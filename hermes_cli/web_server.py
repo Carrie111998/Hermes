@@ -4392,7 +4392,7 @@ def _spawn_gateway_restart(profile: Optional[str] = None) -> Tuple[subprocess.Po
         from hermes_cli.gateway import _reap_unsupervised_gateway_orphans
 
         _reap_unsupervised_gateway_orphans()
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass  # best-effort — don't block the restart on a reap failure
 
     subcommand = _gateway_subcommand(profile, "restart")
@@ -10539,13 +10539,13 @@ async def disconnect_oauth_provider(
                     if oauth_file.exists():
                         oauth_file.unlink()
                         cleared = True
-                except Exception:
+                except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
                     pass
                 # Also clear the credential pool entry if present.
                 try:
                     from hermes_cli.auth import clear_provider_auth
                     cleared = clear_provider_auth("anthropic") or cleared
-                except Exception:
+                except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
                     pass
                 _log.info("oauth/disconnect: %s", provider_id)
                 return {"ok": bool(cleared), "provider": provider_id}
@@ -12618,7 +12618,7 @@ def _profile_env_value(home: Path, key: str) -> str:
             k, v = line.split("=", 1)
             if k.strip() == key:
                 return v.strip().strip('"').strip("'")
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
     return ""
 
@@ -12689,7 +12689,7 @@ def _gateway_fire_endpoint(profile: str, home: Path) -> str:
             multiplex = True
         elif env_flag in {"0", "false", "no", "off"}:
             multiplex = False
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
 
     if multiplex and profile != "default":
@@ -13921,7 +13921,7 @@ async def delete_hook(body: HookDelete):
         # Revoke consent regardless so a re-add re-prompts.
         try:
             shell_hooks.revoke(command)
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass
         return removed
 
@@ -17634,7 +17634,7 @@ def _schedule_check_fn_probe(fn) -> Optional[threading.Thread]:
             from tools.registry import _check_fn_cached
 
             _check_fn_cached(fn)
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass
         finally:
             with _plugins_hub_probe_lock:

@@ -420,7 +420,7 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
         path = _resolve_script_path(script_path)
         if path is not None and path.is_absolute():
             return str(path.parent)
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
     return None
 

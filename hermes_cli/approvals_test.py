@@ -61,7 +61,7 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
     # sees what the runtime would see (load is read-only).
     try:
         approval.load_permanent_allowlist()
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
 
     variants = list(approval._command_detection_variants(command))

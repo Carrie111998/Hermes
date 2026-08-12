@@ -1168,7 +1168,7 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
     # for the prefetch and prints the same notice above the prompt when it
     # lands (prompt_toolkit's patch_stdout renders late prints safely).
     try:
-        behind = get_update_result(timeout=0.05)
+        behind = get_update_result(timeout=0)
         if behind is None and not _update_check_done.is_set():
             _defer_update_notice(console)
         elif behind is not None and behind != 0:

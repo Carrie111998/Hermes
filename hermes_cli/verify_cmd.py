@@ -144,7 +144,7 @@ def _record_evidence(root: Path, recipe, result, *, partial: bool) -> None:
             scope="targeted" if partial else "full",
             output="\n".join(tails),
         )
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
 
 

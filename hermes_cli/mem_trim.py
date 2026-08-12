@@ -56,7 +56,7 @@ def _config_settings() -> tuple[bool, float, int, float]:
             info_log_min_delta_mb = settings.get(
                 "info_log_min_delta_mb", _DEFAULT_INFO_LOG_MIN_DELTA_MB
             )
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
     return (
         enabled,

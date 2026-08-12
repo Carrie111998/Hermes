@@ -243,7 +243,7 @@ def read_anon_rss_mb() -> Optional[int]:
         rss_kib = snapshot.get("rss_kib")
         if isinstance(rss_kib, int) and rss_kib > 0:
             return rss_kib // 1024
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
 
     try:

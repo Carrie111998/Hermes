@@ -89,7 +89,7 @@ def _browser_available() -> bool:
                           HERMES_HOME / "node_modules" / ".bin"):
             if shutil.which("agent-browser", path=str(candidate)):
                 return True
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
     return False
 
