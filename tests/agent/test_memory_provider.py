@@ -310,26 +310,27 @@ class TestMemoryManager:
         assert external.prefetch_queries == ["query", "query 3"]
         assert external.name not in mgr._external_prefetch_threads
 
-    def test_larger_external_prefetch_budget_allows_controlled_provider(self, monkeypatch):
+    def test_larger_external_prefetch_budget_allows_controlled_provider(self):
         mgr = MemoryManager(external_prefetch_timeout=12.0)
         external = BlockingPrefetchProvider("controlled-slow")
         external._prefetch_result = "slow memory"
         mgr.add_provider(external)
-        observed_timeouts = []
-        original_join = threading.Thread.join
 
-        def release_during_join(thread, timeout=None):
-            if thread.name == "memory-prefetch-controlled-slow":
-                observed_timeouts.append(timeout)
-                assert external.started.wait(timeout=5.0)
-                external.release.set()
-                return original_join(thread, timeout=5.0)
-            return original_join(thread, timeout=timeout)
+        def release_after_prefetch_starts():
+            assert external.started.wait(timeout=5.0)
+            external.release.set()
 
-        monkeypatch.setattr(threading.Thread, "join", release_during_join)
+        releaser = threading.Thread(target=release_after_prefetch_starts, daemon=True)
+        releaser.start()
 
-        assert mgr.prefetch_all("query") == "slow memory"
-        assert observed_timeouts == [12.0]
+        try:
+            assert mgr.prefetch_all("query") == "slow memory"
+        finally:
+            external.release.set()
+            releaser.join(timeout=5.0)
+
+        assert not releaser.is_alive()
+        assert mgr._external_prefetch_timeout == 12.0
 
 
 

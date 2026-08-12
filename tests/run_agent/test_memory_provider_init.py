@@ -250,26 +250,34 @@ def test_real_config_reaches_memory_manager_under_temporary_hermes_home(
     )
     from hermes_cli import config as config_module
 
+    previous_load_cache = dict(config_module._LOAD_CONFIG_CACHE)
+    previous_raw_cache = dict(config_module._RAW_CONFIG_CACHE)
     config_module._LOAD_CONFIG_CACHE.clear()
     config_module._RAW_CONFIG_CACHE.clear()
     provider = RecordingMemoryProvider()
 
-    with (
-        patch("plugins.memory.load_memory_provider", return_value=provider),
-        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
-        patch("run_agent.get_tool_definitions", return_value=[]),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI"),
-    ):
-        from run_agent import AIAgent
+    try:
+        with (
+            patch("plugins.memory.load_memory_provider", return_value=provider),
+            patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            from run_agent import AIAgent
 
-        agent = AIAgent(
-            api_key="test-key-1234567890",
-            base_url="https://openrouter.ai/api/v1",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=False,
-        )
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=False,
+            )
+    finally:
+        config_module._LOAD_CONFIG_CACHE.clear()
+        config_module._LOAD_CONFIG_CACHE.update(previous_load_cache)
+        config_module._RAW_CONFIG_CACHE.clear()
+        config_module._RAW_CONFIG_CACHE.update(previous_raw_cache)
 
     manager = getattr(agent, "_memory_manager")
     assert manager is not None
