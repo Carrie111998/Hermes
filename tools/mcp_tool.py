@@ -862,6 +862,28 @@ def _wrap_command_with_watchdog(command: str, args: list) -> tuple[str, list]:
 # ---------------------------------------------------------------------------
 
 
+def _mcp_mime_type(obj) -> str:
+    """Return an MCP object's MIME type across SDK naming conventions.
+
+    ``mcp`` < 2.0.0 named the Python attribute after the wire field
+    (``mimeType``). ``mcp`` >= 2.0.0 renamed every such field to snake_case
+    (``mime_type``) and kept the camelCase spelling as a *serialization
+    alias only* — so ``getattr(block, "mimeType", None)`` returns ``None``
+    on the new SDK even though the block carries a MIME type.
+
+    Every caller here guards its camelCase read with ``getattr``/``hasattr``,
+    so on mcp >= 2.0.0 the failure was silent rather than loud: image blocks
+    fell through to the "Unsupported sampling content block type" warning
+    and were dropped, audio blocks were skipped, and resource links/embedded
+    resources lost their type in the rendered text. Read snake_case first and
+    fall back to camelCase so both SDK generations work without a pin.
+    """
+    value = getattr(obj, "mime_type", None)
+    if value is None:
+        value = getattr(obj, "mimeType", None)
+    return str(value or "")
+
+
 def _mcp_image_extension_for_mime_type(mime_type: str) -> str:
     """Return a reasonable file extension for an MCP image MIME type."""
     import mimetypes
@@ -884,7 +906,7 @@ def _cache_mcp_image_block(block) -> str:
     import base64
 
     data = getattr(block, "data", None)
-    mime_type = getattr(block, "mimeType", None)
+    mime_type = _mcp_mime_type(block)
     normalized_mime = str(mime_type or "").split(";", 1)[0].strip().lower()
     if data is None or not normalized_mime.startswith("image/"):
         return ""
@@ -972,7 +994,7 @@ def _cache_mcp_audio_block(block) -> str:
     import base64
 
     data = getattr(block, "data", None)
-    mime_type = str(getattr(block, "mimeType", None) or "").split(";", 1)[0].strip().lower()
+    mime_type = _mcp_mime_type(block).split(";", 1)[0].strip().lower()
     if data is None or not mime_type.startswith("audio/"):
         return ""
     if len(data) > _MCP_RESOURCE_MAX_B64_CHARS:
@@ -1026,7 +1048,7 @@ def _render_mcp_resource_block(block, server_name: str = "") -> str:
         if not uri:
             return ""
         name = getattr(block, "name", "") or ""
-        mime = getattr(block, "mimeType", "") or ""
+        mime = _mcp_mime_type(block)
         details = f"uri={uri}"
         if name:
             details += f", name={name}"
@@ -1054,7 +1076,7 @@ def _render_mcp_resource_block(block, server_name: str = "") -> str:
     import base64
 
     uri = str(getattr(resource, "uri", "") or "")
-    mime = str(getattr(resource, "mimeType", "") or "")
+    mime = _mcp_mime_type(resource)
     if len(blob) > _MCP_RESOURCE_MAX_B64_CHARS:
         return f"[MCP embedded resource too large to cache: ~{len(blob) * 3 // 4} bytes, uri={uri}]"
     try:
@@ -1621,10 +1643,15 @@ class SamplingHandler:
                     for block in content_blocks:
                         if hasattr(block, "text"):
                             parts.append({"type": "text", "text": block.text})
-                        elif hasattr(block, "data") and hasattr(block, "mimeType"):
+                        elif hasattr(block, "data") and _mcp_mime_type(block):
                             parts.append({
                                 "type": "image_url",
-                                "image_url": {"url": f"data:{block.mimeType};base64,{block.data}"},
+                                "image_url": {
+                                    "url": (
+                                        f"data:{_mcp_mime_type(block)};"
+                                        f"base64,{block.data}"
+                                    )
+                                },
                             })
                         else:
                             logger.warning(
@@ -5570,8 +5597,9 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
                     entry["name"] = r.name
                 if hasattr(r, "description") and r.description:
                     entry["description"] = r.description
-                if hasattr(r, "mimeType") and r.mimeType:
-                    entry["mimeType"] = r.mimeType
+                resource_mime = _mcp_mime_type(r)
+                if resource_mime:
+                    entry["mimeType"] = resource_mime
                 resources.append(entry)
             return json.dumps({"resources": resources}, ensure_ascii=False)
 
