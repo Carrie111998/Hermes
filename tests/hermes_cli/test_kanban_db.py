@@ -328,6 +328,127 @@ def test_rate_limit_exit_requeues_without_counting_failure(
 
 
 
+def test_worker_death_under_live_dispatcher_still_counts_as_crash(
+    kanban_home, monkeypatch,
+):
+    """A worker that dies under a live dispatcher is a crash and counts."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        # _claimer_id() is "<host>:<os.getpid()>" — i.e. a LIVE claimer.
+        claimer = _kb._claimer_id()
+        tid = kb.create_task(conn, title="genuine-crash", assignee="a")
+        kb.claim_task(conn, tid, claimer=claimer)
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (63002, tid),
+        )
+        conn.commit()
+
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert tid in crashed, "a crash under a live dispatcher still counts"
+        task = kb.get_task(conn, tid)
+        assert task.consecutive_failures == 1
+
+
+def test_worker_dies_first_then_claimer_dies_still_counts_as_crash(
+    kanban_home, monkeypatch,
+):
+    """A genuine crash whose dispatcher died before reaping it still counts.
+
+    This is the case that sank the earlier ``orphaned`` carve-out. The durable
+    state it read — worker pid dead with no exit status, claimer pid no longer
+    alive — is reached by two different histories:
+
+      1. the dispatcher restarted and took its worker down with it, and
+      2. the worker was SIGKILLed or OOM-killed under a live dispatcher, which
+         was then itself killed before it persisted the exit.
+
+    They are observationally identical at the next sweep, so no predicate over
+    that state can tell them apart, and a no-fault requeue would silently
+    forgive every case 2. An unclassified exit therefore counts one ordinary
+    failure against the configured limit. The systemic accelerator is still
+    excluded for unclassified exits (see the test below), which is what keeps
+    the 2026-07-27 restart incident from reappearing as first-contact
+    ``gave_up``.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        # A claimer on THIS host (detect_crashed_workers ignores other hosts)
+        # that is NOT this process and is not alive — exactly the state the
+        # withdrawn carve-out treated as proof of a restart.
+        dead_claimer = f"{_kb._claimer_id().split(':', 1)[0]}:4194304"
+        tid = kb.create_task(conn, title="crash-then-claimer-dies", assignee="a")
+        kb.claim_task(conn, tid, claimer=dead_claimer)
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (63003, tid))
+        conn.commit()
+
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert tid in crashed, (
+            "a worker that died before its dispatcher must still be a crash — "
+            "a dead claimer is not evidence the worker was innocent"
+        )
+        task = kb.get_task(conn, tid)
+        assert task.consecutive_failures == 1
+
+
+def test_unclassified_multi_kill_does_not_force_systemic_limit(
+    kanban_home, monkeypatch,
+):
+    """Four concurrent ``pid N not alive`` unknowns must NOT force
+    ``failure_limit=1``.
+
+    Defense-in-depth for the same incident: even where the orphan carve-out
+    cannot prove the claimer is gone (pid reuse, an unparseable lock), an
+    infrastructure multi-kill must not ALSO be accelerated into an immediate
+    ``gave_up``. Every such worker fingerprints identically, so the systemic
+    detector saw >=3 matches and overrode the configured ``failure_limit=2``
+    down to 1 — permanently blocking healthy cards on the first sweep.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        task_ids = []
+        for i in range(4):
+            tid = kb.create_task(conn, title=f"multi-kill-{i}", assignee="a")
+            kb.claim_task(conn, tid, claimer=f"{host}:worker-{i}")
+            conn.execute(
+                "UPDATE tasks SET worker_pid=? WHERE id=?",
+                (64000 + i, tid),
+            )
+            task_ids.append(tid)
+        conn.commit()
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert len(crashed) == 4
+
+        for tid in task_ids:
+            task = kb.get_task(conn, tid)
+            assert task.consecutive_failures == 1
+            # DEFAULT_FAILURE_LIMIT is 2, so one sweep must not block.
+            assert task.status == "ready", (
+                f"{tid}: one unclassified multi-kill must not trip the "
+                f"breaker, got {task.status}"
+            )
+            kinds = [
+                r["kind"] for r in conn.execute(
+                    "SELECT kind FROM task_events WHERE task_id=?", (tid,),
+                ).fetchall()
+            ]
+            assert "gave_up" not in kinds
+
 def test_respawn_guard_defers_rate_limited_within_cooldown(
     kanban_home, monkeypatch,
 ):

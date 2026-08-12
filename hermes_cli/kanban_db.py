@@ -8502,6 +8502,19 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     ``check_respawn_guard`` defers their respawn until the window clears.
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
+
+    When the reap registry shows the worker was terminated by a signal the
+    dispatcher itself sent (deploy or gateway restart), the task is likewise
+    released without counting a failure and reported via
+    ``_last_interrupted``.
+
+    An exit we cannot classify is NOT given that treatment. "We lost the
+    evidence" and "the task crashed" are indistinguishable in the durable
+    state this function reads, so an unclassified exit counts one ordinary
+    failure against the configured limit. It is only excluded from the
+    systemic-failure accelerator below, which is what stops a dispatcher
+    restart from turning N in-flight workers into N first-contact
+    ``gave_up`` cards.
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
@@ -8511,8 +8524,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # clean-exit-but-still-running case, which is accounted against its
     # own bounded violation streak instead of the unified failure
     # counter (see the post-txn loop below).
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    crash_details: list[tuple[str, int, str, bool, str, bool]] = []
+    # (task_id, pid, claimer, protocol_violation, error_text, unclassified)
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
@@ -8651,7 +8664,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
+                         protocol_violation, error_text, kind == "unknown")
                     )
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the retried task transitions to blocked with a ``gave_up`` event
@@ -8673,10 +8686,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
+        for _, _, _, _, err_text, _ in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        for (
+            tid, pid, claimer, protocol_violation, error_text, unclassified,
+        ) in crash_details:
             if protocol_violation:
                 streak = _protocol_violation_streak(conn, tid)
                 trow = conn.execute(
@@ -8724,7 +8739,25 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     auto_blocked.append(tid)
                 continue
             fp = _error_fingerprint(error_text)
-            is_systemic = _fp_counts.get(fp, 0) >= 3
+            # Systemic accelerator: several tasks failing with the SAME error
+            # in one sweep means the cause is environmental (a bad config, a
+            # dead dependency), so retrying each to its own limit just burns
+            # budget — trip on first contact instead.
+            #
+            # UNCLASSIFIED crashes are excluded. A ``pid N not alive`` with no
+            # exit status is not evidence of a shared root cause; it is the
+            # ONE shape an infrastructure multi-kill always produces, and
+            # every such worker fingerprints identically (``_error_fingerprint``
+            # normalizes the pid away). Letting it accelerate meant a single
+            # control-plane restart with >=3 in-flight workers forced
+            # ``failure_limit=1`` and permanently ``gave_up`` every card on the
+            # first sweep, overriding the operator's configured limit — the
+            # exact 2026-07-27 incident. An unclassified exit is counted as
+            # one ordinary failure against the configured limit, but it is
+            # unavailable when the claimer pid is reused or unparseable, so
+            # the accelerator must fail open here too: these tasks still count
+            # a normal failure and still trip at the CONFIGURED limit.
+            is_systemic = not unclassified and _fp_counts.get(fp, 0) >= 3
             tripped = _record_task_failure(
                 conn, tid,
                 error=error_text,
@@ -8745,6 +8778,24 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
     return crashed
+
+
+def _claim_lock_pid(claim_lock: Optional[str]) -> Optional[int]:
+    """Return the dispatcher pid encoded in a ``host:pid`` claim lock.
+
+    ``_claimer_id`` builds claim locks as ``f"{hostname}:{os.getpid()}"``, so
+    the trailing field identifies the *dispatcher* process that claimed the
+    task — not the worker. Returns ``None`` when the lock is missing or does
+    not carry a parseable pid (hand-written locks in tests, future formats).
+    """
+    if not claim_lock:
+        return None
+    _, _, tail = str(claim_lock).rpartition(":")
+    try:
+        pid = int(tail)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
 
 
 def _record_task_failure(
