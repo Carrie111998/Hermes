@@ -8722,7 +8722,11 @@ async def _standalone_send(
                 )
             }
 
-        client = _AsyncWebClient(token=token)
+        client = _AsyncWebClient(
+            token=token,
+            user_agent_prefix=_HERMES_SLACK_USER_AGENT_PREFIX,
+            headers={"Accept-Encoding": "gzip"},
+        )
         _apply_slack_proxy(client, resolve_proxy_url())
         last_message_id = None
 
