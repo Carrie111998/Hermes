@@ -29,6 +29,7 @@ import {
 import { Textarea } from '@/components/ui/textarea'
 import {
   type AutomationBlueprint,
+  AuthenticationState,
   createCronJob,
   type CronDeliveryTarget,
   type CronJob,
@@ -41,6 +42,7 @@ import {
   pauseCronJob,
   resumeCronJob,
   type SessionInfo,
+  toAuthenticationState,
   triggerCronJob,
   updateCronJob
 } from '@/hermes'
@@ -952,7 +954,7 @@ function CronEditorDialog({
   // Configured providers with at least one available model — mirrors the chat
   // model picker's gate so only actually-selectable models are offered.
   const modelProviders = (modelOptions.data?.providers ?? []).filter(
-    provider => provider.authenticated !== false && (provider.models ?? []).length > 0
+    provider => toAuthenticationState(provider.authenticated) !== AuthenticationState.Unauthenticated && (provider.models ?? []).length > 0
   )
 
   // A previously pinned model that has since left the catalog (provider
