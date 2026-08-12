@@ -13,7 +13,12 @@ slim API and the daemon crashes with "Unknown embeddings provider: onnx"
 from unittest.mock import patch
 
 import hermes_cli.memory_setup as memory_setup
-from hermes_cli.memory_setup import _is_intel_macos, _provider_pip_dependencies
+# The plugins/ package is importable because tests/conftest.py puts
+# PROJECT_ROOT on sys.path.  We reference the REAL HindsightMemoryProvider
+# so the plugin guard is tested against actual production behavior, not a
+# mirror.
+import plugins.memory.hindsight as hindsight_plugin
+from hermes_cli.memory_setup import _hindsight_local_embedded_deps, _is_intel_macos, _provider_pip_dependencies
 
 DECLARED = ["hindsight-client>=0.6.1"]
 
@@ -109,37 +114,17 @@ class TestHindsightPluginPostSetupGuard:
     earlier-stage fix and crashing the daemon with "Unknown embeddings
     provider: onnx" (#81421).
 
-    These tests don't import the plugin class (the plugin package is not
-    on the default ``sys.path``).  Instead they mirror the
-    ``local_embedded`` branch of ``HindsightProvider.post_setup`` and
-    assert the dep list reflects the Intel-macOS guard imported from
-    ``hermes_cli.memory_setup``.
+    The plugin's ``post_setup`` and ``_provider_pip_dependencies`` share a
+    single source of truth, ``hermes_cli.memory_setup._hindsight_local_embedded_deps``.
+    These tests drive that real shared helper (exactly what the plugin calls)
+    and additionally assert the REAL plugin is wired to it — so the only way
+    this guard can break is the plugin's actual behavior changing (e.g.
+    someone replacing the helper call with a drifted inline copy).
     """
 
-    @staticmethod
-    def _compute_plugin_local_deps(monkeypatch, *, intel_macos: bool):
-        from hermes_cli import memory_setup
-
-        monkeypatch.setattr(
-            memory_setup, "_is_intel_macos", lambda: intel_macos
-        )
-
-        # Mirror the ``local_embedded`` branch in
-        # ``plugins/memory/hindsight/__init__.py::post_setup``: the plugin
-        # now imports ``_is_intel_macos`` from ``hermes_cli.memory_setup``
-        # and selects the slim stack on Intel macOS.
-        if memory_setup._is_intel_macos():
-            local_dep = [
-                "hindsight-all-slim",
-                "hindsight-api-slim[local-onnx]",
-                "hindsight-embed",
-            ]
-        else:
-            local_dep = ["hindsight-all"]
-        return local_dep
-
     def test_intel_macos_installs_slim_stack(self, monkeypatch):
-        deps = self._compute_plugin_local_deps(monkeypatch, intel_macos=True)
+        self._patch_intel_macos(monkeypatch, intel_macos=True)
+        deps = _hindsight_local_embedded_deps()
 
         assert "hindsight-all" not in deps
         assert "hindsight-all-slim" in deps
@@ -147,9 +132,27 @@ class TestHindsightPluginPostSetupGuard:
         assert "hindsight-embed" in deps
 
     def test_non_intel_installs_full_bundle(self, monkeypatch):
-        deps = self._compute_plugin_local_deps(monkeypatch, intel_macos=False)
+        self._patch_intel_macos(monkeypatch, intel_macos=False)
+        deps = _hindsight_local_embedded_deps()
 
         assert deps == ["hindsight-all"]
+
+    def test_plugin_wizard_is_wired_to_shared_helper(self):
+        """The REAL ``HindsightMemoryProvider.post_setup`` must build its
+        local dep list by calling ``_hindsight_local_embedded_deps`` — not by
+        drifting its own inline copy of the specs.  If it ever reverts to a
+        duplicated list, this wiring assertion fails even though the shared
+        helper is itself correct."""
+        import inspect
+
+        source = inspect.getsource(hindsight_plugin.HindsightMemoryProvider.post_setup)
+        assert "_hindsight_local_embedded_deps" in source
+
+    @staticmethod
+    def _patch_intel_macos(monkeypatch, *, intel_macos: bool):
+        monkeypatch.setattr(
+            memory_setup, "_is_intel_macos", lambda: intel_macos
+        )
 
 
 class TestIntelMacosSmokeCheck:

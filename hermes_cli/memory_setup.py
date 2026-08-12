@@ -36,9 +36,7 @@ def _provider_pip_dependencies(provider_name: str, declared: list) -> list:
     releases whose overlapping ``hindsight_api`` files override the working
     slim API and crash the daemon with "Unknown embeddings provider: onnx"
     (#81421).  On that platform the local-embedded mode installs the thin
-    slim stack instead — ``hindsight-all-slim`` + ``hindsight-api-slim[local-onnx]``
-    + ``hindsight-embed`` (the wrapper is installed ``--no-deps`` upstream,
-    so these explicit specs are the portable declaration).
+    slim stack instead (see ``_hindsight_local_embedded_deps``).
     """
     deps = list(declared or [])
     if provider_name == "hindsight":
@@ -49,19 +47,41 @@ def _provider_pip_dependencies(provider_name: str, declared: list) -> list:
             mode = cfg.get("mode", "")
             # "local" is a legacy alias for "local_embedded"
             if mode in {"local", "local_embedded"}:
-                if _is_intel_macos():
-                    deps.append("hindsight-all-slim")
-                    deps.append("hindsight-api-slim[local-onnx]")
-                    # The embed manager must be declared explicitly: it is
-                    # the component that drives the configured ONNX
-                    # embeddings provider, and a venv rebuild strips it
-                    # exactly like hindsight-embed did in #70636.
-                    deps.append("hindsight-embed")
-                else:
-                    deps.append("hindsight-all")
+                deps += _hindsight_local_embedded_deps()
         except Exception:
             pass
     return deps
+
+
+def _hindsight_local_embedded_deps() -> list:
+    """Hindsight local-embedded pip specs for THIS platform.
+
+    The bare full bundle is not portable to Intel macOS: its current
+    local-ML dependency set pulls MLX packages that have no x86_64 wheels,
+    so the resolver backtracks to ancient releases that break the
+    configured ONNX runtime (#81421).  On that platform install the thin
+    slim stack instead — ``hindsight-all-slim`` + ``hindsight-api-slim[local-onnx]``
+    + ``hindsight-embed`` (the embed manager drives the configured ONNX
+    embeddings provider and is declared explicitly so a venv rebuild strips
+    it no more than hindsight-embed did in #70636).  Apple Silicon (arm64)
+    and every other OS keep the full ``hindsight-all`` bundle.
+
+    This is the single source of truth for the local-embedded spec list —
+    both ``_provider_pip_dependencies`` and the Hindsight plugin's
+    ``HindsightMemoryProvider.post_setup`` wizard call it, so the wizard can
+    never drift from the refresh/heal path (#81421, #81530).
+    """
+    if _is_intel_macos():
+        return [
+            "hindsight-all-slim",
+            "hindsight-api-slim[local-onnx]",
+            # The embed manager must be declared explicitly: it is the
+            # component that drives the configured ONNX embeddings
+            # provider, and a venv rebuild strips it exactly like
+            # hindsight-embed did in #70636.
+            "hindsight-embed",
+        ]
+    return ["hindsight-all"]
 
 
 def _is_intel_macos() -> bool:

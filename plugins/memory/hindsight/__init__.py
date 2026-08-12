@@ -936,7 +936,7 @@ class HindsightMemoryProvider(MemoryProvider):
         from hermes_cli.memory_setup import (
             _CANCELLED,
             _curses_select,
-            _is_intel_macos,
+            _hindsight_local_embedded_deps,
             _print_cancelled_setup,
         )
 
@@ -967,22 +967,10 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # Step 2: Install/upgrade deps for selected mode
         cloud_dep = f"hindsight-client>={_MIN_CLIENT_VERSION}"
-        # The bare full bundle is not portable to Intel macOS: its current
-        # dependencies pull MLX packages with no x86_64 wheels, so the
-        # resolver backtracks to ancient releases that break the configured
-        # ONNX runtime (#81421).  On that platform install the thin slim
-        # stack instead, matching ``_provider_pip_dependencies``.
-        if _is_intel_macos():
-            local_dep = [
-                "hindsight-all-slim",
-                "hindsight-api-slim[local-onnx]",
-                # Same explicit embed spec as ``_provider_pip_dependencies``:
-                # the embed manager drives the configured ONNX embeddings
-                # provider and must be declared, not assumed.
-                "hindsight-embed",
-            ]
-        else:
-            local_dep = ["hindsight-all"]
+        # Single source of truth shared with the refresh/heal path
+        # (``_provider_pip_dependencies``): selects the slim stack on Intel
+        # macOS and the full bundle elsewhere (#81421, #81530).
+        local_dep = _hindsight_local_embedded_deps()
         if mode == "local_embedded":
             deps_to_install = local_dep
         elif mode == "local_external":
