@@ -1,0 +1,245 @@
+"""Tests for empty-tool_calls stripping on the auxiliary client path.
+
+Motivation: strict OpenAI-compatible providers (DeepSeek v4, Console Go /
+opencode.ai zen) reject an assistant message carrying ``tool_calls: []``
+with HTTP 400 "Invalid 'messages[N].tool_calls': empty array. Expected an
+array with minimum length 1, but got an empty array instead." The main loop
+strips these pre-send in ``sanitize_api_messages`` (#58755), but the
+auxiliary client path — ``call_llm`` / ``async_call_llm`` (MoA aggregator
+and reference advisors, compression, vision, title generation) — bypassed
+that chokepoint entirely (#84169).
+
+Regression contract: ``_strip_empty_tool_calls`` drops the ``tool_calls``
+key on assistant messages where it is present but not a non-empty list
+(never writes ``[]``), keeps any existing content, gains a placeholder when
+content is empty so the turn is not empty mid-transcript (Anthropic-family
+providers reject those), never mutates the caller's list, and is a zero-copy
+fast path when nothing needs stripping. Both sync and async call paths must
+apply it before the wire.
+"""
+
+from agent.auxiliary_client import _strip_empty_tool_calls
+
+
+def _tc(cid, name="tool_x", args="{}"):
+    """A minimal OpenAI-compatible tool_call dict."""
+    return {
+        "id": cid,
+        "call_id": cid,
+        "response_item_id": f"fc_{cid}",
+        "type": "function",
+        "function": {"name": name, "arguments": args},
+    }
+
+
+# ── _strip_empty_tool_calls unit behavior ─────────────────────────────────
+
+def test_strip_empty_array_on_assistant():
+    msgs = [{"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "x", "tool_calls": []}]
+    out = _strip_empty_tool_calls(msgs)
+    assert out[1] == {"role": "assistant", "content": "x"}
+
+
+def test_strip_empty_array_empty_content_gets_placeholder():
+    """The poison shape from the real incident (68952): content == '' AND
+    tool_calls == []. Stripping the key must not leave an empty non-final
+    assistant message — Anthropic-family providers reject those (the
+    auxiliary path has no repair_empty_non_final_messages backstop)."""
+    msgs = [{"role": "assistant", "content": "", "tool_calls": []}]
+    out = _strip_empty_tool_calls(msgs)
+    assert "tool_calls" not in out[0]
+    assert out[0]["content"] == "(tool call removed)"
+
+
+def test_strip_none_and_nonlist_values():
+    for bad in (None, "oops", 42):
+        msgs = [{"role": "assistant", "content": "x", "tool_calls": bad}]
+        out = _strip_empty_tool_calls(msgs)
+        assert "tool_calls" not in out[0]
+
+
+def test_strip_keeps_valid_tool_calls_by_identity():
+    tcs = [_tc("c1")]
+    msgs = [{"role": "assistant", "content": "", "tool_calls": tcs}]
+    out = _strip_empty_tool_calls(msgs)
+    assert out[0].get("tool_calls") is tcs  # same object, zero rewrite
+
+
+def test_strip_zero_copy_when_clean():
+    msgs = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}]
+    assert _strip_empty_tool_calls(msgs) is msgs  # fast path: same list object
+
+
+def test_strip_never_mutates_caller_list():
+    import copy
+    msgs = [{"role": "assistant", "content": "x", "tool_calls": []}]
+    snapshot = copy.deepcopy(msgs)
+    _strip_empty_tool_calls(msgs)
+    assert msgs == snapshot
+
+
+def test_strip_non_dict_passthrough():
+    msgs = [None, {"role": "assistant", "content": "x", "tool_calls": []}]
+    out = _strip_empty_tool_calls(msgs)
+    assert out[0] is None and "tool_calls" not in out[1]
+
+
+def test_strip_mixed_only_bad_stripped():
+    good = {"role": "assistant", "content": "keep"}
+    msgs = [good, {"role": "assistant", "content": "drop", "tool_calls": []}]
+    out = _strip_empty_tool_calls(msgs)
+    assert out[0] is good
+    assert "tool_calls" not in out[1]
+
+
+def test_strip_empty_input():
+    assert _strip_empty_tool_calls([]) == []
+
+
+# ── Sync wiring (call_llm applies the strip before the wire) ──────────────
+
+def _fake_completions_create(captured):
+    """Return a create() that records kwargs and yields a minimal response."""
+    from types import SimpleNamespace
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            id="x", model="fake-model", object="chat.completion",
+            choices=[SimpleNamespace(
+                index=0,
+                message=SimpleNamespace(
+                    role="assistant", content="ok", tool_calls=None, reasoning=None,
+                ),
+                finish_reason="stop",
+            )],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+
+    return create
+
+
+def test_call_llm_strips_empty_tool_calls_before_wire(monkeypatch):
+    """End-to-end wiring: call_llm must normalize the messages it hands to
+    the provider. Regression guard for #84169 — the auxiliary path used to
+    bypass the main-loop sanitizer entirely."""
+    from types import SimpleNamespace
+    import agent.auxiliary_client as ac
+
+    captured = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            return _fake_completions_create(captured)(**kwargs)
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        base_url = "http://fake/v1"
+        chat = FakeChat()
+
+    def fake_get_client(*args, **kwargs):
+        return FakeClient(), "fake-model"
+
+    def fake_relay(client, kwargs, *, provider=None, api_mode=None, create=None):
+        captured.update(kwargs)
+        return create(kwargs)
+
+    monkeypatch.setattr(ac, "_get_cached_client", fake_get_client)
+    monkeypatch.setattr(ac, "_relay_sync_completion", fake_relay)
+
+    poison = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "poisoned turn", "tool_calls": []},
+        {"role": "assistant", "content": "clean turn"},
+    ]
+    ac.call_llm(
+        task="test_verify", messages=poison,
+        provider="custom", base_url="http://fake/v1", model="fake-model",
+    )
+
+    sent = captured["messages"]
+    bad = [
+        m for m in sent
+        if isinstance(m, dict) and m.get("role") == "assistant"
+        and "tool_calls" in m
+        and not (isinstance(m["tool_calls"], list) and m["tool_calls"])
+    ]
+    assert not bad, f"empty tool_calls reached the wire: {bad}"
+    assert sent[1] == {"role": "assistant", "content": "poisoned turn"}
+    # caller list is never mutated
+    assert poison[1]["tool_calls"] == []
+
+
+# ── Async wiring (async_call_llm applies the strip before the wire) ───────
+
+def test_async_call_llm_strips_empty_tool_calls_before_wire(monkeypatch):
+    """Async counterpart of the sync wiring test: async_call_llm (used by
+    async auxiliary tasks) must also normalize messages before the wire."""
+    import asyncio
+    from types import SimpleNamespace
+    import agent.auxiliary_client as ac
+
+    captured = {}
+
+    class FakeAsyncCompletions:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                id="x", model="fake-model", object="chat.completion",
+                choices=[SimpleNamespace(
+                    index=0,
+                    message=SimpleNamespace(
+                        role="assistant", content="ok", tool_calls=None, reasoning=None,
+                    ),
+                    finish_reason="stop",
+                )],
+                usage=SimpleNamespace(
+                    prompt_tokens=1, completion_tokens=1, total_tokens=2,
+                ),
+            )
+
+    class FakeAsyncChat:
+        completions = FakeAsyncCompletions()
+
+    class FakeAsyncClient:
+        base_url = "http://fake/v1"
+        chat = FakeAsyncChat()
+
+    monkeypatch.setattr(
+        ac, "_get_cached_client",
+        lambda *a, **kw: (FakeAsyncClient(), "fake-model"),
+    )
+    # Bypass the async semaphore: it is created per-event-loop at first use,
+    # and asyncio.run() spins a NEW loop — the stored semaphore (if any) is
+    # bound to a different loop and would raise on acquire.
+    monkeypatch.setattr(ac, "_acquire_async_aux_semaphore", lambda task: None)
+
+    async def fake_relay(client, kwargs, *, provider=None, api_mode=None, create=None):
+        captured.update(kwargs)
+        return await create(kwargs)
+
+    monkeypatch.setattr(ac, "_relay_async_completion", fake_relay)
+
+    poison = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "poisoned", "tool_calls": []},
+    ]
+
+    asyncio.run(ac.async_call_llm(
+        task="test_verify", messages=poison,
+        provider="custom", base_url="http://fake/v1", model="fake-model",
+    ))
+
+    sent = captured["messages"]
+    bad = [
+        m for m in sent
+        if isinstance(m, dict) and m.get("role") == "assistant"
+        and "tool_calls" in m
+        and not (isinstance(m["tool_calls"], list) and m["tool_calls"])
+    ]
+    assert not bad, f"empty tool_calls reached the wire: {bad}"
+    # caller list is never mutated
+    assert poison[1]["tool_calls"] == []

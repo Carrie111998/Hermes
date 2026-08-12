@@ -8141,6 +8141,67 @@ def _contains_profile_reasoning_fields(value: Any) -> bool:
     return False
 
 
+def _strip_empty_tool_calls(messages: list) -> list:
+    """Drop ``tool_calls`` keys that are empty/invalid on assistant messages.
+
+    Strict OpenAI-compatible providers (DeepSeek v4, Console Go / opencode.ai
+    zen, Moonshot) reject an assistant message carrying ``tool_calls: []``
+    with HTTP 400 "Invalid 'messages[N].tool_calls': empty array. Expected an
+    array with minimum length 1, but got an empty array instead." (#58755).
+
+    The main loop strips these pre-send inside ``sanitize_api_messages``
+    (agent_runtime_helpers), but the auxiliary path — MoA aggregator and
+    reference advisors, compression, vision, title generation — goes through
+    ``auxiliary_client.call_llm`` and bypasses that chokepoint. A live-history
+    message that reaches this path with an empty array (interrupted turns,
+    dangling tool-call state after restart, consecutive-assistant merges)
+    400s the whole auxiliary call with a non-retryable error.
+
+    This is the auxiliary counterpart of the main-loop pass: normalize
+    defensively on a request-local copy so the caller's list is never mutated
+    (returning the original object when nothing needs stripping keeps the hot
+    MoA reference path zero-copy). Semantics match the main-loop pass exactly:
+    an assistant message whose ``tool_calls`` is present but not a non-empty
+    list is semantically identical to one without tool calls.
+    """
+    if not messages:
+        return messages
+    needs_strip = any(
+        isinstance(m, dict)
+        and m.get("role") == "assistant"
+        and "tool_calls" in m
+        and not (isinstance(m["tool_calls"], list) and m["tool_calls"])
+        for m in messages
+    )
+    if not needs_strip:
+        return messages
+    out = []
+    stripped = 0
+    for msg in messages:
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "assistant"
+            and "tool_calls" in msg
+            and not (isinstance(msg["tool_calls"], list) and msg["tool_calls"])
+        ):
+            msg = {k: v for k, v in msg.items() if k != "tool_calls"}
+            # Mirror the main-loop dedup fix: an assistant turn that is now
+            # empty (content == '') must get a placeholder so Anthropic-family
+            # providers don't reject an empty non-final assistant message
+            # ("all messages must have non-empty content..."). The auxiliary
+            # path serves Anthropic-compatible targets too, and it has no
+            # repair_empty_non_final_messages backstop.
+            if not str(msg.get("content") or "").strip():
+                msg["content"] = "(tool call removed)"
+            stripped += 1
+        out.append(msg)
+    logger.debug(
+        "Auxiliary client: stripped empty/invalid tool_calls on %d "
+        "assistant message(s)", stripped,
+    )
+    return out
+
+
 def _build_call_kwargs(
     provider: str,
     model: str,
@@ -9105,6 +9166,15 @@ def _call_llm_impl(
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
         base_url=_base_info or resolved_base_url, task=task)
+    # Strict OpenAI-compatible providers (Console Go / opencode.ai zen,
+    # DeepSeek v4) reject an assistant message carrying an EMPTY tool_calls
+    # array with HTTP 400 "Invalid 'messages[N].tool_calls': empty array".
+    # The main loop strips these pre-send in sanitize_api_messages, but this
+    # auxiliary path (MoA aggregator/reference advisors, compression, vision,
+    # titles) bypasses that chokepoint — normalize the request-local copy here
+    # so a poisoned live-history message can't 400 the whole auxiliary call
+    # (mirror of the main-loop pass, #58755).
+    kwargs["messages"] = _strip_empty_tool_calls(kwargs["messages"])
     if extra_headers:
         kwargs["extra_headers"] = dict(extra_headers)
 
@@ -9873,6 +9943,10 @@ async def _async_call_llm_impl(
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
         base_url=_client_base or resolved_base_url, task=task)
+    # Same empty-tool_calls normalization as the sync path: strict
+    # OpenAI-compatible providers reject ``tool_calls: []`` with HTTP 400
+    # (mirror of the main-loop pass, #58755).
+    kwargs["messages"] = _strip_empty_tool_calls(kwargs["messages"])
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     if _is_anthropic_compat_endpoint(request_provider, _client_base):
