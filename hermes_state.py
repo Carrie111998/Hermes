@@ -6937,33 +6937,41 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             row = cursor.fetchone()
         return self._session_row_dict(row) if row else None
 
-    def resolve_session_by_title(self, title: str) -> Optional[str]:
+    def resolve_session_by_title(self, title: str, session_key: str = None, chat_id: str = None) -> Optional[str]:
         """Resolve a title to a session ID, preferring the latest in a lineage.
 
         If the exact title exists, returns that session's ID.
         If not, searches for "title #N" variants and returns the latest one.
         If the exact title exists AND numbered variants exist, returns the
-        latest numbered variant (the most recent continuation).
+        latest numbered variant (the most recent continuation).  When
+        ``session_key`` is provided, restrict resolution to that gateway-origin
+        boundary so a same-titled session in another chat cannot shadow the
+        current chat's match. When only ``chat_id`` is available, restrict to
+        that legacy chat boundary.
         """
-        # First try exact match
-        exact = self.get_session_by_title(title)
-
-        # Also search for numbered variants: "title #2", "title #3", etc.
-        # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
         escaped = _escape_like(title)
+        where = "WHERE (title = ? OR title LIKE ? ESCAPE '\\')"
+        params: list = [title, f"{escaped} #%"]
+        if session_key:
+            where += " AND session_key = ?"
+            params.append(session_key)
+        elif chat_id:
+            where += " AND chat_id = ?"
+            params.append(chat_id)
+
         with self._read_ctx() as conn:
             cursor = conn.execute(
                 "SELECT id, title, started_at FROM sessions "
-                "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
-                (f"{escaped} #%",),
+                f"{where} ORDER BY CASE WHEN title = ? THEN 1 ELSE 0 END, started_at DESC",
+                (*params, title),
             )
-            numbered = cursor.fetchall()
+            rows = cursor.fetchall()
 
+        numbered = [row for row in rows if row["title"] != title]
         if numbered:
-            # Return the most recent numbered variant
             return numbered[0]["id"]
-        elif exact:
-            return exact["id"]
+        if rows:
+            return rows[0]["id"]
         return None
 
     def get_next_title_in_lineage(self, base_title: str) -> str:
@@ -7105,6 +7113,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         source: str = None,
         sources: List[str] = None,
+        chat_id: str = None,
         exclude_sources: List[str] = None,
         cwd_prefix: str = None,
         limit: int = 20,
@@ -7171,7 +7180,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         Pass ``session_key`` to restrict results to one stable gateway
         conversation scope (DM, group, channel, or thread, including the
-        configured per-user isolation policy).
+        configured per-user isolation policy). Pass ``chat_id`` to restrict
+        results to one platform chat while preserving the broader source and
+        session-key filters.
         """
         # Rows carry token/cost totals — drain queued deltas first so
         # listings (sidebar, /resume, dashboards) show exact counters.
@@ -7205,6 +7216,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if session_key:
             where_clauses.append("s.session_key = ?")
             params.append(session_key)
+        if chat_id:
+            where_clauses.append("s.chat_id = ?")
+            params.append(chat_id)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")

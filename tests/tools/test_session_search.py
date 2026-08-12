@@ -22,6 +22,7 @@ from tools.session_search_tool import (
     _session_link,
     session_search,
 )
+from tools.registry import registry
 
 
 @pytest.fixture
@@ -78,6 +79,8 @@ class TestSchema:
         assert "window" in params
         # Shared
         assert "role_filter" in params
+        assert "scope" in params
+        assert params["scope"]["enum"] == ["chat", "all"]
         # Mode is inferred from which args are set — no explicit mode param
         assert "mode" not in params
 
@@ -106,6 +109,57 @@ class TestBrowseShape:
         result = json.loads(session_search(db=db, current_session_id="s_newest"))
         sids = [r["session_id"] for r in result["results"]]
         assert "s_newest" not in sids
+
+    def test_group_context_browse_defaults_to_current_chat(self, db):
+        db.create_session("current", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=? WHERE id=?",
+            ("chat-a", "group", "Group A", "current"),
+        )
+        db.create_session("same", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=? WHERE id=?",
+            ("chat-a", "group", "Group A", "Same chat", "same"),
+        )
+        db.create_session("foreign", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=? WHERE id=?",
+            ("chat-b", "group", "Group B", "Foreign chat", "foreign"),
+        )
+        db._conn.commit()
+
+        result = json.loads(session_search(db=db, current_session_id="current"))
+
+        sids = [r["session_id"] for r in result["results"]]
+        assert result["scope"] == "chat"
+        assert "same" in sids
+        assert "foreign" not in sids
+        assert result["results"][0]["same_origin"] is True
+
+    def test_group_context_browse_filters_beyond_recent_window(self, db):
+        db.create_session("current", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=? WHERE id=?",
+            ("chat-a", "group", "Group A", "current"),
+        )
+        for idx in range(12):
+            sid = f"foreign_{idx}"
+            db.create_session(sid, source="signal")
+            db._conn.execute(
+                "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=?, started_at=? WHERE id=?",
+                ("chat-b", "group", "Group B", f"Foreign {idx}", 1000 + idx, sid),
+            )
+        db.create_session("same_old", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=?, started_at=? WHERE id=?",
+            ("chat-a", "group", "Group A", "Same old", 1, "same_old"),
+        )
+        db._conn.commit()
+
+        result = json.loads(session_search(limit=3, db=db, current_session_id="current"))
+
+        assert result["scope"] == "chat"
+        assert [r["session_id"] for r in result["results"]] == ["same_old"]
 
 
 # =========================================================================
@@ -157,6 +211,283 @@ class TestDiscoveryShape:
         result = json.loads(session_search(query="modpack", db=db, current_session_id="s_newest"))
         sids = [r["session_id"] for r in result["results"]]
         assert "s_newest" not in sids
+
+    def test_group_context_search_defaults_to_current_session_key(self, db):
+        db.create_session("current", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, session_key=? WHERE id=?",
+            ("chat-a", "group", "Group A", "signal:group:chat-a:user-a", "current"),
+        )
+        db.create_session("same_user_old", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=?, session_key=? WHERE id=?",
+            ("chat-a", "group", "Group A", "Group A user A links", "signal:group:chat-a:user-a", "same_user_old"),
+        )
+        db.append_message("same_user_old", role="user", content="ambiguous local links")
+        db.create_session("same_chat_other_user", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=?, session_key=? WHERE id=?",
+            ("chat-a", "group", "Group A", "Group A user B links", "signal:group:chat-a:user-b", "same_chat_other_user"),
+        )
+        db.append_message("same_chat_other_user", role="user", content="ambiguous other user links ambiguous ambiguous ambiguous")
+        db._conn.commit()
+
+        result = json.loads(session_search(query="ambiguous", db=db, current_session_id="current"))
+
+        assert result["scope"] == "chat"
+        assert [r["session_id"] for r in result["results"]] == ["same_user_old"]
+        assert result["results"][0]["same_origin"] is True
+
+    def test_group_context_search_defaults_to_current_session_key_for_trigram_cjk(self, db):
+        if not db._trigram_available:
+            pytest.skip("trigram tokenizer unavailable in this build")
+        db._fts_cjk_available = False
+        db.create_session("current", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, session_key=? WHERE id=?",
+            ("chat-a", "group", "Group A", "signal:group:chat-a:user-a", "current"),
+        )
+        db.create_session("same_user_old", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=?, session_key=? WHERE id=?",
+            ("chat-a", "group", "Group A", "Group A CJK", "signal:group:chat-a:user-a", "same_user_old"),
+        )
+        db.append_message("same_user_old", role="user", content="关于大别山项目的本地记录")
+        db.create_session("foreign", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=?, session_key=? WHERE id=?",
+            ("chat-b", "group", "Group B", "Group B CJK", "signal:group:chat-b:user-a", "foreign"),
+        )
+        db.append_message("foreign", role="user", content="关于大别山项目的外部记录")
+        db._conn.commit()
+
+        result = json.loads(session_search(query="大别山项目", db=db, current_session_id="current"))
+
+        assert result["scope"] == "chat"
+        assert [r["session_id"] for r in result["results"]] == ["same_user_old"]
+        assert result["results"][0]["same_origin"] is True
+
+    def test_group_context_search_defaults_to_current_chat_when_no_session_key(self, db):
+        db.create_session("current", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=? WHERE id=?",
+            ("chat-a", "group", "Group A", "current"),
+        )
+        db.create_session("same_old", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=? WHERE id=?",
+            ("chat-a", "group", "Group A", "Group A links", "same_old"),
+        )
+        db.append_message("same_old", role="user", content="ambiguous local links")
+        db.create_session("foreign", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=? WHERE id=?",
+            ("foreign", "group", "Group B", "Group B links", "foreign"),
+        )
+        db.append_message("foreign", role="user", content="ambiguous foreign links ambiguous ambiguous ambiguous")
+        db._conn.commit()
+
+        result = json.loads(session_search(query="ambiguous", db=db, current_session_id="current"))
+
+        assert result["scope"] == "chat"
+        assert [r["session_id"] for r in result["results"]] == ["same_old"]
+        assert result["results"][0]["origin"]["display_name"] == "Group A"
+        assert result["results"][0]["same_origin"] is True
+
+    def test_dm_context_search_defaults_to_current_chat(self, db):
+        db.create_session("current", source="telegram")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, session_key=? WHERE id=?",
+            ("dm-a", "dm", "DM A", "telegram:dm:dm-a", "current"),
+        )
+        db.create_session("same_dm", source="telegram")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=?, session_key=? WHERE id=?",
+            ("dm-a", "dm", "DM A", "DM scoped", "telegram:dm:dm-a", "same_dm"),
+        )
+        db.append_message("same_dm", role="user", content="dm private recall marker")
+        db.create_session("other_dm", source="telegram")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=?, session_key=? WHERE id=?",
+            ("dm-b", "dm", "DM B", "Other DM", "telegram:dm:dm-b", "other_dm"),
+        )
+        db.append_message("other_dm", role="user", content="dm private recall marker foreign")
+        db._conn.commit()
+
+        result = json.loads(session_search(query="private recall", db=db, current_session_id="current"))
+
+        assert result["scope"] == "chat"
+        assert [r["session_id"] for r in result["results"]] == ["same_dm"]
+
+    def test_scoped_empty_result_reports_outside_scope_count(self, db):
+        db.create_session("current", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=? WHERE id=?",
+            ("chat-a", "group", "Group A", "current"),
+        )
+        db.create_session("foreign", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=? WHERE id=?",
+            ("chat-b", "group", "Group B", "Foreign", "foreign"),
+        )
+        db.append_message("foreign", role="user", content="outside-scope needle")
+        db._conn.commit()
+
+        result = json.loads(session_search(query="outside-scope", db=db, current_session_id="current"))
+
+        assert result["results"] == []
+        assert result["recall_scope"]["scope_level"] == "chat"
+        assert result["recall_scope"]["matches_before_scope"] == 1
+        assert result["recall_scope"]["matches_after_scope"] == 0
+
+    def test_legacy_null_origin_rows_excluded_from_chat_scope_and_counted(self, db):
+        db.create_session("current", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=? WHERE id=?",
+            ("chat-a", "group", "Group A", "current"),
+        )
+        db.create_session("legacy", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET title=? WHERE id=?",
+            ("Legacy", "legacy"),
+        )
+        db.append_message("legacy", role="user", content="legacy null-origin marker")
+        db._conn.commit()
+
+        scoped = json.loads(session_search(query="null-origin", db=db, current_session_id="current"))
+        global_result = json.loads(session_search(query="null-origin", scope="all", db=db, current_session_id="current"))
+
+        assert scoped["results"] == []
+        assert scoped["recall_scope"]["matches_before_scope"] == 1
+        assert scoped["recall_scope"]["matches_after_scope"] == 0
+        assert global_result["results"][0]["session_id"] == "legacy"
+
+    def test_scope_all_prefers_same_origin_before_foreign(self, db):
+        db.create_session("current", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=? WHERE id=?",
+            ("chat-a", "group", "Group A", "current"),
+        )
+        db.create_session("same", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=? WHERE id=?",
+            ("chat-a", "group", "Group A", "Group A links", "same"),
+        )
+        db.append_message("same", role="user", content="ambiguous same links")
+        db.create_session("foreign", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=? WHERE id=?",
+            ("foreign", "group", "Group B", "Group B links", "foreign"),
+        )
+        db.append_message("foreign", role="user", content="ambiguous foreign links")
+        db._conn.commit()
+
+        result = json.loads(session_search(query="ambiguous", scope="all", db=db, current_session_id="current"))
+
+        assert result["scope"] == "all"
+        assert [r["session_id"] for r in result["results"][:2]] == ["same", "foreign"]
+        assert result["results"][0]["same_origin"] is True
+        assert result["results"][1]["same_origin"] is False
+        assert result["results"][1]["origin"]["display_name"] == "Group B"
+        assert "different conversation" in result["notice"]
+
+    def test_same_chat_id_on_different_source_is_foreign(self, db):
+        db.create_session("current", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=? WHERE id=?",
+            ("shared-id", "group", "Signal Group", "current"),
+        )
+        db.create_session("other_platform", source="telegram")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=? WHERE id=?",
+            ("shared-id", "group", "Telegram Group", "Collision", "other_platform"),
+        )
+        db.append_message("other_platform", role="user", content="collision marker")
+        db._conn.commit()
+
+        scoped = json.loads(session_search(query="collision", db=db, current_session_id="current"))
+        global_result = json.loads(session_search(query="collision", scope="all", db=db, current_session_id="current"))
+
+        assert scoped["results"] == []
+        assert global_result["results"][0]["same_origin"] is False
+
+    def test_title_match_uses_in_chat_session_when_foreign_title_is_newer(self, db):
+        db.create_session("current", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, session_key=? WHERE id=?",
+            ("chat-a", "group", "Group A", "signal:group:chat-a:user-a", "current"),
+        )
+        db.create_session("same_title", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=?, session_key=?, started_at=? WHERE id=?",
+            ("chat-a", "group", "Group A", "Shared Title #2", "signal:group:chat-a:user-a", 1, "same_title"),
+        )
+        db.append_message("same_title", role="user", content="same chat title content")
+        db.create_session("foreign_title", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=?, session_key=?, started_at=? WHERE id=?",
+            ("chat-b", "group", "Group B", "Shared Title", "signal:group:chat-b:user-a", 2, "foreign_title"),
+        )
+        db.append_message("foreign_title", role="user", content="foreign title content")
+        db._conn.commit()
+
+        result = json.loads(session_search(query="Shared Title", db=db, current_session_id="current"))
+
+        assert result["results"][0]["session_id"] == "same_title"
+
+    def test_stale_fts_like_fallback_honors_chat_scope(self, db):
+        db.create_session("current", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, session_key=? WHERE id=?",
+            ("chat-a", "group", "Group A", "signal:group:chat-a:user-a", "current"),
+        )
+        db.create_session("same", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=?, session_key=? WHERE id=?",
+            ("chat-a", "group", "Group A", "Same", "signal:group:chat-a:user-a", "same"),
+        )
+        db.append_message("same", role="user", content="stale fallback scoped needle")
+        db.create_session("foreign", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=?, session_key=? WHERE id=?",
+            ("chat-b", "group", "Group B", "Foreign", "signal:group:chat-b:user-a", "foreign"),
+        )
+        db.append_message("foreign", role="user", content="stale fallback scoped needle foreign")
+        db._conn.commit()
+        db._fts_stale = True
+        db._fts_enabled = False
+
+        result = json.loads(session_search(query="stale fallback", db=db, current_session_id="current"))
+
+        assert [r["session_id"] for r in result["results"]] == ["same"]
+
+    def test_registered_handler_honors_scope(self, db):
+        db.create_session("current", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=? WHERE id=?",
+            ("chat-a", "group", "Group A", "current"),
+        )
+        db.create_session("foreign", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=?, title=? WHERE id=?",
+            ("chat-b", "group", "Group B", "Group B result", "foreign"),
+        )
+        db.append_message("foreign", role="user", content="registry scope marker")
+        db._conn.commit()
+
+        entry = registry.get_entry("session_search")
+        assert entry is not None
+        result = json.loads(
+            entry.handler(
+                {"query": "registry", "scope": "all"},
+                db=db,
+                current_session_id="current",
+            )
+        )
+
+        assert result["scope"] == "all"
+        assert result["results"][0]["session_id"] == "foreign"
+        assert result["results"][0]["same_origin"] is False
 
 
 class TestDiscoverySort:
@@ -307,6 +638,28 @@ class TestReadShape:
         rendered = [m["content"] for m in result["messages"] if m.get("content")]
         assert any(text == "red text and more" for text in rendered)
         assert all("\u001b" not in text for text in rendered)
+
+    def test_read_and_scroll_warn_on_foreign_origin(self, db):
+        db.create_session("current", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=? WHERE id=?",
+            ("chat-a", "group", "Group A", "current"),
+        )
+        db.create_session("foreign", source="signal")
+        db._conn.execute(
+            "UPDATE sessions SET chat_id=?, chat_type=?, display_name=? WHERE id=?",
+            ("chat-b", "group", "Group B", "foreign"),
+        )
+        msg_id = db.append_message("foreign", role="user", content="foreign scroll content")
+        db._conn.commit()
+
+        read_result = json.loads(session_search(session_id="foreign", db=db, current_session_id="current"))
+        scroll_result = json.loads(session_search(session_id="foreign", around_message_id=msg_id, db=db, current_session_id="current"))
+
+        assert read_result["same_origin"] is False
+        assert "different conversation" in read_result["cross_context_warning"]
+        assert scroll_result["same_origin"] is False
+        assert "different conversation" in scroll_result["cross_context_warning"]
 
     def test_read_truncates_large_session(self, db):
         db.create_session("s_big", source="cli")
