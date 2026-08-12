@@ -91,8 +91,15 @@ const comparisonSegments = (path: string): string[] => {
   return isWindowsPath(path) ? segs.map(seg => seg.toLowerCase()) : segs
 }
 
-/** Canonical per-host comparison key (separator/case/trailing-slash agnostic). */
-const pathKey = (path: null | string | undefined): string => comparisonSegments(path ?? '').join('/')
+/**
+ * Canonical per-host comparison key (separator/case/trailing-slash agnostic).
+ * Required for anything compared against a `git worktree list --porcelain` path:
+ * git prints FORWARD slashes even on Windows (`C:/Repo/.worktrees/x`) while the
+ * backend tree and session cwds carry backslashes, so raw string equality —
+ * including {@link normalizePath}, which only strips trailing separators — treats
+ * one worktree as two.
+ */
+export const pathKey = (path: null | string | undefined): string => comparisonSegments(path ?? '').join('/')
 
 /** Last path segment. */
 export const baseName = (path: string): string | undefined => segments(path).pop()
@@ -170,6 +177,9 @@ export function mergeRepoWorktreeGroups(
   // happens to live in. The backend labels these lanes by dir/slug; relabel them
   // to the live branch from `git worktree list` so the sidebar matches the
   // composer's branch strip. Detached worktrees (no branch) keep their dir label.
+  // Keyed by {@link pathKey}: `git worktree list --porcelain` prints FORWARD
+  // slashes even on Windows (`C:/repo/.worktrees/x`) while lane/session paths
+  // come back with backslashes, so a raw string key would miss every match.
   const liveBranchByPath = new Map<string, string>()
   // Inverse: branch → its ONE live worktree path. git guarantees a branch is
   // checked out in at most one worktree, so this mapping is a function and can
@@ -177,11 +187,11 @@ export function mergeRepoWorktreeGroups(
   const livePathByBranch = new Map<string, string>()
 
   for (const worktree of discoveredWorktrees ?? []) {
-    const wtPath = normalizePath(worktree.path)
+    const wtKey = pathKey(worktree.path)
     const branch = worktree.branch?.trim()
 
-    if (wtPath && branch && !worktree.detached) {
-      liveBranchByPath.set(wtPath, branch)
+    if (wtKey && branch && !worktree.detached) {
+      liveBranchByPath.set(wtKey, branch)
       livePathByBranch.set(branch.toLowerCase(), worktree.path.trim())
     }
   }
@@ -207,7 +217,7 @@ export function mergeRepoWorktreeGroups(
       return group
     }
 
-    const branchForPath = liveBranchByPath.get(normalizePath(group.path))
+    const branchForPath = liveBranchByPath.get(pathKey(group.path))
 
     if (branchForPath) {
       return branchForPath !== group.label ? { ...group, label: branchForPath } : group
@@ -215,7 +225,7 @@ export function mergeRepoWorktreeGroups(
 
     const livePath = livePathByBranch.get(normalize(group.label))
 
-    if (livePath && normalizePath(livePath) !== normalizePath(group.path)) {
+    if (livePath && pathKey(livePath) !== pathKey(group.path)) {
       return { ...group, id: livePath, path: livePath }
     }
 
@@ -258,7 +268,7 @@ export function mergeRepoWorktreeGroups(
   const merged: SidebarSessionGroup[] = []
 
   for (const group of reconciled) {
-    const key = !group.isMain && group.path ? normalizePath(group.path) : ''
+    const key = !group.isMain && group.path ? pathKey(group.path) : ''
     const existing = key ? byPath.get(key) : undefined
 
     if (existing) {
@@ -278,7 +288,10 @@ export function mergeRepoWorktreeGroups(
   }
 
   const seenIds = new Set(merged.map(group => group.id))
-  const seenPaths = new Set(merged.map(group => group.path).filter((path): path is string => Boolean(path)))
+  // Path membership is keyed by {@link pathKey}, not the raw string: the same
+  // worktree arrives spelled `C:/Repo/.worktrees/x` from git and
+  // `C:\Repo\.worktrees\x` from the backend, and a raw key would emit both.
+  const seenPaths = new Set(merged.map(group => pathKey(group.path)).filter(Boolean))
   // Dedupe by branch label too: a branch shows once even if it's checked out in
   // a linked worktree AND already has a session lane.
   const seenLabels = new Set(merged.map(group => group.label.toLowerCase()))
@@ -310,7 +323,7 @@ export function mergeRepoWorktreeGroups(
     const id = worktree.isMain ? branchLaneId(repo.id, label) : wtPath
 
     const alreadySeen =
-      seenIds.has(id) || seenLabels.has(label.toLowerCase()) || (!worktree.isMain && seenPaths.has(wtPath))
+      seenIds.has(id) || seenLabels.has(label.toLowerCase()) || (!worktree.isMain && seenPaths.has(pathKey(wtPath)))
 
     if (alreadySeen) {
       continue
@@ -318,7 +331,7 @@ export function mergeRepoWorktreeGroups(
 
     merged.push({ id, isMain: worktree.isMain, label, path: wtPath, sessions: [] })
     seenIds.add(id)
-    seenPaths.add(wtPath)
+    seenPaths.add(pathKey(wtPath))
     seenLabels.add(label.toLowerCase())
   }
 
