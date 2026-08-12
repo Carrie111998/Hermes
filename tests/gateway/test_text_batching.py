@@ -34,6 +34,35 @@ def _make_event(
     )
 
 
+async def _drain_text_batches(adapter) -> None:
+    """Await the adapter's pending flush tasks instead of racing a sleep.
+
+    ``_enqueue_text_event`` dispatches from a background task that first sleeps
+    ``_text_batch_delay_seconds`` (or ``_text_batch_split_delay_seconds``).
+    These tests used to wait for it with ``await asyncio.sleep(0.2)`` against a
+    0.1s delay -- a 2x margin that a loaded box loses, producing a spurious
+    "Expected 'handle_message' to have been called once. Called 0 times."
+
+    The margin is not the only problem: even once the flush task's own deadline
+    has passed, it still needs extra loop turns to get through
+    ``asyncio.shield(handle_message(event))``.  A wall-clock wait cannot express
+    "and then let it finish".  Every adapter already tracks its flush task in
+    ``_pending_text_batch_tasks``, so wait on the work itself.
+
+    Snapshot the values first: ``_flush_text_batch`` pops its own key in a
+    ``finally``, which would otherwise raise "dictionary changed size during
+    iteration".  ``return_exceptions=True`` keeps this a wait and not an
+    assertion -- a superseded chunk's task is cancelled by design, and the
+    sleep it replaces never raised either.
+
+    Deliberately no fallback when the dict is empty -- if nothing was
+    scheduled, the caller's assertion must still fail.
+    """
+    tasks = tuple(adapter._pending_text_batch_tasks.values())
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 # =====================================================================
 # Discord text batching
 # =====================================================================
@@ -69,7 +98,7 @@ class TestDiscordTextBatching:
         adapter.handle_message.assert_not_called()
 
         # Wait for flush
-        await asyncio.sleep(0.2)
+        await _drain_text_batches(adapter)
 
         adapter.handle_message.assert_called_once()
         dispatched = adapter.handle_message.call_args[0][0]
@@ -81,12 +110,12 @@ class TestDiscordTextBatching:
         adapter = _make_discord_adapter()
 
         adapter._enqueue_text_event(_make_event("Part one of a long", Platform.DISCORD))
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0)  # let the first flush task start
         adapter._enqueue_text_event(_make_event("message that was split.", Platform.DISCORD))
 
         adapter.handle_message.assert_not_called()
 
-        await asyncio.sleep(0.2)
+        await _drain_text_batches(adapter)
 
         adapter.handle_message.assert_called_once()
         text = adapter.handle_message.call_args[0][0].text
@@ -98,12 +127,12 @@ class TestDiscordTextBatching:
         adapter = _make_discord_adapter()
 
         adapter._enqueue_text_event(_make_event("chunk 1", Platform.DISCORD))
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0)  # let the first flush task start
         adapter._enqueue_text_event(_make_event("chunk 2", Platform.DISCORD))
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0)  # let the second flush task start
         adapter._enqueue_text_event(_make_event("chunk 3", Platform.DISCORD))
 
-        await asyncio.sleep(0.2)
+        await _drain_text_batches(adapter)
 
         adapter.handle_message.assert_called_once()
         text = adapter.handle_message.call_args[0][0].text
@@ -118,7 +147,7 @@ class TestDiscordTextBatching:
         adapter._enqueue_text_event(_make_event("from A", Platform.DISCORD, chat_id="111"))
         adapter._enqueue_text_event(_make_event("from B", Platform.DISCORD, chat_id="222"))
 
-        await asyncio.sleep(0.2)
+        await _drain_text_batches(adapter)
 
         assert adapter.handle_message.call_count == 2
 
@@ -127,7 +156,7 @@ class TestDiscordTextBatching:
         adapter = _make_discord_adapter()
 
         adapter._enqueue_text_event(_make_event("test", Platform.DISCORD))
-        await asyncio.sleep(0.2)
+        await _drain_text_batches(adapter)
 
         assert len(adapter._pending_text_batches) == 0
 
@@ -144,7 +173,7 @@ class TestDiscordTextBatching:
         adapter.handle_message.assert_not_called()
 
         # After the split delay, should be flushed
-        await asyncio.sleep(0.25)
+        await _drain_text_batches(adapter)
         adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
@@ -244,7 +273,7 @@ class TestMatrixTextBatching:
         adapter._enqueue_text_event(event)
 
         adapter.handle_message.assert_not_called()
-        await asyncio.sleep(0.2)
+        await _drain_text_batches(adapter)
 
         adapter.handle_message.assert_called_once()
         assert adapter.handle_message.call_args[0][0].text == "hello world"
@@ -254,11 +283,11 @@ class TestMatrixTextBatching:
         adapter = _make_matrix_adapter()
 
         adapter._enqueue_text_event(_make_event("first part", Platform.MATRIX))
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0)  # let the first flush task start
         adapter._enqueue_text_event(_make_event("second part", Platform.MATRIX))
 
         adapter.handle_message.assert_not_called()
-        await asyncio.sleep(0.2)
+        await _drain_text_batches(adapter)
 
         adapter.handle_message.assert_called_once()
         text = adapter.handle_message.call_args[0][0].text
@@ -272,7 +301,7 @@ class TestMatrixTextBatching:
         adapter._enqueue_text_event(_make_event("room A", Platform.MATRIX, chat_id="!aaa:matrix.org"))
         adapter._enqueue_text_event(_make_event("room B", Platform.MATRIX, chat_id="!bbb:matrix.org"))
 
-        await asyncio.sleep(0.2)
+        await _drain_text_batches(adapter)
 
         assert adapter.handle_message.call_count == 2
 
@@ -286,14 +315,14 @@ class TestMatrixTextBatching:
         await asyncio.sleep(0.15)
         adapter.handle_message.assert_not_called()
 
-        await asyncio.sleep(0.25)
+        await _drain_text_batches(adapter)
         adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_batch_cleans_up_after_flush(self):
         adapter = _make_matrix_adapter()
         adapter._enqueue_text_event(_make_event("test", Platform.MATRIX))
-        await asyncio.sleep(0.2)
+        await _drain_text_batches(adapter)
         assert len(adapter._pending_text_batches) == 0
 
 
@@ -329,7 +358,7 @@ class TestWeComTextBatching:
         adapter._enqueue_text_event(event)
 
         adapter.handle_message.assert_not_called()
-        await asyncio.sleep(0.2)
+        await _drain_text_batches(adapter)
 
         adapter.handle_message.assert_called_once()
         assert adapter.handle_message.call_args[0][0].text == "hello world"
@@ -339,11 +368,11 @@ class TestWeComTextBatching:
         adapter = _make_wecom_adapter()
 
         adapter._enqueue_text_event(_make_event("first part", Platform.WECOM))
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0)  # let the first flush task start
         adapter._enqueue_text_event(_make_event("second part", Platform.WECOM))
 
         adapter.handle_message.assert_not_called()
-        await asyncio.sleep(0.2)
+        await _drain_text_batches(adapter)
 
         adapter.handle_message.assert_called_once()
         text = adapter.handle_message.call_args[0][0].text
@@ -357,7 +386,7 @@ class TestWeComTextBatching:
         adapter._enqueue_text_event(_make_event("chat A", Platform.WECOM, chat_id="chat_a"))
         adapter._enqueue_text_event(_make_event("chat B", Platform.WECOM, chat_id="chat_b"))
 
-        await asyncio.sleep(0.2)
+        await _drain_text_batches(adapter)
 
         assert adapter.handle_message.call_count == 2
 
@@ -371,14 +400,14 @@ class TestWeComTextBatching:
         await asyncio.sleep(0.15)
         adapter.handle_message.assert_not_called()
 
-        await asyncio.sleep(0.25)
+        await _drain_text_batches(adapter)
         adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_batch_cleans_up_after_flush(self):
         adapter = _make_wecom_adapter()
         adapter._enqueue_text_event(_make_event("test", Platform.WECOM))
-        await asyncio.sleep(0.2)
+        await _drain_text_batches(adapter)
         assert len(adapter._pending_text_batches) == 0
 
 
@@ -409,10 +438,17 @@ class TestTelegramAdaptiveDelay:
     @pytest.mark.asyncio
     async def test_short_chunk_uses_normal_delay(self):
         adapter = _make_telegram_adapter()
+        # Which branch _flush_text_batch picks is the whole point of this
+        # test, and the clock cannot report it: a nominal 0.1s flush is
+        # observed completing in ~0.22s on Windows, so no sleep fits between
+        # the normal (0.1s) and split (0.3s) delays.  Make the branch
+        # structural instead -- the correct branch returns at once, the wrong
+        # one parks for 30s and trips the wait_for.
+        adapter._text_batch_delay_seconds = 0.0
+        adapter._text_batch_split_delay_seconds = 30.0
         adapter._enqueue_text_event(_make_event("short msg", Platform.TELEGRAM))
 
-        # Should flush after the normal 0.1s delay
-        await asyncio.sleep(0.15)
+        await asyncio.wait_for(_drain_text_batches(adapter), timeout=5.0)
         adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
@@ -427,7 +463,7 @@ class TestTelegramAdaptiveDelay:
         adapter.handle_message.assert_not_called()
 
         # After the split delay, should be flushed
-        await asyncio.sleep(0.25)
+        await _drain_text_batches(adapter)
         adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
@@ -436,11 +472,11 @@ class TestTelegramAdaptiveDelay:
         adapter = _make_telegram_adapter()
 
         adapter._enqueue_text_event(_make_event("x" * 4050, Platform.TELEGRAM))
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0)  # let the first flush task start
         adapter._enqueue_text_event(_make_event("continuation text", Platform.TELEGRAM))
 
         # Short chunk arrived → should use normal delay now
-        await asyncio.sleep(0.15)
+        await _drain_text_batches(adapter)
         adapter.handle_message.assert_called_once()
         text = adapter.handle_message.call_args[0][0].text
         assert "continuation text" in text
@@ -477,10 +513,13 @@ class TestFeishuAdaptiveDelay:
     @pytest.mark.asyncio
     async def test_short_chunk_uses_normal_delay(self):
         adapter = _make_feishu_adapter()
+        # Structural, not clock-based -- see the Telegram twin of this test.
+        adapter._text_batch_delay_seconds = 0.0
+        adapter._text_batch_split_delay_seconds = 30.0
         event = _make_event("short msg", Platform.FEISHU)
         await adapter._enqueue_text_event(event)
 
-        await asyncio.sleep(0.15)
+        await asyncio.wait_for(_drain_text_batches(adapter), timeout=5.0)
         adapter._handle_message_with_guards.assert_called_once()
 
     @pytest.mark.asyncio
@@ -494,7 +533,7 @@ class TestFeishuAdaptiveDelay:
         await asyncio.sleep(0.15)
         adapter._handle_message_with_guards.assert_not_called()
 
-        await asyncio.sleep(0.25)
+        await _drain_text_batches(adapter)
         adapter._handle_message_with_guards.assert_called_once()
 
     @pytest.mark.asyncio
@@ -502,10 +541,10 @@ class TestFeishuAdaptiveDelay:
         adapter = _make_feishu_adapter()
 
         await adapter._enqueue_text_event(_make_event("x" * 4050, Platform.FEISHU))
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0)  # let the first flush task start
         await adapter._enqueue_text_event(_make_event("continuation text", Platform.FEISHU))
 
-        await asyncio.sleep(0.15)
+        await _drain_text_batches(adapter)
         adapter._handle_message_with_guards.assert_called_once()
         text = adapter._handle_message_with_guards.call_args[0][0].text
         assert "continuation text" in text
