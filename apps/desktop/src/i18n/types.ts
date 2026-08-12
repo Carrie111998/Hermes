@@ -483,6 +483,10 @@ export interface Translations {
       attachmentSizeDesc: string
       attachmentSizeUnit: string
       attachmentSizeLabel: string
+      enterBehaviorTitle: string
+      enterBehaviorDesc: string
+      enterBehaviorSend: string
+      enterBehaviorNewLine: string
     }
     quickEntry: {
       enabledTitle: string
