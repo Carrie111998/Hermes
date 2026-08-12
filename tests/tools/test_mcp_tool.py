@@ -1474,6 +1474,36 @@ class TestReconnection:
 
         asyncio.run(_test())
 
+    def test_missing_environment_header_stops_before_network(self, monkeypatch):
+        """A missing secret blocks both preflight and the real transport."""
+        from tools.mcp_tool import MCPServerTask
+
+        monkeypatch.delenv("MISSING_MCP_STARTUP_SECRET", raising=False)
+        probe = AsyncMock()
+        transport = AsyncMock()
+
+        async def _test():
+            server = MCPServerTask("http_srv")
+            config = {
+                "url": "https://example.com/mcp",
+                "headers_from_env": {
+                    "Authorization": "MISSING_MCP_STARTUP_SECRET",
+                },
+            }
+
+            with patch.object(MCPServerTask, "_preflight_content_type", probe), \
+                 patch.object(MCPServerTask, "_run_http", transport):
+                with pytest.raises(
+                    ValueError,
+                    match="MISSING_MCP_STARTUP_SECRET.*not set",
+                ):
+                    await server.run(config)
+
+            assert probe.await_count == 0
+            assert transport.await_count == 0
+
+        asyncio.run(_test())
+
 # ---------------------------------------------------------------------------
 # Configurable timeouts
 # ---------------------------------------------------------------------------
