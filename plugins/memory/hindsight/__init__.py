@@ -830,7 +830,13 @@ class HindsightMemoryProvider(MemoryProvider):
             try:
                 subprocess.run(
                     [uv_path, "pip", "install", "--python", sys.executable, "--quiet", "--upgrade"] + deps_to_install,
-                    check=True, timeout=120, capture_output=True,
+                    # DEVNULL, not capture_output=True — an sdist build backend
+                    # is a grandchild that inherits the capture pipes and, on
+                    # Windows, keeps them from reaching EOF past uv's own
+                    # death, leaving the 120s timeout unenforceable. Output is
+                    # discarded either way; check=True carries the result.
+                    check=True, timeout=120,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     stdin=subprocess.DEVNULL,
                 )
                 print("  ✓ Dependencies up to date")
@@ -1228,7 +1234,17 @@ class HindsightMemoryProvider(MemoryProvider):
                         subprocess.run(
                             [uv_path, "pip", "install", "--python", sys.executable,
                              "--quiet", "--upgrade", f"hindsight-client>={_MIN_CLIENT_VERSION}"],
-                            check=True, timeout=120, capture_output=True,
+                            # DEVNULL, not capture_output=True: installing an
+                            # sdist makes uv spawn a build-backend grandchild
+                            # that inherits the capture pipes, and on Windows a
+                            # grandchild holding the write end keeps the pipe
+                            # from ever reaching EOF — subprocess.run kills only
+                            # uv and then blocks re-draining, so the 120s bound
+                            # would not hold. This runs at plugin init inside
+                            # the gateway, where that hang is silent. Nothing
+                            # reads the output; check=True carries the result.
+                            check=True, timeout=120,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             stdin=subprocess.DEVNULL,
                         )
                         logger.info("hindsight-client upgraded to >=%s", _MIN_CLIENT_VERSION)

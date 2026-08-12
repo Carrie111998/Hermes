@@ -174,32 +174,31 @@ def _reinstall_sidecar_deps() -> None:
     if not npm:
         logger.warning("[photon] cannot reinstall stale sidecar deps: npm not on PATH")
         return
-    # Windows: suppress the console flash these short-lived npm runs would
-    # otherwise pop (0 elsewhere). Same helper as the sidecar spawn below.
-    from hermes_cli._subprocess_compat import windows_hide_flags
+    # run_text_capture, not capture_output=True: on Windows ``npm`` is
+    # ``npm.cmd``, so the direct child is cmd.exe and the install itself is a
+    # node grandchild holding the capture pipes open. Under pipe capture the
+    # TimeoutExpired below would never fire on time — subprocess.run kills only
+    # cmd.exe and then blocks re-draining a pipe with no EOF, which is exactly
+    # the "must not stall the photon connect forever" guarantee this function
+    # claims. The helper captures into temp files, so the bound is real. It
+    # also applies CREATE_NO_WINDOW itself, so the console flash stays
+    # suppressed without windows_hide_flags() here.
+    from hermes_cli._subprocess_compat import run_text_capture
 
     try:
-        result = subprocess.run(  # noqa: S603
+        result = run_text_capture(  # noqa: S603
             [npm, "ci"],
             cwd=str(_SIDECAR_DIR),
-            capture_output=True,
-            text=True,
-            check=False,
             timeout=_NPM_REINSTALL_TIMEOUT,
-            creationflags=windows_hide_flags(),
         )
         if result.returncode != 0:
             logger.warning(
                 "[photon] sidecar `npm ci` failed; falling back to `npm install`"
             )
-            result = subprocess.run(  # noqa: S603
+            result = run_text_capture(  # noqa: S603
                 [npm, "install"],
                 cwd=str(_SIDECAR_DIR),
-                capture_output=True,
-                text=True,
-                check=False,
                 timeout=_NPM_REINSTALL_TIMEOUT,
-                creationflags=windows_hide_flags(),
             )
     except subprocess.TimeoutExpired:
         # A wedged npm (dead registry, network blackhole) must not stall the

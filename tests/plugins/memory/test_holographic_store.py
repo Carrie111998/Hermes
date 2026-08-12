@@ -75,7 +75,14 @@ class TestSharedConnection:
         real_dir = tmp_path / "real"
         real_dir.mkdir()
         link_dir = tmp_path / "link"
-        link_dir.symlink_to(real_dir)
+        try:
+            link_dir.symlink_to(real_dir)
+        except (OSError, NotImplementedError) as exc:
+            # Windows needs SeCreateSymbolicLinkPrivilege (Developer Mode or
+            # admin); without it this raises WinError 1314.  Skip rather than
+            # fail — the registry's resolve() keying is what's under test, and
+            # it still runs wherever symlinks are actually creatable.
+            pytest.skip(f"cannot create symlinks on this system: {exc}")
 
         a = MemoryStore(real_dir / "memory_store.db")
         b = MemoryStore(link_dir / "memory_store.db")

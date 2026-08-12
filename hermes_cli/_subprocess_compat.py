@@ -32,7 +32,8 @@ import shutil
 import signal
 import subprocess
 import sys
-from typing import Sequence
+import tempfile
+from typing import Mapping, Optional, Sequence
 
 __all__ = [
     "IS_WINDOWS",
@@ -42,11 +43,29 @@ __all__ = [
     "windows_detach_flags_without_breakaway",
     "windows_hide_flags",
     "windows_detach_popen_kwargs",
+    "windows_pipe_readable_bytes",
     "run_text_capture",
 ]
 
 
 IS_WINDOWS = sys.platform == "win32"
+
+if IS_WINDOWS:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _PeekNamedPipe = _kernel32.PeekNamedPipe
+    _PeekNamedPipe.argtypes = [
+        wintypes.HANDLE,                 # hNamedPipe
+        ctypes.c_void_p,                 # lpBuffer (NULL — we only want the count)
+        wintypes.DWORD,                  # nBufferSize
+        ctypes.POINTER(wintypes.DWORD),  # lpBytesRead
+        ctypes.POINTER(wintypes.DWORD),  # lpTotalBytesAvail
+        ctypes.POINTER(wintypes.DWORD),  # lpBytesLeftThisMessage
+    ]
+    _PeekNamedPipe.restype = wintypes.BOOL
 
 
 # -----------------------------------------------------------------------------
@@ -159,6 +178,46 @@ def resolve_windows_git_bash() -> Optional[str]:
     ):
         return None  # WSL launcher / Store stub — cannot see C:\ paths
     return found
+
+
+# -----------------------------------------------------------------------------
+# Pipe introspection (Windows)
+# -----------------------------------------------------------------------------
+
+
+def windows_pipe_readable_bytes(fd: int) -> Optional[int]:
+    """Return the bytes readable *right now* on a pipe fd, or ``None`` when the
+    pipe is broken / the fd is unusable (the EOF equivalent).
+
+    ``select.select()`` only works on sockets on Windows, so non-blocking pipe
+    drains poll this instead: ``os.read(fd, n)`` is guaranteed not to block
+    whenever this reports > 0 available bytes.
+
+    Built on ``PeekNamedPipe``, which works on anonymous pipes too — both
+    ``subprocess.PIPE`` and ``os.pipe()`` create them.  Pipe fds only; on a
+    non-pipe fd the underlying call fails and this reports ``None``.
+
+    Failure mapping: once every write handle is closed AND the buffer is
+    drained, ``PeekNamedPipe`` fails with ``ERROR_BROKEN_PIPE`` — exactly the
+    moment a POSIX ``read()`` would return ``b""``.  While data is still
+    buffered the call keeps succeeding, so no tail output is lost.  Any other
+    failure (handle closed under us, not a pipe) also returns ``None``: the
+    caller should stop reading in every such case.
+
+    Returns ``None`` on non-Windows hosts, keeping this module's "no-op on
+    POSIX" guarantee — callers there use ``select.select([fd], [], [], t)``.
+    """
+    if not IS_WINDOWS:
+        return None
+    try:
+        handle = msvcrt.get_osfhandle(fd)
+    except (OSError, ValueError):
+        return None  # fd already closed / not a CRT fd
+    avail = wintypes.DWORD(0)
+    ok = _PeekNamedPipe(handle, None, 0, None, ctypes.byref(avail), None)
+    if not ok:
+        return None  # broken pipe (all writers gone) or invalid handle
+    return avail.value
 
 
 # -----------------------------------------------------------------------------
@@ -276,9 +335,14 @@ def windows_hide_flags() -> int:
 
 
 def run_text_capture(
-    argv: Sequence[str],
+    argv: Sequence[str] | str,
     *,
     timeout: float,
+    cwd: str | os.PathLike | None = None,
+    env: Mapping[str, str] | None = None,
+    stdin: int | None = subprocess.DEVNULL,
+    shell: bool = False,
+    executable: str | os.PathLike | None = None,
 ) -> subprocess.CompletedProcess:
     """``subprocess.run(argv, capture_output=True, text=True, timeout=timeout)``
     that reliably honours ``timeout`` on Windows.
@@ -291,14 +355,78 @@ def run_text_capture(
     join because the pipe never reaches EOF. A wedged CLI therefore hangs the
     caller indefinitely instead of timing out at ``timeout`` seconds.
 
-    The fix: launch the child in its own process group, and on timeout
-    tree-kill the whole group (``taskkill /T /F`` on Windows, ``killpg`` on
-    POSIX) so EVERY write end of the pipe closes before we drain. Returns a
-    :class:`subprocess.CompletedProcess`; raises
+    The fix: **capture into temporary files rather than pipes.** A tree-kill
+    alone is not enough — measured against a real wedged `npm audit` on
+    Windows, a nominal 30s budget still cost 75s: `taskkill /T /F` itself ran
+    11.6s and was abandoned at its own cap, the post-kill drain burned its full
+    10s because the surviving grandchild still held the pipe, and
+    ``Popen.__exit__`` then blocked a further 22.8s merely *closing* a pipe
+    whose reader thread was still parked in a blocking read. Every one of
+    those costs is a property of the capture pipes and its reader threads, so
+    the pipes have to go. With file-backed stdio there are no reader threads,
+    nothing to drain, and closing a file handle cannot block — a grandchild
+    that outlives its parent just writes into a temp file nobody reads.
+
+    On timeout we still tree-kill (``taskkill /T /F`` on Windows, ``killpg``
+    on POSIX) so as not to leak an abandoned process tree. The kill is best
+    effort — correctness no longer *depends* on it succeeding, because with
+    file-backed stdio there is nothing left to drain and we never wait on the
+    child again — but it IS synchronous, and that costs real wall clock.
+
+    **The bound is ``timeout`` plus the cost of the kill, not ``timeout``.**
+    On Windows ``_tree_kill`` shells out to ``taskkill`` under its own
+    ``timeout=10``, so the worst case is ``timeout + ~10s`` (a shade over the
+    cap: aborting the timed-out ``taskkill`` and reaping the direct child costs
+    a little more on top). That tail is paid on EVERY timeout, not just when
+    the kill fails. Measured on a loaded Windows host, staged against a real
+    wedged ``npm install`` with a 5s budget: ``taskkill`` alone took 8.47s and
+    10.48s across two probes, for 13.91s and 15.58s end to end (2026-08-11);
+    an earlier probe against a wedged ``npm audit`` tree clocked it at 11.6s.
+    On POSIX ``killpg`` is a bare syscall, so the tail there is negligible.
+
+    Callers must size their timeouts against ``timeout + 10s`` on Windows —
+    ``agent/lsp/install.py`` passing 600s really means "up to ~610s", and
+    ``hermes doctor --audit`` pays the tail once per timed-out target (~40s
+    across four). This is a bounded, predictable overshoot; what the
+    file-backed capture removed was the *unbounded* one, where a kill that
+    missed the grandchild added a 10s drain that could never reach EOF plus a
+    22.8s blocking pipe close — 75s against a nominal 30s budget.
+
+    Returns a :class:`subprocess.CompletedProcess`; raises
     :class:`subprocess.TimeoutExpired` on timeout (same as ``subprocess.run``)
     so existing ``except (OSError, subprocess.TimeoutExpired)`` handlers keep
-    working. May raise ``OSError`` / ``FileNotFoundError`` at spawn, also like
+    working, with ``.output`` / ``.stderr`` carrying whatever the child wrote
+    before the deadline — callers that record timeout diagnostics (the DevFlow
+    validator logs how far a wedged ``pytest`` got) keep working unchanged.
+    May raise ``OSError`` / ``FileNotFoundError`` at spawn, also like
     ``subprocess.run``.
+
+    ``cwd`` and ``env`` are passed straight through to :class:`subprocess.Popen`
+    for callers that must run the command from a particular directory
+    (``npm audit`` in ``hermes doctor``, for one) or under a doctored
+    environment (the Node-ecosystem callers all prepend Hermes' managed Node to
+    ``PATH`` via ``with_hermes_node_path()``).
+
+    ``stdin`` defaults to ``DEVNULL`` rather than inheriting the parent's.
+    Inheriting is the second way this call can outlive its timeout: a child that
+    prompts (``npm`` asking to install a missing peer, ``bash -i`` reading a
+    profile) blocks on a read from a stdin nobody is driving, and in a gateway
+    daemon there is no terminal behind it at all. Every caller of this helper
+    wants a non-interactive probe, so closing stdin is the right default; pass
+    ``stdin=None`` to opt back into inheritance.
+
+    ``shell=True`` runs ``argv`` (then a command *string*, not a list) through
+    the platform shell, and is the case that needs this helper most: with a
+    shell the real command is ALWAYS a grandchild — ``cmd.exe`` / ``/bin/sh``
+    is the direct child — so the grandchild-holds-the-pipe hang above is not a
+    risk but a guarantee, and ``subprocess.run(shell=True, capture_output=True,
+    timeout=N)`` has no bound at all on Windows. File-backed capture removes
+    the pipe the shell's children would otherwise inherit.
+
+    ``executable`` is passed through to :class:`subprocess.Popen`; with
+    ``shell=True`` it selects the shell binary (POSIX only — on Windows Popen
+    uses it *instead of* ``cmd.exe``, so a POSIX shell path there fails to
+    spawn). Callers wanting bash must gate on :data:`IS_WINDOWS` themselves.
     """
     if IS_WINDOWS:
         popen_kwargs: dict = {"creationflags": _CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW}
@@ -306,29 +434,48 @@ def run_text_capture(
         # Own session/process group so killpg() on timeout reaches grandchildren.
         popen_kwargs = {"start_new_session": True}
 
-    with subprocess.Popen(
-        list(argv),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        **popen_kwargs,
-    ) as proc:
+    # Binary temp files + an explicit decode rather than text=True: we own the
+    # handles, so the decoding is ours to make deterministic (utf-8 with
+    # replacement, \r\n normalized) instead of locale-dependent.
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+        proc = subprocess.Popen(
+            # With shell=True the command is a string Popen hands to the shell
+            # verbatim; list() would shred it into one argument per character.
+            argv if shell else list(argv),
+            stdout=out_f,
+            stderr=err_f,
+            stdin=stdin,
+            cwd=cwd,
+            env=dict(env) if env is not None else None,
+            shell=shell,
+            executable=executable,
+            **popen_kwargs,
+        )
         try:
-            stdout, stderr = proc.communicate(timeout=timeout)
+            proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            # Best effort — we do NOT wait on the child again afterwards, so a
+            # kill that fails costs us nothing but a lingering process.
             _tree_kill(proc)
-            # The whole tree is now dead, so every pipe write end is closed and
-            # this drain reaches EOF promptly instead of blocking. Bounded by a
-            # second timeout regardless, so a stubborn descendant can never make
-            # this hang — we drop the output and re-raise instead.
-            try:
-                stdout, stderr = proc.communicate(timeout=10)
-            except subprocess.TimeoutExpired:
-                stdout = stderr = None
+            # Partial output survives the timeout. Reading is safe even when a
+            # grandchild outlived the kill and is still writing: these are
+            # regular files, so the read returns whatever was flushed and
+            # CANNOT block. A pipe-based capture could not do this at all —
+            # that drain is the 10s-then-22.8s cost described above — so the
+            # file-backed design is what makes timeout diagnostics recoverable.
             raise subprocess.TimeoutExpired(
-                proc.args, timeout, output=stdout, stderr=stderr,
+                proc.args, timeout,
+                output=_read_text(out_f), stderr=_read_text(err_f),
             )
-        return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+        return subprocess.CompletedProcess(
+            proc.args, proc.returncode, _read_text(out_f), _read_text(err_f),
+        )
+
+
+def _read_text(handle) -> str:
+    """Rewind a captured temp file and decode it the way ``text=True`` would."""
+    handle.seek(0)
+    return handle.read().decode("utf-8", errors="replace").replace("\r\n", "\n")
 
 
 def _tree_kill(proc: subprocess.Popen) -> None:
@@ -340,8 +487,21 @@ def _tree_kill(proc: subprocess.Popen) -> None:
     through a process group, and ``/T`` without ``/F`` won't reach a windowless
     child. POSIX: ``killpg(SIGKILL)`` reaches the grandchildren because the
     child was started in its own session (``start_new_session=True``). Either
-    way the goal is to close EVERY write end of the capture pipe so a blocked
-    reader-thread drain can reach EOF.
+    way this is best effort: ``run_text_capture`` captures into files, not
+    pipes, so its budget holds whether or not the kill lands — the point here
+    is only to avoid leaving an abandoned process tree behind.
+
+    Best effort is not free, though. This runs SYNCHRONOUSLY inside
+    ``run_text_capture``'s timeout path, so its duration is added to that
+    call's bound (see the note there). ``taskkill`` on a live ``npm`` tree has
+    been measured at 8.47s, 10.48s and 11.6s on a loaded Windows host, and
+    still ~3.5s on a trivial two-process Python tree — the cost scales with the
+    tree but is never zero. That is why it carries its own ``timeout=10`` cap,
+    and why the caller's real bound is ``timeout + ~10s``. Making the kill
+    fire-and-forget would tighten that, but was rejected: detaching it opens a
+    PID-reuse race between spawning ``taskkill`` and this ``Popen`` handle
+    being released, and ``taskkill /PID`` would then be free to shoot an
+    unrelated process that inherited the pid.
     """
     if IS_WINDOWS:
         try:

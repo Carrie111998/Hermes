@@ -28,8 +28,18 @@ def test_priority_dots_cover_all_levels():
 
 
 def test_event_icons_cover_all_types():
-    for et in EventType:
-        assert EVENT_TYPE_EMOJI.get(et), f"missing icon for {et.type_string}"
+    """Every EventType member needs an icon.
+
+    Collect-then-assert, not assert-in-loop: the in-loop form short-circuited
+    on the FIRST miss, so the failure message named one type at every
+    recurrence of this drift (2026-04-27 x2, 2026-05-29, 2026-08-11) while
+    12-13 were actually gone. See events/coverage.py for the standing check.
+    """
+    missing = [et.type_string for et in EventType if not EVENT_TYPE_EMOJI.get(et)]
+    assert not missing, (
+        f"{len(missing)} of {len(list(EventType))} EventType members have no "
+        f"EVENT_TYPE_EMOJI entry: {', '.join(missing)}"
+    )
 
 
 def test_event_icon_uses_inner_type_for_mailbox_message():

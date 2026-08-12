@@ -15,14 +15,18 @@ timeout (HERMES_CRON_SESSION_DB_TIMEOUT, default 10s) so a hang there can
 never again wedge the job past that bound, and — end to end — that the
 dispatch guard is released and the job becomes dispatchable again afterward.
 
-Note: each test releases its ``never_set`` event in a ``finally`` before
+Note: each test releases its ``_WedgedSessionDb.release`` event in a ``finally`` before
 returning. concurrent.futures.thread registers an atexit hook that joins
 EVERY worker thread ever created by ANY ThreadPoolExecutor in the process
 regardless of ``shutdown(wait=False)`` — an event left permanently unset
 would hang the whole test process at interpreter exit, not just this test.
 """
 
+import os
+import shutil
+import tempfile
 import threading
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -30,30 +34,103 @@ import pytest
 from cron.scheduler import run_job
 
 
-def _hanging_session_db(never_set: threading.Event, returned: threading.Event | None = None):
-    """Stand-in for hermes_state.SessionDB() that blocks until released —
-    like the real incident's wedged sqlite3.connect, but bounded so the test
-    process can still exit cleanly once the assertions are done.
+_PROVIDER = {
+    "api_key": "test-key",
+    "base_url": "https://example.invalid/v1",
+    "provider": "openrouter",
+    "api_mode": "chat_completions",
+}
 
-    ``returned`` is set only once the stub actually hands back a database. That
-    flag, sampled the instant run_job returns, is what proves the init timeout
-    fired: if run_job had waited out the wedge, the stub would have returned
-    first. It replaces an ``elapsed < 5.0`` stopwatch that measured the whole of
-    run_job rather than the bounded call, and so failed under parallel load
-    (observed 10.78s and 5.84s) while the timeout itself worked correctly.
+def _warm_run_job() -> None:
+    """Pay ``run_job``'s one-time cost HERE, at collection.
+
+    ``run_job`` resolves a pile of things lazily on its first call
+    in a process — profile context, cron activity policy, config load, and the
+    agent/jsonschema import chain the ``patch`` headers have not already pulled
+    in. That cost used to land inside a ``time.monotonic()`` bracket the tests
+    asserted on; it no longer decides any verdict (see ``_WedgedSessionDb``),
+    but it can still blow the per-test cap outright and kill the file.
+
+    Measured 2026-08-11 under the nightly gate's argv: cold, the first test's
+    ``run_job`` call was 27.8s; with a second suite competing for the box (the
+    ordinary state of a 24-worker gate lane) that cost blew the 60s per-test
+    cap outright and pytest-timeout's thread method killed the process, so the
+    whole file reported as "no tests ran". Collection is not covered by the
+    per-test timeout, so paying it here puts it somewhere it cannot kill the
+    file. Warms the TIMED-OUT branch specifically, since that is the path the
+    tests exercise. Best-effort: a failure must not change what any test
+    asserts.
     """
-    never_set.wait(timeout=30)
-    if returned is not None:
-        returned.set()
-    return MagicMock()
+    home = Path(tempfile.mkdtemp(prefix="warm-run-job-"))
+    wedge = _WedgedSessionDb()
+    try:
+        # Warm the TIMED-OUT branch specifically: a run that gets a SessionDB
+        # back exercises different code than one whose init is cut short, and
+        # only the latter is what the tests below measure.
+        with patch.dict(os.environ, {"HERMES_CRON_SESSION_DB_TIMEOUT": "0.2"}), \
+             patch("cron.scheduler._hermes_home", home), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", side_effect=wedge), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=_PROVIDER), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent_cls.return_value.run_conversation.return_value = {"final_response": "ok"}
+            run_job({"id": "warm-run-job", "name": "warm", "prompt": "hello"})
+    except Exception:
+        pass
+    finally:
+        wedge.release.set()
+        shutil.rmtree(home, ignore_errors=True)
+
+
+# Upper bound on the stand-in's block, so an unreleased event can never hang the
+# test process at interpreter exit (see the module docstring). Nothing asserts
+# on it: a passing run releases the wedge in a ``finally`` long before this.
+_HANG_SECONDS = 30.0
+
+
+class _WedgedSessionDb:
+    """Stand-in for ``hermes_state.SessionDB()`` that blocks until released.
+
+    Like the real incident's wedged ``sqlite3.connect``, but bounded so the
+    test process can still exit cleanly once the assertions are done.
+
+    ``returned`` is the load-independent evidence these tests run on. It is set
+    ONLY if this call ran to completion — i.e. if ``run_job`` sat and waited the
+    wedge out. If ``run_job``'s own timeout did its job, ``run_job`` returns
+    while this call is still parked inside ``wait()`` and ``returned`` is still
+    clear.
+
+    This replaces a wall-clock assertion (``elapsed < N``) that repeatedly
+    failed on correct code. ``run_job`` does a lot besides construct a
+    SessionDB, all of it inside the measured region, and that cost scales with
+    machine load: 6.83s standalone on 2026-08-11 against a 5.0s budget, and
+    18.39s in the shared checkout with a sibling suite running — while the
+    third test in this file, identical shape and identical 0.2s bound but
+    running warm on an idle box, measured 1.8s. Every one of those runs had a
+    working timeout. A stopwatch cannot separate "the wedge was abandoned" from
+    "the machinery was slow"; this flag can, exactly, at any load.
+    """
+
+    def __init__(self):
+        self.release = threading.Event()
+        self.returned = threading.Event()
+
+    def __call__(self):
+        self.release.wait(timeout=_HANG_SECONDS)
+        self.returned.set()
+        return MagicMock()
+
+
+_warm_run_job()
 
 
 class TestSessionDbInitTimeout:
     def test_run_job_does_not_hang_when_sessiondb_init_wedges(self, tmp_path, monkeypatch):
         """run_job returns promptly even if SessionDB() never returns."""
         monkeypatch.setenv("HERMES_CRON_SESSION_DB_TIMEOUT", "0.2")
-        never_set = threading.Event()
-        db_returned = threading.Event()
+        wedge = _WedgedSessionDb()
         job = {"id": "wedged-sessiondb", "name": "test", "prompt": "hello"}
 
         try:
@@ -61,7 +138,7 @@ class TestSessionDbInitTimeout:
                  patch("cron.scheduler._resolve_origin", return_value=None), \
                  patch("hermes_cli.env_loader.load_hermes_dotenv"), \
                  patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-                 patch("hermes_state.SessionDB", side_effect=lambda: _hanging_session_db(never_set, db_returned)), \
+                 patch("hermes_state.SessionDB", side_effect=wedge), \
                  patch(
                      "hermes_cli.runtime_provider.resolve_runtime_provider",
                      return_value={
@@ -77,20 +154,72 @@ class TestSessionDbInitTimeout:
                 mock_agent_cls.return_value = mock_agent
 
                 success, output, final_response, error = run_job(job)
-                # Sample BEFORE the finally releases the wedge, or the stub
-                # could return and set the flag between the two.
-                db_returned_during_run = db_returned.is_set()
+                # Sample BEFORE the finally releases the wedge.
+                abandoned = not wedge.returned.is_set()
         finally:
-            never_set.set()
+            wedge.release.set()
 
-        # Bounded by the 0.2s timeout, not by the hang: run_job came back while
-        # SessionDB() was still wedged, so it cannot have waited the hang out.
-        assert not db_returned_during_run, "run_job waited for the wedged SessionDB()"
+        # run_job gave up on the init instead of waiting it out: the stand-in
+        # was still parked inside its wait() when run_job returned.
+        assert abandoned, (
+            "run_job waited out the wedged SessionDB init instead of "
+            "abandoning it at the 0.2s HERMES_CRON_SESSION_DB_TIMEOUT"
+        )
         # The run still completes successfully without a session store.
         assert success is True
         assert final_response == "ok"
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["session_db"] is None
+
+    def test_timeout_log_renders_the_fractional_bound(self, tmp_path, monkeypatch, caplog):
+        """The timeout message must print the ACTUAL bound, not round it to 0.
+
+        ``%.0f`` rendered a 0.2s bound as "did not return within 0s". That is
+        not merely imprecise — 0 is this very function's sentinel for
+        *unlimited* (see the ``if _session_db_timeout > 0`` branch), so an
+        operator reading that line concludes no timeout was in force at the
+        exact moment one fired. Observed live 2026-08-11.
+        """
+        monkeypatch.setenv("HERMES_CRON_SESSION_DB_TIMEOUT", "0.2")
+        wedge = _WedgedSessionDb()
+        job = {"id": "wedged-sessiondb", "name": "test", "prompt": "hello"}
+
+        try:
+            with patch("cron.scheduler._hermes_home", tmp_path), \
+                 patch("cron.scheduler._resolve_origin", return_value=None), \
+                 patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+                 patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+                 patch("hermes_state.SessionDB", side_effect=wedge), \
+                 patch(
+                     "hermes_cli.runtime_provider.resolve_runtime_provider",
+                     return_value=_PROVIDER,
+                 ), \
+                 patch("run_agent.AIAgent") as mock_agent_cls:
+                mock_agent_cls.return_value.run_conversation.return_value = {
+                    "final_response": "ok"
+                }
+                with caplog.at_level("ERROR"):
+                    run_job(job)
+
+        finally:
+            wedge.release.set()
+
+        rendered = [
+            rec.getMessage()
+            for rec in caplog.records
+            if "SessionDB init did not return" in rec.getMessage()
+        ]
+        assert rendered, (
+            "Expected the SessionDB init timeout to be logged; got: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+        line = rendered[0]
+        assert "0.2s" in line, f"Timeout bound not rendered faithfully: {line!r}"
+        # The specific inversion: 0 is the sentinel for UNLIMITED, so this
+        # exact substring tells the operator the opposite of what happened.
+        assert "within 0s" not in line, (
+            f"Sub-second bound rendered as the unlimited sentinel: {line!r}"
+        )
 
     def test_invalid_timeout_env_falls_back_to_default(self, tmp_path, monkeypatch, caplog):
         """A malformed HERMES_CRON_SESSION_DB_TIMEOUT logs a warning and still
@@ -132,7 +261,7 @@ class TestSessionDbInitTimeout:
             for rec in caplog.records
         ), f"Expected warning about invalid timeout env var; got: {[r.message for r in caplog.records]}"
 
-    def test_timeout_resolved_from_config_yaml(self, tmp_path, monkeypatch, caplog):
+    def test_timeout_resolved_from_config_yaml(self, tmp_path, monkeypatch):
         """cron.session_db_timeout_seconds in config.yaml is respected when
         the env var is not set — the canonical config-first resolution path."""
         import yaml
@@ -142,8 +271,7 @@ class TestSessionDbInitTimeout:
         (tmp_path / "config.yaml").write_text(
             yaml.safe_dump({"cron": {"session_db_timeout_seconds": 0.2}})
         )
-        never_set = threading.Event()
-        db_returned = threading.Event()
+        wedge = _WedgedSessionDb()
         job = {"id": "config-timeout", "name": "test", "prompt": "hello"}
 
         try:
@@ -151,7 +279,7 @@ class TestSessionDbInitTimeout:
                  patch("cron.scheduler._resolve_origin", return_value=None), \
                  patch("hermes_cli.env_loader.load_hermes_dotenv"), \
                  patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-                 patch("hermes_state.SessionDB", side_effect=lambda: _hanging_session_db(never_set, db_returned)), \
+                 patch("hermes_state.SessionDB", side_effect=wedge), \
                  patch(
                      "hermes_cli.runtime_provider.resolve_runtime_provider",
                      return_value={
@@ -166,24 +294,75 @@ class TestSessionDbInitTimeout:
                 mock_agent.run_conversation.return_value = {"final_response": "ok"}
                 mock_agent_cls.return_value = mock_agent
 
-                with caplog.at_level("ERROR"):
-                    success, output, final_response, error = run_job(job)
-                db_returned_during_run = db_returned.is_set()
+                success, output, final_response, error = run_job(job)
+                # Sample BEFORE the finally releases the wedge.
+                abandoned = not wedge.returned.is_set()
         finally:
-            never_set.set()
+            wedge.release.set()
 
-        assert not db_returned_during_run, "run_job waited for the wedged SessionDB()"
-        # Config value 0.2s bounds the hang, not the 10s default. The bound is
-        # read off the timeout report rather than a stopwatch: both values are
-        # far shorter than the stub's 30s wedge, so wall-clock cannot tell 0.2s
-        # from 10s once run_job's own work dilates under parallel load.
-        timeouts = [r.message for r in caplog.records if "SessionDB init" in r.message]
-        assert timeouts, "expected a SessionDB init timeout report"
-        assert "within 0.2s" in timeouts[0], (
-            f"config value not honoured; got: {timeouts[0]!r}"
+        # Config value 0.2s bounded the init, not the 10s default: run_job
+        # returned while the stand-in was still parked in its wait().
+        assert abandoned, (
+            "run_job waited out the wedged SessionDB init instead of "
+            "abandoning it at cron.session_db_timeout_seconds=0.2"
         )
         assert success is True
         assert mock_agent_cls.call_args.kwargs["session_db"] is None
+
+
+class TestNoTimeoutIsRenderedAsTheUnlimitedSentinel:
+    """Sweep for the sibling instances of the ``%.0f``-on-a-timeout defect.
+
+    ``run_job``'s three timeouts all document ``0 = unlimited``
+    (HERMES_CRON_SESSION_DB_TIMEOUT at the ``> 0`` branch,
+    HERMES_CRON_TIMEOUT, HERMES_CRON_HARD_TIMEOUT). Any renderer that
+    truncates toward zero therefore turns a live sub-second bound into the
+    sentinel meaning *no bound* — the operator reads the opposite of what
+    happened.
+
+    The wall-clock and inactivity messages are emitted from a monitor thread
+    that a unit test cannot reach cheaply, so this asserts on the format
+    strings themselves. Anchored on the message text, not line numbers, so it
+    survives edits above it.
+    """
+
+    @staticmethod
+    def _source() -> str:
+        import cron.scheduler
+
+        return Path(cron.scheduler.__file__).read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize(
+        "anchor",
+        [
+            "SessionDB init did not return",
+            "exceeded wall-clock limit",
+            "idle for",
+        ],
+    )
+    def test_timeout_render_does_not_truncate_to_zero(self, anchor):
+        source = self._source()
+        offenders = [
+            line.strip()
+            for line in source.splitlines()
+            if anchor in line and "%.0f" in line
+        ]
+        assert not offenders, (
+            f"{anchor!r} still renders a timeout with %.0f, which prints any "
+            f"sub-second bound as the '0 = unlimited' sentinel: {offenders}"
+        )
+
+    @pytest.mark.parametrize(
+        "expr",
+        ["int(_cron_hard_limit)", "int(_cron_inactivity_limit)"],
+    )
+    def test_raised_timeout_message_does_not_truncate_the_limit(self, expr):
+        """The TimeoutError text an operator sees in the job record has the
+        same hazard as the log line it accompanies."""
+        assert expr not in self._source(), (
+            f"{expr} truncates a sub-second limit to the '0 = unlimited' "
+            "sentinel in the raised TimeoutError message"
+        )
 
 
 class TestDispatchGuardReleasedAfterHang:
@@ -198,7 +377,7 @@ class TestDispatchGuardReleasedAfterHang:
         sched._parallel_pool_max_workers = None
         sched._running_job_ids.clear()
 
-        never_set = threading.Event()
+        wedge = _WedgedSessionDb()
         job = {
             "id": "guard-sessiondb-hang",
             "name": "guard-sessiondb-hang",
@@ -214,7 +393,7 @@ class TestDispatchGuardReleasedAfterHang:
                  patch("cron.scheduler._resolve_origin", return_value=None), \
                  patch("hermes_cli.env_loader.load_hermes_dotenv"), \
                  patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-                 patch("hermes_state.SessionDB", side_effect=lambda: _hanging_session_db(never_set)), \
+                 patch("hermes_state.SessionDB", side_effect=wedge), \
                  patch(
                      "hermes_cli.runtime_provider.resolve_runtime_provider",
                      return_value={
@@ -246,6 +425,6 @@ class TestDispatchGuardReleasedAfterHang:
                 n2 = sched.tick(verbose=False)
                 assert n2 == 1
         finally:
-            never_set.set()
+            wedge.release.set()
             sched._running_job_ids.discard("guard-sessiondb-hang")
             sched._shutdown_parallel_pool()

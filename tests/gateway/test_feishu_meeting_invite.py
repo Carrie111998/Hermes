@@ -1,12 +1,36 @@
 """Tests for Feishu vc.bot.meeting_invited_v1 event handling."""
 
 import asyncio
+import importlib.util
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from gateway.platforms.base import MessageEvent
-from plugins.platforms.feishu.feishu_meeting_invite import (
+# Warm the Feishu SDK HERE, at collection, when it is installed.
+#
+# ``lark_oapi`` is a thousands-of-module SDK whose first import costs ~100s on
+# this box.  This module imports none of it directly, but the invite handlers
+# reach ``FeishuAdapter`` (whose ``__init__`` calls
+# ``check_feishu_requirements()``), so the SDK loads *inside a test body* —
+# where the gate's per-test ``--timeout`` applies.  Measured 2026-08-11 under
+# the nightly gate's own argv (``--timeout=60 --timeout-method=thread``):
+# collection succeeded and 8 tests passed, then the run died with the timeout
+# dump parked mid-``lark_oapi`` import.  pytest-timeout's thread method kills
+# the process, so the file reported as "no tests ran" and even the 8 passes
+# were lost.
+#
+# Collection is NOT covered by the per-test timeout, so paying the load here is
+# the same one-time cost in an untimed place — not a new one.  Same fix as
+# 671b38765 gave tests/gateway/test_feishu.py.  Best-effort on purpose: a
+# failure here must not change what any test asserts.
+if importlib.util.find_spec("lark_oapi") is not None:
+    try:
+        import lark_oapi  # noqa: F401
+    except Exception:
+        pass
+
+from gateway.platforms.base import MessageEvent  # noqa: E402
+from plugins.platforms.feishu.feishu_meeting_invite import (  # noqa: E402
     build_meeting_invite_prompt,
     handle_meeting_invited_event,
     parse_meeting_invited_event,

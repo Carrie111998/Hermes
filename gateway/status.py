@@ -46,6 +46,15 @@ _gateway_lock_handle = None
 # while another process holds the mutual-exclusion lock.
 _WINDOWS_LOCK_OFFSET = 1024 * 1024
 _GATEWAY_RUNNING_PID_CACHE_TTL_SECONDS = 1.0
+# Windows force-kill budget. The old 10s cap was exceeded on a box at 87.8%
+# commit running six concurrent pytest suites *even though the kill landed*
+# (2026-08-11). Match the sibling ``pid_exists`` tasklist probe, which was
+# already widened to 30s because that spawn alone measures 3.4-4.0s idle here.
+_TASKKILL_TIMEOUT_S = 30
+# After a taskkill timeout, how long to poll for the target to actually die
+# before declaring the kill failed. /F is a synchronous TerminateProcess, so
+# a survivor past this window is a genuine failure, not scheduler latency.
+_TASKKILL_VERIFY_TIMEOUT_S = 10.0
 _gateway_running_pid_cache_lock = threading.Lock()
 _gateway_running_pid_cache: dict[tuple[str, bool, bool], tuple[float, tuple[Any, ...], Optional[int]]] = {}
 
@@ -229,11 +238,34 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _wait_for_pid_death(pid: int, timeout_s: float, interval_s: float = 0.25) -> bool:
+    """Poll until ``pid`` is gone, or ``timeout_s`` elapses. True if it died."""
+    deadline = time.monotonic() + max(timeout_s, 0.0)
+    while True:
+        if not _pid_exists(pid):
+            return True
+        if time.monotonic() >= deadline:
+            return not _pid_exists(pid)
+        time.sleep(interval_s)
+
+
 def terminate_pid(pid: int, *, force: bool = False) -> None:
     """Terminate a PID with platform-appropriate force semantics.
 
     POSIX uses SIGTERM/SIGKILL. Windows uses taskkill /T /F for true force-kill
     because os.kill(..., SIGTERM) is not equivalent to a tree-killing hard stop.
+
+    On Windows the *taskkill exit status is not the source of truth* — process
+    liveness is.  A ``TimeoutExpired`` means only that we stopped waiting for
+    taskkill to report back; it says nothing about whether the target died, and
+    on a loaded box the kill routinely lands well before taskkill is scheduled
+    to tell us so.  Treating that as fatal took down the gateway on 2026-08-11:
+    the exception (a ``SubprocessError``, so ``except OSError`` and
+    ``except CalledProcessError`` handlers both missed it) propagated out of
+    ``stop()`` into ``restart()``, which died before spawning the replacement
+    and left :8642 with no listener.  We now verify with a liveness poll and
+    only report failure when the target is provably still alive — and as an
+    ``OSError``, the type callers in the kill path already handle.
     """
     if force and _IS_WINDOWS:
         # CREATE_NO_WINDOW: terminate_pid runs from the windowless pythonw.exe
@@ -246,12 +278,26 @@ def terminate_pid(pid: int, *, force: bool = False) -> None:
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=_TASKKILL_TIMEOUT_S,
                 creationflags=windows_hide_flags(),
             )
         except FileNotFoundError:
             os.kill(pid, signal.SIGTERM)
             return
+        except subprocess.TimeoutExpired:
+            # Indeterminate, not failed. subprocess.run has already killed and
+            # reaped the taskkill child; ask the OS whether the target survived.
+            if _wait_for_pid_death(pid, _TASKKILL_VERIFY_TIMEOUT_S):
+                logger.warning(
+                    "terminate_pid(%s): taskkill exceeded its %.0fs budget but "
+                    "the process is gone — treating the kill as successful.",
+                    pid, _TASKKILL_TIMEOUT_S,
+                )
+                return
+            raise OSError(
+                f"taskkill timed out after {_TASKKILL_TIMEOUT_S:.0f}s and PID "
+                f"{pid} is still alive"
+            ) from None
 
         if result.returncode != 0:
             details = (result.stderr or result.stdout or "").strip()

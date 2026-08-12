@@ -51,31 +51,39 @@ def _listener_pids_on_port(port: int) -> list:
     intervals. Restricting to LISTEN state frees the port for a new bridge
     without ever touching an unrelated client.
 
-    psutil is tried first because it is the only implementation that is both
-    cross-platform and fast. The shell-out alternatives are neither: on Windows
-    ``netstat -ano -p TCP`` was measured at 5.3-36.3s on a developer laptop
-    (1000+ connection rows, re-resolved every call), which blew the 5s
-    subprocess cap that used to guard it and — because the caller swallowed the
-    resulting TimeoutExpired — turned the whole port cleanup into a silent
-    no-op. The same enumeration through psutil takes 16-62ms because it reads
-    the kernel table directly (GetExtendedTcpTable / /proc/net/tcp) instead of
-    spawning a process to format it as text.
+    psutil first, on every platform. It reads the kernel's TCP table in-process
+    (measured 16ms here against 851 connections) where every shell probe pays a
+    process spawn this box cannot afford: ``netstat -ano -p TCP`` was measured
+    at 8.2s, 9.6s and 21.3s on three consecutive idle runs. That is the same
+    spawn-cost trap that made ``gateway.status.pid_exists`` report live
+    processes as dead (fixed 2026-08-11 in e467da742); the Windows branch of
+    ``_kill_port_process`` ran netstat under ``timeout=5`` inside a bare
+    ``except Exception: pass``, so on this machine it did not merely run slowly
+    — it silently killed nothing, every time, and the replacement bridge then
+    burned the full ``_wait_for_port_release`` window and failed to bind.
+
+    The shell probes stay as the fallback for a host where psutil is missing or
+    the platform denies the connection table.
     """
     pids: list = []
     try:
         import psutil
 
         for conn in psutil.net_connections(kind="tcp"):
-            if conn.status != psutil.CONN_LISTEN or conn.pid is None:
-                continue
-            if conn.laddr and conn.laddr.port == port:
+            if (
+                conn.status == psutil.CONN_LISTEN
+                and conn.laddr
+                and conn.laddr.port == port
+                and conn.pid
+            ):
                 pids.append(conn.pid)
         if pids:
             return pids
-    except (ImportError, PermissionError, OSError):
-        pass  # psutil absent, or the kernel table needs privileges we lack
-    except Exception:  # noqa: BLE001 — psutil.AccessDenied et al; fall through
+    except Exception:
+        # ImportError, or AccessDenied on a platform that gates the table.
         pass
+    if _IS_WINDOWS:
+        return _listener_pids_on_port_netstat(port)
     try:
         result = subprocess.run(
             ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
@@ -103,33 +111,55 @@ def _listener_pids_on_port(port: int) -> list:
     return pids
 
 
+def _listener_pids_on_port_netstat(port: int) -> list:
+    """Windows fallback for :func:`_listener_pids_on_port` when psutil is out.
+
+    Timeout is 60s, not the 5s this used to carry. netstat's cost here is a
+    process spawn plus a full TCP-table render, and both scale with host load;
+    a budget it routinely overruns turns a real listener into "no listener"
+    and the caller kills nothing. Overshooting the budget on a wedged netstat
+    is the safe direction — the caller is already in a restart path.
+    """
+    from hermes_cli._subprocess_compat import windows_hide_flags
+
+    pids: list = []
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano", "-p", "TCP"],
+            capture_output=True, text=True, timeout=60,
+            creationflags=windows_hide_flags(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return pids
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        # Proto | Local Address | Foreign Address | State | PID
+        if len(parts) >= 5 and parts[3] == "LISTENING":
+            if parts[1].endswith(f":{port}"):
+                try:
+                    pids.append(int(parts[4]))
+                except ValueError:
+                    pass
+    return pids
+
+
 def _kill_port_process(port: int) -> None:
     """Kill any process *listening* on the given TCP port (a stale bridge).
 
-    Both platforms resolve the target through :func:`_listener_pids_on_port`,
-    so the LISTEN-only safety invariant (never signal a mere client of this
-    port — that is what was closing the user's browser) is enforced in exactly
-    one place rather than reimplemented per-OS. Windows previously parsed
-    ``netstat -ano`` inline under a 5s cap the command routinely exceeded,
-    which meant the cleanup silently did nothing at all on that platform.
+    Discovery is shared across platforms now (see _listener_pids_on_port); only
+    the signalling differs, because Windows has no SIGTERM to send.
     """
-    try:
-        pids = _listener_pids_on_port(port)
-    except Exception:  # noqa: BLE001 — cleanup is best-effort
-        logger.debug("port cleanup: listener lookup failed for %d", port, exc_info=True)
-        return
-
-    for pid in pids:
+    # Only ever signal a process LISTENING on the port. A client whose
+    # connection happens to involve this port number (a browser tab on a local
+    # dev server, etc.) must never be killed.
+    for pid in _listener_pids_on_port(port):
         try:
             if _IS_WINDOWS:
                 from hermes_cli._subprocess_compat import windows_hide_flags
 
-                # Windows has no SIGTERM for an unrelated process; taskkill /F
-                # is the supported equivalent. Only the PID lookup was slow —
-                # killing a single known PID returns promptly.
                 subprocess.run(
                     ["taskkill", "/PID", str(pid), "/F"],
-                    capture_output=True, timeout=10,
+                    capture_output=True, timeout=30,
                     creationflags=windows_hide_flags(),
                 )
             else:
@@ -420,10 +450,18 @@ def _file_content_hash(path: Path) -> str:
         return ""
 
 
+# Budget for the `node --version` sanity probe.  60s, not 5s, for the same
+# reason _listener_pids_on_port_netstat carries 60s: process spawn on this host
+# is not bounded by a few seconds under load (netstat measured 8.2s / 9.6s /
+# 21.3s while idle).  A budget the probe routinely overruns turns a healthy
+# Node into "not installed" — see the TimeoutExpired branch below.
+_NODE_PROBE_TIMEOUT_S = 60
+
+
 def check_whatsapp_requirements() -> bool:
     """
     Check if WhatsApp dependencies are available.
-    
+
     WhatsApp requires a Node.js bridge for most implementations.
     """
     # Prefer Hermes-managed Node/npm so Windows installs are not broken by a
@@ -436,9 +474,23 @@ def check_whatsapp_requirements() -> bool:
             [_node, "--version"],
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=_NODE_PROBE_TIMEOUT_S,
         )
         return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        # Node resolved to a real executable above — that IS the installation
+        # check.  A probe that overruns its budget says the host is loaded,
+        # not that the runtime is absent, and reporting "missing" here makes
+        # connect() stamp a non-retryable whatsapp_node_missing fatal that
+        # keeps WhatsApp down until the next gateway boot.  Observed doing
+        # exactly that on 2026-08-11 at 23:23:47 with node v24.14.0 installed.
+        # If node really is wedged, the bridge spawn below fails with a
+        # retryable error instead of a permanent one.
+        logger.warning(
+            "node --version exceeded %ss; treating Node as present since %s "
+            "resolved on disk", _NODE_PROBE_TIMEOUT_S, _node,
+        )
+        return True
     except Exception:
         return False
 
@@ -922,11 +974,19 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     # Read timeout from environment variable, default to 300 seconds (5 minutes)
                     # to accommodate slower systems like Unraid NAS
                     npm_install_timeout = env_int("WHATSAPP_NPM_INSTALL_TIMEOUT", 300)
-                    install_result = subprocess.run(
+                    # run_text_capture, not capture_output=True: _npm_bin is
+                    # npm.cmd on Windows, so the direct child is cmd.exe and the
+                    # install runs in a node grandchild that inherits the
+                    # capture pipes. subprocess.run would kill only cmd.exe on
+                    # timeout and then block re-draining a pipe that never
+                    # reaches EOF, so npm_install_timeout would not bound this
+                    # at all — a wedged registry would hang gateway startup
+                    # silently instead of failing after 5 minutes.
+                    from hermes_cli._subprocess_compat import run_text_capture
+
+                    install_result = run_text_capture(
                         [_npm_bin, "install", "--silent"],
                         cwd=str(bridge_dir),
-                        capture_output=True,
-                        text=True,
                         timeout=npm_install_timeout,
                         env=with_hermes_node_path(),
                     )

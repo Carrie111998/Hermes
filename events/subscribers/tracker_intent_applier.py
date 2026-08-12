@@ -149,17 +149,27 @@ class TrackerIntentApplierSubscriber(BaseSubscriber):
         # gateway restart doesn't re-apply intents we already handled.
         idempotency.rehydrate_from_processed(self._mailbox["processed"])
 
-        # ``resume_full`` is optional — graphs.jobflow may not be present
-        # in every deployment (e.g. minimal CI installs). Failing soft
-        # here keeps the subscriber registerable in those environments.
-        try:
-            from graphs.jobflow import resume_full as _resume_full
-        except ImportError:
-            _resume_full = None
-            logger.info(
-                "tracker-intent-applier: graphs.jobflow not available; "
-                "thread-resume disabled"
-            )
+        # ``resume_full`` is optional — graphs.jobflow may not be present in
+        # every deployment (e.g. minimal CI installs) — and it is expensive:
+        # ``graphs/__init__`` re-exports from ``graphs.jobflow``, which imports
+        # langgraph at module scope and drags in the whole langchain_core tree.
+        #
+        # Import it LAZILY. ``startup()`` only needs something callable, and
+        # HITL thread-resume is a rare path, so the tree is now loaded on first
+        # actual resume instead of on every gateway/subscriber startup.
+        # IntentApplier already wraps the call in ``except Exception`` and logs
+        # "resume_full(...) skipped (<Error>)", so a minimal install degrades
+        # exactly as before — the notice just moves from startup to first use.
+        #
+        # This cost a monolithic ``pytest tests/events tests/cron`` run its
+        # summary line: the langgraph import landed inside
+        # tests/events/test_gateway_integration.py::
+        # test_mailbox_translator_registered_at_startup — a test that only
+        # asserts a subscriber is registered — and blew the 30s addopts cap,
+        # which hard-exits the interpreter under --timeout-method=thread.
+        def _resume_full(thread_id, resume_payload):
+            from graphs.jobflow import resume_full as _impl
+            return _impl(thread_id, resume_payload)
 
         # Fix A: native-Postgres pre-flight reader (None on minimal installs
         # without a psycopg driver — pre-flight simply stays off).

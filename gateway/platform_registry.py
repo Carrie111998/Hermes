@@ -331,6 +331,23 @@ class PlatformRegistry:
         self._resolve_all()
         return [e for e in self._entries.values() if e.source == "plugin"]
 
+    def known_names(self) -> list[str]:
+        """Return every known platform name WITHOUT resolving deferred loaders.
+
+        Extends :meth:`is_registered`'s cheap-membership contract to the whole
+        set: a deferred platform is named here before its adapter module -- and
+        the vendor SDK behind it -- has been imported.
+
+        Use this instead of :meth:`all_entries` / :meth:`plugin_entries` when
+        the caller only needs to *filter* names and can then :meth:`get` the
+        few survivors. Those two accessors call :meth:`_resolve_all`, which
+        imports every bundled adapter; doing that just to read one metadata
+        field off each entry costs ~100s on a cold filesystem.
+        """
+        names = list(self._entries)
+        names.extend(n for n in self._deferred if n not in self._entries)
+        return names
+
     def is_registered(self, name: str) -> bool:
         # A deferred (not-yet-imported) platform still counts as registered --
         # the loader will materialize it on first real use.  This keeps cheap

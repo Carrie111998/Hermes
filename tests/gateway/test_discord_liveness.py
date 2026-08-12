@@ -65,17 +65,23 @@ class _LiveBot(FakeBot):
 
 
 class _FakeKeepAlive:
-    """A heartbeat stand-in whose ack age is fixed at ``ack_age``, not frozen.
+    """A heartbeat whose ack is always exactly ``ack_age`` old when READ.
 
-    ``_last_ack`` is recomputed on every read so the sampled age is always
-    exactly ``ack_age``, however long the probe takes to fire. Pinning it to a
-    single construction-time instant made the age grow with real elapsed time,
-    which silently turned the default ``ack_age=0.0`` into "fresh for the first
-    ``max_ack_age`` seconds only". Under load the liveness loop reached the
-    health check more than a second after the bot was built, so a probe meant
-    to exercise a *later* branch tripped ``ack_stale`` first and reported the
-    wrong reason. The deliberate-staleness callers (``ack_age=3600``) are
-    unaffected: a constant age of an hour is stale under any threshold.
+    ``_last_ack`` is a property, not a value frozen at construction. The
+    adapter computes ``ack_age = perf_counter() - _last_ack`` at sample time
+    and compares it against ``max_ack_age`` (1.0s by default in
+    ``_make_adapter``), so a timestamp stamped when the bot was built decays:
+    every second the test spends between the factory call and the liveness
+    sample is charged to the fake heartbeat. Under the per-file parallel
+    harness that gap crossed 1.0s and two tests failed for a reason they
+    never asked for — ``ack_stale`` is checked ahead of both the latency and
+    the healthy paths, so
+    ``test_liveness_probe_reports_gateway_health_failure_reason[latency_non_finite]``
+    got ``ack_stale`` instead, and
+    ``test_liveness_probe_does_not_call_rest_while_websocket_is_healthy``
+    went fatal on a bot it had declared healthy. Recomputing on read makes
+    ``ack_age=0`` mean "the ack just landed" whenever it is asked, and leaves
+    the deliberately stale case (``ack_age=3600``) exactly as stale.
     """
 
     def __init__(self, *, ack_age: float = 0.0):

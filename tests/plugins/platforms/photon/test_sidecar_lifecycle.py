@@ -9,6 +9,7 @@ spawning Node or binding ports.
 from __future__ import annotations
 
 import subprocess
+import sys
 from typing import Any, Dict, List, Tuple
 
 import pytest
@@ -16,6 +17,17 @@ import pytest
 from gateway.config import PlatformConfig
 from plugins.platforms.photon import adapter as photon_adapter
 from plugins.platforms.photon.adapter import PhotonAdapter
+
+# _reap_stale_sidecar() returns immediately on win32 by design — it shells out
+# to lsof/ps to find listeners and escalates with SIGKILL, none of which exist
+# there (see the "orphaning is a POSIX-only path" guard in adapter.py).  On
+# Windows these assert against a no-op, so skip rather than record a permanent
+# red.  test_reap_noop_when_port_free is skipped too: it passes on win32 only
+# because of the early return, which is a false green, not coverage.
+posix_only_reaper = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="_reap_stale_sidecar() is a documented no-op on win32 (POSIX-only lsof/ps + SIGKILL)",
+)
 
 
 def _make_adapter(monkeypatch: pytest.MonkeyPatch) -> PhotonAdapter:
@@ -59,6 +71,7 @@ def _capture_kills(monkeypatch: pytest.MonkeyPatch) -> List[Tuple[int, int]]:
     return kills
 
 
+@posix_only_reaper
 @pytest.mark.asyncio
 async def test_reap_noop_when_port_free(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = _make_adapter(monkeypatch)
@@ -74,6 +87,7 @@ async def test_reap_noop_when_port_free(monkeypatch: pytest.MonkeyPatch) -> None
     assert kills == []
 
 
+@posix_only_reaper
 @pytest.mark.asyncio
 async def test_reap_kills_verified_orphan(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = _make_adapter(monkeypatch)
@@ -89,6 +103,7 @@ async def test_reap_kills_verified_orphan(monkeypatch: pytest.MonkeyPatch) -> No
     assert kills == [(4242, photon_adapter.signal.SIGTERM)]
 
 
+@posix_only_reaper
 @pytest.mark.asyncio
 async def test_reap_escalates_to_sigkill(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = _make_adapter(monkeypatch)
@@ -106,6 +121,7 @@ async def test_reap_escalates_to_sigkill(monkeypatch: pytest.MonkeyPatch) -> Non
     assert (4242, photon_adapter.signal.SIGKILL) in kills
 
 
+@posix_only_reaper
 @pytest.mark.asyncio
 async def test_reap_raises_for_foreign_listener(
     monkeypatch: pytest.MonkeyPatch,

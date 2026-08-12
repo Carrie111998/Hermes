@@ -48,6 +48,24 @@ def _find_hermes_root() -> Path | None:
 _HERMES_ROOT = _find_hermes_root()
 THRESHOLDS_CONFIG = None if _HERMES_ROOT is None else _HERMES_ROOT / _THRESHOLDS_REL
 
+# How far *under* its threshold the "not yet stale" run is backdated in
+# test_production_threshold_boundaries.
+#
+# The monitor reads its own `datetime.now()` inside `_check_stale()`, so the
+# age it computes is the backdate plus however long the test takes to reach
+# `poll()` — an EventBus emit, a second sqlite connection to rewrite the
+# timestamp, a subscriber construction and a cursor write. A 1-second margin
+# (the original) lost that race whenever the box was loaded: the per-file
+# parallel harness reproduced it on `nightly-test-gate`, where the monitor saw
+# age_seconds=3600 against threshold=3600 and fired. Nothing about the
+# assertion was wrong — the input drifted past the boundary before it was read.
+#
+# 120s keeps ~100x headroom over the observed latency while still discriminating
+# the per-job override from the 1200s default: every override under test is
+# 1800s or more, so `threshold - 120` stays above 1200 and a monitor that
+# ignored the override would still alert here and fail the test.
+_WITHIN_MARGIN_SECONDS = 120
+
 # Only the production-threshold test needs the deployed file; every other test
 # in this module is hermetic, so this skips that one test rather than the whole
 # module.
@@ -222,15 +240,9 @@ class TestCronStaleMonitor:
         assert config["default_seconds"] == 1200
         assert config["per_job"][job_name] == threshold
 
-        # ±60s, not ±1s. The backdated timestamp is fixed at emit time but the
-        # monitor samples datetime.now() later, so a 1s margin only holds if
-        # emit + sqlite UPDATE + construction + poll all complete inside one
-        # second — under gate load they do not, and the "within" case tipped to
-        # age_seconds == threshold and alerted. 60s still discriminates: the
-        # per-job thresholds are 1200/1800/2100/2400/3600, so every one of them
-        # stays on the correct side of the 1200s default.
-        margin = 60
-        within = datetime.now(timezone.utc) - timedelta(seconds=threshold - margin)
+        within = datetime.now(timezone.utc) - timedelta(
+            seconds=threshold - _WITHIN_MARGIN_SECONDS
+        )
         _emit_started(bus, job_name, started_at=within)
         mon = CronStaleMonitor(
             bus,
@@ -245,7 +257,7 @@ class TestCronStaleMonitor:
         mon.poll()
         assert _stale_events(bus) == []
 
-        past = datetime.now(timezone.utc) - timedelta(seconds=threshold + margin)
+        past = datetime.now(timezone.utc) - timedelta(seconds=threshold + 1)
         _emit_started(bus, job_name, started_at=past)
         mon.poll()
 

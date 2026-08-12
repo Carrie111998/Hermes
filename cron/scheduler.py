@@ -2237,9 +2237,18 @@ def _iter_home_target_platforms():
         from hermes_cli.plugins import discover_plugins
         discover_plugins()  # idempotent
         from gateway.platform_registry import platform_registry
-        for entry in platform_registry.plugin_entries():
-            if entry.cron_deliver_env_var and entry.name not in _HOME_TARGET_ENV_VARS:
-                yield entry.name
+        for name in platform_registry.known_names():
+            # Filter by NAME before resolving. ``plugin_entries()`` would run
+            # every deferred loader -- importing all ~18 bundled adapters and
+            # their vendor SDKs -- only for this loop to discard the 11 whose
+            # names are already built-ins above. Resolving just the survivors
+            # yields the identical set: ``get()`` runs one loader, and a
+            # built-in name is skipped without importing anything.
+            if name in _HOME_TARGET_ENV_VARS:
+                continue
+            entry = platform_registry.get(name)
+            if entry and entry.source == "plugin" and entry.cron_deliver_env_var:
+                yield name
     except Exception:
         pass
 
@@ -5079,7 +5088,10 @@ def _run_job_impl(
             _iter_max = _activity.get("max_iterations", 0)
 
             logger.error(
-                "Job '%s' exceeded wall-clock limit %.0fs (elapsed %.0fs) "
+                # %g, not %.0f: HERMES_CRON_HARD_TIMEOUT uses 0 for UNLIMITED,
+                # so a sub-second limit rounded to "0s" reads as "no limit was
+                # set" at the moment the limit fired.
+                "Job '%s' exceeded wall-clock limit %gs (elapsed %gs) "
                 "| last_activity=%s | iteration=%s/%s | tool=%s",
                 job_name, _cron_hard_limit, _wc_elapsed,
                 _last_desc, _iter_n, _iter_max,
@@ -5089,7 +5101,7 @@ def _run_job_impl(
                 agent.interrupt("Cron job timed out (wall-clock)")
             raise TimeoutError(
                 f"Cron job '{job_name}' exceeded wall-clock limit "
-                f"{int(_cron_hard_limit)}s (elapsed {int(_wc_elapsed)}s) "
+                f"{_cron_hard_limit:g}s (elapsed {_wc_elapsed:g}s) "
                 f"— last activity: {_last_desc}"
             )
 
@@ -5108,7 +5120,9 @@ def _run_job_impl(
             _iter_max = _activity.get("max_iterations", 0)
 
             logger.error(
-                "Job '%s' idle for %.0fs (inactivity limit %.0fs) "
+                # %g, not %.0f — same sentinel hazard as the wall-clock branch
+                # above (HERMES_CRON_TIMEOUT documents 0 = unlimited).
+                "Job '%s' idle for %gs (inactivity limit %gs) "
                 "| last_activity=%s | iteration=%s/%s | tool=%s",
                 job_name, _secs_ago, _cron_inactivity_limit,
                 _last_desc, _iter_n, _iter_max,
@@ -5118,7 +5132,7 @@ def _run_job_impl(
                 agent.interrupt("Cron job timed out (inactivity)")
             raise TimeoutError(
                 f"Cron job '{job_name}' idle for "
-                f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
+                f"{_secs_ago:g}s (limit {_cron_inactivity_limit:g}s) "
                 f"— last activity: {_last_desc}"
             )
 

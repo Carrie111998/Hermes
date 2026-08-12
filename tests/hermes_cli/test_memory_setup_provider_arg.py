@@ -58,7 +58,18 @@ class TestInstallDependenciesRunner:
 
     def _run_with_missing_dep(self, tmp_path, which_side_effect, run_behavior=None):
         """Drive _install_dependencies for a plugin that declares one missing
-        pip dep, capturing every subprocess.run argv issued by the ladder."""
+        pip dep, capturing every argv the ladder issues — in issue order.
+
+        The ladder spawns through TWO primitives, so both have to be stubbed or
+        the recorded argv sequence has holes. The installing rungs (uv, and the
+        final ``pip install``) go through ``run_text_capture``, which captures
+        into temp files because an installer forks a build backend and a
+        Windows grandchild holding a capture pipe defeats the timeout. The
+        non-installing rungs (the ``pip --version`` probe, the ``ensurepip``
+        bootstrap) stay on ``subprocess.run`` with DEVNULL — nothing reads
+        their output. Both fakes append to the same list, so ordering
+        assertions still see one ladder.
+        """
         import sys
 
         (tmp_path / "plugin.yaml").write_text(
@@ -74,7 +85,8 @@ class TestInstallDependenciesRunner:
 
         with patch("plugins.memory.find_provider_dir", return_value=tmp_path), \
              patch("hermes_cli.tools_config.shutil.which", side_effect=which_side_effect), \
-             patch("hermes_cli.tools_config.subprocess.run", fake_run):
+             patch("hermes_cli.tools_config.subprocess.run", fake_run), \
+             patch("hermes_cli._subprocess_compat.run_text_capture", fake_run):
             memory_setup._install_dependencies("x")
         return calls, sys.executable
 

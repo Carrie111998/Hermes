@@ -982,6 +982,13 @@ Do NOT use vim/nano/interactive tools without pty=true — they hang without a p
 _active_environments: Dict[str, Any] = {}
 _last_activity: Dict[str, float] = {}
 _env_lock = threading.Lock()
+# Scratch root recorded when the first environment is created. The exit sweep
+# must not resolve HERMES_HOME for itself: `_atexit_cleanup` is registered at
+# module import, which under pytest is BEFORE conftest redirects HERMES_HOME,
+# and fires at interpreter shutdown, which is AFTER monkeypatch restores it —
+# so neither end of its lifetime knows the home its sandboxes actually live
+# under. Environment creation does.
+_env_scratch_dir: Optional[Path] = None
 _creation_locks: Dict[str, threading.Lock] = {}  # Per-task locks for sandbox creation
 _creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
 _cleanup_thread = None
@@ -1758,20 +1765,60 @@ def is_persistent_env(task_id: str) -> bool:
 
 
 
-def cleanup_all_environments():
-    """Clean up ALL active environments. Use with caution."""
+def resolve_scratch_dir() -> Optional[Path]:
+    """Resolve the sandbox scratch root *now*, for a sweep that runs later.
+
+    ``_get_scratch_dir()`` reads ``HERMES_HOME`` on every call, so a sweep that
+    resolves it lazily sweeps wherever the env var happens to point when it
+    fires — which for an ``atexit`` hook is long after the code that registered
+    it stopped running. Under pytest that gap spans ``monkeypatch`` teardown,
+    so a late-resolved root is the *real* ``~/.hermes``. Capturing the path at
+    registration is what pins the sweep to the home its process actually ran
+    under; see :func:`cleanup_all_environments`'s ``scratch_dir`` parameter.
+
+    Resolves without creating anything: registration happens on every CLI
+    start, including runs that never open a sandbox.
+
+    Returns None if the root can't be resolved, so a best-effort caller can
+    simply skip the sweep.
+    """
+    try:
+        return _get_scratch_dir(create=False)
+    except Exception:
+        return None
+
+
+def cleanup_all_environments(*, scratch_dir: Optional[Path] = None):
+    """Clean up ALL active environments. Use with caution.
+
+    ``scratch_dir`` pins the orphan sweep to a root captured earlier by
+    :func:`resolve_scratch_dir`, instead of resolving ``HERMES_HOME`` at call
+    time. Pass it from any caller that can outlive the environment it was set
+    up in — an ``atexit`` hook above all, whose fire happens after pytest's
+    ``monkeypatch`` has restored the real ``HERMES_HOME``. Without it an
+    exiting test process creates ``<real home>/sandboxes/singularity/`` and
+    then ``rmtree``s every ``hermes-*`` entry under it, including the
+    ``hermes-overlays`` directory of a *live* process.
+    """
     task_ids = list(_active_environments.keys())
     cleaned = 0
-    
+
     for task_id in task_ids:
         try:
             cleanup_vm(task_id)
             cleaned += 1
         except Exception as e:
             logger.error("Error cleaning %s: %s", task_id, e, exc_info=True)
-    
+
     # Also clean any orphaned directories
-    scratch_dir = _get_scratch_dir()
+    if scratch_dir is None:
+        scratch_dir = _get_scratch_dir()
+    elif not scratch_dir.exists():
+        # The captured root is gone (a pytest tmp home, typically). There is
+        # nothing to sweep, and recreating it would just leave litter behind.
+        if cleaned > 0:
+            logger.info("Cleaned %d environments", cleaned)
+        return cleaned
     import glob
     for path in glob.glob(str(scratch_dir / "hermes-*")):
         try:
@@ -1863,7 +1910,7 @@ def _atexit_cleanup():
         # the dict; we need them to wait on docker cleanup threads after the
         # registry has been cleared.
         envs_to_wait = list(_active_environments.values())
-        cleanup_all_environments()
+        cleanup_all_environments(scratch_dir=_env_scratch_dir)
         # Block briefly so docker stop/rm actually completes before the
         # interpreter exits. Issue #20561 — without this join, the daemon
         # cleanup threads were getting torn down mid-`docker stop`, leaving
@@ -2333,6 +2380,11 @@ def terminal_tool(
                         }, ensure_ascii=False)
 
                     with _env_lock:
+                        global _env_scratch_dir
+                        if _env_scratch_dir is None:
+                            # Pin the exit sweep to the home this environment
+                            # was actually created under.
+                            _env_scratch_dir = resolve_scratch_dir()
                         _active_environments[effective_task_id] = new_env
                         _last_activity[effective_task_id] = time.time()
                         env = new_env

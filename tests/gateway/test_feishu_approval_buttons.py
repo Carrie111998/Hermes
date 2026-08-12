@@ -35,6 +35,31 @@ def _ensure_feishu_mocks():
         sys.modules.setdefault("aiohttp.web", aio.web)
 
 
+# Warm the real Feishu SDK HERE, at collection, when it is installed.
+#
+# ``lark_oapi`` is a thousands-of-module SDK whose first import costs ~100s on
+# this box.  ``FeishuAdapter.__init__`` calls ``check_feishu_requirements()``
+# unconditionally and ``_make_adapter()`` below builds a real adapter in every
+# test, so without this the SDK loads *inside the first test body* — where the
+# gate's per-test ``--timeout`` applies.  Measured 2026-08-11 under the nightly
+# gate's own argv (``--timeout=60 --timeout-method=thread``): collection
+# succeeded, then the very first test died with the timeout dump parked
+# mid-``lark_oapi`` import, and pytest-timeout's thread method kills the
+# process, so all 38 tests reported as "no tests ran".
+#
+# Collection is NOT covered by the per-test timeout, so paying the load here is
+# the same one-time cost in an untimed place — not a new one.  Same fix as
+# 671b38765 gave tests/gateway/test_feishu.py.  Runs BEFORE
+# ``_ensure_feishu_mocks()`` on purpose: once the real module is in
+# ``sys.modules`` the stub installer correctly stands down, and when the SDK is
+# absent this is a no-op and the stubs take over as before.  Best-effort: a
+# failure here must not change what any test asserts.
+if importlib.util.find_spec("lark_oapi") is not None:
+    try:
+        import lark_oapi  # noqa: F401
+    except Exception:
+        pass
+
 _ensure_feishu_mocks()
 
 # When the SDK is genuinely installed, _ensure_feishu_mocks() stubs nothing and

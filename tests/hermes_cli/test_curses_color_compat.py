@@ -8,30 +8,32 @@ The bug was ``curses.init_pair(4, 8, -1)`` using raw color 8 ("bright
 black" / dim gray) which does not exist on 8-color terminals.  The fix
 clamps with ``min(8, curses.COLORS - 1)``.
 """
-import sys
-
-import pytest
-
-# curses (and its _curses C extension) is Unix-only; skip the whole module on Windows.
-if sys.platform == "win32":
-    pytest.skip("curses is not available on Windows", allow_module_level=True)
-
 import re
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+import pytest
 
-# ``_curses`` is unavailable on Windows stock Python.  Import-or-skip the whole
-# module so a missing curses is reported as a clean skip rather than raising
-# ModuleNotFoundError at collection time -- which would abort collection of the
-# entire ``tests/`` tree, not just this file.
-curses = pytest.importorskip("curses")
+# ``curses`` (and its ``_curses`` C extension) is Unix-only.  Import it
+# *optionally* rather than skipping the whole module: only the simulation
+# tests below need curses.  The source guardrails are plain text checks, and
+# they must run on Windows too — that is where a developer is just as likely
+# to reintroduce a raw ``init_pair(n, 8, ...)``.  Guarding the import (rather
+# than letting it raise) keeps a missing curses from aborting collection of
+# the entire ``tests/`` tree.
+try:
+    import curses
+except ImportError:  # Windows
+    curses = None
+
+requires_curses = pytest.mark.skipif(curses is None, reason="curses is Unix-only")
 
 
 # Path to the source files under test
 _SRC_ROOT = Path(__file__).parent.parent.parent / "hermes_cli"
 
 
+@requires_curses
 class TestInitPairClampingBehavior:
     """Simulate curses color initialization on low-color terminals.
 

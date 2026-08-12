@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _point_ledger(monkeypatch, tmp_path):
     import cron.executions as executions
@@ -156,8 +158,23 @@ def test_recovery_rejects_recycled_pid(monkeypatch, tmp_path):
     assert executions.latest_execution("recycled")["status"] == "unknown"
 
 
+@pytest.mark.timeout(240)
 def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
-    """Real temp-HERMES_HOME subprocess restart: in-flight is audit-only unknown."""
+    """Real temp-HERMES_HOME subprocess restart: in-flight is audit-only unknown.
+
+    Explicitly budgeted well above the suite-wide per-test cap. This test is
+    the only one in the file that spawns interpreters, and it spawns two — a
+    real restart needs the owner process to actually die before a *different*
+    process recovers its row, which is the whole point of the assertion. Each
+    of those pays a full cold ``import cron.executions``; on this box the pair
+    costs ~26s alone and the nightly gate runs 24 workers on top of that.
+
+    Measured 2026-08-11: standalone the file is green in 72.7s with this test
+    at 26.2s, but in the gate's parallel lane it crossed the 60s cap and
+    pytest-timeout's thread method killed the process, so all 24 tests reported
+    as "no tests ran". The cost is real and inherent, not a wedge — so raise
+    the bound for this test rather than weaken what it proves.
+    """
     home = tmp_path / "home"
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()

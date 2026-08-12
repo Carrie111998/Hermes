@@ -303,14 +303,19 @@ class TestGenerate:
             b64=None, url="https://example.com/img.png",
         )
 
+        cached = Path("/tmp/openai_gpt-image-2_20260524_000000_deadbeef.png")
         with _patched_openai(fake_client), patch(
             "plugins.image_gen.openai.save_url_image",
-            return_value=Path("/tmp/openai_gpt-image-2_20260524_000000_deadbeef.png"),
+            return_value=cached,
         ) as mock_save_url:
             result = provider.generate("a cat")
 
         assert result["success"] is True
-        assert result["image"].startswith("/")
+        # Compare against str(cached), not a "/"-prefixed literal: the contract
+        # is "the path the downloader saved", which renders with "\" on Windows.
+        assert result["image"] == str(cached), (
+            f"URL response must be cached to the saved path, got {result['image']!r}"
+        )
         assert "example.com" not in result["image"]
         mock_save_url.assert_called_once()
 

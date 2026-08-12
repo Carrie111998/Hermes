@@ -26,6 +26,7 @@ from devflow_delegation.contract import SEVERITY_RANK
 from devflow_delegation.ledger import DelegationLedger
 from devflow_delegation.lifecycle import IllegalTransitionError, transition
 from devflow_delegation.validator import MAX_OUTPUT_CHARS, validate_worktree
+from hermes_cli._subprocess_compat import run_text_capture
 
 logger = logging.getLogger(__name__)
 
@@ -114,9 +115,15 @@ def _run_checked(
 ) -> subprocess.CompletedProcess[str]:
     """Run an allowlist-owned argv vector and reject every nonzero outcome."""
     try:
-        result = subprocess.run(
-            list(argv), cwd=str(cwd), env=env, shell=False, capture_output=True,
-            text=True, encoding="utf-8", errors="replace", timeout=timeout_seconds,
+        # run_text_capture, not capture_output=True: these argv vectors spawn
+        # grandchildren as a matter of course — `git push` forks a credential
+        # helper or ssh, `gh` forks git — and on Windows a grandchild inherits
+        # the capture pipes and holds their write end open, so `timeout` never
+        # fires: subprocess.run kills only the direct child, then blocks
+        # re-draining a pipe that can no longer reach EOF. Capturing into temp
+        # files removes the pipes, and with them the hang.
+        result = run_text_capture(
+            list(argv), cwd=str(cwd), env=env, timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired as exc:
         raise ExecutorError(f"{label} timed out: {_bounded(exc.stderr)}") from exc
@@ -293,9 +300,8 @@ def _stage_commit_push(
     _run_checked(
         ["git", "add", "--", *paths], cwd=worktree_path, timeout_seconds=30, label="git add scoped paths",
     )
-    staged = subprocess.run(
-        ["git", "diff", "--cached", "--quiet"], cwd=str(worktree_path), shell=False,
-        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
+    staged = run_text_capture(
+        ["git", "diff", "--cached", "--quiet"], cwd=str(worktree_path), timeout=20,
     )
     if staged.returncode == 0:
         raise ExecutorError("scoped changes disappeared before commit")

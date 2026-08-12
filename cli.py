@@ -1148,8 +1148,31 @@ def _arm_exit_watchdog_on_shutdown_signal() -> None:
         pass  # never let the backstop break signal handling
 
 
-def _run_cleanup(*, notify_session_finalize: bool = True):
-    """Run resource cleanup exactly once."""
+def _capture_exit_scratch_dir():
+    """Resolve the sandbox scratch root now, to be swept later.
+
+    Bind this at ``atexit.register`` time and hand it to ``_run_cleanup``. The
+    sweep inside ``cleanup_all_environments`` otherwise resolves HERMES_HOME
+    when the hook *fires* — at interpreter shutdown, after pytest's monkeypatch
+    teardown has restored the real home — and so creates
+    ``<real home>/sandboxes/singularity/`` and rmtrees ``hermes-*`` under it.
+    """
+    try:
+        from tools.terminal_tool import resolve_scratch_dir
+
+        return resolve_scratch_dir()
+    except Exception:
+        return None
+
+
+def _run_cleanup(*, notify_session_finalize: bool = True, scratch_dir=None):
+    """Run resource cleanup exactly once.
+
+    ``scratch_dir`` pins the sandbox orphan sweep to a root captured when this
+    was registered with ``atexit``. Direct callers (signal handlers, the normal
+    exit path) leave it None and resolve live, which is correct: the process
+    still holds the environment it was launched with.
+    """
     global _cleanup_done
     if _cleanup_done:
         return
@@ -1167,7 +1190,7 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
     _reset_terminal_input_modes_on_exit()
 
     try:
-        _cleanup_all_terminals()
+        _cleanup_all_terminals(scratch_dir=scratch_dir)
     except Exception:
         pass
     try:
@@ -9193,9 +9216,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             # has all API keys in os.environ.
                             from tools.environments.local import _sanitize_subprocess_env
                             sanitized_env = _sanitize_subprocess_env(os.environ.copy())
-                            result = subprocess.run(
-                                exec_cmd, shell=True, capture_output=True,
-                                text=True, timeout=30, env=sanitized_env
+                            # run_text_capture, not subprocess.run: with shell=True
+                            # the real command is always a grandchild of cmd.exe,
+                            # and a grandchild inheriting capture PIPES defeats
+                            # `timeout` outright on Windows. It captures into temp
+                            # files instead, so the 30s bound actually holds.
+                            from hermes_cli._subprocess_compat import run_text_capture
+                            result = run_text_capture(
+                                exec_cmd, shell=True, timeout=30, env=sanitized_env
                             )
                             output = result.stdout.strip() or result.stderr.strip()
                             if output:
@@ -15163,8 +15191,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         process_thread = threading.Thread(target=process_loop, daemon=True)
         process_thread.start()
         
-        # Register atexit cleanup so resources are freed even on unexpected exit
-        atexit.register(_run_cleanup)
+        # Register atexit cleanup so resources are freed even on unexpected exit.
+        # The scratch root is captured HERE, not when the hook fires — see
+        # _capture_exit_scratch_dir.
+        atexit.register(_run_cleanup, scratch_dir=_capture_exit_scratch_dir())
         
         # Register signal handlers for graceful shutdown on SSH disconnect / SIGTERM
         def _signal_handler(signum, frame):
@@ -15792,7 +15822,7 @@ def main(
         sys.exit(0)
     
     # Register cleanup for single-query mode (interactive mode registers in run())
-    atexit.register(_run_cleanup)
+    atexit.register(_run_cleanup, scratch_dir=_capture_exit_scratch_dir())
 
     # Also install signal handlers in single-query / `-q` mode.  Interactive
     # mode registers its own inside HermesCLI.run(), but `-q` runs
