@@ -233,11 +233,37 @@ def _image_generate_parallel_limit() -> int:
     return max(1, min(limit, _MAX_TOOL_WORKERS))
 
 
+def _general_tool_worker_cap() -> int:
+    """Return the configured cap on concurrent tool calls (default 8).
+
+    Heavy tools (browser, MCP, terminal with large payloads) share one pool,
+    so a fixed high cap can cause memory pressure. Lower it per install via
+    ``agent.max_concurrent_tool_calls`` in config.yaml.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+        value = (
+            agent_cfg.get("max_concurrent_tool_calls")
+            if isinstance(agent_cfg, dict)
+            else None
+        )
+    except Exception:
+        value = None
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        limit = _MAX_TOOL_WORKERS
+    return max(1, min(limit, _MAX_TOOL_WORKERS))
+
+
 def _max_workers_for_tool_batch(runnable_calls) -> int:
     """Return the worker cap for a concurrent tool batch."""
     if not runnable_calls:
         return 0
-    max_workers = _MAX_TOOL_WORKERS
+    max_workers = _general_tool_worker_cap()
     if any(
         (call[2] if len(call) >= 3 else None) == "image_generate"
         for call in runnable_calls

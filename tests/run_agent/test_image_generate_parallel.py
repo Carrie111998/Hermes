@@ -95,3 +95,47 @@ def test_image_generate_parallel_worker_cap_can_be_configured_lower():
         return_value={"image_gen": {"max_parallel_requests": 1}},
     ):
         assert tool_executor._max_workers_for_tool_batch(runnable_calls) == 1
+
+
+def _non_image_calls(n):
+    return [
+        (i, _tool_call("web_search", {"q": "x"}, f"c{i}"), "web_search", {})
+        for i in range(n)
+    ]
+
+
+def test_general_tool_worker_cap_defaults_to_eight():
+    calls = _non_image_calls(10)
+    with patch("hermes_cli.config.load_config", return_value={}):
+        assert tool_executor._max_workers_for_tool_batch(calls) == 8
+
+
+def test_general_tool_worker_cap_can_be_configured_lower():
+    calls = _non_image_calls(10)
+    with patch(
+        "hermes_cli.config.load_config",
+        return_value={"agent": {"max_concurrent_tool_calls": 2}},
+    ):
+        assert tool_executor._max_workers_for_tool_batch(calls) == 2
+
+
+def test_general_tool_worker_cap_clamps_invalid_and_high_values():
+    calls = _non_image_calls(10)
+    # Above the ceiling → clamped to _MAX_TOOL_WORKERS.
+    with patch(
+        "hermes_cli.config.load_config",
+        return_value={"agent": {"max_concurrent_tool_calls": 999}},
+    ):
+        assert tool_executor._max_workers_for_tool_batch(calls) == 8
+    # Zero → floored to 1.
+    with patch(
+        "hermes_cli.config.load_config",
+        return_value={"agent": {"max_concurrent_tool_calls": 0}},
+    ):
+        assert tool_executor._max_workers_for_tool_batch(calls) == 1
+    # Non-numeric → default.
+    with patch(
+        "hermes_cli.config.load_config",
+        return_value={"agent": {"max_concurrent_tool_calls": "abc"}},
+    ):
+        assert tool_executor._max_workers_for_tool_batch(calls) == 8
