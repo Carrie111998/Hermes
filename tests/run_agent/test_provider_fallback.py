@@ -146,6 +146,41 @@ class TestFallbackChainAdvancement:
             assert mock_rpc.call_args.kwargs["explicit_api_key"] == "env-secret"
 
 
+    def test_named_provider_persisted_api_mode_controls_activation(self):
+        endpoint = "https://opaque-gateway.example/custom/v1"
+        selected_model = "provider-native-model"
+        agent = _make_agent(fallback_model=[{
+            "provider": "local-backup",
+            "model": selected_model,
+            "base_url": endpoint,
+            "api_mode": "codex_responses",
+        }])
+        fallback_client = _mock_client(base_url=endpoint, api_key="provider-key")
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(fallback_client, "resolver-default-must-not-win"),
+            ) as mock_resolve,
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda model, _provider: model,
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        mock_resolve.assert_called_once_with(
+            "local-backup", model=selected_model, raw_codex=True,
+            explicit_base_url=endpoint,
+            explicit_api_key=None,
+            api_mode="codex_responses")
+        assert agent.client is fallback_client
+        assert agent.provider == "local-backup"
+        assert agent.model == selected_model
+        assert agent.base_url == endpoint
+        assert agent.api_mode == "codex_responses"
+
+
     def test_nous_anthropic_fallback_uses_the_messages_wire(self):
         """Portal Claude fallbacks must not stay on chat_completions.
 
