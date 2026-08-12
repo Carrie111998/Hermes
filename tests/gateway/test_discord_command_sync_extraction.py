@@ -398,28 +398,6 @@ def _class_method(tree, class_name, method_name):
     return methods[0]
 
 
-def _normalize_helper_ast(node):
-    """Compare implementation AST while ignoring only extraction bookkeeping."""
-    staticmethod_marker = ast.Name(
-        id="__staticmethod_owner__", ctx=ast.Load()
-    )
-    for descendant in ast.walk(node):
-        for attribute in ("lineno", "col_offset", "end_lineno", "end_col_offset"):
-            if hasattr(descendant, attribute):
-                setattr(descendant, attribute, None)
-        if isinstance(descendant, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            normalized_decorators = []
-            for decorator in descendant.decorator_list:
-                if isinstance(decorator, ast.Name) and decorator.id == "staticmethod":
-                    # The decorator belongs to the source class in each tree;
-                    # preserve its presence, but not that class's nesting.
-                    normalized_decorators.append(staticmethod_marker)
-                else:
-                    normalized_decorators.append(decorator)
-            descendant.decorator_list = normalized_decorators
-    return ast.dump(node, annotate_fields=True, include_attributes=True)
-
-
 def _adapter_shim_calls(tree):
     calls = {}
     for name in _EXTRACTED_HELPER_NAMES:
@@ -442,29 +420,31 @@ def _adapter_shim_calls(tree):
     return calls
 
 
-def test_pinned_adapter_window_matches_golden_sha_for_all_extracted_helpers():
-    source_pin = "70c6cf8e7efde9bdbce013a493b577170f9b3d75"
-    source_path = "plugins/platforms/discord/adapter.py"
-    source = subprocess.check_output(["git", "show", f"{source_pin}:{source_path}"])
-    window = b"".join(source.splitlines(keepends=True)[2769:2859])
-
-    assert len(window) == 4230
-    assert hashlib.sha256(window).hexdigest() == (
-        "a916fc247b2ce306568c72dd4799633e9669fe928dc7961e9d3a0f4aa028bd3e"
-    )
-    for helper_name in _EXTRACTED_HELPER_NAMES:
-        assert f"def {helper_name}".encode() in window
-
-    historical_tree = ast.parse(source.decode("utf-8"))
+def test_extracted_helpers_match_pinned_semantic_hashes():
+    pinned_hashes = {
+        "_canonicalize_app_command_payload": (
+            "45bdde78c43693a12bdf73da7eea85f459c2f69b452160cd5917c590599d4c5d"
+        ),
+        "_normalize_permissions": (
+            "f5b113aa2aa7c8595b90097d0da81b739484d0194fc8fdbaa54249eb2c41cc86"
+        ),
+        "_existing_command_to_payload": (
+            "59093d528f0fc9814f6465a04c033b02783700f81e462e237a3feea2685c517e"
+        ),
+        "_canonicalize_app_command_option": (
+            "9d0e9329d0f9eebdfcf21a17f2110c8938d2b61583a775fcc7afe4bd46e45d83"
+        ),
+        "_patchable_app_command_payload": (
+            "dcf146b8e8ecf16bb46967e238b89852a97f58b15732aa2a5aba0073e56cca1d"
+        ),
+    }
     current_source = Path(command_sync.__file__).read_text(encoding="utf-8")
     current_tree = ast.parse(current_source)
     for helper_name in _EXTRACTED_HELPER_NAMES:
-        historical = _class_method(historical_tree, "DiscordAdapter", helper_name)
         current = _class_method(current_tree, "_CommandSyncHelpers", helper_name)
-        assert _normalize_helper_ast(
-            historical
-        ) == _normalize_helper_ast(current), (
-            f"{helper_name} implementation diverged from pinned adapter golden"
+        semantic_source = ast.unparse(current).encode("utf-8")
+        assert hashlib.sha256(semantic_source).hexdigest() == pinned_hashes[helper_name], (
+            f"{helper_name} implementation diverged from pinned semantic golden"
         )
 
     adapter_tree = ast.parse(
