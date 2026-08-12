@@ -225,14 +225,18 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
             return 1
         return checked
 
-    # Installer checkouts are shallow (`git clone --depth 1`). On a shallow
-    # clone the history stops at a single commit, so a plain `git fetch` would
-    # unshallow the repo (dragging in the whole history) and
-    # `rev-list --count HEAD..origin/main` would report a huge bogus "behind"
-    # number (e.g. "12492 commits behind"). Detect shallow up front: fetch with
-    # --depth 1 to preserve the boundary and compare tip SHAs instead of
-    # counting. Full clones (developers, Docker dev images) keep the exact
-    # count path unchanged. Mirrors the desktop fix in apps/desktop/electron/main.cjs.
+    # Installer checkouts are shallow (`git clone --depth 1`). This used to
+    # fetch with `--depth 1` here too, on the theory that a plain fetch
+    # would unshallow the repo and drag in the whole history. Verified
+    # against real git behavior that this isn't the case: a plain,
+    # branch-scoped fetch on an ALREADY-shallow repo extends the existing
+    # shallow boundary forward incrementally -- only the new commits
+    # transfer, and merge-base/rev-list remain exact. --depth 1, in
+    # contrast, unconditionally marks the freshly fetched tip as a NEW
+    # boundary even when its parent is already local, permanently breaking
+    # the count from that fetch onward -- not self-healing, since every
+    # later plain fetch's new tip connects to that now-orphaned boundary
+    # (issue #84591).
     shallow = _git_stdout(["rev-parse", "--is-shallow-repository"], cwd=repo_dir)
     is_shallow = shallow == "true"
 
@@ -246,8 +250,6 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         # unaffected; the shallow path compares against FETCH_HEAD, which a
         # scoped fetch also updates.
         fetch_args = ["git", "fetch", "origin", "main"]
-        if is_shallow:
-            fetch_args += ["--depth", "1"]
         fetch_args.append("--quiet")
         subprocess.run(
             fetch_args,
@@ -258,17 +260,35 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         pass  # Offline or timeout — use stale refs, that's fine
 
     if is_shallow:
-        # No history to count across the shallow boundary. `origin/main` may not
-        # be a tracking ref in a `clone --depth 1`, so prefer FETCH_HEAD (just
-        # updated by the fetch above) and fall back to origin/main.
-        head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
+        # `origin/main` may not be a tracking ref in a `clone --depth 1`, so
+        # prefer FETCH_HEAD (just updated by the fetch above) and fall back
+        # to origin/main.
         target_rev = (
             _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
             or _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir)
         )
+        head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         if not head_rev or not target_rev:
             return None
-        return 0 if head_rev == target_rev else UPDATE_AVAILABLE_NO_COUNT
+        if head_rev == target_rev:
+            return 0
+        # The shallow boundary no longer blocks an exact count in the common
+        # case now that the fetch above isn't --depth-limited. Try rev-list
+        # against the resolved target first, falling back to presence-only
+        # only if it genuinely can't connect (e.g. a rewritten upstream
+        # history orphaning the old boundary).
+        try:
+            result = subprocess.run(
+                ["git", "rev-list", "--count", f"{head_rev}..{target_rev}"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=5,
+                cwd=str(repo_dir),
+            )
+            if result.returncode == 0:
+                return int(result.stdout.strip())
+        except Exception:
+            pass
+        return UPDATE_AVAILABLE_NO_COUNT
 
     try:
         result = subprocess.run(

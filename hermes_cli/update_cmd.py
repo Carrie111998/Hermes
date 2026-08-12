@@ -2290,11 +2290,22 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     # Note: upstream/<branch> may not exist for non-main branches (a fork's
     # bb/gui has no upstream counterpart), so when the caller picks a
     # non-default branch we skip the upstream probe and use origin directly.
-    # Installer checkouts are shallow (`git clone --depth 1`). A plain
-    # `git fetch` would unshallow the repo (dragging in the whole history —
-    # the exact cost the shallow clone avoided) and the rev-list count below
-    # would then report a huge bogus "behind" number. Detect shallow up front:
-    # fetch with --depth 1 to preserve the boundary and report presence-only.
+    #
+    # Installer checkouts are shallow (`git clone --depth 1`). This used to
+    # fetch with `--depth 1` here too, on the theory that a plain fetch would
+    # "unshallow" the repo and drag in the whole history. Verified against
+    # real git behavior that this isn't the case: a plain, branch-scoped
+    # fetch on an ALREADY-shallow repo extends the existing shallow boundary
+    # forward incrementally -- git's fetch negotiation reuses the current
+    # boundary as a "have" reference, so only the new commits transfer, .git
+    # doesn't grow, and merge-base/rev-list remain exact. --depth 1, in
+    # contrast, unconditionally marks the freshly fetched tip as a NEW
+    # boundary even when its parent is already local, permanently breaking
+    # merge-base from that fetch onward -- not self-healing, since every
+    # later plain fetch's new tip connects to that now-orphaned boundary
+    # (issue #84591). Kept `is_shallow` (used below to decide the fallback
+    # path if rev-list genuinely can't connect, e.g. after a history rewrite
+    # upstream) without any depth-limiting on the fetch itself.
     is_shallow = (
         subprocess.run(
             git_cmd + ["rev-parse", "--is-shallow-repository"],
@@ -2304,7 +2315,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         ).stdout.strip()
         == "true"
     )
-    depth_args = ["--depth", "1"] if is_shallow else []
+    depth_args: list[str] = []
 
     if branch == "main":
         # Probe locally (~6 ms) whether an 'upstream' remote exists at all
@@ -2382,8 +2393,32 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         sys.exit(1)
 
     if is_shallow:
-        # No history to count across the shallow boundary. Compare tip SHAs and
-        # report presence-only (mirrors the banner's _check_via_local_git).
+        # The shallow boundary no longer blocks an exact count in the
+        # common case (see the fetch comment above) -- try rev-list first
+        # and only fall back to presence-only if it genuinely can't
+        # connect HEAD to compare_branch (e.g. upstream history was
+        # rewritten and the old boundary is no longer an ancestor).
+        rev_probe = subprocess.run(
+            git_cmd + ["rev-list", f"HEAD..{compare_branch}", "--count"],
+            cwd=_m().PROJECT_ROOT,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if rev_probe.returncode == 0:
+            behind = int(rev_probe.stdout.strip())
+            if behind == 0:
+                print("✓ Already up to date.")
+            else:
+                commits_word = "commit" if behind == 1 else "commits"
+                print(f"⚕ Update available: {behind} {commits_word} behind {compare_branch}.")
+                from hermes_cli.config import recommended_update_command
+
+                print(f"  Run '{recommended_update_command()}' to install.")
+            return
+
+        # rev-list couldn't connect the history -- fall back to
+        # presence-only. Compare tip SHAs and report accordingly (mirrors
+        # the banner's _check_via_local_git).
         head_sha = subprocess.run(
             git_cmd + ["rev-parse", "HEAD"],
             cwd=_m().PROJECT_ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
