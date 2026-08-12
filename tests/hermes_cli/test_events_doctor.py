@@ -1,7 +1,11 @@
 """Tests for hermes events doctor CLI diagnostic."""
+import atexit
 import json
+import shutil
 import sqlite3
 import subprocess
+import tempfile
+from pathlib import Path
 
 from events.bus import EventBus
 from events.schema import EventType
@@ -111,22 +115,95 @@ def _git(repo, *args):
     )
 
 
-def _make_repo(tmp_path, name="repo"):
-    repo = tmp_path / name
+# ---------------------------------------------------------------------------
+# Git-spawn budget.
+#
+# ``TestCodeDrift`` builds a real git repo per test, and on Windows every
+# ``git`` spawn costs ~0.5s (``git init`` ~1.2s). At 16 spawns per test that
+# put 11 of the 12 tests at 22-43s against the repo's 30s ``--timeout`` cap
+# from pyproject -- and because ``--timeout-method=thread`` kills the
+# interpreter, the first one over took the other 17 tests in the file with it.
+# Measured with the cap lifted (``--timeout=600``): 23 passed in 402s, worst
+# test 42.85s.
+#
+# The helpers below keep the same repo shapes and the same assertions, and only
+# stop paying for spawns that produce information we can read off disk:
+#
+#   * ``_make_repo``  4 spawns -> 0   (copy a once-built template)
+#   * ``_commit``     3 spawns -> 2   (read HEAD instead of ``rev-parse``)
+#
+# The probe under test (``sample_code_drift``, 5 spawns) is untouched -- that
+# is the behaviour these tests exist to cover.
+# ---------------------------------------------------------------------------
+
+def _build_repo_template():
+    """One ``git init`` + identity config, copied per test.
+
+    A plain ``git init`` embeds no absolute paths, so copying the directory is
+    equivalent to re-running it. The identity is written straight into the
+    repo's own ``.git/config`` rather than through three ``git config`` spawns;
+    writing it into the repo (not HOME) keeps it independent of the conftest
+    ``_hermetic_environment`` fixture, which repoints HOME per test.
+    """
+    base = Path(tempfile.mkdtemp(prefix="events-doctor-git-template-"))
+    atexit.register(shutil.rmtree, base, True)
+    repo = base / "repo"
     repo.mkdir()
     assert _git(repo, "init", "-b", "main").returncode == 0
-    _git(repo, "config", "user.email", "t@test")
-    _git(repo, "config", "user.name", "t")
-    _git(repo, "config", "commit.gpgsign", "false")
+    config = repo / ".git" / "config"
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        + "[user]\n\temail = t@test\n\tname = t\n"
+        + "[commit]\n\tgpgsign = false\n",
+        encoding="utf-8",
+    )
     return repo
+
+
+# Built at import, NOT lazily on first use. `git init` is the single most
+# expensive spawn here (~1.2s idle, several seconds on a loaded box), and a
+# lazy build bills all of it to whichever test calls `_make_repo` first --
+# which is exactly what kept `test_in_sync_detached_head_is_ok` over the cap
+# under parallel load after the other spawn cuts had landed. Module scope puts
+# it in collection, which pytest-timeout does not cover.
+_REPO_TEMPLATE = _build_repo_template()
+
+
+def _make_repo(tmp_path, name="repo"):
+    repo = tmp_path / name
+    shutil.copytree(_REPO_TEMPLATE, repo)
+    return repo
+
+
+def _head_sha(repo):
+    """``git rev-parse HEAD`` without the spawn.
+
+    Falls back to the real command if HEAD is anything other than a loose ref
+    or a raw SHA, so a packed-refs repo cannot make this silently wrong.
+    """
+    head = (repo / ".git" / "HEAD").read_text(encoding="utf-8").strip()
+    if not head.startswith("ref: "):
+        return head
+    ref = repo / ".git" / head[len("ref: "):].strip()
+    if ref.is_file():
+        return ref.read_text(encoding="utf-8").strip()
+    return _git(repo, "rev-parse", "HEAD").stdout.strip()
 
 
 def _commit(repo, msg):
     f = repo / "f.txt"
-    f.write_text(f.read_text() + msg + "\n" if f.exists() else msg + "\n")
-    _git(repo, "add", "-A")
-    assert _git(repo, "commit", "-m", msg).returncode == 0
-    return _git(repo, "rev-parse", "HEAD").stdout.strip()
+    tracked = f.exists()
+    f.write_text(f.read_text() + msg + "\n" if tracked else msg + "\n")
+    if tracked:
+        # ``f.txt`` is the only file these tests ever touch, so once it is
+        # tracked ``commit -a`` covers it and the separate ``git add`` spawn
+        # is pure cost. The first commit still needs ``add`` -- ``-a`` does
+        # not stage a file git has never seen.
+        assert _git(repo, "commit", "-a", "-m", msg).returncode == 0
+    else:
+        _git(repo, "add", "-A")
+        assert _git(repo, "commit", "-m", msg).returncode == 0
+    return _head_sha(repo)
 
 
 class TestCodeDrift:
