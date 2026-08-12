@@ -43,6 +43,12 @@ def _normalize_skills(single_skill=None, skills: Optional[Iterable[str]] = None)
 
 
 def _cron_api(**kwargs):
+    # CLI invocations are one-shot processes. Mark them stateless so a manual
+    # run executes synchronously instead of dispatching work to a daemon that
+    # dies as soon as this command returns.
+    from gateway.session_context import declare_stateless_channel
+    declare_stateless_channel()
+
     from tools.cronjob_tools import cronjob as cronjob_tool
 
     return json.loads(cronjob_tool(**kwargs))

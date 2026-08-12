@@ -471,6 +471,45 @@ class DeliveryRouter:
 
         if not target.chat_id:
             raise ValueError(f"No chat ID for {target.platform.value} delivery")
+
+        # Protect Discord task parents before transport selection matters.
+        # This keeps relay fallback from bypassing the native adapter's guard.
+        if target.platform == Platform.DISCORD:
+            discord_config = self.config.platforms.get(Platform.DISCORD)
+            extra = getattr(discord_config, "extra", None)
+            raw = (
+                extra.get("agent_task_forum_channels")
+                if isinstance(extra, dict)
+                else None
+            )
+            if isinstance(raw, list):
+                protected_ids = {
+                    str(value).strip() for value in raw if str(value).strip()
+                }
+            else:
+                protected_ids = {
+                    value.strip() for value in str(raw or "").split(",")
+                    if value.strip()
+                }
+            metadata_thread_id = (metadata or {}).get("thread_id")
+            metadata_message_thread_id = (metadata or {}).get("message_thread_id")
+            if (
+                metadata_thread_id
+                and metadata_message_thread_id
+                and str(metadata_thread_id) != str(metadata_message_thread_id)
+            ):
+                raise ValueError("Conflicting Discord delivery thread metadata")
+            effective_id = str(
+                metadata_thread_id
+                or metadata_message_thread_id
+                or target.thread_id
+                or target.chat_id
+            )
+            if effective_id in protected_ids:
+                raise ValueError(
+                    "Direct delivery to this Discord task channel is blocked; "
+                    "start a live agent task thread instead."
+                )
         
         # Guard: handle oversized cron output.
         #
@@ -640,7 +679,5 @@ class DeliveryRouter:
             if _send_result_failed(result):
                 raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
         return result
-
-
 
 
