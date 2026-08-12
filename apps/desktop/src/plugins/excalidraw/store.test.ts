@@ -7,7 +7,7 @@ const {
   registerPaneCloser,
   removeTreePane,
   revealTreePane,
-  setPaneCollapsed
+  collapseTreePane
 } = vi.hoisted(() => ({
   $narrowViewport: { get: () => false, listen: () => () => undefined },
   $registryVersion: { get: () => 0, listen: () => () => undefined, subscribe: () => () => undefined },
@@ -15,7 +15,7 @@ const {
   registerPaneCloser: vi.fn(),
   removeTreePane: vi.fn(),
   revealTreePane: vi.fn(),
-  setPaneCollapsed: vi.fn()
+  collapseTreePane: vi.fn()
 }))
 
 vi.mock('@/contrib/registry', () => ({ $registryVersion, registry: { getArea: () => [], register } }))
@@ -24,7 +24,7 @@ vi.mock('@/components/pane-shell/tree/store', () => ({
   registerPaneCloser,
   removeTreePane,
   revealTreePane,
-  setPaneCollapsed
+  collapseTreePane
 }))
 
 import { type ExcalidrawDocumentIdentity, excalidrawPaneId } from './identity'
@@ -43,7 +43,7 @@ describe('Excalidraw drawing panes', () => {
     revealTreePane.mockReset()
     registerPaneCloser.mockReset()
     removeTreePane.mockReset()
-    setPaneCollapsed.mockReset()
+    collapseTreePane.mockReset()
     resetExcalidrawDocumentsForTest()
   })
 
@@ -59,7 +59,7 @@ describe('Excalidraw drawing panes', () => {
       expect.objectContaining({
         area: 'panes',
         data: expect.objectContaining({
-          dock: { pane: 'workspace', pos: 'right' },
+          dock: { root: 'right' },
           placement: 'right'
         }),
         id: paneId,
@@ -89,21 +89,26 @@ describe('Excalidraw drawing panes', () => {
     ])
   })
 
-  it('minimizes the pane without forgetting its document or registration', () => {
+  it('minimizes the pane without forgetting its document, registration, or controller', async () => {
+    const controller = { reconcileExternalChange: vi.fn(), waitForSave: vi.fn(), canCloseCleanly: vi.fn() }
     openDrawing(identity, 'fp1')
+    setDrawingController(identity, controller)
     const paneId = excalidrawPaneId(identity)
     const close = registerPaneCloser.mock.calls[0]?.[1]
 
     close?.()
 
-    expect(setPaneCollapsed).toHaveBeenCalledWith(paneId, true)
+    expect(collapseTreePane).toHaveBeenCalledWith(paneId)
     expect(removeTreePane).not.toHaveBeenCalled()
     expect(register).toHaveBeenCalledTimes(1)
     expect($excalidrawDocuments.get()).toEqual([
       expect.objectContaining({ fingerprint: 'fp1', identity, status: 'connected' })
     ])
 
-    openDrawing(identity, 'fp2')
+    await handleChangedDocument(identity, 'fp2')
+    expect(controller.reconcileExternalChange).toHaveBeenCalledWith('fp2')
+
+    openDrawing(identity, 'fp3')
     expect(register).toHaveBeenCalledTimes(1)
     expect(revealTreePane).toHaveBeenLastCalledWith(paneId)
   })

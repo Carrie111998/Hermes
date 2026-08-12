@@ -288,6 +288,29 @@ export function insertAtGroup(
   return normalize(walk(node))
 }
 
+/** Insert a pane at an outer layout edge. A same-axis root keeps its existing
+ * children and their proportions inside one half of the new split; otherwise
+ * the old tree becomes the opposite half. */
+export function insertAtRootEdge(node: LayoutNode, paneId: string, edge: RootEdge): LayoutNode {
+  const orientation: Orientation = edge === 'left' || edge === 'right' ? 'row' : 'column'
+  const leading = edge === 'left' || edge === 'top'
+  const added = group([paneId])
+
+  if (node.type === 'split' && node.orientation === orientation) {
+    const currentWeights = node.children.map((_, index) => node.weights[index] ?? 1)
+    const total = currentWeights.reduce((sum, weight) => sum + weight, 0) || currentWeights.length
+    const existingWeights = currentWeights.map(weight => weight / total)
+
+    return {
+      ...node,
+      children: leading ? [added, ...node.children] : [...node.children, added],
+      weights: leading ? [1, ...existingWeights] : [...existingWeights, 1]
+    }
+  }
+
+  return split(orientation, leading ? [added, node] : [node, added], [1, 1])
+}
+
 /**
  * The tree's VISIBLE shape: pane stacks + split orientations, with empty
  * groups skipped (editor-session trees may still hold them) and single-child

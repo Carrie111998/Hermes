@@ -599,53 +599,58 @@ export function TreeGroup({
           scroll positions and measurements survive the round-trip — which also
           makes a hidden layer's rect identical to the visible one's, hence the
           marker document-wide lookups filter on (see pane-visibility.ts). */}
-      {!node.minimized && (
-        <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
-          {isEmpty ? (
-            <div className="grid h-full place-items-center">
-              {/* Same decode primitive as the CONNECTING boot overlay. */}
-              <DecodeText className="text-(--ui-text-quaternary)" cursor prefix={1} text="HERMES" />
-            </div>
-          ) : (
-            keptPanes.map(paneId => {
-              const pane = paneFor(paneId)
-              const isActive = paneId === activeId
+      <div
+        aria-hidden={node.minimized || undefined}
+        className={cn(
+          'min-h-0 min-w-0 overflow-hidden',
+          node.minimized ? 'pointer-events-none invisible absolute inset-0' : 'relative flex-1'
+        )}
+        {...hiddenPaneProps(Boolean(node.minimized))}
+      >
+        {isEmpty ? (
+          <div className="grid h-full place-items-center">
+            {/* Same decode primitive as the CONNECTING boot overlay. */}
+            <DecodeText className="text-(--ui-text-quaternary)" cursor prefix={1} text="HERMES" />
+          </div>
+        ) : (
+          keptPanes.map(paneId => {
+            const pane = paneFor(paneId)
+            const isActive = !node.minimized && paneId === activeId
 
-              return (
-                <div
-                  aria-hidden={!isActive || undefined}
-                  className={cn('absolute inset-0 overflow-auto', !isActive && 'pointer-events-none invisible')}
-                  key={paneId}
-                  {...hiddenPaneProps(!isActive)}
-                >
-                  {pane?.render ? (
-                    // Visibility flows to the pane so a kept-alive chat surface
-                    // can gate its hot (per-token) subscriptions while hidden;
-                    // the group id identifies the ZONE it lives in, for state
-                    // that is per-zone rather than per-tab (composer pop-out).
-                    // The reload epoch keys the CONTENT, not this layer: a
-                    // Reload remounts the contribution (effects re-run, state
-                    // resets) while the layer — and every other tab — stays.
-                    <PaneGroupContext.Provider value={node.id}>
-                      <PaneVisibleContext.Provider value={isActive}>
-                        <ContribBoundary id={pane.id} key={paneEpochs[paneId] ?? 0}>
-                          <ContribRender render={pane.render} />
-                        </ContribBoundary>
-                      </PaneVisibleContext.Provider>
-                    </PaneGroupContext.Provider>
-                  ) : (
-                    isActive && (
-                      <div className="p-3 font-mono text-[11px] text-(--ui-text-quaternary)">
-                        {t.zones.missingPane(paneId)}
-                      </div>
-                    )
-                  )}
-                </div>
-              )
-            })
-          )}
-        </div>
-      )}
+            return (
+              <div
+                aria-hidden={!isActive || undefined}
+                className={cn('absolute inset-0 overflow-auto', !isActive && 'pointer-events-none invisible')}
+                key={paneId}
+                {...hiddenPaneProps(!isActive)}
+              >
+                {pane?.render ? (
+                  // Visibility flows to the pane so a kept-alive chat surface
+                  // can gate its hot (per-token) subscriptions while hidden;
+                  // the group id identifies the ZONE it lives in, for state
+                  // that is per-zone rather than per-tab (composer pop-out).
+                  // The reload epoch keys the CONTENT, not this layer: a
+                  // Reload remounts the contribution (effects re-run, state
+                  // resets) while the layer — and every other tab — stays.
+                  <PaneGroupContext.Provider value={node.id}>
+                    <PaneVisibleContext.Provider value={isActive}>
+                      <ContribBoundary id={pane.id} key={paneEpochs[paneId] ?? 0}>
+                        <ContribRender render={pane.render} />
+                      </ContribBoundary>
+                    </PaneVisibleContext.Provider>
+                  </PaneGroupContext.Provider>
+                ) : (
+                  isActive && (
+                    <div className="p-3 font-mono text-[11px] text-(--ui-text-quaternary)">
+                      {t.zones.missingPane(paneId)}
+                    </div>
+                  )
+                )}
+              </div>
+            )
+          })
+        )}
+      </div>
 
       {/* Edit-mode veil: the BODY is a drag handle for the active pane. It
           starts below the header so tabs/headers stay directly interactive
