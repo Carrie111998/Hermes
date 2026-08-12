@@ -258,6 +258,15 @@ def _expand_file_reference(
     if not path.is_file():
         return f"{ref.raw}: path is not a file", None
     if _is_binary_file(path):
+        # Authorization already ran above (_ensure_reference_path_allowed), so
+        # a sensitive or out-of-root path never reaches the store — probing one
+        # must not become a reason to read and persist it.
+        sidecar = _processed_sidecar(path)
+        if sidecar is not None:
+            return None, (
+                f"📄 {ref.raw} processed from `{path.name}` "
+                f"({estimate_tokens_rough(sidecar)} tokens)\n```markdown\n{sidecar}\n```"
+            )
         # A binary file can't be inlined as text, but it IS on disk (the agent's
         # tools run where this resolves — the local cwd, or the staged copy in a
         # remote session workspace). Returning a bare "not supported" warning
@@ -554,6 +563,24 @@ def _human_bytes(n: int) -> str:
             return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024
     return f"{size:.1f} GB"
+
+
+def _processed_sidecar(path: Path) -> str | None:
+    """Text of an already-processed Markdown sidecar for this exact file.
+
+    Lookup only: ``processed_path_for`` never ingests, so referencing a binary
+    the user never attached leaves the store untouched. Any failure here is a
+    miss, not an error — the caller falls back to the actionable binary block.
+    """
+    try:
+        from .document_artifacts import get_store
+
+        sidecar = get_store().processed_path_for(path)
+        if sidecar is None:
+            return None
+        return sidecar.read_text(encoding="utf-8") or None
+    except Exception:
+        return None
 
 
 def _binary_reference_block(ref: ContextReference, path: Path) -> str:

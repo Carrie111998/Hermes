@@ -226,6 +226,54 @@ def test_binary_file_yields_actionable_block_not_a_dead_warning(sample_repo: Pat
     assert str(sample_repo / "blob.bin") in result.message
 
 
+def test_known_document_inlines_its_processed_sidecar(sample_repo: Path, tmp_path,
+                                                      monkeypatch):
+    """A document the user already attached is inlined, not handed back as a path."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    import agent.document_artifacts as store_module
+
+    store_module.reset_store_cache()
+    catalog = sample_repo / "catalog.xlsx"
+    # An .xlsx extension makes this a "binary" reference; the store decides
+    # whether a readable form exists.
+    catalog.write_bytes(b"sku,name\nA-1,Widget\n")
+
+    from agent.context_references import preprocess_context_references
+
+    # Not yet ingested: the reference must still be the actionable binary block,
+    # and probing it must not create an entry.
+    before = preprocess_context_references(
+        "Check @file:catalog.xlsx", cwd=sample_repo, context_length=100_000
+    )
+    assert "binary file" in before.message.lower()
+    assert store_module.get_store().processed_path_for(catalog) is None
+
+    # Once ingested through the normal attachment path, the same reference
+    # inlines the readable form while still naming the original file.
+    store_module.get_store().ingest(
+        _as_csv(catalog), session_id="s", origin="cli"
+    )
+    after = preprocess_context_references(
+        "Check @file:catalog.xlsx", cwd=sample_repo, context_length=100_000
+    )
+    store_module.reset_store_cache()
+    assert "Widget" in after.message
+    assert "catalog" in after.message
+    assert "binary file" not in after.message.lower()
+
+
+def _as_csv(path: Path) -> Path:
+    """Same bytes under a name the processor accepts.
+
+    The store matches on content checksum, so ingesting the identical bytes as
+    a .csv gives the .xlsx reference a sidecar without needing a real xlsx
+    fixture — which is exactly the checksum-keyed reuse the store promises.
+    """
+    twin = path.with_suffix(".csv")
+    twin.write_bytes(path.read_bytes())
+    return twin
+
+
 def test_soft_budget_warns_and_hard_budget_refuses(sample_repo: Path):
     from agent.context_references import preprocess_context_references
 
