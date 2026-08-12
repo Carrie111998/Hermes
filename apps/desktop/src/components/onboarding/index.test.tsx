@@ -62,18 +62,44 @@ describe('onboarding Picker', () => {
 
     expect(screen.getByText('Nous Portal')).toBeTruthy()
     expect(screen.getByText('Recommended')).toBeTruthy()
+    // Fireworks stays behind the disclosure with the other alternatives; only
+    // Nous Portal is visible before the user expands the list.
+    expect(screen.queryByText('Fireworks AI')).toBeNull()
     expect(screen.queryByText('Anthropic API Key')).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: 'Other providers' }))
 
+    expect(screen.getByText('Fireworks AI')).toBeTruthy()
     expect(screen.getByText('Anthropic API Key')).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Collapse' })).toBeTruthy()
+  })
+
+  it('shows Fireworks first in the expanded list, ahead of other OAuth providers', () => {
+    setProviders([
+      provider('openai-codex', 'OpenAI Codex / ChatGPT'),
+      provider('minimax-oauth', 'MiniMax'),
+      provider('nous', 'Nous Portal')
+    ])
+    render(<Picker ctx={ctx} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Other providers' }))
+
+    const labels = screen
+      .getAllByRole('button')
+      .map(el => el.textContent ?? '')
+      .filter(text => /Nous Portal|Fireworks AI|OpenAI OAuth|MiniMax|OpenRouter/.test(text))
+
+    const indexOf = (needle: string) => labels.findIndex(text => text.includes(needle))
+    expect(indexOf('Nous Portal')).toBeGreaterThanOrEqual(0)
+    expect(indexOf('Fireworks AI')).toBeGreaterThan(indexOf('Nous Portal'))
+    expect(indexOf('OpenAI OAuth')).toBeGreaterThan(indexOf('Fireworks AI'))
+    expect(indexOf('MiniMax')).toBeGreaterThan(indexOf('OpenAI OAuth'))
   })
 
   it('shows every provider directly when Nous Portal is absent', () => {
     setProviders([provider('anthropic', 'Anthropic Claude'), provider('openai-codex', 'OpenAI Codex / ChatGPT')])
     render(<Picker ctx={ctx} />)
 
+    expect(screen.getByText('Fireworks AI')).toBeTruthy()
     expect(screen.getByText('Anthropic API Key')).toBeTruthy()
     expect(screen.getByText('OpenAI OAuth (ChatGPT)')).toBeTruthy()
     expect(screen.queryByText('Other sign-in options')).toBeNull()
