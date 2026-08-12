@@ -339,13 +339,8 @@ async def test_shutdown_notification_uses_persisted_origin_for_colon_ids():
 
 
 @pytest.mark.asyncio
-async def test_drain_suppress_skips_home_channel_keeps_session_ping(tmp_path, monkeypatch):
-    """A suppress_notification drain marker mutes ONLY the home-channel broadcast.
-
-    The per-active-session interrupt ping MUST still fire (it carries the
-    "your task was interrupted, message me to resume" hint). This is the core
-    drain-notification-suppression contract.
-    """
+async def test_drain_suppress_mutes_all_shutdown_notifications(tmp_path, monkeypatch):
+    """A maintenance drain marker mutes every shutdown notification."""
     from gateway.config import HomeChannel, Platform
     import gateway.drain_control as dc
 
@@ -366,12 +361,29 @@ async def test_drain_suppress_skips_home_channel_keeps_session_ping(tmp_path, mo
 
     await runner._notify_active_sessions_of_shutdown()
 
-    # Exactly one send — the active-session ping to chat 999. The home-channel
-    # broadcast to home-42 was suppressed.
-    assert len(adapter.sent_calls) == 1
+    assert adapter.sent_calls == []
+
+
+@pytest.mark.asyncio
+async def test_drain_without_suppress_notification_keeps_shutdown_notifications(
+    tmp_path, monkeypatch
+):
+    """A normal drain keeps the established lifecycle notification behavior."""
+    from gateway.config import HomeChannel, Platform
+    import gateway.drain_control as dc
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+    runner._running_agents["agent:main:telegram:dm:999"] = MagicMock()
+    dc.write_drain_request(principal="operator", suppress_notification=False)
+
+    await runner._notify_active_sessions_of_shutdown()
+
     sent_chat_ids = {chat_id for chat_id, _content, _meta in adapter.sent_calls}
-    assert "999" in sent_chat_ids
-    assert "home-42" not in sent_chat_ids
-    assert "shutting down" in adapter.sent[0]
-
-
+    assert sent_chat_ids == {"999", "home-42"}

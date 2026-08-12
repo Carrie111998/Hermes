@@ -9640,6 +9640,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         messages can be delivered. Best-effort: individual send failures are
         logged and swallowed so they never block the shutdown sequence.
         """
+        try:
+            from gateway.drain_control import drain_notification_suppressed
+
+            if drain_notification_suppressed():
+                logger.info(
+                    "All shutdown notifications suppressed by maintenance "
+                    "drain marker (suppress_notification=true)"
+                )
+                return
+        except Exception as e:
+            # Never let a maintenance-marker read block shutdown. The normal
+            # notification path is the safe fallback when the marker cannot
+            # be read.
+            logger.debug("maintenance shutdown-notification check failed: %s", e)
+
         active = self._snapshot_running_agents()
         restart_source = self._restart_command_source if self._restart_requested else None
 
@@ -9750,19 +9765,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Skipping home-channel shutdown notifications for in-chat restart")
             return
 
-        # Suppress ONLY the home-channel broadcast when the drain that is ending
-        # in this shutdown asked us to be quiet (e.g. a NAS auto-update image
-        # migration — drain-gated, then the machine is recreated). On the
-        # always-on Hermes Cloud fleet that broadcast would otherwise fire on
-        # every routine auto-update, spamming home channels with operator-
-        # flavoured "gateway shutting down" pings the user doesn't care about.
-        # The per-active-session interrupt pings above are deliberately NOT
-        # gated: on a drained shutdown they're empty by construction, and in the
-        # force-interrupt (deadline-exceeded) case they carry the genuinely
-        # useful "your task was cut off, message me to resume" hint. The flag is
-        # only honoured for a CURRENT-epoch marker (drain_notification_suppressed
-        # reuses the NS-570 staleness check), so an orphaned marker can never
-        # silence a fresh gateway's legitimate broadcast.
+        # The initial maintenance-marker check above returns before either the
+        # active-session or home-channel phase. Keep this defensive re-check in
+        # the home phase so a marker activated between phases cannot produce a
+        # home-channel lifecycle broadcast. Only a CURRENT-epoch marker is
+        # honoured (drain_notification_suppressed reuses the NS-570 staleness
+        # check), so an orphaned marker can never silence a fresh gateway.
         try:
             from gateway.drain_control import drain_notification_suppressed
             if drain_notification_suppressed():
