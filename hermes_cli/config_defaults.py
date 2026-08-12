@@ -2340,6 +2340,10 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
+        # Push adapters normally send native Kanban text/artifacts and then
+        # wake the originating agent. Set to agent_only to make the wake turn
+        # the sole delivery and let the agent respond in the originating chat.
+        "notification_delivery_mode": "text_and_agent",
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false
