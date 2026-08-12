@@ -97,7 +97,13 @@ def test_repaired_db_search_works(tmp_path):
             "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'pizza'"
         ).fetchone()[0]
         assert hits == 5
-        msg_count = db._conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
+        # MATCH, not a bare COUNT(*): under v32 external content messages_fts
+        # counts the messages_fts_source view, so COUNT(*) would report 10 even
+        # if the repair left the index empty — the exact failure this asserts
+        # against. The 10 rows are 5 "hello world N" + 5 "reply about pizza N".
+        msg_count = db._conn.execute(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'hello OR pizza'"
+        ).fetchone()[0]
         assert msg_count == 10
     finally:
         db.close()

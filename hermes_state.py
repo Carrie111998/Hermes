@@ -238,7 +238,7 @@ def _default_db_path() -> Path:
 # name-gated in session_bridge_migrations, not version-gated). Live DBs sit
 # at 28 without the upstream migrations, so those are re-gated on < 29
 # below (both are idempotent/self-gating).
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 32
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -2107,9 +2107,43 @@ BEGIN
 END;
 """
 
+# External-content FTS5 (schema v32).  ``messages_fts`` indexes the same
+# ``content || tool_name || tool_calls`` concat as before, but stores no copy
+# of it: ``content=messages_fts_source`` points the index at a VIEW that
+# produces the concat, and ``content_rowid=id`` ties index rowids to
+# ``messages.id``.
+#
+# Why a view.  This DB was external-content until v11 and was switched to
+# inline mode only because the index had to start covering tool_name +
+# tool_calls (#16751) while the old schema pointed the FTS column straight at
+# ``messages.content``.  A view producing the 3-column concat satisfies both:
+# the index still covers tool metadata AND SQLite can re-read the indexed text
+# on demand instead of duplicating it.  The duplicate copy it removes — the
+# ``messages_fts_content`` shadow table — was 1273.9 MB of a 5120 MB
+# production state.db (measured 2026-08-11).
+#
+# Cost of not storing it: ``snippet()`` re-reads the row through the view.
+# Measured on that production file, that adds 0.001-0.002 s to a 0.297-2.795 s
+# search (~0.1%), because ``search_messages`` already JOINs ``messages`` and
+# selects ``m.content``, so the row is hot by the time snippet() asks for it.
+#
+# Trigger form.  External-content tables reject a plain ``DELETE FROM
+# messages_fts`` — removing an entry means handing FTS5 the OLD text via the
+# ``'delete'`` command so it knows which terms to retract.  Passing the wrong
+# text there (or deleting a row that was never indexed) silently corrupts the
+# index, which is why the v32 migration runs a full ``'rebuild'`` rather than
+# trusting the pre-existing index to be complete.
 FTS_SQL = """
+CREATE VIEW IF NOT EXISTS messages_fts_source AS
+SELECT
+    id AS id,
+    COALESCE(content, '') || ' ' || COALESCE(tool_name, '') || ' ' || COALESCE(tool_calls, '') AS content
+FROM messages;
+
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-    content
+    content,
+    content='messages_fts_source',
+    content_rowid='id'
 );
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
@@ -2120,11 +2154,19 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
-    DELETE FROM messages_fts WHERE rowid = old.id;
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES (
+        'delete',
+        old.id,
+        COALESCE(old.content, '') || ' ' || COALESCE(old.tool_name, '') || ' ' || COALESCE(old.tool_calls, '')
+    );
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
-    DELETE FROM messages_fts WHERE rowid = old.id;
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES (
+        'delete',
+        old.id,
+        COALESCE(old.content, '') || ' ' || COALESCE(old.tool_name, '') || ' ' || COALESCE(old.tool_calls, '')
+    );
     INSERT INTO messages_fts(rowid, content) VALUES (
         new.id,
         COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
@@ -2136,6 +2178,13 @@ END;
 # tokenizer splits CJK characters into individual tokens, breaking phrase
 # matching.  The trigram tokenizer creates overlapping 3-byte sequences so
 # substring queries work natively for any script (CJK, Thai, etc.).
+#
+# Deliberately still INLINE, unlike messages_fts above.  This table is created
+# lazily and is absent from the production DB, so converting it buys nothing
+# today while widening the v32 blast radius.  Mixed mode is fine: the two
+# tables only share the 'rebuild' command, which is valid for both.  If this
+# index is ever created for real, converting it the same way is the cheap way
+# to avoid its multi-GB content copy.
 FTS_TRIGRAM_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
     content,
@@ -2392,15 +2441,13 @@ class SessionDB:
         *,
         include_trigram: bool = True,
     ) -> None:
-        cursor.execute("DELETE FROM messages_fts")
-        cursor.execute(
-            "INSERT INTO messages_fts(rowid, content) "
-            "SELECT id, "
-            "COALESCE(content, '') || ' ' || "
-            "COALESCE(tool_name, '') || ' ' || "
-            "COALESCE(tool_calls, '') "
-            "FROM messages"
-        )
+        # messages_fts is external-content (v32): a plain DELETE is rejected,
+        # and a manual re-INSERT would be redundant anyway. 'rebuild' discards
+        # the index and regenerates it from the messages_fts_source view, so it
+        # both clears and refills in one statement — and, unlike the old inline
+        # form, it re-reads `messages` directly, so rows that were never
+        # indexed get picked up instead of staying missing.
+        cursor.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
         if not include_trigram:
             return
         cursor.execute("DELETE FROM messages_fts_trigram")
@@ -2621,11 +2668,14 @@ class SessionDB:
         return "fts5" in msg and "corrupt" in msg
 
     def _try_runtime_fts_rebuild(self, exc: sqlite3.DatabaseError) -> bool:
-        """One-shot in-place FTS rebuild after a corrupt-index write failure.
+        """One-shot in-place FTS rebuild after a corrupt-index failure.
 
-        Returns True when a rebuild was performed and the failed write should
-        be retried; False when the error isn't the FTS-corruption class, FTS
-        is disabled, or a rebuild was already attempted for this instance.
+        Returns True when a rebuild was performed and the failed statement
+        should be retried; False when the error isn't the FTS-corruption class,
+        FTS is disabled, or a rebuild was already attempted for this instance.
+
+        Used by both ``_execute_write`` and ``search_messages`` — a corrupt
+        index b-tree rejects reads as readily as writes.
 
         Delegates to :meth:`rebuild_fts` (the FTS5 ``'rebuild'`` command —
         index rewritten from the canonical messages table, zero message-row
@@ -2644,7 +2694,7 @@ class SessionDB:
             return False
         self._fts_runtime_rebuild_attempted = True
         logger.warning(
-            "state.db write failed with an FTS-corruption error (%s) — "
+            "state.db FTS operation failed with a corruption error (%s) — "
             "attempting one-shot in-place FTS rebuild; canonical message "
             "rows are preserved.", exc,
         )
@@ -3900,6 +3950,64 @@ class SessionDB:
                         )
                 except sqlite3.OperationalError as exc:
                     logger.debug("v22 session_model_usage rebuild skipped: %s", exc)
+            if current_version < 32:
+                # v32: convert messages_fts from inline back to external-content
+                # mode over the messages_fts_source view (see FTS_SQL). This
+                # drops the messages_fts_content shadow table — a byte-for-byte
+                # second copy of every message's indexed text, measured at
+                # 1273.9 MB of a 5120 MB production state.db on 2026-08-11.
+                #
+                # v11 moved this DB the other way, but only because the index
+                # had to start covering tool_name + tool_calls (#16751) and the
+                # then-current schema pointed the FTS column at messages.content.
+                # The view supplies the same 3-column concat, so external
+                # content and #16751 are not in conflict after all.
+                #
+                # The 'rebuild' is MANDATORY, not an optimization. An inline
+                # index can lawfully be missing rows (this DB was missing 42,542
+                # of 575,448), and under external content the delete trigger
+                # retracts terms for every deleted row — including terms that
+                # were never inserted, which is how a stale index becomes a
+                # corrupt one. Rebuilding from the view makes the index complete
+                # by construction, closing that hazard before the new triggers
+                # can fire even once.
+                #
+                # COST: this is a full re-index of every message and takes tens
+                # of minutes on a multi-GB DB, holding the write lock throughout.
+                # It runs at the first open by ANY process on the new code, so
+                # landing this code IS the cutover — deploy it inside a window
+                # with writers stopped, not on a routine gateway restart.
+                if fts5_available:
+                    for _trg in ("messages_fts_insert",
+                                 "messages_fts_delete",
+                                 "messages_fts_update"):
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {_trg}")
+                    try:
+                        # Drops the inline shadow tables (_content / _data /
+                        # _docsize / _idx / _config) with it; the view and the
+                        # external-content table are recreated from FTS_SQL by
+                        # _ensure_fts_schema below.
+                        cursor.execute("DROP TABLE IF EXISTS messages_fts")
+                    except sqlite3.OperationalError as exc:
+                        if not self._is_fts5_unavailable_error(exc):
+                            raise
+                        self._warn_fts5_unavailable(exc)
+                        fts5_available = False
+                        fts_migrations_complete = False
+                    if fts5_available:
+                        if self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL):
+                            logger.warning(
+                                "state.db v32: rebuilding messages_fts as an "
+                                "external-content index — this re-reads every "
+                                "message and can take tens of minutes."
+                            )
+                            cursor.execute(
+                                "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')"
+                            )
+                        else:
+                            fts_migrations_complete = False
+                else:
+                    fts_migrations_complete = False
             if current_version < SCHEMA_VERSION and fts_migrations_complete:
                 cursor.execute(
                     "UPDATE schema_version SET version = ?",
@@ -7653,6 +7761,30 @@ class SessionDB:
 
         return sanitized.strip()
 
+    def _fts_select(self, sql: str, params: list) -> List[Dict[str, Any]]:
+        """Run an FTS5 SELECT and materialise its rows under the DB lock.
+
+        The fetch belongs inside the lock *and* inside the caller's error
+        guard: sqlite3 streams rows lazily, so a corrupt-index error surfaces
+        from ``fetchall()`` rather than from ``execute()``.
+
+        A plain ``OperationalError`` here is an FTS5 query-syntax error that
+        survived sanitization — historically swallowed as "no results", and
+        still is. Index corruption is deliberately *not* swallowed: newer
+        SQLite builds report it as an ``OperationalError`` too
+        (``fts5: corrupt structure record``), so it is re-raised for the
+        caller's rebuild-and-retry guard rather than silently reading as an
+        empty result set.
+        """
+        with self._lock:
+            try:
+                cursor = self._conn.execute(sql, params)
+                return [dict(row) for row in cursor.fetchall()]
+            except sqlite3.OperationalError as exc:
+                if self._is_fts_write_corruption_error(exc):
+                    raise
+                return []
+
     @staticmethod
     def _is_cjk_codepoint(cp: int) -> bool:
         return (
@@ -7948,14 +8080,24 @@ class SessionDB:
                     like_cursor = self._conn.execute(like_sql, like_params)
                     matches = [dict(row) for row in like_cursor.fetchall()]
         else:
-            with self._lock:
-                try:
-                    cursor = self._conn.execute(sql, params)
-                except sqlite3.OperationalError:
-                    # FTS5 query syntax error despite sanitization — return empty
-                    return []
-                else:
-                    matches = [dict(row) for row in cursor.fetchall()]
+            try:
+                matches = self._fts_select(sql, params)
+            except sqlite3.DatabaseError as exc:
+                # Read-path counterpart to _execute_write's corruption guard.
+                # An external-content index (v32) whose rowid has no surviving
+                # `messages` row makes snippet() raise "database disk image is
+                # malformed" — but only for the queries that actually match the
+                # orphan, so this can sit latent while everything else works.
+                # The write path already auto-rebuilds; without this, reads
+                # surface the raw error to every search caller instead.
+                #
+                # _try_runtime_fts_rebuild takes self._lock, so it must run
+                # outside the lock _fts_select holds, and it self-limits to one
+                # attempt per instance — a genuinely unrepairable index re-raises
+                # rather than looping.
+                if not self._try_runtime_fts_rebuild(exc):
+                    raise
+                matches = self._fts_select(sql, params)
 
         # Add surrounding context (1 message before + after each match).
         # Done outside the lock so we don't hold it across N sequential queries.
@@ -9893,6 +10035,45 @@ class SessionDB:
                         "FTS rebuild failed for %s: %s", tbl, exc
                     )
         return rebuilt
+
+    def check_fts_integrity(self) -> Dict[str, Optional[str]]:
+        """Validate each FTS index against its content, strictly.
+
+        Returns ``{table: None}`` when the index is healthy and
+        ``{table: "<error>"}`` when it is not. Tables that do not exist are
+        omitted, so an all-``None`` result on an empty dict means "nothing to
+        check", not "healthy".
+
+        Uses the ``rank=1`` form of ``'integrity-check'``, which re-derives the
+        terms from the content table rather than only checking the index
+        against itself. For ``messages_fts`` (external content) that is the
+        difference between detecting and missing the two failure modes that
+        matter: an index rowid with no surviving ``messages`` row, and index
+        text that no longer matches the row it points at. The default rank=0
+        form reports neither.
+
+        Not cheap — it re-reads every indexed row, so this is a deliberate
+        health probe (post-migration verification, ``doctor``-style checks),
+        not something to call on a hot path. ``rebuild_fts()`` repairs whatever
+        it reports.
+
+        Note this is a write statement as far as SQLite is concerned; it cannot
+        run on a read-only connection.
+        """
+        results: Dict[str, Optional[str]] = {}
+        with self._lock:
+            for tbl in self._FTS_TABLES:
+                if not self._fts_table_exists(tbl):
+                    continue
+                try:
+                    self._conn.execute(
+                        f"INSERT INTO {tbl}({tbl}, rank) VALUES('integrity-check', 1)"
+                    )
+                    results[tbl] = None
+                except sqlite3.DatabaseError as exc:
+                    results[tbl] = str(exc)
+                    logger.warning("FTS integrity-check failed for %s: %s", tbl, exc)
+        return results
 
     def vacuum(self) -> int:
         """Run VACUUM to reclaim disk space after large deletes.

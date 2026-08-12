@@ -1428,23 +1428,44 @@ def test_process_lock_concurrent_installers_do_not_lose_backup_or_install(
     assert (skills / LOCK_NAME).is_file()
 
 
+# ── Timeout budget ──────────────────────────────────────────────────────────
+# The pytest-timeout marker is a BACKSTOP and must stay strictly greater than
+# the subprocess budget below it plus run_text_capture's synchronous tree-kill
+# tail. Invert that and `uv build`'s timeout becomes unreachable: pytest-timeout
+# fires first and kills the session with a stack dump, instead of the build
+# raising TimeoutExpired and check_returncode() failing this test alone with the
+# build's own stderr. The ordering here was already correct (180 > 120); these
+# constants make it structural so the two cannot drift apart, which is how the
+# sibling budgets in tests/test_wheel_locales_e2e.py ended up inverted.
+_WHEEL_BUILD_TIMEOUT = 120
+_WHEEL_KILL_TAIL = 15       # taskkill measured at 8.5-11.6s on Windows
+_WHEEL_BACKSTOP_SLACK = 60  # fixture + pytest overhead; keeps the two deadlines apart
+_WHEEL_TEST_BUDGET = _WHEEL_BUILD_TIMEOUT + _WHEEL_KILL_TAIL + _WHEEL_BACKSTOP_SLACK
+
+
 @pytest.mark.skipif(
     "built_wheel" not in " ".join(sys.argv),
     reason="run explicitly because a full repository wheel exceeds focused timeout",
 )
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(_WHEEL_TEST_BUDGET)
 def test_built_wheel_contains_the_sidebar_skill_assets(tmp_path: Path) -> None:
     environment = dict(os.environ)
     environment["UV_NO_PROGRESS"] = "1"
-    subprocess.run(
+    # run_text_capture, not capture_output=True: `uv build` runs the PEP 517
+    # build backend in its own process, so the backend is a grandchild that
+    # inherits the capture pipe handles and holds the write end open — the pipe
+    # never reaches EOF and the budget below never bounds the call. check=True is
+    # open-coded via check_returncode(), which the helper does not accept;
+    # without it a failed build would surface as the far less useful
+    # StopIteration from the tmp_path.glob("*.whl") below.
+    from hermes_cli._subprocess_compat import run_text_capture
+
+    run_text_capture(
         ["uv", "build", "--wheel", "--out-dir", str(tmp_path)],
         cwd=ROOT,
         env=environment,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+        timeout=_WHEEL_BUILD_TIMEOUT,
+    ).check_returncode()
     wheel = next(tmp_path.glob("*.whl"))
 
     with zipfile.ZipFile(wheel) as archive:

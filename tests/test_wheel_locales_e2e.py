@@ -30,20 +30,69 @@ from pathlib import Path
 
 import pytest
 
+from hermes_cli._subprocess_compat import run_text_capture
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# ── Timeout budgets ─────────────────────────────────────────────────────────
+#
+# The pytest-timeout marker is a BACKSTOP and must therefore exceed the sum of
+# the per-subprocess budgets inside the test. Get that backwards and the inner
+# timeouts become unreachable: pytest-timeout fires first and kills the whole
+# session with a stack dump, instead of the subprocess raising TimeoutExpired
+# and the test failing on its own assert with the child's stderr attached.
+#
+# It WAS backwards — a flat ``@pytest.mark.timeout(300)`` guarded a test whose
+# inner budgets sum to ~1330s, so `uv build`'s 600s could never fire. Observed
+# 2026-08-12: a slow `uv build --sdist` was killed by the 300s marker while
+# ``proc.wait(timeout=600)`` was still legitimately waiting, which reads in the
+# traceback as a hang in the subprocess helper rather than a budget the test
+# could never reach.
+#
+# Deriving the marker from the parts keeps the two from drifting apart again;
+# that independent drift is the actual defect, not either number.
+_BUILD_TIMEOUT = 600      # `uv build` — generous for a cold CI build
+_PIP_TIMEOUT = 300        # each `pip install` into the throwaway venv
+_PROBE_TIMEOUT = 120      # the installed-wheel probe
+# run_text_capture's bound is `timeout` PLUS a synchronous tree-kill
+# (taskkill measured at 8.5-11.6s on Windows), so budget the tail too.
+_KILL_TAIL = 15
+# venv.create() takes no timeout argument at all, so it can only be covered by
+# slack in the backstop.
+_VENV_CREATE_SLACK = 120
+# The backstop must be strictly GREATER than the inner sum, not equal to it:
+# at equality both deadlines land together and which one reports the failure is
+# a race. This margin also covers fixture setup and pytest's own overhead,
+# which sit inside the marker's window but outside every inner budget.
+_BACKSTOP_SLACK = 60
+
+_SDIST_TEST_BUDGET = _BUILD_TIMEOUT + _KILL_TAIL + _BACKSTOP_SLACK
+_WHEEL_TEST_BUDGET = (
+    _BUILD_TIMEOUT + _KILL_TAIL
+    + _VENV_CREATE_SLACK
+    + 2 * _PIP_TIMEOUT
+    + _PROBE_TIMEOUT
+    + _BACKSTOP_SLACK
+)
 
 
 @pytest.mark.integration
-@pytest.mark.timeout(300)  # overrides the global --timeout=30; cold-CI wheel build + venv + pip can exceed it
+# Backstop only — see the budget block above. Overrides the global --timeout=30
+# (a per-test marker beats the CLI flag), and must stay >= the inner budgets.
+@pytest.mark.timeout(_WHEEL_TEST_BUDGET)
 def test_installed_wheel_renders_i18n_strings(tmp_path):
     # 1. Build the wheel from the current tree.
     wheel_dir = tmp_path / "wheel"
-    build = subprocess.run(
+    # run_text_capture, not capture_output=True: `uv build` runs the PEP 517
+    # build backend in its own process, so the backend is a grandchild of this
+    # call and inherits the capture pipe handles. On Windows it holds the write
+    # end open, the pipe never reaches EOF, and subprocess.run kills only uv at
+    # 600s before blocking on a drain that can never finish. Same class as the
+    # uv/pip installs converted in tools/lazy_deps.py.
+    build = run_text_capture(
         ["uv", "build", "--wheel", "--out-dir", str(wheel_dir), "."],
         cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=600,
+        timeout=_BUILD_TIMEOUT,
     )
     assert build.returncode == 0, f"uv build failed:\n{build.stderr}"
     wheels = glob.glob(str(wheel_dir / "*.whl"))
@@ -56,11 +105,14 @@ def test_installed_wheel_renders_i18n_strings(tmp_path):
     venv_dir = tmp_path / "venv"
     venv.create(venv_dir, with_pip=True)
     vpy = venv_dir / "bin" / "python"
-    subprocess.run([str(vpy), "-m", "pip", "install", "-q", "pyyaml"], check=True, timeout=300)
+    subprocess.run(
+        [str(vpy), "-m", "pip", "install", "-q", "pyyaml"],
+        check=True, timeout=_PIP_TIMEOUT,
+    )
     subprocess.run(
         [str(vpy), "-m", "pip", "install", "-q", "--no-deps", "--force-reinstall", wheel],
         check=True,
-        timeout=300,
+        timeout=_PIP_TIMEOUT,
     )
 
     # 3. Run from a directory that is NOT the source tree, with a clean env
@@ -83,7 +135,7 @@ def test_installed_wheel_renders_i18n_strings(tmp_path):
         capture_output=True,
         text=True,
         env=env,
-        timeout=120,
+        timeout=_PROBE_TIMEOUT,
     )
     assert run.returncode == 0, (
         "installed wheel returned raw i18n keys instead of human strings:\n"
@@ -92,7 +144,9 @@ def test_installed_wheel_renders_i18n_strings(tmp_path):
 
 
 @pytest.mark.integration
-@pytest.mark.timeout(300)  # overrides the global --timeout=30; cold-CI sdist build can exceed it
+# Backstop only — see the budget block above. Must stay >= the build budget
+# plus its tree-kill tail, or `uv build`'s timeout can never fire.
+@pytest.mark.timeout(_SDIST_TEST_BUDGET)
 def test_built_sdist_ships_locale_catalogs(tmp_path):
     """The sdist must carry locales/ too.
 
@@ -105,12 +159,12 @@ def test_built_sdist_ships_locale_catalogs(tmp_path):
     #27632 / #35374 / #23943.
     """
     sdist_dir = tmp_path / "sdist"
-    build = subprocess.run(
+    # run_text_capture: the PEP 517 backend is a grandchild here too — see the
+    # note on the --wheel build above.
+    build = run_text_capture(
         ["uv", "build", "--sdist", "--out-dir", str(sdist_dir), "."],
         cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=600,
+        timeout=_BUILD_TIMEOUT,
     )
     assert build.returncode == 0, f"uv build --sdist failed:\n{build.stderr}"
     tarballs = glob.glob(str(sdist_dir / "*.tar.gz"))

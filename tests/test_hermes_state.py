@@ -4024,8 +4024,20 @@ class TestSchemaInit:
             assert trigram_content_only_inserts == []
             version = migrated_db._conn.execute("SELECT version FROM schema_version").fetchone()[0]
             assert version == SCHEMA_VERSION
-            normal_count = migrated_db._conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
-            trigram_count = migrated_db._conn.execute("SELECT COUNT(*) FROM messages_fts_trigram").fetchone()[0]
+            # Both counts must go through MATCH. A bare COUNT(*) on
+            # messages_fts scans the messages_fts_source view under v32
+            # external content, so it counts message rows rather than index
+            # entries — it would report 1 even against a totally empty index.
+            # Matching on the tool name also re-asserts the #16751 requirement
+            # that the base index covers tool_name, not just content.
+            normal_count = migrated_db._conn.execute(
+                "SELECT COUNT(*) FROM messages_fts "
+                "WHERE messages_fts MATCH 'browser_snapshot'"
+            ).fetchone()[0]
+            trigram_count = migrated_db._conn.execute(
+                "SELECT COUNT(*) FROM messages_fts_trigram "
+                "WHERE messages_fts_trigram MATCH 'plain content'"
+            ).fetchone()[0]
             assert normal_count == 1
             assert trigram_count == 1
             tool_hit = migrated_db._conn.execute(

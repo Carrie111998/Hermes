@@ -3516,7 +3516,32 @@ async def run_debug_share_endpoint(body: DebugShareRequest | None = None):
 # the dashboard can tail them back to the user.
 # ---------------------------------------------------------------------------
 
-_ACTION_LOG_DIR: Path = get_hermes_home() / "logs"
+# Resolved at CALL time, not import time.  As a module-level constant this was
+# ``get_hermes_home() / "logs"``, which baked in whatever ``HERMES_HOME`` held
+# when the module was first imported.  Under pytest that is collection time —
+# before ``tests/conftest.py``'s autouse fixture redirects HERMES_HOME to a
+# per-test tempdir — so ~30 test modules that import this one at module scope
+# armed the two writes below against the developer's live ``~/.hermes/logs``.
+# Tests may still pin a directory by assigning a Path to ``_ACTION_LOG_DIR``.
+#
+# The resolver is ``get_process_hermes_home()``, NOT ``get_hermes_home()``: an
+# action log belongs to the dashboard PROCESS, not to the profile a request is
+# scoped to.  No ``_spawn_hermes_action`` / ``_record_completed_action`` call
+# site runs inside ``_profile_scope`` — the requested profile is carried into
+# the child instead, via ``_profile_cli_args`` / ``_gateway_subcommand`` — so
+# ignoring the context-local override is both what the old constant did (no
+# override is ever active at import) and what keeps the log where the dashboard
+# tails it back from.
+_ACTION_LOG_DIR: Optional[Path] = None
+
+
+def _action_log_dir() -> Path:
+    """Directory holding the per-action log files."""
+    if _ACTION_LOG_DIR is not None:
+        return Path(_ACTION_LOG_DIR)
+    return get_process_hermes_home() / "logs"
+
+
 _ACTION_LOG_TAIL_MAX_BYTES = 256 * 1024
 _ACTION_LOG_TAIL_INITIAL_CHUNK_BYTES = 8 * 1024
 _ACTION_LOG_TAIL_MAX_CHUNK_BYTES = 64 * 1024
@@ -3555,8 +3580,9 @@ _ACTION_RESULTS: Dict[str, Dict[str, Any]] = {}
 def _record_completed_action(name: str, message: str, exit_code: int = 1) -> None:
     """Record a non-spawned action result and write it to the action log."""
     log_file_name = _ACTION_LOG_FILES[name]
-    _ACTION_LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = _ACTION_LOG_DIR / log_file_name
+    log_dir = _action_log_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / log_file_name
     with open(log_path, "ab", buffering=0) as log_file:
         log_file.write(
             f"\n=== {name} completed {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode()
@@ -3588,8 +3614,9 @@ def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
     inherits the same venv/PYTHONPATH the web server is using.
     """
     log_file_name = _ACTION_LOG_FILES[name]
-    _ACTION_LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = _ACTION_LOG_DIR / log_file_name
+    log_dir = _action_log_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / log_file_name
     log_file = open(log_path, "ab", buffering=0)
     log_file.write(
         f"\n=== {name} started {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode()
@@ -4301,7 +4328,7 @@ async def get_action_status(name: str, lines: int = 200):
     if log_file_name is None:
         raise HTTPException(status_code=404, detail=f"Unknown action: {name}")
 
-    log_path = _ACTION_LOG_DIR / log_file_name
+    log_path = _action_log_dir() / log_file_name
     tail = _tail_lines(log_path, min(max(lines, 1), 2000))
 
     proc = _ACTION_PROCS.get(name)

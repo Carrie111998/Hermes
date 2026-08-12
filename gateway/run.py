@@ -1387,11 +1387,11 @@ def _home_thread_env_var(platform_name: str) -> str:
 
 def _restart_notification_pending() -> bool:
     """Return True when a /restart completion marker is waiting to be delivered."""
-    return (_hermes_home / ".restart_notify.json").exists()
+    return (_resolve_hermes_home() / ".restart_notify.json").exists()
 
 
 def _planned_restart_notification_path() -> Path:
-    return _hermes_home / ".restart_pending.json"
+    return _resolve_hermes_home() / ".restart_pending.json"
 
 
 def _planned_restart_notification_pending() -> bool:
@@ -1413,16 +1413,52 @@ _ensure_ssl_certs()
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
-from hermes_constants import get_hermes_home, get_hermes_home_override
+from hermes_constants import get_hermes_home, get_hermes_home_override, get_process_hermes_home
 from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, is_truthy_value
-_hermes_home = get_hermes_home()
+
+# Resolved per call, never at import.  Import happens at test-COLLECTION time,
+# before conftest's ``_hermetic_environment`` fixture can redirect HERMES_HOME,
+# so a constant here would bake in the developer's real ``~/.hermes`` and every
+# write below would land there.  ``None`` means "resolve live"; the ~150
+# existing ``patch("gateway.run._hermes_home", tmp_path)`` sites keep working
+# because a non-None value still wins.
+# See GBrain ``concepts/import-time-hermes-home-snapshot-bug``.
+_hermes_home: Optional[Path] = None
+
+
+def _resolve_hermes_home() -> Path:
+    """Return the gateway's Hermes home, resolved at call time.
+
+    ``get_process_hermes_home()`` rather than ``get_hermes_home()``, on purpose,
+    and the choice is sharper here than for the earlier instances of this bug
+    class because THIS module is the one that installs the override:
+    ``_profile_runtime_scope`` wraps every multiplexed inbound turn in
+    ``set_hermes_home_override(profile_home)``, and use sites such as the three
+    ``mark_seen(config.yaml)`` calls run inside that scope.  The constant this
+    replaces was evaluated at import with no override active, so the launch home
+    is exactly what it captured; following the override would redirect a routed
+    profile's turn into that profile's config.yaml instead of the launch
+    profile's — a behaviour change, not a fix.
+
+    ``_gateway_config_home()`` settles it independently.  It exists to layer an
+    explicit ``get_hermes_home_override()`` check ON TOP of this value, which is
+    only meaningful while this value stays override-blind.
+    """
+    if _hermes_home is not None:
+        return Path(_hermes_home)  # coerce: callers pin a str in places
+    return get_process_hermes_home()
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
 from dotenv import load_dotenv  # noqa: F401  # backward-compat for tests that monkeypatch this symbol
 from hermes_cli.env_loader import load_hermes_dotenv
-_env_path = _hermes_home / '.env'
-load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
+# Import-scoped and vestigial: nothing in this module reads ``_env_path``, so it
+# cannot leak a stale home.  The name is kept because seven tests
+# (test_discord_channel_prompts, test_fast_command, test_reasoning_command)
+# ``monkeypatch.setattr`` it, which raises when the attribute is absent.
+# Do NOT introduce a runtime read of it — that would make it a second snapshot.
+_env_path = _resolve_hermes_home() / '.env'
+load_hermes_dotenv(hermes_home=_resolve_hermes_home(), project_env=Path(__file__).resolve().parents[1] / '.env')
 
 
 def _reload_runtime_env_preserving_config_authority() -> None:
@@ -1444,14 +1480,14 @@ def _reload_runtime_env_preserving_config_authority() -> None:
         # Credentials are resolved from the active profile's secret scope, not
         # os.environ. Still honor config.yaml's agent.max_turns bridge below
         # using the scoped home, but never reload .env into global env.
-        _bridge_max_turns_from_config(_hermes_home)
+        _bridge_max_turns_from_config(_resolve_hermes_home())
         return
 
     load_hermes_dotenv(
-        hermes_home=_hermes_home,
+        hermes_home=_resolve_hermes_home(),
         project_env=Path(__file__).resolve().parents[1] / '.env',
     )
-    _bridge_max_turns_from_config(_hermes_home)
+    _bridge_max_turns_from_config(_resolve_hermes_home())
 
 
 def _bridge_max_turns_from_config(home: "Path") -> None:
@@ -1615,7 +1651,11 @@ _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
-_config_path = _hermes_home / 'config.yaml'
+# Import-scoped: consumed by the config->env bridge immediately below and never
+# read again.  Bridging config.yaml into os.environ is inherently an import-time
+# act, so the process home at import IS the correct home here.  Do NOT reuse this
+# name later in the module — a deferred read would make it a second snapshot.
+_config_path = _resolve_hermes_home() / 'config.yaml'
 if _config_path.exists():
     try:
         import yaml as _yaml
@@ -2195,7 +2235,7 @@ def _try_resolve_fallback_provider() -> dict | None:
     from hermes_cli.runtime_provider import resolve_runtime_provider
     try:
         import yaml as _y
-        cfg_path = _hermes_home / "config.yaml"
+        cfg_path = _resolve_hermes_home() / "config.yaml"
         if not cfg_path.exists():
             return None
         with open(cfg_path, encoding="utf-8") as _f:
@@ -2564,15 +2604,16 @@ def _gateway_config_home() -> Path:
     override = get_hermes_home_override()
     if override:
         return Path(override)
-    return _hermes_home
+    return _resolve_hermes_home()
 
 
 def _load_gateway_config() -> dict:
     """Load and parse ~/.hermes/config.yaml, returning {} on any error.
 
-    Uses the module-level ``_hermes_home`` (so tests that monkeypatch it
-    still see their fixture) and shares the mtime-keyed raw-yaml cache
-    from ``hermes_cli.config.read_raw_config`` when the paths match.
+    Resolves the home through ``_resolve_hermes_home()`` (so tests that
+    monkeypatch ``_hermes_home`` still see their fixture) and shares the
+    mtime-keyed raw-yaml cache from ``hermes_cli.config.read_raw_config`` when
+    the paths match.
 
     Managed scope is overlaid on the result (via the shared helper) so the
     gateway honors administrator-pinned values — neither read_raw_config nor a
@@ -2584,7 +2625,7 @@ def _load_gateway_config() -> dict:
     used_canonical = False
     try:
         from hermes_cli.config import get_config_path, read_raw_config
-        # Fast path: if _hermes_home agrees with the canonical config
+        # Fast path: if the resolved home agrees with the canonical config
         # location, reuse the shared cache. Otherwise fall through to a
         # direct read (keeps test fixtures with a monkeypatched
         # _hermes_home working).
@@ -3572,7 +3613,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     # -- Voice mode persistence ------------------------------------------
 
-    _VOICE_MODE_PATH = _hermes_home / "gateway_voice_mode.json"
+    # A DERIVED snapshot, and the only one here that is read and written long
+    # after import — so it needs its own seam, not just a fixed root.  Kept as a
+    # plain (overridable) class attribute rather than a property because
+    # existing tests set it on the INSTANCE (``runner._VOICE_MODE_PATH = ...``
+    # in test_voice_command, ``patch.object(runner, ...)`` in
+    # test_voice_mode_platform_isolation), which a data descriptor would break.
+    _VOICE_MODE_PATH: Optional[Path] = None
+
+    def _voice_mode_path(self) -> Path:
+        """Return the voice-mode state file, resolved at call time."""
+        if self._VOICE_MODE_PATH is not None:
+            return Path(self._VOICE_MODE_PATH)
+        return _resolve_hermes_home() / "gateway_voice_mode.json"
 
     def _voice_key(self, platform: Platform, chat_id: str) -> str:
         """Return a platform-namespaced key for voice mode state."""
@@ -3580,7 +3633,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _load_voice_modes(self) -> Dict[str, str]:
         try:
-            data = json.loads(self._VOICE_MODE_PATH.read_text())
+            data = json.loads(self._voice_mode_path().read_text())
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return {}
 
@@ -3606,8 +3659,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _save_voice_modes(self) -> None:
         try:
-            self._VOICE_MODE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            self._VOICE_MODE_PATH.write_text(
+            path = self._voice_mode_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
                 json.dumps(self._voice_mode, indent=2)
             )
         except OSError as e:
@@ -5440,7 +5494,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return []
         path = Path(file_path).expanduser()
         if not path.is_absolute():
-            path = _hermes_home / path
+            path = _resolve_hermes_home() / path
         if not path.exists():
             logger.warning("Prefill messages file not found: %s", path)
             return []
@@ -5768,7 +5822,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Load OpenRouter provider routing preferences from config.yaml."""
         try:
             import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
+            cfg_path = _resolve_hermes_home() / "config.yaml"
             if cfg_path.exists():
                 with open(cfg_path, encoding="utf-8") as _f:
                     cfg = _y.safe_load(_f) or {}
@@ -5787,7 +5841,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         try:
             import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
+            cfg_path = _resolve_hermes_home() / "config.yaml"
             if cfg_path.exists():
                 with open(cfg_path, encoding="utf-8") as _f:
                     cfg = _y.safe_load(_f) or {}
@@ -5814,7 +5868,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         try:
             import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
+            cfg_path = _resolve_hermes_home() / "config.yaml"
             if not cfg_path.exists():
                 self._fallback_model = None
                 return self._fallback_model
@@ -6446,7 +6500,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"{message}\n\n"
                     f"{busy_input_hint_gateway(_hint_mode)}"
                 )
-                mark_seen(_hermes_home / "config.yaml", BUSY_INPUT_FLAG)
+                mark_seen(_resolve_hermes_home() / "config.yaml", BUSY_INPUT_FLAG)
         except Exception as _onb_err:
             logger.debug("Failed to apply busy-input onboarding hint: %s", _onb_err)
 
@@ -6915,7 +6969,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         import json
 
-        path = _hermes_home / self._STUCK_LOOP_FILE
+        path = _resolve_hermes_home() / self._STUCK_LOOP_FILE
         try:
             counts = json.loads(path.read_text()) if path.exists() else {}
         except Exception:
@@ -6942,7 +6996,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         import json
 
-        path = _hermes_home / self._STUCK_LOOP_FILE
+        path = _resolve_hermes_home() / self._STUCK_LOOP_FILE
         if not path.exists():
             return 0
 
@@ -6989,7 +7043,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         import json
 
-        path = _hermes_home / self._STUCK_LOOP_FILE
+        path = _resolve_hermes_home() / self._STUCK_LOOP_FILE
         if not path.exists():
             return
         try:
@@ -7958,7 +8012,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # process already drained active agents, so sessions aren't stuck.
         # This prevents unwanted auto-resets after `hermes update`,
         # `hermes gateway restart`, or `/restart`.
-        _clean_marker = _hermes_home / ".clean_shutdown"
+        _clean_marker = _resolve_hermes_home() / ".clean_shutdown"
         # Stash the boolean for the GATEWAY_STARTED payload below — by the
         # time we emit, the marker file is gone (consumed/unlinked). Without
         # this stash, distinguishing operator-restart-after-Ctrl-C from
@@ -8331,8 +8385,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not notified and any(
             path.exists()
             for path in (
-                _hermes_home / ".update_pending.json",
-                _hermes_home / ".update_pending.claimed.json",
+                _resolve_hermes_home() / ".update_pending.json",
+                _resolve_hermes_home() / ".update_pending.claimed.json",
             )
         ):
             self._schedule_update_notification_watch()
@@ -9727,7 +9781,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # of resuming a half-finished tool loop.
             if not timed_out:
                 try:
-                    (_hermes_home / ".clean_shutdown").touch()
+                    (_resolve_hermes_home() / ".clean_shutdown").touch()
                 except Exception:
                     pass
             else:
@@ -10671,8 +10725,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     response_text = raw
             if response_text:
-                response_path = _hermes_home / ".update_response"
-                prompt_path = _hermes_home / ".update_prompt.json"
+                response_path = _resolve_hermes_home() / ".update_response"
+                prompt_path = _resolve_hermes_home() / ".update_prompt.json"
                 try:
                     tmp = response_path.with_suffix(".tmp")
                     tmp.write_text(response_text)
@@ -10691,8 +10745,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # blocking on stdin until the 30-minute watcher timeout.
             # The slash command then falls through to normal dispatch.
             if _recognized_cmd:
-                response_path = _hermes_home / ".update_response"
-                prompt_path = _hermes_home / ".update_prompt.json"
+                response_path = _resolve_hermes_home() / ".update_response"
+                prompt_path = _resolve_hermes_home() / ".update_prompt.json"
                 try:
                     tmp = response_path.with_suffix(".tmp")
                     tmp.write_text("")
@@ -13327,7 +13381,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and not is_seen(_onb_cfg, PROFILE_BUILD_FLAG)
                 ):
                     turn_sidecar_notes.append(profile_build_directive().strip())
-                    mark_seen(_hermes_home / "config.yaml", PROFILE_BUILD_FLAG)
+                    mark_seen(_resolve_hermes_home() / "config.yaml", PROFILE_BUILD_FLAG)
                 else:
                     turn_sidecar_notes.append(_intro_note)
             except Exception as _pb_err:
@@ -14517,7 +14571,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
 
         try:
-            marker_path = _hermes_home / ".restart_last_processed.json"
+            marker_path = _resolve_hermes_home() / ".restart_last_processed.json"
             if not marker_path.exists():
                 # Belt-and-suspenders for when the dedup marker goes missing
                 # (manually cleaned up, or the previous cycle's write failed).
@@ -16491,11 +16545,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         the messenger.  The user's next message is intercepted by
         ``_handle_message`` and written to ``.update_response``.
         """
-        pending_path = _hermes_home / ".update_pending.json"
-        claimed_path = _hermes_home / ".update_pending.claimed.json"
-        output_path = _hermes_home / ".update_output.txt"
-        exit_code_path = _hermes_home / ".update_exit_code"
-        prompt_path = _hermes_home / ".update_prompt.json"
+        pending_path = _resolve_hermes_home() / ".update_pending.json"
+        claimed_path = _resolve_hermes_home() / ".update_pending.claimed.json"
+        output_path = _resolve_hermes_home() / ".update_output.txt"
+        exit_code_path = _resolve_hermes_home() / ".update_exit_code"
+        prompt_path = _resolve_hermes_home() / ".update_prompt.json"
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -16621,7 +16675,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for p in (pending_path, claimed_path, output_path,
                           exit_code_path, prompt_path):
                     p.unlink(missing_ok=True)
-                (_hermes_home / ".update_response").unlink(missing_ok=True)
+                (_resolve_hermes_home() / ".update_response").unlink(missing_ok=True)
                 self._update_prompt_pending.pop(session_key, None)
                 return
 
@@ -16707,7 +16761,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for p in (pending_path, claimed_path, output_path,
                       exit_code_path, prompt_path):
                 p.unlink(missing_ok=True)
-            (_hermes_home / ".update_response").unlink(missing_ok=True)
+            (_resolve_hermes_home() / ".update_response").unlink(missing_ok=True)
             self._update_prompt_pending.pop(session_key, None)
 
     async def _send_update_notification(self) -> bool:
@@ -16720,10 +16774,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         cannot resolve the adapter (e.g. after a gateway restart where the
         platform hasn't reconnected yet).
         """
-        pending_path = _hermes_home / ".update_pending.json"
-        claimed_path = _hermes_home / ".update_pending.claimed.json"
-        output_path = _hermes_home / ".update_output.txt"
-        exit_code_path = _hermes_home / ".update_exit_code"
+        pending_path = _resolve_hermes_home() / ".update_pending.json"
+        claimed_path = _resolve_hermes_home() / ".update_pending.claimed.json"
+        output_path = _resolve_hermes_home() / ".update_output.txt"
+        exit_code_path = _resolve_hermes_home() / ".update_exit_code"
 
         if not pending_path.exists() and not claimed_path.exists():
             return False
@@ -16830,7 +16884,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _send_restart_notification(self) -> Optional[tuple[str, str, Optional[str]]]:
         """Notify the chat that initiated /restart that the gateway is back."""
-        notify_path = _hermes_home / ".restart_notify.json"
+        notify_path = _resolve_hermes_home() / ".restart_notify.json"
         if not notify_path.exists():
             return None
 
@@ -19849,7 +19903,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if gate_on and not is_seen(_cfg, TOOL_PROGRESS_FLAG):
                             long_tool_hint_fired[0] = True
                             progress_queue.put(tool_progress_hint_gateway())
-                            mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
+                            mark_seen(_resolve_hermes_home() / "config.yaml", TOOL_PROGRESS_FLAG)
                 except Exception as _hint_err:
                     logger.debug("tool-progress onboarding hint failed: %s", _hint_err)
                 return
@@ -20063,7 +20117,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             from agent.redact import RedactingFormatter
 
-            log_dir = _hermes_home / "logs"
+            log_dir = _resolve_hermes_home() / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
             file_handler = RotatingFileHandler(
                 log_dir / "tool_calls.log",
@@ -23266,7 +23320,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # and gateway.log (INFO+, gateway-component records only).
     # Idempotent, so repeated calls from AIAgent.__init__ won't duplicate.
     from hermes_logging import setup_logging, _safe_stderr
-    setup_logging(hermes_home=_hermes_home, mode="gateway")
+    setup_logging(hermes_home=_resolve_hermes_home(), mode="gateway")
 
     # Startup security posture audit — warn-on-load, never blocks. Surfaces
     # root / weak-SSH / ephemeral-container / unauthenticated-listener posture
@@ -23282,7 +23336,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             _audit_cfg = read_raw_config()
         except Exception:
             _audit_cfg = None
-        log_startup_security_warnings(hermes_home=_hermes_home, config=_audit_cfg)
+        log_startup_security_warnings(hermes_home=_resolve_hermes_home(), config=_audit_cfg)
     except Exception as _audit_exc:
         logger.debug("Startup security audit failed (non-fatal): %s", _audit_exc)
 
@@ -23414,7 +23468,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             # if our cgroup is being torn down.  Bounded by an internal
             # timeout; never blocks the event loop here.
             try:
-                _diag_log = _hermes_home / "logs" / "gateway-shutdown-diag.log"
+                _diag_log = _resolve_hermes_home() / "logs" / "gateway-shutdown-diag.log"
                 spawn_async_diagnostic(
                     _diag_log, _shutdown_ctx["signal"], timeout_seconds=5.0
                 )

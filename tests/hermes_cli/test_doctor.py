@@ -18,21 +18,24 @@ import hermes_cli.gateway as gateway_cli
 from hermes_cli import doctor as doctor_mod
 from hermes_cli.doctor import _has_provider_env_config
 
-# ``run_doctor`` imports ``model_tools`` lazily, and importing it runs
+# NOTE: this module deliberately does NOT `import model_tools`.
+#
+# ``run_doctor`` imports it lazily, and importing it runs
 # ``discover_builtin_tools()`` -- the whole builtin tool registry, which
 # transitively pulls in asyncio/websockets/openai and constructs the
 # module-scope ``tools.process_registry.ProcessRegistry`` singleton. Cold on
-# Windows that single import measures ~66s (`python -X importtime -c "import
-# model_tools"`), and warm it is still ~13s.
+# Windows that single import measures ~66s; warm it is ~13s, and it accounted
+# for ~20s of this file's ~31s collection time.
 #
-# It is a session-shared cost, but a lazy import inside ``run_doctor`` charges
-# all of it to whichever test happens to call ``run_doctor`` first -- which
-# pushed that one test past the repo's 30s `--timeout` cap whenever this file
-# is run on its own. Importing it here moves the cost into module collection,
-# which pytest-timeout does not cover, so no single test is billed for it.
-# Ten other test modules already import model_tools at module scope for the
-# same reason.
-import model_tools  # noqa: F401,E402
+# It used to be imported here at module scope, so that a lazy import inside
+# ``run_doctor`` could not charge the whole session-shared cost to whichever
+# test called ``run_doctor`` first (that alone blew the 30s per-test cap).
+# ``_stub_doctor_externals`` now puts a stub in ``sys.modules`` instead, so the
+# real module is never imported at all and nothing pays for it. That matters
+# for the OTHER cap: ``scripts/run_tests_parallel.py`` enforces a 300s
+# wall-clock budget per FILE, and unlike pytest-timeout it does count
+# collection -- so for that budget, moving cost into collection is not a fix,
+# only removing it is.
 
 
 def _fake_install_probe(names, entrypoints, python=None, env=None):
@@ -89,7 +92,24 @@ def _stub_doctor_externals(request, monkeypatch):
 
     Classes that deliberately exercise the real gh probe opt out by setting
     ``exercises_real_gh_probe = True`` (see ``TestGitHubTokenCheck``).
+
+    It also stubs ``model_tools`` in ``sys.modules``. ``run_doctor`` only wants
+    ``check_tool_availability``/``TOOLSET_REQUIREMENTS`` from it, behind a
+    ``try/except`` that degrades to "Could not check tool availability", and no
+    test here asserts on the real registry's contents -- the ~20 tests that
+    already care install their own stub, which still wins because a test's own
+    ``monkeypatch`` runs after this fixture. Stubbing it for everyone keeps the
+    real module out of the process entirely.
     """
+    monkeypatch.setitem(
+        sys.modules,
+        "model_tools",
+        types.SimpleNamespace(
+            check_tool_availability=lambda *a, **kw: ([], []),
+            TOOLSET_REQUIREMENTS={},
+        ),
+    )
+
     from hermes_cli import install_doctor as _install_doctor
 
     _real_section_lines = _install_doctor.doctor_section_lines
@@ -1978,6 +1998,101 @@ class TestNpmAuditBudget:
         assert "WhatsApp bridge deps" in out
         assert "1 critical, 2 high, 3 moderate" in out
         assert issues == ["WhatsApp bridge has 6 npm vulnerabilities"]
+
+
+class TestNpmAuditFixHintTracksFixAvailable:
+    """The `npm audit fix` hint must reflect whether npm says a fix EXISTS.
+
+    Doctor used to pick the hint purely from which target it was, never from
+    the audit payload. On the WhatsApp bridge that produced a command that
+    cannot work: its two high advisories (link-preview-js GHSA-4gp8-rjrq-ch6q
+    and @whiskeysockets/baileys, which only inherits it) both report
+    `fixAvailable: false` — every published link-preview-js is <=4.0.0, all
+    affected, and Baileys pins ^3.0.0. Running the suggested command is a
+    no-op that leaves the warning byte-identical, so the reader concludes
+    something is broken rather than that there is nothing to bump.
+    """
+
+    @staticmethod
+    def _run(payload: str, capsys, monkeypatch, tmp_path):
+        def _ok(argv, *, cwd, timeout):
+            return subprocess.CompletedProcess(argv, 1, payload, "")
+
+        monkeypatch.setattr(doctor_mod, "_run_npm_audit", _ok)
+        issues: list[str] = []
+        doctor_mod._audit_npm_target("npm", tmp_path, "WhatsApp bridge", [], issues)
+        return capsys.readouterr().out, issues
+
+    def test_unfixable_advisories_do_not_suggest_npm_audit_fix(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        payload = json.dumps(
+            {
+                "metadata": {"vulnerabilities": {"critical": 0, "high": 2, "moderate": 0}},
+                "vulnerabilities": {
+                    "link-preview-js": {"severity": "high", "fixAvailable": False},
+                    "@whiskeysockets/baileys": {"severity": "high", "fixAvailable": False},
+                },
+            }
+        )
+        out, issues = self._run(payload, capsys, monkeypatch, tmp_path)
+
+        assert "0 critical, 2 high, 0 moderate" in out
+        # The whole point: no command that cannot accomplish anything.
+        assert "npm audit fix" not in out
+        # ... and the reader is told WHY, so the absence isn't mistaken for a gap.
+        assert "no upstream fix" in out
+        # Still a real finding — unfixable is not the same as absent.
+        assert issues == ["WhatsApp bridge has 2 npm vulnerabilities"]
+
+    def test_fixable_advisories_still_suggest_npm_audit_fix(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """The hint must survive where it actually works — no over-correction."""
+        payload = json.dumps(
+            {
+                "metadata": {"vulnerabilities": {"critical": 0, "high": 1, "moderate": 0}},
+                "vulnerabilities": {
+                    "body-parser": {"severity": "high", "fixAvailable": True},
+                },
+            }
+        )
+        out, _ = self._run(payload, capsys, monkeypatch, tmp_path)
+        assert "npm audit fix" in out
+
+    def test_partially_fixable_still_suggests_the_fix(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """A mixed set is worth running: the command clears the fixable subset."""
+        payload = json.dumps(
+            {
+                "metadata": {"vulnerabilities": {"critical": 0, "high": 2, "moderate": 0}},
+                "vulnerabilities": {
+                    "link-preview-js": {"severity": "high", "fixAvailable": False},
+                    # npm reports an object, not a bool, when it has a target.
+                    "body-parser": {
+                        "severity": "high",
+                        "fixAvailable": {
+                            "name": "body-parser",
+                            "version": "1.20.6",
+                            "isSemVerMajor": False,
+                        },
+                    },
+                },
+            }
+        )
+        out, _ = self._run(payload, capsys, monkeypatch, tmp_path)
+        assert "npm audit fix" in out
+
+    def test_missing_vulnerabilities_block_does_not_invent_a_fix(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """No per-advisory detail (older npm, trimmed payload) → claim nothing."""
+        payload = json.dumps(
+            {"metadata": {"vulnerabilities": {"critical": 0, "high": 1, "moderate": 0}}}
+        )
+        out, _ = self._run(payload, capsys, monkeypatch, tmp_path)
+        assert "npm audit fix" not in out
 
 
 class TestNpmAuditIsOptIn:
