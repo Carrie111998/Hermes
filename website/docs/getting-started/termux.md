@@ -22,7 +22,7 @@ On Termux, the normal `install.sh` entrypoint dispatches to `scripts/install-ter
 - creates the Hermes virtual environment with `uv venv`
 - derives an Android-safe dependency graph from `pyproject.toml` and `uv.lock`
 - verifies that the graph matches the immutable CPython 3.13 Android arm64 wheel release
-- downloads ten native wheels from release `wheelhouse-cp313-android24-arm64-20260719.1`, verifying the pinned `SHA256SUMS` file and every wheel before installation
+- downloads ten native wheels from release `wheelhouse-cp313-android24-arm64-20260811.1`, verifying the pinned `SHA256SUMS` file and every wheel before installation
 - installs the complete graph with `--only-binary :all:` so a supported phone never silently starts a local C or Rust build
 - installs Hermes as an editable package with `--no-deps` and runs dependency/import smoke checks
 - writes a launcher to `$PREFIX/bin/hermes` that clears inherited `PYTHONPATH` and `PYTHONHOME`
@@ -93,6 +93,43 @@ bash scripts/install-termux.sh --branch my-branch --skip-setup
 
 This path is intentionally the same installer contract used by the one-line command.
 
+## Desktop UI on a phone
+
+`hermes desktop` is supported on native Termux without trying to execute the Linux Electron binary. Android/Termux uses Bionic rather than the glibc Electron runtime, so Hermes builds the same current Desktop React renderer and hosts it on the hardened loopback web server instead.
+
+On first launch Hermes will:
+
+1. build the Desktop renderer with the repository lockfile while skipping Electron/native lifecycle scripts;
+2. enable the official Termux `x11-repo` and install `termux-x11-nightly` plus `chromium` if they are missing;
+3. resolve the official Termux:X11 nightly Android companion APK and verify its GitHub-published SHA-256 digest before installation;
+4. hand that APK to Android's package installer (Android still requires the normal one-time user confirmation);
+5. start or reuse Termux:X11 on `DISPLAY=:1`; and
+6. serve Desktop on `http://127.0.0.1:9119` and open that URL in Termux Chromium as an app window.
+
+Run:
+
+```bash
+hermes desktop
+```
+
+The exact same loopback session can also be opened in the phone's normal Android browser at:
+
+```text
+http://127.0.0.1:9119
+```
+
+Use another loopback port when needed:
+
+```bash
+hermes desktop --port 9120
+```
+
+The server intentionally binds only to `127.0.0.1`; `hermes desktop` does not expose the Desktop session to Wi-Fi/LAN peers. The browser-hosted renderer uses the same authenticated `/api/*` and `/api/ws` backend contract as Desktop. Its coding/files rail uses the Termux backend filesystem and Git routes, including the in-app backend folder picker, and the Desktop terminal rail opens an interactive Termux shell through a separate authenticated loopback-only PTY WebSocket. Electron-only machine features such as native window translucency, global quick-entry hotkeys, and direct host-file-manager IPC are unavailable in this mode and degrade to browser/backend equivalents where possible. Core chat, profiles, settings, tools, sessions, coding/Git workflows, and backend-driven features remain on the normal Hermes backend.
+
+The Android companion is sourced from the official [Termux:X11 releases](https://github.com/termux/termux-x11/releases/tag/nightly); Hermes verifies the current release asset against the SHA-256 digest published in GitHub's release metadata before invoking Android's installer. If Android blocks the installer prompt or package installation is cancelled, install `termux-x11-universal-debug.apk` from that release manually and rerun `hermes desktop`.
+
+For build/debug workflows, `hermes desktop --build-only` builds the browser-safe Desktop renderer without starting X11, while `--skip-build` reuses an existing `apps/desktop/dist`.
+
 ## Updating
 
 Use the normal updater:
@@ -108,7 +145,7 @@ Before accepting newly pulled code, the updater executes the wheel verifier from
 The verified cache is stored under:
 
 ```text
-~/.hermes/cache/termux-wheelhouse/wheelhouse-cp313-android24-arm64-20260719.1/
+~/.hermes/cache/termux-wheelhouse/wheelhouse-cp313-android24-arm64-20260811.1/
 ```
 
 Rerunning the installer remains supported when repairing the repository checkout itself:
@@ -123,7 +160,7 @@ Local changes are stashed before an update and restored afterward when Git can a
 
 ### Termux currently provides Python 3.14
 
-Hermes supports Python 3.11 through 3.13, but automatic arm64 installs deliberately use CPython 3.13 so they can consume the immutable wheelhouse. When no CPython 3.13 interpreter is available, including when Termux currently provides only Python 3.14?the native installer stages the exact `python_3.13.14_aarch64.deb` asset from release `termux-aarch64-20260719.9.1` side-by-side without replacing Termux's system aliases. The download is locked to SHA-256 `42376a2a47e50048cb7eca2d0f442fc1895fbca2aee2dee3d2fd82728ea1bd80`; installation stops before extraction if the bytes or package metadata differ. This fallback currently supports aarch64 Termux devices only.
+Hermes supports Python 3.11 through 3.13, but automatic arm64 installs deliberately use CPython 3.13 so they can consume the immutable wheelhouse. When no CPython 3.13 interpreter is available, including when Termux currently provides only Python 3.14, the native installer stages the exact `python_3.13.14_aarch64.deb` asset from release `termux-aarch64-20260719.9.1` side-by-side without replacing Termux's system aliases. The download is locked to SHA-256 `42376a2a47e50048cb7eca2d0f442fc1895fbca2aee2dee3d2fd82728ea1bd80`; installation stops before extraction if the bytes or package metadata differ. This fallback currently supports aarch64 Termux devices only.
 
 A known compatible interpreter can also be selected explicitly. Selecting 3.11 or 3.12 opts into the native-build compatibility path:
 
@@ -139,7 +176,7 @@ Do not bypass the checksum check or remove `--only-binary :all:`. Rerun the inst
 bash scripts/install-termux.sh --skip-setup
 ```
 
-The immutable release is [`wheelhouse-cp313-android24-arm64-20260719.1`](https://github.com/adybag14-cyber/termux-hermes/releases/tag/wheelhouse-cp313-android24-arm64-20260719.1). Its `SHA256SUMS` asset is itself pinned by Hermes to SHA-256 `916ff13af7e5283f75952b810fb6b7eef86ab3422bc5004c1ee1440d5163ade5`.
+The immutable release is [`wheelhouse-cp313-android24-arm64-20260811.1`](https://github.com/adybag14-cyber/termux-hermes/releases/tag/wheelhouse-cp313-android24-arm64-20260811.1). Its `SHA256SUMS` asset is itself pinned by Hermes to SHA-256 `435f23524d76cf061bf658c48bbee7439a85bf39e3a3b0b292d54db38669d079`.
 
 CPython 3.11/3.12 or non-arm64 Termux environments cannot consume these CPython 3.13 arm64 wheels. Those unsupported targets retain the older one-time native-build compatibility path and therefore still require the compiler/Rust toolchain.
 

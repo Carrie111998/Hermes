@@ -5351,7 +5351,7 @@ def _write_web_ui_build_stamp(project_root: Path, web_dir: Path) -> None:
         from datetime import datetime, timezone
         stamp_data = {
             "contentHash": _compute_web_ui_content_hash(project_root, web_dir),
-            "builtAt": datetime.now(timezone.utc).isoformat(),
+            "builtAt": datetime.now().astimezone().isoformat(),
         }
         stamp_file.write_text(json.dumps(stamp_data, indent=2) + "\n", encoding="utf-8")
     except Exception as exc:
@@ -7059,12 +7059,191 @@ def _register_linux_desktop_entry() -> None:
         print(f"⚠ Could not install the desktop launcher entry: {exc}")
 
 
+
+def _termux_desktop_stamp_path() -> Path:
+    """Separate renderer-only stamp; never satisfy a full Electron source build."""
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "termux-desktop-renderer-build-stamp.json"
+
+
+def _termux_desktop_renderer_build_needed(desktop_dir: Path) -> bool:
+    if not _desktop_dist_exists(desktop_dir):
+        return True
+    stamp = _termux_desktop_stamp_path()
+    if not stamp.is_file():
+        return True
+    try:
+        data = json.loads(stamp.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True
+    saved_hash = str(data.get("contentHash") or "")
+    return not saved_hash or saved_hash != _compute_desktop_content_hash(PROJECT_ROOT)
+
+
+def _write_termux_desktop_renderer_stamp() -> None:
+    stamp = _termux_desktop_stamp_path()
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "contentHash": _compute_desktop_content_hash(PROJECT_ROOT),
+        "surface": "termux-browser-hosted-desktop",
+        "builtAt": datetime.now().astimezone().isoformat(),
+    }
+    tmp = stamp.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, stamp)
+
+
+def _build_termux_desktop_renderer(
+    desktop_dir: Path,
+    *,
+    skip_build: bool,
+    force_build: bool,
+) -> None:
+    """Build only the browser-safe Desktop renderer on Android/Bionic.
+
+    `npm ci --ignore-scripts` is deliberate: the desktop workspace contains
+    Electron/node-pty dependencies used by the native shell, but Termux only
+    needs the Vite renderer. Skipping lifecycle scripts avoids attempting to
+    download/compile glibc Electron/native modules while npm still resolves the
+    exact lockfile graph needed by Vite.
+    """
+    if skip_build:
+        if not _desktop_dist_exists(desktop_dir):
+            print(f"? --skip-build was passed but no Desktop renderer exists at: {desktop_dir / 'dist'}")
+            print("  Drop --skip-build to build the Termux browser-hosted Desktop renderer.")
+            sys.exit(1)
+        print(f"→ Reusing Desktop renderer at {desktop_dir / 'dist'} (--skip-build)")
+        return
+
+    if not force_build and not _termux_desktop_renderer_build_needed(desktop_dir):
+        print("V Termux Desktop renderer is up to date (content stamp matches)")
+        return
+
+    npm = _resolve_node_runtime_npm()
+    if not npm:
+        print("Termux Desktop requires Node.js/npm, but npm was not found on PATH.")
+        print("Install it with:  pkg install nodejs")
+        sys.exit(1)
+
+    from hermes_constants import with_hermes_node_path
+
+    npm_cwd, workspace_args = _termux_workspace_install_context(desktop_dir)
+    install_env = with_hermes_node_path()
+    install_env["ELECTRON_SKIP_BINARY_DOWNLOAD"] = "1"
+    install_env["npm_config_ignore_scripts"] = "true"
+    print("→ Installing browser-safe Desktop renderer dependencies for Termux...")
+    install_result = _run_npm_install_deterministic(
+        npm,
+        npm_cwd,
+        extra_args=(*workspace_args, "--ignore-scripts", "--prefer-offline"),
+        capture_output=False,
+        env=install_env,
+    )
+    if install_result.returncode != 0:
+        print("? Termux Desktop renderer dependency install failed")
+        print("  Retry manually from the Hermes checkout with:")
+        print("    npm ci --workspace apps/desktop --include-workspace-root=false --ignore-scripts")
+        sys.exit(install_result.returncode or 1)
+
+    print("→ Building the Hermes Desktop renderer (Electron shell intentionally omitted on Termux)...")
+    build_result = subprocess.run(
+        [npm, "run", "build:renderer"],
+        cwd=desktop_dir,
+        env=install_env,
+        check=False,
+    )
+    if build_result.returncode != 0 or not _desktop_dist_exists(desktop_dir):
+        print("? Termux Desktop renderer build failed")
+        print("  Run manually:  cd apps/desktop && npm run build:renderer")
+        sys.exit(build_result.returncode or 1)
+    _write_termux_desktop_renderer_stamp()
+    print(f"V Termux Desktop renderer built at {desktop_dir / 'dist'}")
+
+
+def _cmd_termux_gui(args: argparse.Namespace, desktop_dir: Path) -> None:
+    """Run the latest Desktop renderer on Termux via loopback + Termux:X11."""
+    _build_termux_desktop_renderer(
+        desktop_dir,
+        skip_build=getattr(args, "skip_build", False),
+        force_build=getattr(args, "force_build", False),
+    )
+
+    if getattr(args, "build_only", False):
+        print("V Termux Desktop renderer ready (not launching; --build-only)")
+        return
+
+    from hermes_cli.termux_desktop import (
+        acquire_termux_x11_android_app,
+        chromium_browser_spec,
+        ensure_termux_x11_packages,
+        launch_termux_x11,
+        termux_x11_android_app_installed,
+    )
+
+    try:
+        runtime = ensure_termux_x11_packages(env=os.environ)
+    except RuntimeError as exc:
+        print(f"? Termux Desktop runtime setup failed: {exc}")
+        sys.exit(1)
+
+    if not termux_x11_android_app_installed():
+        print("→ Termux:X11 Android companion is not installed; acquiring the official nightly APK...")
+        print("  Android will show its required one-time package-install confirmation.")
+        if not acquire_termux_x11_android_app(env=os.environ):
+            print("? Termux:X11 Android companion is still unavailable.")
+            print("  Official release: https://github.com/termux/termux-x11/releases/tag/nightly")
+            print("  Install termux-x11-universal-debug.apk, then rerun `hermes desktop`.")
+            sys.exit(1)
+
+    print(f"→ Starting Termux:X11 on DISPLAY={runtime.display}...")
+    try:
+        launch_termux_x11(runtime, env=os.environ)
+    except RuntimeError as exc:
+        print(f"? Termux:X11 failed to start: {exc}")
+        sys.exit(1)
+    os.environ["DISPLAY"] = runtime.display
+    os.environ["BROWSER"] = chromium_browser_spec(runtime)
+    # Reuse the hardened dashboard server's auth/token/REST/WS implementation,
+    # but serve the *Desktop* Vite dist. The Desktop bundle detects the injected
+    # loopback token and installs its browser-host bridge before React evaluates.
+    os.environ["HERMES_WEB_DIST"] = str((desktop_dir / "dist").resolve())
+    os.environ.pop("HERMES_SERVE_HEADLESS", None)
+
+    port = int(getattr(args, "port", 9119) or 9119)
+    if not 1 <= port <= 65535:
+        print(f"? --port must be between 1 and 65535 (got {port})")
+        sys.exit(2)
+    print(f"V Hermes Desktop (Termux:X11): http://127.0.0.1:{port}")
+    print(f"V Phone browser URL:            http://127.0.0.1:{port}")
+    print("  The server is loopback-only; other LAN devices cannot reach it.")
+
+    dashboard_args = argparse.Namespace(
+        headless_backend=False,
+        host="127.0.0.1",
+        insecure=False,
+        isolated=True,
+        no_open=False,
+        open_profile="",
+        port=port,
+        skip_build=True,
+        ssh_owner_nonce=None,
+        ssh_session_token_file=None,
+        status=False,
+        stop=False,
+    )
+    cmd_dashboard(dashboard_args)
+
 def cmd_gui(args: argparse.Namespace):
-    """Build and launch the native Electron desktop GUI."""
+    """Build and launch Hermes Desktop (Electron, or browser-hosted on Termux)."""
     desktop_dir = PROJECT_ROOT / "apps" / "desktop"
     if not (desktop_dir / "package.json").exists():
         print(f"Desktop GUI source not found at: {desktop_dir}")
         sys.exit(1)
+
+    if _is_termux_startup_environment():
+        _cmd_termux_gui(args, desktop_dir)
+        return
 
     try:
         from hermes_logging import setup_logging as _setup_logging_gui
@@ -8540,6 +8719,18 @@ def _install_python_dependencies_with_optional_fallback(
     copies (Windows blocks REPLACE on a running .exe but allows RENAME). See
     ``_quarantine_running_hermes_exe`` for the rationale.
     """
+    if group == "termux-all" and _is_termux_env(env) and _is_android_python():
+        if _install_termux_dependencies_from_wheelhouse(
+            install_cmd_prefix,
+            env=env,
+        ):
+            return
+        print(
+            "  WARNING: Immutable wheels do not support this Python/architecture; "
+            "using the native-build compatibility fallback..."
+        )
+        _install_psutil_android_compat(install_cmd_prefix, env=env)
+
     scripts_dir = _venv_scripts_dir() if _is_windows() else None
 
     def _install(args: list[str]) -> None:
@@ -8913,6 +9104,393 @@ def _is_windows_npm_path(npm_path: str) -> bool:
         or low.startswith("/mnt/")
         or "\\" in npm_path
     )
+
+
+def _termux_wheelhouse_cache_root(env: dict[str, str] | None = None) -> Path:
+    values = env or os.environ
+    home = values.get("HERMES_HOME")
+    root = Path(home).expanduser() if home else Path.home() / ".hermes"
+    return root / "cache" / "termux-wheelhouse"
+
+
+def _install_termux_dependencies_from_wheelhouse(
+    install_cmd_prefix: list[str],
+    *,
+    env: dict[str, str] | None = None,
+) -> bool:
+    """Resolve and install the Termux graph from the pinned binary wheelhouse.
+
+    Returns ``False`` only when the interpreter/architecture is outside the
+    published CPython 3.13 arm64 target. Integrity, download, or dependency-pin
+    failures raise and therefore never silently fall back to local compilation.
+    """
+    if len(install_cmd_prefix) < 2 or install_cmd_prefix[1] != "pip":
+        return False
+
+    from hermes_cli.termux_wheelhouse import (
+        TermuxWheelhouseUnsupported,
+        binary_install_options,
+        ensure_wheelhouse,
+        validate_runtime,
+    )
+
+    uv_bin = install_cmd_prefix[0]
+    target_python = _resolve_install_target_python(install_cmd_prefix, env)
+    if target_python is None:
+        return False
+
+    probe = (
+        "import json, platform, sys; "
+        "g=getattr(sys, 'getandroidapilevel', None); "
+        "print(json.dumps({'platform':sys.platform,'version':list(sys.version_info[:2]),"
+        "'machine':platform.machine(),'api':g() if callable(g) else None,'full_version':platform.python_version()}))"
+    )
+    result = subprocess.run(
+        [str(target_python), "-c", probe],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    )
+    details = json.loads(result.stdout)
+    try:
+        validate_runtime(
+            python_version=tuple(details["version"]),
+            machine=str(details["machine"]),
+            android_api=details["api"],
+            sys_platform=str(details["platform"]),
+        )
+    except TermuxWheelhouseUnsupported:
+        return False
+
+    work = _termux_wheelhouse_cache_root(env).parent / "termux-update"
+    work.mkdir(parents=True, exist_ok=True)
+    direct = work / "direct.in"
+    lock_constraints = work / "lock-constraints.txt"
+    resolved = work / "resolved.txt"
+    run_env = {**os.environ, **(env or {})}
+    run_env.pop("PYTHONPATH", None)
+    run_env.pop("PYTHONHOME", None)
+    run_env["UV_NO_CONFIG"] = "1"
+    run_env["UV_LINK_MODE"] = "copy"
+    run_env["UV_PYTHON"] = str(target_python)
+    run_env["UV_DEFAULT_INDEX"] = "https://pypi.org/simple"
+    run_env["UV_INDEX_STRATEGY"] = "first-index"
+    for key in (
+        "UV_INDEX",
+        "UV_EXTRA_INDEX_URL",
+        "PIP_INDEX_URL",
+        "PIP_EXTRA_INDEX_URL",
+    ):
+        run_env.pop(key, None)
+
+    _run_install_with_heartbeat(
+        [uv_bin, "pip", "install", "--python", str(target_python), "packaging==26.0"],
+        env=run_env,
+    )
+    subprocess.run(
+        [
+            str(target_python),
+            str(PROJECT_ROOT / "scripts" / "termux_requirements.py"),
+            "--pyproject",
+            str(PROJECT_ROOT / "pyproject.toml"),
+            "--lock",
+            str(PROJECT_ROOT / "uv.lock"),
+            "--requirements",
+            str(direct),
+            "--constraints",
+            str(lock_constraints),
+            "--python-version",
+            str(details["full_version"]),
+        ],
+        cwd=PROJECT_ROOT,
+        check=True,
+        env=run_env,
+    )
+    subprocess.run(
+        [
+            uv_bin,
+            "pip",
+            "compile",
+            str(direct),
+            "--python",
+            str(target_python),
+            "--constraint",
+            str(lock_constraints),
+            "--output-file",
+            str(resolved),
+            "--no-annotate",
+        ],
+        cwd=PROJECT_ROOT,
+        check=True,
+        env=run_env,
+    )
+    wheelhouse = ensure_wheelhouse(
+        _termux_wheelhouse_cache_root(run_env),
+        requirements=resolved,
+        uv_lock=PROJECT_ROOT / "uv.lock",
+        check_runtime=False,
+    )
+    print(f"  Using immutable Termux wheelhouse: {wheelhouse.name}")
+    _run_install_with_heartbeat(
+        [
+            uv_bin,
+            "pip",
+            "install",
+            "--python",
+            str(target_python),
+            "--requirements",
+            str(resolved),
+            "--constraint",
+            str(PROJECT_ROOT / "constraints-termux.txt"),
+            *binary_install_options(wheelhouse),
+        ],
+        env=run_env,
+    )
+    _run_install_with_heartbeat(
+        [
+            uv_bin,
+            "pip",
+            "install",
+            "--python",
+            str(target_python),
+            "--no-deps",
+            "--editable",
+            ".",
+        ],
+        env=run_env,
+    )
+    subprocess.run(
+        [uv_bin, "pip", "check", "--python", str(target_python)],
+        cwd=PROJECT_ROOT,
+        check=True,
+        env=run_env,
+    )
+    smoke = (
+        "import importlib; "
+        "[importlib.import_module(m) for m in "
+        "('cffi','cryptography','jiter','markupsafe','PIL.Image','psutil',"
+        "'pydantic_core','yaml','rpds','_ruamel_yaml')]; "
+        "print('immutable Termux native imports ok')"
+    )
+    subprocess.run(
+        [str(target_python), "-c", smoke],
+        cwd=PROJECT_ROOT,
+        check=True,
+        env=run_env,
+    )
+    return True
+
+
+def _termux_post_pull_wheelhouse_gate(
+    git_cmd: list[str],
+    pre_pull_sha: str | None,
+) -> None:
+    """Reject a pulled Termux update unless its complete graph is binary-only.
+
+    The verifier runs in a child process so it loads the newly pulled release
+    constants instead of this process's pre-pull module cache. After the
+    immutable wheel release is verified, uv performs a dry-run of the freshly
+    resolved Termux graph with source distributions disabled. Any pin,
+    checksum, download, or binary-coverage failure rolls the checkout back.
+    """
+    if not (_is_termux_env() and _is_android_python()):
+        return
+
+    def reject(detail: str) -> None:
+        print("Updated checkout failed the immutable Termux wheel gate:")
+        print(
+            f"  {detail.splitlines()[-1] if detail else 'unknown wheelhouse failure'}"
+        )
+        if pre_pull_sha:
+            rollback = subprocess.run(
+                git_cmd + ["reset", "--hard", pre_pull_sha],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if rollback.returncode == 0:
+                print(
+                    f"  Rolled back to {pre_pull_sha[:10]}; "
+                    "the existing install is unchanged"
+                )
+            else:
+                print(f"  Recover manually: git reset --hard {pre_pull_sha}")
+        raise SystemExit(1)
+
+    uv_bin = shutil.which("uv")
+    if not uv_bin:
+        reject("Termux uv is unavailable; reinstall the Termux uv package")
+
+    target_python = _resolve_install_target_python(
+        [uv_bin, "pip"],
+        {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")},
+    ) or Path(sys.executable)
+    verifier = [
+        str(target_python),
+        str(PROJECT_ROOT / "scripts" / "prepare_termux_wheelhouse.py"),
+        "--cache-root",
+        str(_termux_wheelhouse_cache_root()),
+        "--uv-lock",
+        str(PROJECT_ROOT / "uv.lock"),
+    ]
+    result = subprocess.run(
+        verifier,
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 2:
+        print(
+            "  WARNING: Updated checkout is outside the immutable "
+            "arm64/Python 3.13 target"
+        )
+        return
+    if result.returncode != 0:
+        reject(
+            (result.stderr or result.stdout or "wheelhouse verification failed").strip()
+        )
+
+    work = _termux_wheelhouse_cache_root().parent / "termux-update-gate"
+    work.mkdir(parents=True, exist_ok=True)
+    direct = work / "direct.in"
+    lock_constraints = work / "lock-constraints.txt"
+    resolved = work / "resolved.txt"
+    run_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+    run_env.pop("PYTHONPATH", None)
+    run_env.pop("PYTHONHOME", None)
+    run_env["UV_NO_CONFIG"] = "1"
+    run_env["UV_LINK_MODE"] = "copy"
+    run_env["UV_PYTHON"] = str(target_python)
+    run_env["UV_DEFAULT_INDEX"] = "https://pypi.org/simple"
+    run_env["UV_INDEX_STRATEGY"] = "first-index"
+    for key in (
+        "UV_INDEX",
+        "UV_EXTRA_INDEX_URL",
+        "PIP_INDEX_URL",
+        "PIP_EXTRA_INDEX_URL",
+    ):
+        run_env.pop(key, None)
+
+    version_probe = subprocess.run(
+        [
+            str(target_python),
+            "-c",
+            "import platform; print(platform.python_version())",
+        ],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=run_env,
+    )
+    if version_probe.returncode != 0:
+        reject((version_probe.stderr or "target Python version probe failed").strip())
+    full_version = version_probe.stdout.strip()
+
+    try:
+        subprocess.run(
+            [
+                str(target_python),
+                str(PROJECT_ROOT / "scripts" / "termux_requirements.py"),
+                "--pyproject",
+                str(PROJECT_ROOT / "pyproject.toml"),
+                "--lock",
+                str(PROJECT_ROOT / "uv.lock"),
+                "--requirements",
+                str(direct),
+                "--constraints",
+                str(lock_constraints),
+                "--python-version",
+                full_version,
+            ],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+            env=run_env,
+        )
+        subprocess.run(
+            [
+                uv_bin,
+                "pip",
+                "compile",
+                str(direct),
+                "--python",
+                str(target_python),
+                "--constraint",
+                str(lock_constraints),
+                "--output-file",
+                str(resolved),
+                "--no-annotate",
+            ],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+            env=run_env,
+        )
+    except subprocess.CalledProcessError as exc:
+        reject((exc.stderr or exc.stdout or str(exc)).strip())
+
+    graph_verifier = [*verifier, "--requirements", str(resolved)]
+    graph_result = subprocess.run(
+        graph_verifier,
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=run_env,
+    )
+    if graph_result.returncode != 0:
+        reject(
+            (
+                graph_result.stderr or graph_result.stdout or "dependency pin mismatch"
+            ).strip()
+        )
+    output_lines = [
+        line.strip() for line in graph_result.stdout.splitlines() if line.strip()
+    ]
+    if not output_lines:
+        reject("wheelhouse verifier returned no cache path")
+    wheelhouse = Path(output_lines[-1])
+
+    binary_probe = subprocess.run(
+        [
+            uv_bin,
+            "pip",
+            "install",
+            "--dry-run",
+            "--reinstall",
+            "--python",
+            str(target_python),
+            "--requirements",
+            str(resolved),
+            "--constraint",
+            str(PROJECT_ROOT / "constraints-termux.txt"),
+            "--find-links",
+            str(wheelhouse),
+            "--only-binary",
+            ":all:",
+        ],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=run_env,
+    )
+    if binary_probe.returncode != 0:
+        reject(
+            (
+                binary_probe.stderr
+                or binary_probe.stdout
+                or "resolved graph requires an unavailable source build"
+            ).strip()
+        )
+    print("  Immutable Termux wheel update gate passed (binary-only graph)")
 
 
 def _resolve_node_runtime_npm() -> str | None:

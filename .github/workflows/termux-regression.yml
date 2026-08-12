@@ -1,0 +1,163 @@
+name: Termux regression
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/termux-regression.yml"
+      - ".github/workflows/lint.yml"
+      - "apps/desktop/**"
+      - "apps/shared/**"
+      - "hermes_cli/**"
+      - "package.json"
+      - "package-lock.json"
+      - "pyproject.toml"
+      - "scripts/android_wheels.py"
+      - "scripts/check-termux-footguns.py"
+      - "scripts/install-termux.sh"
+      - "scripts/termux_requirements.py"
+      - "tests/hermes_cli/test_termux_desktop.py"
+      - "tests/scripts/test_termux_footguns.py"
+      - "tests/test_termux_requirements.py"
+      - "ui-tui/**"
+      - "uv.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: termux-regression-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-termux-aarch64:
+    name: Native Termux aarch64 (CLI + TUI + Desktop renderer)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 55
+    env:
+      TERMUX_IMAGE: termux/termux-docker@sha256:3aed9c7fbcf9195a9919deaad418da006232864a779fb4f322d68a34887a2e15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Make the checked-out PR addressable to the native installer
+        shell: bash
+        run: git branch -f termux-ci "$GITHUB_SHA"
+
+      - name: Pull pinned native Termux aarch64 image
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          docker pull "$TERMUX_IMAGE"
+          test "$(docker image inspect --format '{{.Architecture}}' "$TERMUX_IMAGE")" = "arm64"
+
+      - name: Run native installer and UX regression gates
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker run --rm \
+            -v "$PWD:/workspace:ro" \
+            "$TERMUX_IMAGE" \
+            bash -lc '
+              set -Eeuo pipefail
+              export TERMUX_VERSION="ci"
+              export HERMES_REPO_URL="file:///workspace"
+              export HERMES_HOME="$HOME/.hermes-ci"
+              export HERMES_INSTALL_DIR="$HOME/hermes-agent-ci"
+              git config --global --add safe.directory /workspace
+
+              echo "== native installer =="
+              bash /workspace/scripts/install-termux.sh \
+                --branch termux-ci \
+                --dir "$HERMES_INSTALL_DIR" \
+                --hermes-home "$HERMES_HOME" \
+                --skip-setup \
+                --skip-browser \
+                --no-skills \
+                --non-interactive
+
+              echo "== CLI smoke =="
+              hermes --version
+              hermes --help >/dev/null
+              "$HERMES_INSTALL_DIR/venv/bin/python" - <<"PY"
+          from hermes_cli.main import _is_termux_startup_environment
+          from hermes_cli.termux_desktop import chromium_browser_spec, TermuxDesktopRuntime
+
+          assert _is_termux_startup_environment(), "Termux startup detection is false in native image"
+          spec = chromium_browser_spec(
+              TermuxDesktopRuntime(
+                  browser="/data/data/com.termux/files/usr/bin/chromium-browser",
+                  display=":1",
+                  x11="/data/data/com.termux/files/usr/bin/termux-x11",
+              )
+          )
+          assert "--app=%s" in spec
+          assert "--no-sandbox" not in spec
+          print("native-termux-runtime-contract-ok")
+          PY
+
+              echo "== Desktop renderer build (must not execute Electron) =="
+              hermes desktop --build-only
+              test -f "$HERMES_INSTALL_DIR/apps/desktop/dist/index.html"
+
+              echo "== TUI install/build path =="
+              "$HERMES_INSTALL_DIR/venv/bin/python" - <<"PY"
+          from pathlib import Path
+          from hermes_cli.main import PROJECT_ROOT, _make_tui_argv
+
+          argv, cwd = _make_tui_argv(PROJECT_ROOT / "ui-tui", False)
+          entry = Path(argv[-1])
+          assert entry.is_file(), entry
+          assert "ui-tui" in str(entry) or "tui_dist" in str(entry)
+          print(f"native-tui-entry={entry}")
+          print(f"native-tui-cwd={cwd}")
+          PY
+
+              echo "== frontend type/regression tests =="
+              cd "$HERMES_INSTALL_DIR"
+              npm run build:ink --workspace ui-tui
+              npm run typecheck --workspace ui-tui
+              npm exec --workspace ui-tui -- vitest run src/__tests__/termuxComposerLayout.test.ts
+              echo "== real narrow PTY TUI smoke =="
+              "$HERMES_INSTALL_DIR/venv/bin/python" scripts/smoke-termux-tui.py --cols 48 --rows 18
+              npm run typecheck --workspace apps/desktop
+              npm exec --workspace apps/desktop -- vitest run src/lib/browser-desktop-bridge.test.ts src/lib/local-preview.test.ts src/lib/desktop-fs.test.ts --project ui
+
+              echo "== Termux:X11 package availability =="
+              pkg install -y x11-repo >/dev/null
+              pkg install -y termux-x11-nightly chromium >/dev/null
+              apt-cache show termux-x11-nightly >/dev/null
+              apt-cache show chromium >/dev/null
+
+              echo "== browser-hosted Desktop loopback smoke =="
+              export HERMES_WEB_DIST="$HERMES_INSTALL_DIR/apps/desktop/dist"
+              export HERMES_SERVE_HEADLESS=""
+              "$HERMES_INSTALL_DIR/venv/bin/python" -c "from hermes_cli.web_server import start_server; start_server(host=\"127.0.0.1\", port=9127, open_browser=False)" \
+                >"$TMPDIR/hermes-desktop-browser-smoke.log" 2>&1 &
+              server_pid=$!
+              cleanup_browser_smoke() { kill "$server_pid" >/dev/null 2>&1 || true; }
+              trap cleanup_browser_smoke EXIT
+              for attempt in $(seq 1 60); do
+                if curl --fail --silent --show-error http://127.0.0.1:9127/ >/dev/null; then
+                  break
+                fi
+                if ! kill -0 "$server_pid" >/dev/null 2>&1; then
+                  cat "$TMPDIR/hermes-desktop-browser-smoke.log" >&2
+                  exit 1
+                fi
+                sleep 0.5
+              done
+              curl --fail --silent --show-error http://127.0.0.1:9127/ >/dev/null
+              browser_exe="$(command -v chromium-browser || command -v chromium)"
+              HERMES_BROWSER_EXECUTABLE="$browser_exe" \
+                HERMES_BROWSER_HOST_URL="http://127.0.0.1:9127/" \
+                HERMES_BROWSER_REQUIRE_TERMINAL=1 \
+                npm run smoke:browser-host --workspace apps/desktop
+              cleanup_browser_smoke
+              trap - EXIT
+
+              echo "native-termux-regression-ok"
+            '
