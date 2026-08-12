@@ -165,6 +165,28 @@ class TestMergeMode:
         assert "rationale" not in store.read()[0]
         assert "basis was not preserved" in store.format_for_injection().lower()
 
+    def test_content_update_with_blank_rationale_discards_stale_basis(self):
+        store = TodoStore()
+        store.write([{
+            "id": "1",
+            "content": "Trace route provenance",
+            "status": "in_progress",
+            "rationale": "Need to learn whether the task created it",
+        }])
+
+        store.write(
+            [{
+                "id": "1",
+                "content": "Remove route",
+                "status": "pending",
+                "rationale": "   ",
+            }],
+            merge=True,
+        )
+
+        assert "rationale" not in store.read()[0]
+        assert "basis was not preserved" in store.format_for_injection().lower()
+
 
 class TestTodoToolFunction:
     def test_read_mode(self):
