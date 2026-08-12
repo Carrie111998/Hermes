@@ -70,10 +70,18 @@ _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
 
-def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
+def _approval_event_choices(
+    *, smart_denied: bool, allow_session: bool = True, allow_permanent: bool
+) -> list[str]:
     if smart_denied:
         return ["once", "deny"]
-    return ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
+    choices = ["once"]
+    if allow_session:
+        choices.append("session")
+    if allow_permanent:
+        choices.append("always")
+    choices.append("deny")
+    return choices
 
 
 try:
@@ -6660,6 +6668,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "timestamp": time.time(),
                         "choices": _approval_event_choices(
                             smart_denied=bool(event.get("smart_denied")),
+                            allow_session=event.get("allow_session") is not False,
                             allow_permanent=event.get("allow_permanent") is not False,
                         ),
                     })

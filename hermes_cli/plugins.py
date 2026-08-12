@@ -2462,6 +2462,8 @@ class _PreToolCallDirective:
     action: Optional[str] = None
     message: Optional[str] = None
     rule_key: Optional[str] = None
+    allow_session: bool = True
+    allow_permanent: bool = True
 
 
 def set_thread_tool_whitelist(
@@ -2550,7 +2552,17 @@ def _get_pre_tool_call_directive_details(
         rule_key = rule_key.strip() if isinstance(rule_key, str) else None
         if not rule_key:
             rule_key = None
-        return _PreToolCallDirective(action=action, message=message, rule_key=rule_key)
+        allow_session = result.get("allow_session", True)
+        allow_permanent = result.get("allow_permanent", True)
+        return _PreToolCallDirective(
+            action=action,
+            message=message,
+            rule_key=rule_key,
+            allow_session=allow_session if isinstance(allow_session, bool) else True,
+            allow_permanent=(
+                allow_permanent if isinstance(allow_permanent, bool) else True
+            ),
+        )
 
     return _PreToolCallDirective()
 
@@ -2657,6 +2669,8 @@ def resolve_pre_tool_block(
                     tool_name,
                     details.message or "",
                     rule_key=details.rule_key or tool_name,
+                    allow_session=details.allow_session,
+                    allow_permanent=details.allow_permanent,
                 )
             finally:
                 if approval_tokens is not None:

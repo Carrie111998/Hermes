@@ -34,4 +34,19 @@ class TestTuiApprovalEmitRedaction:
         assert emitted["payload"]["description"] == "x"
         assert "github.com" in emitted["payload"]["command"]
 
+    def test_emit_approval_request_hides_disallowed_scopes(self, monkeypatch):
+        from tui_gateway import server as tui_server
+
+        emitted = {}
+        monkeypatch.setattr(
+            tui_server,
+            "_emit",
+            lambda event, sid, payload=None: emitted.update({"payload": payload}),
+        )
+        tui_server._emit_approval_request(
+            "sess-1",
+            {"command": "publish", "allow_session": False, "allow_permanent": False},
+        )
+        assert emitted["payload"]["choices"] == ["once", "deny"]
+
 

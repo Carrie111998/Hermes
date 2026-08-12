@@ -42,12 +42,87 @@ class TestRequestToolApproval:
         res = request_tool_approval("write_file", "sensitive path", rule_key="ssh")
         assert res == {"approved": True, "message": None}
 
+    def test_once_only_ignores_cached_approval(self, monkeypatch):
+        monkeypatch.setattr(approval, "is_approved", lambda sk, pk: True)
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        calls = []
+        monkeypatch.setattr(
+            approval,
+            "prompt_dangerous_approval",
+            lambda *a, **k: calls.append(k) or "once",
+        )
+
+        result = request_tool_approval(
+            "social_publish",
+            "one operation only",
+            allow_session=False,
+            allow_permanent=False,
+        )
+
+        assert result["approved"] is True
+        assert len(calls) == 1
+
     def test_cli_approve_once(self, monkeypatch):
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
         monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
         monkeypatch.setattr(approval, "prompt_dangerous_approval", lambda *a, **k: "once")
         res = request_tool_approval("write_file", "writing ~/.ssh/authorized_keys")
         assert res["approved"] is True
+
+    def test_gateway_once_only_capabilities_reach_payload(self, monkeypatch):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+        captured = {}
+
+        def _notify(data):
+            captured.update(data)
+            with approval._lock:
+                entry = approval._gateway_queues["test-session"][-1]
+                entry.result = "once"
+                entry.event.set()
+
+        monkeypatch.setitem(approval._gateway_notify_cbs, "test-session", _notify)
+        try:
+            result = request_tool_approval(
+                "social_publish",
+                "one operation only",
+                allow_session=False,
+                allow_permanent=False,
+            )
+        finally:
+            approval._gateway_notify_cbs.pop("test-session", None)
+
+        assert result["approved"] is True
+        assert captured["allow_session"] is False
+        assert captured["allow_permanent"] is False
+
+    @pytest.mark.parametrize("invalid_choice", ["session", "always"])
+    def test_gateway_rejects_disallowed_persistent_choice(
+        self, monkeypatch, invalid_choice
+    ):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+
+        def _notify(data):
+            with approval._lock:
+                entry = approval._gateway_queues["test-session"][-1]
+                entry.result = invalid_choice
+                entry.event.set()
+
+        monkeypatch.setitem(approval._gateway_notify_cbs, "test-session", _notify)
+        try:
+            result = request_tool_approval(
+                "social_publish",
+                "one operation only",
+                allow_session=False,
+                allow_permanent=False,
+            )
+        finally:
+            approval._gateway_notify_cbs.pop("test-session", None)
+
+        assert result["approved"] is False
+        assert "not permitted" in result["message"]
 
     def test_cli_deny_blocks(self, monkeypatch):
         from hermes_cli import lifecycle
@@ -94,6 +169,30 @@ class TestRequestToolApproval:
         assert res["approved"] is True
         assert calls["session"] == ["plugin_rule:ssh-writes"]
         assert calls["permanent"] == []  # session != always
+
+    @pytest.mark.parametrize("invalid_choice", ["session", "always"])
+    def test_cli_rejects_disallowed_persistent_choice(self, monkeypatch, invalid_choice):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(approval, "prompt_dangerous_approval", lambda *a, **k: invalid_choice)
+        result = request_tool_approval(
+            "social_publish", "one operation only",
+            allow_session=False, allow_permanent=False,
+        )
+        assert result["approved"] is False
+        assert "not permitted" in result["message"]
+
+    def test_gateway_queue_preserves_choice_capabilities(self, monkeypatch):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+        result = request_tool_approval(
+            "social_publish", "one operation only",
+            allow_session=False, allow_permanent=False,
+        )
+        assert result["status"] == "approval_required"
+        pending = approval._pending["test-session"]
+        assert pending["allow_session"] is False
+        assert pending["allow_permanent"] is False
 
 
     def test_cron_deny_mode_blocks(self, monkeypatch):

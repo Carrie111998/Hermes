@@ -1834,10 +1834,13 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
     if "choices" not in payload:
         if payload.get("smart_denied"):
             payload["choices"] = ["once", "deny"]
-        elif payload.get("allow_permanent") is False:
-            payload["choices"] = ["once", "session", "deny"]
-        elif "allow_permanent" in payload:
-            payload["choices"] = ["once", "session", "always", "deny"]
+        elif "allow_permanent" in payload or "allow_session" in payload:
+            payload["choices"] = ["once"]
+            if payload.get("allow_session") is not False:
+                payload["choices"].append("session")
+            if payload.get("allow_permanent") is not False:
+                payload["choices"].append("always")
+            payload["choices"].append("deny")
     if "command" in payload:
         from gateway.run import _redact_approval_command
 

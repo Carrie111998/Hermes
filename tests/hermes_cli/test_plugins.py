@@ -657,6 +657,30 @@ class TestResolvePreToolBlock:
             "rule_key": "write_file:ssh",
         }
 
+    def test_approve_passes_choice_capabilities_to_gate(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        seen = {}
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [{
+                "action": "approve",
+                "message": "one operation only",
+                "allow_session": False,
+                "allow_permanent": False,
+            }],
+        )
+
+        def _approve(tool_name, reason, **kwargs):
+            seen.update(kwargs)
+            return {"approved": True, "message": None}
+
+        monkeypatch.setattr("tools.approval.request_tool_approval", _approve)
+
+        assert resolve_pre_tool_block("social_publish", {}) is None
+        assert seen["allow_session"] is False
+        assert seen["allow_permanent"] is False
+
 
     def test_approve_gate_exception_fails_closed(self, monkeypatch):
         from hermes_cli.plugins import resolve_pre_tool_block

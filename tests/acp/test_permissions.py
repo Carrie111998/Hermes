@@ -22,6 +22,7 @@ def _make_response(outcome):
 def _invoke_callback(
     outcome,
     *,
+    allow_session=True,
     allow_permanent=True,
     smart_denied=False,
     timeout=60.0,
@@ -45,6 +46,7 @@ def _invoke_callback(
             result = prompt_dangerous_approval(
                 "rm -rf /",
                 "dangerous command",
+                allow_session=allow_session,
                 allow_permanent=allow_permanent,
                 smart_denied=smart_denied,
                 approval_callback=cb,
@@ -53,6 +55,7 @@ def _invoke_callback(
             result = cb(
                 "rm -rf /",
                 "dangerous command",
+                allow_session=allow_session,
                 allow_permanent=allow_permanent,
                 smart_denied=smart_denied,
             )
@@ -63,6 +66,19 @@ def _invoke_callback(
 
 
 class TestApprovalBridge:
+    def test_once_only_hides_persistent_options(self):
+        result, kwargs, _, _, _ = _invoke_callback(
+            AllowedOutcome(option_id="allow_once", outcome="selected"),
+            allow_session=False,
+            allow_permanent=False,
+        )
+        assert result == "once"
+        assert [option.option_id for option in kwargs["options"]] == [
+            "allow_once",
+            "deny",
+            "deny_always",
+        ]
+
     def test_bridge_schedules_request_on_the_given_loop(self):
         result, kwargs, scheduled, _, loop = _invoke_callback(
             AllowedOutcome(option_id="allow_once", outcome="selected"),

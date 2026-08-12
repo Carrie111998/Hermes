@@ -39,13 +39,13 @@ def _permission_option_supports_kind(kind: str) -> bool:
 
 
 def _build_permission_options(
-    *, allow_permanent: bool, smart_denied: bool = False,
+    *, allow_session: bool = True, allow_permanent: bool, smart_denied: bool = False,
 ) -> list[PermissionOption]:
     """Return ACP options that match Hermes approval semantics."""
     options = [PermissionOption(
         option_id="allow_once", kind="allow_once", name="Allow once",
     )]
-    if not smart_denied:
+    if allow_session and not smart_denied:
         options.append(PermissionOption(
             option_id="allow_session",
             # ACP has no session-scoped kind, so use the closest persistent
@@ -131,6 +131,7 @@ def make_approval_callback(
         command: str,
         description: str,
         *,
+        allow_session: bool = True,
         allow_permanent: bool = True,
         smart_denied: bool = False,
         **_: object,
@@ -138,6 +139,7 @@ def make_approval_callback(
         from agent.async_utils import safe_schedule_threadsafe
 
         options = _build_permission_options(
+            allow_session=allow_session,
             allow_permanent=allow_permanent,
             smart_denied=smart_denied,
         )
