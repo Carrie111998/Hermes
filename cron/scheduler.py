@@ -3429,12 +3429,62 @@ def run_job(
                 f"{_monitor_context}\n\n{extra_prompt}" if extra_prompt else _monitor_context
             )
 
-    # ---------------------------------------------------------------
-    # Default (LLM) path — import and construct the agent machinery now
-    # that we know we actually need it. Doing these imports here instead of
-    # at module top keeps no_agent ticks from paying for AIAgent / SessionDB
-    # construction costs.
-    # ---------------------------------------------------------------
+    # Wake-gate: if this job has a pre-check script, run it BEFORE building
+    # the prompt or opening SessionDB so a ``{"wakeAgent": false}`` response
+    # can short-circuit without acquiring agent-only resources. We pass the
+    # result into _build_job_prompt so the script is only executed once.
+    prerun_script = None
+    script_path = job.get("script")
+    if script_path:
+        prerun_script = _run_job_script_with_claim_heartbeat(job, script_path)
+        _ran_ok, _script_output = prerun_script
+        if _ran_ok and not _parse_wake_gate(_script_output):
+            logger.info(
+                "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
+                job_name, job_id,
+            )
+            silent_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                "Script gate returned `wakeAgent=false` — agent skipped.\n"
+            )
+            return True, silent_doc, SILENT_MARKER, None
+
+    try:
+        prompt = _build_job_prompt(
+            job, prerun_script=prerun_script, extra_prompt=extra_prompt
+        )
+    except CronPromptInjectionBlocked as block_exc:
+        # Assembled prompt (user prompt + loaded skill content) tripped the
+        # injection scanner. Refuse to run the agent this tick and surface
+        # a clear failure to the operator so they see WHY the scheduled job
+        # didn't run and can audit the offending skill.
+        logger.warning(
+            "Job '%s' (ID: %s): blocked by prompt-injection scanner — %s",
+            job_name, job_id, block_exc,
+        )
+        blocked_doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"**Status:** BLOCKED\n\n"
+            "The assembled prompt (user prompt + loaded skill content) tripped "
+            "the cron injection scanner and the agent was NOT run.\n\n"
+            f"**Scanner result:** {block_exc}\n\n"
+            "Audit the skill(s) attached to this job for prompt-injection "
+            "payloads or invisible-unicode markers. If the skill is legitimate "
+            "and the match is a false positive, rephrase the content to avoid "
+            "the threat pattern (`tools/cronjob_tools.py::_CRON_THREAT_PATTERNS`)."
+        )
+        return False, blocked_doc, "", str(block_exc)
+    if prompt is None:
+        logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
+        return True, "", SILENT_MARKER, None
+
+    # Import and construct agent-only machinery only after every wake/prompt
+    # gate has committed this tick to an LLM run. Idle minute-scheduled jobs
+    # must not open a SessionDB connection that an early return could leak.
     from run_agent import AIAgent
 
     # Initialize SQLite session store so cron job messages are persisted
@@ -3504,58 +3554,6 @@ def run_job(
     except Exception as e:
         logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
 
-    # Wake-gate: if this job has a pre-check script, run it BEFORE building
-    # the prompt so a ``{"wakeAgent": false}`` response can short-circuit
-    # the whole agent run. We pass the result into _build_job_prompt so
-    # the script is only executed once.
-    prerun_script = None
-    script_path = job.get("script")
-    if script_path:
-        prerun_script = _run_job_script_with_claim_heartbeat(job, script_path)
-        _ran_ok, _script_output = prerun_script
-        if _ran_ok and not _parse_wake_gate(_script_output):
-            logger.info(
-                "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
-                job_name, job_id,
-            )
-            silent_doc = (
-                f"# Cron Job: {job_name}\n\n"
-                f"**Job ID:** {job_id}\n"
-                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                "Script gate returned `wakeAgent=false` — agent skipped.\n"
-            )
-            return True, silent_doc, SILENT_MARKER, None
-
-    try:
-        prompt = _build_job_prompt(
-            job, prerun_script=prerun_script, extra_prompt=extra_prompt
-        )
-    except CronPromptInjectionBlocked as block_exc:
-        # Assembled prompt (user prompt + loaded skill content) tripped the
-        # injection scanner. Refuse to run the agent this tick and surface
-        # a clear failure to the operator so they see WHY the scheduled job
-        # didn't run and can audit the offending skill.
-        logger.warning(
-            "Job '%s' (ID: %s): blocked by prompt-injection scanner — %s",
-            job_name, job_id, block_exc,
-        )
-        blocked_doc = (
-            f"# Cron Job: {job_name}\n\n"
-            f"**Job ID:** {job_id}\n"
-            f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"**Status:** BLOCKED\n\n"
-            "The assembled prompt (user prompt + loaded skill content) tripped "
-            "the cron injection scanner and the agent was NOT run.\n\n"
-            f"**Scanner result:** {block_exc}\n\n"
-            "Audit the skill(s) attached to this job for prompt-injection "
-            "payloads or invisible-unicode markers. If the skill is legitimate "
-            "and the match is a false positive, rephrase the content to avoid "
-            "the threat pattern (`tools/cronjob_tools.py::_CRON_THREAT_PATTERNS`)."
-        )
-        return False, blocked_doc, "", str(block_exc)
-    if prompt is None:
-        logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
-        return True, "", SILENT_MARKER, None
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
