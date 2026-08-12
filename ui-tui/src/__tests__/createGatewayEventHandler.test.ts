@@ -188,11 +188,11 @@ describe('createGatewayEventHandler', () => {
     const onEvent = createGatewayEventHandler(ctx)
 
     onEvent({
-      payload: { kind: 'compressing', text: 'compressing 968 messages (~123,400 tok)…' },
+      payload: { kind: 'compacting', text: 'compacting 968 messages (~123,400 tok)…' },
       type: 'status.update'
     } as any)
 
-    expect(ctx.system.sys).toHaveBeenCalledWith('compressing 968 messages (~123,400 tok)…')
+    expect(ctx.system.sys).toHaveBeenCalledWith('compacting 968 messages (~123,400 tok)…')
   })
 
   it('keeps goal verdict text in transcript but shows a brief idle status (#goal statusbar)', () => {
