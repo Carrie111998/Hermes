@@ -21,6 +21,7 @@ import { ResponseLoadingIndicator, StreamStallIndicator } from '@/components/ass
 import { formatMessageTimestamp } from '@/components/assistant-ui/thread/timestamp'
 import { useMessageReactions, useTapbackDoubleClick } from '@/components/assistant-ui/thread/use-message-reactions'
 import { TooltipIconButton } from '@/components/assistant-ui/tooltip-icon-button'
+import { formatElapsed } from '@/components/chat/activity-timer'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { Codicon } from '@/components/ui/codicon'
 import { CopyButton } from '@/components/ui/copy-button'
@@ -70,6 +71,10 @@ export const AssistantMessage: FC<{
   // tool-heavy turn doesn't grow a copy/refresh bar per paragraph (see
   // ChatMessage.interim).
   const isInterim = useAuiState(s => s.message.metadata?.custom?.interim === true)
+
+  // Whole-turn wall-clock seconds (set once at completion — referentially
+  // stable across the 30 Hz delta stream, so this adds no per-token renders).
+  const turnDurationS = useAuiState(s => s.message.metadata?.custom?.durationS as number | undefined)
 
   // The thinking/stall indicator belongs to the TAIL of the thread, period. A
   // stale pending bubble mid-transcript (a turn that ended without its settle
@@ -159,7 +164,12 @@ export const AssistantMessage: FC<{
         </MessagePrimitive.Error>
       </div>
       {hasVisibleText && !isInterim && (
-        <AssistantFooter getMessageText={getMessageText} messageId={messageId} onBranchInNewChat={onBranchInNewChat} />
+        <AssistantFooter
+          durationS={turnDurationS}
+          getMessageText={getMessageText}
+          messageId={messageId}
+          onBranchInNewChat={onBranchInNewChat}
+        />
       )}
       {/* Last thing in the turn — under the action bar, the way Cursor ends a
           turn on its summary rather than burying it above the controls. */}
@@ -320,8 +330,20 @@ const MessageAge: FC = () => {
   )
 }
 
-const AssistantFooter: FC<MessageActionProps> = props => (
+const AssistantFooter: FC<MessageActionProps & { durationS?: number }> = ({ durationS, ...props }) => {
+  const { t } = useI18n()
+
+  return (
   <div className="flex min-h-6 flex-col items-end gap-1 pr-(--message-text-indent) pl-(--message-text-indent)">
+    {durationS !== undefined && (
+      <span
+        className="select-none px-0.5 text-[0.6875rem] leading-5 tabular-nums text-muted-foreground"
+        data-slot="aui_turn-duration"
+        title={t.assistant.thread.turnDuration(formatElapsed(durationS))}
+      >
+        ⏱ {formatElapsed(durationS)}
+      </span>
+    )}
     <BranchPickerPrimitive.Root
       className="inline-flex h-6 items-center gap-1 text-xs text-muted-foreground"
       hideWhenSingleBranch
@@ -338,4 +360,5 @@ const AssistantFooter: FC<MessageActionProps> = props => (
     </BranchPickerPrimitive.Root>
     <AssistantActionBar {...props} />
   </div>
-)
+  )
+}

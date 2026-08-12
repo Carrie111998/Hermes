@@ -139,7 +139,19 @@ const _chatMessageFieldsExhaustive: {
   [K in Exclude<keyof ChatMessage, (typeof COMPARED_FIELDS)[number] | (typeof IGNORED_FIELDS)[number]>]: never
 } = {}
 
-const COMPARED_FIELDS = ['id', 'role', 'pending', 'error', 'hidden', 'branchGroupId', 'interim', 'reactions'] as const
+const COMPARED_FIELDS = [
+  'id',
+  'role',
+  'pending',
+  'error',
+  'hidden',
+  'branchGroupId',
+  'interim',
+  'reactions',
+  // Turn wall-clock duration — stamps the visible "⏱ 38s" badge, so a change
+  // must re-render (set once at completion; stable afterwards).
+  'durationS'
+] as const
 
 const IGNORED_FIELDS = ['timestamp', 'attachmentRefs', 'parts', 'rowId'] as const
 

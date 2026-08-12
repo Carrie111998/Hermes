@@ -567,6 +567,12 @@ export function useMessageStream({
         const keepFailedPartialText = Boolean(failure?.partial && finalText)
         const interimBoundaryPending = state.interimBoundaryPending
 
+        // Wall-clock seconds this turn actually ran (message.start stamped
+        // turnStartedAt). Read BEFORE the state return below nulls it.
+        const durationS = state.turnStartedAt
+          ? Math.max(1, Math.round((Date.now() - state.turnStartedAt) / 1000))
+          : undefined
+
         const replaceTextPart = (parts: ChatMessagePart[]) => {
           const visibleFinalText = stripGeneratedImageEchoes(finalText, generatedImageEchoSources(parts)).trim()
 
@@ -576,7 +582,12 @@ export function useMessageStream({
         // Settling the final response onto a bubble makes it the turn's real
         // reply — clear `interim` so it regains the action footer.
         const completeMessage = (message: ChatMessage): ChatMessage => {
-          const settled = { ...message, pending: false, interim: false }
+          const settled = {
+            ...message,
+            pending: false,
+            interim: false,
+            ...(durationS !== undefined ? { durationS } : {})
+          }
 
           if (completionError && !keepFailedPartialText) {
             return { ...settled, error: completionError, parts: message.parts.filter(part => part.type !== 'text') }
@@ -594,6 +605,7 @@ export function useMessageStream({
           role: 'assistant',
           parts: completionError && !keepFailedPartialText ? [] : [assistantTextPart(finalText)],
           branchGroupId: state.pendingBranchGroup ?? undefined,
+          ...(durationS !== undefined ? { durationS } : {}),
           ...(completionError && { error: completionError })
         })
 
@@ -720,13 +732,18 @@ export function useMessageStream({
         const prev = state.messages
         const error = errorMessage.trim() || 'Hermes reported an error'
 
+        const durationS = state.turnStartedAt
+          ? Math.max(1, Math.round((Date.now() - state.turnStartedAt) / 1000))
+          : undefined
+
         const nextMessages = prev.some(m => m.id === streamId)
           ? prev.map(message =>
               message.id === streamId
                 ? {
                     ...message,
                     error,
-                    pending: false
+                    pending: false,
+                    ...(durationS !== undefined ? { durationS } : {})
                   }
                 : message
             )
@@ -738,7 +755,8 @@ export function useMessageStream({
                 parts: [],
                 error,
                 pending: false,
-                branchGroupId: groupId
+                branchGroupId: groupId,
+                ...(durationS !== undefined ? { durationS } : {})
               }
             ]
 
