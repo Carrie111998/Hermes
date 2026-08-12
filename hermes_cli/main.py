@@ -1595,19 +1595,6 @@ def _print_tui_exit_summary(
     )
 
 
-_NPM_LOCK_RUNTIME_KEYS = frozenset({"ideallyInert", "peer"})
-"""Lockfile fields npm writes non-deterministically at install time.
-
-``ideallyInert`` is npm's runtime annotation for packages it skipped installing
-(per-platform opt-outs).  ``peer`` is dropped from the hidden ``.package-lock.json``
-on dev-dependencies that are *also* declared as peers — the canonical
-``package-lock.json`` records the dual role, but npm 9's actualized tree strips
-it.  Neither key represents a real skew between what was declared and what was
-installed, so we exclude them from the comparison in :func:`_tui_need_npm_install`
-to avoid false-positive reinstalls on every launch.
-"""
-
-
 def _workspace_root(dir: Path) -> Path:
     """Return the npm workspace root for *dir*.
 
@@ -1683,9 +1670,11 @@ def _tui_need_npm_install(root: Path) -> bool:
 
     For each entry in the root lock's ``packages`` map:
       - missing from hidden lock → reinstall (unless the entry is marked
-        ``optional`` or ``peer``, which npm may intentionally skip per platform)
-      - present but with differing fields (excluding npm-written runtime
-        annotations like ``ideallyInert``) → reinstall
+        ``optional`` or ``peer`` — which npm may intentionally skip per
+        platform — or is a workspace ``link`` / non-``node_modules/`` entry,
+        which a partial ``--workspace ui-tui`` install never materializes)
+      - present but with a differing ``resolved`` or ``integrity`` → reinstall
+        (the only fields npm >= 10's reduced hidden lockfile still records)
 
     Extra entries that exist only in the hidden lock are ignored — stale
     transitives left over from a removed dependency don't break runtime and
@@ -1720,7 +1709,9 @@ def _tui_need_npm_install(root: Path) -> bool:
         return lock.stat().st_mtime > marker.stat().st_mtime
 
     def comparable(pkg: dict) -> dict:
-        return {k: v for k, v in pkg.items() if k not in _NPM_LOCK_RUNTIME_KEYS}
+        # resolved/integrity are the only fields npm >= 10 keeps in its reduced
+        # hidden lockfile; comparing the rest flags every package as changed.
+        return {k: pkg.get(k) for k in ("resolved", "integrity") if pkg.get(k) is not None}
 
     for name, pkg in wanted.items():
         if not name:
@@ -1730,7 +1721,11 @@ def _tui_need_npm_install(root: Path) -> bool:
             continue
 
         if name not in installed:
-            if pkg.get("optional") or pkg.get("peer"):
+            # ``link`` entries and workspace roots are never materialized by a
+            # partial install (#38772); @hermes/ink is checked up front.
+            if pkg.get("optional") or pkg.get("peer") or pkg.get("link"):
+                continue
+            if not name.startswith("node_modules/"):
                 continue
             return True
 

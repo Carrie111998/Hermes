@@ -1,5 +1,6 @@
 """_tui_need_npm_install: auto npm when node_modules is behind the lockfile."""
 
+import json
 import os
 import types
 from pathlib import Path
@@ -176,3 +177,97 @@ def test_make_tui_argv_omits_workspace_when_tui_has_own_lockfile(
     assert install_cmd[:2] == ["/bin/npm", "install"]
     # cwd must be tui_dir (standalone), not parent
     assert calls[0][1]["cwd"] == str(tui_dir)
+
+
+# ── _tui_need_npm_install: reduced npm >= 10 hidden lockfile ─────────
+
+
+def _write_workspace(tmp_path: Path, wanted: dict, installed: dict) -> Path:
+    """Scaffold a minimal npm-workspace checkout under *tmp_path*.
+
+    Returns the ``ui-tui`` sub-directory to hand to ``_tui_need_npm_install``.
+    """
+    (tmp_path / "package-lock.json").write_text(
+        json.dumps({"packages": wanted}), encoding="utf-8"
+    )
+    hidden = tmp_path / "node_modules" / ".package-lock.json"
+    hidden.parent.mkdir(parents=True, exist_ok=True)
+    hidden.write_text(json.dumps({"packages": installed}), encoding="utf-8")
+    # @hermes/ink marker — checked up front, must exist or the function
+    # short-circuits to True before reaching the lockfile comparison.
+    ink = tmp_path / "node_modules" / "@hermes" / "ink" / "package.json"
+    ink.parent.mkdir(parents=True, exist_ok=True)
+    ink.write_text("{}")
+    tui = tmp_path / "ui-tui"
+    tui.mkdir()
+    (tui / "package.json").write_text("{}")
+    return tui
+
+
+def test_tui_need_npm_install_ignores_reduced_hidden_lockfile(
+    tmp_path: Path, main_mod
+) -> None:
+    """npm >= 10 writes a *reduced* node_modules/.package-lock.json: only
+    resolved/integrity survive, declarative fields (version/dependencies/dev/
+    engines/...) are nulled, and hoisted packages gain ``extraneous``.  A fresh
+    install must not look "behind".  Regression for #84617.
+    """
+    wanted = {
+        "": {},
+        "node_modules/react": {
+            "version": "18.2.0",
+            "resolved": "https://registry.npmjs.org/react/-/react-18.2.0.tgz",
+            "integrity": "sha512-reacthash",
+            "dependencies": {"loose-envify": "^1.1.0"},
+            "dev": True,
+            "engines": {"node": ">=0.10.0"},
+        },
+        # workspace link + workspace-root entry: never materialized by
+        # `npm install --workspace ui-tui`
+        "node_modules/hermes": {"link": True, "resolved": "apps/desktop"},
+        "apps/desktop": {"name": "hermes-desktop", "version": "0.0.0"},
+        # optional dep skipped by npm on this platform
+        "node_modules/fsevents": {"optional": True, "version": "2.3.3"},
+    }
+    installed = {
+        # reduced npm 11 form: no version/dependencies/dev, plus extraneous
+        "node_modules/react": {
+            "resolved": "https://registry.npmjs.org/react/-/react-18.2.0.tgz",
+            "integrity": "sha512-reacthash",
+            "extraneous": True,
+        },
+    }
+    tui = _write_workspace(tmp_path, wanted, installed)
+    assert main_mod._tui_need_npm_install(tui) is False
+
+
+def test_tui_need_npm_install_detects_real_skew(tmp_path: Path, main_mod) -> None:
+    """A bumped integrity/resolved still triggers a reinstall."""
+    wanted = {
+        "node_modules/react": {
+            "version": "18.3.0",
+            "resolved": "https://registry.npmjs.org/react/-/react-18.3.0.tgz",
+            "integrity": "sha512-newhash",
+        },
+    }
+    installed = {
+        "node_modules/react": {
+            "resolved": "https://registry.npmjs.org/react/-/react-18.2.0.tgz",
+            "integrity": "sha512-oldhash",
+        },
+    }
+    tui = _write_workspace(tmp_path, wanted, installed)
+    assert main_mod._tui_need_npm_install(tui) is True
+
+
+def test_tui_need_npm_install_detects_new_dependency(tmp_path: Path, main_mod) -> None:
+    """A newly added (non-link, node_modules/) package triggers a reinstall."""
+    wanted = {
+        "node_modules/newpkg": {
+            "version": "1.0.0",
+            "resolved": "https://registry.npmjs.org/newpkg/-/newpkg-1.0.0.tgz",
+            "integrity": "sha512-newpkghash",
+        },
+    }
+    tui = _write_workspace(tmp_path, wanted, {})
+    assert main_mod._tui_need_npm_install(tui) is True
