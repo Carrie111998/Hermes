@@ -10928,6 +10928,21 @@ def complete_task(
     source_commit_required = bool(
         source_policy is not None and source_policy["source_commit_required"]
     )
+    source_commit_forbidden = bool(
+        source_policy is not None and source_policy["source_commit_forbidden"]
+    )
+    if source_commit_forbidden and source_policy is not None and source_policy["workspace_path"]:
+        repo_root = _git_toplevel(Path(str(source_policy["workspace_path"])))
+        if repo_root is not None:
+            status = subprocess.run(
+                ["git", "-C", str(repo_root), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if status.returncode == 0 and status.stdout:
+                raise _SourceCommitError("source_forbidden_dirty")
     if source_commit_required:
         source_run_id = (
             int(expected_run_id)

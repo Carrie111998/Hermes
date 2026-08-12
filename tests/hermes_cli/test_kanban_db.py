@@ -4718,6 +4718,68 @@ def test_complete_task_forbidden_source_does_not_commit_worker_diff(
     ).stdout.strip()
 
 
+def test_complete_task_forbidden_source_rejects_dirty_git_before_terminal_mutation(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "dirty-forbidden-repo"
+    _init_git_repo(repo)
+    before_sha = _head_sha(repo)
+    with kb.connect() as conn:
+        parent_id = kb.create_task(
+            conn,
+            title="Evidence-only parent",
+            assignee="reviewer",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            source_commit_forbidden=True,
+        )
+        child_id = kb.create_task(conn, title="Dependent")
+        kb.link_tasks(conn, parent_id, child_id)
+        claimed = kb.claim_task(conn, parent_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        (repo / "README.md").write_text("dirty\n", encoding="utf-8")
+        (repo / "untracked.txt").write_text("diagnosis\n", encoding="utf-8")
+
+        with pytest.raises(kb._SourceCommitError) as raised:
+            kb.complete_task(conn, parent_id, expected_run_id=claimed.current_run_id)
+
+        parent = kb.get_task(conn, parent_id)
+        child = kb.get_task(conn, child_id)
+        run = kb.get_run(conn, claimed.current_run_id)
+
+    assert raised.value.code == "source_forbidden_dirty"
+    assert parent is not None and parent.status == "running"
+    assert child is not None and child.status == "todo"
+    assert run is not None and run.ended_at is None
+    assert _head_sha(repo) == before_sha
+    assert (repo / "README.md").read_text(encoding="utf-8") == "dirty\n"
+    assert (repo / "untracked.txt").read_text(encoding="utf-8") == "diagnosis\n"
+
+
+def test_complete_task_forbidden_source_allows_non_git_report_only_workspace(
+    kanban_home, tmp_path
+):
+    workspace = tmp_path / "report-only"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Report-only evidence",
+            assignee="reviewer",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+            source_commit_forbidden=True,
+        )
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+
+        assert kb.complete_task(conn, task_id, expected_run_id=claimed.current_run_id)
+
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None and task.status == "done"
+
+
 def test_complete_task_required_source_raises_typed_failure_without_commit(
     kanban_home, tmp_path
 ):
