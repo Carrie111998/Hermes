@@ -3327,6 +3327,35 @@ def _clear_pending(sid: str | None = None) -> None:
 # ── Agent factory ────────────────────────────────────────────────────
 
 
+# Desktop built-in names (apps/desktop/src/themes/presets.ts ``BUILTIN_THEMES``).
+# These persist in renderer localStorage without a YAML file. User YAML skins
+# do not — see ``should_reaffirm_yaml_skin_on_connect``.
+_DESKTOP_BUILTIN_SKINS = frozenset(
+    {"nous", "midnight", "ember", "mono", "cyberpunk", "slate", "default"}
+)
+
+
+def should_reaffirm_yaml_skin_on_connect(skin: dict | None) -> bool:
+    """True when connect-time seed is a user YAML skin Desktop cannot persist alone.
+
+    Desktop ``gateway.ready`` ingests with ``apply=false``. ``normalizeSkin``
+    falls back to ``nous`` until that seed lands, so a cold boot of a YAML skin
+    paints Nous and stays there. A follow-up ``skin.changed`` is the existing
+    client's missed-activation recovery (seed-only baseline + same-name apply).
+    Built-in names are left alone so Appearance picks of slate/nous/… still
+    stick independently of ``display.skin``.
+    """
+    if not isinstance(skin, dict):
+        return False
+    name = str(skin.get("name") or "").strip()
+    if not name or name in _DESKTOP_BUILTIN_SKINS:
+        return False
+    try:
+        return (_watcher_home() / "skins" / f"{name}.yaml").is_file()
+    except OSError:
+        return False
+
+
 def resolve_skin() -> dict:
     try:
         from hermes_cli.skin_engine import init_skin_from_config, get_active_skin

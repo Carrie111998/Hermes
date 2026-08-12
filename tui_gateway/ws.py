@@ -330,6 +330,20 @@ async def handle_ws(ws: Any) -> None:
             # Track this peer for session-less global broadcasts (skin.changed
             # from the background watcher) — write_json can't route those.
             server.register_live_transport(transport)
+            # User YAML skins are not Desktop built-ins. The ready seed above
+            # is apply=false so a reconnect never stomps a built-in Appearance
+            # pick; that same rule leaves YAML skins stuck on nous after every
+            # cold boot. Re-affirm via skin.changed — current Desktop clients
+            # already treat seed-only + same-name changed as missed-activation
+            # recovery. Built-ins are skipped on purpose.
+            if server.should_reaffirm_yaml_skin_on_connect(skin_payload):
+                await transport.write_async(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "event",
+                        "params": {"type": "skin.changed", "payload": skin_payload},
+                    }
+                )
         if not ready_ok:
             disconnect_reason = "ready_send_failed"
             send_failures += 1
