@@ -6123,6 +6123,14 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
       clearTimeout(timer)
       reject(error)
     })
+    request.on('abort', () => {
+      if (timedOut) {
+        return
+      }
+
+      clearTimeout(timer)
+      reject(new Error('Request canceled'))
+    })
 
     if (body) {
       request.write(body)
