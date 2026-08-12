@@ -13554,6 +13554,16 @@ def _resolve_worktree_workspace(
         base_branch = _story_base_branch(conn, task.id, board=board)
     base = base_branch or "HEAD"
 
+    def resolve_default_base(repo_root: Path) -> None:
+        nonlocal base_branch, base
+        if (
+            base_branch is None
+            and conn is not None
+            and not _handoff_v2_enabled(product_board_metadata(board))
+        ):
+            base_branch = _dependency_source_base(conn, task, repo_root)
+            base = base_branch or "HEAD"
+
     def ensure_epic_base(repo_root: Path) -> None:
         if (
             base_branch is None
@@ -13594,13 +13604,7 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        if (
-            base_branch is None
-            and conn is not None
-            and not _handoff_v2_enabled(product_board_metadata(board))
-        ):
-            base_branch = _dependency_source_base(conn, task, repo_root)
-            base = base_branch or "HEAD"
+        resolve_default_base(repo_root)
         ensure_epic_base(repo_root)
         _materialize_worktree_with_dependencies(
             repo_root,
@@ -13641,6 +13645,7 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
+                resolve_default_base(fallback_root)
                 ensure_epic_base(fallback_root)
                 _materialize_worktree_with_dependencies(
                     fallback_root,
@@ -13659,13 +13664,7 @@ def _resolve_worktree_workspace(
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        if (
-            base_branch is None
-            and conn is not None
-            and not _handoff_v2_enabled(product_board_metadata(board))
-        ):
-            base_branch = _dependency_source_base(conn, task, repo_root)
-            base = base_branch or "HEAD"
+        resolve_default_base(repo_root)
         ensure_epic_base(repo_root)
         _materialize_worktree_with_dependencies(
             repo_root,
@@ -13683,6 +13682,7 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
+    resolve_default_base(repo_root)
     ensure_epic_base(repo_root)
     _materialize_worktree_with_dependencies(
         repo_root,

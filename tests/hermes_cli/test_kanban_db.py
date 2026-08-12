@@ -4735,6 +4735,40 @@ def test_dependency_source_flow_resolves_parent_and_child_worktrees(kanban_home,
     assert (child_ws / "parent.txt").read_text(encoding="utf-8") == "parent content\n"
 
 
+def test_dependency_source_flow_resolves_concrete_child_worktree_from_parent(kanban_home, tmp_path):
+    board = "dependency-source-concrete-child"
+    kb.create_board(board, name="Dependency Source Concrete Child", preset="generic")
+    repo = tmp_path / "dependency-source-concrete-child-repo"
+    _init_git_repo(repo)
+    with kb.connect(board=board) as conn:
+        parent_id = kb.create_task(
+            conn, title="Parent", board=board, assignee="developer",
+            workspace_kind="worktree", workspace_path=str(repo),
+            source_commit_required=True,
+        )
+        parent = kb.get_task(conn, parent_id)
+        assert parent is not None
+        parent_ws, parent_branch = kb._resolve_worktree_workspace(parent, board=board, conn=conn)
+        conn.execute("UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(parent_ws), parent_id))
+        (parent_ws / "parent.txt").write_text("parent content\n", encoding="utf-8")
+        claimed = kb.claim_task(conn, parent_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.complete_task(conn, parent_id, expected_run_id=claimed.current_run_id)
+
+        child_id = kb.create_task(
+            conn, title="Child", board=board, parents=[parent_id], assignee="developer",
+            workspace_kind="worktree", workspace_path=str(repo / ".worktrees" / "child"),
+            branch_name=f"child/{parent_id}",
+        )
+        child = kb.get_task(conn, child_id)
+        assert child is not None and child.status == "ready"
+        child_ws, child_branch = kb._resolve_worktree_workspace(child, board=board, conn=conn)
+
+    assert parent_branch != child_branch
+    assert child_ws == repo / ".worktrees" / "child"
+    assert (child_ws / "parent.txt").read_text(encoding="utf-8") == "parent content\n"
+
+
 def test_complete_task_required_source_commits_before_terminal_update_and_persists_receipt(
     kanban_home, tmp_path
 ):
