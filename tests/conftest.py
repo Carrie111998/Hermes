@@ -923,6 +923,28 @@ def _live_system_guard(request, monkeypatch):
         except ValueError:
             return cmd_str.split()
 
+    def _cmd_words(cmd) -> list:
+        """``_cmd_tokens`` plus the words *inside* each argv element.
+
+        A shell-wrapped command carries the whole real command in ONE argv
+        element — ``["bash", "-c", "systemctl --user restart hermes-gateway"]``
+        — so a predicate that only looks at argv elements never sees
+        ``systemctl`` or ``restart`` as tokens. The old join+``shlex`` route
+        happened to split those apart, which is why the shell-wrapped cases
+        were caught; it also ate Windows backslashes, which is why the
+        absolute-path cases were not. Splitting each element on whitespace
+        keeps both: separators inside a token are untouched, so
+        ``C:\\Windows\\System32\\taskkill.exe`` survives whole (a path with a
+        space still keeps its basename in the final word).
+
+        Surrounding quotes are stripped because ``shlex`` used to remove
+        them, and a quoted element (``'"restart"'``) must not stop matching
+        just because the tokeniser changed — the same reason
+        ``_is_gateway_lifecycle_cmd`` strips them.
+        """
+        words = (w.strip("\"'") for tok in _cmd_tokens(cmd) for w in tok.split())
+        return [w for w in words if w]
+
     def _is_package_install(cmd) -> bool:
         """True if *cmd* would install/remove packages in the LIVE venv.
 
@@ -1050,22 +1072,25 @@ def _live_system_guard(request, monkeypatch):
             return False
         if not _matches_hermes_gateway(cmd_str):
             return False
-        try:
-            tokens = _shlex.split(cmd_str)
-        except ValueError:
-            tokens = cmd_str.split()
-        return any(verb in tokens for verb in _MUTATING_VERBS)
+        # ``_cmd_words``, not ``shlex``: a list argv must not be joined and
+        # re-split in posix mode (see _cmd_tokens).
+        return any(verb in _cmd_words(cmd) for verb in _MUTATING_VERBS)
 
     def _is_process_killer(cmd) -> bool:
         cmd_str = _cmd_to_string(cmd)
-        try:
-            tokens = _shlex.split(cmd_str)
-        except ValueError:
-            tokens = cmd_str.split()
+        # Same tokenising rule as the Node guard: joining a list argv and
+        # re-splitting it with posix ``shlex`` eats the backslashes, so
+        # ``["C:\\Windows\\System32\\taskkill.exe", "/F", "/PID", "123"]``
+        # collapsed to one ``C:WindowsSystem32taskkill.exe`` token whose
+        # basename matched nothing and the guard stayed silent. Bare
+        # ``taskkill`` still fired, which is why it went unnoticed.
+        # ``_exe_head`` also strips the ``.exe``/``.cmd`` suffix, so the
+        # Windows spelling of the basename is matched as well.
+        tokens = _cmd_words(cmd)
         if not tokens:
             return False
         for tok in tokens:
-            head = tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+            head = _exe_head(tok)
             if head in _PROCESS_KILLERS:
                 low = cmd_str.lower()
                 # pkill -f pattern: catch hermes-themed patterns + a

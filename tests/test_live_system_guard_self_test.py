@@ -303,6 +303,96 @@ def test_subprocess_killall_hermes_blocked():
         subprocess.run(["killall", "hermes"])
 
 
+# ─────────── killers spelled the Windows way (literal backslashes) ─────────
+#
+# These use LITERAL backslash paths rather than tmp_path so the Windows argv
+# shape is exercised on every platform. The predicates used to join a list
+# argv into a string and re-split it with posix ``shlex``, which treats a
+# backslash as an escape: ``C:\Windows\System32\taskkill.exe`` collapsed to
+# ``C:WindowsSystem32taskkill.exe``, one token whose basename is in no
+# killer list, so the guard stayed silent. Bare ``taskkill`` still fired,
+# which is why the hole survived. Same defect class as the Node guard's
+# ``_cmd_tokens`` fix and the ``_is_package_install`` migration.
+#
+# Every payload below is inert if the guard ever stops firing: the binary
+# path does not exist, or the target image/unit/pattern matches no real
+# process. A canary for live kills must not be able to perform one.
+
+_UNREAL_EXE_DIR = "C:\\hermes-guard-probe-no-such-dir\\bin"
+_UNREAL_IMAGE = "hermes-guard-probe-no-such-image.exe"
+
+
+def test_subprocess_absolute_windows_taskkill_blocked():
+    """An absolute ``…\\taskkill.exe /F /IM hermes…`` must fire.
+
+    Pre-fix the whole path became one ``C:hermes-guard-probe…taskkill.exe``
+    token, so no basename check could see ``taskkill``.
+    """
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(
+            [_UNREAL_EXE_DIR + "\\taskkill.exe", "/F", "/IM", _UNREAL_IMAGE]
+        )
+
+
+def test_subprocess_absolute_windows_pkill_python_dash_f_blocked():
+    """An absolute ``pkill.exe -f python`` reaches the live gateway too."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(
+            [_UNREAL_EXE_DIR + "\\pkill.exe", "-f", "python-guard-probe-no-such-proc"]
+        )
+
+
+def test_subprocess_taskkill_exe_suffix_blocked():
+    """The bare Windows spelling ``taskkill.exe`` must match ``taskkill``.
+
+    Unsuffixed ``taskkill`` was in the killer tuple; ``taskkill.exe`` — what
+    a resolved Windows argv actually carries — was not.
+    """
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["taskkill.exe", "/F", "/IM", _UNREAL_IMAGE])
+
+
+def test_subprocess_windows_taskkill_string_form_blocked():
+    """The same command as a shell string rather than an argv list."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(
+            _UNREAL_EXE_DIR + "\\taskkill.exe /F /IM " + _UNREAL_IMAGE, shell=True
+        )
+
+
+def test_subprocess_shell_wrapped_pkill_still_blocked():
+    """``bash -c "pkill -f hermes…"`` hides the killer inside one argv element.
+
+    The join+``shlex`` route split that element apart for free. Whatever
+    replaces it must keep doing so, or closing the Windows hole would open a
+    shell-wrapped one.
+    """
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(
+            ["bash", "-c", "pkill -f hermes-gateway-guard-probe-no-such-proc"]
+        )
+
+
+def test_subprocess_systemctl_verb_after_trailing_backslash_blocked():
+    """A trailing-backslash argument must not swallow the mutating verb.
+
+    Joined and posix-``shlex``-split, the backslash ending ``--root=C:\\``
+    escapes the space after it, so ``--root=C: restart`` became a single
+    token, ``restart`` was no longer in the token list, and the
+    mutating-verb check found nothing.
+    """
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "--root=C:\\",
+                "restart",
+                "hermes-gateway-guard-probe-no-such-unit",
+            ]
+        )
+
+
 # ──────────────────── pass-through cases (must NOT raise) ──────
 
 
@@ -372,6 +462,23 @@ def test_subprocess_pkill_with_unrelated_pattern_passes_through():
     # Use 'true' so it succeeds quickly.
     r = subprocess.run(["true"], capture_output=True)
     assert r.returncode == 0
+
+
+def test_windows_taskkill_on_an_unrelated_pid_passes_through():
+    """Widening the killer match must not block a plain pid-targeted taskkill.
+
+    Production's Windows terminate paths spawn ``taskkill /PID <n> /T /F``
+    (gateway_windows, the WhatsApp adapter, update's stale-dashboard sweep)
+    with no hermes/gateway/python token in the command, and several tests
+    assert on that argv. The killer basename now matches with a full path
+    and an ``.exe`` suffix, but the hermes/gateway/python condition still
+    has to hold — so these stay allowed. A nonexistent binary proves the
+    command reached the real subprocess machinery instead of the guard.
+    """
+    with pytest.raises(FileNotFoundError):
+        subprocess.run(
+            ["C:\\guard-probe-no-such-dir\\taskkill.exe", "/PID", "4242", "/T", "/F"]
+        )
 
 
 def test_normal_subprocess_run_passes_through():
