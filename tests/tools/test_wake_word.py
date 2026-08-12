@@ -314,9 +314,9 @@ def test_intel_macos_engine_ensures_slim_stack(monkeypatch):
     # specs cannot carry markers — `wake.openwakeword` hard-pins 1.27.0 and
     # its version match would fail against a 1.23.2 install, re-raising the
     # #81560 lazy-install failure at engine construction. The engine must
-    # ensure the slim feature (openwakeword + sounddevice + numpy, no
-    # onnxruntime) on Intel macOS; the extra already provides the runtime
-    # at the platform-correct version (#81577 follow-up).
+    # ensure the slim feature on Intel macOS, which pins onnxruntime==1.23.2
+    # itself so a pure lazy install (no [wake] extra) fetches the runtime
+    # (#81560, #81577 follow-up).
     _install_fake_openwakeword(monkeypatch)
     ensured = []
     monkeypatch.setattr(
@@ -333,13 +333,42 @@ def test_intel_macos_engine_ensures_slim_stack(monkeypatch):
     assert "wake.openwakeword.tflite" not in ensured
 
 
+def test_intel_macos_slim_lazy_request_pins_onnxruntime_1_23_2(monkeypatch):
+    # The pure-lazy path (a fresh env, no [wake] extra ever installed) must
+    # install onnxruntime itself at the platform-correct version. The engine
+    # ensures `wake.openwakeword.slim` on Intel macOS; its spec must carry
+    # onnxruntime==1.23.2 (the last Darwin x86_64 wheel) — NOT the 1.27.0
+    # pin of the shared default feature, which has no x86_64 macOS wheel
+    # (#81560, #81577).
+    from tools import lazy_deps
+
+    slim_specs = lazy_deps.feature_specs("wake.openwakeword.slim")
+    assert "onnxruntime==1.23.2" in slim_specs
+    assert "onnxruntime==1.27.0" not in slim_specs
+
+    default_specs = lazy_deps.feature_specs("wake.openwakeword")
+    assert "onnxruntime==1.27.0" in default_specs
+
+    # When onnxruntime is missing (fresh install), the lazy installer's
+    # feature_missing() must report 1.23.2 as the spec to fetch on Intel
+    # macOS — the request the engine's ensure() would pass to pip.
+    original = lazy_deps.feature_missing
+    monkeypatch.setattr(
+        "tools.lazy_deps._is_satisfied",
+        lambda spec: "onnxruntime" not in spec,
+    )
+    missing = original("wake.openwakeword.slim")
+    assert "onnxruntime==1.23.2" in missing
+    assert not any(s.startswith("onnxruntime==") and "1.23.2" not in s for s in missing)
+
+
 def test_intel_macos_engine_reports_missing_onnxruntime(monkeypatch):
-    # The slim feature omits onnxruntime — it expects the [wake] extra's
-    # marker pin (1.23.2 on Intel macOS) to provide the runtime. A user who
-    # manually pip-installed only the slim stack (no [wake] extra) would
-    # otherwise hit openwakeword's bare ModuleNotFoundError at engine
-    # construction. The engine must surface an actionable hint instead of the
-    # raw "No module named 'onnxruntime'".
+    # The engine's lazy ensure() installs onnxruntime (slim → 1.23.2 on
+    # Intel macOS), but a user who manually pip-installed only the slim
+    # stack with lazy installs disabled would otherwise hit openwakeword's
+    # bare ModuleNotFoundError at engine construction. The engine must
+    # surface an actionable hint instead of the raw "No module named
+    # 'onnxruntime'".
     import builtins
 
     real_import = builtins.__import__

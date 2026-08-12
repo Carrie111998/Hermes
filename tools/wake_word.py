@@ -121,9 +121,9 @@ def _is_macos_intel() -> bool:
     publishes arm64-only macOS wheels (no x86_64, no sdist). The [wake]
     extra therefore pins ``onnxruntime==1.23.2`` — the last release with a
     Darwin x86_64 wheel — via platform marker, and this platform gates the
-    engine to the ``wake.openwakeword.slim`` feature, which omits
-    onnxruntime so lazy-deps' version match cannot fail against the
-    marker-pinned 1.23.2 install (#81560, #81577).
+    engine to the ``wake.openwakeword.slim`` feature, which pins that same
+    1.23.2 runtime so a pure lazy install (no [wake] extra) fetches it
+    (#81560, #81577).
     """
     import platform
 
@@ -574,37 +574,36 @@ class _OpenWakeWordEngine(_Engine):
         from tools import lazy_deps
 
         framework = resolve_inference_framework(cfg)
-        # The platform-correct onnxruntime wheel is pinned in pyproject.toml:
-        # 1.23.2 on Intel macOS (the last release with a Darwin x86_64 wheel),
-        # 1.27.0 elsewhere. lazy_deps specs cannot carry PEP 508 markers, so
-        # ``wake.openwakeword`` hard-pins 1.27.0 and would fail its version
-        # match on Intel macOS (where 1.23.2 is installed via the [wake]
-        # extra). Use the slim feature there — it omits onnxruntime, which the
-        # extra already provides at the platform-correct version (#81560,
-        # #81577).
+        # The [wake] extra pins the platform-correct onnxruntime: 1.23.2 on
+        # Intel macOS (the last release with a Darwin x86_64 wheel), 1.27.0
+        # elsewhere. lazy_deps specs cannot carry PEP 508 markers, so they
+        # mirror that branch as two features: ``wake.openwakeword`` hard-pins
+        # 1.27.0, ``wake.openwakeword.slim`` hard-pins 1.23.2 (matching the
+        # extra on Intel macOS so the version match cannot fail against the
+        # marker-pinned install). The slim feature carries its own
+        # onnxruntime==1.23.2 so a PURE lazy install — no [wake] extra ever
+        # installed — actually fetches the runtime here (#81560, #81577).
         if _is_macos_intel():
             lazy_deps.ensure("wake.openwakeword.slim", prompt=False)
         else:
             lazy_deps.ensure("wake.openwakeword", prompt=False)
 
-        # slim omits onnxruntime, which the [wake] extra provides at the
-        # platform-correct version (1.23.2 on Intel macOS, 1.27.0 elsewhere).
-        # A bare openwakeword install (e.g. ``pip install openwakeword``)
-        # leaves the runtime missing; openwakeword's own import then raises a
-        # bare ModuleNotFoundError. Surface the real fix instead (#81560,
-        # #81577).
+        # Belt-and-suspenders: the lazy ensure() above installs onnxruntime at
+        # the platform-correct version (1.23.2 on Intel macOS, 1.27.0
+        # elsewhere), but a bare openwakeword install (e.g. ``pip install
+        # openwakeword`` with lazy installs disabled) leaves the runtime
+        # missing; openwakeword's own import then raises a bare
+        # ModuleNotFoundError. Surface the real fix instead (#81560, #81577).
         try:
             import onnxruntime  # noqa: F401
         except ImportError:
-            if _is_macos_intel():
-                # The default feature hard-pins onnxruntime==1.27.0, which has
-                # no x86_64 macOS wheel — only the [wake] extra's marker pin
-                # (1.23.2) is correct here, so point at the wizard, not pip.
-                hint = "Run `hermes tools` (Voice section) to install it."
-            else:
-                hint = "Run `hermes tools` (Voice section) to install it, or manually: " + (
-                    lazy_deps.feature_install_command("wake.openwakeword") or ""
-                )
+            # Lazy installs were disabled or the ensure above couldn't fetch the
+            # runtime; point at the correct per-platform feature so a manual
+            # install gets the wheel that actually exists here.
+            feature = "wake.openwakeword.slim" if _is_macos_intel() else "wake.openwakeword"
+            hint = "Run `hermes tools` (Voice section) to install it, or manually: " + (
+                lazy_deps.feature_install_command(feature) or ""
+            )
             raise ImportError(
                 "The wake word needs onnxruntime (openWakeWord's inference "
                 f"runtime), which is not installed. {hint}"
@@ -979,9 +978,10 @@ def check_wake_word_requirements(cfg: Optional[Dict[str, Any]] = None) -> Dict[s
     elif provider in ("sherpa", "sherpa-onnx", "kws", "open"):
         feature = "wake.sherpa"
     else:
-        # All supported platforms install the default wake.openwakeword
-        # feature; pyproject.toml pins the right onnxruntime wheel per
-        # platform (1.23.2 on Intel macOS, 1.27.0 elsewhere — #81560, #81577).
+        # Each platform has its own onnxruntime pin: 1.23.2 on Intel macOS
+        # (wake.openwakeword.slim), 1.27.0 elsewhere (wake.openwakeword) —
+        # the marker-carrying [wake] extra path and the marker-free lazy
+        # path both converge on the platform-correct wheel (#81560, #81577).
         feature = "wake.openwakeword.slim" if _is_macos_intel() else "wake.openwakeword"
     deps_ok = lazy_deps.is_available(feature)
     lazy_ok = lazy_deps._allow_lazy_installs()
