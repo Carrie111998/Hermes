@@ -11,14 +11,11 @@ probe), not specific config snapshots.
 Since #81220 the policy also applies to *user-configured*
 ``mcp_servers.cua-driver`` MCP entries: the same ``--no-overlay`` flag the
 embedded cua_backend applies at ``_resolve_mcp_invocation`` is applied to
-the user MCP launch path via ``normalize_user_cua_driver_args``, and
-``_cua_no_overlay`` auto-detects multi-monitor X11 desktops (virtual root
-wider than a single 5K panel) the same way it treats macOS / headless
-Linux / WSL2.
+the user MCP launch path via ``normalize_user_cua_driver_args``.
 """
 
 import os
-from unittest.mock import MagicMock, mock_open, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -293,68 +290,39 @@ class TestNormalizeUserCuaDriverArgs:
 
 
 # ---------------------------------------------------------------------------
-# Multi-monitor X11 auto-detect
+# Embedded default is unchanged (multi-monitor detection is out-of-scope here)
 # ---------------------------------------------------------------------------
 
-# The multi-monitor heuristic only runs on Linux with DISPLAY set; the host
-# platform is not faked (per the repo-wide policy from 30da5d0a8). On Linux
-# CI the probe target ``_x11_root_pixel_width`` is patched directly; on
-# other hosts the whole class is skipped.
+# The X11 multi-monitor auto-detect (virtual-root width > single 5K panel)
+# is intentionally NOT part of the #81220 MCP fix: it changes embedded-backend
+# auto-select behavior, so it is tracked as a separate follow-up. This guard
+# locks the embedded contract: desktop Linux with a display keeps the overlay
+# on by default, and only the user-MCP normalization helper (below) or an
+# explicit ``computer_use.no_overlay`` flips it off.
 
 
 @pytest.mark.linux_only
-class TestX11MultiMonitorAutoDetect:
-    def test_wide_virtual_root_forces_no_overlay(self):
-        """A virtual root wider than a single 5K panel must trigger
-        ``--no-overlay`` even when no explicit config is set — this is
-        the exact X11 multi-monitor class reported in #81220.
+class TestEmbeddedDesktopDefaultUnchanged:
+    def test_desktop_linux_with_display_keeps_overlay_by_default(self):
+        """Embedded backend must NOT force ``--no-overlay`` on desktop Linux
+        with a display. A wide virtual root (multi-monitor) used to flip this
+        True; that detection is deferred out of this PR, so the default stays
+        off-the-overlay=false for embedded spawns and session start.
         """
         with patch("hermes_cli.config.load_config", return_value={}), \
-             patch.dict(os.environ, {"DISPLAY": ":0"}, clear=False), \
-             patch.object(cua_backend, "_x11_root_pixel_width", return_value=6000):
-            assert cua_backend._cua_no_overlay() is True
-
-    def test_single_4k_panel_keeps_overlay(self):
-        """A single 4K panel (4096 px wide) must NOT trigger the
-        heuristic — only multi-monitor layouts exceed the threshold.
-        """
-        with patch("hermes_cli.config.load_config", return_value={}), \
-             patch.dict(os.environ, {"DISPLAY": ":0"}, clear=False), \
-             patch.object(cua_backend, "_x11_root_pixel_width", return_value=4096):
+             patch.dict(os.environ, {"DISPLAY": ":0"}, clear=False):
             assert cua_backend._cua_no_overlay() is False
 
-    def test_unprobeable_x11_falls_through(self):
-        """When xrandr is missing or fails, the heuristic must return
-        False so we don't regress single-head Linux setups where
-        ``--no-overlay`` would otherwise strip a useful cursor.
+    def test_mcp_normalization_still_applies_without_multi_monitor_detect(self):
+        """The #81220 fix must survive without the (deferred) multi-monitor
+        heuristic: a user cua-driver MCP entry still gets ``--no-overlay``.
         """
-        with patch("hermes_cli.config.load_config", return_value={}), \
-             patch.dict(os.environ, {"DISPLAY": ":0"}, clear=False), \
-             patch.object(cua_backend, "_x11_root_pixel_width", return_value=None):
-            assert cua_backend._cua_no_overlay() is False
-
-    def test_explicit_false_overrides_multi_monitor(self):
-        """An explicit ``computer_use.no_overlay: false`` must beat the
-        heuristic — users on multi-monitor setups can still opt back
-        into the overlay when they understand the risk.
-        """
-        with patch(
-            "hermes_cli.config.load_config",
-            return_value={"computer_use": {"no_overlay": False}},
-        ), \
-             patch.dict(os.environ, {"DISPLAY": ":0"}, clear=False), \
-             patch.object(cua_backend, "_x11_root_pixel_width", return_value=6000):
-            assert cua_backend._cua_no_overlay() is False
-
-    def test_no_display_skips_multi_monitor_probe(self):
-        """Headless Linux must not run xrandr at all — return True via
-        the existing no-DISPLAY branch.
-        """
-        with patch("hermes_cli.config.load_config", return_value={}), \
-             patch.dict(os.environ, {}, clear=True), \
-             patch.object(cua_backend, "_x11_root_pixel_width", return_value=6000):
-            # DISPLAY cleared; xrandr result should not even matter.
-            assert cua_backend._cua_no_overlay() is True
+        with patch.object(cua_backend, "_cua_no_overlay", return_value=True), \
+             patch.object(cua_backend, "_cua_driver_supports_no_overlay", return_value=True):
+            result = cua_backend.normalize_user_cua_driver_args(
+                "/usr/local/bin/cua-driver", ["mcp"],
+            )
+        assert result == ["mcp", "--no-overlay"]
 
 
 # ---------------------------------------------------------------------------

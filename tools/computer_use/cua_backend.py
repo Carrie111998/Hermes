@@ -227,69 +227,7 @@ def _cua_no_overlay() -> bool:
                 return True
     except Exception:
         pass
-    # Multi-monitor X11 desktops expose a virtual root wider than any single
-    # panel. A full-virtual-root InputOutput override-redirect overlay
-    # window then intercepts clicks on every head (#81220), so prefer off.
-    if _x11_has_multi_monitor_layout():
-        return True
     return False
-
-
-def _x11_has_multi_monitor_layout() -> bool:
-    """True when the X11 root window is wider than a single 4K panel.
-
-    Probes ``/proc/<ppid-of-Xorg>/cmdline`` for an ``Xorg`` process and
-    falls back to ``xrandr`` when present. Any condition that fails (no
-    Xorg, missing tools, unreadable files) returns False so a desktop with
-    a single 4K+ panel is unaffected by this heuristic.
-
-    The threshold is intentionally generous (single 4K panel ≈ 4096 wide;
-    5K iMac ≈ 5120) to avoid false positives on legitimate single-head
-    setups. Multi-monitor desktops commonly exceed 6000 wide.
-    """
-    if sys.platform != "linux" or not os.environ.get("DISPLAY"):
-        return False
-    width = _x11_root_pixel_width()
-    if width is None:
-        return False
-    # > 5120 px is unlikely to be a single panel (5K iMac is 5120 wide);
-    # multi-monitor desktops are routinely 6000+ wide.
-    return width > 5120
-
-
-def _x11_root_pixel_width() -> Optional[int]:
-    """Best-effort X11 virtual root pixel width via ``xrandr``.
-
-    Sums the widths of every ``connected`` output. Returns None when
-    xrandr is missing, unreadable, or reports no connected output so
-    callers can fall back to the legacy single-DISPLAY heuristic.
-    """
-    try:
-        from tools.environments.local import _sanitize_subprocess_env
-        proc = subprocess.run(
-            ["xrandr", "--query"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=2.0, stdin=subprocess.DEVNULL,
-            env=_sanitize_subprocess_env(),
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if proc.returncode != 0 or not proc.stdout:
-        return None
-    total = 0
-    seen_any = False
-    for line in proc.stdout.splitlines():
-        parts = line.split()
-        # xrandr ``--query`` output: ``<name> connected <WxH>+<X>+<Y> ...``.
-        if len(parts) < 3 or parts[1] != "connected":
-            continue
-        geom = parts[2]
-        try:
-            total += int(geom.split("x", 1)[0])
-            seen_any = True
-        except (ValueError, IndexError):
-            continue
-    return total if seen_any else None
 
 
 def _cua_telemetry_disabled() -> bool:
