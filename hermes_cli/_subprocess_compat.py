@@ -395,7 +395,10 @@ def run_text_capture(
     Returns a :class:`subprocess.CompletedProcess`; raises
     :class:`subprocess.TimeoutExpired` on timeout (same as ``subprocess.run``)
     so existing ``except (OSError, subprocess.TimeoutExpired)`` handlers keep
-    working. May raise ``OSError`` / ``FileNotFoundError`` at spawn, also like
+    working, with ``.output`` / ``.stderr`` carrying whatever the child wrote
+    before the deadline — callers that record timeout diagnostics (the DevFlow
+    validator logs how far a wedged ``pytest`` got) keep working unchanged.
+    May raise ``OSError`` / ``FileNotFoundError`` at spawn, also like
     ``subprocess.run``.
 
     ``cwd`` and ``env`` are passed straight through to :class:`subprocess.Popen`
@@ -454,7 +457,16 @@ def run_text_capture(
             # Best effort — we do NOT wait on the child again afterwards, so a
             # kill that fails costs us nothing but a lingering process.
             _tree_kill(proc)
-            raise subprocess.TimeoutExpired(proc.args, timeout)
+            # Partial output survives the timeout. Reading is safe even when a
+            # grandchild outlived the kill and is still writing: these are
+            # regular files, so the read returns whatever was flushed and
+            # CANNOT block. A pipe-based capture could not do this at all —
+            # that drain is the 10s-then-22.8s cost described above — so the
+            # file-backed design is what makes timeout diagnostics recoverable.
+            raise subprocess.TimeoutExpired(
+                proc.args, timeout,
+                output=_read_text(out_f), stderr=_read_text(err_f),
+            )
         return subprocess.CompletedProcess(
             proc.args, proc.returncode, _read_text(out_f), _read_text(err_f),
         )
