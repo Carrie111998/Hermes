@@ -171,6 +171,7 @@ def test_wsl_and_per_backend_cwds_are_bridged_everywhere():
         "singularity_cwd",
         "modal_cwd",
         "daytona_cwd",
+        "vercel_sandbox_cwd",
     }
 
     for bridge_name, bridge_keys in (
