@@ -914,7 +914,9 @@ class SignalAdapter(BasePlatformAdapter):
                     "account": self.account,
                     "recipient": recipient,
                     "type": "read",
-                    "targetTimestamp": target_timestamp,
+                    # Use signal-cli's canonical typed JSON-RPC shape even
+                    # when acknowledging one message (v0.14.6: Vec<u64>).
+                    "targetTimestamps": [target_timestamp],
                 },
                 log_failures=False,
             )
@@ -945,6 +947,11 @@ class SignalAdapter(BasePlatformAdapter):
 
         source = event.source
         if source is None:
+            return None
+        # Match GatewayRunner's shared fail-closed ingress gate: an explicit
+        # route to an unserved profile is dropped before auth or hooks. Never
+        # acknowledge it through the receiving/default adapter's policy.
+        if getattr(source, "profile_route_rejected", False) is True:
             return None
         authorized = self._is_sender_authorized(
             source.user_id,

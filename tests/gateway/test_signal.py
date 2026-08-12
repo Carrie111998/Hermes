@@ -172,7 +172,7 @@ class TestSignalReadReceipts:
                 "account": "+15551234567",
                 "recipient": "05668cf3-8ffa-467e-9b24-f5eefa5cf475",
                 "type": "read",
-                "targetTimestamp": 1777600696077,
+                "targetTimestamps": [1777600696077],
             },
         }]
 
@@ -283,6 +283,21 @@ class TestSignalReadReceipts:
         await asyncio.sleep(0)
 
         adapter.send_read_receipt.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rejected_profile_route_is_not_acknowledged(self, monkeypatch):
+        """Match GatewayRunner's pre-auth fail-closed multiplexing gate."""
+        adapter = _make_signal_adapter(monkeypatch, send_read_receipts=True)
+        adapter.set_authorization_check(lambda user_id, chat_type, chat_id: True)
+        adapter.send_read_receipt = AsyncMock()
+        event = _make_receipt_event(adapter)
+        event.source.profile_route_rejected = True
+
+        adapter._schedule_read_receipt(event)
+        await asyncio.sleep(0)
+
+        adapter.send_read_receipt.assert_not_awaited()
+        assert not adapter._background_tasks
 
     @pytest.mark.asyncio
     async def test_note_to_self_is_not_acknowledged(self, monkeypatch):
