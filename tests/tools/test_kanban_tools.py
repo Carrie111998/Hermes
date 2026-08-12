@@ -657,6 +657,23 @@ def test_worker_can_comment_on_foreign_task(worker_env):
         conn.close()
 
 
+def test_worker_comment_defaults_to_env_task_id(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_comment({"body": "durable progress note"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+    assert d["task_id"] == worker_env
+
+    conn = kb.connect()
+    try:
+        comments = kb.list_comments(conn, worker_env)
+        assert [comment.body for comment in comments] == ["durable progress note"]
+    finally:
+        conn.close()
+
+
 def test_worker_unblock_rejects_foreign_task_id(worker_env):
     """A worker cannot unblock any task — kanban_unblock is orchestrator-only.
 
