@@ -579,7 +579,7 @@ state.db 后可安全删除。
 - Gateway session 根据配置的重置策略自动重置
 - 重置前，agent 保存即将过期 session 中的记忆和技能
 - 可选自动清理：当 `sessions.auto_prune` 为 `true` 时，在 CLI/gateway 启动时清理早于 `sessions.retention_days`（默认 90）天的已结束 session
-- 实际删除了行的清理操作完成后，`state.db` 会执行 `VACUUM` 以回收磁盘空间（SQLite 在普通 DELETE 后不会缩小文件）
+- 清理**不会**回收磁盘空间。SQLite 在普通 DELETE 后不会缩小文件，而 `VACUUM` 需要整个数据库的独占锁——运行中的 gateway 无法授予，因此自动清理从不执行 VACUUM。参见下方[回收磁盘空间](#回收磁盘空间)。
 - 清理最多每 `sessions.min_interval_hours`（默认 24）小时运行一次；上次运行时间戳记录在 `state.db` 内部，因此在同一 `HERMES_HOME` 下的所有 Hermes 进程间共享
 
 默认为**关闭**——session 历史对 `session_search` 召回很有价值，静默删除可能会让用户感到意外。在 `~/.hermes/config.yaml` 中启用：
@@ -588,11 +588,27 @@ state.db 后可安全删除。
 sessions:
   auto_prune: true          # 选择启用——默认为 false
   retention_days: 90        # 保留已结束 session 的天数
-  vacuum_after_prune: true  # 清理后回收磁盘空间
   min_interval_hours: 24    # 清理间隔不短于此值
 ```
 
+:::caution `vacuum_after_prune` 已失效
+旧版配置和文档中列出的 `sessions.vacuum_after_prune` 键**没有任何代码读取**。
+两个自动维护调用方都硬编码了 `vacuum=False`，因为运行中的多进程 gateway 无法
+授予 `VACUUM` 所需的独占锁。将其设为 `true` 不会有任何效果；保留在配置中也无害。
+请改用下方的离线方式回收空间。
+:::
+
 活跃 session 永远不会被自动清理，无论时间多长。
+
+### 回收磁盘空间
+
+`VACUUM` 会重写整个数据库，并在整个过程中持有独占锁，因此它只能是**按需、在
+gateway 停止时**执行的操作，永远不会自动运行。请使用 session 浏览器中的
+`optimize` 操作，它会先合并 FTS5 段，然后执行 VACUUM。
+
+开始前请预估成本：在一个 5.1 GB 的 `state.db` 上，实测 `VACUUM` 持有独占锁约
+**19.8 分钟**，仅回收了约 **3.0%** 的文件体积。更激进的清理（降低
+`retention_days`）通常比 VACUUM 更有效。
 
 ### 手动清理
 

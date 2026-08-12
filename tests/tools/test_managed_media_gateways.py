@@ -47,6 +47,19 @@ def _restore_tool_and_agent_modules():
 
 
 @pytest.fixture(autouse=True)
+def _neutralize_lazy_install_gate(monkeypatch):
+    """Let the ``fal_client`` stubs in this file actually be reachable.
+
+    ``import_fal_client`` runs ``tools.lazy_deps.ensure("image.fal")`` before
+    the real import, and that gate resolves availability from distribution
+    metadata (``importlib.metadata.version``) rather than ``sys.modules``. A
+    module injected into ``sys.modules`` can therefore never satisfy it, so
+    with fal-client absent from the venv every stub here would be unreachable.
+    """
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *a, **k: None)
+
+
+@pytest.fixture(autouse=True)
 def _enable_managed_nous_tools(monkeypatch):
     """Patch the source modules so managed_nous_tools_enabled() returns True
     even after tool modules are dynamically reloaded."""

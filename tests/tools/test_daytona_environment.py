@@ -43,6 +43,12 @@ def _patch_daytona_imports(monkeypatch):
     daytona_mod.SandboxState = _SandboxState
 
     monkeypatch.setitem(__import__("sys").modules, "daytona", daytona_mod)
+    # DaytonaEnvironment.__init__ runs the lazy-install gate before importing
+    # ``daytona``, and that gate resolves availability from distribution
+    # metadata (importlib.metadata.version), not sys.modules. With the real
+    # daytona distribution absent it raises FeatureUnavailable -> ImportError
+    # and the stub above is never reached.
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *a, **k: None)
     return daytona_mod
 
 

@@ -40,6 +40,30 @@ from hermes_cli.browser_connect import (
 )
 
 
+def _is_windows_executable(command: str) -> bool:
+    """True if ``command`` names something cmd.exe can actually execute.
+
+    Windows has no execute bit: cmd.exe decides by extension (``PATHEXT``).
+    Handing it a file with an unregistered extension — a bash script, say —
+    does not fail; it blocks indefinitely in the shell-association handler.
+    Callers use this to refuse that fallback rather than hang.
+    """
+    import shutil
+
+    if not command:
+        return False
+    exe = command if os.path.exists(command) else (command.split() or [""])[0]
+    resolved = shutil.which(exe)
+    if resolved is None:
+        return False
+    pathext = tuple(
+        ext.lower()
+        for ext in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep)
+        if ext
+    )
+    return resolved.lower().endswith(pathext)
+
+
 class CLICommandsMixin:
     """Mixin holding the interactive-CLI slash-command handlers.
 
@@ -2366,10 +2390,19 @@ class CLICommandsMixin:
                 if initial_text:
                     fh.write(initial_text)
             try:
-                subprocess.call([*shlex.split(editor), path])
-            except Exception:
+                # posix=False on Windows so backslashes in a path-like $EDITOR
+                # survive the split instead of being eaten as escapes.
+                subprocess.call([*shlex.split(editor, posix=os.name != "nt"), path])
+            except (OSError, ValueError) as exc:
                 # Fall back to a bare invocation (editor value may not be a
-                # simple argv-splittable string on some platforms).
+                # simple argv-splittable string on some platforms). On Windows
+                # refuse to hand cmd.exe something it has no association for:
+                # it blocks forever in the "how do you want to open this file?"
+                # handler instead of failing.
+                if os.name == "nt" and not _is_windows_executable(editor):
+                    raise RuntimeError(
+                        f"{editor!r} is not an executable program on Windows"
+                    ) from exc
                 subprocess.call(f"{editor} {shlex.quote(path)}", shell=True)
             with open(path, "r", encoding="utf-8") as fh:
                 raw = fh.read()
