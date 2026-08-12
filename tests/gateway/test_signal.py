@@ -1245,6 +1245,44 @@ class TestSignalAutomaticQuoteRouting:
         assert _reply_anchor_for_event(merged) == "1712345679000"
         await adapter._flush_text_debounce_now("signal:dm")
 
+    @pytest.mark.asyncio
+    async def test_separate_busy_bursts_keep_latest_signal_reply_anchor(
+        self, monkeypatch
+    ):
+        from gateway.platforms.base import MessageEvent, _reply_anchor_for_event
+        from gateway.session import SessionSource
+
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._busy_text_debounce_seconds = 60.0
+        source = SessionSource(
+            platform=Platform.SIGNAL,
+            chat_id="+15551230000",
+            chat_type="dm",
+            user_id="+15551230000",
+        )
+        first = MessageEvent(
+            text="burst one",
+            source=source,
+            message_id="1712345680000",
+            raw_message={"timestamp_ms": 1712345678000},
+        )
+        second = MessageEvent(
+            text="burst two",
+            source=source,
+            message_id="1712345690000",
+            raw_message={"timestamp_ms": 1712345679000},
+        )
+
+        await adapter._queue_text_debounce("signal:dm", first)
+        await adapter._flush_text_debounce_now("signal:dm")
+        await adapter._queue_text_debounce("signal:dm", second)
+        await adapter._flush_text_debounce_now("signal:dm")
+
+        pending = adapter._pending_messages["signal:dm"]
+        assert pending.text == "burst one\nburst two"
+        assert pending.message_id == "1712345690000"
+        assert _reply_anchor_for_event(pending) == "1712345679000"
+
 
 class TestSignalQuoteExtraction:
     """Verify Signal reply quote fields are propagated to MessageEvent."""

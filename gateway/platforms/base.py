@@ -2792,6 +2792,19 @@ def merge_pending_message_event(
         ):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            incoming_source = getattr(event, "source", None)
+            if (
+                _platform_name(getattr(incoming_source, "platform", None)) == "signal"
+                and isinstance(getattr(event, "raw_message", None), dict)
+            ):
+                # A later busy burst becomes the reply target for the combined
+                # pending turn. Carry both its distinct event identity and its
+                # Signal-native displayed-message anchor.
+                if event.message_id is not None:
+                    existing.message_id = str(event.message_id)
+                existing.raw_message = event.raw_message
+                if event.reply_to_message_id is not None:
+                    existing.reply_to_message_id = str(event.reply_to_message_id)
             return
 
     pending_messages[session_key] = event
