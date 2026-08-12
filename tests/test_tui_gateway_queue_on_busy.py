@@ -530,7 +530,15 @@ def test_drain_releases_running_on_dispatch_failure(monkeypatch):
 
 
 def test_drain_does_not_dispatch_a_prompt_cancelled_after_claim(monkeypatch):
-    session = _session(queued_prompt={"text": "B", "transport": None})
+    """Generation cancel aborts dispatch but must restore the claimed head.
+
+    Compress re-anchor / Stop bump generation between claim and check. Dropping
+    the envelope would silently lose a legitimate follow-up (#84417 belt).
+    """
+    session = _session(
+        queued_prompt={"text": "B", "transport": "ws-1"},
+        queued_prompts=[{"text": "C", "transport": "ws-1"}],
+    )
     monkeypatch.setattr(
         server,
         "_session_uses_compute_host",
@@ -544,6 +552,29 @@ def test_drain_does_not_dispatch_a_prompt_cancelled_after_claim(monkeypatch):
 
     assert server._drain_queued_prompt("r1", "sid", session) is True
     assert session["running"] is False
+    # Claimed B restored first; C that advanced into the slot is behind it.
+    assert session.get("queued_prompt") == {"text": "B", "transport": "ws-1"}
+    assert session.get("queued_prompts") == [{"text": "C", "transport": "ws-1"}]
+
+
+def test_drain_restores_claimed_prompt_when_generation_bumps_mid_claim(monkeypatch):
+    """Single-item queue: generation cancel must not empty the queue."""
+    session = _session(queued_prompt={"text": "follow-up Q", "transport": None})
+    monkeypatch.setattr(
+        server,
+        "_session_uses_compute_host",
+        lambda _session: session.__setitem__("_queued_prompt_generation", 1) or False,
+    )
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not dispatch")),
+    )
+
+    assert server._drain_queued_prompt("r1", "sid", session) is True
+    assert session["running"] is False
+    assert session.get("queued_prompt") == {"text": "follow-up Q", "transport": None}
+    assert not session.get("queued_prompts")
 
 
 def test_drain_does_not_clear_stop_after_its_final_generation_check(monkeypatch):

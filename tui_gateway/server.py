@@ -4997,10 +4997,11 @@ def _sync_session_key_after_compress(
         session["session_key"] = new_session_id
 
     # #84417 (belt): invalidate any in-flight ``_drain_queued_prompt`` claim
-    # that captured generation under the pre-rotation session_key. The queue
-    # contents stay (legitimate follow-ups must survive), but a drain that
-    # raced compression cannot dispatch against the rotated continuation
-    # with a stale claim. Complements self-duplicate scrubbing on redirect.
+    # that captured generation under the pre-rotation session_key. A raced
+    # drain must not dispatch on the continuation with a stale claim; the
+    # claimed envelope is restored to the queue (see ``_drain_queued_prompt``)
+    # so legitimate follow-ups still survive. Complements self-duplicate
+    # scrubbing on redirect.
     session["_queued_prompt_generation"] = int(
         session.get("_queued_prompt_generation", 0)
     ) + 1
@@ -7805,6 +7806,21 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
+            # Generation cancelled the claim (Stop, compress re-anchor, …).
+            # Do not dispatch — but put the claimed envelope back so a
+            # legitimate follow-up is not silently dropped. Order: claimed
+            # head first, then whatever advanced into the slot while we held
+            # the claim (#84417 belt accuracy).
+            rest: list = []
+            advanced = session.get("queued_prompt")
+            if advanced:
+                rest.append(advanced)
+            rest.extend(session.get("queued_prompts") or [])
+            session["queued_prompt"] = queued
+            if rest:
+                session["queued_prompts"] = rest
+            else:
+                session.pop("queued_prompts", None)
             session["running"] = False
             return True
     dispatch_failed = False
