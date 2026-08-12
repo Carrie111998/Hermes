@@ -74,8 +74,8 @@ const status: Record<string, string> = {
 
 // ── UI string catalog ─────────────────────────────────────────────
 // Must provide a translated value for every key declared in en.ts.
-// Non-zh locales that don't have a translation yet fall back to the
-// EN catalog automatically; this file is only for completed locales.
+// Other locale overlays are independent and may be partial; their missing
+// values fall back directly to the English catalog, never through this pack.
 const catalog: Record<TranslationKey, string> = {
   'background.short': '后台',
   'background.resumeWhenSubagentFinishes': '↩ 子 Agent 完成后自动继续',

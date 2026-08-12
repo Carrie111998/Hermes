@@ -73,8 +73,8 @@ const status: Record<string, string> = {
 
 // ── UI string catalog ─────────────────────────────────────────────
 // Every key listed here is part of the public TranslationKey type.
-// Third-party locale files must provide a value for every key;
-// missing keys fall back to this EN catalog at runtime.
+// Locale overlays may translate any subset of these keys; every missing
+// value falls back directly to this English source catalog at runtime.
 const catalog = {
   'background.short': 'bg',
   'background.resumeWhenSubagentFinishes': '↩ resumes when subagent finishes',
