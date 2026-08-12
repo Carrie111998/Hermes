@@ -13,6 +13,7 @@ import { Navigate, Route, Routes, useParams } from 'react-router'
 
 import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
 import { useContributions } from '@/contrib/react/use-contributions'
+import { $gateway } from '@/store/gateway'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $freshDraftReady, $gatewayState } from '@/store/session'
 
@@ -114,18 +115,10 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
   maxVoiceRecordingSeconds?: number
 }) {
   const activeGatewayProfile = useStore($activeGatewayProfile)
+  const gateway = useStore($gateway)
   const gatewayState = useStore($gatewayState)
   useContributions(ROUTES_AREA)
   const routeContributions = contributedRoutes()
-
-  // Recapture the live gateway instance whenever the connection state flips.
-  // getGateway reads a controller ref, so gatewayState is the intentional
-  // re-eval trigger (not a value the computation itself reads).
-  const gateway = useMemo(
-    () => actions.getGateway(),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [actions, gatewayState]
-  )
 
   const modelMenuContent = useMemo(
     () =>
