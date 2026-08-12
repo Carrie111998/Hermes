@@ -32,7 +32,7 @@ import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
-import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { classifyOwnerMessageGate, parseOwnerCommands } from './owner_message_gate.js';
 import {
   buildPollPayload,
   createReconnectScheduler,
@@ -111,6 +111,7 @@ try {
 const PAIR_ONLY = args.includes('--pair-only');
 const PAIR_JSON = args.includes('--pair-json');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
+const OWNER_COMMANDS = parseOwnerCommands(process.env._HERMES_WHATSAPP_OWNER_COMMANDS || '');
 const WHATSAPP_DM_POLICY = String(process.env.WHATSAPP_DM_POLICY || 'open').trim().toLowerCase();
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
 const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
@@ -557,6 +558,7 @@ async function startSocket() {
 
       // Handle fromMe messages based on mode
       let fromOwner = false;
+      let ownerCommand = false;
       if (msg.key.fromMe) {
         if (isGroup || chatId.includes('status')) {
           emitDebugEvent({
@@ -618,13 +620,28 @@ async function startSocket() {
             accountLid: redactWhatsAppId(sock.user?.lid),
           });
           if (!isSelfChat) {
-            emitDebugEvent({
-              stage: 'ignored',
-              reason: 'self_chat_mismatch',
-              chatId: redactWhatsAppId(chatId),
-              senderId: redactWhatsAppId(senderId),
+            const decision = classifyOwnerMessageGate({
+              mode: WHATSAPP_MODE,
+              fromMe: true,
+              recentlySent: recentlySentIds,
+              messageId: msg.key.id,
+              chatId,
+              isSelfChat: false,
+              ownerCommands: OWNER_COMMANDS,
+              messageContent: getMessageContent(msg),
             });
-            continue;
+            if (decision.action === 'forward_owner') {
+              fromOwner = true;
+              ownerCommand = true;
+            } else {
+              emitDebugEvent({
+                stage: 'ignored',
+                reason: 'self_chat_mismatch',
+                chatId: redactWhatsAppId(chatId),
+                senderId: redactWhatsAppId(senderId),
+              });
+              continue;
+            }
           }
         }
       }
@@ -734,6 +751,7 @@ async function startSocket() {
         },
       });
       event.fromOwner = fromOwner;
+      if (ownerCommand) event.ownerCommand = true;
 
       // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
       if (msg.key.fromMe && ((REPLY_PREFIX && event.body.startsWith(REPLY_PREFIX)) || recentlySentIds.has(msg.key.id))) {
@@ -1111,6 +1129,7 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
+    ownerCommands: OWNER_COMMANDS,
   });
 });
 

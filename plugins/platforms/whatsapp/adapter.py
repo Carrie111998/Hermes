@@ -16,6 +16,7 @@ with different backends via a bridge pattern.
 """
 
 import asyncio
+import json
 import logging
 import os
 import platform
@@ -401,6 +402,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     - group_policy: "open" | "allowlist" | "disabled" | "pairing" — which groups are processed (default: "pairing")
     - group_allow_from: List of group JIDs allowed (when group_policy="allowlist")
     - send_read_receipts: Mark accepted inbound WhatsApp messages as read
+    - owner_commands: Slash command names accepted from owner customer chats in self-chat mode
 
     Behavior (gating, mention parsing, markdown conversion, chunking) is
     provided by ``WhatsAppBehaviorMixin`` so the Cloud API adapter can
@@ -455,6 +457,16 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             read_receipts if isinstance(read_receipts, bool)
             else str(read_receipts or "").strip().lower() in {"1", "true", "yes", "on"}
         )
+        owner_commands = config.extra.get("owner_commands", [])
+        if isinstance(owner_commands, list):
+            self._owner_commands = list(dict.fromkeys(
+                name.strip().lower()
+                for name in owner_commands
+                if isinstance(name, str)
+                and re.fullmatch(r"[A-Za-z0-9_-]+", name.strip())
+            ))
+        else:
+            self._owner_commands = []
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
         self._bridge_log_fh = None
@@ -638,7 +650,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 running_hash = data.get("scriptHash", "")
                                 disk_hash = _file_content_hash(bridge_path)
                                 running_read_receipts = bool(data.get("sendReadReceipts", False))
-                                config_matches = running_read_receipts == self._send_read_receipts
+                                running_owner_commands = data.get("ownerCommands", [])
+                                if not isinstance(running_owner_commands, list):
+                                    running_owner_commands = []
+                                config_matches = (
+                                    running_read_receipts == self._send_read_receipts
+                                    and running_owner_commands
+                                    == getattr(self, "_owner_commands", [])
+                                )
                                 if (
                                     running_hash
                                     and disk_hash
@@ -654,7 +673,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 stale_reason = (
                                     f"running={running_hash or 'unversioned'}, disk={disk_hash}"
                                     if running_hash != disk_hash
-                                    else "send_read_receipts config changed"
+                                    else "bridge config changed"
                                 )
                                 print(f"[{self.name}] Running bridge is stale ({stale_reason}), restarting")
                             else:
@@ -685,6 +704,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             bridge_env["WHATSAPP_SEND_READ_RECEIPTS"] = (
                 "true" if self._send_read_receipts else "false"
             )
+            owner_commands = getattr(self, "_owner_commands", [])
+            bridge_env.pop("_HERMES_WHATSAPP_OWNER_COMMANDS", None)
+            if owner_commands:
+                bridge_env["_HERMES_WHATSAPP_OWNER_COMMANDS"] = json.dumps(
+                    owner_commands, separators=(",", ":")
+                )
             # Under multiplexing, the bridge subprocess runs with a copy of
             # os.environ that does NOT contain the secondary profile's .env
             # vars.  Inject the resolved WHATSAPP_* values so the Node bridge
@@ -1615,12 +1640,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # having to peek at raw_message.  We also prefix ``MessageEvent.text``
             # with ``[owner reply] `` here so the marker survives any downstream
             # failure (e.g. handover-rule errors that bypass silent_ingest).
-            # Gated by ``WHATSAPP_FORWARD_OWNER_MESSAGES`` at the bridge layer;
-            # metadata + text tagging are unconditional when the flag is present
-            # so a future producer can set it without adapter changes.
+            # The narrow self-chat command ingress sets ``ownerCommand`` so its
+            # leading slash remains visible to the gateway command dispatcher;
+            # bot-mode owner forwarding keeps the existing prefix behavior.
             if data.get("fromOwner"):
                 metadata["whatsapp_from_owner"] = True
-                if not body.startswith(_OWNER_REPLY_PREFIX):
+                if data.get("ownerCommand") is not True and not body.startswith(_OWNER_REPLY_PREFIX):
                     body = f"{_OWNER_REPLY_PREFIX}{body}"
 
             return MessageEvent(
@@ -1834,13 +1859,18 @@ def interactive_setup() -> None:
 
 
 def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
-    """Translate config.yaml whatsapp: keys into WHATSAPP_* env vars.
+    """Translate config.yaml WhatsApp keys into adapter config and env vars.
 
     Implements the apply_yaml_config_fn contract (#24849). Mirrors the legacy
     whatsapp_cfg block from gateway/config.py::load_gateway_config(). Env vars
-    take precedence over YAML. Returns None — everything flows through env.
+    take precedence over YAML for legacy settings. Non-secret bridge behavior
+    remains in ``PlatformConfig.extra``.
     """
     import json as _json
+    seeded = {}
+    owner_commands = whatsapp_cfg.get("owner_commands")
+    if isinstance(owner_commands, list):
+        seeded["owner_commands"] = owner_commands
     if "require_mention" in whatsapp_cfg and not os.getenv("WHATSAPP_REQUIRE_MENTION"):
         os.environ["WHATSAPP_REQUIRE_MENTION"] = str(whatsapp_cfg["require_mention"]).lower()
     if "mention_patterns" in whatsapp_cfg and not os.getenv("WHATSAPP_MENTION_PATTERNS"):
@@ -1864,7 +1894,7 @@ def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
         if isinstance(gaf, list):
             gaf = ",".join(str(v) for v in gaf)
         os.environ["WHATSAPP_GROUP_ALLOWED_USERS"] = str(gaf)
-    return None
+    return seeded or None
 
 
 def _is_connected(config) -> bool:

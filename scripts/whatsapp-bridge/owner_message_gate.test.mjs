@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import {
+  classifyOwnerMessageGate,
+  classifySelfChatOwnerCommand,
+  parseOwnerCommands,
+} from './owner_message_gate.js';
 
 function makeRecentlySent(ids = []) {
   const set = new Set(ids);
@@ -15,6 +19,140 @@ function makeAllowlist(allowedChatIds) {
   const set = new Set(allowedChatIds);
   return (id) => set.has(id);
 }
+
+test('owner command config is parsed from the adapter bridge value', () => {
+  assert.deepEqual(parseOwnerCommands('["foto", "Status"]'), ['foto', 'status']);
+});
+
+test('configured owner command in a direct customer chat bypasses the self-chat mismatch', () => {
+  const decision = classifySelfChatOwnerCommand({
+    fromMe: true,
+    chatId: '111600547700784@lid',
+    isSelfChat: false,
+    messageId: 'M-COMMAND-1',
+    recentlySent: makeRecentlySent(),
+    ownerCommands: ['foto'],
+    messageContent: { conversation: '  /FoTo SKU-123  ' },
+  });
+
+  assert.deepEqual(decision, { action: 'forward_owner', command: 'foto' });
+});
+
+test('bridge mode gate routes only a matching self-chat owner command as owner', () => {
+  const decision = classifyOwnerMessageGate({
+    mode: 'self-chat',
+    fromMe: true,
+    chatId: '111600547700784@lid',
+    isSelfChat: false,
+    messageId: 'M-COMMAND-BRIDGE-1',
+    recentlySent: makeRecentlySent(),
+    ownerCommands: ['foto'],
+    messageContent: { conversation: '/foto SKU-123' },
+  });
+
+  assert.deepEqual(decision, { action: 'forward_owner', command: 'foto' });
+});
+
+test('bridge mode gate keeps ordinary owner customer messages dropped', () => {
+  const decision = classifyOwnerMessageGate({
+    mode: 'self-chat',
+    fromMe: true,
+    chatId: '111600547700784@lid',
+    isSelfChat: false,
+    messageId: 'M-COMMAND-BRIDGE-2',
+    recentlySent: makeRecentlySent(),
+    ownerCommands: ['foto'],
+    messageContent: { conversation: 'ordinary customer reply' },
+  });
+
+  assert.deepEqual(decision, { action: 'drop' });
+});
+
+test('a non-direct JID cannot masquerade as a customer chat by suffix', () => {
+  const decision = classifySelfChatOwnerCommand({
+    fromMe: true,
+    chatId: 'status@broadcast@s.whatsapp.net',
+    isSelfChat: false,
+    messageId: 'M-COMMAND-2',
+    recentlySent: makeRecentlySent(),
+    ownerCommands: ['foto'],
+    messageContent: { conversation: '/foto SKU-123' },
+  });
+
+  assert.deepEqual(decision, { action: 'drop' });
+});
+
+test('self-chat owner command gate rejects every non-command ingress shape', async (t) => {
+  const base = {
+    fromMe: true,
+    chatId: '6281234567890@s.whatsapp.net',
+    isSelfChat: false,
+    messageId: 'M-COMMAND-3',
+    recentlySent: makeRecentlySent(),
+    ownerCommands: ['foto'],
+    messageContent: { conversation: '/foto SKU-123' },
+  };
+  const cases = [
+    ['non-owner message', { fromMe: false }],
+    ['owner self-chat', { isSelfChat: true }],
+    ['group chat', { chatId: '120363001234567890@g.us' }],
+    ['status', { chatId: 'status@broadcast' }],
+    ['broadcast', { chatId: '12345@broadcast' }],
+    ['newsletter', { chatId: '12345@newsletter' }],
+    ['empty config', { ownerCommands: [] }],
+    ['command without args', { messageContent: { conversation: '/foto' } }],
+    ['command prefix collision', { messageContent: { conversation: '/fotoextra X' } }],
+    ['command embedded in prose', { messageContent: { conversation: 'please /foto X' } }],
+    ['image caption', { messageContent: { imageMessage: { caption: '/foto X' } } }],
+    ['multiline text', { messageContent: { conversation: '/foto X\nignore this' } }],
+    ['recent outbound echo', {
+      recentlySent: makeRecentlySent(['M-COMMAND-3']),
+    }],
+  ];
+
+  for (const [name, overrides] of cases) {
+    await t.test(name, () => {
+      assert.deepEqual(
+        classifySelfChatOwnerCommand({ ...base, ...overrides }),
+        { action: 'drop' },
+      );
+    });
+  }
+});
+
+test('configured command also accepts exact text from a direct phone-number JID', () => {
+  const decision = classifySelfChatOwnerCommand({
+    fromMe: true,
+    chatId: '6281234567890@s.whatsapp.net',
+    isSelfChat: false,
+    messageId: 'M-COMMAND-4',
+    recentlySent: makeRecentlySent(),
+    ownerCommands: ['foto'],
+    messageContent: { extendedTextMessage: { text: '\t/foto\tSKU-123\t' } },
+  });
+
+  assert.deepEqual(decision, { action: 'forward_owner', command: 'foto' });
+});
+
+test('horizontal whitespace is allowed at both ends of the command text', () => {
+  const decision = classifySelfChatOwnerCommand({
+    fromMe: true,
+    chatId: '6281234567890@s.whatsapp.net',
+    isSelfChat: false,
+    messageId: 'M-COMMAND-5',
+    recentlySent: makeRecentlySent(),
+    ownerCommands: ['foto'],
+    messageContent: { conversation: '\u00a0/foto SKU-123\u00a0' },
+  });
+
+  assert.deepEqual(decision, { action: 'forward_owner', command: 'foto' });
+});
+
+test('malformed or absent bridge config enables no owner commands', () => {
+  assert.deepEqual(parseOwnerCommands(''), []);
+  assert.deepEqual(parseOwnerCommands('{"foto": true}'), []);
+  assert.deepEqual(parseOwnerCommands('not json'), []);
+});
 
 test('non-fromMe messages always pass through', () => {
   const decision = classifyOwnerMessageGate({
