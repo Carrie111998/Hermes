@@ -7068,72 +7068,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
-        persist: bool = True,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
         Priority (highest first): session ``/model`` → ``channel_overrides`` →
         global config/env (``_resolve_gateway_model(user_config)`` and default
         provider resolution).
-
-        ``persist`` defaults to ``True`` for turn-processing callers, which
-        rely on the side effects (rehydrating the persisted ``/model`` override
-        into live state and caching ``last_resolved_model`` for #35314
-        recovery).  Display-only callers such as ``/status`` pass
-        ``persist=False``: the same route is resolved and returned, but the two
-        fields this method would otherwise mutate are snapshotted first and
-        restored afterward so a read-only status render leaves no trace in
-        conversation/process state.
-        """
-        if persist:
-            return self._resolve_session_agent_runtime_impl(
-                source=source, session_key=session_key, user_config=user_config
-            )
-
-        resolved_key = session_key
-        if not resolved_key and source is not None:
-            try:
-                resolved_key = self._session_key_for_source(source)
-            except Exception:
-                resolved_key = None
-        _snap_state = (
-            self._peek_session_state(resolved_key) if resolved_key else None
-        )
-        _snap_star = self._peek_session_state("*")
-        _prev_override = (
-            _snap_state.conversation.model_override if _snap_state else None
-        )
-        _prev_lrm = (
-            _snap_state.conversation.last_resolved_model if _snap_state else ""
-        )
-        _prev_star_lrm = (
-            _snap_star.conversation.last_resolved_model if _snap_star else ""
-        )
-        try:
-            return self._resolve_session_agent_runtime_impl(
-                source=source, session_key=session_key, user_config=user_config
-            )
-        finally:
-            if resolved_key:
-                _rs = self._peek_session_state(resolved_key)
-                if _rs is not None:
-                    _rs.conversation.model_override = _prev_override
-                    _rs.conversation.last_resolved_model = _prev_lrm
-            _rstar = self._peek_session_state("*")
-            if _rstar is not None:
-                _rstar.conversation.last_resolved_model = _prev_star_lrm
-
-    def _resolve_session_agent_runtime_impl(
-        self,
-        *,
-        source: Optional[SessionSource] = None,
-        session_key: Optional[str] = None,
-        user_config: Optional[dict] = None,
-    ) -> tuple[str, dict]:
-        """Concrete route resolution.  See :meth:`_resolve_session_agent_runtime`.
-
-        This performs the actual (mutating) resolution; the public method wraps
-        it with an optional snapshot/restore for display-only callers.
         """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
