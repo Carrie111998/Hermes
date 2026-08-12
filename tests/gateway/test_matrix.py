@@ -3062,6 +3062,29 @@ class TestMatrixLinkSanitization:
 # Reactions
 # ---------------------------------------------------------------------------
 
+
+async def _drain_reaction_redactions(adapter) -> None:
+    """Await the adapter's scheduled redaction tasks instead of racing a sleep.
+
+    ``_schedule_reaction_redaction`` fires the redaction from a background task
+    that first sleeps ``_reaction_redaction_delay_seconds``.  These tests used to
+    wait for it with ``await asyncio.sleep(0.03)`` against a 0.01s delay -- a 3x
+    margin that a loaded box loses, producing a spurious "Expected mock to have
+    been awaited once. Awaited 0 times."  The adapter already tracks every such
+    task in ``_reaction_redaction_tasks``, so wait on the work itself.
+
+    Snapshot the set first: ``add_done_callback(...discard)`` mutates it as tasks
+    finish, which would otherwise raise "Set changed size during iteration".
+    ``_redact_later`` swallows its own exceptions, so gathering cannot raise.
+
+    Deliberately no fallback when the set is empty -- if nothing was scheduled,
+    the caller's ``assert_awaited*`` must still fail.
+    """
+    tasks = tuple(adapter._reaction_redaction_tasks)
+    if tasks:
+        await asyncio.gather(*tasks)
+
+
 class TestMatrixReactions:
     def setup_method(self):
         self.adapter = _make_adapter()
@@ -3131,7 +3154,7 @@ class TestMatrixReactions:
         await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
         self.adapter._redact_reaction.assert_not_awaited()
         self.adapter._send_reaction.assert_called_once_with("!room:ex", "$msg1", "\u2705")
-        await asyncio.sleep(0.03)
+        await _drain_reaction_redactions(self.adapter)
         self.adapter._redact_reaction.assert_awaited_once_with(
             "!room:ex",
             "$eyes_reaction_123",
@@ -3160,7 +3183,7 @@ class TestMatrixReactions:
         await self.adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
         self.adapter._redact_reaction.assert_not_awaited()
         self.adapter._send_reaction.assert_called_once_with("!room:ex", "$msg1", "\u274c")
-        await asyncio.sleep(0.03)
+        await _drain_reaction_redactions(self.adapter)
         self.adapter._redact_reaction.assert_awaited_once_with(
             "!room:ex",
             "$eyes_reaction_123",
@@ -3224,7 +3247,7 @@ class TestMatrixReactions:
         await self.adapter._redact_bot_approval_reactions("!room:ex", prompt)
 
         self.adapter._redact_reaction.assert_not_awaited()
-        await asyncio.sleep(0.03)
+        await _drain_reaction_redactions(self.adapter)
         self.adapter._redact_reaction.assert_any_await(
             "!room:ex",
             "$allow_reaction",

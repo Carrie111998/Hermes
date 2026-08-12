@@ -83,16 +83,27 @@ traceback. There is none, because they passed. Do **not** record this as fixed:
 *(All 14 are now fixed — see the status table above. Every group carries a ✅ banner with
 its evidence; the original triage is preserved verbatim underneath each one.)*
 
-**One flaky test in this suite is NOT one of the 14, and you will still see it fail.**
-`test_matrix.py::TestMatrixReactions::test_on_processing_complete_sends_cross_on_failure`
-failed once in three whole-file runs on 2026-08-11 and then passed **8/8 in isolation** and
-in a clean `250 passed, 1 skipped` whole-file rerun. It is a wall-clock race, not a
-regression: the test sets `_reaction_redaction_delay_seconds = 0.01`, then
-`await asyncio.sleep(0.03)` before asserting the background task already ran — a 3× margin
-that a loaded box loses, giving `Expected mock to have been awaited once. Awaited 0 times.`
-**Two sibling tests in the same class use the identical 0.01/0.03 pattern** (around
-`test_matrix.py:3117`, `:3146`, `:3216`), so any of the three can fire. Do not chase it as a
-break in the code under test; the fix is to wait on the effect rather than on the clock.
+**✅ A 15th failure — a flaky test that was never one of the 14 — was found and fixed here
+(2026-08-12).** `test_matrix.py::TestMatrixReactions` had **three** tests racing a clock:
+each set `_reaction_redaction_delay_seconds = 0.01`, then `await asyncio.sleep(0.03)` before
+asserting the background redaction had run. A 3× margin a loaded box loses, reporting
+`Expected mock to have been awaited once. Awaited 0 times.`
+
+It surfaced as a single failure in one of three whole-file runs while group E's fix was being
+confirmed — ~1900 lines from that fix's only hunks, looking exactly like a regression it had
+caused. It was not: an A/B with `git checkout main -- tests/gateway/test_matrix.py` and
+nothing else varied had the control fail E and pass Reactions, and the picked tree pass E and
+fail Reactions.
+
+Fixed by waiting on the effect instead of the clock. The adapter already tracks every
+scheduled task in `_reaction_redaction_tasks` (`adapter.py:974`, populated at `:3301`), so a
+`_drain_reaction_redactions()` helper snapshots that set and `asyncio.gather`s it. Test-side
+only; no production change. The `assert_not_awaited()` checks are kept — that deferral is the
+real property under test, and it does not race.
+
+Proof it is actually fixed rather than merely passing: raising the background delay to 0.5s
+(simulating the loaded box) fails **all three** tests on the old code and passes all nine on
+the new. Whole file `250 passed, 1 skipped`.
 
 ### A. ✅ FIXED — Stale test scaffolding — 5 — `test_multiplex_adapter_registry.py`
 
