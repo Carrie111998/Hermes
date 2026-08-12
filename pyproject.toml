@@ -138,6 +138,16 @@ dependencies = [
   # Hence the ``sys_platform == 'win32'`` marker: the dep (and its portalocker
   # / pywin32 tree) ships only where it's actually used.
   "concurrent-log-handler==0.9.29; sys_platform == 'win32'",
+  # Local document → Markdown conversion (agent/document_processing.py). Every
+  # upload surface — onboarding uploads, chat attachments, messaging media,
+  # `@file:` context references — routes through it, so it belongs in core
+  # rather than an extra: a lazy install mid-upload would either block the
+  # request or silently degrade the document to an un-inlinable binary.
+  # Ranged rather than exact-pinned (the only such core dep) because it ships
+  # per-platform abi3 wheels and the <0.3 ceiling is the API contract boundary;
+  # the resolved version is still frozen in uv.lock, so an install only moves
+  # when the lockfile is regenerated on purpose.
+  "firecrawl-anydoc>=0.1.8,<0.3",
 ]
 
 [project.optional-dependencies]
