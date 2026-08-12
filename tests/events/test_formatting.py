@@ -48,6 +48,52 @@ def test_event_icons_cover_all_types():
     )
 
 
+def test_event_icons_are_unique_within_a_telegram_topic():
+    """Two events on the SAME Telegram topic must not share a glyph.
+
+    Coverage is now guaranteed by construction (EventType requires a non-empty
+    icon at class creation), but nothing asserts that icons are
+    *distinguishable* — so the table can be 100% covered and still unreadable.
+    The standard the EventType docstring states is per-topic, not global ("pick
+    a glyph disjoint from its neighbours in the same Telegram topic"), because
+    an operator only ever scans one topic's feed at a time; two identical
+    glyphs in different topics never appear side by side and are deliberately
+    allowed.
+
+    Caught for real on 2026-08-11: 💥 was on both ``cron_failed`` (2026-04-17)
+    and ``agent_loop_fault`` (2026-05-29), i.e. two failure events landing in
+    watchdog_alerts that a reader could not tell apart at a glance. It had
+    gone unnoticed for ~2.5 months. The near-miss cost was higher: efc77632f
+    added 12 DevFlow icons colliding with six pre-existing types (four of them
+    on a shared topic) and no test objected — it was caught only by a human
+    AST diff while resolving it against a competing fix (b0adeb34c).
+
+    Cross-topic duplicates are intentionally NOT asserted here; as of this
+    writing ✅ (application_submitted / critic_auto_applied) and 🟢
+    (devflow.build_succeeded / gateway_started) are both fine.
+    """
+    from collections import defaultdict
+
+    from events.routing_policy import _POLICY
+
+    by_topic_glyph = defaultdict(list)
+    for event_type, glyph in EVENT_TYPE_EMOJI.items():
+        spec = _POLICY.get(event_type)
+        if spec is None:
+            continue  # unrouted: never rendered into a topic feed
+        by_topic_glyph[(spec.topic_key, glyph)].append(event_type.type_string)
+
+    collisions = {k: sorted(v) for k, v in by_topic_glyph.items() if len(v) > 1}
+    assert not collisions, (
+        "EVENT_TYPE_EMOJI reuses a glyph within a single Telegram topic, so "
+        "an operator scanning that feed cannot tell the events apart: "
+        + "; ".join(
+            f"{glyph} on {topic} -> {', '.join(names)}"
+            for (topic, glyph), names in sorted(collisions.items())
+        )
+    )
+
+
 def test_event_type_emoji_is_derived_from_the_enum():
     """EVENT_TYPE_EMOJI must stay a view over EventType.icon, not a second
     hand-maintained table. Four drifts (2026-04-27 x2, 2026-05-29, 2026-08-11)
@@ -320,7 +366,7 @@ def test_format_whatsapp_message_has_no_separator():
 
 
 def test_watchdog_burst_renders_with_burst_icon():
-    """WATCHDOG_BURST gets a distinct icon (🌀) so operators can scan for it."""
+    """WATCHDOG_BURST gets a distinct icon (🌊) so operators can scan for it."""
     e = Event.create(
         event_type=EventType.WATCHDOG_BURST,
         source="watchdog",
