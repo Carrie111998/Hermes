@@ -635,6 +635,19 @@ PLATFORM_TOKEN_ENV_NAMES: dict["Platform", str] = {
 }
 
 
+MAX_LOADING_MESSAGES = 10
+
+
+def _validate_loading_messages(value: Any) -> Optional[List[str]]:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_LOADING_MESSAGES:
+        raise ValueError("loading_messages must contain between 1 and 10 strings")
+    if any(not isinstance(item, str) or not item.strip() for item in value):
+        raise ValueError("loading_messages entries must be non-empty strings")
+    return [item.strip() for item in value]
+
+
 @dataclass
 class PlatformConfig:
     """Configuration for a single messaging platform."""
@@ -674,6 +687,8 @@ class PlatformConfig:
     # Telegram, Matrix, …) ignore it.
     typing_status_text: Optional[str] = None
 
+    loading_messages: Optional[List[str]] = None
+
     # Per-channel model/provider/system_prompt overrides (channel_id -> ChannelOverride)
     channel_overrides: Dict[str, ChannelOverride] = field(default_factory=dict)
 
@@ -690,6 +705,8 @@ class PlatformConfig:
         }
         if self.typing_status_text is not None:
             result["typing_status_text"] = self.typing_status_text
+        if self.loading_messages is not None:
+            result["loading_messages"] = self.loading_messages
         if self.token:
             result["token"] = self.token
         if self.api_key:
@@ -731,6 +748,11 @@ class PlatformConfig:
         if _typing_text is None:
             _typing_text = extra.get("typing_status_text")
 
+        _loading_messages = data.get("loading_messages")
+        if _loading_messages is None:
+            _loading_messages = extra.get("loading_messages")
+        _loading_messages = _validate_loading_messages(_loading_messages)
+
         channel_overrides: Dict[str, ChannelOverride] = {}
         raw_overrides = data.get("channel_overrides") or {}
         if isinstance(raw_overrides, dict):
@@ -747,6 +769,7 @@ class PlatformConfig:
             gateway_restart_notification=_coerce_bool(_grn, True),
             typing_indicator=_coerce_bool(_typing, True),
             typing_status_text=_typing_text,
+            loading_messages=_loading_messages,
             channel_overrides=channel_overrides,
             extra=extra,
         )
@@ -1668,6 +1691,8 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["typing_indicator"] = platform_cfg["typing_indicator"]
                 if "typing_status_text" in platform_cfg:
                     bridged["typing_status_text"] = platform_cfg["typing_status_text"]
+                if "loading_messages" in platform_cfg:
+                    bridged["loading_messages"] = platform_cfg["loading_messages"]
                 # Bridge top-level port/host/secret into extra for platforms
                 # whose adapters read these from config.extra (webhook,
                 # msgraph_webhook, api_server).  Without this, YAML like:
