@@ -27,6 +27,29 @@ def _make_adapter() -> WeixinAdapter:
     )
 
 
+async def _drain_text_batches(adapter) -> None:
+    """Await the adapter's pending flush tasks instead of racing a sleep.
+
+    ``_enqueue_text_event`` dispatches from a background task that first sleeps
+    ``_text_batch_delay_seconds``.  The batching tests used to wait for that
+    with ``await asyncio.sleep(0.2)`` against a 0.05s delay -- a margin that
+    looks generous but is not a synchronisation primitive: the task still needs
+    loop turns after its deadline to finish dispatching, so on a loaded box
+    ``dispatched`` is still empty when the assertion runs.  The adapter already
+    tracks the task in ``_pending_text_batch_tasks``, so wait on the work.
+
+    Snapshot the values first: the flush pops its own key in a ``finally``.
+    ``return_exceptions=True`` keeps this a wait, not an assertion -- a
+    superseded chunk's task is cancelled by design.
+
+    Deliberately no fallback when the map is empty -- if nothing was
+    scheduled, the caller's assertion must still fail.
+    """
+    tasks = tuple(adapter._pending_text_batch_tasks.values())
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 class TestWeixinFormatting:
     def test_format_message_preserves_markdown(self):
         adapter = _make_adapter()
@@ -961,7 +984,7 @@ class TestWeixinContentDedup:
             await adapter._process_message({**base_msg, "message_id": "msg-1"})
             await adapter._process_message({**base_msg, "message_id": "msg-2"})
             # Wait out the quiet period so the buffered text batch flushes.
-            await asyncio.sleep(0.2)
+            await _drain_text_batches(adapter)
 
         asyncio.run(_drive())
 
@@ -1056,7 +1079,7 @@ class TestWeixinTextDebounce:
             adapter._enqueue_text_event(_event("two"))
             adapter._enqueue_text_event(_event("three"))
             assert dispatched == []  # nothing flushed during the burst
-            await asyncio.sleep(0.2)
+            await _drain_text_batches(adapter)
 
         asyncio.run(_drive())
         assert dispatched == ["one\ntwo\nthree"]

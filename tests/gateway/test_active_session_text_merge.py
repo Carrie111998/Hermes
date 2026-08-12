@@ -149,7 +149,11 @@ async def test_debounce_buffers_rapid_text_then_flushes_to_pending():
     await adapter.handle_message(_make_event("part three"))
     assert _debounced_event(adapter, session_key).text == "part two\npart three"
 
-    await asyncio.sleep(0.15)
+    # Wait on the debounce timer task, not a 3x multiple of its delay.  Grab
+    # the handle before draining: the flush removes the whole _text_debounce
+    # record, so it is unreachable afterwards.
+    timer_task = adapter._text_debounce[session_key].task
+    await asyncio.gather(timer_task, return_exceptions=True)
 
     assert session_key not in adapter._text_debounce
     assert adapter._pending_messages[session_key].text == "part two\npart three"
@@ -182,7 +186,9 @@ async def test_debounce_resets_timer_on_new_arrival():
     assert task3 is not None
     assert task3 is not task2
 
-    await asyncio.sleep(0.2)
+    # task3 is the live timer -- await it rather than a 2x multiple of the
+    # 0.1s debounce delay.
+    await asyncio.gather(task3, return_exceptions=True)
     assert session_key not in adapter._text_debounce
     assert adapter._pending_messages[session_key].text == "one\ntwo\nthree"
 
@@ -235,8 +241,10 @@ async def test_force_flush_cancels_timer_without_duplicate_processing():
     assert session_key not in adapter._text_debounce
     assert adapter._pending_messages[session_key].text == "queued once"
 
-    await asyncio.sleep(0.3)
+    # The force-flush cancels the timer; settle it by awaiting rather than by
+    # outlasting the 0.2s debounce delay with a 0.3s sleep.
     assert timer_task is not None
+    await asyncio.gather(timer_task, return_exceptions=True)
     assert timer_task.cancelled() or timer_task.done()
     assert adapter._pending_messages[session_key].text == "queued once"
 
