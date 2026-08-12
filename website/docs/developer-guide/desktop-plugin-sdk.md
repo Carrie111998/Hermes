@@ -405,17 +405,17 @@ Rich presentation + activation (extends the original `ctx.os` door):
 
 ```ts
 ctx.os.notify({
-  title: 'Task ready for review',
-  body: 'Landing page copy',
+  title: 'New match found',
+  body: 'Someone matched your signal',
   icon: '/abs/path/to/icon.png', // Electron Notification icon
   // Body click → focus Hermes + navigate. Same vocabulary as OS deep links:
-  activate: '/kanban?task=t1',
-  // or: activate: 'hermes://open/kanban?task=t1'
-  // or: activate: { path: '/kanban', params: { task: 't1' } }
-  onActivate: () => focusLocalState('t1'), // optional renderer callback
+  activate: '/my-page?item=i1',
+  // or: activate: 'hermes://open/my-page?item=i1'
+  // or: activate: { path: '/my-page', params: { item: 'i1' } }
+  onActivate: () => focusLocalState('i1'), // optional renderer callback
   actions: [
-    { id: 'open', label: 'Open', activate: '/kanban?task=t1' },
-    { id: 'snooze', label: 'Snooze', onAction: () => snooze('t1') },
+    { id: 'open', label: 'Open', activate: '/my-page?item=i1' },
+    { id: 'dismiss', label: 'Dismiss', onAction: () => dismiss('i1') },
   ],
 })
 ```

@@ -204,29 +204,29 @@ describe('dispatchPluginNativeNotification', () => {
   })
 
   it('forwards icon, resolved activate path, and action buttons (deeplink-compatible)', () => {
-    dispatchPluginNativeNotification('kanban', {
+    dispatchPluginNativeNotification('my-plugin', {
       actions: [
-        { id: 'open', label: 'Open', activate: { path: '/kanban', params: { task: 't1' } } },
+        { id: 'open', label: 'Open', activate: { path: '/my-page', params: { item: 'i1' } } },
         { id: 'snooze', label: 'Snooze', onAction: () => undefined }
       ],
-      activate: 'hermes://open/kanban?task=t1',
+      activate: 'hermes://open/my-page?item=i1',
       body: 'Ready',
-      icon: '/tmp/kanban.png',
-      title: 'Task'
+      icon: '/tmp/my-plugin.png',
+      title: 'Update'
     })
 
     expect(notify).toHaveBeenCalledWith(
       expect.objectContaining({
-        activate: '/kanban?task=t1',
+        activate: '/my-page?item=i1',
         actions: [
-          { activate: '/kanban?task=t1', id: 'open', text: 'Open' },
+          { activate: '/my-page?item=i1', id: 'open', text: 'Open' },
           { activate: undefined, id: 'snooze', text: 'Snooze' }
         ],
-        icon: '/tmp/kanban.png',
+        icon: '/tmp/my-plugin.png',
         kind: 'plugin',
-        notifyId: expect.stringMatching(/^kanban:/),
-        tag: 'kanban',
-        title: 'Task'
+        notifyId: expect.stringMatching(/^my-plugin:/),
+        tag: 'my-plugin',
+        title: 'Update'
       })
     )
   })
@@ -235,12 +235,12 @@ describe('dispatchPluginNativeNotification', () => {
     const onActivate = vi.fn()
     const onAction = vi.fn()
 
-    // Distinct plugin id — throttle is per tag, and the previous case used kanban.
+    // Distinct plugin id — throttle is per tag, and the previous case used my-plugin.
     dispatchPluginNativeNotification('handlers-plugin', {
-      activate: '/kanban',
+      activate: '/my-page',
       onActivate,
       actions: [{ id: 'snooze', label: 'Snooze', onAction }],
-      title: 'Task'
+      title: 'Update'
     })
 
     const payload = notify.mock.calls[0]?.[0] as { notifyId?: string }

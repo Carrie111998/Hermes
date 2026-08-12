@@ -76,8 +76,8 @@ The ONLY import surface is `@hermes/plugin-sdk` (plus `react` /
   posts a native OS notification. Fires only while the user is away from Hermes
   (use `host.notify` for the in-app toast); gated by Settings ▸ Notifications ▸
   "Plugin notifications" and throttled per plugin — reserve it for genuinely
-  notable events. `activate` accepts a hash path (`/kanban?task=x`),
-  `hermes://open/kanban?task=x`, or `{ path, params }` — same resolver as OS
+  notable events. `activate` accepts a hash path (`/my-page?item=x`),
+  `hermes://open/my-page?item=x`, or `{ path, params }` — same resolver as OS
   deep links. Action buttons may set their own `activate` or an `onAction`
   callback (renderer-only; only the action id crosses IPC).
   `ctx.os.openExternal(url)`, `ctx.os.revealPath(path)`, and

@@ -481,8 +481,8 @@ describe('useDesktopIntegrations', () => {
       } as unknown as Window['hermesDesktop']
 
       render({ profileReady: true, sessions: [] })
-      activate?.({ activate: '/kanban?task=t1' })
-      expect(navigate).toHaveBeenCalledWith('/kanban?task=t1')
+      activate?.({ activate: '/my-page?item=i1' })
+      expect(navigate).toHaveBeenCalledWith('/my-page?item=i1')
     })
 
     it('navigates hermes://open/… deep links through the same path vocabulary', () => {
@@ -498,8 +498,8 @@ describe('useDesktopIntegrations', () => {
       } as unknown as Window['hermesDesktop']
 
       render({ profileReady: true, sessions: [] })
-      deepLink?.({ kind: 'open', name: 'kanban', params: { task: 't1' } })
-      expect(navigate).toHaveBeenCalledWith('/kanban?task=t1')
+      deepLink?.({ kind: 'open', name: 'my-page', params: { item: 'i1' } })
+      expect(navigate).toHaveBeenCalledWith('/my-page?item=i1')
     })
   })
 })

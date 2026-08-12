@@ -46,7 +46,7 @@ function isSafeAppPath(path: string): boolean {
   return true
 }
 
-/** Normalize a string target to a hash-router path (`/kanban?task=x`) or null. */
+/** Normalize a string target to a hash-router path (`/my-page?item=x`) or null. */
 export function normalizeHermesOpenString(raw: string): string | null {
   const trimmed = raw.trim()
 

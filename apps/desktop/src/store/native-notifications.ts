@@ -235,8 +235,8 @@ export interface PluginNativeNotificationInput {
   /** Absolute filesystem path for the notification icon. */
   icon?: string
   /**
-   * Where body-click should land. Accepts a hash path (`/kanban?task=x`), a
-   * `hermes://open/kanban?task=x` deep link, or `{ path, params }` — all resolve
+   * Where body-click should land. Accepts a hash path (`/my-page?item=x`), a
+   * `hermes://open/my-page?item=x` deep link, or `{ path, params }` — all resolve
    * through the same helper as OS deep links.
    */
   activate?: HermesOpenTarget
