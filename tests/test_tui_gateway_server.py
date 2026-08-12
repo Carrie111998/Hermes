@@ -12583,6 +12583,7 @@ def test_session_active_list_reports_live_sessions(monkeypatch):
         "last_active": 20.0,
         "message_count": 1,
         "model": "model-a",
+        "provider": "",
         "preview": "find docs",
         "session_key": "key-a",
         "started_at": 10.0,
@@ -12642,6 +12643,73 @@ def test_session_active_list_excludes_finalized_sessions(monkeypatch):
 
     session_rows = resp["result"]["sessions"]
     assert [row["id"] for row in session_rows] == ["sid-live"]
+
+
+def test_session_active_list_reports_foreign_db_rows(monkeypatch):
+    """Cross-process liveness (#live-indicators): sessions that exist only in
+    state.db (cron runs, CLI one-shots, messaging turns in other processes)
+    never enter ``_sessions``, so ``session.active_list`` must surface
+    recently-active rows flagged ``foreign`` for clients to paint from the
+    same poll. Rows outside the 300s recency window are not reported."""
+
+    class _DB:
+        def get_session_title(self, key):
+            return ""
+
+        def list_sessions_rich(self, **kwargs):
+            now = time.time()
+            return [
+                {
+                    "id": "cron_abc_20260812",
+                    "source": "cron",
+                    "model": "m",
+                    "title": "Nightly job",
+                    "started_at": now - 100,
+                    "last_active": now - 10,
+                    "last_activity_description": "executing tool",
+                    "message_count": 4,
+                    "ended_at": None,
+                },
+                {
+                    "id": "old_cli_session",
+                    "source": "cli",
+                    "model": "m",
+                    "title": "Stale",
+                    "started_at": now - 4000,
+                    "last_active": now - 4000,
+                    "last_activity_description": "",
+                    "message_count": 9,
+                    "ended_at": None,
+                },
+            ]
+
+    previous_sessions = dict(server._sessions)
+    previous_children = dict(server._active_child_runs)
+    server._sessions.clear()
+    server._active_child_runs.clear()
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.active_list",
+                "params": {},
+            }
+        )
+    finally:
+        server._sessions.clear()
+        server._sessions.update(previous_sessions)
+        server._active_child_runs.clear()
+        server._active_child_runs.update(previous_children)
+
+    rows = {row["id"]: row for row in resp["result"]["sessions"]}
+    foreign = rows["cron_abc_20260812"]
+    assert foreign["foreign"] is True
+    assert foreign["status"] == "working"
+    assert foreign["session_key"] == "cron_abc_20260812"
+    assert foreign["description"] == "executing tool"
+    # A row outside the 300s recency window is NOT reported.
+    assert "old_cli_session" not in rows
 
 
 

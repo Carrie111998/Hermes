@@ -37,6 +37,15 @@ class ActivityProvenance(str, Enum):
     AGENT_COMPRESSION = "agent.compression"
     AGENT_COMPRESSION_TIMEOUT = "agent.compression_timeout"
     AGENT_COMPRESSION_COOLDOWN = "agent.compression_cooldown"
+    # Creator surfaces — lets consumers distinguish user-started sessions from
+    # agent/automated ones using only the DB row (#live-indicators).
+    SOURCE_CLI = "cli"
+    SOURCE_CRON = "cron"
+    SOURCE_SUBAGENT = "subagent"
+    SOURCE_GATEWAY = "gateway"
+    SOURCE_ACP = "acp"
+    SOURCE_DESKTOP = "desktop"
+    SOURCE_TUI = "tui"
 
 
 def bound_activity_description(description: Optional[str]) -> str:
@@ -58,6 +67,12 @@ def normalize_activity_provenance(
         return ActivityProvenance(value)
     except ValueError:
         return ActivityProvenance.UNKNOWN
+
+
+def provenance_for_source(source: Optional[str]) -> ActivityProvenance:
+    """Map a session ``source`` label (``desktop``/``cli``/``cron``/…) to a
+    known provenance, falling back to UNKNOWN for unrecognized labels."""
+    return normalize_activity_provenance(source)
 
 
 def reset_session_activity_persist_window(agent: Any) -> None:
