@@ -3844,6 +3844,9 @@ class APIServerAdapter(BasePlatformAdapter):
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
         message_id = f"msg_{uuid.uuid4().hex}"
         run_id = f"run_{uuid.uuid4().hex}"
+        # The SSE writer needs the live agent so a disconnected client can
+        # cooperatively stop provider/tool work running in the executor.
+        agent_ref: list = [None]
         seq = 0
 
         def _event_payload(name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
@@ -3901,6 +3904,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     requested_runtime=runtime_request.get("requested") or {},
                     route_source=runtime_request.get("route_source") or "global",
                     confirmed_runtime_lock=lock_active,
+                    agent_ref=agent_ref,
                     **agent_overrides,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -3976,9 +3980,27 @@ class APIServerAdapter(BasePlatformAdapter):
                     break
                 name, payload = item
                 await response.write(_sse_frame(payload, event=name, ensure_ascii=False))
-        except (asyncio.CancelledError, ConnectionResetError):
+        except (
+            asyncio.CancelledError,
+            ConnectionResetError,
+            ConnectionAbortedError,
+            ConnectionError,
+            BrokenPipeError,
+            OSError,
+        ) as disconnect_exc:
+            agent = agent_ref[0]
+            if agent is not None:
+                try:
+                    request_hard_interrupt(agent, "Session SSE client disconnected")
+                except Exception:
+                    logger.debug(
+                        "[api_server] failed to interrupt disconnected session agent",
+                        exc_info=True,
+                    )
+                _reap_disconnected_agent_processes(agent)
             task.cancel()
-            raise
+            if isinstance(disconnect_exc, asyncio.CancelledError):
+                raise
         except Exception as exc:
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
