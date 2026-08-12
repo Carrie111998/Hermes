@@ -1,16 +1,31 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { $narrowViewport, $registryVersion, register, registerPaneCloser, removeTreePane, revealTreePane } = vi.hoisted(() => ({
+const {
+  $narrowViewport,
+  $registryVersion,
+  register,
+  registerPaneCloser,
+  removeTreePane,
+  revealTreePane,
+  setPaneCollapsed
+} = vi.hoisted(() => ({
   $narrowViewport: { get: () => false, listen: () => () => undefined },
   $registryVersion: { get: () => 0, listen: () => () => undefined, subscribe: () => () => undefined },
   register: vi.fn(),
   registerPaneCloser: vi.fn(),
   removeTreePane: vi.fn(),
-  revealTreePane: vi.fn()
+  revealTreePane: vi.fn(),
+  setPaneCollapsed: vi.fn()
 }))
 
 vi.mock('@/contrib/registry', () => ({ $registryVersion, registry: { getArea: () => [], register } }))
-vi.mock('@/components/pane-shell/tree/store', () => ({ $narrowViewport, registerPaneCloser, removeTreePane, revealTreePane }))
+vi.mock('@/components/pane-shell/tree/store', () => ({
+  $narrowViewport,
+  registerPaneCloser,
+  removeTreePane,
+  revealTreePane,
+  setPaneCollapsed
+}))
 
 import { type ExcalidrawDocumentIdentity, excalidrawPaneId } from './identity'
 import { $excalidrawDocuments, handleChangedDocument, openDrawing, requestDrawingClose, resetExcalidrawDocumentsForTest, restoreExcalidrawDocuments, setDrawingController } from './store'
@@ -28,6 +43,7 @@ describe('Excalidraw drawing panes', () => {
     revealTreePane.mockReset()
     registerPaneCloser.mockReset()
     removeTreePane.mockReset()
+    setPaneCollapsed.mockReset()
     resetExcalidrawDocumentsForTest()
   })
 
@@ -42,7 +58,10 @@ describe('Excalidraw drawing panes', () => {
     expect(register).toHaveBeenCalledWith(
       expect.objectContaining({
         area: 'panes',
-        data: expect.objectContaining({ placement: 'right' }),
+        data: expect.objectContaining({
+          dock: { pane: 'workspace', pos: 'right' },
+          placement: 'right'
+        }),
         id: paneId,
         title: 'design.excalidraw'
       })
@@ -70,18 +89,23 @@ describe('Excalidraw drawing panes', () => {
     ])
   })
 
-  it('removes a closed pane and closer so reopening registers one visible pane', () => {
+  it('minimizes the pane without forgetting its document or registration', () => {
     openDrawing(identity, 'fp1')
+    const paneId = excalidrawPaneId(identity)
     const close = registerPaneCloser.mock.calls[0]?.[1]
+
     close?.()
 
-    expect(removeTreePane).toHaveBeenCalledWith(excalidrawPaneId(identity))
-    expect(registerPaneCloser).toHaveBeenLastCalledWith(excalidrawPaneId(identity))
-    expect($excalidrawDocuments.get()).toEqual([])
+    expect(setPaneCollapsed).toHaveBeenCalledWith(paneId, true)
+    expect(removeTreePane).not.toHaveBeenCalled()
+    expect(register).toHaveBeenCalledTimes(1)
+    expect($excalidrawDocuments.get()).toEqual([
+      expect.objectContaining({ fingerprint: 'fp1', identity, status: 'connected' })
+    ])
 
     openDrawing(identity, 'fp2')
-    expect(register).toHaveBeenCalledTimes(2)
-    expect(revealTreePane).toHaveBeenLastCalledWith(excalidrawPaneId(identity))
+    expect(register).toHaveBeenCalledTimes(1)
+    expect(revealTreePane).toHaveBeenLastCalledWith(paneId)
   })
 
   it('reconciles only the matching full identity', async () => {
@@ -115,20 +139,23 @@ describe('Excalidraw drawing panes', () => {
     expect($excalidrawDocuments.get()).toEqual([])
   })
 
-  it('uses the registered closer confirmation to veto or discard unresolved work', async () => {
-    const controller = { reconcileExternalChange: vi.fn(), waitForSave: vi.fn(), canCloseCleanly: vi.fn().mockReturnValue(false) }
-    const confirm = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true)
-    vi.stubGlobal('confirm', confirm)
-    openDrawing(identity, 'fp1')
-    setDrawingController(identity, controller)
-    const close = registerPaneCloser.mock.calls.at(-1)?.[1]
+  it('docks the first drawing beside workspace and later drawings into its tab group', () => {
+    const second = { ...identity, path: '/drawings/flow.excalidraw' }
+    const firstPaneId = excalidrawPaneId(identity)
 
-    close?.()
-    await vi.waitFor(() => expect(confirm).toHaveBeenCalledTimes(1))
-    expect($excalidrawDocuments.get()).toHaveLength(1)
-    close?.()
-    await vi.waitFor(() => expect($excalidrawDocuments.get()).toEqual([]))
-    expect(confirm).toHaveBeenCalledTimes(2)
+    openDrawing(identity, 'fp1')
+    openDrawing(second, 'fp2')
+
+    expect(register).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        data: {
+          dock: { pane: firstPaneId, pos: 'center' },
+          placement: 'right'
+        },
+        id: excalidrawPaneId(second)
+      })
+    )
   })
 
   it('recovers a restored remote pane when its runtime reconnects', () => {
