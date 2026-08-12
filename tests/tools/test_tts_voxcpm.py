@@ -17,6 +17,7 @@ under ``~/.hermes/models/VoxCPM2`` (or the path they configure).
 import json
 import os
 import sys
+import types
 import wave
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -78,6 +79,39 @@ def _patch_voxcpm(monkeypatch):
     # Reset call recorders so each test starts clean
     _FakeVoxCPM.last_call_kwargs = None
     _FakeVoxCPM.last_call_count = 0
+
+
+@pytest.fixture(autouse=True)
+def _fake_soundfile(monkeypatch):
+    """Stub the optional `soundfile` dependency so the unit tests run in CI.
+
+    `_generate_voxcpm_tts` does `import soundfile as sf` at runtime and
+    calls `sf.write(path, audio, sample_rate, subtype=...)`. CI does not
+    install soundfile (voxcpm is optional), so without this stub every
+    config-resolution test fails with ModuleNotFoundError. The stub writes
+    a real, wave-module-readable WAV so the output assertions still hold.
+    """
+    import types
+    import wave
+
+    fake_sf = types.ModuleType("soundfile")
+
+    def _fake_write(path, audio, sample_rate, subtype="PCM_16", **kwargs):
+        import numpy as np
+        samples = np.asarray(audio)
+        if samples.dtype != np.int16:
+            # Normalize float audio to int16 so `wave` can write it.
+            scaled = np.clip(samples, -1.0, 1.0)
+            samples = (scaled * 32767).astype(np.int16)
+        with wave.open(str(path), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(sample_rate)
+            wav.writeframes(samples.tobytes())
+
+    fake_sf.write = _fake_write
+    monkeypatch.setitem(sys.modules, "soundfile", fake_sf)
+    yield fake_sf
 
 
 # ---------------------------------------------------------------------------
@@ -289,9 +323,18 @@ def _find_ffmpeg():
 
 
 class TestImportVoxCPM:
-    def test_returns_callable_class(self):
-        # When voxcpm is installed (it is in this test env), _import_voxcpm
-        # returns the actual VoxCPM class which is callable.
+    def test_returns_callable_class(self, monkeypatch):
+        """When voxcpm is importable, _import_voxcpm returns a callable class."""
+        import builtins
+
+        original_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "voxcpm":
+                return types.SimpleNamespace(VoxCPM=_FakeVoxCPM)
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
         cls = _import_voxcpm()
         assert callable(cls)
 
