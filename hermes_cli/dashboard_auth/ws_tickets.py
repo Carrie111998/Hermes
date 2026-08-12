@@ -59,17 +59,23 @@ class TicketInvalid(Exception):
     """Ticket missing, expired, or already consumed."""
 
 
-def mint_ticket(*, user_id: str, provider: str) -> str:
+def mint_ticket(*, user_id: str, provider: str, endpoint: str = "/api/ws") -> str:
     """Generate a one-shot ticket bound to this user identity.
 
     The returned token is base64url, 43 bytes of entropy (32-byte random
     seed). Stash returns the ``info`` dict to the caller on consume so the
     WS handler can carry the identity forward into its session log.
+
+    ``endpoint`` binds the ticket to the WS path it was minted for (default
+    ``/api/ws``); :func:`consume_ticket` rejects the ticket on any other
+    path, so a leaked ticket can't be replayed against console/PTY/events
+    surfaces. (#84749)
     """
     ticket = secrets.token_urlsafe(32)
     info = {
         "user_id": user_id,
         "provider": provider,
+        "endpoint": endpoint,
         "minted_at": int(time.time()),
     }
     with _lock:
@@ -78,12 +84,19 @@ def mint_ticket(*, user_id: str, provider: str) -> str:
     return ticket
 
 
-def consume_ticket(ticket: str) -> Dict[str, Any]:
+def consume_ticket(
+    ticket: str, *, endpoint: Optional[str] = None
+) -> Dict[str, Any]:
     """Validate and consume. Raises :class:`TicketInvalid` on missing/expired/used.
 
     Single-use semantics: a successful consume immediately removes the
     ticket from the store, so a second call with the same value raises
     ``TicketInvalid("unknown ticket: …")``.
+
+    When ``endpoint`` is given and the ticket carries a bound endpoint,
+    mismatches raise ``TicketInvalid`` — a ticket minted for one surface is
+    not accepted on another. Tickets minted before this binding existed
+    (no ``endpoint`` in info) remain accepted for backward compatibility.
     """
     now = int(time.time())
     with _lock:
@@ -96,6 +109,11 @@ def consume_ticket(ticket: str) -> Dict[str, Any]:
         expires_at, info = entry
         if expires_at < now:
             raise TicketInvalid("expired")
+        bound = info.get("endpoint")
+        if endpoint is not None and bound and bound != endpoint:
+            raise TicketInvalid(
+                f"endpoint mismatch (ticket bound to {bound!r}, used on {endpoint!r})"
+            )
         return info
 
 

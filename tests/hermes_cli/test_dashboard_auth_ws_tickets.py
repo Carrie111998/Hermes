@@ -176,3 +176,26 @@ class TestInternalCredential:
         # Consuming the internal credential leaves the ticket intact.
         ws_tickets.consume_internal_credential(cred)
         assert consume_ticket(ticket)["user_id"] == "u1"
+
+
+class TestEndpointBinding:
+    """Regression for #84749: tickets are bound to the WS path they were
+    minted for; a leaked ticket cannot be replayed on another surface."""
+
+    def test_consume_on_bound_endpoint_ok(self):
+        t = ws_tickets.mint_ticket(user_id="u1", provider="basic", endpoint="/api/ws")
+        info = ws_tickets.consume_ticket(t, endpoint="/api/ws")
+        assert info["user_id"] == "u1"
+        assert info["endpoint"] == "/api/ws"
+
+    def test_consume_on_wrong_endpoint_rejected(self):
+        t = ws_tickets.mint_ticket(user_id="u1", provider="basic", endpoint="/api/ws")
+        with pytest.raises(ws_tickets.TicketInvalid):
+            ws_tickets.consume_ticket(t, endpoint="/api/pty")
+
+    def test_consume_without_endpoint_still_ok(self):
+        # Backward compat: consuming without an endpoint arg (or a ticket
+        # minted before binding existed) keeps working.
+        t = ws_tickets.mint_ticket(user_id="u1", provider="basic")
+        info = ws_tickets.consume_ticket(t)
+        assert info["user_id"] == "u1"

@@ -207,11 +207,18 @@ class TestWsAuthOkGated:
 
     def test_consumed_ticket_rejected(self, gated_app):
         ticket = mint_ticket(user_id="u1", provider="stub")
-        ws_one = _fake_ws(query={"ticket": ticket})
-        ws_two = _fake_ws(query={"ticket": ticket})
+        ws_one = _fake_ws(query={"ticket": ticket}, path="/api/ws")
+        ws_two = _fake_ws(query={"ticket": ticket}, path="/api/ws")
         assert web_server._ws_auth_ok(ws_one) is True
         # Single-use — second consumption fails.
         assert web_server._ws_auth_ok(ws_two) is False
+
+    def test_ticket_rejected_on_other_endpoint(self, gated_app):
+        """Regression for #84749: a ticket minted for /api/ws must not be
+        accepted on another surface (console/PTY/events)."""
+        ticket = mint_ticket(user_id="u1", provider="stub")
+        ws = _fake_ws(query={"ticket": ticket}, path="/api/pty")
+        assert web_server._ws_auth_ok(ws) is False
 
 
     def test_legacy_token_rejected_in_gated_mode(self, gated_app):

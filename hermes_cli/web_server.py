@@ -15136,7 +15136,7 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             return "no_credential", "none"
 
         try:
-            consume_ticket(ticket)
+            consume_ticket(ticket, endpoint=ws.url.path)
             return None, "ticket"
         except TicketInvalid as exc:
             audit_log(
