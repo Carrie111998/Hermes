@@ -14,6 +14,14 @@ import { computed } from 'nanostores'
 import { $sessions, lineageAliases } from './session'
 import { $sessionStates } from './session-states'
 
+// Janela de atividade REAL: ~1.5x a cadência do heartbeat de 60s
+// (agent/session_activity.py:29). `is_active` (janela de 300s) sozinho pinta
+// linhas reabertas/órfãs como vivas por até 5 min; um toque RECENTE de
+// last_activity_at prova que um agente está de fato escrevendo agora.
+// Tool calls longas mantêm o toque via descrições "terminal command running
+// (Ns elapsed)" e streams de token.
+export const FOREIGN_LIVE_ACTIVITY_MS = 90_000
+
 export const $foreignLiveSessionIds = computed([$sessions, $sessionStates], (sessions, states) => {
   const owned = new Set<string>()
 
@@ -27,6 +35,11 @@ export const $foreignLiveSessionIds = computed([$sessions, $sessionStates], (ses
 
   for (const session of sessions) {
     if (!session.is_active || owned.has(session.id)) {
+      continue
+    }
+
+    const stamp = Number(session.last_activity_at ?? 0) * 1000
+    if (!Number.isFinite(stamp) || stamp <= 0 || Date.now() - stamp >= FOREIGN_LIVE_ACTIVITY_MS) {
       continue
     }
 

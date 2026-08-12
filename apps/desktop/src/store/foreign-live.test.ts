@@ -9,7 +9,7 @@ const row = (id: string, isActive: boolean) => ({
   id,
   is_active: isActive,
   last_active: Date.now() / 1000,
-  last_activity_at: Date.now() / 1000,
+  last_activity_at: Date.now() / 1000 - 10,
   message_count: 3,
   profile: 'default',
   source: 'cli'
@@ -36,6 +36,38 @@ describe('$foreignLiveSessionIds', () => {
     expect($foreignLiveSessionIds.get()).toContain('s-cli')
     $sessions.set([row('s-cli', false) as never])
     expect($foreignLiveSessionIds.get()).not.toContain('s-cli')
+  })
+
+  it('does NOT claim an is_active row with stale last_activity_at (reopened/ended)', () => {
+    $sessions.set([
+      {
+        id: 's-ended',
+        is_active: true, // ended_at NULL no refresh, mas sem toque real
+        last_active: Date.now() / 1000,
+        last_activity_at: Date.now() / 1000 - 600, // 10 min atrás
+        message_count: 3,
+        profile: 'default',
+        source: 'cli'
+      } as never
+    ])
+    $sessionStates.set({})
+    expect($foreignLiveSessionIds.get()).not.toContain('s-ended')
+  })
+
+  it('claims a row whose last_activity_at is fresh even when is_active is stale-adjacent', () => {
+    $sessions.set([
+      {
+        id: 's-fresh',
+        is_active: true,
+        last_active: Date.now() / 1000,
+        last_activity_at: Date.now() / 1000 - 30, // 30s atrás: turno ativo
+        message_count: 3,
+        profile: 'default',
+        source: 'cron'
+      } as never
+    ])
+    $sessionStates.set({})
+    expect($foreignLiveSessionIds.get()).toContain('s-fresh')
   })
 
   it('paints the working dot through the dot-state pipeline', () => {
