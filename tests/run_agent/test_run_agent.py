@@ -1479,6 +1479,74 @@ class TestFormatToolsForSystemMessage:
 
 
 class TestExecuteToolCalls:
+    def test_terminal_return_direct_yields_to_pending_steer(self, agent):
+        agent.valid_tool_names = {"terminal"}
+        tc = _mock_tool_call(
+            name="terminal",
+            arguments=json.dumps(
+                {
+                    "command": "usage --markdown",
+                    "return_direct": True,
+                }
+            ),
+            call_id="usage-1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+        agent.steer("Actually, show only Codex.")
+
+        with patch(
+            "run_agent.handle_function_call",
+            return_value=json.dumps(
+                {
+                    "output": "| Provider | Weekly |\n| --- | ---: |\n| Codex | 43% |",
+                    "exit_code": 0,
+                    "error": None,
+                }
+            ),
+        ):
+            result = agent._execute_tool_calls(mock_msg, messages, "task-1")
+
+        assert result is None
+        assert "Actually, show only Codex." in messages[-1]["content"]
+
+    def test_terminal_return_direct_is_disabled_for_multi_tool_batches(self, agent):
+        agent.valid_tool_names = {"terminal"}
+        tool_calls = [
+            _mock_tool_call(
+                name="terminal",
+                arguments=json.dumps(
+                    {
+                        "command": f"usage --markdown --section {section}",
+                        "return_direct": True,
+                    }
+                ),
+                call_id=f"usage-{section}",
+            )
+            for section in ("providers", "summary")
+        ]
+        mock_msg = _mock_assistant_msg(content="", tool_calls=tool_calls)
+        messages = []
+
+        with patch(
+            "run_agent.handle_function_call",
+            return_value=json.dumps(
+                {
+                    "output": "formatted output",
+                    "exit_code": 0,
+                    "error": None,
+                }
+            ),
+        ):
+            result = agent._execute_tool_calls(mock_msg, messages, "task-1")
+
+        assert result is None
+        assert len(messages) == 2
+
+
+
+
+
     def test_single_tool_executed(self, agent):
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
@@ -1944,6 +2012,7 @@ class TestConcurrentToolExecution:
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=agent.disabled_toolsets,
                 tool_request_middleware_trace=[],
+                parent_agent=agent,
             )
             assert result == "result"
 
@@ -2711,7 +2780,245 @@ class TestHandleMaxIterations:
         assert tool_ids == ["call_good", "call_bad"]
 
 
+class TestHandleMaxIterationsRequiredDelegationInFlight:
+    """Fix 1 follow-up (adversarial review, HIGH): handle_max_iterations makes
+    its summary call directly against the provider SDK — bypassing
+    interruptible_api_call/interruptible_streaming_api_call entirely — so it
+    needs its own in_flight=True/False touches around the call, or a required
+    child hitting max_iterations gets judged against the tight idle ceiling
+    for a legitimately slow summary call and killed mid-work."""
+
+    def test_survives_past_idle_ceiling_during_summary_call(self, agent):
+        import threading
+
+        from tools import async_delegation as ad
+
+        owner_token = "owner-max-iter"
+        agent._required_delegation_owner_token = owner_token
+        agent.session_id = "parent-max-iter"
+        agent._current_turn_id = "turn-max-iter"
+        agent._cached_system_prompt = "You are helpful."
+
+        call_started = threading.Event()
+        release = threading.Event()
+
+        def _slow_create(**kwargs):
+            call_started.set()
+            assert release.wait(timeout=2)
+            return _mock_response(content="Summary of work done.")
+
+        agent.client.chat.completions.create.side_effect = _slow_create
+
+        # The batch's own runner simulates "this child's conversation loop is
+        # still running" — it must stay blocked for the whole test, otherwise
+        # _finalize_batch terminalizes the record the instant it returns,
+        # before agent._handle_max_iterations (exercised separately below)
+        # ever gets a chance to propagate its own in_flight touches onto the
+        # same child slot.
+        runner_release = threading.Event()
+
+        def _runner():
+            runner_release.wait(timeout=10)
+            return {"results": [{"task_index": 0, "status": "completed"}]}
+
+        dispatch = ad.dispatch_async_delegation_batch(
+            goals=["summary work"],
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model=None,
+            session_key=agent.session_id,
+            parent_session_id=agent.session_id,
+            parent_owner_token=owner_token,
+            parent_turn_id=agent._current_turn_id,
+            runner=_runner,
+            child_ids=["child-max-iter"],
+            required=True,
+            max_async_children=3,
+            no_progress_timeout_seconds=0.02,
+            in_flight_no_progress_timeout_seconds=5.0,
+        )
+        delegation_id = dispatch["delegation_id"]
+        try:
+            agent._required_delegation_id = delegation_id
+            agent._subagent_id = "child-max-iter"
+            ad.note_required_progress(
+                delegation_id,
+                child_id="child-max-iter",
+                current_tool=None,
+                activity="started",
+                meaningful=False,
+                state="running",
+            )
+
+            messages = [{"role": "user", "content": "do stuff"}]
+            result_holder = {}
+
+            def _run():
+                result_holder["result"] = agent._handle_max_iterations(messages, 60)
+
+            t = threading.Thread(target=_run)
+            t.start()
+            assert call_started.wait(timeout=2)
+
+            # Mid-call: the summary dispatch must have marked this child
+            # in_flight. Push last_meaningful_at well past the idle ceiling
+            # but still under the wider in-flight ceiling — the child must
+            # NOT be terminalized (this is exactly the false-positive kill
+            # the review flagged: pre-fix, this call was uninstrumented and
+            # in_flight would still be False, so this same push would have
+            # timed the child out mid-legitimate-work).
+            with ad._records_lock:
+                record = ad._records[delegation_id]
+                child = record["child_supervision"]["child-max-iter"]
+                assert child.get("in_flight_sources")
+                child["last_meaningful_at"] -= 1.0
+            status = ad.required_status(agent, delegation_id)
+            assert status["terminal"] is False
+
+            release.set()
+            t.join(timeout=2)
+
+            assert result_holder["result"] == "Summary of work done."
+            with ad._records_lock:
+                child = ad._records[delegation_id]["child_supervision"]["child-max-iter"]
+                assert not child.get("in_flight_sources")
+        finally:
+            release.set()
+            runner_release.set()
+            ad._reset_for_tests()
+
+
 class TestRunConversation:
+    def test_terminal_return_direct_bypasses_model_rewrite_and_preserves_markdown(
+        self,
+        agent,
+    ):
+        self._setup_agent(agent)
+        agent.platform = "acp"
+        agent.valid_tool_names = {"terminal", "delegate_task"}
+        agent.tools = _make_tool_defs("terminal", "delegate_task")
+        interim_messages = []
+        agent.interim_assistant_callback = (
+            lambda text, **kwargs: interim_messages.append(text)
+        )
+
+        table = (
+            "| Provider | Session | Weekly |\n"
+            "| --- | ---: | ---: |\n"
+            "| Codex | 100% | 43% |\n"
+        )
+        tool_turn = _mock_response(
+            content="I will fetch that now.",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    name="terminal",
+                    arguments=json.dumps(
+                        {
+                            "command": "usage --markdown",
+                            "return_direct": True,
+                        }
+                    ),
+                    call_id="usage-1",
+                )
+            ],
+        )
+        agent.client.chat.completions.create.return_value = tool_turn
+        invoked_hooks = []
+
+        def _invoke_hook(hook_name, **kwargs):
+            invoked_hooks.append(hook_name)
+            if hook_name == "transform_llm_output":
+                return ["flattened by hook"]
+            return []
+
+        with (
+            patch(
+                "run_agent.handle_function_call",
+                return_value=json.dumps(
+                    {
+                        "output": table,
+                        "exit_code": 0,
+                        "error": None,
+                    }
+                ),
+            ),
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_invoke_hook),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("Get me my AI usage")
+
+        assert agent.client.chat.completions.create.call_count == 1
+        assert result["api_calls"] == 1
+        assert result["completed"] is True
+        assert result["turn_exit_reason"] == "direct_tool_response"
+        assert result["final_response"] == table
+        assert result["response_transformed"] is False
+        assert "transform_llm_output" not in invoked_hooks
+        assert interim_messages == []
+        assert result["messages"][-1]["role"] == "assistant"
+        assert result["messages"][-1]["content"] == table
+
+    def test_terminal_return_direct_failure_uses_normal_model_follow_up(
+        self,
+        agent,
+    ):
+        self._setup_agent(agent)
+        agent.platform = "acp"
+        agent.valid_tool_names = {"terminal", "delegate_task"}
+        agent.tools = _make_tool_defs("terminal", "delegate_task")
+        tool_turn = _mock_response(
+            content="Checking now.",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    name="terminal",
+                    arguments=json.dumps(
+                        {
+                            "command": "usage --markdown",
+                            "return_direct": True,
+                        }
+                    ),
+                    call_id="usage-1",
+                )
+            ],
+        )
+        normal_follow_up = _mock_response(
+            content="The usage command failed; no report was returned.",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            tool_turn,
+            normal_follow_up,
+        ]
+
+        with (
+            patch(
+                "run_agent.handle_function_call",
+                return_value=json.dumps(
+                    {
+                        "output": "",
+                        "exit_code": 1,
+                        "error": "usage command failed",
+                    }
+                ),
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("Get me my AI usage")
+
+        assert agent.client.chat.completions.create.call_count == 2
+        assert result["turn_exit_reason"].startswith("text_response")
+        assert (
+            result["final_response"]
+            == "The usage command failed; no report was returned."
+        )
+
     """Tests for the main run_conversation method.
 
     Each test mocks client.chat.completions.create to return controlled

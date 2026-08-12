@@ -249,6 +249,81 @@ def _tool_result_failed(result: Optional[str], tool_name: str | None = None) -> 
     return False
 
 
+def _is_async_background_dispatch(result: Optional[str], tool_name: str | None = None) -> bool:
+    """Return True when ``delegate_task`` merely *dispatched* a background batch.
+
+    ``delegate_task(background=True)`` returns
+    ``{"status": "dispatched", "mode": "background", ...}`` the instant the async
+    unit is accepted — the child agents keep running and their consolidated
+    result re-enters the conversation later as its own out-of-turn frame (see
+    ``server._notify_background_completion``). Reporting the dispatch tool_call as
+    ``completed`` here made ACP clients show every subagent as Done ~1s after
+    dispatch. Keep the frame ``in_progress`` so completion is driven by the
+    re-entry frames, not the dispatch ack.
+
+    The pool-at-capacity and synchronous paths in ``delegate_tool`` return the
+    real aggregated results (not ``status="dispatched"``), so they stay
+    ``completed`` — this predicate matches only the accepted-async case.
+    """
+    return _async_background_delegation_id(result, tool_name) is not None
+
+
+def _async_background_delegation_id(
+    result: Optional[str], tool_name: str | None = None
+) -> Optional[str]:
+    """Return the delegation id from an accepted background dispatch ack."""
+    if tool_name != "delegate_task":
+        return None
+    data = _json_loads_maybe(result)
+    if not isinstance(data, dict):
+        return None
+    accepted = (
+        str(data.get("status") or "").strip().lower() == "dispatched"
+        and str(data.get("mode") or "").strip().lower() == "background"
+    )
+    delegation_id = str(data.get("delegation_id") or "").strip()
+    return delegation_id if accepted and delegation_id else None
+
+
+def build_async_background_completion(
+    tool_call_id: str, event: Dict[str, Any], formatted_result: str
+) -> ToolCallProgress:
+    """Close the original dispatch card with its aggregated child result."""
+    status_raw = str(event.get("status") or "completed").strip().lower()
+    ok = status_raw in {"completed", "complete", "success", "done", ""}
+    return acp.update_tool_call(
+        tool_call_id,
+        kind="execute",
+        status="completed" if ok else "failed",
+        content=[_text(formatted_result)] if formatted_result else None,
+    )
+
+
+def flush_async_background_dispatches(
+    delegation_tool_calls: Dict[str, str],
+    missing_result_ids: set[str],
+) -> List[ToolCallProgress]:
+    """Terminalize every dispatch card that remains open at turn end."""
+    updates = []
+    for delegation_id, tool_call_id in list(delegation_tool_calls.items()):
+        missing = delegation_id in missing_result_ids
+        text = (
+            "subagent result not received"
+            if missing
+            else "Background delegation detached; result will arrive in a later turn."
+        )
+        updates.append(
+            acp.update_tool_call(
+                tool_call_id,
+                kind="execute",
+                status="failed" if missing else "completed",
+                content=[_text(text)],
+            )
+        )
+        delegation_tool_calls.pop(delegation_id, None)
+    return updates
+
+
 def _truncate_text(text: str, limit: int = 5000) -> str:
     if len(text) <= limit:
         return text
@@ -1041,6 +1116,44 @@ def _build_tool_complete_content(
 # ---------------------------------------------------------------------------
 
 
+def _delegate_raw_input(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Bounded machine-readable rawInput for a delegate_task dispatch.
+
+    Keeps only goal/role identity (goals truncated) and drops per-task
+    ``context`` bodies so persisted wire frames stay small.
+    """
+    out: Dict[str, Any] = {"tool": "delegate_task"}
+    args: Dict[str, Any] = {}
+    tasks = arguments.get("tasks")
+    if isinstance(tasks, list) and tasks:
+        bounded = []
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            entry: Dict[str, Any] = {}
+            goal = str(task.get("goal") or "").strip()
+            role = str(task.get("role") or "").strip()
+            if goal:
+                entry["goal"] = _truncate_text(goal, limit=400)
+            if role:
+                entry["role"] = role
+            if entry:
+                bounded.append(entry)
+        if bounded:
+            args["tasks"] = bounded
+    else:
+        goal = str(arguments.get("goal") or "").strip()
+        if goal:
+            args["goal"] = _truncate_text(goal, limit=400)
+        role = str(arguments.get("role") or "").strip()
+        if role:
+            args["role"] = role
+    if arguments.get("background"):
+        args["background"] = True
+    out["arguments"] = args
+    return out
+
+
 def build_tool_start(
     tool_call_id: str,
     tool_name: str,
@@ -1251,6 +1364,12 @@ def _build_tool_start(
             content = [_text("Delegating task" + (f":\n{_truncate_text(goal, limit=800)}" if goal else ""))]
         return acp.start_tool_call(
             tool_call_id, title, kind=kind, content=content, locations=locations,
+            # Machine-readable identity + bounded structure for ACP clients
+            # (Switchboard classifies subagent dispatches off rawInput.tool and
+            # builds per-child cards from goal/role/tasks). Deliberately omits
+            # `context` bodies — they can be large and the wire frame is
+            # persisted verbatim by clients.
+            raw_input=_delegate_raw_input(arguments),
         )
 
     if tool_name == "session_search":
@@ -1322,10 +1441,16 @@ def build_tool_complete(
             function_args=function_args,
             snapshot=snapshot,
         )
+    if _is_async_background_dispatch(result, tool_name):
+        status = "in_progress"
+    elif _tool_result_failed(result, tool_name):
+        status = "failed"
+    else:
+        status = "completed"
     return acp.update_tool_call(
         tool_call_id,
         kind=kind,
-        status="failed" if _tool_result_failed(result, tool_name) else "completed",
+        status=status,
         content=content,
         raw_output=None if tool_name in _POLISHED_TOOLS or _is_structured_json_result(result) else result,
     )

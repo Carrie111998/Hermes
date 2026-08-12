@@ -67,6 +67,23 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
+def _hook_timeout_s() -> float:
+    """Per-callback timeout (seconds) for the response-gating finalize hooks.
+
+    These hooks (``transform_llm_output`` / ``post_llm_call`` / ``on_session_end``)
+    run on the synchronous ``finalize_turn`` tail, which gates the ACP
+    ``session/prompt`` response the gateway awaits. An unbounded blocking
+    callback there freezes the turn until the gateway's 300s stall watchdog
+    force-fails it. Bounding each callback well under that (default 30s) lets the
+    turn deliver its response and its ``stopReason`` normally. Tunable via
+    ``HERMES_HOOK_TIMEOUT_S``; ``<= 0`` restores the prior unbounded behavior.
+    """
+    try:
+        return float(os.environ.get("HERMES_HOOK_TIMEOUT_S", "30"))
+    except (TypeError, ValueError):
+        return 30.0
+
+
 def finalize_turn(
     agent,
     *,
@@ -91,6 +108,37 @@ def finalize_turn(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
+
+    required_gate_blocked = bool(
+        getattr(agent, "_required_observation_failed", False)
+    )
+    if not required_gate_blocked:
+        try:
+            required_gate_blocked = bool(
+                agent._has_unconsumed_required_delegations()
+            )
+        except Exception:
+            if str(getattr(agent, "platform", "") or "").lower() == "acp":
+                required_gate_blocked = True
+                logger.exception(
+                    "Required delegation final gate check failed"
+                )
+    if required_gate_blocked:
+        # This is not a normal assistant response. Keep every visible output
+        # hook closed and return a structured failure; the next ACP turn
+        # abandons the old owner only after this result has been surfaced.
+        final_response = None
+        failed = True
+        _pending_verification_response = None
+        _pending_verification_response_previewed = False
+        _turn_exit_reason = "required_delegation_observation_failed"
+        try:
+            agent._finish_acp_provisional_stream(discard=True)
+        except Exception:
+            logger.debug(
+                "Required final-gate provisional cleanup failed",
+                exc_info=True,
+            )
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -480,7 +528,11 @@ def finalize_turn(
     # Gate: only applied when a real text response exists for this
     # turn and the user didn't interrupt.  Empty/interrupted turns
     # already have other surface text that shouldn't be augmented.
-    if final_response and not interrupted:
+    if (
+        final_response
+        and not interrupted
+        and _turn_exit_reason != "direct_tool_response"
+    ):
         try:
             _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
             if _failed and agent._file_mutation_verifier_enabled():
@@ -506,7 +558,11 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted:
+    if (
+        not interrupted
+        and not required_gate_blocked
+        and _turn_exit_reason != "direct_tool_response"
+    ):
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
@@ -555,11 +611,16 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    if (
+        final_response
+        and not interrupted
+        and _turn_exit_reason != "direct_tool_response"
+    ):
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
                 "transform_llm_output",
+                _timeout_s=_hook_timeout_s(),
                 response_text=final_response,
                 session_id=agent.session_id or "",
                 model=agent.model,
@@ -583,6 +644,7 @@ def finalize_turn(
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _invoke_hook(
                 "post_llm_call",
+                _timeout_s=_hook_timeout_s(),
                 session_id=agent.session_id,
                 task_id=effective_task_id,
                 turn_id=turn_id,
@@ -688,6 +750,9 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if required_gate_blocked:
+        result["error"] = "required_delegation_observation_failed"
+        result["required_delegation_pending"] = True
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in
@@ -779,6 +844,7 @@ def finalize_turn(
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         _invoke_hook(
             "on_session_end",
+            _timeout_s=_hook_timeout_s(),
             session_id=agent.session_id,
             task_id=effective_task_id,
             turn_id=turn_id,

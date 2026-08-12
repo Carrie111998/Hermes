@@ -739,8 +739,18 @@ def run_codex_app_server_turn(
         # users see no live tool-progress or interim commentary while
         # codex_app_server is running — only the final answer (#33200).
         # Supersedes the narrower item/started-only bridge from #38835.
+        reasoning_effort = None
+        reasoning_config = getattr(agent, "reasoning_config", None)
+        if (
+            isinstance(reasoning_config, dict)
+            and reasoning_config.get("enabled") is not False
+        ):
+            reasoning_effort = str(reasoning_config.get("effort") or "").strip() or None
+
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            model=str(getattr(agent, "model", "") or "").strip() or None,
+            reasoning_effort=reasoning_effort,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -1039,6 +1049,8 @@ def _consume_codex_event_stream(
     on_text_delta=None,
     on_reasoning_delta=None,
     on_commentary_message=None,
+    on_tool_start=None,
+    on_tool_delta=None,
     on_first_delta=None,
     on_event=None,
     interrupt_check=None,
@@ -1075,6 +1087,10 @@ def _consume_codex_event_stream(
       is supplied, commentary also uses this legacy fallback.
     * ``on_commentary_message(str)`` — fires once per completed
       ``phase=commentary`` message, before any following tool item executes.
+    * ``on_tool_start(str)`` — fires when a function-call output item names
+      the tool being generated.
+    * ``on_tool_delta(str)`` — fires for every nonempty
+      ``response.function_call_arguments.delta`` payload.
     * ``on_first_delta()`` — one-shot, fires on the first text delta only.
     * ``on_event(event)`` — fires for every event before any other processing.
       Used for watchdog activity, debug logging, anything wire-shape-agnostic.
@@ -1140,6 +1156,15 @@ def _consume_codex_event_stream(
                 active_message_phase = None
             if "function_call" in str(item_type):
                 has_tool_calls = True
+                tool_name = _item_field(item, "name", "")
+                if tool_name and on_tool_start is not None:
+                    try:
+                        on_tool_start(str(tool_name))
+                    except Exception:
+                        logger.debug(
+                            "Codex stream on_tool_start raised",
+                            exc_info=True,
+                        )
             continue
 
         if "output_text.delta" in event_type or event_type == "response.output_text.delta":
@@ -1174,6 +1199,19 @@ def _consume_codex_event_stream(
                             on_text_delta(delta_text)
                         except Exception:
                             logger.debug("Codex stream on_text_delta raised", exc_info=True)
+            continue
+
+        if "function_call_arguments.delta" in event_type:
+            has_tool_calls = True
+            arguments_delta = _event_field(event, "delta", "")
+            if arguments_delta and on_tool_delta is not None:
+                try:
+                    on_tool_delta(str(arguments_delta))
+                except Exception:
+                    logger.debug(
+                        "Codex stream on_tool_delta raised",
+                        exc_info=True,
+                    )
             continue
 
         if "function_call" in event_type:
@@ -1331,10 +1369,23 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     def _on_commentary_message(text: str) -> None:
         agent._fire_streamed_codex_commentary(text)
 
+    def _on_tool_start(name: str) -> None:
+        agent._fire_tool_gen_started(name)
+
+    def _on_tool_delta(_delta: str) -> None:
+        agent._touch_activity(
+            "receiving tool call arguments",
+            meaningful=True,
+        )
+
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.
         agent._codex_stream_last_event_ts = time.time()
-        agent._touch_activity("receiving stream response")
+        # Generic envelopes (including keepalive/in_progress) prove only
+        # transport liveness. Real content callbacks mark semantic progress.
+        agent._touch_activity(
+            "receiving stream response", meaningful=False
+        )
 
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
@@ -1448,6 +1499,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         )
                         else None
                     ),
+                    on_tool_start=_on_tool_start,
+                    on_tool_delta=_on_tool_delta,
                     on_first_delta=on_first_delta,
                     on_event=_on_event,
                     interrupt_check=_interrupt_or_superseded,

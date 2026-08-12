@@ -30,6 +30,7 @@ class FakeClient:
         self.codex_bin = codex_bin
         self.codex_home = codex_home
         self.requests: list[tuple[str, dict]] = []
+        self.request_timeouts: list[tuple[str, float]] = []
         self.notifications_responses: list[dict] = []
         self.responses: list[tuple[Any, dict]] = []
         self.error_responses: list[tuple[Any, int, str]] = []
@@ -47,6 +48,7 @@ class FakeClient:
 
     def request(self, method: str, params: Optional[dict] = None, timeout: float = 30.0):
         self.requests.append((method, params or {}))
+        self.request_timeouts.append((method, timeout))
         if self._request_handler is not None:
             return self._request_handler(method, params or {})
         # Sensible defaults for protocol methods used by the session
@@ -173,6 +175,36 @@ class TestLifecycle:
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
+
+    def test_thread_start_allows_cold_plugin_initialization(self):
+        client = FakeClient()
+        make_session(client).ensure_started()
+
+        timeout = next(value for method, value in client.request_timeouts if method == "thread/start")
+        assert timeout == 30.0
+
+    def test_model_and_reasoning_effort_become_app_server_config_args(self):
+        captured = {}
+        client = FakeClient()
+
+        def client_factory(**kwargs):
+            captured.update(kwargs)
+            return client
+
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            model="gpt-5.6-terra",
+            reasoning_effort="ultra",
+            client_factory=client_factory,
+        )
+        session.ensure_started()
+
+        assert captured["extra_args"] == [
+            "-c",
+            "model=gpt-5.6-terra",
+            "-c",
+            "model_reasoning_effort=ultra",
+        ]
 
     def test_close_idempotent(self):
         client = FakeClient()
@@ -505,6 +537,85 @@ class TestCompactThread:
 # ---- approval bridge ----
 
 class TestServerRequestRouting:
+    def test_approval_drain_ignores_foreign_child_completion(self):
+        """Child frames queued beside an approval request must be filtered
+        before display callbacks, projection, or final-text mutation."""
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="approval-foreign-child",
+            command="pwd",
+            cwd="/tmp",
+        )
+        client.queue_notification(
+            "item/completed",
+            threadId="thread-child-001",
+            turnId="turn-child-001",
+            item={
+                "type": "agentMessage",
+                "id": "child-message",
+                "text": "STALE CHILD APPROVAL ANSWER",
+            },
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-child-001",
+            turn={
+                "id": "turn-child-001",
+                "status": "completed",
+                "error": None,
+            },
+        )
+
+        events: list[dict] = []
+
+        def approve_and_release_parent(
+            command,
+            description,
+            *,
+            allow_permanent=True,
+        ):
+            client.queue_notification(
+                "item/completed",
+                threadId="thread-fake-001",
+                turnId="turn-fake-001",
+                item={
+                    "type": "agentMessage",
+                    "id": "parent-message",
+                    "text": "CURRENT PARENT APPROVAL ANSWER",
+                },
+            )
+            client.queue_notification(
+                "turn/completed",
+                threadId="thread-fake-001",
+                turn={
+                    "id": "turn-fake-001",
+                    "status": "completed",
+                    "error": None,
+                },
+            )
+            return "once"
+
+        result = make_session(
+            client,
+            approval_callback=approve_and_release_parent,
+            on_event=events.append,
+        ).run_turn("delegate then approve", turn_timeout=2.0)
+
+        assert result.final_text == "CURRENT PARENT APPROVAL ANSWER"
+        assert result.projected_messages == [
+            {
+                "role": "assistant",
+                "content": "CURRENT PARENT APPROVAL ANSWER",
+            }
+        ]
+        assert not any(
+            (event.get("params") or {}).get("threadId")
+            == "thread-child-001"
+            for event in events
+        )
+        assert client._notifications == []
+
 
 
 
@@ -729,7 +840,15 @@ class TestSessionRetirement:
             msg["role"] == "assistant" and msg.get("content") == "done"
             for msg in r.projected_messages
         )
-        assert not any(method == "turn/interrupt" for method, _ in client.requests)
+        # The recovery is graceful for the caller (not interrupted, no
+        # error), but the abandoned server-side turn IS interrupted so it
+        # stops emitting straggler notifications into the shared queue
+        # (2026-07-26 stale-echo incident).
+        assert any(
+            method == "turn/interrupt"
+            and params.get("turnId") == "turn-fake-001"
+            for method, params in client.requests
+        )
 
 
     def test_post_tool_watchdog_uses_monotonic_clock(self):
@@ -798,6 +917,132 @@ class TestSessionRetirement:
         assert r.should_retire is False
         assert r.interrupted is False
 
+    def test_post_tool_watchdog_reset_on_empty_projection_activity(self):
+        """A tool completion followed by a notification that projects to
+        nothing (a reasoning item, the next tool's item/started, an
+        outputDelta) still means codex is alive and must reset the quiet
+        watchdog. Regression: a long second tool or reasoning phase used to
+        trip the watchdog and kill a live turn."""
+        clock = [1000.0]
+
+        class BumpingClient(FakeClient):
+            def take_notification(self, timeout: float = 0.0):
+                note = super().take_notification(timeout)
+                if note is not None and note.get("method") == "item/completed":
+                    item = (note.get("params") or {}).get("item") or {}
+                    if item.get("type") == "reasoning":
+                        # >post_tool_quiet_timeout passes while codex is still
+                        # streaming reasoning, but well under the turn deadline.
+                        clock[0] += 0.5
+                return note
+
+        client = BumpingClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution", "id": "ex1",
+                "command": "echo hi", "cwd": "/tmp",
+                "status": "completed", "aggregatedOutput": "hi",
+                "exitCode": 0, "commandActions": [],
+            },
+            threadId="t", turnId="tu1",
+        )
+        # Empty-projection activity (reasoning) after the tool — still alive.
+        client.queue_notification(
+            "item/completed",
+            item={"type": "reasoning", "id": "r1", "content": ["thinking..."]},
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+        with patch.object(
+            session_mod.time, "monotonic", side_effect=lambda: clock[0]
+        ):
+            r = s.run_turn(
+                "tool then reasoning then done", turn_timeout=30.0,
+                notification_poll_timeout=0.0,
+                post_tool_quiet_timeout=0.15,
+            )
+        assert r.interrupted is False
+        assert r.should_retire is False
+
+    def test_post_tool_watchdog_drains_queued_activity_at_timeout_boundary(self):
+        """A queued liveness event wins over the quiet-timeout boundary.
+
+        Regression: the watchdog checked elapsed time before polling the
+        notification queue, so it could interrupt even though reasoning or
+        another item was already waiting to be consumed.
+        """
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution", "id": "ex1",
+                "command": "echo hi", "cwd": "/tmp",
+                "status": "completed", "aggregatedOutput": "hi",
+                "exitCode": 0, "commandActions": [],
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "reasoning", "id": "r1", "content": ["thinking..."]},
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        # Advance past the quiet timeout exactly as the loop starts its next
+        # iteration. The reasoning event is already queued and must be read
+        # before the watchdog decides the turn is silent.
+        clock_values = iter([1000.0, 1000.0, 1000.0, 1000.2])
+
+        def monotonic():
+            return next(clock_values, 1000.2)
+
+        s = make_session(client)
+        with patch.object(session_mod.time, "monotonic", side_effect=monotonic):
+            r = s.run_turn(
+                "tool then queued reasoning then done",
+                turn_timeout=30.0,
+                notification_poll_timeout=0.0,
+                post_tool_quiet_timeout=0.15,
+            )
+        assert r.interrupted is False
+        assert r.should_retire is False
+        assert not any(
+            method == "turn/interrupt" for (method, _) in client.requests
+        )
+
+    def test_turn_aborted_marker_in_text_is_terminal(self):
+        """If codex emits `<turn_aborted>` in agent text and never sends
+        turn/completed, we still exit promptly instead of burning the
+        deadline."""
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage", "id": "m1",
+                "text": "partial output... <turn_aborted>",
+            },
+            threadId="t", turnId="tu1",
+        )
+        # Deliberately NO turn/completed notification queued.
+        s = make_session(client)
+        r = s.run_turn(
+            "abort mid-turn", turn_timeout=2.0,
+            notification_poll_timeout=0.01,
+        )
+        assert r.interrupted is True
+        assert r.error and "turn_aborted" in r.error
+        # Should have exited fast — not waited for the full 2s deadline.
+        # (Can't measure wall clock reliably in CI; presence of the marker
+        # error string instead of a "timed out" message is the proxy.)
+        assert "timed out" not in r.error
 
 
 
@@ -896,3 +1141,297 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
 
+    def test_multi_string_search(self):
+        """Hint can come from any of the provided strings."""
+        from agent.transports.codex_app_server_session import (
+            _classify_oauth_failure,
+        )
+        hint = _classify_oauth_failure(
+            "rpc returned -32603",
+            "[stderr] token has expired, run codex login",
+        )
+        assert hint is not None
+
+
+# ---- straggler-notification guard (2026-07-26 Switchboard stale-echo) ----
+
+class TestStragglerNotificationGuard:
+    def test_foreign_child_completion_does_not_end_parent_turn(self):
+        """A hosted child thread shares the app-server notification queue,
+        but its answer and completion must not terminate the root turn."""
+        client = FakeClient()
+        client.queue_notification(
+            "item/started",
+            threadId="thread-child-001",
+            turnId="turn-child-001",
+            item={
+                "type": "fileChange",
+                "id": "child-file-change",
+                "changes": [{"path": "/tmp/child-only", "kind": "add"}],
+            },
+        )
+        client.queue_notification(
+            "thread/tokenUsage/updated",
+            threadId="thread-child-001",
+            turnId="turn-child-001",
+            tokenUsage={
+                "last": {
+                    "inputTokens": 999,
+                    "outputTokens": 999,
+                    "totalTokens": 1998,
+                },
+                "total": {
+                    "inputTokens": 999,
+                    "outputTokens": 999,
+                    "totalTokens": 1998,
+                },
+                "modelContextWindow": 200000,
+            },
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage",
+                "id": "child-message",
+                "text": "STALE CHILD ANSWER",
+            },
+            threadId="thread-child-001",
+            turnId="turn-child-001",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-child-001",
+            turn={
+                "id": "turn-child-001",
+                "status": "completed",
+                "error": None,
+            },
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage",
+                "id": "parent-message",
+                "text": "CURRENT PARENT ANSWER",
+            },
+            threadId="thread-fake-001",
+            turnId="turn-fake-001",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={
+                "id": "turn-fake-001",
+                "status": "completed",
+                "error": None,
+            },
+        )
+
+        session = make_session(client)
+        result = session.run_turn("delegate", turn_timeout=2.0)
+
+        assert result.final_text == "CURRENT PARENT ANSWER"
+        assert result.projected_messages == [
+            {"role": "assistant", "content": "CURRENT PARENT ANSWER"}
+        ]
+        assert result.token_usage_last is None
+        assert session._pending_file_changes == {}
+        assert client._notifications == []
+
+    @pytest.mark.parametrize(
+        "note,expected",
+        [
+            (
+                {
+                    "params": {
+                        "item": {
+                            "thread_id": "nested-thread",
+                            "turn_id": "nested-turn",
+                        }
+                    }
+                },
+                ("nested-thread", "nested-turn"),
+            ),
+            (
+                {
+                    "params": {
+                        "turn": {
+                            "threadId": "turn-thread",
+                            "id": "turn-id",
+                        }
+                    }
+                },
+                ("turn-thread", "turn-id"),
+            ),
+        ],
+    )
+    def test_notification_scope_extraction_supports_nested_aliases(
+        self,
+        note,
+        expected,
+    ):
+        assert session_mod._notification_scope_ids(note) == expected
+
+    def test_unscoped_legacy_notifications_still_flow(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage",
+                "id": "legacy-message",
+                "text": "legacy unscoped answer",
+            },
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={
+                "id": "turn-fake-001",
+                "status": "completed",
+                "error": None,
+            },
+        )
+
+        result = make_session(client).run_turn("legacy", turn_timeout=2.0)
+
+        assert result.final_text == "legacy unscoped answer"
+        assert result.error is None
+
+    """Codex keeps emitting notifications for a turn after run_turn()
+    returned (watchdog interrupt, deadline fallback, late flush). They land
+    in the ONE shared notification queue, and without a turn-id guard the
+    NEXT run_turn() consumes them and instantly "completes" the new user
+    prompt with the old turn's text — zero inference, stale answer.
+    """
+
+    @staticmethod
+    def _session_with_turn_ids(client, ids):
+        turn_ids = iter(ids)
+
+        def handler(method, params):
+            if method == "thread/start":
+                return {
+                    "thread": {"id": "thread-fake-001"},
+                    "activePermissionProfile": {"id": "workspace-write"},
+                }
+            if method == "turn/start":
+                return {"turn": {"id": next(turn_ids)}}
+            return {}
+
+        client._request_handler = handler
+        return make_session(client)
+
+    def test_next_turn_ignores_stragglers_from_previous_turn(self):
+        client = FakeClient()
+        s = self._session_with_turn_ids(client, ["turn-A", "turn-B"])
+
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "answer A"},
+            threadId="t", turnId="turn-A",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "turn-A", "status": "completed", "error": None},
+        )
+        r1 = s.run_turn("first", turn_timeout=2.0)
+        assert r1.final_text == "answer A"
+
+        # Stragglers for turn-A queued between turns (the incident shape:
+        # a full agentMessage AND a turn/completed), then the real turn-B
+        # frames behind them.
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m2", "text": "stale echo of A"},
+            threadId="t", turnId="turn-A",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "turn-A", "status": "completed", "error": None},
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m3", "text": "answer B"},
+            threadId="t", turnId="turn-B",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "turn-B", "status": "completed", "error": None},
+        )
+
+        r2 = s.run_turn("second", turn_timeout=2.0)
+        assert r2.final_text == "answer B"
+        assert not any(
+            "stale echo" in str(m.get("content") or "")
+            for m in r2.projected_messages
+        )
+
+    def test_stale_turn_completed_alone_does_not_end_new_turn(self):
+        """A lone straggler turn/completed must not terminate the new turn
+        before its own frames arrive."""
+        client = FakeClient()
+        s = self._session_with_turn_ids(client, ["turn-A", "turn-B"])
+
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "turn-A", "status": "completed", "error": None},
+        )
+        r1 = s.run_turn("first", turn_timeout=2.0)
+        assert r1.turn_id == "turn-A"
+
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "turn-A", "status": "completed", "error": None},
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "real B"},
+            threadId="t", turnId="turn-B",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "turn-B", "status": "completed", "error": None},
+        )
+        r2 = s.run_turn("second", turn_timeout=2.0)
+        assert r2.final_text == "real B"
+        assert r2.error is None
+
+    def test_turn_ids_are_retired_on_every_exit(self):
+        client = FakeClient()
+        s = self._session_with_turn_ids(client, ["turn-A"])
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "turn-A", "status": "completed", "error": None},
+        )
+        s.run_turn("first", turn_timeout=2.0)
+        assert "turn-A" in s._retired_turn_ids
+
+    @pytest.mark.skip(
+        reason=(
+            "Superseded by upstream's _notification_belongs_to_turn scope guard "
+            "(rebase onto origin/main, 2026-08-09). Upstream drops ANY "
+            "notification whose turnId differs from the active turn, including "
+            "drifted/unknown ids; this fork previously dropped only ids on the "
+            "retired list, letting drifted ids through. Upstream's rule subsumes "
+            "the 2026-07-26 stale-echo fix (a straggler from turn A during turn B "
+            "mismatches and is dropped), but reverses this drift tolerance. "
+            "Re-enable only if codex id drift is observed dropping live turns."
+        )
+    )
+    def test_unknown_turn_id_frames_still_flow(self):
+        """Frames whose turn id never matches a retired turn (codex builds
+        where notification ids drift from the turn/start response) must be
+        processed exactly as before the guard existed."""
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "drifting ids"},
+            threadId="t", turnId="tu-drift",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu-drift", "status": "completed", "error": None},
+        )
+        r = make_session(client).run_turn("hi", turn_timeout=2.0)
+        assert r.final_text == "drifting ids"
+        assert r.error is None

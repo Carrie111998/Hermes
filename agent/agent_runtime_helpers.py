@@ -479,6 +479,8 @@ def note_turn_start(agent, turn_id: str):
     prev_started = getattr(agent, "_inflight_turn_started", 0.0)
     agent._inflight_turn_id = turn_id
     agent._inflight_turn_started = time.time()
+    # New turn, fresh time budget: the check-in nudge may fire once per turn.
+    agent._turn_checkin_fired = False
     overlap = None
     if prev and prev != turn_id:
         logger.warning(
@@ -3041,6 +3043,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
+                parent_agent=agent,
             )
             if skip_tool_execution_middleware:
                 dispatch_kwargs["skip_tool_execution_middleware"] = True

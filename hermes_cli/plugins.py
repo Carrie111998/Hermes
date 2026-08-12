@@ -2100,11 +2100,20 @@ class PluginManager:
     # Hook invocation
     # -----------------------------------------------------------------------
 
-    def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
+    def invoke_hook(
+        self, hook_name: str, *, _timeout_s: Optional[float] = None, **kwargs: Any
+    ) -> List[Any]:
         """Call all registered callbacks for *hook_name*.
 
         Each callback is wrapped in its own try/except so a misbehaving
         plugin cannot break the core agent loop.
+
+        ``_timeout_s`` (keyword-only, opt-in) bounds each callback: when set,
+        the callback runs on a daemon worker thread and is abandoned if it does
+        not finish within the timeout. This keeps a blocking observer from
+        freezing the synchronous turn-finalization path. The default
+        (``None``) preserves the prior unbounded behavior, including for
+        ``pre_llm_call`` context injection.
 
         Returns a list of non-``None`` return values from callbacks.
 
@@ -2124,6 +2133,46 @@ class PluginManager:
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
         for cb in callbacks:
+            if _timeout_s and _timeout_s > 0:
+                # Threads cannot be safely killed in CPython. A timed-out
+                # callback is therefore deliberately abandoned, while the
+                # daemon worker cannot keep the process alive.
+                box: Dict[str, Any] = {}
+
+                def _run(_cb=cb, _box=box):
+                    try:
+                        _box["ret"] = _cb(**kwargs)
+                    except Exception as _exc:  # noqa: BLE001 -- log below
+                        _box["exc"] = _exc
+
+                worker = threading.Thread(
+                    target=_run,
+                    name=f"hook-{hook_name}",
+                    daemon=True,
+                )
+                worker.start()
+                worker.join(_timeout_s)
+                if worker.is_alive():
+                    logger.warning(
+                        "Hook '%s' callback %s exceeded %.1fs timeout; "
+                        "abandoning (turn continues)",
+                        hook_name,
+                        getattr(cb, "__name__", repr(cb)),
+                        _timeout_s,
+                    )
+                    continue
+                if "exc" in box:
+                    logger.warning(
+                        "Hook '%s' callback %s raised: %s",
+                        hook_name,
+                        getattr(cb, "__name__", repr(cb)),
+                        box["exc"],
+                    )
+                    continue
+                ret = box.get("ret")
+                if ret is not None:
+                    results.append(ret)
+                continue
             try:
                 ret = cb(**kwargs)
                 if ret is not None:
@@ -2424,12 +2473,20 @@ def get_portable_mcp_server_names_nowait() -> "set[str]":
     return set(manager.get_portable_mcp_servers())
 
 
-def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
-    """Invoke a lifecycle hook on loaded plugins.
+def invoke_hook(
+    hook_name: str, *, _timeout_s: Optional[float] = None, **kwargs: Any
+) -> List[Any]:
+    """Invoke a lifecycle hook on all loaded plugins.
+
+    ``_timeout_s`` (keyword-only, opt-in) bounds each callback — see
+    ``PluginManager.invoke_hook``. Omit it to keep the prior unbounded behavior.
 
     Returns a list of non-``None`` return values from plugin callbacks.
     """
-    return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+    manager = get_plugin_manager()
+    if _timeout_s is None:
+        return manager.invoke_hook(hook_name, **kwargs)
+    return manager.invoke_hook(hook_name, _timeout_s=_timeout_s, **kwargs)
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:

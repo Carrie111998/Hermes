@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from hermes_constants import get_hermes_home
 
+import asyncio
 import copy
 import json
 import logging
@@ -21,9 +22,24 @@ import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from threading import Lock
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+_TRANSCRIPT_CORRECTION_POISON_KEY = "acp_transcript_correction_poisoned"
+
+
+class UnsafeSessionTranscriptError(RuntimeError):
+    """Refuse a session whose rejected assistant candidate remains durable."""
+
+    def __init__(self, session_id: str):
+        super().__init__(
+            "ACP session "
+            f"{session_id} is blocked because its transcript could not be "
+            "safely corrected; do not resume it until the durable history is repaired"
+        )
+        self.session_id = session_id
 
 
 def _translate_acp_cwd(cwd: str) -> str:
@@ -168,8 +184,104 @@ class SessionState:
     is_running: bool = False
     queued_prompts: List[str] = field(default_factory=list)
     runtime_lock: Any = field(default_factory=Lock)
+    turn_terminal_lock: Any = field(default_factory=asyncio.Lock)
+    turn_terminal_winner: str | None = None
     current_prompt_text: str = ""
     interrupted_prompt_text: str = ""
+    transcript_correction_poisoned: bool = False
+    transcript_correction_poison_persisted: bool | None = None
+
+
+class OwnedSessions:
+    """Tracks which ACP session ids THIS process may legitimately serve.
+
+    Every hermes-acp process serving Switchboard can share one on-disk
+    SessionDB (``~/.hermes/state.db``) with sibling processes, each serving
+    an unrelated Switchboard/editor session (see ``get_hermes_home``).
+    Without this gate, ``SessionManager.get_session`` happily restores ANY
+    session id that happens to exist in that shared database — even one
+    live in a DIFFERENT process's connection right now — letting output
+    leak across sessions (#delegation-cross-session-leak, 2026-07-25).
+
+    The first ``session/new`` or ``session/load``/``session/resume`` this
+    process handles establishes its *primary* id (see :meth:`add` and
+    :meth:`check_first_bind`). Every id this process creates afterwards —
+    a fork, or any other in-process session creation — joins the owned set
+    automatically. Every other ACP protocol entry point that takes a
+    client-supplied ``session_id`` must be a member of the set or be
+    refused; see the ``_guard_owned_session`` / ``_guard_first_bind``
+    helpers on ``HermesACPAgent`` for where that refusal happens.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._owned: set[str] = set()
+        self._primary_id: str | None = None
+
+    @property
+    def primary_id(self) -> str | None:
+        with self._lock:
+            return self._primary_id
+
+    def is_owned(self, session_id: str) -> bool:
+        """Return True if *session_id* belongs to this process's owned set."""
+        if not session_id:
+            return False
+        with self._lock:
+            return session_id in self._owned
+
+    def add(self, session_id: str) -> None:
+        """Record *session_id* as owned (in-process creation: new/fork/etc.).
+
+        The first id ever added becomes the process's primary id. This is
+        never refused — the id was minted or explicitly bound by this
+        process itself, so there is nothing foreign to guard against.
+        """
+        if not session_id:
+            return
+        with self._lock:
+            if self._primary_id is None:
+                self._primary_id = session_id
+            self._owned.add(session_id)
+
+    def check_first_bind(self, session_id: str) -> str | None:
+        """Enforce bind-on-load for ``session/load``/``session/resume``.
+
+        Returns ``None`` when *session_id* is allowed — either it is
+        already owned, or the bind is legitimate for this process's
+        topology. Returns a human-readable denial reason otherwise.
+
+        Two topologies exist. A *dedicated* process — spawned by Switchboard
+        for exactly one conversation, marked by ``HERMES_SESSION_CHAT_ID``
+        and/or ``HERMES_EXPECTED_ACP_SESSION_ID`` in its environment — may
+        bind only once: its first ``session/load``/``session/resume`` (or
+        ``session/new``) claims the process, and every later load of a
+        different id is refused. A *generic* multi-session host (Zed, Buzz —
+        one long-lived process serving several independent conversations)
+        has neither marker set; each ``session/load`` of a not-yet-owned id
+        is an additional legitimate bind. Handlers other than load/resume
+        always require prior membership regardless of topology.
+        """
+        if not session_id:
+            return "empty session id"
+        expected = (os.environ.get("HERMES_EXPECTED_ACP_SESSION_ID") or "").strip()
+        dedicated = bool(
+            expected or (os.environ.get("HERMES_SESSION_CHAT_ID") or "").strip()
+        )
+        with self._lock:
+            if session_id in self._owned:
+                return None
+            if self._owned:
+                if dedicated:
+                    return "not owned by this process"
+                self._owned.add(session_id)
+                return None
+            if expected and expected != session_id:
+                return f"does not match spawn-pinned session {expected!r}"
+            if self._primary_id is None:
+                self._primary_id = session_id
+            self._owned.add(session_id)
+            return None
 
 
 class SessionManager:
@@ -193,6 +305,12 @@ class SessionManager:
         self._lock = Lock()
         self._agent_factory = agent_factory
         self._db_instance = db  # None → lazy-init on first use
+        self._owned_sessions = OwnedSessions()
+
+    @property
+    def owned_sessions(self) -> OwnedSessions:
+        """This process's session-ownership gate (see :class:`OwnedSessions`)."""
+        return self._owned_sessions
 
     # ---- public API ---------------------------------------------------------
 
@@ -212,6 +330,7 @@ class SessionManager:
         )
         with self._lock:
             self._sessions[session_id] = state
+        self._owned_sessions.add(session_id)
         _register_task_cwd(session_id, cwd)
         self._persist(state)
         logger.info("Created ACP session %s (cwd=%s)", session_id, cwd)
@@ -226,9 +345,30 @@ class SessionManager:
         with self._lock:
             state = self._sessions.get(session_id)
         if state is not None:
+            self._raise_if_transcript_poisoned(state)
             return state
         # Attempt to restore from database.
         return self._restore(session_id)
+
+    def peek_session(self, session_id: str) -> Optional[SessionState]:
+        """Return *session_id* only if it is already resident in THIS process.
+
+        Unlike :meth:`get_session`, this never falls back to restoring from
+        the (potentially shared, multi-process) SessionDB. Deliberately
+        stricter for callers that must prove **live ownership** of a session
+        before acting on its behalf — e.g. routing a background-delegation
+        completion — where "exists in the database" only means some process,
+        possibly a different one working an unrelated conversation, created
+        that session at some point. It does NOT mean this process is that
+        session's current, legitimate owner. When multiple ACP processes
+        share one SessionDB (e.g. a host that doesn't isolate HERMES_HOME
+        per process), ``get_session`` would silently adopt and mutate a
+        session this process was never asked to load or resume, and any
+        outbound ACP notification would then be sent over the WRONG
+        connection under a foreign session_id (#delegation-cross-session-leak).
+        """
+        with self._lock:
+            return self._sessions.get(session_id)
 
     def remove_session(self, session_id: str) -> bool:
         """Remove a session from memory and database. Returns True if it existed."""
@@ -242,6 +382,15 @@ class SessionManager:
     def fork_session(self, session_id: str, cwd: str = ".") -> Optional[SessionState]:
         """Deep-copy a session's history into a new session."""
         import threading
+
+        from acp_adapter.orchestration import requested_orchestration_mode
+
+        if requested_orchestration_mode() is not None:
+            raise RuntimeError(
+                "ACP session/fork is unavailable for a Switchboard-managed "
+                "orchestration session; a fork requires a distinct gateway "
+                "record and credential"
+            )
 
         cwd = _translate_acp_cwd(cwd)
         original = self.get_session(session_id)  # checks DB too
@@ -264,6 +413,7 @@ class SessionManager:
         )
         with self._lock:
             self._sessions[new_id] = state
+        self._owned_sessions.add(new_id)
         _register_task_cwd(new_id, cwd)
         self._persist(state)
         logger.info("Forked ACP session %s -> %s", session_id, new_id)
@@ -374,7 +524,7 @@ class SessionManager:
             except Exception:
                 logger.debug("Failed to cleanup ACP sessions from DB", exc_info=True)
 
-    def save_session(self, session_id: str) -> None:
+    def save_session(self, session_id: str) -> bool:
         """Persist the current state of a session to the database.
 
         Called by the server after prompt completion, slash commands that
@@ -383,7 +533,28 @@ class SessionManager:
         with self._lock:
             state = self._sessions.get(session_id)
         if state is not None:
-            self._persist(state)
+            return self._persist(state)
+        return False
+
+    def mark_transcript_correction_poisoned(self, state: SessionState) -> bool:
+        """Persist a fail-closed marker without rewriting unsafe messages."""
+        state.transcript_correction_poisoned = True
+        persisted = self._persist(state, persist_history=False)
+        state.transcript_correction_poison_persisted = persisted
+        return persisted
+
+    def clear_transcript_correction_poisoned(self, state: SessionState) -> bool:
+        """Clear the marker only after the caller verifies durable correction."""
+        state.transcript_correction_poisoned = False
+        persisted = self._persist(state, persist_history=False)
+        if not persisted:
+            # The durable row may still be poisoned. Keep the in-memory owner
+            # blocked too rather than claiming the session is safe.
+            state.transcript_correction_poisoned = True
+            state.transcript_correction_poison_persisted = False
+            return False
+        state.transcript_correction_poison_persisted = None
+        return True
 
     # ---- persistence via SessionDB ------------------------------------------
 
@@ -409,7 +580,12 @@ class SessionManager:
             logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
             return None
 
-    def _persist(self, state: SessionState) -> None:
+    def _persist(
+        self,
+        state: SessionState,
+        *,
+        persist_history: bool = True,
+    ) -> bool:
         """Write session state to the database.
 
         Creates the session record if it doesn't exist, then replaces all
@@ -417,7 +593,7 @@ class SessionManager:
         """
         db = self._get_db()
         if db is None:
-            return
+            return True
 
         # Ensure model is a plain string (not a MagicMock or other proxy).
         model_str = str(state.model) if state.model else None
@@ -431,6 +607,8 @@ class SessionManager:
             session_meta["base_url"] = base_url.strip()
         if isinstance(api_mode, str) and api_mode.strip():
             session_meta["api_mode"] = api_mode.strip()
+        if state.transcript_correction_poisoned:
+            session_meta[_TRANSCRIPT_CORRECTION_POISON_KEY] = True
         cwd_json = json.dumps(session_meta)
 
         try:
@@ -441,14 +619,14 @@ class SessionManager:
                     session_id=state.session_id,
                     source="acp",
                     model=model_str,
-                    model_config={"cwd": state.cwd},
+                    model_config=session_meta,
                 )
             else:
                 # Update model_config (contains cwd) if changed.
-                try:
-                    db.update_session_meta(state.session_id, cwd_json, model_str)
-                except Exception:
-                    logger.debug("Failed to update ACP session metadata", exc_info=True)
+                db.update_session_meta(state.session_id, cwd_json, model_str)
+
+            if not persist_history:
+                return True
 
             # When the agent owns persistence to this same SessionDB it has
             # already flushed the live transcript incrementally during
@@ -492,8 +670,89 @@ class SessionManager:
                 db.replace_messages(
                     state.session_id, state.history, active_only=True
                 )
+            return True
         except Exception:
             logger.warning("Failed to persist ACP session %s", state.session_id, exc_info=True)
+            return False
+
+    def _self_heal_poisoned_history(
+        self,
+        *,
+        db: Any,
+        session_id: str,
+        history: List[Dict[str, Any]],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Attempt to redo a stuck correction on a poisoned session at restore time.
+
+        The durable poison marker means "correction may not have completed" —
+        it is a redo flag, not a tombstone. Two shapes reach here:
+
+        1. ``replace_messages`` genuinely succeeded last time and only the
+           subsequent marker CLEAR failed transiently (the round-2 defect
+           this method exists to fix): ``history`` is already the sanitized,
+           safe version. Re-running sanitize is then a true no-op (nothing
+           left to strip — ``_sanitize_required_assistant_candidate`` clears
+           an already-empty ``content``/absent ``api_content``/etc
+           idempotently), re-running ``replace_messages`` rewrites the same
+           safe bytes, and only the clear needs to actually take effect this
+           time.
+        2. The correction never completed at all (a genuine crash-window
+           hit, or a persistently failing correction): ``history`` still
+           carries the tainted candidate. Sanitize strips it for real this
+           time, and the rewrite durably persists the correction.
+
+        In both cases the boundary is "everything after the most recent
+        user message" — the only turn a poisoned session can ever have
+        pending, since a poisoned session can never accept a new user turn
+        (``_raise_if_transcript_poisoned`` / this same poison check refuses
+        before one could ever be appended). Forcing
+        ``_sanitize_failed_turn_history``'s baseline-clamp fallback (passing
+        a ``baseline_count`` past the end of the list) computes exactly that
+        boundary instead of risking sanitizing an unrelated, already-
+        completed earlier turn.
+
+        Returns the (possibly sanitized) history on success, or ``None`` if
+        the redo could not be proven safe — callers must then refuse exactly
+        as before (fail closed, unchanged from the pre-self-heal behavior).
+        """
+        from acp_adapter.server import (
+            _rewrite_agent_active_history,
+            _sanitize_failed_turn_history,
+        )
+
+        safe_history = _sanitize_failed_turn_history(
+            history, baseline_count=len(history) + 1
+        )
+        correction_target = SimpleNamespace(_session_db=db, session_id=session_id)
+        temp_state = SessionState(
+            session_id=session_id,
+            agent=correction_target,
+            transcript_correction_poisoned=True,
+        )
+        try:
+            healed = _rewrite_agent_active_history(
+                correction_target, safe_history, temp_state, self
+            )
+        except Exception:
+            logger.warning(
+                "Poisoned-session self-heal redo raised for ACP session %s",
+                session_id,
+                exc_info=True,
+            )
+            return None
+        if not healed:
+            logger.warning(
+                "Poisoned-session self-heal redo did not complete for ACP "
+                "session %s; refusing resume",
+                session_id,
+            )
+            return None
+        logger.info(
+            "Poisoned ACP session %s self-healed on restore (%d messages)",
+            session_id,
+            len(safe_history),
+        )
+        return safe_history
 
     def _restore(self, session_id: str) -> Optional[SessionState]:
         """Load a session from the database into memory, recreating the AIAgent."""
@@ -516,16 +775,20 @@ class SessionManager:
         if row.get("source") != "acp":
             return None
 
-        # Extract cwd from model_config.
+        # Extract cwd/provider metadata from model_config. Reading this is
+        # safe even for a poisoned session — it is routing/identity data,
+        # not the protected message content the poison marker guards.
         cwd = "."
         requested_provider = row.get("billing_provider")
         restored_base_url = row.get("billing_base_url")
         restored_api_mode = None
+        poisoned = False
         mc = row.get("model_config")
         if mc:
             try:
                 meta = json.loads(mc)
                 if isinstance(meta, dict):
+                    poisoned = bool(meta.get(_TRANSCRIPT_CORRECTION_POISON_KEY))
                     cwd = meta.get("cwd", ".")
                     requested_provider = meta.get("provider") or requested_provider
                     restored_base_url = meta.get("base_url") or restored_base_url
@@ -547,6 +810,17 @@ class SessionManager:
         except Exception:
             logger.warning("Failed to load messages for ACP session %s", session_id, exc_info=True)
             history = []
+
+        if poisoned:
+            # The marker means "correction may not have completed" — redo it
+            # before resuming. Proceed only on full success; otherwise keep
+            # refusing exactly as before self-heal existed.
+            healed_history = self._self_heal_poisoned_history(
+                db=db, session_id=session_id, history=history
+            )
+            if healed_history is None:
+                raise UnsafeSessionTranscriptError(session_id)
+            history = healed_history
 
         try:
             agent = self._make_agent(
@@ -574,6 +848,11 @@ class SessionManager:
         _register_task_cwd(session_id, cwd)
         logger.info("Restored ACP session %s from DB (%d messages)", session_id, len(history))
         return state
+
+    @staticmethod
+    def _raise_if_transcript_poisoned(state: SessionState) -> None:
+        if state.transcript_correction_poisoned:
+            raise UnsafeSessionTranscriptError(state.session_id)
 
     def _delete_persisted(self, session_id: str) -> bool:
         """Delete a session from the database. Returns True if it existed."""
@@ -604,6 +883,7 @@ class SessionManager:
         from run_agent import AIAgent
         from hermes_cli.config import load_config
         from hermes_cli.runtime_provider import resolve_runtime_provider
+        from hermes_constants import parse_reasoning_effort
 
         config = load_config()
         model_cfg = config.get("model")
@@ -615,11 +895,37 @@ class SessionManager:
         elif isinstance(model_cfg, str) and model_cfg.strip():
             default_model = model_cfg.strip()
 
+        from acp_adapter.orchestration import without_reserved_switchboard_mcp
+
         configured_mcp_servers = [
             name
-            for name, cfg in (config.get("mcp_servers") or {}).items()
+            for name, cfg in without_reserved_switchboard_mcp(
+                config.get("mcp_servers")
+            ).items()
             if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
         ]
+        agent_cfg = config.get("agent")
+        configured_reasoning_effort = (
+            str(agent_cfg.get("reasoning_effort") or "")
+            if isinstance(agent_cfg, dict)
+            else ""
+        )
+        session_reasoning_effort = (
+            os.environ.get("HERMES_SESSION_REASONING_EFFORT") or ""
+        ).strip().lower()
+        requested_reasoning_effort = (
+            session_reasoning_effort or configured_reasoning_effort
+        ).strip().lower()
+        reasoning_config = (
+            {"enabled": True, "effort": requested_reasoning_effort}
+            if requested_reasoning_effort in {"max", "ultra"}
+            else parse_reasoning_effort(requested_reasoning_effort)
+        )
+        effective_reasoning_effort = (
+            str(reasoning_config.get("effort") or "").lower()
+            if isinstance(reasoning_config, dict)
+            else ""
+        )
 
         kwargs = {
             "platform": "acp",
@@ -631,14 +937,30 @@ class SessionManager:
             "session_id": session_id,
             "session_db": self._get_db(),
             "model": model or default_model,
+            "reasoning_config": reasoning_config,
         }
+
+        # Internal Switchboard bridge contract: apply the session-scoped
+        # orchestration owner before AIAgent snapshots its tools. Invalid or
+        # incomplete enforcement fails construction rather than silently
+        # exposing Hermes native delegation in Single/Switchboard mode.
+        from acp_adapter.orchestration import apply_orchestration_tool_policy
+
+        apply_orchestration_tool_policy(kwargs)
 
         try:
             runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
+            runtime_provider = runtime.get("provider")
+            runtime_api_mode = api_mode or runtime.get("api_mode")
+            if (
+                effective_reasoning_effort in {"max", "ultra"}
+                and runtime_provider == "openai-codex"
+            ):
+                runtime_api_mode = "codex_app_server"
             kwargs.update(
                 {
-                    "provider": runtime.get("provider"),
-                    "api_mode": api_mode or runtime.get("api_mode"),
+                    "provider": runtime_provider,
+                    "api_mode": runtime_api_mode,
                     "base_url": base_url or runtime.get("base_url"),
                     "api_key": runtime.get("api_key"),
                     "command": runtime.get("command"),

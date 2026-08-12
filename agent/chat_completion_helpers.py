@@ -852,6 +852,29 @@ def direct_api_call(agent, api_kwargs: dict):
 
 
 def interruptible_api_call(agent, api_kwargs: dict):
+    """Non-streaming provider call with a required-delegation in-flight marker.
+
+    The marker is explicit and never inferred from ``meaningful``: a required
+    child silently awaiting this response earns the wider in-flight
+    no-progress ceiling only while it is True, and it is cleared
+    unconditionally so a later idle wait reverts to the tight ceiling.
+    Wrapping (rather than inlining) keeps the upstream implementation below
+    byte-identical, so future rebases of that body stay conflict-free.
+    """
+    agent._touch_activity(
+        "waiting for non-streaming API response",
+        meaningful=False,
+        in_flight=True,
+    )
+    try:
+        return _interruptible_api_call_impl(agent, api_kwargs)
+    finally:
+        agent._touch_activity(
+            "non-streaming API call settled", meaningful=False, in_flight=False,
+        )
+
+
+def _interruptible_api_call_impl(agent, api_kwargs: dict):
     """
     Run the API call in a background thread so the main conversation loop
     can detect interrupts without waiting for the full HTTP round-trip.
@@ -1324,6 +1347,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     if result["response"] is not None:
         _reset_stale_streak(agent)
     return result["response"]
+
 
 
 
@@ -2459,6 +2483,18 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             from agent.portal_tags import nous_portal_tags as _portal_tags
             summary_extra_body["tags"] = _portal_tags()
 
+        # In-flight marker (never inferred from `meaningful`): a
+        # required-delegation child silently awaiting this iteration-limit
+        # summary call earns the wider in-flight no-progress ceiling instead
+        # of the tight idle one. This call bypasses
+        # interruptible_api_call/interruptible_streaming_api_call entirely and
+        # hits the provider SDK directly, so without this marker a slow
+        # reasoning-model summary is judged against the 300s idle ceiling and
+        # kills the child mid-work.
+        agent._touch_activity(
+            "dispatching iteration-limit summary call",
+            meaningful=False, in_flight=True,
+        )
         if agent.api_mode == "codex_responses":
             codex_kwargs = agent._build_api_kwargs(api_messages)
             codex_kwargs.pop("tools", None)
@@ -2609,6 +2645,55 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     summary_kwargs.update(agent._max_tokens_param(agent.max_tokens))
                 if _lm_reasoning_effort is not None:
                     summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
+
+                # Merge the profile's canonical body even when routing is unset:
+                # profiles may always emit required metadata such as Portal tags.
+                provider_preferences = _provider_preferences_for_agent(agent)
+                profile_extra_body = {}
+                try:
+                    from providers import get_provider_profile
+
+                    provider_profile = get_provider_profile(agent.provider)
+                    if provider_profile is not None:
+                        profile_extra_body = provider_profile.build_extra_body(
+                            session_id=getattr(agent, "session_id", None),
+                            provider_preferences=provider_preferences or None,
+                            model=agent.model,
+                            base_url=agent.base_url,
+                            reasoning_config=agent.reasoning_config,
+                        )
+                except Exception:
+                    pass
+
+                if profile_extra_body:
+                    summary_extra_body.update(profile_extra_body)
+                if provider_preferences and "provider" not in profile_extra_body and (
+                    (agent.provider or "").strip().lower() == "openrouter"
+                    or agent._is_openrouter_url()
+                ):
+                    summary_extra_body["provider"] = provider_preferences
+
+                # Pareto Code router plugin — model-gated. Same shape as
+                # the main-loop emission so summary calls on
+                # openrouter/pareto-code respect the user's coding-score floor.
+                if (
+                    agent.model == "openrouter/pareto-code"
+                    and (
+                        (agent.provider or "").strip().lower() == "openrouter"
+                        or agent._is_openrouter_url()
+                    )
+                    and agent.openrouter_min_coding_score is not None
+                    and agent.openrouter_min_coding_score != ""
+                ):
+                    try:
+                        _ps = float(agent.openrouter_min_coding_score)
+                    except (TypeError, ValueError):
+                        _ps = None
+                    if _ps is not None and 0.0 <= _ps <= 1.0:
+                        summary_extra_body["plugins"] = [
+                            {"id": "pareto-router", "min_coding_score": _ps}
+                        ]
+
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
 
@@ -2643,6 +2728,12 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         relay_llm.complete_logical_call(
             summary_api_request_id,
             outcome=summary_call_outcome,
+        )
+        # Cleared unconditionally so a later idle wait (or an exception /
+        # interrupt exit) reverts to the tight idle ceiling.
+        agent._touch_activity(
+            "iteration-limit summary call settled",
+            meaningful=False, in_flight=False,
         )
 
     return final_response
@@ -2730,6 +2821,29 @@ def _build_partial_stream_stub(
 
 
 def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):
+    """Streaming provider call with a required-delegation in-flight marker.
+
+    Explicit and never inferred from ``meaningful``: a required child
+    silently awaiting this response earns the wider in-flight no-progress
+    ceiling only while this is True, and it is cleared unconditionally so a
+    later idle wait reverts to the tight ceiling. Wrapping (rather than
+    inlining) keeps the upstream implementation below byte-identical, so
+    future rebases of that body stay conflict-free.
+    """
+    agent._touch_activity(
+        "dispatching streaming API call", meaningful=False, in_flight=True,
+    )
+    try:
+        return _interruptible_streaming_api_call_impl(
+            agent, api_kwargs, on_first_delta=on_first_delta
+        )
+    finally:
+        agent._touch_activity(
+            "streaming API call settled", meaningful=False, in_flight=False,
+        )
+
+
+def _interruptible_streaming_api_call_impl(agent, api_kwargs: dict, *, on_first_delta=None):
     """Streaming variant of _interruptible_api_call for real-time token delivery.
 
     Handles all three api_modes:

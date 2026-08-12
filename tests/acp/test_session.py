@@ -66,7 +66,13 @@ class TestCreateSession:
         assert fetched is state
 
 
-    def test_make_agent_stamps_session_cwd_for_codex_runtime(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ("session_effort", "configured_effort"),
+        [("ultra", "xhigh"), (None, "ultra")],
+    )
+    def test_make_agent_stamps_session_cwd_for_codex_runtime(
+        self, monkeypatch, session_effort, configured_effort
+    ):
         class FakeAgent:
             model = "fake-model"
 
@@ -79,8 +85,9 @@ class TestCreateSession:
             lambda: {
                 "model": {
                     "default": "fake-model",
-                    "provider": "fake-provider",
+                    "provider": "openai-codex",
                 },
+                "agent": {"reasoning_effort": configured_effort},
                 "mcp_servers": {},
             },
             raising=False,
@@ -90,8 +97,9 @@ class TestCreateSession:
             lambda: {
                 "model": {
                     "default": "fake-model",
-                    "provider": "fake-provider",
+                    "provider": "openai-codex",
                 },
+                "agent": {"reasoning_effort": configured_effort},
                 "mcp_servers": {},
             },
         )
@@ -99,16 +107,26 @@ class TestCreateSession:
             "hermes_cli.runtime_provider.resolve_runtime_provider",
             lambda requested=None: {
                 "provider": requested,
-                "api_mode": "codex_app_server",
+                "api_mode": "codex_responses",
                 "base_url": "https://example.invalid",
                 "api_key": "test-key",
             },
         )
         monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda task_id, cwd: None)
+        if session_effort:
+            monkeypatch.setenv("HERMES_SESSION_REASONING_EFFORT", session_effort)
+        else:
+            monkeypatch.delenv("HERMES_SESSION_REASONING_EFFORT", raising=False)
 
         state = SessionManager(db=None).create_session(cwd="/tmp/project")
 
         assert state.agent.session_cwd == "/tmp/project"
+        assert state.agent.kwargs["reasoning_config"] == {
+            "enabled": True,
+            "effort": "ultra",
+        }
+        assert state.agent.kwargs["provider"] == "openai-codex"
+        assert state.agent.kwargs["api_mode"] == "codex_app_server"
 
 
 

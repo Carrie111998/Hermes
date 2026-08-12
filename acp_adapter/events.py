@@ -10,6 +10,8 @@ thread while the event loop lives on the main thread).
 import asyncio
 import json
 import logging
+import os
+import threading
 from collections import deque
 from typing import Any, Callable, Deque, Dict
 
@@ -17,12 +19,26 @@ import acp
 from acp.schema import AgentPlanUpdate, PlanEntry
 
 from .tools import (
+    _text as _tool_text,
     build_tool_complete,
     build_tool_start,
     make_tool_call_id,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _subagent_updates_enabled() -> bool:
+    """Per-child subagent ACP emission gate (default on).
+
+    Set ``HERMES_ACP_SUBAGENT_UPDATES=0`` to fall back to the legacy
+    behaviour (one opaque delegate_task tool call, no per-child frames).
+    """
+    return os.environ.get("HERMES_ACP_SUBAGENT_UPDATES", "1").strip().lower() not in {
+        "0",
+        "false",
+        "off",
+    }
 
 
 def _json_loads_maybe_prefix(value: str) -> Any:
@@ -90,21 +106,53 @@ def _send_update(
     loop: asyncio.AbstractEventLoop,
     update: Any,
 ) -> None:
-    """Fire-and-forget an ACP session update from a worker thread."""
+    """Send an ACP update without ever blocking the ACP event-loop thread."""
+    update_coro = conn.session_update(session_id, update)
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+
+    if running_loop is loop:
+        # STOP runs on the ACP loop and synchronously interrupts required
+        # children. Their terminal callbacks also land here. Waiting on
+        # run_coroutine_threadsafe(...).result() from that same loop deadlocks
+        # until the 5s timeout for every child. Schedule in-order on the loop
+        # and observe failure asynchronously instead.
+        task = loop.create_task(update_coro)
+
+        def _observe_task(done: asyncio.Task) -> None:
+            try:
+                done.result()
+            except asyncio.CancelledError:
+                logger.debug("ACP update task cancelled")
+            except Exception:
+                logger.debug("Failed to send ACP update", exc_info=True)
+
+        task.add_done_callback(_observe_task)
+        return
+
+    # Worker-thread callbacks must also stay nonblocking. Some lifecycle
+    # paths hold child ordering locks while scheduling an update; waiting for
+    # the ACP loop here can invert that lock against STOP/interrupt delivery.
     from agent.async_utils import safe_schedule_threadsafe
 
     future = safe_schedule_threadsafe(
-        conn.session_update(session_id, update),
+        update_coro,
         loop,
         logger=logger,
         log_message="Failed to send ACP update",
     )
     if future is None:
         return
-    try:
-        future.result(timeout=5)
-    except Exception:
-        logger.debug("Failed to send ACP update", exc_info=True)
+
+    def _observe_future(done) -> None:
+        try:
+            done.result()
+        except Exception:
+            logger.debug("Failed to send ACP update", exc_info=True)
+
+    future.add_done_callback(_observe_future)
 
 
 # ------------------------------------------------------------------
@@ -131,7 +179,190 @@ def make_tool_progress_cb(
     ``reasoning.available``) are silently ignored.
     """
 
+    # Per-child delegate_task subagent calls (subagent_id -> ACP tool call id)
+    # plus the last relayed activity snippet per child, folded into the final
+    # completion frame. Children run on worker threads; per-key dict ops are
+    # safe under the GIL and each child only touches its own key.
+    child_calls: Dict[str, str] = {}
+    child_last_activity: Dict[str, str] = {}
+    child_early_terminals: Dict[str, tuple[str, Dict[str, Any]]] = {}
+    child_lock = threading.Lock()
+
+    def _send_child_terminal(
+        sid: str,
+        tc_id: str,
+        preview: str,
+        kwargs: Dict[str, Any],
+        last_activity: str | None,
+    ) -> None:
+        status_raw = str(kwargs.get("status") or "completed").strip().lower()
+        status = (
+            "completed"
+            if status_raw in {"completed", "complete", "success", "done", ""}
+            else "failed"
+        )
+        parts = []
+        supervision_status = str(
+            kwargs.get("supervision_status") or ""
+        ).strip().lower()
+        if supervision_status:
+            parts.append(
+                json.dumps(
+                    {
+                        "type": "subagent.supervision",
+                        "subagentId": sid,
+                        "supervisionStatus": supervision_status,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        for candidate in (preview, kwargs.get("summary"), last_activity):
+            text_value = str(candidate or "").strip()
+            if text_value and text_value not in parts:
+                parts.append(text_value)
+        update = acp.update_tool_call(
+            tc_id,
+            kind="execute",
+            status=status,
+            content=[_tool_text("\n\n".join(parts))] if parts else None,
+            raw_output=(
+                {
+                    "subagentId": sid,
+                    "supervisionStatus": supervision_status,
+                }
+                if supervision_status
+                else None
+            ),
+        )
+        _send_update(conn, session_id, loop, update)
+
+    def _handle_subagent_event(
+        event_type: str, tool_name: str, preview: str, kwargs: Dict[str, Any]
+    ) -> None:
+        """Translate relayed ``subagent.*`` events into per-child ACP frames.
+
+        delegate_tool relays child lifecycle fully identity-tagged
+        (subagent_id/task_index/goal/...). Emission contract for ACP clients:
+        one ToolCallStart on ``subagent.start``, same-id in-progress heartbeat
+        updates, and one terminal update on ``subagent.complete``. Switchboard
+        preserves same-id ``in_progress`` updates and closes only on terminal
+        status.
+        """
+        if not _subagent_updates_enabled():
+            return
+        sid = kwargs.get("subagent_id")
+        if sid is None:
+            return
+        sid = str(sid)
+
+        if event_type == "subagent.start":
+            goal = str(preview or kwargs.get("goal") or "").strip()
+            title = "subagent"
+            if goal:
+                title += ": " + (goal[:120] + ("…" if len(goal) > 120 else ""))
+            raw_arguments: Dict[str, Any] = {"subagentId": sid}
+            if goal:
+                raw_arguments["goal"] = goal[:400]
+            for key, out_key in (
+                ("task_index", "taskIndex"),
+                ("task_count", "taskCount"),
+                ("model", "model"),
+                ("depth", "depth"),
+            ):
+                value = kwargs.get(key)
+                if value is not None:
+                    raw_arguments[out_key] = value
+            terminal = None
+            with child_lock:
+                if sid in child_calls:
+                    return
+                tc_id = make_tool_call_id()
+                child_calls[sid] = tc_id
+                update = acp.start_tool_call(
+                    tc_id,
+                    title,
+                    kind="execute",
+                    raw_input={"tool": "subagent", "arguments": raw_arguments},
+                )
+                # Preserve wire order against a controller timeout racing this
+                # start: the start is scheduled before a terminal can claim it.
+                _send_update(conn, session_id, loop, update)
+                pending = child_early_terminals.pop(sid, None)
+                if pending is not None:
+                    child_calls.pop(sid, None)
+                    terminal = (
+                        tc_id,
+                        pending[0],
+                        pending[1],
+                        child_last_activity.pop(sid, None),
+                    )
+            if terminal is not None:
+                _send_child_terminal(
+                    sid,
+                    terminal[0],
+                    terminal[1],
+                    terminal[2],
+                    terminal[3],
+                )
+            return
+
+        if event_type == "subagent.heartbeat":
+            heartbeat = {
+                "type": "subagent.heartbeat",
+                "subagentId": sid,
+                "elapsedSeconds": kwargs.get("elapsed_seconds"),
+                "currentTool": kwargs.get("current_tool"),
+                "lastActivity": kwargs.get("last_activity") or preview,
+                "progressGeneration": kwargs.get("progress_generation", 0),
+                "supervisionStatus": kwargs.get(
+                    "supervision_status", "running"
+                ),
+            }
+            with child_lock:
+                tc_id = child_calls.get(sid)
+                if tc_id is None:
+                    return
+                update = acp.update_tool_call(
+                    tc_id,
+                    kind="execute",
+                    status="in_progress",
+                    content=[_tool_text(json.dumps(heartbeat, ensure_ascii=False))],
+                )
+                # Keep an in-progress heartbeat from overtaking a terminal
+                # update claimed concurrently on another worker thread.
+                _send_update(conn, session_id, loop, update)
+            return
+
+        if event_type == "subagent.complete":
+            with child_lock:
+                tc_id = child_calls.pop(sid, None)
+                last_activity = child_last_activity.pop(sid, None)
+                if (
+                    tc_id is None
+                    and kwargs.get("supervision_terminal")
+                    and sid not in child_early_terminals
+                ):
+                    # STOP can win before the worker emits subagent.start.
+                    # Remember the controller terminal so a late start is
+                    # immediately paired and can never strand an open card.
+                    child_early_terminals[sid] = (preview, dict(kwargs))
+            if tc_id is None:
+                return
+            _send_child_terminal(sid, tc_id, preview, kwargs, last_activity)
+            return
+
+        # subagent.tool / subagent.thinking / subagent.text / subagent.progress:
+        # keep the freshest snippet for the completion frame.
+        snippet = str(preview or tool_name or "").strip()
+        if snippet:
+            with child_lock:
+                if sid in child_calls:
+                    child_last_activity[sid] = snippet[:500]
+
     def _tool_progress(event_type: str, name: str = None, preview: str = None, args: Any = None, **kwargs) -> None:
+        if isinstance(event_type, str) and event_type.startswith("subagent."):
+            _handle_subagent_event(event_type, name, preview, kwargs)
+            return
         # Only emit ACP ToolCallStart for tool.started; ignore other event types
         if event_type != "tool.started":
             return
@@ -255,8 +486,56 @@ def make_step_cb(
                             _send_update(conn, session_id, loop, plan_update)
                     if not queue:
                         tool_call_ids.pop(tool_name, None)
+                elif tool_name:
+                    # No queued start for this completion: the pairing FIFO can
+                    # drift on long turns (steering/compression rewrite the
+                    # message history prev_tools is rebuilt from). Log instead
+                    # of silently dropping so wire-level completion loss is
+                    # diagnosable; flush_open_tool_calls() closes the inverse
+                    # case (started-but-never-completed) at turn end.
+                    logger.debug(
+                        "ACP completion for %r has no queued tool_call id; dropping",
+                        tool_name,
+                    )
 
     return _step
+
+
+def flush_open_tool_calls(
+    conn: acp.Client,
+    session_id: str,
+    loop: asyncio.AbstractEventLoop,
+    tool_call_ids: Dict[str, Deque[str]],
+    tool_call_meta: Dict[str, Dict[str, Any]],
+) -> int:
+    """Close every tool call that never received a completion this turn.
+
+    The name-keyed FIFO pairing in ``make_step_cb`` loses completions on long
+    turns (live evidence 2026-07-19: 61 tool_call starts vs 22 updates in one
+    session), leaving clients with stuck in-progress items. Called at the end
+    of a prompt turn so the wire always converges; results are unknown by then,
+    so frames carry status=completed with no content.
+    """
+    flushed = 0
+    for tool_name in list(tool_call_ids.keys()):
+        queue = tool_call_ids.pop(tool_name)
+        if isinstance(queue, str):
+            queue = deque([queue])
+        while queue:
+            tc_id = queue.popleft()
+            meta = tool_call_meta.pop(tc_id, {})
+            update = build_tool_complete(
+                tc_id,
+                tool_name,
+                result=None,
+                function_args=meta.get("args"),
+                snapshot=meta.get("snapshot"),
+            )
+            _send_update(conn, session_id, loop, update)
+            flushed += 1
+    if flushed:
+        logger.debug("Flushed %d unclosed ACP tool call(s) at turn end", flushed)
+    return flushed
 
 
 # ------------------------------------------------------------------

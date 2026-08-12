@@ -180,6 +180,33 @@ ROUTINE_COMPRESSION_STATUS_SAMPLES = (
 )
 
 
+class RequiredDelegationCompressionBlocked(RuntimeError):
+    """Compression cannot rewrite an ACP turn that still owns child work."""
+
+
+def _assert_no_required_delegation_owner(agent: Any) -> None:
+    """Fail closed before any forced, automatic, rotating, or in-place rewrite."""
+    if (
+        str(getattr(agent, "platform", "") or "").lower() != "acp"
+        or getattr(agent, "_delegate_depth", 0) != 0
+    ):
+        return
+    try:
+        pending = bool(
+            getattr(agent, "_required_delegation_launching", False)
+            or agent._has_unconsumed_required_delegations()
+        )
+    except Exception as exc:
+        raise RequiredDelegationCompressionBlocked(
+            "Cannot verify required-delegation ownership before compression"
+        ) from exc
+    if pending:
+        raise RequiredDelegationCompressionBlocked(
+            "Context compression is blocked while required child work is "
+            "unobserved; wait for and persist the child result first"
+        )
+
+
 def _builtin_memory_prompt_snapshot(agent: Any) -> Optional[Tuple[str, str]]:
     """Return the built-in memory text that can affect a system prompt.
 
@@ -2188,6 +2215,10 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+    # Must precede every compressor branch, including codex app-server,
+    # force=True/manual compression, and in-place compaction. Any rewrite
+    # before required evidence is consumed can invalidate turn ownership.
+    _assert_no_required_delegation_owner(agent)
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
         agent.context_compressor
     )
@@ -2226,6 +2257,13 @@ def compress_context(
         })
     except Exception:
         pass
+
+    # Attempt-start timestamp for the compression telemetry call sites below.
+    # Restored after merge c71b9a28e kept upstream's `started_at=` usages
+    # (356ff9903) but dropped this assignment in conflict resolution, which
+    # made every compression attempt die with a NameError. Assigned before
+    # any branch so every telemetry site can see it.
+    _attempt_started_at = time.monotonic()
 
     # Codex app-server sessions: the codex agent owns the real thread context;
     # Hermes' summarizer would only rewrite a local mirror without shrinking

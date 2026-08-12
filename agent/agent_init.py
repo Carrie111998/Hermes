@@ -922,6 +922,9 @@ def init_agent(
     agent._last_activity_provenance = ActivityProvenance.UNKNOWN
     # Rate-limit durable SessionDB activity stamps from _touch_activity (#72016).
     agent._session_activity_last_persist_mono: float = 0.0
+    agent._last_meaningful_activity_ts: float = agent._last_activity_ts
+    agent._last_meaningful_activity_desc: str = "initializing"
+    agent._meaningful_progress_generation: int = 0
     agent._current_tool: str | None = None
     agent._api_call_count: int = 0
     # Opt-out flag for the between-turns MCP tool refresh (build_turn_context).
@@ -995,6 +998,11 @@ def init_agent(
     # commentary when the provider later returns it as a completed interim
     # assistant message.
     agent._current_streamed_assistant_text = ""
+    # Whether any visible delta has been emitted for the current model
+    # response. Gates the stream-start leading-newline strip independently of
+    # _current_streamed_assistant_text, which ACP provisional buffering leaves
+    # empty for the entire stream.
+    agent._stream_visible_text_started = False
     # Completed interim messages delivered during the current user turn.
     # Unlike token-stream tracking, this spans Codex continuation/tool calls so
     # repeated commentary is not re-sent before normalization can deduplicate it.

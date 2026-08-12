@@ -157,6 +157,52 @@ def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
     )
 
 
+def terminal_direct_output_requested(
+    function_name: str,
+    function_args: Any,
+) -> bool:
+    """Whether a terminal call requests the guarded direct-response path."""
+    return (
+        function_name == "terminal"
+        and isinstance(function_args, dict)
+        and function_args.get("return_direct") is True
+        and function_args.get("background") is not True
+        and function_args.get("pty") is not True
+    )
+
+
+def extract_terminal_direct_output(
+    function_name: str,
+    function_args: Any,
+    function_result: Any,
+) -> Optional[str]:
+    """Extract exact, sanitized stdout from a successful direct terminal call.
+
+    ``terminal_tool`` has already stripped ANSI escapes, bounded the payload,
+    and redacted secrets before this seam. Fail closed on every unexpected
+    result shape so ordinary model synthesis remains the fallback.
+    """
+    if not terminal_direct_output_requested(function_name, function_args):
+        return None
+    if not isinstance(function_result, str):
+        return None
+    try:
+        payload = json.loads(function_result)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    exit_code = payload.get("exit_code")
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool) or exit_code != 0:
+        return None
+    if payload.get("error") not in (None, "", False):
+        return None
+    output = payload.get("output")
+    if not isinstance(output, str) or not output.strip():
+        return None
+    return output
+
+
 def _resolve_concurrent_tool_timeout() -> float | None:
     raw = os.getenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "").strip()
     if not raw:
@@ -962,7 +1008,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # Touch activity before launching workers so the gateway knows
     # we're executing tools (not stuck).
     agent._current_tool = tool_names_str
-    agent._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
+    agent._touch_activity(
+        f"executing {num_tools} tools concurrently: {tool_names_str}",
+        meaningful=True,
+    )
 
     def _run_tool(
         index,
@@ -1327,7 +1376,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         ]
                         agent._touch_activity(
                             f"concurrent tools running ({_conc_elapsed}s, "
-                            f"{len(not_done)} remaining: {', '.join(_still_running[:3])})"
+                            f"{len(not_done)} remaining: {', '.join(_still_running[:3])})",
+                            meaningful=False,
                         )
             finally:
                 # Belt-and-braces: any exit from the wait loop that abandoned
@@ -1364,6 +1414,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # loop. Prefer that real result over a fabricated timeout message — the
         # tool genuinely succeeded, just slightly late.
         effect_disposition = None
+        # r is None means the executor never got a verified outcome from the
+        # worker: timed out (thread left running detached — see the
+        # executor.shutdown comment above), interrupted before/without
+        # reporting, or the thread died without writing results[i]. That is
+        # NOT real progress — it's the required-delegation supervision
+        # equivalent of a no-op, and stamping meaningful=True here would
+        # reset the no-progress deadline for a child whose tool call may
+        # still be silently running unsupervised, exactly when the deadline
+        # should tighten instead. Only an r that the executor actually
+        # observed (success or tool-level error) counts as meaningful.
+        _worker_result_verified = r is not None
         if i in timed_out_indices and r is None:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
@@ -1600,7 +1661,7 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
         ))
 
 
-def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> Optional[str]:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
 
     ``finalize=False`` skips the end-of-batch aggregate budget enforcement
@@ -1609,6 +1670,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     """
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
+    direct_response: Optional[str] = None
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
@@ -2217,6 +2279,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
             )
+            if finalize and len(assistant_message.tool_calls) == 1:
+                direct_response = extract_terminal_direct_output(
+                    function_name,
+                    function_args,
+                    function_result,
+                )
         if _is_error_result:
             logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
         else:
@@ -2316,6 +2384,20 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
             except Exception as cb_err:
                 logging.debug("Tool output risk callback error: %s", cb_err)
+        _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage=f"tool result {function_name}",
+        )
+
+        # ── Per-tool /steer drain ───────────────────────────────────
+        # Drain pending steer BETWEEN individual tool calls so the
+        # injection lands as soon as a tool finishes — not after the
+        # entire batch.  The model sees it on the next API iteration.
+        _content_before_steer = tool_message.get("content")
+        agent._apply_pending_steer_to_tool_results(messages, 1)
+        if tool_message.get("content") != _content_before_steer:
+            direct_response = None
 
         if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
             if agent.verbose_logging:
@@ -2357,7 +2439,23 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # See _execute_tool_calls_parallel for the rationale. Same hook,
     # applied to sequential execution as well.
     if finalize and num_tools_seq > 0:
+        _tail_before_steer = (
+            messages[-1].get("content")
+            if messages and isinstance(messages[-1], dict)
+            else None
+        )
         agent._apply_pending_steer_to_tool_results(messages, num_tools_seq)
+        _tail_after_steer = (
+            messages[-1].get("content")
+            if messages and isinstance(messages[-1], dict)
+            else None
+        )
+        if _tail_after_steer != _tail_before_steer:
+            direct_response = None
+
+    if agent._interrupt_requested:
+        return None
+    return direct_response
 
 
 
@@ -2423,7 +2521,9 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
 
 
 __all__ = [
+    "extract_terminal_direct_output",
     "execute_tool_calls_concurrent",
     "execute_tool_calls_sequential",
     "execute_tool_calls_segmented",
+    "terminal_direct_output_requested",
 ]
