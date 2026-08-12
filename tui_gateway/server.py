@@ -9759,6 +9759,13 @@ def _run_prompt_submit(
         # True once a failed turn's snapshot was retained for resume replay —
         # tells the finally below to skip the normal inflight clear.
         turn_error_retained = False
+        # Pre-turn history snapshot is captured inside the try (after the
+        # turn-start model sync mutates it). Pre-bind here so the finally
+        # block's `history.clear()` can never raise UnboundLocalError when an
+        # exception fires before that snapshot — which would otherwise abort
+        # the rest of the cleanup and leave the session wedged running=True.
+        history: list = []
+        history_version = 0
         # Durable crash marker: written before the turn runs, retired the
         # moment its outcome reaches the client (see _retire_turn_marker).
         # Any concluded turn — success, handled error, interrupt — retires

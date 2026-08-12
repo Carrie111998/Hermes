@@ -289,3 +289,43 @@ def test_next_turn_replaces_retained_error_snapshot(emits, turn_env):
     completes = _events(emits, "message.complete")
     assert len(completes) == 1
     assert completes[0]["status"] == "complete"
+
+
+# ── Early exception before the history snapshot ───────────────────────
+
+
+def test_early_exception_before_snapshot_still_resets_running(
+    emits, turn_env, monkeypatch
+):
+    """An exception before the history snapshot must not abort the finally.
+
+    The finally block calls ``history.clear()`` unconditionally, but ``history``
+    is only assigned inside the try, after the turn-start model sync. An
+    exception firing earlier (e.g. in ``_set_session_context``) used to raise
+    ``UnboundLocalError`` out of the finally, which skipped the
+    running/inflight/context reset and left the session wedged ``running=True``.
+    """
+
+    def _boom(*a, **k):
+        raise RuntimeError("boom before snapshot")
+
+    monkeypatch.setattr(server, "_set_session_context", _boom)
+
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=lambda *a, **k: {"final_response": "never reached"},
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True)
+    server._start_inflight_turn(session, "do the thing")
+
+    # Pre-fix this raised UnboundLocalError out of the finally; the fix makes
+    # the whole cleanup run so the session can never stay running=True.
+    server._run_prompt_submit("rid", "sid", session, "do the thing")
+
+    assert session["running"] is False
+    # The failed turn is retained for resume replay (existing contract) — the
+    # finally still has to run to completion to reset running/context.
+    snapshot = server._inflight_snapshot(session)
+    assert snapshot is not None
+    assert snapshot["error"] == "boom before snapshot"
