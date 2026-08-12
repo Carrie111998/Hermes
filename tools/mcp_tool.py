@@ -3211,7 +3211,14 @@ class MCPServerTask:
             # Caller owns the client lifecycle — the SDK skips cleanup when
             # http_client is provided, so we wrap in async-with.
             try:
-                async with httpx.AsyncClient(**client_kwargs) as http_client:
+                if _strict_cfg_headers:
+                    from tools.mcp_oauth_manager import _StrictRedirectAsyncClient
+                    client_kwargs["redirect_origin"] = _original_url
+                    client_kwargs["configured_header_names"] = _configured_header_names
+                    http_client = _StrictRedirectAsyncClient(**client_kwargs)
+                else:
+                    http_client = httpx.AsyncClient(**client_kwargs)
+                async with http_client:
                     async with streamable_http_client(url, http_client=http_client) as (
                         read_stream, write_stream, _get_session_id,
                     ):

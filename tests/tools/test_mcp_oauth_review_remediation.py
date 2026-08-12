@@ -725,6 +725,165 @@ async def test_cold_control_requests_use_tls_policy_without_bearer(
     assert str(requests[1].url).endswith("oauth-authorization-server")
 
 
+@pytest.mark.asyncio
+async def test_public_current_http_real_followed_redirect_strips_strict_headers(
+    monkeypatch,
+):
+    """The public current client must enforce strict policy on HTTPX redirects."""
+    import tools.mcp_tool as tool_module
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if str(request.url) == "https://source.example/mcp":
+            return httpx.Response(
+                302,
+                request=request,
+                headers={"location": "https://source.example/next"},
+            )
+        if str(request.url) == "https://source.example/next":
+            return httpx.Response(
+                302,
+                request=request,
+                headers={"location": "https://other.example/next"},
+            )
+        return httpx.Response(200, request=request)
+
+    transport = httpx.MockTransport(handler)
+    original_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return original_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched_async_client)
+
+    class FakeSession:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def initialize(self):
+            return SimpleNamespace(capabilities=SimpleNamespace(tools=None))
+
+    @asynccontextmanager
+    async def stream_factory(url, *, http_client, **_kwargs):
+        await http_client.get(url)
+        yield (object(), object(), lambda: None)
+
+    monkeypatch.setattr(tool_module, "ClientSession", FakeSession)
+    monkeypatch.setattr(tool_module, "streamable_http_client", stream_factory)
+    monkeypatch.setattr(tool_module, "streamablehttp_client", stream_factory)
+    monkeypatch.setattr(tool_module, "_MCP_NEW_HTTP", True)
+    monkeypatch.setattr(tool_module.MCPServerTask, "_discover_tools", lambda self: _done())
+    monkeypatch.setattr(
+        tool_module.MCPServerTask,
+        "_wait_for_lifecycle_event",
+        lambda self: _shutdown(),
+    )
+    monkeypatch.setattr(tool_module, "_reset_server_error", lambda _name: None)
+
+    task = tool_module.MCPServerTask("strict-redirect")
+    task._auth_type = ""
+    await task._run_http(
+        {
+            "url": "https://source.example/mcp",
+            "transport": "streamable_http",
+            "strict_redirect_headers": True,
+            "headers": {
+                "Authorization": "Bearer resource-secret",
+                "X-Strict-Secret": "must-not-cross-origin",
+            },
+        }
+    )
+
+    assert len(seen) == 3
+    assert seen[0].headers["authorization"] == "Bearer resource-secret"
+    assert seen[0].headers["x-strict-secret"] == "must-not-cross-origin"
+    assert seen[1].headers["authorization"] == "Bearer resource-secret"
+    assert seen[1].headers["x-strict-secret"] == "must-not-cross-origin"
+    assert "authorization" not in seen[2].headers
+    assert "x-strict-secret" not in seen[2].headers
+
+
+@pytest.mark.asyncio
+async def test_cold_prefetch_real_followed_redirect_strips_strict_headers(
+    tmp_path, monkeypatch
+):
+    """Cold PRM/ASM prefetch must enforce the same cross-origin policy."""
+    provider = await _provider(tmp_path, monkeypatch)
+    provider.context.oauth_metadata = None
+    provider._hermes_transport_options = {
+        "headers": {"X-Strict-Secret": "must-not-cross-origin"},
+        "strict_redirect_headers": True,
+    }
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        url = str(request.url)
+        if url == "https://example.com/.well-known/oauth-protected-resource/mcp":
+            return httpx.Response(
+                302,
+                request=request,
+                headers={"location": "https://attacker.example/prm"},
+            )
+        if url == "https://attacker.example/prm":
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "resource": "https://example.com/mcp",
+                    "authorization_servers": ["https://auth.example"],
+                },
+            )
+        if url == "https://auth.example/.well-known/oauth-authorization-server":
+            return httpx.Response(
+                302,
+                request=request,
+                headers={"location": "https://attacker.example/asm"},
+            )
+        if url == "https://attacker.example/asm":
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "issuer": "https://auth.example",
+                    "authorization_endpoint": "https://auth.example/authorize",
+                    "token_endpoint": "https://auth.example/token",
+                    "response_types_supported": ["code"],
+                },
+            )
+        return httpx.Response(404, request=request)
+
+    transport = httpx.MockTransport(handler)
+    original_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return original_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched_async_client)
+    await provider._prefetch_oauth_metadata()
+
+    assert [str(request.url) for request in seen] == [
+        "https://example.com/.well-known/oauth-protected-resource/mcp",
+        "https://attacker.example/prm",
+        "https://auth.example/.well-known/oauth-authorization-server",
+        "https://attacker.example/asm",
+    ]
+    assert seen[0].headers["x-strict-secret"] == "must-not-cross-origin"
+    assert "x-strict-secret" not in seen[1].headers
+    assert seen[2].headers["x-strict-secret"] == "must-not-cross-origin"
+    assert "x-strict-secret" not in seen[3].headers
+
+
 def _metadata_prm():
     return SimpleNamespace(
         resource="https://example.com/mcp",

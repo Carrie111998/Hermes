@@ -86,6 +86,33 @@ def _merge_oauth_control_request(client: Any, request: Any) -> Any:
     )
 
 
+def _StrictRedirectAsyncClient(*args: Any, **kwargs: Any) -> Any:
+    """Build HTTPX client enforcing configured headers at redirect creation."""
+    import types
+    import httpx
+
+    redirect_origin = kwargs.pop("redirect_origin")
+    configured_header_names = frozenset(kwargs.pop("configured_header_names"))
+    client = httpx.AsyncClient(*args, **kwargs)
+    original_builder = client._build_redirect_request
+
+    def build_redirect_request(self: Any, request: Any, response: Any) -> Any:
+        next_request = original_builder(request, response)
+        target = next_request.url
+        if (target.scheme, target.host, target.port) != (
+            redirect_origin.scheme,
+            redirect_origin.host,
+            redirect_origin.port,
+        ):
+            next_request.headers.pop("authorization", None)
+            for name in configured_header_names:
+                next_request.headers.pop(name, None)
+        return next_request
+
+    client._build_redirect_request = types.MethodType(build_redirect_request, client)
+    return client
+
+
 class MCPAuthFlowProtocolError(RuntimeError):
     """Raised when the installed SDK cannot provide HTTPX auth-flow semantics."""
 
@@ -463,9 +490,19 @@ def _make_hermes_provider_class() -> Optional[type]:
                     "response": list(options.get("response_hooks") or []),
                 },
             }
+            if options.get("strict_redirect_headers"):
+                from tools.mcp_oauth_manager import _StrictRedirectAsyncClient
+                client_kwargs["redirect_origin"] = httpx.URL(server_url)
+                client_kwargs["configured_header_names"] = {
+                    key.lower() for key in configured_headers
+                }
             if options.get("client_cert") is not None:
                 client_kwargs["cert"] = options["client_cert"]
-            async with httpx.AsyncClient(**client_kwargs) as client:
+            if options.get("strict_redirect_headers"):
+                client = _StrictRedirectAsyncClient(**client_kwargs)
+            else:
+                client = httpx.AsyncClient(**client_kwargs)
+            async with client:
                 # Step 1: PRM discovery to learn the authorization_server URL.
                 prm = None
                 for url in build_protected_resource_metadata_discovery_urls(
