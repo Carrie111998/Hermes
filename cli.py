@@ -17519,6 +17519,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         process_thread = threading.Thread(target=process_loop, daemon=True)
         process_thread.start()
 
+        # Background drain: poll completion_queue even while agent is mid-turn,
+        # so async delegation results appear as soon as they finish instead of
+        # waiting for the next turn boundary. Without this, results from
+        # parallel delegate_task calls pile up invisibly until the agent's
+        # run_conversation() returns and cli-post-turn drain fires — a gap that
+        # can be many minutes with reasoning_effort=max on long sessions.
+        def _background_drain_loop() -> None:
+            import time as _time
+            while not self._should_exit:
+                _time.sleep(2)
+                try:
+                    self._drain_process_notifications("cli-background-drain")
+                except Exception:
+                    pass
+        _drain_thread = threading.Thread(
+            target=_background_drain_loop, daemon=True, name="bg-drain"
+        )
+        _drain_thread.start()
+
         # Wake word ("Hey Hermes") — start the always-on hotword listener if
         # enabled. Off-thread so a first-run engine install never blocks the
         # prompt; best-effort, so deps/mic/key gaps are surfaced, never fatal.
