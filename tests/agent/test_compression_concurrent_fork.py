@@ -651,8 +651,15 @@ def test_compression_restores_user_turn_when_compressor_drops_all_users(tmp_path
 
     compressed, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
 
-    user_messages = [msg for msg in compressed if msg.get("role") == "user"]
-    assert user_messages == [{"role": "user", "content": "please continue from here"}]
+    # The rotation path appends a synthetic continuity-handoff marker.  It is
+    # required for deterministic resume, but it is scaffolding—not a human
+    # anchor—and must not satisfy or obscure this provider-template guard.
+    real_user_messages = [
+        msg
+        for msg in compressed
+        if msg.get("role") == "user" and not msg.get("_handoff_marker_synthetic")
+    ]
+    assert real_user_messages == [{"role": "user", "content": "please continue from here"}]
 
 
 def test_synthetic_user_scaffolding_does_not_replace_human_anchor(tmp_path: Path) -> None:
