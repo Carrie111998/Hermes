@@ -1413,56 +1413,50 @@ _ensure_ssl_certs()
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
-from hermes_constants import (
-    get_hermes_home,
-    get_hermes_home_override,
-    get_process_hermes_home,
-)
+from hermes_constants import get_hermes_home, get_hermes_home_override, get_process_hermes_home
 from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, is_truthy_value
 
-# ``None`` means "resolve live". This was ``_hermes_home = get_hermes_home()``
-# evaluated at module import — i.e. at test-COLLECTION time, before
-# tests/conftest.py redirects HERMES_HOME to a per-test tempdir. Every unpatched
-# use site below therefore addressed the user's REAL ~/.hermes, and the write
-# sites (voice-mode state, .clean_shutdown, the update/restart markers, and
-# mark_seen -> atomic_config_write on config.yaml) wrote there. The same bug
-# class destroyed the real ~/.hermes/config.yaml on 2026-08-11.
-#
-# Tests may still pin a Path here: the ~260 existing
-# ``monkeypatch.setattr(gateway.run, "_hermes_home", tmp_path)`` sites keep
-# working because a non-None override wins.
+# Resolved per call, never at import.  Import happens at test-COLLECTION time,
+# before conftest's ``_hermetic_environment`` fixture can redirect HERMES_HOME,
+# so a constant here would bake in the developer's real ``~/.hermes`` and every
+# write below would land there.  ``None`` means "resolve live"; the ~150
+# existing ``patch("gateway.run._hermes_home", tmp_path)`` sites keep working
+# because a non-None value still wins.
+# See GBrain ``concepts/import-time-hermes-home-snapshot-bug``.
 _hermes_home: Optional[Path] = None
 
 
 def _resolve_hermes_home() -> Path:
-    """Return the Hermes home for gateway state, resolved at CALL time.
+    """Return the gateway's Hermes home, resolved at call time.
 
-    Uses ``get_process_hermes_home()`` rather than ``get_hermes_home()``
-    deliberately. No context-local override is ever active at module import, so
-    the process-level resolver is the exact live equivalent of what the old
-    import-time constant captured — behaviour-preserving in production and
-    hermetic under pytest (the fixture mutates ``os.environ``, which this
-    reads). It also keeps ``_gateway_config_home()`` meaningful: that helper
-    layers ``get_hermes_home_override()`` on TOP of this value, which only makes
-    sense while this value is itself override-free. Switching to
-    ``get_hermes_home()`` would both make that layering redundant and silently
-    give ~60 unrelated write sites per-turn profile scope they never had.
+    ``get_process_hermes_home()`` rather than ``get_hermes_home()``, on purpose,
+    and the choice is sharper here than for the earlier instances of this bug
+    class because THIS module is the one that installs the override:
+    ``_profile_runtime_scope`` wraps every multiplexed inbound turn in
+    ``set_hermes_home_override(profile_home)``, and use sites such as the three
+    ``mark_seen(config.yaml)`` calls run inside that scope.  The constant this
+    replaces was evaluated at import with no override active, so the launch home
+    is exactly what it captured; following the override would redirect a routed
+    profile's turn into that profile's config.yaml instead of the launch
+    profile's — a behaviour change, not a fix.
+
+    ``_gateway_config_home()`` settles it independently.  It exists to layer an
+    explicit ``get_hermes_home_override()`` check ON TOP of this value, which is
+    only meaningful while this value stays override-blind.
     """
     if _hermes_home is not None:
-        return Path(_hermes_home)
+        return Path(_hermes_home)  # coerce: callers pin a str in places
     return get_process_hermes_home()
-
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
 from dotenv import load_dotenv  # noqa: F401  # backward-compat for tests that monkeypatch this symbol
 from hermes_cli.env_loader import load_hermes_dotenv
-# Import-scoped and vestigial: nothing in this module READS ``_env_path``, so it
-# cannot leak a stale home. The name is kept because seven tests
+# Import-scoped and vestigial: nothing in this module reads ``_env_path``, so it
+# cannot leak a stale home.  The name is kept because seven tests
 # (test_discord_channel_prompts, test_fast_command, test_reasoning_command)
-# ``monkeypatch.setattr`` it, and monkeypatch raises when the attribute is
-# absent. Do NOT introduce a runtime read of it — that would make it a second
-# import-time snapshot, which is the whole defect this seam removes.
+# ``monkeypatch.setattr`` it, which raises when the attribute is absent.
+# Do NOT introduce a runtime read of it — that would make it a second snapshot.
 _env_path = _resolve_hermes_home() / '.env'
 load_hermes_dotenv(hermes_home=_resolve_hermes_home(), project_env=Path(__file__).resolve().parents[1] / '.env')
 
@@ -1657,6 +1651,10 @@ _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
+# Import-scoped: consumed by the config->env bridge immediately below and never
+# read again.  Bridging config.yaml into os.environ is inherently an import-time
+# act, so the process home at import IS the correct home here.  Do NOT reuse this
+# name later in the module — a deferred read would make it a second snapshot.
 _config_path = _resolve_hermes_home() / 'config.yaml'
 if _config_path.exists():
     try:
@@ -1925,12 +1923,6 @@ if _config_path.exists():
             "your current config.yaml. Run `hermes doctor` to investigate.",
             file=sys.stderr,
         )
-
-# Drop the import-time path so it cannot become a second stale snapshot: it is
-# resolved and consumed entirely within the bridge above, and anything reading
-# it later would be addressing the home this process was IMPORTED under rather
-# than the live one. Runtime readers must call _resolve_hermes_home().
-del _config_path
 
 # Apply IPv4 preference if configured (before any HTTP clients are created).
 try:
@@ -3621,33 +3613,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     # -- Voice mode persistence ------------------------------------------
 
-    # A property, not a class constant. ``_hermes_home / "..."`` evaluated in
-    # the class body is an import-time snapshot exactly like the module-level
-    # one: under pytest it bound the REAL ~/.hermes, so _save_voice_modes()
-    # wrote the user's live voice state instead of the per-test home.
-    #
-    # The setter preserves the existing tests, which assign the attribute
-    # directly (``runner._VOICE_MODE_PATH = tmp_path / ...`` in
-    # test_voice_command.py) or patch.object() it
-    # (test_voice_mode_platform_isolation.py).
-    @property
-    def _VOICE_MODE_PATH(self) -> Path:
-        override = getattr(self, "_voice_mode_path_override", None)
-        if override is not None:
-            return Path(override)
+    # A DERIVED snapshot, and the only one here that is read and written long
+    # after import — so it needs its own seam, not just a fixed root.  Kept as a
+    # plain (overridable) class attribute rather than a property because
+    # existing tests set it on the INSTANCE (``runner._VOICE_MODE_PATH = ...``
+    # in test_voice_command, ``patch.object(runner, ...)`` in
+    # test_voice_mode_platform_isolation), which a data descriptor would break.
+    _VOICE_MODE_PATH: Optional[Path] = None
+
+    def _voice_mode_path(self) -> Path:
+        """Return the voice-mode state file, resolved at call time."""
+        if self._VOICE_MODE_PATH is not None:
+            return Path(self._VOICE_MODE_PATH)
         return _resolve_hermes_home() / "gateway_voice_mode.json"
-
-    @_VOICE_MODE_PATH.setter
-    def _VOICE_MODE_PATH(self, value) -> None:
-        self._voice_mode_path_override = None if value is None else Path(value)
-
-    @_VOICE_MODE_PATH.deleter
-    def _VOICE_MODE_PATH(self) -> None:
-        # Required by ``mock.patch.object``: because the attribute lives on the
-        # CLASS, patch.object restores it with delattr() rather than by
-        # reassigning the original value. Dropping the override is also the
-        # semantically right answer — it falls back to live resolution.
-        self._voice_mode_path_override = None
 
     def _voice_key(self, platform: Platform, chat_id: str) -> str:
         """Return a platform-namespaced key for voice mode state."""
@@ -3655,7 +3633,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _load_voice_modes(self) -> Dict[str, str]:
         try:
-            data = json.loads(self._VOICE_MODE_PATH.read_text())
+            data = json.loads(self._voice_mode_path().read_text())
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return {}
 
@@ -3681,8 +3659,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _save_voice_modes(self) -> None:
         try:
-            self._VOICE_MODE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            self._VOICE_MODE_PATH.write_text(
+            path = self._voice_mode_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
                 json.dumps(self._voice_mode, indent=2)
             )
         except OSError as e:
