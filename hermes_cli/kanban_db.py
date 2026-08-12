@@ -3995,6 +3995,8 @@ class Task:
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
     rework_count: int = 0
+    source_commit_required: bool = False
+    source_commit_forbidden: bool = False
     # Canonical handoff_v2 state flags (see ``_apply_v2_flags`` /
     # ``_legacy_status``). Always False on legacy (non-v2) boards and on
     # rows read before these columns existed.
@@ -4106,6 +4108,16 @@ class Task:
                 int(row["rework_count"])
                 if "rework_count" in keys and row["rework_count"] is not None
                 else 0
+            ),
+            source_commit_required=(
+                bool(row["source_commit_required"])
+                if "source_commit_required" in keys
+                else False
+            ),
+            source_commit_forbidden=(
+                bool(row["source_commit_forbidden"])
+                if "source_commit_forbidden" in keys
+                else False
             ),
             running=bool(row["running"]) if "running" in keys else False,
             blocked=bool(row["blocked"]) if "blocked" in keys else False,
@@ -4328,7 +4340,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- writers nor gating consult these yet (added in T1.2/T1.3/T1.4) — this
     -- migration only makes the columns exist.
     running               INTEGER NOT NULL DEFAULT 0,
-    blocked               INTEGER NOT NULL DEFAULT 0
+    blocked               INTEGER NOT NULL DEFAULT 0,
+    source_commit_required INTEGER NOT NULL DEFAULT 0,
+    source_commit_forbidden INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -5759,6 +5773,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "tasks",
             "work_item_kind",
             "work_item_kind TEXT NOT NULL DEFAULT 'card'",
+        )
+    if "source_commit_required" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "source_commit_required",
+            "source_commit_required INTEGER NOT NULL DEFAULT 0",
+        )
+    if "source_commit_forbidden" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "source_commit_forbidden",
+            "source_commit_forbidden INTEGER NOT NULL DEFAULT 0",
         )
     if "skills" not in cols:
         # JSON array of skill names the dispatcher force-loads into the
@@ -7800,6 +7828,8 @@ def create_task(
     work_contract_id: Optional[str] = None,
     work_item_kind: str = "card",
     project_source_task_id: Optional[str] = None,
+    source_commit_required: bool = False,
+    source_commit_forbidden: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -7845,6 +7875,10 @@ def create_task(
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
+    if source_commit_required and source_commit_forbidden:
+        raise ValueError(
+            "source_commit_required and source_commit_forbidden are mutually exclusive"
+        )
     assignee = _canonical_assignee(assignee)
     if assignee == RESOLVER_PROFILE:
         # A card being created has no preflight yet, so this routing can
@@ -8238,8 +8272,9 @@ def create_task(
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id,
                         workflow_template_id, current_step_key,
-                        work_contract_id, work_item_kind
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        work_contract_id, work_item_kind,
+                        source_commit_required, source_commit_forbidden
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -8269,6 +8304,8 @@ def create_task(
                         current_step_key,
                         work_contract_id,
                         work_item_kind,
+                        1 if source_commit_required else 0,
+                        1 if source_commit_forbidden else 0,
                     ),
                 )
                 for pid in parents:
@@ -8295,6 +8332,8 @@ def create_task(
                         "current_step_key": current_step_key,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "source_commit_required": bool(source_commit_required),
+                        "source_commit_forbidden": bool(source_commit_forbidden),
                     },
                 )
                 if workflow_defaulted:
@@ -9239,6 +9278,8 @@ def _end_run(
             "review_base_sha",
             "review_head_sha",
             "executor",
+            "source_completion_intent",
+            "source_completion_receipt",
         ):
             value = active_metadata.get(key)
             if value is not None:
@@ -10638,6 +10679,18 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class _SourceCommitError(RuntimeError):
+    """Typed failure raised when commit-first completion cannot be proven."""
+
+    def __init__(self, code: str, detail: Optional[str] = None):
+        self.code = code
+        self.detail = detail
+        message = f"source completion failed: {code}"
+        if detail:
+            message += f": {detail}"
+        super().__init__(message)
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10863,7 +10916,65 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    source_policy = conn.execute(
+        "SELECT source_commit_required, source_commit_forbidden, current_run_id, "
+        "workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    source_commit_required = bool(
+        source_policy is not None and source_policy["source_commit_required"]
+    )
+    if source_commit_required:
+        source_run_id = (
+            int(expected_run_id)
+            if expected_run_id is not None
+            else (
+                int(source_policy["current_run_id"])
+                if source_policy is not None
+                and source_policy["current_run_id"] is not None
+                else None
+            )
+        )
+        if source_run_id is None:
+            raise _SourceCommitError("missing_run")
+        _commit_worker_diff(
+            conn,
+            task_id,
+            message=f"complete: {task_id}",
+            expected_run_id=source_run_id,
+        )
+        expected_run_id = source_run_id
+        source_run = get_run(conn, source_run_id)
+        if source_run is None or not isinstance(source_run.metadata, dict):
+            raise _SourceCommitError("missing_receipt")
+        source_metadata = {
+            key: source_run.metadata[key]
+            for key in ("source_completion_intent", "source_completion_receipt")
+            if key in source_run.metadata
+        }
+        if "source_completion_receipt" not in source_metadata:
+            raise _SourceCommitError("missing_receipt")
+        metadata = dict(metadata or {})
+        metadata.update(source_metadata)
     with authorized_governance_write(), write_txn(conn):
+        if source_commit_required:
+            owned = conn.execute(
+                "SELECT r.metadata FROM tasks t JOIN task_runs r "
+                "ON r.id = t.current_run_id "
+                "WHERE t.id = ? AND t.current_run_id = ? AND r.ended_at IS NULL",
+                (task_id, int(expected_run_id)),
+            ).fetchone()
+            if owned is None:
+                raise _SourceCommitError("run_changed")
+            try:
+                owned_metadata = json.loads(owned["metadata"] or "{}")
+            except (TypeError, ValueError) as exc:
+                raise _SourceCommitError("missing_receipt") from exc
+            receipt = owned_metadata.get("source_completion_receipt")
+            if not isinstance(receipt, dict) or receipt.get("run_id") != int(
+                expected_run_id
+            ):
+                raise _SourceCommitError("missing_receipt")
         terminal_row = conn.execute(
             "SELECT current_step_key FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -10947,6 +11058,7 @@ def complete_task(
             outcome="completed", status="done",
             summary=summary if summary is not None else result,
             metadata=metadata,
+            expected_run_id=expected_run_id,
         )
         # If complete_task was called on a never-claimed task (ready or
         # blocked → done with no run in flight), synthesize a
@@ -15725,8 +15837,48 @@ def set_branch_name(
         )
 
 
+def _persist_source_completion_metadata(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    *,
+    intent: dict[str, Any],
+    receipt: Optional[dict[str, Any]] = None,
+) -> None:
+    """CAS-write one completion intent and optional receipt onto the owned run."""
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT r.metadata FROM tasks t JOIN task_runs r "
+            "ON r.id = t.current_run_id "
+            "WHERE t.id = ? AND t.current_run_id = ? AND r.ended_at IS NULL",
+            (task_id, int(run_id)),
+        ).fetchone()
+        if row is None:
+            raise _SourceCommitError("run_changed")
+        try:
+            run_metadata = json.loads(row["metadata"] or "{}")
+        except (TypeError, ValueError):
+            run_metadata = {}
+        if not isinstance(run_metadata, dict):
+            run_metadata = {}
+        run_metadata["source_completion_intent"] = dict(intent)
+        if receipt is not None:
+            run_metadata["source_completion_receipt"] = dict(receipt)
+        updated = conn.execute(
+            "UPDATE task_runs SET metadata = ? "
+            "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+            (json.dumps(run_metadata, ensure_ascii=False), int(run_id), task_id),
+        )
+        if updated.rowcount != 1:
+            raise _SourceCommitError("run_changed")
+
+
 def _commit_worker_diff(
-    conn: sqlite3.Connection, task_id: str, *, message: Optional[str] = None
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    message: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> Optional[str]:
     """Commit a card's worktree, source-only, and return the new SHA.
 
@@ -15737,44 +15889,145 @@ def _commit_worker_diff(
     This is load-bearing for T2.2: no commit means the card does not advance.
     """
     row = conn.execute(
-        "SELECT title, workspace_path FROM tasks WHERE id = ?",
+        "SELECT title, workspace_path, current_run_id FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
         return None
+    strict = expected_run_id is not None
+    if strict and row["current_run_id"] != int(expected_run_id):
+        raise _SourceCommitError("run_changed")
     workspace_path: Optional[str] = row["workspace_path"]
     if not workspace_path:
+        if strict:
+            raise _SourceCommitError("missing_workspace")
         return None
     repo_root = _git_toplevel(Path(workspace_path))
     if repo_root is None:
+        if strict:
+            raise _SourceCommitError("not_a_git_repository")
         return None
 
+    def git(
+        *args: str, ok_codes: tuple[int, ...] = (0,)
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(repo_root), *args],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except Exception as exc:
+            if strict:
+                raise _SourceCommitError("git_failed", str(exc)) from exc
+            raise
+        if completed.returncode not in ok_codes and strict:
+            detail = (completed.stderr or completed.stdout or "").strip()
+            raise _SourceCommitError("git_failed", detail)
+        return completed
+
     try:
-        add_result = subprocess.run(
-            ["git", "-C", str(repo_root), "add", "-A"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        add_result = git("add", "-A")
     except Exception:
+        if strict:
+            raise
         return None
     if add_result.returncode != 0:
         return None
 
     try:
-        diff_result = subprocess.run(
-            ["git", "-C", str(repo_root), "diff", "--cached", "--quiet"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        diff_result = git("diff", "--cached", "--quiet", ok_codes=(0, 1))
     except Exception:
+        if strict:
+            raise
         return None
     if diff_result.returncode == 0:
-        # Nothing staged — clean tree, nothing to commit.
+        if strict:
+            intent_row = conn.execute(
+                "SELECT id, metadata FROM task_runs WHERE task_id = ? "
+                "AND id != ? ORDER BY id DESC",
+                (task_id, int(expected_run_id)),
+            ).fetchall()
+            head = git("rev-parse", "HEAD").stdout.strip()
+            for prior in intent_row:
+                try:
+                    prior_metadata = json.loads(prior["metadata"] or "{}")
+                except (TypeError, ValueError):
+                    continue
+                intent = (
+                    prior_metadata.get("source_completion_intent")
+                    if isinstance(prior_metadata, dict)
+                    else None
+                )
+                if not isinstance(intent, dict):
+                    continue
+                base_sha = str(intent.get("base_sha") or "")
+                tree_sha = str(intent.get("tree_sha") or "")
+                parent = git("rev-parse", "HEAD^").stdout.strip()
+                head_tree = git("rev-parse", "HEAD^{tree}").stdout.strip()
+                if parent != base_sha or head_tree != tree_sha:
+                    continue
+                paths = [
+                    path
+                    for path in git(
+                        "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"
+                    ).stdout.splitlines()
+                    if path
+                ]
+                if paths != intent.get("paths"):
+                    continue
+                receipt = {
+                    "intent_id": intent["intent_id"],
+                    "intent_run_id": int(prior["id"]),
+                    "run_id": int(expected_run_id),
+                    "base_sha": base_sha,
+                    "commit_sha": head,
+                    "tree_sha": tree_sha,
+                    "diff_digest": intent["diff_digest"],
+                    "paths": paths,
+                    "created_at": int(time.time()),
+                    "adopted": True,
+                }
+                _persist_source_completion_metadata(
+                    conn,
+                    task_id,
+                    int(expected_run_id),
+                    intent=intent,
+                    receipt=receipt,
+                )
+                return head
+            raise _SourceCommitError("nothing_to_commit")
         return None
+
+    intent: Optional[dict[str, Any]] = None
+    if strict:
+        base_sha = git("rev-parse", "HEAD").stdout.strip()
+        tree_sha = git("write-tree").stdout.strip()
+        paths = [
+            path
+            for path in git("diff", "--cached", "--name-only", base_sha).stdout.splitlines()
+            if path
+        ]
+        diff_bytes = subprocess.run(
+            ["git", "-C", str(repo_root), "diff", "--cached", "--binary", base_sha],
+            capture_output=True,
+            timeout=30,
+            check=True,
+        ).stdout
+        intent = {
+            "intent_id": secrets.token_hex(16),
+            "run_id": int(expected_run_id),
+            "base_sha": base_sha,
+            "tree_sha": tree_sha,
+            "diff_digest": hashlib.sha256(diff_bytes).hexdigest(),
+            "paths": paths,
+            "created_at": int(time.time()),
+        }
+        _persist_source_completion_metadata(
+            conn, task_id, int(expected_run_id), intent=intent
+        )
 
     if message is not None:
         commit_message = message
@@ -15783,31 +16036,43 @@ def _commit_worker_diff(
         commit_message = f"handoff: {title} ({task_id})" if title else f"handoff: {task_id}"
 
     try:
-        commit_result = subprocess.run(
-            ["git", "-C", str(repo_root), "commit", "-m", commit_message],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        commit_result = git("commit", "-m", commit_message)
     except Exception:
+        if strict:
+            raise
         return None
     if commit_result.returncode != 0:
         return None
 
     try:
-        sha_result = subprocess.run(
-            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        sha_result = git("rev-parse", "HEAD")
     except Exception:
+        if strict:
+            raise
         return None
     if sha_result.returncode != 0:
         return None
     sha = (sha_result.stdout or "").strip()
+    if strict and sha and intent is not None:
+        receipt = {
+            "intent_id": intent["intent_id"],
+            "intent_run_id": int(expected_run_id),
+            "run_id": int(expected_run_id),
+            "base_sha": intent["base_sha"],
+            "commit_sha": sha,
+            "tree_sha": intent["tree_sha"],
+            "diff_digest": intent["diff_digest"],
+            "paths": intent["paths"],
+            "created_at": int(time.time()),
+            "adopted": False,
+        }
+        _persist_source_completion_metadata(
+            conn,
+            task_id,
+            int(expected_run_id),
+            intent=intent,
+            receipt=receipt,
+        )
     return sha or None
 
 

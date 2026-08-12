@@ -4480,6 +4480,226 @@ def _head_sha(repo: Path) -> str:
     ).stdout.strip()
 
 
+def test_complete_task_required_source_commits_before_terminal_update_and_persists_receipt(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "completion-repo"
+    _init_git_repo(repo)
+    base_sha = _head_sha(repo)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Commit before done",
+            assignee="developer",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            source_commit_required=True,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        (repo / "feature.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Implemented feature",
+            expected_run_id=run_id,
+        )
+
+        task = kb.get_task(conn, tid)
+        run = kb.get_run(conn, run_id)
+
+    assert task is not None and task.status == "done"
+    assert run is not None and run.metadata is not None
+    intent = run.metadata["source_completion_intent"]
+    receipt = run.metadata["source_completion_receipt"]
+    assert intent["run_id"] == run_id
+    assert receipt["intent_id"] == intent["intent_id"]
+    assert receipt["run_id"] == run_id
+    assert receipt["base_sha"] == base_sha
+    assert receipt["commit_sha"] == _head_sha(repo)
+    assert receipt["commit_sha"] != base_sha
+    assert len(receipt["tree_sha"]) == 40
+    assert len(receipt["diff_digest"]) == 64
+    assert receipt["paths"] == ["feature.py"]
+    assert receipt["created_at"] >= intent["created_at"]
+    assert subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == ""
+
+
+def test_complete_task_adopts_the_one_exact_commit_after_crash_before_receipt(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "adoption-repo"
+    _init_git_repo(repo)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Adopt exact commit",
+            assignee="developer",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            source_commit_required=True,
+        )
+        first = kb.claim_task(conn, tid)
+        assert first is not None and first.current_run_id is not None
+        first_run_id = first.current_run_id
+        (repo / "feature.py").write_text("VALUE = 2\n", encoding="utf-8")
+        original_persist = kb._persist_source_completion_metadata
+        persist_calls = 0
+
+        def crash_before_receipt(*args, **kwargs):
+            nonlocal persist_calls
+            persist_calls += 1
+            if persist_calls == 2:
+                raise RuntimeError("simulated crash after git commit")
+            return original_persist(*args, **kwargs)
+
+        monkeypatch.setattr(kb, "_persist_source_completion_metadata", crash_before_receipt)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            kb.complete_task(conn, tid, expected_run_id=first_run_id)
+        committed_sha = _head_sha(repo)
+        assert kb.get_task(conn, tid).status == "running"
+
+        monkeypatch.setattr(kb, "_persist_source_completion_metadata", original_persist)
+        assert kb.reclaim_task(conn, tid, reason="retry source finalization")
+        second = kb.claim_task(conn, tid)
+        assert second is not None and second.current_run_id is not None
+        second_run_id = second.current_run_id
+
+        assert kb.complete_task(conn, tid, expected_run_id=second_run_id)
+        receipt = kb.get_run(conn, second_run_id).metadata["source_completion_receipt"]
+
+    assert receipt["adopted"] is True
+    assert receipt["commit_sha"] == committed_sha == _head_sha(repo)
+    assert receipt["intent_run_id"] == first_run_id
+    assert receipt["run_id"] == second_run_id
+    log_count = subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--count", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert log_count == "2"
+
+
+def test_complete_task_forbidden_source_does_not_commit_worker_diff(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "forbidden-repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Evidence only",
+            assignee="reviewer",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            source_commit_forbidden=True,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        monkeypatch.setattr(
+            kb,
+            "_commit_worker_diff",
+            lambda *args, **kwargs: pytest.fail("forbidden completion authored source"),
+        )
+
+        assert kb.complete_task(
+            conn, tid, expected_run_id=claimed.current_run_id
+        )
+
+        task = kb.get_task(conn, tid)
+
+    assert task is not None and task.status == "done"
+    assert task.source_commit_forbidden is True
+    assert _head_sha(repo) == subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--max-parents=0", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_complete_task_required_source_raises_typed_failure_without_commit(
+    kanban_home, tmp_path
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Missing source",
+            assignee="developer",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+            source_commit_required=True,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+
+        with pytest.raises(kb._SourceCommitError) as raised:
+            kb.complete_task(conn, tid, expected_run_id=claimed.current_run_id)
+
+        task = kb.get_task(conn, tid)
+
+    assert raised.value.code == "not_a_git_repository"
+    assert task is not None and task.status == "running"
+
+
+def test_complete_task_required_source_rechecks_run_ownership_before_done(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "cas-repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="CAS before done",
+            assignee="developer",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            source_commit_required=True,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        (repo / "feature.py").write_text("VALUE = 3\n", encoding="utf-8")
+        original_persist = kb._persist_source_completion_metadata
+
+        def lose_ownership_after_receipt(*args, **kwargs):
+            original_persist(*args, **kwargs)
+            if kwargs.get("receipt") is not None:
+                conn.execute(
+                    "UPDATE tasks SET current_run_id = NULL WHERE id = ?",
+                    (tid,),
+                )
+                conn.commit()
+
+        monkeypatch.setattr(
+            kb, "_persist_source_completion_metadata", lose_ownership_after_receipt
+        )
+
+        with pytest.raises(kb._SourceCommitError) as raised:
+            kb.complete_task(conn, tid, expected_run_id=run_id)
+
+        task = kb.get_task(conn, tid)
+
+    assert raised.value.code == "run_changed"
+    assert task is not None and task.status == "running"
+    assert _head_sha(repo) != subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--max-parents=0", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 def test_commit_worker_diff_dirty_worktree_returns_sha_and_cleans_tree(kanban_home, tmp_path):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
