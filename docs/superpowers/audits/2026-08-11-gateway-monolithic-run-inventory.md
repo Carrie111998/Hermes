@@ -44,7 +44,7 @@ an inherited claim.
 | B | 4 | ✅ fixed by `e467da742` | 21 + 114 passed |
 | C | 3 | ✅ green | see group C |
 | D | 1 | ✅ green — but the "ordering artifact" reading is disputed | see group D |
-| E | 1 | ❌ **still fails** — the only open entry | see group E |
+| E | 1 | ❌ **still fails** on `main` — the only open entry, and a fix exists unlanded | see group E |
 
 Two runs, both from an isolated worktree, both `0 failed` except where noted:
 `167 passed in 497.35s` over the three A+B files, and `1 failed, 298 passed, 1 skipped in
@@ -196,8 +196,16 @@ Verified by re-running each file alone (`gw_iso.log`):
 >
 > Note it reproduced in a **four-file** run, not just the 9,898-test monolithic one — so
 > "only fails under the full suite" understates it. Any concurrent load on this box is
-> enough. The fix is to raise or remove the hard-coded `timeout=10` at `test_matrix.py:1224`,
-> which is a wall-clock deadline in a test, not a property of the code under test.
+> enough. The cause is a wall-clock deadline in a test, not a property of the code under test.
+>
+> **Before you fix this: a fix already exists, unlanded.** `3e3ea51b9` *"fix(tests): size the
+> matrix import probe's two budgets to its real cost"* (`tests/gateway/test_matrix.py` only,
+> +55/−20) sits on branch `claude/gifted-jones-0cb48d` and is **not an ancestor of `main`** —
+> checked 2026-08-11. Land or review that rather than writing a second one. Second-hand but
+> worth knowing: it reportedly needs *two* budgets raised together, because `pyproject`'s
+> global `addopts --timeout=30` and pytest-timeout's thread method hard-exit the whole pytest
+> process, so any subprocess budget above 30s is unreachable and the **file** dies instead.
+> Raising the `timeout=10` alone would make this worse, not better.
 
 - `test_matrix::TestMatrixModuleImport::test_module_importable_without_mautrix` —
   `subprocess.TimeoutExpired … timed out after 10 seconds`. Confirmed PASSED when run
