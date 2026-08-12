@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict'
+import { execFile, execFileSync, spawn } from 'node:child_process'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 
 import { test } from 'vitest'
 
@@ -266,6 +270,126 @@ test('pidIsOurDashboard requires the exact serve ownership nonce', async () => {
     false
   )
   assert.equal(await pidIsOurDashboard(fakeSsh([[/print\("OWNED"/, 'FOREIGN\n']]), 5, SPAWN_NONCE, '/x/hermes'), false)
+})
+
+// An ssh stub that REALLY RUNS the command. pidIsOurDashboard's decision
+// procedure is a python program embedded in a string, so a fakeSsh that returns
+// a canned OWNED/FOREIGN proves nothing about which argv shapes it accepts.
+// A shell is deliberate: ssh.exec()'s contract is "run this shell command line
+// on the remote", and the line is built by the code under test, not by input.
+function shellSsh() {
+  const calls: string[] = []
+
+  return {
+    calls,
+    exec(cmd: string) {
+      calls.push(cmd)
+
+      return new Promise<string>((resolve, reject) => {
+        execFile('/bin/sh', ['-c', cmd], { encoding: 'utf8' }, (error, stdout) =>
+          error ? reject(error) : resolve(String(stdout))
+        )
+      })
+    }
+  }
+}
+
+// Launch a live process through an install.sh-style exec wrapper. The wrapper
+// `exec`s the venv entrypoint, so the shell is replaced IN PLACE (same pid) and
+// the kernel rewrites argv for the entrypoint's shebang. The launcher path we
+// record in the lockfile then appears in neither argv[0] nor argv[1].
+function spawnThroughExecWrapper(extraServeArgs: string[]) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-wrapper-'))
+  const entrypoint = path.join(dir, 'venv', 'bin', 'hermes')
+  const launcher = path.join(dir, '.local', 'bin', 'hermes')
+  fs.mkdirSync(path.dirname(entrypoint), { recursive: true })
+  fs.mkdirSync(path.dirname(launcher), { recursive: true })
+  fs.writeFileSync(entrypoint, '#!/usr/bin/env python3\nimport time\ntime.sleep(120)\n', { mode: 0o755 })
+  fs.writeFileSync(launcher, `#!/bin/sh\nexec ${JSON.stringify(entrypoint)} "$@"\n`, { mode: 0o755 })
+
+  const child = spawn(launcher, ['serve', '--isolated', '--host', '127.0.0.1', '--port', '0', ...extraServeArgs], {
+    stdio: 'ignore'
+  })
+
+  const cleanup = () => {
+    try {
+      child.kill('SIGKILL')
+    } catch {
+      void 0
+    }
+
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+
+  return { launcher, entrypoint, pid: child.pid as number, cleanup }
+}
+
+// Poll until the exec has actually happened, so we probe the replaced argv.
+async function waitForServeArgv(pid: number) {
+  for (let attempt = 0; attempt < 60; attempt++) {
+    const line = execFileSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8' })
+
+    if (line.includes('serve')) {
+      return line.trim()
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+
+  throw new Error(`pid ${pid} never reached the serve argv`)
+}
+
+// The Desktop SSH reconnect orphan leak: locateHermes records the launcher
+// (~/.local/bin/hermes) in backend.lock.json, but that wrapper execs the venv
+// entrypoint. The owned, still-live dashboard was therefore judged FOREIGN, so
+// connect() could not kill it, dropped its only lock, and spawned another
+// detached serve — one orphan per reconnect.
+test('pidIsOurDashboard reclaims a dashboard whose exec wrapper rewrote argv', async () => {
+  if (process.platform === 'win32') {
+    return
+  }
+
+  const tokenFilePath = `${ownershipDirectory(OWNERSHIP_ID).replace(/^~/, os.homedir())}/${SPAWN_NONCE}.token`
+  const wrapper = spawnThroughExecWrapper(['--ssh-session-token-file', tokenFilePath, '--ssh-owner-nonce', SPAWN_NONCE])
+
+  try {
+    const argv = await waitForServeArgv(wrapper.pid)
+    assert.ok(!argv.includes(wrapper.launcher), 'the recorded launcher path must be absent from the live argv')
+
+    assert.equal(
+      await pidIsOurDashboard(shellSsh(), wrapper.pid, SPAWN_NONCE, wrapper.launcher, OWNERSHIP_ID),
+      true,
+      'a live process carrying our exact serve --isolated shape, owner nonce and ownership token-file path is ours'
+    )
+  } finally {
+    wrapper.cleanup()
+  }
+})
+
+test.each([
+  ['the owner nonce without a token path', ['--ssh-owner-nonce', SPAWN_NONCE]],
+  [
+    'a token path for another ownership ID',
+    [
+      '--ssh-session-token-file',
+      `${ownershipDirectory('ffffffffffffffffffffffffffffffff').replace(/^~/, os.homedir())}/${SPAWN_NONCE}.token`,
+      '--ssh-owner-nonce',
+      SPAWN_NONCE
+    ]
+  ]
+])('pidIsOurDashboard rejects wrapper argv with %s', async (_label, extraServeArgs) => {
+  if (process.platform === 'win32') {
+    return
+  }
+
+  const wrapper = spawnThroughExecWrapper(extraServeArgs)
+
+  try {
+    await waitForServeArgv(wrapper.pid)
+    assert.equal(await pidIsOurDashboard(shellSsh(), wrapper.pid, SPAWN_NONCE, wrapper.launcher, OWNERSHIP_ID), false)
+  } finally {
+    wrapper.cleanup()
+  }
 })
 
 test('cleanupStale kills ONLY a provably-ours pid, always drops the lockfile', async () => {

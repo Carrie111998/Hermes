@@ -364,10 +364,12 @@ async function remotePidAlive(ssh, pid) {
 
 // A pid is "provably ours" only if its remote cmdline carries our dashboard
 // args — never kill a pid we can't positively identify as our dashboard.
-async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
+async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '', ownershipId = '') {
   if (!pid || !/^[0-9a-f]{16}$/.test(String(spawnNonce || '')) || !hermesPath) {
     return false
   }
+
+  const tokenFilePath = ownershipId ? `${ownershipDirectory(ownershipId)}/${validateSpawnNonce(spawnNonce)}.token` : ''
 
   try {
     const script =
@@ -375,6 +377,7 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
       `pid=${Number(pid)}\n` +
       `expected=os.path.expanduser(${shq(hermesPath)})\n` +
       `nonce=${shq(spawnNonce)}\n` +
+      `tokenfile=os.path.expanduser(${shq(tokenFilePath)})\n` +
       'try:\n' +
       ' raw=open(f"/proc/{pid}/cmdline","rb").read()\n' +
       ' args=[x.decode("utf-8","surrogateescape") for x in raw.split(b"\\0") if x]\n' +
@@ -387,7 +390,14 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
       ' owner=args.index("--ssh-owner-nonce",serve+1)\n' +
       ' direct=args[0]==expected\n' +
       ' python_entry=len(args)>1 and args[1]==expected and os.path.basename(args[0]).startswith("python")\n' +
-      ' ok=(direct or python_entry) and "--isolated" in args[serve+1:] and args[owner+1]==nonce\n' +
+      ' executable_match=direct or python_entry\n' +
+      ' wrapper_owned=False\n' +
+      ' if tokenfile:\n' +
+      '  token=args.index("--ssh-session-token-file",serve+1)\n' +
+      '  host=args.index("--host",serve+1)\n' +
+      '  port=args.index("--port",serve+1)\n' +
+      '  wrapper_owned=(args[token+1]==tokenfile and args[host+1]=="127.0.0.1" and args[port+1]=="0")\n' +
+      ' ok=(executable_match or wrapper_owned) and "--isolated" in args[serve+1:] and args[owner+1]==nonce\n' +
       'except (ValueError,IndexError):pass\n' +
       'print("OWNED" if ok else "FOREIGN")'
 
@@ -404,7 +414,7 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
 
 // Kill the stale dashboard ONLY if provably ours, then drop the lockfile.
 async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
-  if (pidAlive && lock && (await pidIsOurDashboard(ssh, lock.pid, lock.spawnNonce, lock.hermesPath))) {
+  if (pidAlive && lock && (await pidIsOurDashboard(ssh, lock.pid, lock.spawnNonce, lock.hermesPath, ownershipId))) {
     try {
       const result = (
         await ssh.exec(
@@ -706,7 +716,7 @@ async function connect(deps) {
 
   if (lock) {
     const pidAlive = await remotePidAlive(ssh, lock.pid)
-    const owned = pidAlive && (await pidIsOurDashboard(ssh, lock.pid, lock.spawnNonce, lock.hermesPath))
+    const owned = pidAlive && (await pidIsOurDashboard(ssh, lock.pid, lock.spawnNonce, lock.hermesPath, ownershipId))
 
     const reusable =
       pidAlive &&
