@@ -15,6 +15,7 @@ The routes:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -202,7 +203,9 @@ async def auth_login(request: Request, provider: str, next: str = ""):
         return RedirectResponse(url=login_url, status_code=302)
 
     try:
-        ls = p.start_login(redirect_uri=_redirect_uri(request))
+        ls = await asyncio.to_thread(
+            p.start_login, redirect_uri=_redirect_uri(request)
+        )
     except ProviderError as e:
         audit_log(
             AuditEvent.LOGIN_FAILURE,
@@ -367,7 +370,9 @@ async def auth_native_authorize(
         raise HTTPException(status_code=503, detail=str(e))
 
     try:
-        ls = p.start_login(redirect_uri=_redirect_uri(request))
+        ls = await asyncio.to_thread(
+            p.start_login, redirect_uri=_redirect_uri(request)
+        )
     except ProviderError as e:
         raise HTTPException(status_code=503, detail=f"Provider unreachable: {e}")
 
@@ -467,7 +472,8 @@ async def auth_callback(
         )
 
     try:
-        session = p.complete_login(
+        session = await asyncio.to_thread(
+            p.complete_login,
             code=code,
             state=state,
             code_verifier=verifier,
