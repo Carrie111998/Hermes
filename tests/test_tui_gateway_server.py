@@ -12644,6 +12644,177 @@ def test_session_active_list_excludes_finalized_sessions(monkeypatch):
     assert [row["id"] for row in session_rows] == ["sid-live"]
 
 
+def test_session_active_list_reports_foreign_db_rows(monkeypatch):
+    """Cross-process liveness (#live-indicators): sessions that exist only in
+    state.db (cron runs, CLI one-shots, messaging turns in other processes)
+    never enter ``_sessions``, so ``session.active_list`` must surface
+    recently-active rows flagged ``foreign`` for clients to paint from the
+    same poll. Rows outside the 300s recency window are not reported."""
+
+    class _DB:
+        def get_session_title(self, key):
+            return ""
+
+        def list_sessions_rich(self, **kwargs):
+            now = time.time()
+            return [
+                {
+                    "id": "cron_abc_20260812",
+                    "source": "cron",
+                    "model": "m",
+                    "title": "Nightly job",
+                    "started_at": now - 100,
+                    "last_active": now - 10,
+                    "last_activity_description": "executing tool",
+                    "message_count": 4,
+                    "ended_at": None,
+                },
+                {
+                    "id": "old_cli_session",
+                    "source": "cli",
+                    "model": "m",
+                    "title": "Stale",
+                    "started_at": now - 4000,
+                    "last_active": now - 4000,
+                    "last_activity_description": "",
+                    "message_count": 9,
+                    "ended_at": None,
+                },
+                {
+                    "id": "quiet_cli_session",
+                    "source": "cli",
+                    "model": "m",
+                    "title": "Quiet",
+                    "started_at": now - 400,
+                    "last_active": now - 200,
+                    "last_activity_description": "",
+                    "message_count": 5,
+                    "ended_at": None,
+                },
+            ]
+
+    previous_sessions = dict(server._sessions)
+    previous_children = dict(server._active_child_runs)
+    server._sessions.clear()
+    server._active_child_runs.clear()
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.active_list",
+                "params": {},
+            }
+        )
+    finally:
+        server._sessions.clear()
+        server._sessions.update(previous_sessions)
+        server._active_child_runs.clear()
+        server._active_child_runs.update(previous_children)
+
+    rows = {row["id"]: row for row in resp["result"]["sessions"]}
+    foreign = rows["cron_abc_20260812"]
+    assert foreign["foreign"] is True
+    assert foreign["status"] == "working"
+    assert foreign["session_key"] == "cron_abc_20260812"
+    assert foreign["description"] == "executing tool"
+    # A row outside the 300s recency window is NOT reported.
+    assert "old_cli_session" not in rows
+    # A row inside 300s but outside the REAL-ACTIVITY window (90s) is NOT
+    # reported either: is_active alone would paint reopened/orphan rows live.
+    assert "quiet_cli_session" not in rows
+
+
+def test_session_resume_does_not_reopen_ended_session(monkeypatch):
+    """#liveness-stale-end: abrir (resume) uma sessão finalizada é LEITURA —
+    a linha deve permanecer com ended_at set até o primeiro turno real
+    (prompt.submit). O resume atual reabre incondicionalmente."""
+    import uuid as _uuid
+
+    class _DB:
+        def __init__(self):
+            self.reopened = []
+
+        def get_session_title(self, key):
+            return ""
+
+        def get_session_by_title(self, key):
+            return None
+
+        def get_messages_as_conversation(self, target, repair_alternation=False):
+            return []
+
+        def get_resume_conversations(self, target):
+            return [], []
+
+        def reopen_session(self, session_id):
+            self.reopened.append(session_id)
+
+        def get_session(self, key):
+            return {"id": key, "ended_at": 123.0, "started_at": 100.0}
+
+    fake = _DB()
+    previous_sessions = dict(server._sessions)
+    server._sessions.clear()
+    monkeypatch.setattr(server, "_get_db", lambda: fake)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.resume",
+                "params": {"session_id": "finalized-1", "lazy": True},
+            }
+        )
+    finally:
+        server._sessions.clear()
+        server._sessions.update(previous_sessions)
+
+    assert resp.get("result") is not None, resp
+    assert fake.reopened == [], f"resume reabriu sessão finalizada: {fake.reopened}"
+
+
+def test_reopen_if_finalized_only_reopens_ended_rows():
+    """#liveness-stale-end: o primeiro turno (prompt.submit) reabre só linhas
+    com ended_at set — linhas abertas, inexistentes ou com erro de DB ficam
+    intocadas."""
+    from tui_gateway.methods_prompt import _reopen_if_finalized
+
+    class _DB:
+        def __init__(self, row):
+            self.row = row
+            self.reopened = []
+            self.raise_on_get = False
+
+        def get_session(self, session_id):
+            if self.raise_on_get:
+                raise OSError("db locked")
+            return self.row
+
+        def reopen_session(self, session_id):
+            self.reopened.append(session_id)
+
+    ended = _DB({"id": "s1", "ended_at": 123.0})
+    _reopen_if_finalized(ended, "s1")
+    assert ended.reopened == ["s1"]
+
+    open_row = _DB({"id": "s1", "ended_at": None})
+    _reopen_if_finalized(open_row, "s1")
+    assert open_row.reopened == []
+
+    missing = _DB(None)
+    _reopen_if_finalized(missing, "s1")
+    assert missing.reopened == []
+
+    broken = _DB({"id": "s1", "ended_at": 123.0})
+    broken.raise_on_get = True
+    _reopen_if_finalized(broken, "s1")
+    assert broken.reopened == []
+
+    noop = _DB({"id": "s1", "ended_at": 123.0})
+    _reopen_if_finalized(noop, "")
+    assert noop.reopened == []
+
+
 
 def test_session_activate_returns_inflight_stream_before_completion(monkeypatch):
     """Switching into a still-running live session must hydrate partial output.

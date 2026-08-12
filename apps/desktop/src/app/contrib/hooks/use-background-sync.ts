@@ -44,6 +44,10 @@ const LIVE_SESSION_STATUS_BACKSTOP_INTERVAL_MS = 30_000
 const SESSIONS_LIST_TICK_GAP_MS = 10_000
 
 interface LiveSessionStatusItem {
+  description?: string
+  /** Row reported from state.db, not this serve's in-memory registry (cron
+   *  runs, CLI one-shots, other processes). No runtime exists for it here. */
+  foreign?: boolean
   id?: string
   last_active?: number
   session_key?: string
@@ -91,6 +95,13 @@ export function rehydrateLiveSessionStatuses(
     seen.add(runtimeSessionId)
 
     const existing = $sessionStates.get()[runtimeSessionId]
+
+    // A foreign row (DB-derived, no in-memory runtime) whose id now has a
+    // real runtime in this renderer: the event path owns it from here — the
+    // DB snapshot is a weaker rung and must not clobber event-derived state.
+    if (session.foreign && existing) {
+      continue
+    }
 
     // A turn we just submitted is not yet running as far as the backend is
     // concerned, so the snapshot honestly reports it idle — but the local

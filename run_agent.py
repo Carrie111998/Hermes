@@ -3782,12 +3782,21 @@ class AIAgent:
         from agent.session_activity import (
             bound_activity_description,
             normalize_activity_provenance,
+            provenance_for_source,
             reset_session_activity_persist_window,
         )
 
         self._last_activity_ts = time.time()
         self._last_activity_desc = bound_activity_description(desc)
-        self._last_activity_provenance = normalize_activity_provenance(provenance)
+        # Ordinary call sites pass no provenance; default it to the session's
+        # OWNER (the same HERMES_SESSION_SOURCE/platform resolution the DB row
+        # uses), so a cron run stamps 'cron', a subagent 'subagent' — not
+        # 'unknown'. An explicit provenance (compression writers) still wins.
+        self._last_activity_provenance = normalize_activity_provenance(
+            provenance if provenance is not None else provenance_for_source(
+                _session_source_for_agent(getattr(self, "platform", None))
+            )
+        )
         if os.environ.get("HERMES_KANBAN_TASK"):
             try:
                 from tools.kanban_tools import (

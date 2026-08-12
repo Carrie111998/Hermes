@@ -39,13 +39,16 @@ def test_touch_activity_persists_session_activity_once_per_minute(monkeypatch):
     monkeypatch.setattr(run_agent.time, "time", lambda: 1_700_000_000.0)
     monkeypatch.setattr(run_agent.time, "monotonic", lambda: mono["t"])
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
 
     agent._touch_activity("starting API call #1")
     agent._session_db.touch_session_activity.assert_called_once_with(
         "sess-1",
         1_700_000_000.0,
         description="starting API call #1",
-        provenance=ActivityProvenance.UNKNOWN,
+        # No platform and no HERMES_SESSION_SOURCE: the honest default is the
+        # CLI source, matching what _ensure_db_session stamps on the row.
+        provenance=ActivityProvenance.SOURCE_CLI,
     )
 
     agent._session_db.touch_session_activity.reset_mock()
@@ -59,7 +62,7 @@ def test_touch_activity_persists_session_activity_once_per_minute(monkeypatch):
         "sess-1",
         1_700_000_000.0,
         description="API call #1 completed",
-        provenance=ActivityProvenance.UNKNOWN,
+        provenance=ActivityProvenance.SOURCE_CLI,
     )
 
 
@@ -72,7 +75,8 @@ def test_touch_activity_skips_persist_without_session_db(monkeypatch):
 
     agent._touch_activity("starting API call #1")
     assert agent._last_activity_desc == "starting API call #1"
-    assert agent._last_activity_provenance is ActivityProvenance.UNKNOWN
+    # Source-derived default (no platform/env → CLI), never 'unknown'.
+    assert agent._last_activity_provenance is ActivityProvenance.SOURCE_CLI
 
 
 def test_touch_activity_accepts_named_provenance(monkeypatch):
@@ -96,12 +100,12 @@ def test_touch_activity_accepts_named_provenance(monkeypatch):
     agent._session_db.touch_session_activity.reset_mock()
     agent._session_activity_last_persist_mono = 0.0
     agent._touch_activity("starting API call #1")
-    assert agent._last_activity_provenance is ActivityProvenance.UNKNOWN
+    assert agent._last_activity_provenance is ActivityProvenance.SOURCE_CLI
     agent._session_db.touch_session_activity.assert_called_once_with(
         "sess-1",
         1_700_000_000.0,
         description="starting API call #1",
-        provenance=ActivityProvenance.UNKNOWN,
+        provenance=ActivityProvenance.SOURCE_CLI,
     )
 
 
@@ -318,3 +322,48 @@ def test_compression_transition_provenances_surface_in_activity_summary(monkeypa
         assert summary["provenance"] == provenance.value
         assert summary["last_activity_description"] == desc
         assert summary["last_activity_desc"] == desc
+
+
+def test_normalize_source_provenance_values():
+    """Creator-surface provenance values resolve; garbage falls back to UNKNOWN."""
+    from agent.session_activity import normalize_activity_provenance
+
+    assert normalize_activity_provenance("cron") == ActivityProvenance("cron")
+    assert normalize_activity_provenance("cli") == ActivityProvenance("cli")
+    assert normalize_activity_provenance("subagent") == ActivityProvenance("subagent")
+    assert normalize_activity_provenance("gateway") == ActivityProvenance("gateway")
+    assert normalize_activity_provenance("acp") == ActivityProvenance("acp")
+    assert normalize_activity_provenance("garbage-value") == ActivityProvenance.UNKNOWN
+
+
+def test_touch_activity_defaults_provenance_from_platform(monkeypatch):
+    """The ordinary activity clock stamps the session's OWNER, not 'unknown' —
+    a cron run's DB row says provenance='cron', a subagent's 'subagent'."""
+    from agent.session_activity import provenance_for_source
+
+    assert provenance_for_source("cron") == ActivityProvenance.SOURCE_CRON
+    assert provenance_for_source("subagent") == ActivityProvenance.SOURCE_SUBAGENT
+    assert provenance_for_source("desktop") == ActivityProvenance.SOURCE_DESKTOP
+    assert provenance_for_source("tui") == ActivityProvenance.SOURCE_TUI
+    assert provenance_for_source("something-new") == ActivityProvenance.UNKNOWN
+
+    for platform, expected in (
+        ("cron", ActivityProvenance.SOURCE_CRON),
+        ("subagent", ActivityProvenance.SOURCE_SUBAGENT),
+        ("cli", ActivityProvenance.SOURCE_CLI),
+    ):
+        agent = _agent_with_db()
+        agent.platform = platform
+        mono = {"t": 1000.0}
+        monkeypatch.setattr(run_agent.time, "time", lambda: 1_700_000_000.0)
+        monkeypatch.setattr(run_agent.time, "monotonic", lambda: mono["t"])
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
+
+        agent._touch_activity("starting API call #1")
+        agent._session_db.touch_session_activity.assert_called_once_with(
+            "sess-1",
+            1_700_000_000.0,
+            description="starting API call #1",
+            provenance=expected,
+        )

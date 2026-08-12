@@ -305,6 +305,13 @@ def _(rid, params: dict) -> dict:
 
 @method("session.resume")
 def _(rid, params: dict) -> dict:
+    """Resume a session: register it live and read its stored transcript.
+
+    Read-only MOUNT: this never reopens an ended DB row (ended_at stays set)
+    — a session that closed is only reopened by the first real turn
+    (prompt.submit -> _reopen_if_finalized) so opening a chat cannot paint
+    liveness by itself (#liveness-stale-end).
+    """
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
@@ -449,7 +456,6 @@ def _(rid, params: dict) -> dict:
             source = _resolve_session_source(str(params.get("source") or "").strip() or None)
             lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
             try:
-                db.reopen_session(target)
                 # The child's OWN conversation only — include_ancestors would prepend
                 # the parent's transcript onto the subagent's branch.
                 # repair_alternation: this resume feeds LIVE REPLAY (the loaded
@@ -530,7 +536,6 @@ def _(rid, params: dict) -> dict:
             # the deferred build wires the remaining per-session callbacks.
             _enable_gateway_prompts()
             try:
-                db.reopen_session(target)
                 # One lineage SELECT feeds both projections (#67142-adjacent perf,
                 # from the desktop audit): the model-fed copy is alternation-repaired
                 # (raw_history → sanitize_replay_history → the resumed session's
@@ -618,7 +623,6 @@ def _(rid, params: dict) -> dict:
             else None
         )
         try:
-            db.reopen_session(target)
             # One lineage SELECT feeds both projections (see the interactive resume
             # above): the model-fed copy is alternation-repaired for LIVE REPLAY, the
             # display copy stays verbatim.
@@ -912,7 +916,12 @@ def _(rid, params: dict) -> dict:
 
     Unlike ``session.list`` this is not a historical DB browser: it reports only
     sessions with in-memory agents/workers that the current TUI can switch to
-    without closing siblings.
+    without closing siblings. It ALSO reports ``foreign`` rows — recently-active
+    sessions that exist only in state.db (cron runs, CLI one-shots, messaging
+    turns written by other processes, subagent children with a run in flight)
+    — so clients can paint cross-process liveness from the same poll. Foreign
+    rows must show REAL activity (last_active within the 90s heartbeat-ish
+    window); ``is_active`` alone would paint reopened/orphan rows live.
     """
     current = str(params.get("current_session_id") or "")
     try:
@@ -941,6 +950,73 @@ def _(rid, params: dict) -> dict:
         for sid, session in snapshot
         if not session.get("_finalized")
     ]
+
+    # Cross-process liveness (foreign rows): sessions that exist only in
+    # state.db — cron runs, CLI one-shots, messaging turns written by OTHER
+    # processes — never enter this gateway's ``_sessions``, so their stream
+    # events never reach clients. The shared SQLite file is the one thing they
+    # all move (#58671); report recently-active rows here so clients can paint
+    # them from the same poll. Same 300s recency window ``/api/sessions`` uses
+    # for its ``is_active`` flag, then narrowed to a REAL-ACTIVITY window
+    # (~1.5x the 60s agent heartbeat) — is_active alone would keep painting
+    # reopened/orphan rows live for up to 5 min (#liveness-stale-end).
+    # Best-effort: a failed DB probe must never break the in-memory answer.
+    try:
+        db = _get_db()
+        if db is not None:
+            in_memory = {sid for sid, session in snapshot if not session.get("_finalized")}
+            now = time.time()
+            for s in db.list_sessions_rich(limit=50, order_by_last_active=True, compact_rows=True):
+                sid = str(s.get("id") or "")
+                if not sid or sid in in_memory:
+                    continue
+                if s.get("ended_at") is not None:
+                    continue
+                last_active = float(s.get("last_active") or s.get("started_at") or 0)
+                if (now - last_active) >= _FOREIGN_LIVE_ACTIVITY_S:
+                    continue
+                rows.append(
+                    {
+                        "current": False,
+                        "description": str(s.get("last_activity_description") or ""),
+                        "foreign": True,
+                        "id": sid,
+                        "last_active": last_active,
+                        "message_count": int(s.get("message_count") or 0),
+                        "model": str(s.get("model") or ""),
+                        "preview": "",
+                        "provider": "",
+                        "session_key": sid,
+                        "started_at": float(s.get("started_at") or 0),
+                        "status": "working",
+                        "title": str(s.get("title") or s.get("display_name") or ""),
+                    }
+                )
+            # Subagent children with a delegation run in flight but no watch
+            # window: their own session row is live in the DB, and the child
+            # mirror only streams into an opened window.
+            for child_key in list(_active_child_runs):
+                if child_key and child_key not in in_memory:
+                    rows.append(
+                        {
+                            "current": False,
+                            "description": "subagent running",
+                            "foreign": True,
+                            "id": child_key,
+                            "last_active": float(_active_child_runs[child_key]),
+                            "message_count": 0,
+                            "model": "",
+                            "preview": "",
+                            "provider": "",
+                            "session_key": child_key,
+                            "started_at": 0.0,
+                            "status": "working",
+                            "title": "",
+                        }
+                    )
+    except Exception:
+        pass
+
     return _ok(rid, {"sessions": rows})
 
 

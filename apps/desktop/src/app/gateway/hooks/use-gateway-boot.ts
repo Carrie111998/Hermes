@@ -18,13 +18,14 @@ import {
   closeSecondaryGateways,
   configureGatewayRegistry,
   ensureGatewayForProfile,
-  pruneSecondaryGateways,
   reconnectSecondaryGateways,
+  reconcileLiveGateways,
   reportPrimaryGatewayState,
   setPrimaryGateway,
   touchSecondaryGateways
 } from '@/store/gateway'
 import { $gatewaySwitching, wipeSessionListsForGatewaySwitch } from '@/store/gateway-switch'
+import { $foreignLiveSessionIds } from '@/store/foreign-live'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, normalizeProfileKey, touchActiveGatewayBackend } from '@/store/profile'
 import {
@@ -457,7 +458,11 @@ export function useGatewayBoot({
     // Once that profile goes idle its socket is dropped and its backend is free
     // to idle-reap. The active profile is always spared.
     const recomputeKeptGateways = () => {
-      const live = new Set([...$workingSessionIds.get(), ...$attentionSessionIds.get()])
+      const live = new Set([
+        ...$workingSessionIds.get(),
+        ...$attentionSessionIds.get(),
+        ...$foreignLiveSessionIds.get()
+      ])
       const keep = new Set<string>()
 
       for (const session of $sessions.get()) {
@@ -466,11 +471,14 @@ export function useGatewayBoot({
         }
       }
 
-      pruneSecondaryGateways(keep)
+      // Open sockets for profiles with live rows the user never touched
+      // (DB-fresh foreign liveness), then prune the genuinely idle ones.
+      reconcileLiveGateways(keep)
     }
 
     const offWorking = $workingSessionIds.subscribe(() => recomputeKeptGateways())
     const offAttention = $attentionSessionIds.subscribe(() => recomputeKeptGateways())
+    const offForeignLive = $foreignLiveSessionIds.subscribe(() => recomputeKeptGateways())
     const offActiveProfile = $activeGatewayProfile.subscribe(() => recomputeKeptGateways())
 
     const offWindowState = desktop.onWindowStateChanged?.(payload => {
@@ -631,6 +639,7 @@ export function useGatewayBoot({
       clearInterval(keepaliveTimer)
       offWorking()
       offAttention()
+      offForeignLive()
       offActiveProfile()
       window.removeEventListener('online', onOnline)
       document.removeEventListener('visibilitychange', onVisible)

@@ -345,10 +345,20 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         }
 
         return
+      } else if (event.type === 'sessions.changed') {
+        // The backend's on-disk signature moved — ANY profile's state.db
+        // writes (a background profile's own serve, a foreign CLI/cron
+        // process) move this profile's list too, so refresh regardless of
+        // which profile's socket delivered the broadcast.
+        notifySessionsChanged()
+
+        return
+      } else if (event.type === 'cron.changed') {
+        notifyCronChanged()
+
+        return
       } else if (
         event.type === 'pet.changed' ||
-        event.type === 'cron.changed' ||
-        event.type === 'sessions.changed' ||
         event.type === 'platforms.changed' ||
         event.type === 'pairing.changed'
       ) {
@@ -362,14 +372,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         if (fromActiveChangeProfile) {
           if (event.type === 'pet.changed') {
             notifyPetChanged(payload as PetChangeMeta | undefined)
-          } else if (event.type === 'cron.changed') {
-            notifyCronChanged()
           } else if (event.type === 'platforms.changed') {
             notifyPlatformsChanged()
-          } else if (event.type === 'pairing.changed') {
-            notifyPairingChanged()
           } else {
-            notifySessionsChanged()
+            notifyPairingChanged()
           }
         }
 
