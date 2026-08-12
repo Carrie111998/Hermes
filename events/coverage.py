@@ -44,13 +44,19 @@ every absent member. It reports; it never repairs — see its docstring.
 Discovery, not just a hand-written list
 ---------------------------------------
 :func:`discover_tables` walks the whole ``events`` package and finds every
-module-level dict keyed entirely by ``EventType``. Anything it finds that is not
-named in :data:`MANIFEST` is reported as *unclassified* — so a new sibling table
-added later is covered automatically, and whoever adds it has to say once
-whether it is total or deliberately partial. Only dicts are discovered: a total
-contract is a property of a *lookup* table, whereas the ``frozenset``s in this
-package (``JOBFLOW_DEMOTE_TYPES``, ``_NEVER_CONSUME``, the ``outcomes`` verdict
-sets) are membership filters that are partial by construction.
+module-level mapping keyed entirely by ``EventType``. Anything it finds that is
+not named in :data:`MANIFEST` is reported as *unclassified* — so a new sibling
+table added later is covered automatically, and whoever adds it has to say once
+whether it is total or deliberately partial. Only *mappings* are discovered: a
+total contract is a property of a *lookup* table, whereas the ``frozenset``s in
+this package (``JOBFLOW_DEMOTE_TYPES``, ``_NEVER_CONSUME``, the ``outcomes``
+verdict sets) are membership filters that are partial by construction.
+
+``collections.abc.Mapping``, not ``dict``, deliberately: ``EVENT_TYPE_EMOJI`` is
+a ``MappingProxyType`` (a read-only view derived from the enum), and a
+``MappingProxyType`` is not a ``dict``. Testing for ``dict`` dropped discovery
+from 5 tables to 4 and quietly took the flagship table out of the unclassified
+safety net — a blind spot in the very check whose job is to have none.
 """
 
 from __future__ import annotations
@@ -58,9 +64,10 @@ from __future__ import annotations
 import importlib
 import logging
 import pkgutil
+from collections.abc import Mapping as _MappingABC
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from events.schema import EventType
 
@@ -94,7 +101,7 @@ class TableSpec:
     def qualname(self) -> str:
         return f"{self.module}.{self.attribute}"
 
-    def resolve(self) -> Dict[EventType, object]:
+    def resolve(self) -> Mapping[EventType, object]:
         """Import the owning module and return the live table."""
         mod = importlib.import_module(self.module)
         try:
@@ -109,15 +116,38 @@ class TableSpec:
 
 # Tables that MUST have an entry for every EventType member. A miss here is a
 # real defect in delivered notifications, not merely a red test.
+#
+# TOTAL BY CONSTRUCTION vs TOTAL BY CHECK — the two entries below are no longer
+# the same kind of claim, and the difference matters when reading a green run:
+#
+#   EVENT_TYPE_EMOJI  is TOTAL BY CONSTRUCTION. It is a MappingProxyType built
+#       as ``{et: et.icon for et in EventType}``, and ``EventType.__init__``
+#       rejects a missing (TypeError) or blank (ValueError) icon at class-
+#       creation time. It CANNOT be partial while events.schema imports at all,
+#       so its line in the report is a tautology, kept deliberately: it is the
+#       regression detector for the derivation itself. If someone ever
+#       re-introduces a hand-maintained icon dict — the exact shape that drifted
+#       four times — this entry goes back to being a real check on the day it
+#       lands, with no edit to this file.
+#
+#   _POLICY           is TOTAL BY CHECK. It is an ordinary partial dict with a
+#       genuine runtime fallback in classify(), so this is the entry that can
+#       actually fail, and the one the pre-commit hook exists for. Do NOT
+#       "harden" it by back-filling unmapped types at import time: coverage.py
+#       reads _POLICY after import, so a back-fill makes this check report
+#       79/79 on a table that IS missing an entry. That false green is why the
+#       2026-08-11 icon-hardening branch (archive/eventtype-icon-as-enum-field-
+#       20260811) was rejected as-is rather than landed.
 REQUIRED_TOTAL: Tuple[TableSpec, ...] = (
     TableSpec(
         "events.formatting",
         "EVENT_TYPE_EMOJI",
         total=True,
         why=(
-            "event_icon() returns '' for a missing entry, so the Telegram/"
-            "WhatsApp header renders with a double-space gap and no visual "
-            "scan token"
+            "event_icon() renders the Telegram/WhatsApp header's visual scan "
+            "token; a missing entry used to leave a double-space gap. Now "
+            "total by construction (derived from EventType.icon) — a failure "
+            "here means the derivation was replaced by a hand-maintained dict"
         ),
     ),
     TableSpec(
@@ -186,7 +216,7 @@ class DiscoveredTable:
         return self.qualnames[0]
 
 
-def missing_members(table: Dict[EventType, object]) -> List[str]:
+def missing_members(table: Mapping[EventType, object]) -> List[str]:
     """Return the type strings absent from ``table``, in enum declaration order.
 
     A key mapped to a falsy value (``""``, ``None``) counts as missing: an empty
@@ -196,7 +226,7 @@ def missing_members(table: Dict[EventType, object]) -> List[str]:
 
 
 def log_missing_members(
-    table: Dict[EventType, object],
+    table: Mapping[EventType, object],
     qualname: str,
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[str, ...]:
@@ -286,19 +316,23 @@ def _walk_event_modules() -> Tuple[Tuple[str, ...], Tuple[Tuple[str, str], ...]]
 
 
 def discover_tables() -> Tuple[DiscoveredTable, ...]:
-    """Find every module-level dict in ``events`` keyed entirely by EventType.
+    """Find every module-level mapping in ``events`` keyed entirely by EventType.
 
     Results are deduped by object identity, so a table imported into a second
     module is reported once with both qualified names.
+
+    The isinstance test is against ``collections.abc.Mapping``, not ``dict``, so
+    that a ``MappingProxyType`` (how ``EVENT_TYPE_EMOJI`` is now exposed) is
+    still discovered — see the module docstring.
     """
     imported, _failures = _walk_event_modules()
     by_id: Dict[int, List[str]] = {}
-    tables: Dict[int, Dict[EventType, object]] = {}
+    tables: Dict[int, Mapping[EventType, object]] = {}
 
     for module_name in imported:
         mod = importlib.import_module(module_name)
         for attribute, value in vars(mod).items():
-            if not isinstance(value, dict) or not value:
+            if not isinstance(value, _MappingABC) or not value:
                 continue
             if not all(isinstance(key, EventType) for key in value):
                 continue
