@@ -6,6 +6,13 @@ plugin. Discovers test files under ``tests/`` (excluding integration/e2e
 unless explicitly requested), then runs one ``python -m pytest <file>``
 subprocess per file, with bounded parallelism (default: ``os.cpu_count()``).
 
+Concurrency is bounded twice over. ``-j`` bounds THIS invocation; a
+machine-global slot limiter bounds every invocation on the host together,
+so two concurrent runs take turns instead of stacking to 2x the core
+count. A commit-charge gate additionally holds off a spawn while memory
+is tight. See the "Host-saturation guards" block below for why both exist
+(2026-08-12: ~50 stacked workers starved a dashboard boot for 29 minutes).
+
 Why per-file rather than per-test?
     Per-test spawn overhead (~250ms × 17k tests = 70min CPU minimum)
     swamped the actual work. Per-file spawn (~250ms × ~850 files = ~3.5min)
@@ -33,6 +40,13 @@ Usage:
 Environment:
     HERMES_TEST_WORKERS  Override worker count (default: os.cpu_count())
     HERMES_TEST_PATHS    Override discovery roots (colon-sep, default: 'tests')
+
+    NOTE: scripts/run_tests.sh execs this script under ``env -i`` with an
+    explicit allowlist, so a variable only reaches us if that allowlist
+    names it. The host-saturation guards are therefore configured by CLI
+    flag (--no-host-limit / --host-slots / --min-free-commit-gb), not by
+    environment, and key their state off ``Path.home()`` — one of the few
+    things that survives the clean environment.
 
 Exit code: 0 if every file's pytest exited 0; 1 otherwise.
 """
@@ -109,6 +123,339 @@ _DURATIONS_FILE = "test_durations.json"
 # pure helpers don't dirty the filesystem.
 _BASETEMP_ROOT: Path | None = None
 _basetemp_lock = threading.Lock()
+
+
+# ── Host-saturation guards ──────────────────────────────────────────────
+# On 2026-08-12 a Hermes dashboard startup was starved for 29 minutes and
+# died without ever reaching its uvicorn bind: 5.1s CPU / 3 threads / 83MB
+# RSS after 29 min, against 6.1s / 6 threads / 110MB for a healthy boot.
+# RSS *below* the healthy figure is the tell — the working set was never
+# faulted in. That is thrashing, not a deadlock.
+#
+# The trigger was ~50 concurrent pytest subprocesses on a 12-core box.
+# Nothing here could have produced 50 from one invocation (the old default
+# topped out at cpu_count*2 = 24), so at least two invocations stacked.
+# Three separate gaps allowed it, and each has its own guard below:
+#
+#   1. The default was cpu_count*2 despite the docstring promising
+#      cpu_count. -j 24 is known to oversubscribe this host; the failure
+#      tail vanishes at -j 12.  →  _default_worker_count()
+#   2. Nothing coordinated across invocations, and a per-process
+#      semaphore cannot: the stacking runs live in different worktrees,
+#      in different shells, with no shared parent.  →  _acquire_global_slot()
+#   3. Nothing consulted memory pressure, even though the resource that
+#      actually ran out was commit charge, not CPU.  →  _await_commit_headroom()
+#
+# Why file locks rather than a named semaphore or a PID registry: an OS
+# file lock is released by the kernel when the holding process dies, however
+# it dies. A registry of PIDs (or a counter file) would need stale-entry
+# reaping, and a reaper that runs while the box is thrashing is exactly the
+# code least likely to get scheduled. Ctrl-C'ing a run must never wedge the
+# host, and with file locks that is a property of the kernel, not of our
+# cleanup path.
+
+# Machine-global slot directory. This must sit OUTSIDE any repo: the
+# invocations we need to serialize typically run in different git
+# worktrees, so a repo-relative path would give each its own private
+# limiter and coordinate nothing.
+#
+# ``Path.home()`` (not an env var) is deliberate. scripts/run_tests.sh
+# execs the runner under ``env -i`` with a fixed allowlist, so almost
+# every HERMES_* variable is stripped before main() ever sees it —
+# HOME/USERPROFILE are among the few that survive. A limiter keyed on an
+# env var would silently no-op through the primary entry point.
+_SLOT_DIR_NAME = Path(".hermes") / "locks" / "test-slots"
+
+# How long to wait for commit headroom before giving up and spawning
+# anyway (loudly). Bounded on purpose: if the box is out of commit for a
+# reason unrelated to us, blocking forever converts a slow suite into a
+# hung one, which is a worse failure than the one we are preventing.
+_DEFAULT_COMMIT_WAIT_SECONDS = 120.0
+
+# Commit headroom required before spawning another pytest subprocess.
+# A worker costs roughly 200-400MB here, so ~4GB keeps a full complement
+# of in-flight workers plus the OS and the resident Hermes services
+# (gateway, mempalace, gbrain) off the cliff edge.
+_DEFAULT_MIN_FREE_COMMIT_BYTES = 4 * 1024**3
+
+_commit_warned = threading.Event()
+_slot_wait_warned = threading.Event()
+
+# Invocation-scoped limiter config, populated by main(). Module-level so
+# the worker threads can read it without threading it through every call
+# site (same pattern as _SKIP_PARTS).
+_HOST_LIMIT_ENABLED = True
+_SLOT_CAPACITY = max(1, os.cpu_count() or 4)
+# None means "resolve via _default_slot_dir() on first use". Not eagerly
+# resolved here: _default_slot_dir() is defined below, and a literal path
+# default risks scattering lock files into whatever cwd an importer has.
+_SLOT_DIR: "Path | None" = None
+_MIN_FREE_COMMIT = _DEFAULT_MIN_FREE_COMMIT_BYTES
+
+
+def _default_worker_count() -> int:
+    """Default ``-j``: one worker per core, never a multiple of it.
+
+    Historically ``cpu_count * 2``, on the theory that per-file pytest
+    subprocesses are partly I/O bound (interpreter startup, imports) so
+    the box could absorb the oversubscription. It cannot: each worker is
+    a full CPython process with the repo's import graph resident, so the
+    cost that actually binds is committed memory, and doubling the worker
+    count doubles it.
+    """
+    return max(1, os.cpu_count() or 4)
+
+
+def _global_slot_capacity() -> int:
+    """Total pytest subprocesses allowed on this HOST, across all runs."""
+    return max(1, os.cpu_count() or 4)
+
+
+def _default_slot_dir() -> Path:
+    """Machine-global slot directory, with a temp-dir fallback.
+
+    ``Path.home()`` raises when the home directory is unresolvable. That
+    must not take down the test runner at import time, so fall back to the
+    shared temp root — still machine-global, which is the property the
+    limiter actually needs.
+    """
+    try:
+        return Path.home() / _SLOT_DIR_NAME
+    except (RuntimeError, OSError):
+        return Path(tempfile.gettempdir()) / "hermes-test-slots"
+
+
+def _try_lock(handle) -> bool:
+    """Take an exclusive, non-blocking OS lock on *handle*'s first byte."""
+    if sys.platform == "win32":
+        import msvcrt
+
+        try:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    else:
+        import fcntl
+
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+
+
+def _slot_dir_usable(slot_dir: "Path | str") -> bool:
+    """True if *slot_dir* exists (or can be created) and can hold locks.
+
+    Kept separate from acquisition because "cannot use slots at all" and
+    "every slot is currently busy" demand opposite responses — proceed
+    immediately vs. wait for a peer to finish. Collapsing them into one
+    ``None`` return made an uncreatable directory (read-only HOME, exotic
+    sandbox) spin forever instead of degrading to unlimited.
+    """
+    try:
+        Path(slot_dir).mkdir(parents=True, exist_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def _try_acquire_any_slot(capacity: int, slot_dir: "Path | str"):
+    """Grab any free slot, or return None if all *capacity* are taken.
+
+    Returns the open file handle on success — the caller must keep it
+    alive for as long as it holds the slot, since closing the file drops
+    the lock. Pass it to :func:`_release_slot` when done.
+    """
+    directory = Path(slot_dir)
+    if not _slot_dir_usable(directory):
+        return None
+
+    for index in range(capacity):
+        path = directory / f"slot-{index:02d}.lock"
+        try:
+            handle = open(path, "a+b")
+        except OSError:
+            continue
+        # msvcrt.locking() needs a byte to actually exist at the offset.
+        try:
+            if handle.seek(0, os.SEEK_END) == 0:
+                handle.write(b"\0")
+                handle.flush()
+        except OSError:
+            handle.close()
+            continue
+        if _try_lock(handle):
+            return handle
+        handle.close()
+    return None
+
+
+def _release_slot(handle) -> None:
+    """Drop a slot acquired via :func:`_try_acquire_any_slot`."""
+    if handle is None:
+        return
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        # Closing the handle releases the lock regardless.
+        pass
+    try:
+        handle.close()
+    except OSError:
+        pass
+
+
+class _acquire_global_slot:
+    """Context manager holding one machine-global test-execution slot.
+
+    Blocks until a slot frees up. Blocking is the intended behaviour: two
+    concurrent invocations should take turns rather than both running at
+    full width. The wait is announced once so a run that looks stalled is
+    explicable.
+    """
+
+    def __init__(
+        self,
+        capacity: int,
+        slot_dir: "Path | str | None" = None,
+        enabled: bool = True,
+    ):
+        self._capacity = capacity
+        self._slot_dir = _default_slot_dir() if slot_dir is None else slot_dir
+        self._enabled = enabled
+        self._handle = None
+
+    def __enter__(self):
+        if not self._enabled:
+            return self
+        if not _slot_dir_usable(self._slot_dir):
+            # No lockable location. Degrade to the historical unlimited
+            # behaviour rather than blocking tests from running at all.
+            if not _slot_wait_warned.is_set():
+                _slot_wait_warned.set()
+                print(
+                    f"  [host-limit] cannot create slot dir {self._slot_dir} — "
+                    f"running without a machine-global limit.",
+                    flush=True,
+                )
+            return self
+        while True:
+            self._handle = _try_acquire_any_slot(self._capacity, self._slot_dir)
+            if self._handle is not None:
+                return self
+            if not _slot_wait_warned.is_set():
+                _slot_wait_warned.set()
+                print(
+                    f"  [host-limit] all {self._capacity} machine-global test "
+                    f"slots are busy — another test run is active on this box. "
+                    f"Waiting rather than stacking on top of it.",
+                    flush=True,
+                )
+            # Poll rather than block on a single slot: waiting on slot 0
+            # specifically would ignore slot 5 freeing up first.
+            time.sleep(0.25)
+
+    def __exit__(self, *exc_info) -> None:
+        _release_slot(self._handle)
+        self._handle = None
+        return None
+
+
+def _available_commit_bytes() -> "int | None":
+    """Bytes of commit charge still available, or None if unknown.
+
+    Commit — not physical RAM — is the metric that matters. The 08-12
+    incident exhausted commit while physical memory still showed free
+    pages, so a ``virtual_memory()``-style reading would have reported a
+    healthy box right up until the dashboard died.
+    """
+    if sys.platform == "win32":
+        import ctypes
+
+        class _MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+        try:
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return None
+        except (OSError, AttributeError):
+            return None
+        # ullAvailPageFile is "how much more can be committed" — exactly
+        # the headroom a new process needs to reserve its working set.
+        return int(status.ullAvailPageFile)
+
+    # POSIX: MemAvailable + SwapFree is the closest analogue to Windows'
+    # commit headroom.
+    try:
+        values: dict[str, int] = {}
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                key, _, rest = line.partition(":")
+                if key in ("MemAvailable", "SwapFree"):
+                    values[key] = int(rest.strip().split()[0]) * 1024
+        if "MemAvailable" not in values:
+            return None
+        return values["MemAvailable"] + values.get("SwapFree", 0)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _await_commit_headroom(
+    min_free_bytes: int = _DEFAULT_MIN_FREE_COMMIT_BYTES,
+    deadline_seconds: float = _DEFAULT_COMMIT_WAIT_SECONDS,
+) -> bool:
+    """Wait for *min_free_bytes* of commit headroom.
+
+    Returns True once headroom is available, False if the deadline passed
+    first — in which case the caller spawns anyway. Returning False rather
+    than raising is deliberate: a runner that refuses to run tests when
+    memory looks tight would be its own outage.
+
+    Also returns True when headroom is unmeasurable, so an unsupported
+    platform degrades to today's behaviour rather than stalling.
+    """
+    if min_free_bytes <= 0:
+        return True
+    deadline = time.monotonic() + max(0.0, deadline_seconds)
+    while True:
+        available = _available_commit_bytes()
+        if available is None or available >= min_free_bytes:
+            return True
+        if time.monotonic() >= deadline:
+            if not _commit_warned.is_set():
+                _commit_warned.set()
+                print(
+                    f"  [host-limit] only {available / 1024**3:.1f}GB commit free "
+                    f"(want {min_free_bytes / 1024**3:.1f}GB) after "
+                    f"{deadline_seconds:.0f}s — spawning anyway. Expect slow "
+                    f"tests and starved background services.",
+                    flush=True,
+                )
+            return False
+        time.sleep(0.5)
 
 
 def _basetemp_for(file: Path, repo_root: Path) -> Path:
@@ -371,6 +718,23 @@ def _run_one_file_once(
     file_timeout: float,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
+    # Two host-saturation guards, both held for the FULL lifetime of the
+    # subprocess rather than just its spawn. A slot released at spawn time
+    # would bound the spawn rate but not the number of workers actually
+    # resident, which is the quantity that exhausts commit.
+    with _acquire_global_slot(_SLOT_CAPACITY, _SLOT_DIR, enabled=_HOST_LIMIT_ENABLED):
+        if _HOST_LIMIT_ENABLED:
+            _await_commit_headroom(min_free_bytes=_MIN_FREE_COMMIT)
+        return _spawn_pytest(file, pytest_args, repo_root, file_timeout)
+
+
+def _spawn_pytest(
+    file: Path,
+    pytest_args: List[str],
+    repo_root: Path,
+    file_timeout: float,
+) -> Tuple[Path, int, str, dict[str, int], float]:
+    """Run one pytest subprocess to completion (no concurrency guards)."""
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
     # Give each file its own tmp_path base so concurrent subprocesses can't
     # delete one another's numbered pytest temp roots during retention
@@ -730,8 +1094,41 @@ def main() -> int:
         "-j",
         "--jobs",
         type=int,
-        default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4) * 2),
-        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count*2)",
+        default=int(os.environ.get("HERMES_TEST_WORKERS") or _default_worker_count()),
+        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count)",
+    )
+    parser.add_argument(
+        "--no-host-limit",
+        action="store_true",
+        help=(
+            "Disable the machine-global concurrency slot limiter and the "
+            "commit-pressure spawn gate. A CLI flag rather than an env var "
+            "because scripts/run_tests.sh execs under 'env -i', which strips "
+            "HERMES_* vars before this process starts."
+        ),
+    )
+    parser.add_argument(
+        "--host-slots",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Total pytest subprocesses allowed on this HOST across ALL "
+            f"concurrent invocations (default: cpu_count = {_global_slot_capacity()})."
+        ),
+    )
+    parser.add_argument(
+        "--min-free-commit-gb",
+        type=float,
+        default=_DEFAULT_MIN_FREE_COMMIT_BYTES / 1024**3,
+        metavar="GB",
+        help=(
+            "Wait for this much free commit charge before spawning a worker "
+            "(0 disables). After "
+            f"{_DEFAULT_COMMIT_WAIT_SECONDS:.0f}s the runner spawns anyway "
+            "with a warning rather than hanging. Default: "
+            f"{_DEFAULT_MIN_FREE_COMMIT_BYTES / 1024**3:.0f}GB."
+        ),
     )
     parser.add_argument(
         "--paths",
@@ -829,6 +1226,7 @@ def main() -> int:
     OUR_FLAGS = {
         "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
+        "--no-host-limit", "--host-slots", "--min-free-commit-gb",
     }
     # pytest short flags that consume the NEXT token as their value.
     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
@@ -887,6 +1285,13 @@ def main() -> int:
         except (ValueError, AttributeError):
             print(f"error: --slice must be I/N (e.g. 1/4), got: {slice_raw!r}", file=sys.stderr)
             sys.exit(2)
+
+    # Publish limiter config for the worker threads before any spawn.
+    global _HOST_LIMIT_ENABLED, _SLOT_CAPACITY, _SLOT_DIR, _MIN_FREE_COMMIT  # noqa: PLW0603 — config knobs
+    _HOST_LIMIT_ENABLED = not args.no_host_limit
+    _SLOT_CAPACITY = max(1, args.host_slots or _global_slot_capacity())
+    _SLOT_DIR = _default_slot_dir()
+    _MIN_FREE_COMMIT = int(max(0.0, args.min_free_commit_gb) * 1024**3)
 
     repo_root = Path(__file__).resolve().parent.parent
 

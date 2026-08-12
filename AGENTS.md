@@ -1310,6 +1310,31 @@ negative-timing races).
 Every test file runs in a freshly-spawned Python subprocess via `run_tests_parallel.py`. This means module-level dicts/sets and
 ContextVars from one test file cannot leak into the next.
 
+#### Host-saturation guards
+
+Concurrency is bounded twice. `-j` bounds a single invocation (default:
+`os.cpu_count()`). A **machine-global slot limiter** bounds every invocation on
+the box together, so two concurrent runs — typically in different worktrees —
+take turns instead of stacking to 2x the core count. A **commit-charge gate**
+additionally holds off a spawn while memory is tight, then spawns anyway with a
+warning after 120s rather than hanging.
+
+This exists because on 2026-08-12 ~50 stacked pytest subprocesses exhausted
+commit on this 12-core box and starved a Hermes dashboard boot for 29 minutes
+(5.1s CPU / 3 threads / 83MB RSS after 29 min, vs 6.1s / 6 / 110MB healthy —
+RSS *below* healthy means the working set never faulted in: thrashing, not a
+deadlock). Measured: two `-j 12` invocations peak at 24 concurrent workers
+unlimited, 12 with the limiter.
+
+Escape hatches are **CLI flags, not env vars** — `run_tests.sh` execs under
+`env -i`, so anything not in its allowlist never reaches the runner:
+
+```bash
+scripts/run_tests.sh --no-host-limit        # disable both guards
+scripts/run_tests.sh --host-slots 8         # host-wide ceiling
+scripts/run_tests.sh --min-free-commit-gb 0 # disable just the memory gate
+```
+
 #### Why the wrapper
 
 |                     | Without wrapper                             | With wrapper                              |
