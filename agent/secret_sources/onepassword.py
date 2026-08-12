@@ -526,6 +526,45 @@ class OnePasswordSource(SecretSource):
             token_env = str(cfg.get("service_account_token_env") or token_env)
         return frozenset({token_env})
 
+    def stale_secrets(
+        self, cfg: dict, home_path: Path
+    ) -> Optional[Tuple[Dict[str, str], float]]:
+        """Most recent complete disk-cached pull for this config, or None.
+
+        Backs the orchestrator's stale-cache fallback (see
+        ``SecretSource.stale_secrets``).  Only a complete, error-free pull is
+        ever written to the disk cache, so what this returns is exactly "the
+        last known-good set".  The cache key folds in the auth fingerprint:
+        a rotated/absent token can never resurrect values cached under a
+        different identity.  Honours the cache opt-out (TTL <= 0 → None).
+        """
+        cfg = cfg if isinstance(cfg, dict) else {}
+        try:
+            ttl = float(cfg.get("cache_ttl_seconds", 300))
+        except (TypeError, ValueError):
+            ttl = 300.0
+        if ttl <= 0:
+            return None
+        env_map = cfg.get("env")
+        valid, _ = _validate_references(
+            env_map if isinstance(env_map, dict) else None
+        )
+        if not valid:
+            return None
+        token_env = str(
+            cfg.get("service_account_token_env") or _DEFAULT_TOKEN_ENV
+        )
+        cache_key: _CacheKey = (
+            _auth_fingerprint(token_env),
+            str(cfg.get("account") or ""),
+            str(home_path) if home_path is not None else "",
+            _refs_fingerprint(valid),
+        )
+        entry = _DISK_CACHE.read(cache_key, float("inf"), home_path)
+        if entry is None or not entry.secrets:
+            return None
+        return dict(entry.secrets), max(0.0, time.time() - entry.fetched_at)
+
     def config_schema(self) -> dict:
         return {
             "enabled": {"description": "Master switch", "default": False},
@@ -616,6 +655,19 @@ class OnePasswordSource(SecretSource):
 
         result.secrets = secrets
         result.warnings.extend(fetch_warnings)
+        if valid and not secrets and fetch_warnings:
+            # Every reference failed (one warning per ref).  Report a real,
+            # classified error instead of ok-with-empty-secrets: an "ok"
+            # here lets the process start with no credentials at all — the
+            # 2026-07-27 incident shape (12/12 refs down, 11 consumers
+            # silent for 15 h) — and hides the failure from the
+            # orchestrator's kind-dependent stale-cache fallback.
+            first = fetch_warnings[0]
+            result.error = (
+                f"all {len(valid)} op:// reference(s) failed to resolve — "
+                f"first error: {first[:200]}"
+            )
+            result.error_kind = _classify_op_error(first)
         return result
 
     def remediation(self, kind, cfg: dict) -> str:
