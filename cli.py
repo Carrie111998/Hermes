@@ -2918,6 +2918,58 @@ def _rich_text_from_ansi(text: str) -> _RichText:
 def _strip_markdown_syntax(text: str) -> str:
     """Best-effort markdown marker removal for plain-text display."""
     plain = _rich_text_from_ansi(text or "").plain
+
+    # Shelve code before marker removal.  Without this, dunder identifiers
+    # (``__name__``) and ``**`` exponentiation inside code get eaten by the
+    # emphasis regexes below (``if __name__ == ...`` would render as
+    # ``if name == ...``).  Fence markers are still dropped and inline
+    # backticks still unwrapped, as before — only the *contents* are
+    # protected from being interpreted as markdown.  See issue #84377.
+    _shelved: list[str] = []
+    _CODE_PLACEHOLDER = "\x00__HERMES_CODE_{}__\x00"
+
+    def _shelve(match: re.Match[str]) -> str:
+        _shelved.append(match.group(1))
+        return _CODE_PLACEHOLDER.format(len(_shelved) - 1)
+
+    # Fenced blocks: drop the fence lines (keeping any info string, matching
+    # the old fence-marker-only removal) and shelve the body verbatim.
+    _out_lines: list[str] = []
+    _in_fence = False
+    _fence_char = ""
+    _fence_body: list[str] = []
+    for _line in plain.split("\n"):
+        _fm = re.match(r"^\s*(`{3,}|~{3,})", _line)
+        if _fm is None:
+            if _in_fence:
+                _fence_body.append(_line)
+            else:
+                _out_lines.append(_line)
+            continue
+        _marker = _fm.group(1)
+        _trailing = _line[_fm.end():]
+        if not _in_fence:
+            _in_fence = True
+            _fence_char = _marker[0]
+            _fence_body = []
+            if _trailing.strip():
+                _out_lines.append(_trailing.lstrip())
+        elif _marker[0] == _fence_char and not _trailing.strip():
+            _in_fence = False
+            _shelved.append("\n".join(_fence_body))
+            _out_lines.append(_CODE_PLACEHOLDER.format(len(_shelved) - 1))
+        else:
+            # Different fence char or trailing content: body line, not a closer.
+            _fence_body.append(_line)
+    if _in_fence:
+        # Unterminated block — body stays visible, just protected.
+        _shelved.append("\n".join(_fence_body))
+        _out_lines.append(_CODE_PLACEHOLDER.format(len(_shelved) - 1))
+    plain = "\n".join(_out_lines)
+
+    # Inline code spans: unwrap the backticks but protect the contents.
+    plain = re.sub(r"`([^`]*)`", _shelve, plain)
+
     # Avoid stripping cron-style expressions like "* * * * *" as if they were
     # Markdown horizontal rules. CommonMark treats three or more "*" as an HR,
     # but in Hermes output it's common to display cron schedules verbatim.
@@ -2929,7 +2981,6 @@ def _strip_markdown_syntax(text: str) -> str:
     plain = re.sub(r"^\s{0,3}#{1,6}\s+", "", plain, flags=re.MULTILINE)
     # Preserve blockquotes, lists, and checkboxes because they carry structure.
     plain = re.sub(r"(```+|~~~+)", "", plain)
-    plain = re.sub(r"`([^`]*)`", r"\1", plain)
     plain = re.sub(r"!\[([^\]]*)\]\([^\)]*\)", r"\1", plain)
     plain = re.sub(r"\[([^\]]+)\]\([^\)]*\)", r"\1", plain)
     plain = re.sub(r"\*\*\*([^*]+)\*\*\*", r"\1", plain)
@@ -2942,6 +2993,12 @@ def _strip_markdown_syntax(text: str) -> str:
     plain = re.sub(r"(?<!\w)_([^_]+)_(?!\w)", r"\1", plain)
     plain = re.sub(r"~~([^~]+)~~", r"\1", plain)
     plain = re.sub(r"\n{3,}", "\n\n", plain)
+
+    # Restore shelved code verbatim.
+    def _restore(match: re.Match[str]) -> str:
+        return _shelved[int(match.group(1))]
+
+    plain = re.sub(_CODE_PLACEHOLDER.format(r"(\d+)"), _restore, plain)
     return plain.strip("\n")
 
 

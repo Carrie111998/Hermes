@@ -102,3 +102,54 @@ def test_strip_mode_still_strips_boundary_underscore_emphasis():
 
     output = _render_to_text(renderable)
     assert "say hi and bold now" in output
+
+
+def test_strip_mode_preserves_dunder_identifiers_in_fenced_code():
+    # Regression: #84377 — dunder identifiers and ** operators inside
+    # fenced code blocks must render verbatim, not be eaten as emphasis.
+    renderable = _render_final_assistant_content(
+        "```python\n"
+        'if __name__ == "__main__":\n'
+        "    total = a**2 + b**2\n"
+        "```",
+        mode="strip",
+    )
+
+    output = _render_to_text(renderable)
+    assert 'if __name__ == "__main__":' in output
+    assert "total = a**2 + b**2" in output
+
+
+def test_strip_mode_preserves_dunders_in_unterminated_fence():
+    # A fence without a closing marker still marks the intent as code.
+    renderable = _render_final_assistant_content(
+        "```\nvalue = __all__[0]\n",
+        mode="strip",
+    )
+
+    output = _render_to_text(renderable)
+    assert "value = __all__[0]" in output
+
+
+def test_strip_mode_preserves_emphasis_in_inline_code():
+    # Regression: #84377 — inline code spans keep ** and __ verbatim while
+    # prose emphasis around them is still stripped.
+    renderable = _render_final_assistant_content(
+        "Run `a**2` and guard with `if __name__ == '__main__':` now",
+        mode="strip",
+    )
+
+    output = _render_to_text(renderable)
+    assert "a**2" in output
+    assert "__name__" in output
+
+
+def test_strip_mode_still_strips_prose_emphasis_outside_code():
+    renderable = _render_final_assistant_content(
+        "**bold** prose and `**not bold**` code",
+        mode="strip",
+    )
+
+    output = _render_to_text(renderable)
+    assert "bold prose and" in output
+    assert "**not bold**" in output
