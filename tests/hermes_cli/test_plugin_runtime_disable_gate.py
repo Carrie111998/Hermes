@@ -20,14 +20,29 @@ from unittest.mock import patch, AsyncMock
 import pytest
 
 from hermes_cli import web_server
+from hermes_cli.plugin_activation import PluginActivationState
+
+
+def _activation(*, enabled=(), disabled=(), safe_mode=False):
+    return PluginActivationState(
+        enabled=frozenset(enabled),
+        disabled=frozenset(disabled),
+        safe_mode=safe_mode,
+    )
 
 
 @pytest.fixture(autouse=True)
 def _reset_plugin_cache():
     """Bust the plugin cache before and after each test."""
+    mounted_owners = dict(web_server._mounted_plugin_api_owners)
     web_server._dashboard_plugins_cache = None
+    web_server._dashboard_plugins_cache_fingerprint = None
+    web_server._mounted_plugin_api_owners.clear()
     yield
     web_server._dashboard_plugins_cache = None
+    web_server._dashboard_plugins_cache_fingerprint = None
+    web_server._mounted_plugin_api_owners.clear()
+    web_server._mounted_plugin_api_owners.update(mounted_owners)
 
 
 @pytest.fixture
@@ -83,6 +98,37 @@ def _make_bundled_plugin(tmp_path, name="bundledx"):
     return dashboard_dir
 
 
+def _make_bundled_runtime_plugin(root, directory, *, key, dashboard_name):
+    """Create a bundled runtime plugin claiming a dashboard route name."""
+    plugin_root = root / directory
+    dashboard_dir = plugin_root / "dashboard"
+    dashboard_dir.mkdir(parents=True)
+    (plugin_root / "plugin.yaml").write_text(
+        f"name: {key}\nkind: backend\nversion: 1.0.0\n"
+    )
+    (dashboard_dir / "manifest.json").write_text(json.dumps({
+        "name": dashboard_name,
+        "label": dashboard_name,
+        "entry": "dist/index.js",
+    }))
+    return dashboard_dir
+
+
+def _make_project_plugin(project_root, name="project-extension"):
+    """Create a dashboard-only project extension with a browser asset."""
+    dashboard_dir = project_root / ".hermes" / "plugins" / name / "dashboard"
+    dashboard_dir.mkdir(parents=True)
+    dist_dir = dashboard_dir / "dist"
+    dist_dir.mkdir()
+    (dist_dir / "index.js").write_text("console.log('project');")
+    (dashboard_dir / "manifest.json").write_text(json.dumps({
+        "name": name,
+        "label": "Project Extension",
+        "entry": "dist/index.js",
+    }))
+    return dashboard_dir
+
+
 # ---------------------------------------------------------------------------
 # Test 1: Runtime-disabled user plugin API routes return 404
 # ---------------------------------------------------------------------------
@@ -118,9 +164,14 @@ class TestPluginApiRuntimeGate:
 
         call_next = AsyncMock(return_value=JSONResponse({"ok": True}))
 
-        with patch.object(web_server, "_get_dashboard_plugins", return_value=[fake_plugin]), \
-             patch("hermes_cli.plugins_cmd._get_enabled_set", return_value={"hot"}), \
-             patch("hermes_cli.plugins_cmd._get_disabled_set", return_value={"hot"}):
+        with patch.dict(
+            web_server._mounted_plugin_api_owners,
+            {"hot": fake_plugin},
+            clear=True,
+        ), patch(
+            "hermes_cli.config.load_plugin_activation_state",
+            return_value=_activation(enabled={"hot"}, disabled={"hot"}),
+        ):
             response = await web_server._plugin_api_runtime_gate(request, call_next)
 
         assert response.status_code == 404
@@ -171,8 +222,194 @@ class TestPluginApiRuntimeGate:
         call_next = AsyncMock(return_value=JSONResponse({"ok": True}))
 
         with patch.object(web_server, "_get_dashboard_plugins", return_value=[]), \
-             patch("hermes_cli.plugins_cmd._get_enabled_set", return_value=set()), \
-             patch("hermes_cli.plugins_cmd._get_disabled_set", return_value=set()):
+             patch(
+                 "hermes_cli.config.load_plugin_activation_state",
+                 return_value=_activation(),
+             ):
+            response = await web_server._plugin_api_runtime_gate(request, call_next)
+
+        assert response.status_code == 404
+        call_next.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_middleware_gates_the_mounted_owner_after_winner_changes(
+        self,
+        tmp_path,
+    ):
+        """A new same-name winner cannot authorize the old mounted router."""
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse
+
+        user_root = tmp_path / "user" / "shared-runtime"
+        bundled_root = tmp_path / "bundled" / "shared-runtime"
+        (user_root / "dashboard").mkdir(parents=True)
+        (bundled_root / "dashboard").mkdir(parents=True)
+
+        mounted_user = {
+            "name": "shared-api",
+            "source": "user",
+            "_dir": str(user_root / "dashboard"),
+            "_runtime_name": "shared-runtime",
+            "_runtime_key": "backend/shared-runtime",
+            "_runtime_source": "user",
+            "_runtime_kind": "backend",
+            "_runtime_managed": True,
+        }
+        current_bundled = {
+            **mounted_user,
+            "source": "bundled",
+            "_dir": str(bundled_root / "dashboard"),
+            "_runtime_source": "bundled",
+        }
+        runtime_entries = [
+            (
+                "shared-runtime",
+                "1.0.0",
+                "",
+                "bundled",
+                bundled_root,
+                "backend/shared-runtime",
+                "backend",
+            )
+        ]
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/api/plugins/shared-api/probe",
+            "query_string": b"",
+            "headers": [],
+            "state": {"token_authenticated": True},
+        })
+        call_next = AsyncMock(return_value=JSONResponse({"owner": "user"}))
+
+        with patch.dict(
+            web_server._mounted_plugin_api_owners,
+            {"shared-api": mounted_user},
+            clear=True,
+        ), patch.object(
+            web_server,
+            "_get_dashboard_plugins",
+            return_value=[current_bundled],
+        ), patch.object(
+            web_server,
+            "_discover_dashboard_runtime_entries",
+            return_value=runtime_entries,
+        ), patch(
+            "hermes_cli.config.load_plugin_activation_state",
+            return_value=_activation(enabled={"backend/shared-runtime"}),
+        ):
+            response = await web_server._plugin_api_runtime_gate(
+                request,
+                call_next,
+            )
+
+        assert response.status_code == 404
+        call_next.assert_not_called()
+
+    def test_mount_skips_an_already_owned_public_namespace(self, tmp_path):
+        """A second same-name router cannot add differently gated subpaths."""
+        dashboard_dir = tmp_path / "second" / "dashboard"
+        dashboard_dir.mkdir(parents=True)
+        (dashboard_dir / "api.py").write_text("# import sentinel\n")
+        second_owner = {
+            "name": "shared-api",
+            "source": "user",
+            "_dir": str(dashboard_dir),
+            "_api_file": "api.py",
+        }
+
+        with patch.dict(
+            web_server._mounted_plugin_api_owners,
+            {"shared-api": {"name": "shared-api", "source": "bundled"}},
+            clear=True,
+        ), patch.object(
+            web_server,
+            "_get_dashboard_plugins",
+            return_value=[second_owner],
+        ), patch.object(
+            web_server,
+            "_dashboard_plugin_is_active",
+            return_value=True,
+        ) as active, patch(
+            "importlib.util.spec_from_file_location",
+        ) as spec:
+            web_server._mount_plugin_api_routes()
+
+        active.assert_not_called()
+        spec.assert_not_called()
+
+
+class TestDashboardRouteNameCollision:
+    def test_distinct_canonical_plugins_sharing_route_fail_closed(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        bundled = tmp_path / "bundled"
+        home = tmp_path / "home"
+        bundled.mkdir()
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        _make_bundled_runtime_plugin(
+            bundled,
+            "one",
+            key="runtime-one",
+            dashboard_name="shared-route",
+        )
+        _make_bundled_runtime_plugin(
+            bundled,
+            "two",
+            key="runtime-two",
+            dashboard_name="shared-route",
+        )
+
+        with patch(
+            "hermes_cli.plugins.get_bundled_plugins_dir",
+            return_value=bundled,
+        ):
+            plugins = web_server._get_dashboard_plugins(force_rescan=True)
+            claimants = [p for p in plugins if p["name"] == "shared-route"]
+            assert len(claimants) == 2
+            assert all(p.get("_route_name_collision") for p in claimants)
+            assert all(
+                web_server._dashboard_plugin_status(p) == "not enabled"
+                for p in claimants
+            )
+
+    @pytest.mark.asyncio
+    async def test_collision_cannot_borrow_another_plugins_runtime_gate(self):
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse
+
+        claimants = [
+            {
+                "name": "shared-route",
+                "source": "bundled",
+                "_runtime_key": "runtime-one",
+                "_route_name_collision": True,
+            },
+            {
+                "name": "shared-route",
+                "source": "bundled",
+                "_runtime_key": "runtime-two",
+                "_route_name_collision": True,
+            },
+        ]
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/api/plugins/shared-route/probe",
+            "query_string": b"",
+            "headers": [],
+            "state": {"token_authenticated": True},
+        })
+        call_next = AsyncMock(return_value=JSONResponse({"ok": True}))
+
+        with patch.dict(
+            web_server._mounted_plugin_api_owners,
+            {"shared-route": claimants[0]},
+            clear=True,
+        ):
             response = await web_server._plugin_api_runtime_gate(request, call_next)
 
         assert response.status_code == 404
@@ -203,9 +440,8 @@ class TestBundledPluginAssetGate:
         with patch.object(web_server, "_get_dashboard_plugins", return_value=[fake_plugin]):
             # Sanity: asset is served when not disabled.
             with patch(
-                "hermes_cli.plugins_cmd._get_enabled_set", return_value=set()
-            ), patch(
-                "hermes_cli.plugins_cmd._get_disabled_set", return_value=set()
+                "hermes_cli.config.load_plugin_activation_state",
+                return_value=_activation(),
             ):
                 resp = test_client.get("/dashboard-plugins/bundledx/dist/index.js")
                 assert resp.status_code == 200, (
@@ -214,9 +450,8 @@ class TestBundledPluginAssetGate:
 
             # Disable it.
             with patch(
-                "hermes_cli.plugins_cmd._get_enabled_set", return_value=set()
-            ), patch(
-                "hermes_cli.plugins_cmd._get_disabled_set", return_value={"bundledx"}
+                "hermes_cli.config.load_plugin_activation_state",
+                return_value=_activation(disabled={"bundledx"}),
             ):
                 resp = test_client.get("/dashboard-plugins/bundledx/dist/index.js")
                 assert resp.status_code == 404, (
@@ -237,10 +472,160 @@ class TestBundledPluginAssetGate:
 
         with patch.object(web_server, "_get_dashboard_plugins", return_value=[fake_plugin]):
             with patch(
-                "hermes_cli.plugins_cmd._get_enabled_set", return_value=set()
-            ), patch(
-                "hermes_cli.plugins_cmd._get_disabled_set", return_value=set()
+                "hermes_cli.config.load_plugin_activation_state",
+                return_value=_activation(),
             ):
                 resp = test_client.get("/dashboard-plugins/goodbundled/dist/index.js")
                 assert resp.status_code == 200
+
+
+def test_dashboard_display_name_cannot_replace_canonical_runtime_key(tmp_path):
+    plugin_root = tmp_path / "plugins" / "web" / "runtime-key"
+    dashboard_dir = plugin_root / "dashboard"
+    dashboard_dir.mkdir(parents=True)
+    plugin = {
+        "name": "dashboard-label",
+        "source": "user",
+        "_dir": str(dashboard_dir),
+    }
+    runtime_entries = [
+        (
+            "runtime-name",
+            "1.0.0",
+            "",
+            "user",
+            plugin_root,
+            "web/runtime-key",
+            "standalone",
+        )
+    ]
+
+    display_only = _activation(enabled={"dashboard-label"})
+    canonical = _activation(enabled={"web/runtime-key"})
+
+    assert (
+        web_server._dashboard_plugin_status(
+            plugin,
+            runtime_entries,
+            display_only,
+        )
+        == "not enabled"
+    )
+    assert (
+        web_server._dashboard_plugin_status(
+            plugin,
+            runtime_entries,
+            canonical,
+        )
+        == "enabled"
+    )
+
+
+def test_dashboard_only_fallback_honors_safe_mode():
+    plugin = {
+        "name": "project-extension",
+        "source": "project",
+    }
+    state = _activation(
+        enabled={"project-extension"},
+        safe_mode=True,
+    )
+
+    assert (
+        web_server._dashboard_plugin_status(plugin, [], state)
+        == "not enabled"
+    )
+
+
+class TestProjectDashboardScopeInvalidation:
+    """Cached project JavaScript must not outlive its cwd/env opt-in scope."""
+
+    def test_gate_disable_blocks_asset_and_list_from_populated_cache(
+        self,
+        test_client,
+        tmp_path,
+        monkeypatch,
+    ):
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        monkeypatch.chdir(project_root)
+        monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", "1")
+        _make_project_plugin(project_root)
+        activation = _activation(enabled={"project-extension"})
+
+        with patch(
+            "hermes_cli.config.load_plugin_activation_state",
+            return_value=activation,
+        ):
+            cached = web_server._get_dashboard_plugins(force_rescan=True)
+            stale_plugin = next(
+                p for p in cached if p["name"] == "project-extension"
+            )
+            assert test_client.get(
+                "/dashboard-plugins/project-extension/dist/index.js"
+            ).status_code == 200
+            listed = test_client.get("/api/dashboard/plugins")
+            assert listed.status_code == 200
+            assert "project-extension" in {
+                item["name"] for item in listed.json()
+            }
+
+            # Keep the old directory in place: invalidation must be driven by
+            # scope identity, not by the legacy "directory disappeared" check.
+            monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", "0")
+            assert test_client.get(
+                "/dashboard-plugins/project-extension/dist/index.js"
+            ).status_code == 404
+            listed = test_client.get("/api/dashboard/plugins")
+            assert listed.status_code == 200
+            assert "project-extension" not in {
+                item["name"] for item in listed.json()
+            }
+            assert stale_plugin["source"] == "project"
+
+    @pytest.mark.asyncio
+    async def test_runtime_api_gate_rejects_stale_project_entry_when_gate_turns_off(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse
+
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        monkeypatch.chdir(project_root)
+        monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", "1")
+        _make_project_plugin(project_root)
+        stale_plugin = next(
+            p
+            for p in web_server._get_dashboard_plugins(force_rescan=True)
+            if p["name"] == "project-extension"
+        )
+        monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", "0")
+
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/api/plugins/project-extension/probe",
+            "query_string": b"",
+            "headers": [],
+            "state": {"token_authenticated": True},
+        })
+        call_next = AsyncMock(return_value=JSONResponse({"ok": True}))
+        with patch.dict(
+            web_server._mounted_plugin_api_owners,
+            {"project-extension": stale_plugin},
+            clear=True,
+        ), patch(
+            "hermes_cli.config.load_plugin_activation_state",
+            return_value=_activation(enabled={"project-extension"}),
+        ):
+            response = await web_server._plugin_api_runtime_gate(
+                request,
+                call_next,
+            )
+
+        assert response.status_code == 404
+        call_next.assert_not_called()
 

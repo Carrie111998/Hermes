@@ -77,6 +77,23 @@ class TestResolvePluginKey:
         assert _resolve_plugin_key("openai") is None
         assert _resolve_plugin_key("image_gen/openai") == "image_gen/openai"
 
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    def test_dashboard_file_actions_resolve_key_to_real_user_directory(
+        self,
+        mock_user,
+        mock_bundled,
+        nested_plugin_env,
+    ):
+        from hermes_cli.plugins_cmd import _user_installed_plugin_dir
+
+        mock_user.return_value = nested_plugin_env
+        mock_bundled.return_value = nested_plugin_env / "nonexistent"
+
+        assert _user_installed_plugin_dir("observability/nemo_relay") == (
+            nested_plugin_env / "observability" / "nemo_relay"
+        ).resolve()
+
 
 # ---------------------------------------------------------------------------
 # cmd_enable / cmd_disable — write the canonical key
@@ -134,6 +151,193 @@ class TestEnableDisableNested:
         cmd_enable("disk-cleanup", allow_tool_override=False)
         saved = mock_save_en.call_args[0][0]
         assert "disk-cleanup" in saved
+
+    def test_enable_clears_legacy_denies_for_every_same_key_candidate(
+        self,
+        monkeypatch,
+    ):
+        from hermes_cli import plugins_cmd
+        from hermes_cli.plugin_activation import PluginActivationState
+
+        candidates = [
+            ("bundled-shared", "1", "", "bundled", None, "shared", "backend"),
+            ("user-shared", "2", "", "user", None, "shared", "backend"),
+        ]
+        saved = {}
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_resolve_plugin_key_and_source",
+            lambda _name: ("shared", "user", "user-shared", "backend"),
+        )
+        monkeypatch.setattr(
+            plugins_cmd, "_discover_plugin_candidates", lambda: candidates
+        )
+        monkeypatch.setattr(plugins_cmd, "_get_enabled_set", set)
+        monkeypatch.setattr(
+            plugins_cmd, "_get_disabled_set", lambda: {"bundled-shared"}
+        )
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_save_enabled_set",
+            lambda value: saved.update(enabled=set(value)),
+        )
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_save_disabled_set",
+            lambda value: saved.update(disabled=set(value)),
+        )
+        monkeypatch.setattr(plugins_cmd, "_set_plugin_entry_flag", lambda *args: None)
+
+        plugins_cmd.cmd_enable("shared", allow_tool_override=False)
+
+        assert saved == {"enabled": {"shared"}, "disabled": set()}
+        activation = PluginActivationState(
+            enabled=frozenset(saved["enabled"]),
+            disabled=frozenset(saved["disabled"]),
+        )
+        assert plugins_cmd._select_active_plugin_entries(candidates, activation) == [
+            candidates[1]
+        ]
+
+    def test_enable_shared_manifest_preserves_other_canonical_deny(
+        self,
+        monkeypatch,
+    ):
+        from hermes_cli import plugins_cmd
+        from hermes_cli.plugin_activation import PluginActivationState
+
+        candidates = [
+            ("xai", "1", "Images", "bundled", None, "image_gen/xai", "backend"),
+            ("xai", "1", "Video", "bundled", None, "video_gen/xai", "backend"),
+        ]
+        saved = {}
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_resolve_plugin_key_and_source",
+            lambda _name: ("image_gen/xai", "bundled", "xai", "backend"),
+        )
+        monkeypatch.setattr(
+            plugins_cmd, "_discover_plugin_candidates", lambda: candidates
+        )
+        monkeypatch.setattr(plugins_cmd, "_get_enabled_set", set)
+        monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: {"xai"})
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_save_enabled_set",
+            lambda value: saved.update(enabled=set(value)),
+        )
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_save_disabled_set",
+            lambda value: saved.update(disabled=set(value)),
+        )
+
+        plugins_cmd.cmd_enable("image_gen/xai")
+
+        assert saved == {
+            "enabled": {"image_gen/xai"},
+            "disabled": {"video_gen/xai"},
+        }
+        activation = PluginActivationState(
+            enabled=frozenset(saved["enabled"]),
+            disabled=frozenset(saved["disabled"]),
+        )
+        assert plugins_cmd._select_active_plugin_entries(candidates, activation) == [
+            candidates[0]
+        ]
+
+    def test_disable_shared_manifest_drops_redundant_bundled_allow(
+        self,
+        monkeypatch,
+    ):
+        from hermes_cli import plugins_cmd
+        from hermes_cli.plugin_activation import PluginActivationState
+
+        candidates = [
+            ("xai", "1", "Images", "bundled", None, "image_gen/xai", "backend"),
+            ("xai", "1", "Video", "bundled", None, "video_gen/xai", "backend"),
+        ]
+        saved = {}
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_resolve_plugin_key_and_source",
+            lambda _name: ("image_gen/xai", "bundled", "xai", "backend"),
+        )
+        monkeypatch.setattr(
+            plugins_cmd, "_discover_plugin_candidates", lambda: candidates
+        )
+        monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"xai"})
+        monkeypatch.setattr(plugins_cmd, "_get_disabled_set", set)
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_save_enabled_set",
+            lambda value: saved.update(enabled=set(value)),
+        )
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_save_disabled_set",
+            lambda value: saved.update(disabled=set(value)),
+        )
+
+        plugins_cmd.cmd_disable("image_gen/xai")
+
+        assert saved == {
+            "enabled": set(),
+            "disabled": {"image_gen/xai"},
+        }
+        activation = PluginActivationState(
+            enabled=frozenset(saved["enabled"]),
+            disabled=frozenset(saved["disabled"]),
+        )
+        assert plugins_cmd._select_active_plugin_entries(candidates, activation) == [
+            candidates[1]
+        ]
+
+    def test_disable_user_override_preserves_shared_deny(
+        self,
+        monkeypatch,
+    ):
+        from hermes_cli import plugins_cmd
+        from hermes_cli.plugin_activation import PluginActivationState
+
+        candidates = [
+            ("shared", "1", "Target", "bundled", None, "target/key", "backend"),
+            ("shared", "1", "Sibling", "bundled", None, "sibling/key", "backend"),
+            ("target-user", "2", "Target", "user", None, "target/key", "backend"),
+        ]
+        saved = {}
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_resolve_plugin_key_and_source",
+            lambda _name: ("target/key", "user", "target-user", "backend"),
+        )
+        monkeypatch.setattr(
+            plugins_cmd, "_discover_plugin_candidates", lambda: candidates
+        )
+        monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"target/key"})
+        monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: {"shared"})
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_save_enabled_set",
+            lambda value: saved.update(enabled=set(value)),
+        )
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_save_disabled_set",
+            lambda value: saved.update(disabled=set(value)),
+        )
+
+        plugins_cmd.cmd_disable("target/key")
+
+        assert saved == {
+            "enabled": set(),
+            "disabled": {"shared", "target/key"},
+        }
+        activation = PluginActivationState(
+            enabled=frozenset(saved["enabled"]),
+            disabled=frozenset(saved["disabled"]),
+        )
+        assert plugins_cmd._select_active_plugin_entries(candidates, activation) == []
 
 
 # ---------------------------------------------------------------------------
@@ -217,11 +421,10 @@ class TestCompositeMenuWritesCanonicalKey:
         # key differs from the manifest name, mirroring web/firecrawl.
         plugin_keys = ["web/firecrawl"]
         plugin_labels = ["web-firecrawl — firecrawl [bundled]"]
-        plugin_selected = set()  # unchecked → should be disabled
+        plugin_selected = {0}  # active initially, then explicitly unchecked
 
-        # First input() toggles nothing (blank Enter confirms immediately),
-        # second (category prompt) is skipped with blank Enter.
-        with patch("builtins.input", return_value=""):
+        answers = iter(["1", ""])
+        with patch("builtins.input", side_effect=lambda _prompt: next(answers)):
             _run_composite_fallback(
                 plugin_keys, plugin_labels, plugin_selected,
                 set(), [], Console(),

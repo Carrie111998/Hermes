@@ -24,7 +24,7 @@ from tools.environments.base import (
     _popen_bash,
 )
 from tools.environments.local import (
-    _HERMES_PROVIDER_ENV_BLOCKLIST,
+    _get_current_provider_env_blocklist,
     _is_hermes_internal_secret,
 )
 
@@ -1572,7 +1572,8 @@ class DockerEnvironment(BaseEnvironment):
         _implicit_forward = {
             k for k in passthrough_keys if not _is_hermes_internal_secret(k)
         }
-        forward_keys = explicit_forward_keys | (_implicit_forward - _HERMES_PROVIDER_ENV_BLOCKLIST)
+        provider_env_blocklist = _get_current_provider_env_blocklist()
+        forward_keys = explicit_forward_keys | (_implicit_forward - provider_env_blocklist)
         hermes_env = _load_hermes_env_vars() if forward_keys else {}
         unset_names: set[str] = set()
         for key in sorted(forward_keys):

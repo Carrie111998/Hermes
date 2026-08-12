@@ -29,10 +29,13 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Set
+from typing import Dict, Any, Optional, List, Tuple, Set, TYPE_CHECKING
 
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.secret_prompt import masked_secret_prompt
+
+if TYPE_CHECKING:
+    from hermes_cli.plugin_activation import PluginActivationState
 
 logger = logging.getLogger(__name__)
 
@@ -3187,6 +3190,35 @@ def load_config_readonly() -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=False)
 
 
+def load_plugin_activation_state() -> "PluginActivationState":
+    """Derive plugin activation from the canonical loaded configuration.
+
+    This accessor deliberately performs no parsing of its own.  Environment
+    expansion, managed-scope precedence, cache invalidation, and
+    last-known-good behavior all remain owned by :func:`load_config_readonly`.
+    An unexpected loader failure uses an empty allow-list, which keeps
+    non-bundled plugins fail-closed while bundled defaults remain available.
+    """
+    from hermes_cli.plugin_activation import PluginActivationState
+    from utils import env_var_enabled
+
+    safe_mode = env_var_enabled("HERMES_SAFE_MODE")
+    if safe_mode:
+        # Safe mode is a recovery boundary, not merely another config flag.
+        # Do not let an unreadable or user-controlled plugins section disable
+        # the bundled model providers needed to recover the installation.
+        return PluginActivationState(safe_mode=True)
+
+    try:
+        config = load_config_readonly()
+    except Exception:
+        config = {}
+    return PluginActivationState.from_config(
+        config,
+        safe_mode=False,
+    )
+
+
 def write_platform_config_field(
     platform_key: str,
     field_key: str,
@@ -5363,30 +5395,31 @@ def config_command(args):
 # ── Profile-driven env var injection ─────────────────────────────────────────
 # Any provider registered in providers/ with auth_type="api_key" automatically
 # gets its env_vars exposed in OPTIONAL_ENV_VARS without editing this file.
-# Runs once at import time.
+# Entries are retained once observed so cached/concurrent profile switches
+# cannot overwrite this process-global compatibility inventory.
 
-_profile_env_vars_injected = False
+_profile_env_vars_lock = threading.RLock()
 
 
 def _inject_profile_env_vars() -> None:
-    """Populate OPTIONAL_ENV_VARS from provider profiles not already listed.
-
-    Called once at module load time. Idempotent — repeated calls are no-ops.
-    """
-    global _profile_env_vars_injected
-    if _profile_env_vars_injected:
-        return
-    _profile_env_vars_injected = True
+    """Monotonically add metadata from provider profiles observed in-process."""
     try:
         from providers import list_providers
-        for _pp in list_providers():
+
+        profiles = tuple(list_providers())
+    except Exception:
+        return
+
+    with _profile_env_vars_lock:
+        additions: Dict[str, Dict[str, Any]] = {}
+        for _pp in profiles:
             if _pp.auth_type not in {"api_key",}:
                 continue
             for _var in _pp.env_vars:
-                if _var in OPTIONAL_ENV_VARS:
+                if _var in OPTIONAL_ENV_VARS or _var in additions:
                     continue
                 _is_key = not _var.endswith("_BASE_URL") and not _var.endswith("_URL")
-                OPTIONAL_ENV_VARS[_var] = {
+                additions[_var] = {
                     "description": f"{_pp.display_name or _pp.name} {'API key' if _is_key else 'base URL override'}",
                     "prompt": f"{_pp.display_name or _pp.name} {'API key' if _is_key else 'base URL (leave empty for default)'}",
                     "url": _pp.signup_url or None,
@@ -5394,12 +5427,22 @@ def _inject_profile_env_vars() -> None:
                     "category": "provider",
                     "advanced": True,
                 }
-    except Exception:
-        pass
+        OPTIONAL_ENV_VARS.update(additions)
+
+
+def _refresh_profile_env_vars() -> None:
+    """Observe provider metadata after a new catalog becomes active."""
+    _inject_profile_env_vars()
 
 
 # Eagerly inject so that OPTIONAL_ENV_VARS is fully populated at import time.
 _inject_profile_env_vars()
+try:
+    from providers import register_provider_refresh_hook
+
+    register_provider_refresh_hook(_refresh_profile_env_vars)
+except Exception:
+    pass
 
 
 # ── Platform-plugin env var injection ────────────────────────────────────────

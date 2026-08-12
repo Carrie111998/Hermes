@@ -69,7 +69,7 @@ def _is_hermes_provider_credential(name: str) -> bool:
     """
     try:
         from tools.environments.local import (
-            _HERMES_PROVIDER_ENV_BLOCKLIST,
+            _get_current_provider_env_blocklist,
             _is_hermes_internal_secret,
         )
     except Exception as e:
@@ -87,7 +87,7 @@ def _is_hermes_provider_credential(name: str) -> bool:
     # as passthrough and tunnel them into an execute_code / terminal child.
     if _is_hermes_internal_secret(name):
         return True
-    return name in _HERMES_PROVIDER_ENV_BLOCKLIST
+    return name in _get_current_provider_env_blocklist()
 
 
 def register_env_passthrough(var_names: Iterable[str]) -> None:
@@ -169,14 +169,19 @@ def is_env_passthrough(var_name: str) -> bool:
     Returns ``True`` if the variable was registered by a skill or listed in
     the user's ``tools.env_passthrough`` config.
     """
-    if var_name in _get_allowed():
-        return True
-    return var_name in _load_config_passthrough()
+    allowed = (
+        var_name in _get_allowed()
+        or var_name in _load_config_passthrough()
+    )
+    return allowed and not _is_hermes_provider_credential(var_name)
 
 
 def get_all_passthrough() -> frozenset[str]:
     """Return the union of skill-registered and config-based passthrough vars."""
-    return frozenset(_get_allowed()) | _load_config_passthrough()
+    candidates = frozenset(_get_allowed()) | _load_config_passthrough()
+    return frozenset(
+        name for name in candidates if not _is_hermes_provider_credential(name)
+    )
 
 
 def resolve_passthrough_value(

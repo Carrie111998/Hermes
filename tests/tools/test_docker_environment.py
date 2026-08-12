@@ -174,6 +174,32 @@ def _make_execute_only_env(forward_env=None):
     return env
 
 
+def test_implicit_forward_filters_late_active_provider_key(monkeypatch):
+    from hermes_cli import auth
+
+    active = auth.ProviderConfig(
+        id="late-docker",
+        name="Late active",
+        auth_type="api_key",
+        api_key_env_vars=("LATE_DOCKER_API_KEY",),
+    )
+    monkeypatch.setattr(auth, "PROVIDER_REGISTRY", {active.id: active})
+    monkeypatch.setattr(
+        "tools.env_passthrough.get_all_passthrough",
+        lambda: frozenset({"LATE_DOCKER_API_KEY"}),
+    )
+    monkeypatch.setenv("LATE_DOCKER_API_KEY", "secret")
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
+
+    env = _make_execute_only_env()
+
+    assert "LATE_DOCKER_API_KEY" not in env._build_passthrough_env()
+
+    monkeypatch.setattr(auth, "PROVIDER_REGISTRY", {})
+
+    assert "LATE_DOCKER_API_KEY" not in env._build_passthrough_env()
+
+
 def test_init_env_args_uses_hermes_dotenv_for_allowlisted_env(monkeypatch):
     """_build_init_env_args picks up forwarded env vars from .env file at init time."""
     # Use a var that is NOT in _HERMES_PROVIDER_ENV_BLOCKLIST (GITHUB_TOKEN

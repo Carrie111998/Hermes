@@ -6,23 +6,47 @@ from types import SimpleNamespace
 
 from hermes_cli import web_server
 from hermes_cli import plugins_cmd
+from hermes_cli.plugin_activation import PluginActivationState
 from tools import registry as tools_registry
 
 
-_PLUGIN_ROW = [("demo", "1.0.0", "demo plugin", "user", "/tmp/demo-plugin", "demo")]
+_PLUGIN_ROW = [
+    (
+        "demo",
+        "1.0.0",
+        "demo plugin",
+        "user",
+        "/tmp/demo-plugin",
+        "category/demo",
+        "standalone",
+    )
+]
 
 
 def _patch_minimal_hub_dependencies(monkeypatch, *, check_fn, discover_all_plugins=None):
+    discover_entries = discover_all_plugins or (lambda: list(_PLUGIN_ROW))
     monkeypatch.setattr(web_server, "_get_dashboard_plugins", lambda force_rescan=False: [])
+    monkeypatch.setattr(
+        web_server,
+        "_discover_dashboard_runtime_entries",
+        lambda: list(_PLUGIN_ROW),
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_discover_dashboard_plugin_records",
+        lambda: [(entry, "enabled") for entry in discover_entries()],
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_load_dashboard_plugin_activation_state",
+        lambda: PluginActivationState(
+            enabled=frozenset({"category/demo"})
+        ),
+    )
     monkeypatch.setattr(web_server, "_discover_memory_provider_statuses", lambda: [])
     monkeypatch.setattr(web_server, "get_hermes_home", lambda: Path("/tmp/hermes-home"))
     monkeypatch.setattr(web_server, "load_config", lambda: {"dashboard": {"hidden_plugins": []}})
 
-    monkeypatch.setattr(
-        plugins_cmd,
-        "_discover_all_plugins",
-        discover_all_plugins or (lambda: list(_PLUGIN_ROW)),
-    )
     monkeypatch.setattr(plugins_cmd, "_get_current_context_engine", lambda: "compressor")
     monkeypatch.setattr(plugins_cmd, "_get_current_memory_provider", lambda: "")
     monkeypatch.setattr(plugins_cmd, "_discover_context_engines", lambda: [])
@@ -58,7 +82,28 @@ def test_plugins_hub_does_not_probe_cold_check_fns(monkeypatch):
     # happens on a background warmer thread, never inline.
     assert payload["plugins"][0]["auth_required"] is False
     assert payload["plugins"][0]["auth_command"] == ""
+    assert payload["plugins"][0]["name"] == "demo"
+    assert payload["plugins"][0]["key"] == "category/demo"
     assert threading.current_thread() not in calls["threads"]
+
+
+def test_plugins_hub_preserves_resolved_group_deny_label(monkeypatch):
+    web_server._invalidate_plugins_hub_cache()
+    _patch_minimal_hub_dependencies(monkeypatch, check_fn=lambda: True)
+    monkeypatch.setattr(
+        web_server,
+        "_discover_dashboard_plugin_records",
+        lambda: [(_PLUGIN_ROW[0], "disabled")],
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_discover_dashboard_runtime_entries",
+        list,
+    )
+
+    payload = web_server._merged_plugins_hub(force_refresh=True)
+
+    assert payload["plugins"][0]["runtime_status"] == "disabled"
 
 
 def test_plugins_hub_cold_cache_schedules_background_probe(monkeypatch):

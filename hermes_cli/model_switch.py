@@ -2104,6 +2104,15 @@ def list_authenticated_providers(
     matches the active provider without blocking on every saved/offline custom
     endpoint.
     """
+    # One coarse freshness boundary per picker build keeps direct config edits
+    # live while metadata alias/label hot loops stay discovery-free.
+    try:
+        from providers import get_provider_catalog_snapshot
+
+        get_provider_catalog_snapshot()
+    except Exception:
+        pass
+
     import os
     from agent.models_dev import (
         PROVIDER_TO_MODELS_DEV,
@@ -2391,7 +2400,10 @@ def list_authenticated_providers(
 
     # --- 2. Check Hermes-only providers (nous, openai-codex, copilot, opencode-go) ---
     from hermes_cli.providers import HERMES_OVERLAYS
-    from hermes_cli.auth import PROVIDER_REGISTRY as _auth_registry
+    from hermes_cli.auth import (
+        PROVIDER_REGISTRY as _auth_registry,
+        is_runtime_provider_routable,
+    )
 
     # Build reverse mapping: models.dev ID → Hermes provider ID.
     # HERMES_OVERLAYS keys may be models.dev IDs (e.g. "github-copilot")
@@ -2407,6 +2419,8 @@ def list_authenticated_providers(
         if hermes_slug.lower() in seen_slugs:
             continue
         if pid.lower() in _excluded or hermes_slug.lower() in _excluded:
+            continue
+        if not is_runtime_provider_routable(hermes_slug):
             continue
 
         # Check if credentials exist
@@ -2657,7 +2671,12 @@ def list_authenticated_providers(
     # produces two picker rows: one bare-slug ("openrouter") from section 3
     # and one "custom:openrouter" from section 4, both labelled identically.
     _section3_emitted_pairs: set = set()
-    if user_providers and isinstance(user_providers, dict):
+    _custom_runtime_routable = is_runtime_provider_routable("custom")
+    if (
+        _custom_runtime_routable
+        and user_providers
+        and isinstance(user_providers, dict)
+    ):
         # Group ``providers:`` entries by (api_url, key_env, api_mode) so that
         # multiple keyed providers pointing at the same endpoint with the
         # same credential and wire-protocol collapse into one picker row.
@@ -2912,7 +2931,8 @@ def list_authenticated_providers(
     # list_authenticated_providers(). Surface the active endpoint explicitly so
     # /model does not look like it ignored config.yaml.
     if (
-        _current_provider_norm == "custom"
+        _custom_runtime_routable
+        and _current_provider_norm == "custom"
         and current_base_url
         and "custom" not in seen_slugs
         and not any(
@@ -2964,7 +2984,11 @@ def list_authenticated_providers(
     # "Ollama" row with four models inside instead of four near-duplicates
     # that differ only by suffix. Same-host entries with different ``key_env``
     # or ``api_mode`` remain distinct providers.
-    if custom_providers and isinstance(custom_providers, list):
+    if (
+        _custom_runtime_routable
+        and custom_providers
+        and isinstance(custom_providers, list)
+    ):
         from collections import OrderedDict
 
         # Key by endpoint + credential identity + wire protocol + display

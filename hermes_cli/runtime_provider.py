@@ -26,6 +26,7 @@ from hermes_cli.auth import (
     DEFAULT_QWEN_BASE_URL,
     DEFAULT_XAI_OAUTH_BASE_URL,
     PROVIDER_REGISTRY,
+    get_provider_implementation_config,
     _agent_key_is_usable,
     _nous_inference_env_override,
     format_auth_error,
@@ -503,7 +504,10 @@ def _resolve_runtime_from_pool_entry(
             getattr(entry, "runtime_api_key", ""),
             target_model=effective_model,
         )
-        base_url = base_url or PROVIDER_REGISTRY["copilot"].inference_base_url
+        base_url = (
+            base_url
+            or get_provider_implementation_config("copilot").inference_base_url
+        )
     elif provider == "azure-foundry":
         # Azure Foundry: read api_mode and base_url from config
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
@@ -1681,6 +1685,44 @@ def resolve_runtime_provider(
     """
     requested_provider = resolve_requested_provider(requested)
 
+    def require_plugin_provider(provider_id: str) -> None:
+        from providers import is_provider_plugin_active
+
+        if not is_provider_plugin_active(provider_id):
+            raise AuthError(
+                f"Provider '{provider_id}' is disabled by plugin configuration.",
+                code="invalid_provider",
+            )
+
+    shortcut_provider = requested_provider
+    if requested_provider.startswith("custom:") or requested_provider in {
+        "custom",
+        "local",
+        "ollama",
+        "vllm",
+        "llamacpp",
+        "llama.cpp",
+        "llama-cpp",
+    }:
+        shortcut_provider = "custom"
+    elif requested_provider in {
+        "vertex",
+        "google-vertex",
+        "vertex-ai",
+        "gcp-vertex",
+        "vertexai",
+    }:
+        shortcut_provider = "vertex"
+    elif requested_provider in {
+        "azure-foundry",
+        "azure",
+        "azure-ai-foundry",
+        "azure-ai",
+    }:
+        shortcut_provider = "azure-foundry"
+    if shortcut_provider not in {"auto", "moa"}:
+        require_plugin_provider(shortcut_provider)
+
     # Honour ``providers.<name>.enabled: false`` for BOTH user-defined
     # custom providers and the built-in ones (openai / anthropic /
     # openrouter / gemini / ...). The earlier ``_get_named_custom_provider``
@@ -1786,6 +1828,7 @@ def resolve_runtime_provider(
         explicit_base_url=explicit_base_url,
     )
     if custom_runtime:
+        require_plugin_provider("custom")
         custom_runtime["requested_provider"] = requested_provider
         return custom_runtime
 
@@ -1818,6 +1861,7 @@ def resolve_runtime_provider(
                 base_url_host_matches(cfg_base_url, host)
                 for host in _known_cloud_hosts
             ):
+                require_plugin_provider("custom")
                 runtime = _resolve_openrouter_runtime(
                     requested_provider=requested_provider,
                     explicit_api_key=explicit_api_key,
@@ -2288,6 +2332,14 @@ def resolve_runtime_provider(
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
     )
+    if requested_provider == "auto":
+        runtime_base_url = str(runtime.get("base_url") or "").strip()
+        endpoint_provider = (
+            "openrouter"
+            if base_url_host_matches(runtime_base_url, "openrouter.ai")
+            else "custom"
+        )
+        require_plugin_provider(endpoint_provider)
     runtime["requested_provider"] = requested_provider
     return runtime
 

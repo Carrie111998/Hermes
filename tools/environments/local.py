@@ -222,13 +222,22 @@ _AWS_SDK_CREDENTIAL_ENV_VARS = frozenset({
 })
 
 
-def _build_provider_env_blocklist() -> frozenset:
+def _build_provider_env_blocklist(*, include_active: bool = True) -> frozenset:
     """Derive the blocklist from provider, tool, and gateway config."""
     blocked: set[str] = set()
 
     try:
-        from hermes_cli.auth import PROVIDER_REGISTRY
-        for pconfig in PROVIDER_REGISTRY.values():
+        from hermes_cli.auth import (
+            get_builtin_provider_configs,
+            get_known_provider_configs,
+        )
+
+        provider_configs = (
+            get_known_provider_configs()
+            if include_active
+            else get_builtin_provider_configs()
+        )
+        for pconfig in provider_configs:
             blocked.update(pconfig.api_key_env_vars)
             if pconfig.auth_type == "aws_sdk":
                 blocked.update(_AWS_SDK_CREDENTIAL_ENV_VARS)
@@ -334,7 +343,20 @@ def _build_provider_env_blocklist() -> frozenset:
     return frozenset(blocked)
 
 
-_HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
+_HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist(
+    include_active=False,
+)
+
+
+def _get_current_provider_env_blocklist() -> frozenset[str]:
+    """Return static, active, and process-observed provider credential names."""
+    from hermes_cli.auth import get_observed_provider_security_env_names
+
+    return (
+        _HERMES_PROVIDER_ENV_BLOCKLIST
+        | _build_provider_env_blocklist(include_active=True)
+        | get_observed_provider_security_env_names()
+    )
 
 # Active-virtualenv markers that must NOT leak into terminal subprocesses.
 # The gateway runs inside its own venv, so its process environment carries
@@ -455,6 +477,7 @@ def _inject_session_context_env(env: dict) -> None:
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
+    provider_env_blocklist = _get_current_provider_env_blocklist()
     try:
         from tools.env_passthrough import (
             is_env_passthrough as _is_passthrough,
@@ -472,7 +495,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         if _is_hermes_internal_secret(key):
             continue
         passthrough = _is_passthrough(key)
-        if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+        if key in provider_env_blocklist and not passthrough:
             continue
         resolved = _resolve_passthrough_value(key, value) if passthrough else value
         if resolved is not None:
@@ -488,7 +511,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             continue
         else:
             passthrough = _is_passthrough(key)
-            if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+            if key in provider_env_blocklist and not passthrough:
                 continue
             resolved = _resolve_passthrough_value(key, value) if passthrough else value
             if resolved is not None:
@@ -621,7 +644,8 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
 
     if not inherit_credentials:
         # Tier 2 — strip provider/tool credentials unless explicitly inherited.
-        for key in _HERMES_PROVIDER_ENV_BLOCKLIST:
+        provider_env_blocklist = _get_current_provider_env_blocklist()
+        for key in provider_env_blocklist:
             env.pop(key, None)
 
     # Windows UTF-8 safety for spawned processes (#31420).
@@ -1267,6 +1291,7 @@ def _path_env_key(run_env: dict) -> str | None:
 
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
+    provider_env_blocklist = _get_current_provider_env_blocklist()
     try:
         from tools.env_passthrough import (
             is_env_passthrough as _is_passthrough,
@@ -1288,7 +1313,7 @@ def _make_run_env(env: dict) -> dict:
             continue
         else:
             passthrough = _is_passthrough(k)
-            if k in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+            if k in provider_env_blocklist and not passthrough:
                 continue
             value = _resolve_passthrough_value(k, v) if passthrough else v
             if value is not None:

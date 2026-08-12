@@ -49,11 +49,12 @@ class TestReadManifestInfo:
         })
         result = _read_manifest_info(d, "")
         assert result is not None
-        name, version, description, key = result
+        name, version, description, key, kind = result
         assert name == "my-plugin"
         assert version == "1.0.0"
         assert description == "test"
         assert key == "my-plugin"  # flat: key == name
+        assert kind == "standalone"
 
 
     def test_no_manifest(self, tmp_path):
@@ -146,6 +147,38 @@ class TestDiscoverAllPlugins:
         assert "web/tavily" in keys
         assert "a/b/c" not in keys
 
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    def test_bundled_platform_key_matches_runtime_loader(
+        self,
+        mock_user_dir,
+        mock_bundled_dir,
+        tmp_path,
+    ):
+        from hermes_cli.plugins_cmd import _discover_all_plugins
+
+        bundled = tmp_path / "bundled"
+        user = tmp_path / "user"
+        user.mkdir()
+        _make_category_plugin(
+            bundled,
+            "platforms",
+            "buzz",
+            {
+                "name": "buzz-platform",
+                "kind": "platform",
+                "version": "1.0.0",
+            },
+        )
+        mock_bundled_dir.return_value = bundled
+        mock_user_dir.return_value = user
+
+        entries = _discover_all_plugins()
+        buzz = next(entry for entry in entries if entry[0] == "buzz-platform")
+
+        assert buzz[5] == "buzz-platform"
+        assert buzz[6] == "platform"
+
 
 # ---------------------------------------------------------------------------
 # _plugin_status — key-aware status
@@ -174,17 +207,26 @@ class TestFilterPluginEntries:
         from hermes_cli.plugins_cmd import _filter_plugin_entries
 
         entries = [
-            ("web-tavily", "1.0.0", "search", "user", Path("/tmp"), "web/tavily"),
-            ("disk-cleanup", "1.0.0", "cleanup", "bundled", Path("/tmp"), "disk-cleanup"),
+            ("web-tavily", "1.0.0", "search", "user", Path("/tmp"), "web/tavily", "standalone"),
+            (
+                "disk-cleanup",
+                "1.0.0",
+                "cleanup",
+                "bundled",
+                Path("/tmp"),
+                "disk-cleanup",
+                "standalone",
+            ),
         ]
         args = MagicMock()
         args.no_bundled = False
         args.user = False
         args.enabled = True
 
-        result = _filter_plugin_entries(entries, args, {"web/tavily"}, set())
+        records = [(entries[0], "enabled"), (entries[1], "not enabled")]
+        result = _filter_plugin_entries(records, args)
         assert len(result) == 1
-        assert result[0][5] == "web/tavily"
+        assert result[0][0][5] == "web/tavily"
 
 
 # ---------------------------------------------------------------------------
@@ -220,10 +262,13 @@ class TestCmdListJson:
         names = [p["name"] for p in payload]
         assert "web-tavily" in names
         assert "disk-cleanup" in names
+        by_name = {p["name"]: p for p in payload}
+        assert by_name["web-tavily"]["key"] == "web/tavily"
 
     @patch("hermes_cli.plugins.get_bundled_plugins_dir")
     @patch("hermes_cli.plugins_cmd._plugins_dir")
     def test_json_status_uses_key(self, mock_user_dir, mock_bundled_dir, tmp_path, capsys):
+        from hermes_cli.plugin_activation import PluginActivationState
         from hermes_cli.plugins_cmd import cmd_list
 
         _make_category_plugin(tmp_path, "web", "tavily", {
@@ -233,7 +278,11 @@ class TestCmdListJson:
         mock_bundled_dir.return_value = tmp_path / "nonexistent"
 
         # Patch config to return web/tavily as enabled
-        with patch("hermes_cli.plugins_cmd._get_enabled_set", return_value={"web/tavily"}):
+        activation = PluginActivationState(enabled=frozenset({"web/tavily"}))
+        with patch(
+            "hermes_cli.config.load_plugin_activation_state",
+            return_value=activation,
+        ):
             args = MagicMock()
             args.json = True
             args.plain = False

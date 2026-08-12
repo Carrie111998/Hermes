@@ -13,8 +13,9 @@ Discovers, loads, and manages plugins from four sources:
 4. **Pip plugins**     – packages that expose the ``hermes_agent.plugins``
    entry-point group.
 
-Later sources override earlier ones on name collision, so a user or project
-plugin with the same name as a bundled plugin replaces it.
+Among active candidates, later sources override earlier ones on name
+collision. An external candidate must be explicitly enabled before it can
+replace a bundled default with the same canonical key.
 
 Each directory plugin must contain a ``plugin.yaml`` manifest **and** an
 ``__init__.py`` with a ``register(ctx)`` function.
@@ -45,11 +46,22 @@ import threading
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    TypeVar,
+    Union,
+)
 
 from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
-from hermes_cli.config import cfg_get
+from hermes_cli.config import cfg_get, load_plugin_activation_state
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
 
 
@@ -235,13 +247,7 @@ def _get_disabled_plugins() -> set:
     name in this set will never load, even if it appears in
     ``plugins.enabled``.
     """
-    try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        disabled = cfg_get(config, "plugins", "disabled", default=[])
-        return set(disabled) if isinstance(disabled, list) else set()
-    except Exception:
-        return set()
+    return set(load_plugin_activation_state().disabled)
 
 
 def _get_enabled_plugins() -> Optional[set]:
@@ -258,20 +264,8 @@ def _get_enabled_plugins() -> Optional[set]:
     * ``set()`` — an empty list was explicitly set; nothing loads.
     * ``set(...)`` — the concrete allow-list.
     """
-    try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        plugins_cfg = config.get("plugins")
-        if not isinstance(plugins_cfg, dict):
-            return None
-        if "enabled" not in plugins_cfg:
-            return None
-        enabled = plugins_cfg.get("enabled")
-        if not isinstance(enabled, list):
-            return None
-        return set(enabled)
-    except Exception:
-        return None
+    enabled = load_plugin_activation_state().enabled
+    return set(enabled) if enabled is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +353,38 @@ class LoadedPlugin:
     # imported) loader. The module loads on first real use via the
     # platform_registry; see PluginManager._register_deferred_platform.
     deferred: bool = False
+
+
+_PluginCandidate = TypeVar("_PluginCandidate")
+
+
+def resolve_plugin_candidate_winner(
+    candidates: Iterable[_PluginCandidate],
+    status_for: Callable[[_PluginCandidate], str],
+) -> Optional[tuple[_PluginCandidate, str]]:
+    """Resolve one canonical-key group using active-winner semantics.
+
+    ``candidates`` must be ordered from lowest to highest source precedence,
+    matching discovery (bundled, user, project, then entry point).  An
+    explicit disable on any candidate blocks the whole canonical key.
+    Otherwise, the highest-precedence enabled candidate wins and an inactive
+    external candidate cannot shadow an enabled bundled fallback.
+
+    When no candidate is enabled, the highest-precedence candidate is
+    returned with its inactive status so callers can retain one useful
+    introspection record without executing it.
+    """
+    ranked = list(candidates)
+    if not ranked:
+        return None
+
+    statuses = [(candidate, status_for(candidate)) for candidate in reversed(ranked)]
+    if any(status == "disabled" for _candidate, status in statuses):
+        return statuses[0][0], "disabled"
+    for candidate, status in statuses:
+        if status == "enabled":
+            return candidate, status
+    return statuses[0]
 
 
 # ---------------------------------------------------------------------------
@@ -1388,24 +1414,33 @@ class PluginManager:
         logger.debug("  entrypoints: %d manifest(s)", len(ep_manifests))
         manifests.extend(ep_manifests)
 
-        # Load each manifest (skip user-disabled plugins).
-        # Later sources override earlier ones on key collision — user
-        # plugins take precedence over bundled, project plugins take
-        # precedence over user. Dedup here so we only load the final
-        # winner. Keys are path-derived (``image_gen/openai``,
-        # ``disk-cleanup``) so ``tts/openai`` and ``image_gen/openai``
-        # don't collide even when both manifests say ``name: openai``.
-        disabled = _get_disabled_plugins()
-        enabled = _get_enabled_plugins()  # None = opt-in default (nothing enabled)
-        winners: Dict[str, PluginManifest] = {}
+        # Load one active winner per canonical key. Source precedence is the
+        # discovery order above (later sources win), but only among active
+        # candidates: an unconfigured external plugin must not shadow a
+        # bundled default with the same key. Explicit disable remains a
+        # key-wide deny. Keys are path-derived (``image_gen/openai``,
+        # ``disk-cleanup``) so ``tts/openai`` and ``image_gen/openai`` don't
+        # collide even when both manifests say ``name: openai``.
+        activation = load_plugin_activation_state()
+        grouped: Dict[str, List[PluginManifest]] = {}
         for manifest in manifests:
-            winners[manifest.key or manifest.name] = manifest
-        for manifest in winners.values():
-            lookup_key = manifest.key or manifest.name
+            grouped.setdefault(manifest.key or manifest.name, []).append(manifest)
+        for lookup_key, candidates in grouped.items():
+            selection = resolve_plugin_candidate_winner(
+                candidates,
+                lambda candidate: activation.status(
+                    name=candidate.name,
+                    key=candidate.key or candidate.name,
+                    source=candidate.source,
+                    kind=candidate.kind,
+                ),
+            )
+            if selection is None:  # pragma: no cover - groups are never empty
+                continue
+            manifest, status = selection
 
-            # Explicit disable always wins (matches on key or on legacy
-            # bare name for back-compat with existing user configs).
-            if lookup_key in disabled or manifest.name in disabled:
+            # Explicit disable always wins, including for bundled defaults.
+            if status == "disabled":
                 loaded = LoadedPlugin(manifest=manifest, enabled=False)
                 loaded.error = "disabled via config"
                 self._plugins[lookup_key] = loaded
@@ -1434,11 +1469,31 @@ class PluginManager:
             # ProviderProfile instances and break the "last writer wins"
             # override semantics between bundled and user plugins.
             if manifest.kind == "model-provider":
-                loaded = LoadedPlugin(manifest=manifest, enabled=True)
+                loaded = LoadedPlugin(
+                    manifest=manifest,
+                    enabled=status == "enabled",
+                )
+                if not loaded.enabled:
+                    loaded.error = (
+                        "not enabled in config (run `hermes plugins enable {}` "
+                        "to activate)".format(lookup_key)
+                    )
                 self._plugins[lookup_key] = loaded
                 logger.debug(
                     "Skipping '%s' (model-provider, handled by providers/ discovery)",
                     lookup_key,
+                )
+                continue
+
+            if status != "enabled":
+                loaded = LoadedPlugin(manifest=manifest, enabled=False)
+                loaded.error = (
+                    "not enabled in config (run `hermes plugins enable {}` to activate)"
+                    .format(lookup_key)
+                )
+                self._plugins[lookup_key] = loaded
+                logger.debug(
+                    "Skipping '%s' (not active under plugin policy)", lookup_key
                 )
                 continue
 
@@ -1465,25 +1520,6 @@ class PluginManager:
                 self._register_deferred_platform(manifest)
                 continue
 
-            # Everything else (standalone, user-installed backends,
-            # entry-point plugins) is opt-in via plugins.enabled.
-            # Accept both the path-derived key and the legacy bare name
-            # so existing configs keep working.
-            is_enabled = (
-                enabled is not None
-                and (lookup_key in enabled or manifest.name in enabled)
-            )
-            if not is_enabled:
-                loaded = LoadedPlugin(manifest=manifest, enabled=False)
-                loaded.error = (
-                    "not enabled in config (run `hermes plugins enable {}` to activate)"
-                    .format(lookup_key)
-                )
-                self._plugins[lookup_key] = loaded
-                logger.debug(
-                    "Skipping '%s' (not in plugins.enabled)", lookup_key
-                )
-                continue
             self._load_plugin(manifest)
 
         if manifests:
@@ -1544,44 +1580,43 @@ class PluginManager:
 
         return manifests
 
-    def has_enabled_portable_mcp(self, raw_config: Mapping[str, Any]) -> bool:
+    def has_enabled_portable_mcp(
+        self, effective_config: Mapping[str, Any]
+    ) -> bool:
         """Probe enabled portable MCP packages without loading plugins.
 
         The directory manifest collection is shared with full discovery, so
         native ``plugin.yaml`` precedence, source ordering, depth limits, and
         project-plugin gating cannot diverge between startup and runtime.
+        ``effective_config`` is the canonical loaded config snapshot used by
+        the startup gate, including environment expansion and managed policy.
         """
         if _env_enabled("HERMES_SAFE_MODE"):
             return False
 
-        plugins_config = raw_config.get("plugins")
-        if not isinstance(plugins_config, dict):
-            return False
-        enabled_value = plugins_config.get("enabled")
-        if not isinstance(enabled_value, list):
-            return False
-        enabled = {value for value in enabled_value if isinstance(value, str)}
-        disabled_value = plugins_config.get("disabled", [])
-        disabled = (
-            {value for value in disabled_value if isinstance(value, str)}
-            if isinstance(disabled_value, list)
-            else set()
-        )
-        if not enabled:
-            return False
+        from hermes_cli.plugin_activation import PluginActivationState
 
-        winners: Dict[str, PluginManifest] = {}
+        activation = PluginActivationState.from_config(effective_config)
+        grouped: Dict[str, List[PluginManifest]] = {}
         for manifest in self._collect_directory_manifests():
-            winners[manifest.key or manifest.name] = manifest
+            grouped.setdefault(manifest.key or manifest.name, []).append(manifest)
 
-        for manifest in winners.values():
-            if not manifest.portable:
+        for candidates in grouped.values():
+            selection = resolve_plugin_candidate_winner(
+                candidates,
+                lambda candidate: activation.status(
+                    name=candidate.name,
+                    key=candidate.key or candidate.name,
+                    source=candidate.source,
+                    kind=candidate.kind,
+                ),
+            )
+            if selection is None:
+                continue
+            manifest, status = selection
+            if status != "enabled" or not manifest.portable:
                 continue
             lookup_key = manifest.key or manifest.name
-            if lookup_key in disabled or manifest.name in disabled:
-                continue
-            if lookup_key not in enabled and manifest.name not in enabled:
-                continue
             try:
                 from hermes_cli.agent_plugins import _discover_mcp
 
@@ -2272,13 +2307,13 @@ def get_plugin_manager() -> PluginManager:
     return _plugin_manager
 
 
-def has_enabled_agent_plugin_mcp(raw_config: Mapping[str, Any]) -> bool:
+def has_enabled_agent_plugin_mcp(effective_config: Mapping[str, Any]) -> bool:
     """Return whether config enables a portable package with MCP servers.
 
     A fresh manager performs manifest-only scanning, so this startup gate does
     not mutate the process-wide plugin registry or import native plugin code.
     """
-    return PluginManager().has_enabled_portable_mcp(raw_config)
+    return PluginManager().has_enabled_portable_mcp(effective_config)
 
 
 def discover_plugins(force: bool = False) -> None:

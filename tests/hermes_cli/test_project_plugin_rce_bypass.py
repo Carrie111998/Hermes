@@ -38,6 +38,8 @@ from unittest.mock import patch
 import pytest
 
 from hermes_cli import web_server
+from hermes_cli.agent_plugins import PLUGIN_SCHEMA_V1
+from hermes_cli.plugin_activation import PluginActivationState
 
 
 @pytest.fixture(autouse=True)
@@ -46,9 +48,15 @@ def _reset_plugin_cache(monkeypatch):
     cache before *and* after each test so leakage between tests can't
     mask a regression — and so the production cache the import-time
     ``_mount_plugin_api_routes()`` populated doesn't bleed in."""
+    mounted_owners = dict(web_server._mounted_plugin_api_owners)
     web_server._dashboard_plugins_cache = None
+    web_server._dashboard_plugins_cache_fingerprint = None
+    web_server._mounted_plugin_api_owners.clear()
     yield
     web_server._dashboard_plugins_cache = None
+    web_server._dashboard_plugins_cache_fingerprint = None
+    web_server._mounted_plugin_api_owners.clear()
+    web_server._mounted_plugin_api_owners.update(mounted_owners)
 
 
 def _write_plugin_manifest(root: Path, name: str, manifest: dict) -> Path:
@@ -58,6 +66,68 @@ def _write_plugin_manifest(root: Path, name: str, manifest: dict) -> Path:
     dashboard_dir.mkdir(parents=True)
     (dashboard_dir / "manifest.json").write_text(json.dumps(manifest))
     return dashboard_dir
+
+
+def _write_runtime_plugin(
+    root: Path,
+    directory: str,
+    *,
+    runtime_name: str,
+    dashboard_name: str | None = None,
+    with_api: bool = False,
+) -> Path:
+    """Create a flat runtime plugin, optionally with a dashboard extension."""
+    plugin_root = root / directory
+    plugin_root.mkdir(parents=True)
+    (plugin_root / "plugin.yaml").write_text(
+        f"name: {runtime_name}\nkind: backend\nversion: 1.0.0\n"
+    )
+    if dashboard_name is not None:
+        dashboard_dir = plugin_root / "dashboard"
+        dashboard_dir.mkdir()
+        dist_dir = dashboard_dir / "dist"
+        dist_dir.mkdir()
+        (dist_dir / "index.js").write_text("console.log('winner');")
+        manifest = {
+            "name": dashboard_name,
+            "entry": "dist/index.js",
+        }
+        if with_api:
+            (dashboard_dir / "api.py").write_text(
+                "from fastapi import APIRouter\nrouter = APIRouter()\n"
+            )
+            manifest["api"] = "api.py"
+        (dashboard_dir / "manifest.json").write_text(json.dumps(manifest))
+    return plugin_root
+
+
+def _write_portable_runtime_plugin(
+    root: Path,
+    directory: str,
+    *,
+    runtime_name: str,
+    dashboard_name: str,
+    valid_manifest: bool = True,
+) -> Path:
+    """Create an Agent Plugins v1 package with a dashboard API."""
+    plugin_root = root / directory
+    dashboard_dir = plugin_root / "dashboard"
+    dashboard_dir.mkdir(parents=True)
+    if valid_manifest:
+        portable_manifest = {
+            "$schema": PLUGIN_SCHEMA_V1,
+            "name": runtime_name,
+        }
+        (plugin_root / "plugin.json").write_text(json.dumps(portable_manifest))
+    else:
+        (plugin_root / "plugin.json").write_text("{not-json")
+    (dashboard_dir / "api.py").write_text(
+        "from fastapi import APIRouter\nrouter = APIRouter()\n"
+    )
+    (dashboard_dir / "manifest.json").write_text(
+        json.dumps({"name": dashboard_name, "api": "api.py"})
+    )
+    return plugin_root
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +185,389 @@ class TestProjectPluginsEnvGate:
         evil = next((p for p in plugins if p["name"] == "evil"), None)
         assert evil is not None
         assert evil["source"] == "project"
+
+
+class TestDashboardDiscoveryScopeAndWinners:
+    @pytest.mark.parametrize(
+        (
+            "valid_manifest",
+            "activation",
+            "expected_name",
+            "expected_status",
+            "should_import",
+        ),
+        [
+            (
+                True,
+                PluginActivationState(
+                    enabled=frozenset({"ui.foo"}),
+                    disabled=frozenset({"portable.test"}),
+                ),
+                "portable.test",
+                "disabled",
+                False,
+            ),
+            (
+                True,
+                PluginActivationState(enabled=frozenset({"portable.test"})),
+                "portable.test",
+                "enabled",
+                True,
+            ),
+            (
+                False,
+                PluginActivationState(
+                    enabled=frozenset({"portable-dir", "ui.foo"})
+                ),
+                "portable-dir",
+                "not enabled",
+                False,
+            ),
+        ],
+    )
+    def test_portable_dashboard_uses_canonical_runtime_gate(
+        self,
+        tmp_path,
+        monkeypatch,
+        valid_manifest,
+        activation,
+        expected_name,
+        expected_status,
+        should_import,
+    ):
+        bundled = tmp_path / "bundled"
+        user_home = tmp_path / "home"
+        bundled.mkdir()
+        user_home.mkdir()
+        plugin_root = _write_portable_runtime_plugin(
+            user_home / "plugins",
+            "portable-dir",
+            runtime_name="portable.test",
+            dashboard_name="ui.foo",
+            valid_manifest=valid_manifest,
+        )
+        monkeypatch.setenv("HERMES_HOME", str(user_home))
+
+        with patch(
+            "hermes_cli.plugins.get_bundled_plugins_dir",
+            return_value=bundled,
+        ), patch(
+            "hermes_cli.config.load_plugin_activation_state",
+            return_value=activation,
+        ):
+            plugins = web_server._get_dashboard_plugins(force_rescan=True)
+            portable = next(p for p in plugins if p["name"] == "ui.foo")
+            assert portable["_runtime_managed"] is True
+            assert portable["_runtime_name"] == expected_name
+            assert portable["_runtime_key"] == expected_name
+            assert web_server._dashboard_plugin_status(
+                portable,
+                activation=activation,
+            ) == expected_status
+
+            with patch(
+                "importlib.util.spec_from_file_location",
+                side_effect=RuntimeError("portable API import probe"),
+            ) as spec:
+                web_server._mount_plugin_api_routes()
+
+        if should_import:
+            spec.assert_called_once_with(
+                "hermes_dashboard_plugin_ui.foo",
+                plugin_root / "dashboard" / "api.py",
+            )
+        else:
+            spec.assert_not_called()
+
+    def test_populated_project_cache_is_invalidated_on_cwd_change(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", "1")
+        old_cwd = tmp_path / "old-project"
+        new_cwd = tmp_path / "new-project"
+        old_cwd.mkdir()
+        new_cwd.mkdir()
+        _write_plugin_manifest(
+            old_cwd / ".hermes" / "plugins",
+            "old-extension",
+            {"name": "old-extension", "entry": "dist/index.js"},
+        )
+
+        monkeypatch.chdir(old_cwd)
+        cached = web_server._get_dashboard_plugins(force_rescan=True)
+        stale = next(p for p in cached if p["name"] == "old-extension")
+        assert Path(stale["_dir"]).is_dir()
+
+        monkeypatch.chdir(new_cwd)
+        refreshed = web_server._get_dashboard_plugins()
+        assert "old-extension" not in {p["name"] for p in refreshed}
+        assert web_server._dashboard_plugin_status(
+            stale,
+            [],
+            PluginActivationState(enabled=frozenset({"old-extension"})),
+        ) == "not enabled"
+
+    def test_user_home_and_bundled_root_are_cache_identities(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        home_one = tmp_path / "home-one"
+        home_two = tmp_path / "home-two"
+        home_one.mkdir()
+        home_two.mkdir()
+        _write_plugin_manifest(
+            home_one / "plugins",
+            "old-user",
+            {"name": "old-user", "entry": "dist/index.js"},
+        )
+        bundled_one = tmp_path / "bundled-one"
+        bundled_two = tmp_path / "bundled-two"
+        bundled_one.mkdir()
+        bundled_two.mkdir()
+        _write_plugin_manifest(
+            bundled_one,
+            "old-bundled",
+            {"name": "old-bundled", "entry": "dist/index.js"},
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(home_one))
+        with patch(
+            "hermes_cli.plugins.get_bundled_plugins_dir",
+            return_value=bundled_one,
+        ):
+            first = web_server._get_dashboard_plugins(force_rescan=True)
+        assert {"old-user", "old-bundled"} <= {p["name"] for p in first}
+
+        monkeypatch.setenv("HERMES_HOME", str(home_two))
+        with patch(
+            "hermes_cli.plugins.get_bundled_plugins_dir",
+            return_value=bundled_two,
+        ):
+            second = web_server._get_dashboard_plugins()
+        assert "old-user" not in {p["name"] for p in second}
+        assert "old-bundled" not in {p["name"] for p in second}
+
+    def test_project_dashboard_is_last_winner_by_runtime_key(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        bundled = tmp_path / "bundled"
+        user_home = tmp_path / "home"
+        project = tmp_path / "project"
+        bundled.mkdir()
+        user_home.mkdir()
+        project.mkdir()
+        _write_runtime_plugin(
+            bundled,
+            "bundled-copy",
+            runtime_name="shared-runtime",
+            dashboard_name="bundled-ui",
+        )
+        _write_runtime_plugin(
+            user_home / "plugins",
+            "user-copy",
+            runtime_name="shared-runtime",
+            dashboard_name="user-ui",
+        )
+        project_root = project / ".hermes" / "plugins"
+        _write_runtime_plugin(
+            project_root,
+            "project-copy",
+            runtime_name="shared-runtime",
+            dashboard_name="project-ui",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(user_home))
+        monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", "1")
+        monkeypatch.chdir(project)
+
+        with patch(
+            "hermes_cli.plugins.get_bundled_plugins_dir",
+            return_value=bundled,
+        ), patch(
+            "hermes_cli.config.load_plugin_activation_state",
+            return_value=PluginActivationState(
+                enabled=frozenset({"shared-runtime"})
+            ),
+        ):
+            plugins = web_server._get_dashboard_plugins(force_rescan=True)
+            shared = [p for p in plugins if p.get("_runtime_key") == "shared-runtime"]
+            assert len(shared) == 1
+            assert shared[0]["name"] == "project-ui"
+            assert shared[0]["source"] == "project"
+            assert web_server._dashboard_plugin_status(
+                shared[0],
+                activation=PluginActivationState(
+                    enabled=frozenset({"shared-runtime"})
+                ),
+            ) == "enabled"
+
+    def test_inactive_user_candidate_falls_back_to_bundled_dashboard(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        bundled = tmp_path / "bundled"
+        user_home = tmp_path / "home"
+        bundled.mkdir()
+        user_home.mkdir()
+        _write_runtime_plugin(
+            bundled,
+            "bundled-copy",
+            runtime_name="shared-runtime",
+            dashboard_name="bundled-ui",
+            with_api=True,
+        )
+        # The higher-precedence copy is installed but not enabled and has no
+        # dashboard. It must not suppress the active bundled fallback.
+        _write_runtime_plugin(
+            user_home / "plugins",
+            "user-copy",
+            runtime_name="shared-runtime",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(user_home))
+        monkeypatch.delenv("HERMES_ENABLE_PROJECT_PLUGINS", raising=False)
+
+        with patch(
+            "hermes_cli.plugins.get_bundled_plugins_dir",
+            return_value=bundled,
+        ):
+            plugins = web_server._get_dashboard_plugins(force_rescan=True)
+            bundled_dashboard = next(p for p in plugins if p["name"] == "bundled-ui")
+            assert bundled_dashboard["source"] == "bundled"
+            assert web_server._dashboard_plugin_status(
+                bundled_dashboard,
+                activation=PluginActivationState(),
+            ) == "enabled"
+
+    def test_activation_change_reselects_cached_dashboard_candidate(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        bundled = tmp_path / "bundled"
+        user_home = tmp_path / "home"
+        bundled.mkdir()
+        user_home.mkdir()
+        _write_runtime_plugin(
+            bundled,
+            "bundled-copy",
+            runtime_name="shared-runtime",
+            dashboard_name="bundled-ui",
+        )
+        _write_runtime_plugin(
+            user_home / "plugins",
+            "user-copy",
+            runtime_name="shared-runtime",
+            dashboard_name="user-ui",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(user_home))
+        state = {"activation": PluginActivationState()}
+
+        with patch(
+            "hermes_cli.plugins.get_bundled_plugins_dir",
+            return_value=bundled,
+        ), patch(
+            "hermes_cli.config.load_plugin_activation_state",
+            side_effect=lambda: state["activation"],
+        ):
+            first = web_server._get_dashboard_plugins(force_rescan=True)
+            assert "bundled-ui" in {p["name"] for p in first}
+
+            state["activation"] = PluginActivationState(
+                enabled=frozenset({"shared-runtime"})
+            )
+            second = web_server._get_dashboard_plugins()
+            assert "user-ui" in {p["name"] for p in second}
+
+            state["activation"] = PluginActivationState()
+            third = web_server._get_dashboard_plugins()
+            assert "bundled-ui" in {p["name"] for p in third}
+
+    def test_enabled_user_without_dashboard_suppresses_bundled_dashboard(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        bundled = tmp_path / "bundled"
+        user_home = tmp_path / "home"
+        bundled.mkdir()
+        user_home.mkdir()
+        _write_runtime_plugin(
+            bundled,
+            "bundled-copy",
+            runtime_name="shared-runtime",
+            dashboard_name="bundled-ui",
+        )
+        _write_runtime_plugin(
+            user_home / "plugins",
+            "user-copy",
+            runtime_name="shared-runtime",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(user_home))
+
+        enabled = PluginActivationState(enabled=frozenset({"shared-runtime"}))
+        with patch(
+            "hermes_cli.plugins.get_bundled_plugins_dir",
+            return_value=bundled,
+        ), patch(
+            "hermes_cli.config.load_plugin_activation_state",
+            return_value=enabled,
+        ):
+            plugins = web_server._get_dashboard_plugins(force_rescan=True)
+            bundled_dashboard = next(p for p in plugins if p["name"] == "bundled-ui")
+            assert web_server._dashboard_plugin_status(
+                bundled_dashboard,
+                activation=enabled,
+            ) == "not enabled"
+
+    def test_explicit_disable_closes_every_candidate_for_canonical_key(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        bundled = tmp_path / "bundled"
+        user_home = tmp_path / "home"
+        bundled.mkdir()
+        user_home.mkdir()
+        _write_runtime_plugin(
+            bundled,
+            "bundled-copy",
+            runtime_name="shared-runtime",
+            dashboard_name="bundled-ui",
+        )
+        _write_runtime_plugin(
+            user_home / "plugins",
+            "user-copy",
+            runtime_name="shared-runtime",
+            dashboard_name="user-ui",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(user_home))
+
+        disabled = PluginActivationState(
+            enabled=frozenset({"shared-runtime"}),
+            disabled=frozenset({"shared-runtime"}),
+        )
+        with patch(
+            "hermes_cli.plugins.get_bundled_plugins_dir",
+            return_value=bundled,
+        ), patch(
+            "hermes_cli.config.load_plugin_activation_state",
+            return_value=disabled,
+        ):
+            plugins = web_server._get_dashboard_plugins(force_rescan=True)
+            shared = [p for p in plugins if p.get("_runtime_key") == "shared-runtime"]
+            assert len(shared) == 1
+            assert web_server._dashboard_plugin_status(
+                shared[0],
+                activation=disabled,
+            ) == "disabled"
 
 
 # ---------------------------------------------------------------------------
@@ -229,8 +682,15 @@ class TestMountApiRoutesRefusesUntrusted:
 
     def test_project_source_api_is_not_imported(self, tmp_path):
         plugin = self._payload_plugin(tmp_path, source="project")
-        web_server._dashboard_plugins_cache = [plugin]
-        with patch("importlib.util.spec_from_file_location") as spec:
+        with patch.object(
+            web_server,
+            "_get_dashboard_plugins",
+            return_value=[plugin],
+        ), patch.object(
+            web_server,
+            "_dashboard_plugin_is_active",
+            return_value=True,
+        ), patch("importlib.util.spec_from_file_location") as spec:
             web_server._mount_plugin_api_routes()
         assert spec.call_count == 0, (
             "project-source plugin's api file was imported — "
@@ -244,8 +704,15 @@ class TestMountApiRoutesRefusesUntrusted:
         file outside the dashboard dir."""
         plugin = self._payload_plugin(tmp_path, source="user",
                                        api_file="../../../tmp/evil.py")
-        web_server._dashboard_plugins_cache = [plugin]
-        with patch("importlib.util.spec_from_file_location") as spec:
+        with patch.object(
+            web_server,
+            "_get_dashboard_plugins",
+            return_value=[plugin],
+        ), patch.object(
+            web_server,
+            "_dashboard_plugin_is_active",
+            return_value=True,
+        ), patch("importlib.util.spec_from_file_location") as spec:
             web_server._mount_plugin_api_routes()
         assert spec.call_count == 0
 

@@ -10512,14 +10512,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # look like "nothing installed".
                 from hermes_cli.plugins_cmd import (
                     _discover_all_plugins,
-                    _get_disabled_set,
-                    _get_enabled_set,
-                    _plugin_status,
+                    _discover_plugin_display_records,
                 )
 
                 entries = _discover_all_plugins()
-                enabled = _get_enabled_set()
-                disabled = _get_disabled_set()
+                resolved_groups = {
+                    entry[5]: (entry, status)
+                    for entry, status in _discover_plugin_display_records()
+                }
 
                 # `/plugins` is a quick glance — default to user-installed
                 # plugins (what the user actually added). Bundled provider/
@@ -10546,8 +10546,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         loaded = {}
 
                     print(f"User plugins ({len(user_entries)}):")
-                    for name, version, _desc, source, _dir, key in sorted(user_entries):
-                        state = _plugin_status(name, enabled, disabled, key=key)
+                    for entry in sorted(user_entries):
+                        name, version, _desc, _source, _dir, key, _kind = entry
+                        resolved_entry, group_status = resolved_groups.get(
+                            key,
+                            (None, "not enabled"),
+                        )
+                        if group_status == "disabled":
+                            state = "disabled"
+                        elif group_status == "enabled" and entry == resolved_entry:
+                            state = "enabled"
+                        else:
+                            state = "not enabled"
                         glyph = {"enabled": "✓", "disabled": "✗"}.get(state, "○")
                         ver = f" v{version}" if version else ""
                         info = loaded.get(name) or {}
