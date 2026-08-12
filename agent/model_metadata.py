@@ -3293,11 +3293,17 @@ def estimate_request_tokens_rough(
 # NOTE: tool schemas can be large. Avoid repeated `str(tools)` conversions,
 # which are CPU-heavy and can stall GUI event loops under GIL pressure.
 #
-# Keyed by ``id(tools)``. A long-lived gateway/desktop backend builds many
-# transient tool lists over its lifetime, so the cache is bounded and evicts
-# oldest-first (insertion-ordered dict) once it exceeds the cap. The cap is
-# generous relative to how rarely toolsets are rebuilt within a process.
-_TOOLS_TOKENS_CACHE: dict[int, Tuple[int, str, str, int]] = {}
+# Keyed by a cheap content signature — (count, per-tool (len(name),
+# len(description), len(str(params)))) — instead of ``id(tools)``. The
+# signature is recomputed on every call (a few len()/str() calls per tool,
+# far cheaper than json.dumps of every schema) and detects in-place
+# mutations of any tool, which ``id(list)`` cannot: the old key validated
+# only size + first/last name, so a description change to a middle tool
+# returned a stale estimate forever, and recycled ids could alias an
+# unrelated list. A long-lived gateway/desktop backend builds many transient
+# tool lists over its lifetime, so the cache is bounded and evicts
+# oldest-first (insertion-ordered dict) once it exceeds the cap.
+_TOOLS_TOKENS_CACHE: dict[tuple, int] = {}
 _TOOLS_TOKENS_CACHE_MAX = 256
 
 
@@ -3313,22 +3319,52 @@ def _tool_name_for_cache(tool: Any) -> str:
     return name if isinstance(name, str) else ""
 
 
+def _tools_tokens_signature(tools: List[Dict[str, Any]]) -> tuple:
+    """Cheap content signature of a tool list, without serializing schemas.
+
+    Returns ``(count, (per-tool (name_len, desc_len, params_str_len), ...))``.
+    ``len(str(params))`` tracks nested schema size closely enough to detect
+    real mutations while being far cheaper than the ``json.dumps`` the token
+    estimate itself performs. The name is included as an opaque field so the
+    first/last-name aliasing the old cache suffered is impossible.
+    """
+    per_tool = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            per_tool.append((0, 0, 0))
+            continue
+        fn = tool.get("function")
+        if isinstance(fn, dict):
+            name = fn.get("name") or ""
+            desc = fn.get("description") or ""
+            params = fn.get("parameters") or {}
+        else:
+            name = tool.get("name") or ""
+            desc = tool.get("description") or ""
+            params = tool.get("parameters") or {}
+        name_len = len(name) if isinstance(name, str) else 0
+        desc_len = len(desc) if isinstance(desc, str) else 0
+        try:
+            params_len = len(str(params))
+        except Exception:  # noqa: BLE001 - a pathological params object must not break estimates
+            params_len = 0
+        per_tool.append((name_len, desc_len, params_len))
+    return (len(tools), tuple(per_tool))
+
+
 def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
     if not tools:
         return 0
 
-    # Cache by list identity. Tools are rebuilt rarely (toolset changes),
+    # Cache by content signature. Tools are rebuilt rarely (toolset changes),
     # but token estimates are requested frequently (preflight, compaction).
-    key = id(tools)
-    n = len(tools)
-    first = _tool_name_for_cache(tools[0]) if n else ""
-    last = _tool_name_for_cache(tools[-1]) if n else ""
+    # The signature revalidation is O(n) len()/str() — cheap vs. the
+    # json.dumps of every schema the miss path performs.
+    key = _tools_tokens_signature(tools)
 
     cached = _TOOLS_TOKENS_CACHE.get(key)
     if cached is not None:
-        cached_n, cached_first, cached_last, cached_tokens = cached
-        if cached_n == n and cached_first == first and cached_last == last:
-            return cached_tokens
+        return cached
 
     # Fast, stable rough estimate: sum lengths of the major schema fields.
     # This avoids the pathological `str(tools)` path while still scaling with
@@ -3360,8 +3396,8 @@ def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
     tokens = (total_chars + 3) // 4
     # Bound the cache: drop the oldest entry when the cap is exceeded so a
     # long-running process can't accumulate an unbounded number of stale
-    # ``id(tools)`` entries (id values are recycled after GC anyway).
+    # entries.
     if len(_TOOLS_TOKENS_CACHE) >= _TOOLS_TOKENS_CACHE_MAX:
         _TOOLS_TOKENS_CACHE.pop(next(iter(_TOOLS_TOKENS_CACHE)), None)
-    _TOOLS_TOKENS_CACHE[key] = (n, first, last, tokens)
+    _TOOLS_TOKENS_CACHE[key] = tokens
     return tokens

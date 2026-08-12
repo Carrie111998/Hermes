@@ -176,6 +176,10 @@ class TestEstimateRequestTokensRough:
         mm._TOOLS_TOKENS_CACHE.clear()
         cap = mm._TOOLS_TOKENS_CACHE_MAX
         # Keep references so ids are not recycled mid-loop, forcing distinct keys.
+        # Description length varies per list: the content-signature key
+        # (len(name), len(desc), len(params)) collapses lists whose field sizes
+        # are identical — same estimate, so one entry is correct — so each
+        # fixture list must differ in at least one field size to be distinct.
         held = []
         for i in range(cap + 50):
             tools = [
@@ -183,7 +187,7 @@ class TestEstimateRequestTokensRough:
                     "type": "function",
                     "function": {
                         "name": f"tool_{i}",
-                        "description": "d",
+                        "description": "d" * (i + 1),
                         "parameters": {"type": "object"},
                     },
                 }
@@ -192,6 +196,34 @@ class TestEstimateRequestTokensRough:
             mm._estimate_tools_tokens_rough(tools)
             assert len(mm._TOOLS_TOKENS_CACHE) <= cap
         assert len(mm._TOOLS_TOKENS_CACHE) == cap
+
+    def test_middle_tool_mutation_invalidates_cache(self):
+        # Regression for #84732: the estimate cache was keyed by ``id(list)``
+        # and validated only size + first/last tool name, so an in-place
+        # mutation to a MIDDLE tool's description returned the stale estimate
+        # forever. The key must be a content signature, not list identity.
+        import agent.model_metadata as mm
+
+        mm._TOOLS_TOKENS_CACHE.clear()
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": f"tool_{i}",
+                    "description": "short",
+                    "parameters": {"type": "object"},
+                },
+            }
+            for i in range(3)
+        ]
+        first = mm._estimate_tools_tokens_rough(tools)
+        assert mm._estimate_tools_tokens_rough(tools) == first  # stable on hit
+
+        # Mutate the middle tool's description (same list object, same id()).
+        tools[1]["function"]["description"] = "x" * 10_000
+        second = mm._estimate_tools_tokens_rough(tools)
+        assert second != first, "stale cached estimate returned after mutation"
+        assert second > first
 
 
 # =========================================================================
