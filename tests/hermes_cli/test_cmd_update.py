@@ -751,6 +751,40 @@ class TestNodeRuntimeNpmResolution:
 
 
 
+    def test_node_update_refreshes_npm_after_root_engine_repair(
+        self, tmp_path, monkeypatch
+    ):
+        """The workspace install must use managed npm if root install repaired it."""
+        from hermes_cli import main as hm
+        import hermes_constants
+
+        (tmp_path / "package.json").write_text("{}")
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(hm, "_npm_lockfile_changed", lambda _root: True)
+        monkeypatch.setattr(hm, "_record_npm_lockfile_hash", lambda _root: None)
+        monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda: tmp_path)
+
+        resolved_npms = iter(["/opt/homebrew/bin/npm", "/Users/seth/.hermes/node/bin/npm"])
+        monkeypatch.setattr(hm, "_resolve_node_runtime_npm", lambda: next(resolved_npms))
+
+        npm_calls = []
+
+        def fake_npm_install(npm, *_args, **_kwargs):
+            npm_calls.append(npm)
+            return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+        monkeypatch.setattr(hm, "_run_npm_install_deterministic", fake_npm_install)
+
+        failed = hm._update_node_dependencies()
+
+        assert failed == []
+        assert npm_calls == [
+            "/opt/homebrew/bin/npm",
+            "/Users/seth/.hermes/node/bin/npm",
+        ]
+
+
+
     def test_wsl_update_skips_windows_npm_build_paths(self, mock_args, monkeypatch):
         """A Windows-only npm on WSL must not reach web or desktop builds."""
         from hermes_cli import main as hm

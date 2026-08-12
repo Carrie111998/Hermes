@@ -2186,6 +2186,13 @@ def _update_node_dependencies() -> list[str]:
             print(f"    {stderr.splitlines()[-1]}")
         return _partial_update_failure("repo root")
 
+    # Step 1 may have recovered from EBADENGINE by provisioning a Hermes-managed
+    # Node/npm tree. Refresh the npm path before the workspace install so the
+    # second command does not fall back to the original foreign npm that failed.
+    refreshed_npm = _m()._resolve_node_runtime_npm()
+    if refreshed_npm:
+        npm = refreshed_npm
+
     # Step 2: install only the workspaces update needs (ui-tui, web).
     # --workspace selects specific workspaces; the rest (desktop) are skipped.
     ws_args = [*extra_args, "--workspace", "ui-tui", "--workspace", "web"]
