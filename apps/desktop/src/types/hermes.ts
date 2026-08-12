@@ -884,6 +884,8 @@ export interface ProfileInfo {
   path: string
   provider: null | string
   skill_count: number
+  /** Custom avatar URL */
+  avatar_url?: null | string
 }
 
 export interface ProfileSetupCommand {

@@ -23,6 +23,7 @@ from pathlib import Path  # noqa: F401
 from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
 
 from fastapi import APIRouter, HTTPException, Query  # noqa: F401
+from fastapi import UploadFile
 
 from hermes_cli.web_deps import late
 from hermes_cli.web_models import (
@@ -72,6 +73,9 @@ _hub_action_name = late("_hub_action_name")
 _open_session_db_at_path = late("_open_session_db_at_path")
 _profile_setup_command = late("_profile_setup_command")
 _profile_to_dict = late("_profile_to_dict")
+_resolve_profile_avatar = late("_resolve_profile_avatar")
+_profile_avatar_extensions = late("_profile_avatar_extensions")
+_profile_avatar_max_size = late("_profile_avatar_max_size")
 _resolve_profile_dir = late("_resolve_profile_dir")
 _spawn_hermes_action = late("_spawn_hermes_action")
 _strip_session_list_rows = late("_strip_session_list_rows")
@@ -620,6 +624,89 @@ async def list_profiles_endpoint():
     except Exception:
         _log.exception("GET /api/profiles failed; falling back to profile directory scan")
         return {"profiles": _fallback_profile_dicts(profiles_mod)}
+
+
+
+
+# ---------------------------------------------------------------------------
+# Profile avatar endpoints
+# ---------------------------------------------------------------------------
+
+_AVATAR_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
+@router.get("/api/profiles/avatar")
+async def get_profile_avatar(name: str = "default"):
+    """Serve a profile's avatar image bytes, or 404 when unset."""
+    resolved = _resolve_profile_avatar(name)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="No avatar set")
+    path, ext = resolved
+    try:
+        data = path.read_bytes()
+    except OSError:
+        raise HTTPException(status_code=500, detail="Failed to read avatar")
+    from fastapi.responses import Response
+    return Response(
+        content=data,
+        media_type=_AVATAR_MIME.get(ext, "application/octet-stream"),
+        headers={"Cache-Control": "private, max-age=300"},
+    )
+
+
+@router.post("/api/profiles/avatar")
+async def set_profile_avatar(name: str = "default", file: UploadFile = ...):
+    """Upload (or replace) a profile's avatar image. Multipart: name + file."""
+    if file is None:
+        raise HTTPException(status_code=400, detail="Missing avatar file")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Avatar file is empty")
+    if len(content) > _profile_avatar_max_size():
+        raise HTTPException(status_code=413, detail="Avatar image exceeds 5 MB limit")
+    from pathlib import Path as _Path
+    ext = _Path(file.filename or "").suffix.lower()
+    if ext not in _profile_avatar_extensions():
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported image type. Use PNG, JPG, WEBP, or GIF.",
+        )
+    from hermes_cli import profiles as profiles_mod
+    try:
+        home = profiles_mod.get_profile_dir(name)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    if not home.is_dir():
+        raise HTTPException(status_code=404, detail="Profile not found")
+    for old_ext in _profile_avatar_extensions():
+        old = home / f"avatar{old_ext}"
+        if old.is_file():
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    dest = home / f"avatar{ext}"
+    dest.write_bytes(content)
+    return {"ok": True, "avatar_url": f"/api/profiles/avatar?name={name}"}
+
+
+@router.delete("/api/profiles/avatar")
+async def remove_profile_avatar(name: str = "default"):
+    """Remove a profile's custom avatar."""
+    resolved = _resolve_profile_avatar(name)
+    if resolved is None:
+        return {"ok": True, "removed": False}
+    try:
+        resolved[0].unlink()
+    except OSError:
+        raise HTTPException(status_code=500, detail="Failed to remove avatar")
+    return {"ok": True, "removed": True}
 
 
 @router.post("/api/profiles")

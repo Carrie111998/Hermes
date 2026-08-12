@@ -13718,7 +13718,61 @@ def _profile_to_dict(info) -> Dict[str, Any]:
         "distribution_version": _profile_attr(info, "distribution_version"),
         "distribution_source": _profile_attr(info, "distribution_source"),
         "has_alias": _profile_attr(info, "alias_path") is not None,
+        "avatar_url": _profile_avatar_url(
+            _profile_attr(info, "name", ""),
+            _profile_attr(info, "path", ""),
+        ),
     }
+
+
+
+
+# ---------------------------------------------------------------------------
+# Profile avatar support
+# ---------------------------------------------------------------------------
+
+PROFILE_AVATAR_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+PROFILE_AVATAR_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _profile_avatar_url(profile_name, profile_path):
+    """Avatar API URL for a profile, or None when no avatar file exists."""
+    from pathlib import Path as _Path
+    try:
+        path = _Path(str(profile_path))
+        if not path.is_dir():
+            return None
+        for ext in PROFILE_AVATAR_EXTENSIONS:
+            if (path / f"avatar{ext}").is_file():
+                return "/api/profiles/avatar?name=" + str(profile_name)
+    except Exception:
+        return None
+    return None
+
+
+def _profile_avatar_extensions():
+    return PROFILE_AVATAR_EXTENSIONS
+
+
+def _profile_avatar_max_size():
+    return PROFILE_AVATAR_MAX_BYTES
+
+
+def _resolve_profile_avatar(name):
+    """Return (path, ext) for a profile's avatar file, or None."""
+    from pathlib import Path as _Path
+    from hermes_cli import profiles as profiles_mod
+    try:
+        home = profiles_mod.get_profile_dir(name)
+    except Exception:
+        return None
+    if not home.is_dir():
+        return None
+    for ext in PROFILE_AVATAR_EXTENSIONS:
+        candidate = home / f"avatar{ext}"
+        if candidate.is_file():
+            return (candidate, ext)
+    return None
 
 
 def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:

@@ -1504,6 +1504,30 @@ export function getProfiles(): Promise<ProfilesResponse> {
   })
 }
 
+// ── Profile avatars ─────────────────────────────────────────────────────────
+export interface ProfileAvatarUploadResponse {
+  ok: boolean
+  avatar_url?: string
+  error?: string
+}
+
+export function uploadProfileAvatar(name: string, file: File): Promise<ProfileAvatarUploadResponse> {
+  return file.arrayBuffer().then(bytes =>
+    window.hermesDesktop.api<ProfileAvatarUploadResponse>({
+      path: `/api/profiles/avatar?name=${encodeURIComponent(name)}`,
+      method: 'POST',
+      upload: { filename: file.name, contentType: file.type || 'application/octet-stream', bytes }
+    })
+  )
+}
+
+export function removeProfileAvatar(name: string): Promise<{ ok: boolean; removed: boolean; error?: string }> {
+  return window.hermesDesktop.api<{ ok: boolean; removed: boolean; error?: string }>({
+    path: `/api/profiles/avatar?name=${encodeURIComponent(name)}`,
+    method: 'DELETE'
+  })
+}
+
 export function createProfile(body: ProfileCreatePayload): Promise<{ name: string; ok: boolean; path: string }> {
   return window.hermesDesktop.api<{ name: string; ok: boolean; path: string }>({
     path: '/api/profiles',
