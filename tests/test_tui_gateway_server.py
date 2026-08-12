@@ -11953,9 +11953,10 @@ def test_prompt_submit_auto_title_accounts_in_profile_store(monkeypatch, tmp_pat
     process_home = tmp_path / "process"
     profile_home.mkdir(parents=True)
     process_home.mkdir()
-    profile_db = SessionDB(profile_home / "state.db")
     process_db = SessionDB(process_home / "state.db")
-    profile_db.create_session("session-key", source="tui")
+    seed_db = SessionDB(profile_home / "state.db")
+    seed_db.create_session("session-key", source="tui")
+    seed_db.close()
 
     class _Agent:
         model = "gpt-5.6-sol"
@@ -11963,7 +11964,9 @@ def test_prompt_submit_auto_title_accounts_in_profile_store(monkeypatch, tmp_pat
         base_url = "https://chatgpt.example.test/backend-api/codex"
         api_key = object()
         api_mode = "codex_responses"
-        _session_db = profile_db
+
+        def __init__(self, session_db):
+            self._session_db = session_db
 
         def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             return {
@@ -11974,15 +11977,38 @@ def test_prompt_submit_auto_title_accounts_in_profile_store(monkeypatch, tmp_pat
                 ],
             }
 
-    server._sessions["sid"] = _session(
-        agent=_Agent(),
+    session = _session(
         profile_home=str(profile_home),
     )
+    session["agent"] = None
+    session["agent_ready"] = threading.Event()
+    server._sessions["sid"] = session
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: process_db)
+    monkeypatch.setattr(
+        server,
+        "_make_agent",
+        lambda *_args, session_db=None, **_kwargs: _Agent(session_db),
+    )
+    monkeypatch.setattr(
+        "tui_gateway.entry.ensure_mcp_discovery_started",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "agent.credits_tracker.seed_credits_at_session_start",
+        lambda _agent: None,
+    )
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(server, "_session_info", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *_args: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args: None)
+    monkeypatch.setattr(server, "_probe_config_health", lambda *_args: None)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *_args: None)
+    monkeypatch.setenv("HERMES_HOME", str(process_home))
 
     def _title_and_account(db, session_id, *_args, **_kwargs):
         db.record_auxiliary_usage(
@@ -11995,7 +12021,13 @@ def test_prompt_submit_auto_title_accounts_in_profile_store(monkeypatch, tmp_pat
         )
         assert db.set_auto_title_if_empty(session_id, "Ancient Rome")
 
+    profile_db = None
     try:
+        server._start_agent_build("sid", session)
+        assert session["agent_ready"].is_set()
+        profile_db = session["agent"]._session_db
+        assert profile_db.db_path == profile_home / "state.db"
+
         with patch(
             "agent.title_generator.maybe_auto_title",
             side_effect=_title_and_account,
@@ -12036,7 +12068,8 @@ def test_prompt_submit_auto_title_accounts_in_profile_store(monkeypatch, tmp_pat
         assert process_db.get_session("session-key") is None
     finally:
         server._sessions.pop("sid", None)
-        profile_db.close()
+        if profile_db is not None:
+            profile_db.close()
         process_db.close()
 
 
