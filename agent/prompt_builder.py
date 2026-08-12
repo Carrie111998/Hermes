@@ -1598,7 +1598,7 @@ def _build_snapshot_entry(
 
     if len(parts) >= 2:
         skill_name = parts[-2]
-        category = "/".join(parts[:-2]) if len(parts) > 2 else parts[0]
+        category = "/".join(parts[:-2]) or "general"
     else:
         category = "general"
         skill_name = skill_file.parent.name
@@ -1979,6 +1979,9 @@ def build_skills_system_prompt(
             "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
             "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
             "`hermes setup`) so you don't have to guess or invent workarounds.\n"
+            "Skill bullet names are the values to pass to skill_view(name). Category headings "
+            "only organize the index; do not prepend them to skill names. If an entry is marked "
+            "as a name collision, follow its qualified-path instruction instead.\n"
             "If a skill has issues, fix it with skill_manage(action='patch').\n"
             "After difficult/iterative tasks, offer to save as a skill. "
             "If a skill you loaded was missing steps, had wrong commands, or needed "

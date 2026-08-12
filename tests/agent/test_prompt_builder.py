@@ -294,6 +294,22 @@ class TestBuildSkillsSystemPrompt:
         # "search" should appear only once per category
         assert result.count("- search") == 1
 
+    def test_top_level_skill_name_is_not_rendered_as_its_own_category(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "db"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: db\ndescription: Query the database\n---\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "\n  general:\n    - db: Query the database" in result
+        assert "\n  db:\n    - db:" not in result
+        assert "Category headings only organize the index" in result
+
 
     def test_compact_categories_demote_nested_and_miss_cache_separately(
         self, monkeypatch, tmp_path
@@ -988,5 +1004,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 
