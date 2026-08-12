@@ -252,6 +252,7 @@ Returns a machine-readable description of the API server's stable surface for ex
     "run_submission": true,
     "run_status": true,
     "run_events_sse": true,
+    "run_context_usage": true,
     "run_stop": true
   }
 }
@@ -367,11 +368,32 @@ Poll the current run state. This is useful for dashboards that need status witho
   "session_id": "space-session",
   "model": "hermes-agent",
   "output": "Done.",
-  "usage": {"input_tokens": 50, "output_tokens": 200, "total_tokens": 250}
+  "usage": {
+    "input_tokens": 50,
+    "output_tokens": 200,
+    "total_tokens": 250,
+    "context_tokens": 12000,
+    "context_length": 200000,
+    "compression_count": 1,
+    "context_source": "provider_prompt_tokens"
+  }
 }
 ```
 
 Statuses are retained briefly after terminal states (`completed`, `failed`, or `cancelled`) for polling and UI reconciliation.
+
+The billing counters (`input_tokens`, `output_tokens`, and `total_tokens`)
+aggregate model calls made by the run. They are not an occupancy meter.
+`context_tokens` is the most recent prompt size tracked by Hermes, while
+`context_length` is the active model's resolved context window. The
+`context_source` value is `provider_prompt_tokens`, `rough_estimate`, or
+`unknown`; `context_tokens` is `null` when Hermes cannot report a trustworthy
+value, including immediately after compaction while it awaits fresh provider
+usage. This is the last prompt measurement, not a projection of the next turn.
+
+`run.completed` carries the same `usage` object as status polling. It also
+includes the effective `session_id`; if compaction rotated the session during
+the run, `previous_session_id` identifies the session submitted by the client.
 
 ### GET /v1/runs/\{run_id\}/events
 
