@@ -104,6 +104,16 @@ export const pathKey = (path: null | string | undefined): string => comparisonSe
 /** Last path segment. */
 export const baseName = (path: string): string | undefined => segments(path).pop()
 
+/**
+ * How a LINKED worktree names itself: its checked-out branch (every git UI's
+ * identity for a worktree), falling back to its directory name when detached.
+ * The fallback goes through {@link baseName}, which splits on BOTH separators —
+ * worktree paths reach the renderer native-spelled (`C:\repo\.worktrees\feat`),
+ * so a `/`-only split would surface the whole path as the label on Windows.
+ */
+export const worktreeLabel = (branch: null | string | undefined, path: string): string =>
+  branch?.trim() || baseName(path) || path
+
 // The `.worktrees` dir for a KANBAN-TASK worktree path, else null. Only matches
 // task worktrees (`<repo>/.worktrees/t_<hex>`, the `t_…` id kanban_db mints) so
 // the many ephemeral task worktrees collapse into one lane — while user-named
@@ -315,10 +325,11 @@ export function mergeRepoWorktreeGroups(
       continue
     }
 
-    const label =
-      (worktree.isMain ? worktree.branch?.trim() || DEFAULT_BRANCH_LABEL : worktree.branch?.trim()) ||
-      baseName(wtPath) ||
-      wtPath
+    // The home checkout always reads as a branch (defaulting to `main`); a
+    // linked worktree falls back to its dir name when detached.
+    const label = worktree.isMain
+      ? worktree.branch?.trim() || DEFAULT_BRANCH_LABEL
+      : worktreeLabel(worktree.branch, wtPath)
 
     const id = worktree.isMain ? branchLaneId(repo.id, label) : wtPath
 

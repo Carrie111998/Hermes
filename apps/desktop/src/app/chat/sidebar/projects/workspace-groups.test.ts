@@ -13,7 +13,8 @@ import {
   sessionProjectColor,
   type SidebarProjectTree,
   type SidebarSessionGroup,
-  sortWorktreeGroups
+  sortWorktreeGroups,
+  worktreeLabel
 } from './workspace-groups'
 
 // The grouping itself now lives on the backend (tui_gateway/project_tree.py,
@@ -54,6 +55,26 @@ describe('baseName', () => {
     expect(baseName('/www/hermes-agent/')).toBe('hermes-agent')
     expect(baseName('C:\\repos\\app')).toBe('app')
     expect(baseName('')).toBeUndefined()
+  })
+})
+
+describe('worktreeLabel', () => {
+  it('prefers the checked-out branch', () => {
+    expect(worktreeLabel('feature/login', '/repo/.worktrees/wt')).toBe('feature/login')
+    expect(worktreeLabel('  feature/login  ', '/repo/.worktrees/wt')).toBe('feature/login')
+  })
+
+  it('falls back to the dir name for a DETACHED worktree, on either separator', () => {
+    // Worktree paths reach the renderer native-spelled (electron `path.normalize`
+    // / the gateway's `_native_path`), so a `/`-only split would have handed the
+    // whole `C:\…` path back as the label on Windows.
+    expect(worktreeLabel('', 'C:\\repo\\.worktrees\\feat')).toBe('feat')
+    expect(worktreeLabel(null, 'C:/repo/.worktrees/feat')).toBe('feat')
+    expect(worktreeLabel(undefined, '/repo/.worktrees/feat')).toBe('feat')
+  })
+
+  it('falls back to the raw path when there is no segment to take', () => {
+    expect(worktreeLabel('', '')).toBe('')
   })
 })
 

@@ -237,6 +237,48 @@ def test_windows_path_identity_preserves_explicit_project_priority():
     assert tree["scoped_session_ids"] == [session["id"]]
 
 
+def test_windows_main_checkout_is_main_across_git_and_native_spellings():
+    # This is the REAL shape of git_probe.resolve() on Windows: `worktree_root`
+    # comes from `git rev-parse --show-toplevel` (forward slashes, `C:/…`) while
+    # `repo_root` is derived via os.path.realpath/dirname of the common git dir
+    # (native backslashes). They name the SAME directory, so the main checkout
+    # must be recognized as main — a raw `==` reads them as different dirs and
+    # files every main-checkout session into a dir-labeled linked-worktree lane.
+    resolve = _resolver({r"C:\repo": (r"C:\repo", "C:/repo")})
+    sessions = [_session(r"C:\repo", branch="main")]
+
+    tree = pt.build_tree([], sessions, [], resolve, hydrate=True)
+    project = next(p for p in tree["projects"] if p["sessionCount"])
+    groups = [g for repo in project["repos"] for g in repo["groups"]]
+
+    assert [g["isMain"] for g in groups] == [True]
+    assert [g["label"] for g in groups] == ["main"]
+    assert _lane_ids(project) == [r"C:\repo::branch::main"]
+
+
+def test_windows_linked_worktree_stays_non_main_under_mixed_spellings():
+    # The guard on the fix above: folding separators must not collapse a genuine
+    # LINKED worktree into the main lane. Different dirs stay different lanes.
+    resolve = _resolver(
+        {
+            r"C:\repo": (r"C:\repo", "C:/repo"),
+            r"C:\repo\.worktrees\feat": (r"C:\repo", "C:/repo/.worktrees/feat"),
+        }
+    )
+    sessions = [
+        _session(r"C:\repo", branch="main"),
+        _session(r"C:\repo\.worktrees\feat", branch="feat"),
+    ]
+
+    tree = pt.build_tree([], sessions, [], resolve, hydrate=True)
+    project = next(p for p in tree["projects"] if p["sessionCount"])
+    groups = [g for repo in project["repos"] for g in repo["groups"]]
+
+    assert sorted(g["isMain"] for g in groups) == [False, True]
+    linked = next(g for g in groups if not g["isMain"])
+    assert linked["label"] == "feat"
+
+
 def test_wsl_localhost_cwds_collapse_into_one_auto_project():
     # Root-relative WSL spellings (single leading backslash) are Windows paths,
     # so case/separator variants collapse instead of spawning duplicate autos.
