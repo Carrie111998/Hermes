@@ -94,3 +94,43 @@ def test_provider_model_ids_passes_base_url_when_supported(monkeypatch):
     assert "live-model-from-full" in ids
     assert calls
     assert calls[-1]["base_url"] == "https://override.example/v1"
+
+
+def test_provider_model_ids_does_not_mask_internal_typeerror(monkeypatch):
+    """A TypeError raised inside a compliant fetch_models is not retried or masked."""
+    from hermes_cli import models as hm
+
+    calls: list[int] = []
+
+    def fetch_models(*, api_key=None, base_url=None, timeout=8.0):
+        calls.append(1)
+        # Simulate an internal implementation bug (e.g., None + 1).
+        # This TypeError should propagate, not be caught and retried.
+        raise TypeError("internal implementation failure")
+
+    profile = _make_profile(name="buggy-fetch-plugin", fetch_models=fetch_models)
+
+    monkeypatch.setattr(hm, "normalize_provider", lambda p: "buggy-fetch-plugin")
+    monkeypatch.setattr(
+        "providers.get_provider_profile",
+        lambda name: profile if name == "buggy-fetch-plugin" else None,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_api_key_provider_credentials",
+        lambda name: {
+            "api_key": "secret",
+            "base_url": "https://override.example/v1",
+        },
+    )
+    monkeypatch.setattr(hm, "_PROVIDER_MODELS", {"buggy-fetch-plugin": []}, raising=False)
+    if hasattr(hm, "_MODELS_DEV_PREFERRED"):
+        monkeypatch.setattr(hm, "_MODELS_DEV_PREFERRED", set(), raising=False)
+
+    # The outer exception handler in provider_model_ids swallows it and falls back
+    # to static models, but the fetch_models is called ONCE, not retried.
+    ids = hm.provider_model_ids("buggy-fetch-plugin", force_refresh=True)
+
+    # Fall back to curated static (empty in our mock).
+    assert ids == []
+    # fetch_models was called exactly once (not retried).
+    assert len(calls) == 1

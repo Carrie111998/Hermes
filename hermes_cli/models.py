@@ -8,6 +8,7 @@ Add, remove, or reorder entries here — both `hermes setup` and
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import logging
 import os
@@ -3063,15 +3064,27 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             if api_key:
                 # ProviderProfile.fetch_models accepts base_url, but some
                 # third-party model-provider plugins still override it with a
-                # narrower signature (api_key/timeout only). Passing base_url
-                # then raises TypeError, which the outer except Exception
-                # swallows — the picker shows 0 models for an otherwise
-                # healthy provider. Prefer the full call, then fall back.
+                # narrower signature (api_key/timeout only). Inspect the
+                # signature to determine whether to pass base_url so a real
+                # implementation failure (TypeError raised inside a compliant
+                # fetch_models) is not masked.
                 try:
+                    sig = inspect.signature(_p.fetch_models)
+                    accepts_base_url = (
+                        "base_url" in sig.parameters
+                        or any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD
+                            for p in sig.parameters.values()
+                        )
+                    )
+                except (ValueError, TypeError):
+                    accepts_base_url = False
+
+                if accepts_base_url:
                     live = _p.fetch_models(
                         api_key=api_key, base_url=base_url or None
                     )
-                except TypeError:
+                else:
                     live = _p.fetch_models(api_key=api_key)
                 if live:
                     # Merge static curated list with live API results so
