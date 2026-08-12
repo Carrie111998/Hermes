@@ -182,6 +182,60 @@ def test_termux_renderer_stamp_records_hash_and_timezone(tmp_path: Path, monkeyp
     assert datetime.fromisoformat(payload["builtAt"]).utcoffset() is not None
 
 
+def test_termux_renderer_build_runs_nested_workspace_from_root(tmp_path: Path, monkeypatch):
+    root = tmp_path / "repo"
+    desktop = root / "apps" / "desktop"
+    desktop.mkdir(parents=True)
+    (root / "package.json").write_text('{"workspaces":["apps/*"]}', encoding="utf-8")
+    (root / "package-lock.json").write_text("{}", encoding="utf-8")
+    (desktop / "package.json").write_text("{}", encoding="utf-8")
+
+    install_calls = []
+    build_calls = []
+
+    monkeypatch.setattr(cli_main, "_resolve_node_runtime_npm", lambda: "/termux/bin/npm")
+    monkeypatch.setattr(cli_main, "_write_termux_desktop_renderer_stamp", lambda: None)
+
+    def install(npm, cwd, **kwargs):
+        install_calls.append((npm, cwd, kwargs))
+        return _completed()
+
+    def run(argv, **kwargs):
+        build_calls.append((list(argv), kwargs))
+        dist = desktop / "dist"
+        dist.mkdir()
+        (dist / "index.html").write_text("ok", encoding="utf-8")
+        return _completed()
+
+    monkeypatch.setattr(cli_main, "_run_npm_install_deterministic", install)
+    monkeypatch.setattr(cli_main.subprocess, "run", run)
+
+    cli_main._build_termux_desktop_renderer(
+        desktop,
+        skip_build=False,
+        force_build=True,
+    )
+
+    assert len(install_calls) == 1
+    assert install_calls[0][1] == root
+    assert install_calls[0][2]["extra_args"][:3] == (
+        "--workspace",
+        "apps/desktop",
+        "--include-workspace-root=false",
+    )
+    assert len(build_calls) == 1
+    argv, kwargs = build_calls[0]
+    assert argv == [
+        "/termux/bin/npm",
+        "run",
+        "--workspace",
+        "apps/desktop",
+        "build:renderer",
+    ]
+    assert kwargs["cwd"] == root
+    assert "npm_config_ignore_scripts" not in kwargs["env"]
+    assert kwargs["env"]["ELECTRON_SKIP_BINARY_DOWNLOAD"] == "1"
+
 def test_official_x11_release_digest_is_required():
     payload = {
         "assets": [

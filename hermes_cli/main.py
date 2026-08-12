@@ -7147,16 +7147,42 @@ def _build_termux_desktop_renderer(
         print("    npm ci --workspace apps/desktop --include-workspace-root=false --ignore-scripts")
         sys.exit(install_result.returncode or 1)
 
+    # Run the renderer script from the npm workspace root when this checkout
+    # uses workspaces.  In native Termux npm can hoist the dev toolchain
+    # (vite/tsc/vitest) to the root node_modules tree without making those
+    # shims discoverable when a nested workspace script is launched by changing
+    # cwd back into apps/desktop.  `npm run --workspace ...` keeps npm in charge
+    # of constructing PATH for the selected workspace and its hoisted bins.
+    build_cwd = desktop_dir
+    build_cmd = [npm, "run", "build:renderer"]
+    if npm_cwd != desktop_dir:
+        try:
+            workspace = desktop_dir.relative_to(npm_cwd).as_posix()
+        except ValueError:
+            workspace = ""
+        if workspace:
+            build_cwd = npm_cwd
+            build_cmd = [npm, "run", "--workspace", workspace, "build:renderer"]
+
+    # `ignore-scripts` belongs to dependency installation only.  The renderer
+    # build below is an explicit trusted repo script and must not inherit npm's
+    # global lifecycle suppression from the install phase.
+    build_env = dict(install_env)
+    build_env.pop("npm_config_ignore_scripts", None)
+
     print("→ Building the Hermes Desktop renderer (Electron shell intentionally omitted on Termux)...")
     build_result = subprocess.run(
-        [npm, "run", "build:renderer"],
-        cwd=desktop_dir,
-        env=install_env,
+        build_cmd,
+        cwd=build_cwd,
+        env=build_env,
         check=False,
     )
     if build_result.returncode != 0 or not _desktop_dist_exists(desktop_dir):
         print("? Termux Desktop renderer build failed")
-        print("  Run manually:  cd apps/desktop && npm run build:renderer")
+        if build_cwd == desktop_dir:
+            print("  Run manually:  cd apps/desktop && npm run build:renderer")
+        else:
+            print(f"  Run manually:  npm run --workspace {workspace} build:renderer")
         sys.exit(build_result.returncode or 1)
     _write_termux_desktop_renderer_stamp()
     print(f"V Termux Desktop renderer built at {desktop_dir / 'dist'}")
