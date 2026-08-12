@@ -201,10 +201,12 @@ export type {
   PluginContext,
   PluginContribution,
   PluginNativeNotificationInput,
+  PluginNotificationAction,
   PluginOs,
   PluginRestOptions,
   PluginStorage
 } from '@/contrib/plugin'
+export type { HermesOpenTarget } from '@/lib/hermes-open-target'
 
 // -- contracts ----------------------------------------------------------------
 

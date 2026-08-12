@@ -372,7 +372,8 @@ host.state.viewport         // ReadableAtom<{ width, height, narrow }>
 
 host.notify({ kind, message, title?, detail?, action? })  // toast; returns id
 host.notifyError(error, fallbackMessage)                   // toast an error
-ctx.os.notify({ title, body?, silent? })   // native OS notification (attributed to your plugin)
+ctx.os.notify({ title, body?, silent?, icon?, activate?, onActivate?, actions? })
+                                           // native OS notification (attributed to your plugin)
 ctx.os.openExternal(url)                   // OS default handler (browser, mail, spotify:) → Promise<boolean>
 ctx.os.revealPath(path)                    // reveal in Finder / Explorer → Promise<boolean>
 ctx.os.writeClipboard(text)                // system clipboard → Promise<boolean>
@@ -399,6 +400,32 @@ approval/turn alerts use. It fires only while the user is away from Hermes
 they're looking at the app. Users can silence it per device under Settings ▸
 Notifications ▸ "Plugin notifications", and repeats from the same plugin are
 throttled, so treat it as a signal for genuinely notable events — not a log.
+
+Rich presentation + activation (extends the original `ctx.os` door):
+
+```ts
+ctx.os.notify({
+  title: 'Task ready for review',
+  body: 'Landing page copy',
+  icon: '/abs/path/to/icon.png', // Electron Notification icon
+  // Body click → focus Hermes + navigate. Same vocabulary as OS deep links:
+  activate: '/kanban?task=t1',
+  // or: activate: 'hermes://open/kanban?task=t1'
+  // or: activate: { path: '/kanban', params: { task: 't1' } }
+  onActivate: () => focusLocalState('t1'), // optional renderer callback
+  actions: [
+    { id: 'open', label: 'Open', activate: '/kanban?task=t1' },
+    { id: 'snooze', label: 'Snooze', onAction: () => snooze('t1') },
+  ],
+})
+```
+
+`activate` is deeplink-compatible: a hash path and `hermes://open/<path>?…`
+resolve to the same in-app route (and `hermes://open/…` deep links from outside
+the app use that same resolver). Action buttons only render on signed macOS
+builds; elsewhere the body click still activates. Navigation only happens on
+user click — never from a background event alone.
+
 The other doors (`openExternal`, `revealPath`, `writeClipboard`) resolve
 `false` instead of throwing when the capability isn't available (older desktop
 shell, plain browser) — branch on the result rather than sniffing the bridge.
@@ -615,7 +642,7 @@ not treat this pipeline as a trust boundary.
 | Category | Exports |
 |----------|---------|
 | Host | `host` (`.state.*`, `.notify`, `.notifyError`, `.navigate`, `.onEvent`, `.logs`, `.status`, `.restartGateway`, `.request`) |
-| Plugin contract | `HermesPlugin`, `PluginContext`, `PluginContribution`, `PluginStorage`, `PluginOs`, `PluginRestOptions`, `PluginNativeNotificationInput`, `Contribution` |
+| Plugin contract | `HermesPlugin`, `PluginContext`, `PluginContribution`, `PluginStorage`, `PluginOs`, `PluginRestOptions`, `PluginNativeNotificationInput`, `PluginNotificationAction`, `HermesOpenTarget`, `Contribution` |
 | Area constants | `PANES_AREA`, `ROUTES_AREA`, `SIDEBAR_NAV_AREA`, `STATUSBAR_AREAS`, `TITLEBAR_AREAS`, `PALETTE_AREA`, `KEYBINDS_AREA`, `THEMES_AREA`, `COMPOSER_AREAS` |
 | Area payloads | `RouteContribution`, `SidebarNavContribution`, `StatusbarItem`, `TitlebarTool`, `PaletteContribution`, `KeybindContribution`, `ComposerMiddleware`, `ComposerAttachmentProvider` |
 | React / state | `useValue`, `atom`, `computed`, `useQuery`, `useMutation`, `useQueryClient`, `queryClient`, `Contribute` |

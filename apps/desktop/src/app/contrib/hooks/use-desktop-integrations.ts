@@ -2,8 +2,14 @@ import { useEffect, useRef } from 'react'
 
 import { closeActiveTab } from '@/app/chat/close-tab'
 import { openSession } from '@/app/open-session'
+import { pathFromOpenDeepLink } from '@/lib/hermes-open-target'
 import { storedSessionIdForNotification } from '@/lib/session-ids'
-import { respondToApprovalAction } from '@/store/native-notifications'
+import {
+  clearPluginNotifyHandlers,
+  invokePluginNotifyAction,
+  invokePluginNotifyActivate,
+  respondToApprovalAction
+} from '@/store/native-notifications'
 import { openFolderAsProject } from '@/store/projects'
 import {
   getRememberedRoute,
@@ -187,10 +193,51 @@ export function useDesktopIntegrations({
     return () => unsubscribe?.()
   }, [])
 
-  // hermes:// deep links -> a reviewable /blueprint command in the composer.
+  // Plugin OS notification body/action → optional callback + navigate. Activation
+  // is user-driven (click), so this is offer-not-hijack. Paths share the
+  // hermes://open/… vocabulary with deep links.
+  useEffect(() => {
+    const unsubscribe = window.hermesDesktop?.onNotificationActivate?.(payload => {
+      if (!payload) {
+        return
+      }
+
+      if (payload.actionId) {
+        invokePluginNotifyAction(payload.notifyId, payload.actionId)
+      } else {
+        invokePluginNotifyActivate(payload.notifyId)
+      }
+
+      if (payload.activate) {
+        navigate(payload.activate)
+      }
+
+      clearPluginNotifyHandlers(payload.notifyId)
+    })
+
+    return () => unsubscribe?.()
+  }, [navigate])
+
+  // hermes:// deep links:
+  //  - open/<path>?… → in-app navigate (same resolver as notification activate)
+  //  - blueprint/<name>?… → reviewable /blueprint command in the composer
   useEffect(() => {
     const unsubscribe = window.hermesDesktop?.onDeepLink?.(payload => {
-      if (!payload || payload.kind !== 'blueprint' || !payload.name) {
+      if (!payload?.kind) {
+        return
+      }
+
+      if (payload.kind === 'open' && payload.name) {
+        const path = pathFromOpenDeepLink(payload.name, payload.params || {})
+
+        if (path) {
+          navigate(path)
+        }
+
+        return
+      }
+
+      if (payload.kind !== 'blueprint' || !payload.name) {
         return
       }
 
@@ -210,7 +257,7 @@ export function useDesktopIntegrations({
     void window.hermesDesktop?.signalDeepLinkReady?.()
 
     return () => unsubscribe?.()
-  }, [])
+  }, [navigate])
 
   // ⌘W via the macOS menu accelerator → close the focused tab; if nothing is
   // closeable, fall back to closing the window (so ⌘W still works as the

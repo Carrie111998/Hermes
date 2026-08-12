@@ -2,8 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $gateway } from './gateway'
 import {
+  clearPluginNotifyHandlers,
   dispatchNativeNotification,
   dispatchPluginNativeNotification,
+  invokePluginNotifyAction,
+  invokePluginNotifyActivate,
   NATIVE_NOTIFICATION_KINDS,
   respondToApprovalAction,
   sendTestNativeNotification,
@@ -49,6 +52,8 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  clearPluginNotifyHandlers()
+
   if (initialHermesDesktop) {
     desktopWindow.hermesDesktop = initialHermesDesktop
   } else {
@@ -196,6 +201,54 @@ describe('dispatchPluginNativeNotification', () => {
     dispatchPluginNativeNotification('plugin-a', { title: 'a again' })
     dispatchPluginNativeNotification('plugin-b', { title: 'b' })
     expect(notify).toHaveBeenCalledTimes(2)
+  })
+
+  it('forwards icon, resolved activate path, and action buttons (deeplink-compatible)', () => {
+    dispatchPluginNativeNotification('kanban', {
+      actions: [
+        { id: 'open', label: 'Open', activate: { path: '/kanban', params: { task: 't1' } } },
+        { id: 'snooze', label: 'Snooze', onAction: () => undefined }
+      ],
+      activate: 'hermes://open/kanban?task=t1',
+      body: 'Ready',
+      icon: '/tmp/kanban.png',
+      title: 'Task'
+    })
+
+    expect(notify).toHaveBeenCalledWith(
+      expect.objectContaining({
+        activate: '/kanban?task=t1',
+        actions: [
+          { activate: '/kanban?task=t1', id: 'open', text: 'Open' },
+          { activate: undefined, id: 'snooze', text: 'Snooze' }
+        ],
+        icon: '/tmp/kanban.png',
+        kind: 'plugin',
+        notifyId: expect.stringMatching(/^kanban:/),
+        tag: 'kanban',
+        title: 'Task'
+      })
+    )
+  })
+
+  it('registers onActivate / onAction handlers keyed by notifyId', () => {
+    const onActivate = vi.fn()
+    const onAction = vi.fn()
+
+    // Distinct plugin id — throttle is per tag, and the previous case used kanban.
+    dispatchPluginNativeNotification('handlers-plugin', {
+      activate: '/kanban',
+      onActivate,
+      actions: [{ id: 'snooze', label: 'Snooze', onAction }],
+      title: 'Task'
+    })
+
+    const payload = notify.mock.calls[0]?.[0] as { notifyId?: string }
+    expect(payload.notifyId).toBeTruthy()
+    invokePluginNotifyActivate(payload.notifyId)
+    expect(onActivate).toHaveBeenCalledTimes(1)
+    expect(invokePluginNotifyAction(payload.notifyId, 'snooze')).toBe(true)
+    expect(onAction).toHaveBeenCalledTimes(1)
   })
 })
 

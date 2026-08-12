@@ -68,6 +68,7 @@ describe('useDesktopIntegrations', () => {
       onOpenUpdatesRequested: vi.fn(),
       onFocusSession: vi.fn(),
       onNotificationAction: vi.fn(),
+      onNotificationActivate: vi.fn(),
       onDeepLink: vi.fn(),
       signalDeepLinkReady: vi.fn(),
       onClosePreviewRequested: vi.fn(),
@@ -464,6 +465,41 @@ describe('useDesktopIntegrations', () => {
       })
 
       expect(window.localStorage.getItem('hermes.desktop.lastSessionId.profile.default')).toBe('other-session')
+    })
+  })
+
+  describe('notification activate + hermes://open deep links', () => {
+    it('navigates when a plugin notification activate payload arrives', () => {
+      let activate: ((payload: { activate?: string }) => void) | undefined
+      desktopWindow.hermesDesktop = {
+        ...desktopWindow.hermesDesktop,
+        onNotificationActivate: (cb: (payload: { activate?: string }) => void) => {
+          activate = cb
+
+          return () => undefined
+        }
+      } as unknown as Window['hermesDesktop']
+
+      render({ profileReady: true, sessions: [] })
+      activate?.({ activate: '/kanban?task=t1' })
+      expect(navigate).toHaveBeenCalledWith('/kanban?task=t1')
+    })
+
+    it('navigates hermes://open/… deep links through the same path vocabulary', () => {
+      let deepLink: ((payload: { kind: string; name: string; params: Record<string, string> }) => void) | undefined
+      desktopWindow.hermesDesktop = {
+        ...desktopWindow.hermesDesktop,
+        onDeepLink: (cb: (payload: { kind: string; name: string; params: Record<string, string> }) => void) => {
+          deepLink = cb
+
+          return () => undefined
+        },
+        signalDeepLinkReady: vi.fn()
+      } as unknown as Window['hermesDesktop']
+
+      render({ profileReady: true, sessions: [] })
+      deepLink?.({ kind: 'open', name: 'kanban', params: { task: 't1' } })
+      expect(navigate).toHaveBeenCalledWith('/kanban?task=t1')
     })
   })
 })
