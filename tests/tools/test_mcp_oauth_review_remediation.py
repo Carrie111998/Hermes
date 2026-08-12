@@ -726,6 +726,50 @@ async def test_cold_control_requests_use_tls_policy_without_bearer(
 
 
 @pytest.mark.asyncio
+async def test_strict_redirect_client_uses_current_request_origin_for_control_redirect(
+    monkeypatch,
+):
+    """A control request on another origin keeps headers on its own redirect."""
+    from tools.mcp_oauth_manager import _StrictRedirectAsyncClient
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if str(request.url) == "https://auth.example/metadata":
+            return httpx.Response(
+                302,
+                request=request,
+                headers={"location": "https://auth.example/metadata-next"},
+            )
+        return httpx.Response(200, request=request)
+
+    transport = httpx.MockTransport(handler)
+    original_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return original_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched_async_client)
+    client = _StrictRedirectAsyncClient(
+        follow_redirects=True,
+        headers={"X-Strict-Secret": "must-stay-on-auth-origin"},
+        redirect_origin=httpx.URL("https://mcp.example/mcp"),
+        configured_header_names={"x-strict-secret"},
+    )
+    async with client:
+        response = await client.get("https://auth.example/metadata")
+
+    assert response.status_code == 200
+    assert len(seen) == 2
+    assert all(
+        request.headers["x-strict-secret"] == "must-stay-on-auth-origin"
+        for request in seen
+    )
+
+
+@pytest.mark.asyncio
 async def test_public_current_http_real_followed_redirect_strips_strict_headers(
     monkeypatch,
 ):
@@ -781,7 +825,9 @@ async def test_public_current_http_real_followed_redirect_strips_strict_headers(
     monkeypatch.setattr(tool_module, "streamable_http_client", stream_factory)
     monkeypatch.setattr(tool_module, "streamablehttp_client", stream_factory)
     monkeypatch.setattr(tool_module, "_MCP_NEW_HTTP", True)
-    monkeypatch.setattr(tool_module.MCPServerTask, "_discover_tools", lambda self: _done())
+    monkeypatch.setattr(
+        tool_module.MCPServerTask, "_discover_tools", lambda self: _done()
+    )
     monkeypatch.setattr(
         tool_module.MCPServerTask,
         "_wait_for_lifecycle_event",
@@ -791,25 +837,30 @@ async def test_public_current_http_real_followed_redirect_strips_strict_headers(
 
     task = tool_module.MCPServerTask("strict-redirect")
     task._auth_type = ""
-    await task._run_http(
-        {
-            "url": "https://source.example/mcp",
-            "transport": "streamable_http",
-            "strict_redirect_headers": True,
-            "headers": {
-                "Authorization": "Bearer resource-secret",
-                "X-Strict-Secret": "must-not-cross-origin",
-            },
-        }
-    )
+    await task._run_http({
+        "url": "https://source.example/mcp",
+        "transport": "streamable_http",
+        "strict_redirect_headers": True,
+        "headers": {
+            "Authorization": "Bearer resource-secret",
+            "X-Strict-Secret": "must-not-cross-origin",
+        },
+        "identity_header": {
+            "name": "X-Resolved-Identity",
+            "value": "alice",
+        },
+    })
 
     assert len(seen) == 3
     assert seen[0].headers["authorization"] == "Bearer resource-secret"
     assert seen[0].headers["x-strict-secret"] == "must-not-cross-origin"
     assert seen[1].headers["authorization"] == "Bearer resource-secret"
     assert seen[1].headers["x-strict-secret"] == "must-not-cross-origin"
+    assert seen[0].headers["x-resolved-identity"] == "alice"
+    assert seen[1].headers["x-resolved-identity"] == "alice"
     assert "authorization" not in seen[2].headers
     assert "x-strict-secret" not in seen[2].headers
+    assert "x-resolved-identity" not in seen[2].headers
 
 
 @pytest.mark.asyncio
