@@ -165,8 +165,7 @@ class TestRunBackgroundTask:
         mock_adapter.send.assert_called_once()
         call_args = mock_adapter.send.call_args
         content = call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "")
-        assert "Background task complete" in content
-        assert "Hello from background!" in content
+        assert content == "Hello from background!"
         agent_kwargs = MockAgent.call_args.kwargs
         assert agent_kwargs["checkpoints_enabled"] is True
         assert agent_kwargs["checkpoint_max_snapshots"] == 8

@@ -5380,7 +5380,9 @@ class PluginManager:
         transformed = False
         for cb in self._hooks.get(hook_name, []):
             try:
-                ret = cb(response_text=current, **kwargs)
+                ret = self._invoke_hook_callback(
+                    cb, {"response_text": current, **kwargs}
+                )
             except Exception as exc:
                 logger.warning(
                     "Required text hook '%s' callback %s raised: %s",
@@ -5410,7 +5412,9 @@ class PluginManager:
         """
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         for callback in self._hooks.get(hook_name, ()):
-            result = callback(response_text=response_text, **kwargs)
+            result = self._invoke_hook_callback(
+                callback, {"response_text": response_text, **kwargs}
+            )
             if result is False:
                 raise RuntimeError(f"Terminal validation hook '{hook_name}' rejected output")
             if result is not None and result is not True:
@@ -5971,14 +5975,14 @@ def invoke_text_hook(
     hook_name: str, *, response_text: str, **kwargs: Any
 ) -> tuple[str, bool]:
     """Invoke a required sequential text hook without swallowing failures."""
-    return get_plugin_manager().invoke_text_hook(
+    return _delivery_manager().invoke_text_hook(
         hook_name, response_text=response_text, **kwargs
     )
 
 
 def invoke_validation_hook(hook_name: str, *, response_text: str, **kwargs: Any) -> None:
     """Invoke terminal validators; any rejection propagates to the caller."""
-    get_plugin_manager().invoke_validation_hook(
+    _delivery_manager().invoke_validation_hook(
         hook_name, response_text=response_text, **kwargs
     )
 

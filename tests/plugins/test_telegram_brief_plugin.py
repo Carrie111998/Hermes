@@ -155,7 +155,7 @@ def test_brief_transform_is_conservative_allowlist_for_code_diff_commands_and_lo
         "pytest -q", "Traceback", 'File "x.py"', "tool result", "RuntimeError: boom",
     ):
         assert forbidden not in transformed
-    assert "阻礙：技術細節已省略" in transformed
+    assert "阻礙：RuntimeError；測試未完成" in transformed
     assert "print(secret_token)" not in plugin._sanitize_brief_response(
         "結果：完成\n變更：print(secret_token)"
     )
@@ -176,6 +176,175 @@ def test_safe_english_punctuation_remains_usable():
         assert plugin._safe_field_value(value) == value
 
 
+def test_requested_hardware_values_survive_brief_projection():
+    plugin = _load_plugin()
+    response = "\n".join(
+        (
+            "結果：完成",
+            "變更：已即時讀取家中電腦硬體。",
+            "驗證：以下為實際數值：",
+            "- CPU：AMD Ryzen 5 5600X 6-Core Processor",
+            "- 記憶體：總量 16.0 GB；目前可用 6.5 GB",
+            "- GPU：NVIDIA GeForce RTX 3060 Ti",
+            "- 專用 GPU 記憶體：8.0 GB",
+            "- C 槽：總容量 952.9 GB；已用 895.4 GB；剩餘 57.5 GB",
+            "- D 槽：總容量 953.9 GB；已用 681.6 GB；剩餘 272.3 GB",
+        )
+    )
+
+    delivered = plugin._sanitize_brief_response(response)
+
+    for expected in (
+        "AMD Ryzen 5 5600X 6-Core Processor",
+        "總量 16.0 GB",
+        "目前可用 6.5 GB",
+        "NVIDIA GeForce RTX 3060 Ti",
+        "專用 GPU 記憶體：8.0 GB",
+        "C 槽：總容量 952.9 GB",
+        "D 槽：總容量 953.9 GB",
+    ):
+        assert expected in delivered
+    assert "技術細節已省略" not in delivered
+
+
+def test_plain_hardware_answer_without_brief_schema_is_preserved_verbatim():
+    plugin = _load_plugin()
+    response = (
+        "CPU：AMD Ryzen 5 5600X 6-Core Processor\n"
+        "RAM 總量：15.91 GiB；可用：2.87 GiB\n"
+        "GPU：NVIDIA GeForce RTX 3060 Ti\n"
+        "專用 VRAM：8192 MiB；shared memory 不計入\n"
+        "C: 總量 952.90 GiB；剩餘 57.08 GiB"
+    )
+
+    assert plugin._sanitize_brief_response(response) == response
+
+
+def test_non_schema_final_answer_keeps_safe_prose_instead_of_generic_fallback():
+    plugin = _load_plugin()
+    response = "答案是 42。\n這是使用者明確要求的完整正文。"
+
+    delivered = plugin._sanitize_brief_response(response)
+
+    assert delivered == response
+    assert "最終摘要未符合 brief 格式" not in delivered
+    assert "明確要求詳細說明" not in delivered
+
+
+def test_fragmented_secret_across_answer_lines_is_redacted_as_a_whole():
+    plugin = _load_plugin()
+    left = "Ab9xY7zQ2mN8pL4r"
+    right = "T6uV0wK3sJ5hG1fD7cB"
+    response = f"結果：完成\n- {left}\n- {right}"
+
+    delivered = plugin._sanitize_brief_response(response)
+
+    assert left not in delivered
+    assert right not in delivered
+    assert "敏感內容已遮蔽" in delivered
+
+
+def test_telegram_text_delivery_keeps_required_body_alongside_voice_media():
+    plugin = _load_plugin()
+    response = (
+        "CPU：AMD Ryzen 5 5600X\n"
+        "專用 VRAM：8 GiB\n"
+        "[[audio_as_voice]]\nMEDIA:C:\\Users\\User\\memo.ogg"
+    )
+
+    delivered = plugin._sanitize_brief_response(response)
+    files, text = BasePlatformAdapter.extract_media(delivered)
+
+    assert "CPU：AMD Ryzen 5 5600X" in text
+    assert "專用 VRAM：8 GiB" in text
+    assert files == [("C:\\Users\\User\\memo.ogg", True)]
+    assert "最終摘要未符合 brief 格式" not in delivered
+
+
+def test_explicit_detailed_data_request_keeps_body_instead_of_omission_placeholder():
+    plugin = _load_plugin()
+    event = _telegram_event("請詳細列出 CPU、記憶體、GPU 專用記憶體與磁碟空間")
+    _bind_event(plugin, event)
+    plugin._on_pre_llm_call(
+        platform="telegram", sender_id="u1", user_message=event.text
+    )
+    response = (
+        "結果：完成\n"
+        "驗證：硬體資料如下：\n"
+        "- CPU：AMD Ryzen 5 5600X\n"
+        "- 記憶體：16 GB\n"
+        "- 專用 GPU 記憶體：8 GB\n"
+        "- C 槽剩餘：57.5 GB"
+    )
+    delivered = plugin._transform_llm_output(
+        platform="telegram", response_text=response
+    ) or response
+
+    assert "CPU：AMD Ryzen 5 5600X" in delivered
+    assert "專用 GPU 記憶體：8 GB" in delivered
+    assert "C 槽剩餘：57.5 GB" in delivered
+    assert "技術細節已省略" not in delivered
+    assert "明確要求詳細說明" not in delivered
+
+
+def test_simple_success_operation_remains_compact():
+    plugin = _load_plugin()
+    response = "結果：完成\n變更：設定已儲存。\n驗證：回讀值一致。"
+    assert plugin._sanitize_brief_response(response) == response
+
+
+def test_markdown_heading_and_requested_list_survive_projection():
+    plugin = _load_plugin()
+    response = (
+        "結果：完成\n"
+        "驗證：實際硬體如下：\n"
+        "**硬體數值**\n"
+        "- CPU：AMD Ryzen 5 5600X\n"
+        "- 專用 GPU 記憶體：8 GB"
+    )
+    delivered = plugin._sanitize_brief_response(response)
+
+    assert "**硬體數值**" in delivered
+    assert "CPU：AMD Ryzen 5 5600X" in delivered
+    assert "專用 GPU 記憶體：8 GB" in delivered
+
+
+def test_long_requested_list_is_preserved_for_telegram_adapter_chunking():
+    plugin = _load_plugin()
+    rows = [f"- 磁碟 {index:03d}：總容量 1000 GB；已用 400 GB；剩餘 600 GB；檔案系統 NTFS；狀態正常；已完成容量與可用空間實際回讀驗證，數值可供使用者直接採用" for index in range(55)]
+    response = "結果：完成\n驗證：完整清單如下：\n" + "\n".join(rows)
+
+    delivered = plugin._sanitize_brief_response(response)
+    chunks = BasePlatformAdapter.truncate_message(delivered, 4096)
+
+    assert len(delivered) > 4096
+    assert rows[0] in delivered
+    assert rows[-1] in delivered
+    assert len(chunks) > 1
+    assert all(len(chunk) <= 4096 for chunk in chunks)
+
+
+def test_actionable_error_reason_survives_without_stack_trace():
+    plugin = _load_plugin()
+    response = "\n".join(
+        (
+            "結果：失敗",
+            "阻礙：連線逾時，無法連上本機服務 127.0.0.1:9332。",
+            "Traceback (most recent call last):",
+            "RuntimeError: connection timed out",
+            "下一步：確認服務已啟動並檢查 9332 連接埠後重試。",
+        )
+    )
+    delivered = plugin._sanitize_brief_response(response)
+
+    assert "連線逾時" in delivered
+    assert "127.0.0.1:9332" in delivered
+    assert "確認服務已啟動" in delivered
+    assert "Traceback" not in delivered
+    assert "RuntimeError" not in delivered
+    assert "技術細節已省略" not in delivered
+
+
 @pytest.mark.parametrize(
     "secret",
     (
@@ -192,7 +361,7 @@ def test_credential_shaped_values_are_forcibly_redacted(secret):
     plugin = _load_plugin()
     result = plugin._sanitize_brief_response(f"結果：完成\n變更：{secret}")
     assert secret not in result
-    assert "技術細節已省略" in result
+    assert "敏感內容已遮蔽" in result
 
 
 def test_unlabelled_high_entropy_values_are_redacted():
@@ -208,7 +377,7 @@ def test_unlabelled_high_entropy_values_are_redacted():
     for value in opaque_values:
         result = plugin._sanitize_brief_response(f"結果：完成\n變更：{value}")
         assert value not in result
-        assert "技術細節已省略" in result
+        assert "敏感內容已遮蔽" in result
 
 
 def test_control_character_fragments_cannot_reconstruct_secret_after_screening():
@@ -224,7 +393,7 @@ def test_control_character_fragments_cannot_reconstruct_secret_after_screening()
             f"結果：完成\n變更：{fragmented}"
         )
         assert reconstructed not in result
-        assert "技術細節已省略" in result
+        assert "敏感內容已遮蔽" in result
 
 
 def test_high_entropy_media_basename_is_rejected():
@@ -300,7 +469,7 @@ def test_unstructured_long_output_fails_closed_without_leaking_details():
     transformed = plugin._transform_llm_output(
         response_text=raw, platform="telegram", session_id="s1"
     )
-    assert transformed.startswith("結果：部分完成")
+    assert transformed.startswith("結果：無法安全顯示")
     assert "def secret" not in transformed
     assert "token" not in transformed
     assert "log output" not in transformed

@@ -12,13 +12,13 @@ import re
 from typing import Any
 
 _DEFAULT_MODE = "brief"
-_MAX_BRIEF_LINES = 10
-_MAX_BRIEF_CHARS = 3500
-_MAX_FIELD_CHARS = 240
+_MAX_BRIEF_LINES = 500
+_MAX_BRIEF_CHARS = 30000
+_MAX_FIELD_CHARS = 10000
 _MAX_MEDIA = 10
 _MAX_MEDIA_PATH_CHARS = 300
 _MAX_MEDIA_PATH_TOTAL = 1200
-_MAX_SERIALIZED_CHARS = 3900
+_MAX_SERIALIZED_CHARS = 32000
 
 _modes_by_identity: dict[str, str] = {}
 _turn_identity: contextvars.ContextVar[str | None] = contextvars.ContextVar(
@@ -34,7 +34,7 @@ _final_output_allows_detail: contextvars.ContextVar[bool] = contextvars.ContextV
 _BRIEF_CONTEXT = """[TELEGRAM REPORT MODE: BRIEF]
 This instruction controls only the final user-facing Telegram response; retain and use every normal agent capability, tool, approval, permission, secret rule, and project rule.
 Do not narrate progress. Do not expose reasoning, tool calls, tool output, assistant deltas, commands, diffs, logs, stack traces, or file-by-file edits. Do not include complete code or a code fence.
-Return only the final conclusion, normally within 10 lines and in Traditional Chinese when the user writes Chinese. Use this schema:
+Return only the final conclusion, normally within 10 lines and in Traditional Chinese when the user writes Chinese. Use this schema when it fits:
 結果：完成／部分完成／失敗
 變更：1～3 sentences
 驗證：tests, build, and real inspection results
@@ -42,6 +42,7 @@ Return only the final conclusion, normally within 10 lines and in Traditional Ch
 阻礙：only when a real blocker exists
 下一步：only when the user must decide or act
 On failure, include only the key error, root cause, impact, and next step; keep full logs locally and provide only their path. Do not make another model call merely to summarize.
+Never replace an explicitly requested answer, value, list, error reason, or verification result with a status word or an omission notice. If the user asks to list information, include the requested list in the final response. Concision may remove process narration and duplicate logs, never the answer itself.
 """
 
 _DETAIL_CONTEXT = """[TELEGRAM REPORT MODE: DETAIL]
@@ -73,7 +74,7 @@ _REQUIRED_TELEGRAM_DISPLAY = {
 }
 _UNSAFE_VALUE_RE = re.compile(
     r"MEDIA:|```|~~~|diff\s+--git|traceback|stack\s*trace|tool\s*(?:call|output|result)|"
-    r"assistant\s*delta|private\s*reasoning|思考過程|runtimeerror|keyerror|"
+    r"assistant\s*delta|private\s*reasoning|思考過程|"
     r"(?:^|\s)(?:def|class|function|import|from|const|let|var)\s+[A-Za-z_$]|"
     r"\b[A-Za-z_$][\w$]*\([^\n)]*\)|"
     r"(?:^|\s)(?:git|python|npm|pnpm|yarn|curl|powershell|cmd\.exe|bash|pytest)\s+[-/A-Za-z]|"
@@ -129,8 +130,15 @@ def _contains_sensitive_material(value: str) -> bool:
 # Natural-language summaries only: reject code delimiters/operators, shell
 # quoting, Windows paths, and serialized structures instead of guessing.
 _SAFE_VALUE_RE = re.compile(
-    r"^[\w\s\u3000-\u303f，。！？：；、（）「」『』《》〈〉…·％%＋+\-－／/：:,.!?()'\";–—’“”]+$",
+    r"^[\w\s\u3000-\u303f，。！？：；、（）「」『』《》〈〉…·％%＋+\-－／/：:,.!?()'\";–—’“”|*]+$",
     re.UNICODE,
+)
+_MARKDOWN_PREFIX_RE = re.compile(r"^(?:[-*•]\s+|\d+[.)、]\s*|>\s*|\|\s*)")
+_TOKEN_FRAGMENT_RE = re.compile(r"^[A-Za-z0-9_-]{12,}$")
+_UNSAFE_ANSWER_LINE_RE = re.compile(
+    r"^(?:return\b|RuntimeError\s*:|KeyError\s*:|REASONING\s*:)|"
+    r"internal\s+stack|\blog\s+output\b|(?:^|\s)[A-Za-z]:[/\\](?:private|secret)(?:[/\\]|$)",
+    re.IGNORECASE,
 )
 
 
@@ -260,32 +268,59 @@ def _safe_field_value(value: str) -> str:
     value = re.sub(r"[\x00-\x1f\x7f]", "", value)
     value = re.sub(r"\s+", " ", value).strip().replace("`", "")
     if _contains_sensitive_material(value):
-        return "技術細節已省略；可明確要求詳細說明。"
+        return "敏感內容已遮蔽。"
     if not value or _UNSAFE_VALUE_RE.search(value) or not _SAFE_VALUE_RE.fullmatch(value):
-        return "技術細節已省略；可明確要求詳細說明。" if value else ""
+        return "不安全內容已遮蔽。" if value else ""
     return value[: _MAX_FIELD_CHARS - 1] + "…" if len(value) > _MAX_FIELD_CHARS else value
+
+
+def _normalized_secret_stream(lines: list[str]) -> str:
+    """Join only credential-like line fragments for cross-line screening."""
+    fragments: list[str] = []
+    for line in lines:
+        candidate = _MARKDOWN_PREFIX_RE.sub("", line.strip())
+        candidate = candidate.strip("|* `")
+        if _TOKEN_FRAGMENT_RE.fullmatch(candidate):
+            fragments.append(candidate)
+    return "".join(fragments)
 
 
 def _sanitize_brief_response(text: str) -> str:
     original = str(text or "")
     fields: dict[str, str] = {}
+    answer_lines: list[str] = []
+    blocked = {"敏感內容已遮蔽。", "不安全內容已遮蔽。"}
     for raw_line in original.splitlines():
-        match = _FIELD_RE.match(raw_line.strip())
+        stripped = raw_line.strip()
+        match = _FIELD_RE.match(stripped)
         if match and match.group(1) not in fields:
             value = _safe_field_value(match.group(2))
             if value:
                 fields[match.group(1)] = value
+        elif (
+            stripped
+            and not stripped.startswith(("MEDIA:", "[[audio_as_voice]]", "[[as_document]]"))
+            and not _UNSAFE_ANSWER_LINE_RE.search(stripped)
+        ):
+            value = _safe_field_value(stripped)
+            if value and value not in blocked:
+                answer_lines.append(value)
 
-    if "結果" not in fields:
-        fields = {
-            "結果": "部分完成",
-            "變更": "任務已結束，但最終摘要未符合 brief 格式。",
-            "下一步": "如需查看技術內容，請明確要求詳細說明。",
-        }
-    lines = [f"{name}：{fields[name]}" for name in _FIELD_ORDER if name in fields][:_MAX_BRIEF_LINES]
+    secret_stream = _normalized_secret_stream(answer_lines)
+    if secret_stream and _contains_sensitive_material(secret_stream):
+        answer_lines = ["敏感內容已遮蔽。"]
+
+    if fields:
+        lines = [f"{name}：{fields[name]}" for name in _FIELD_ORDER if name in fields]
+        lines.extend(answer_lines)
+    else:
+        # Brief is a presentation preference, not a schema gate. Preserve every
+        # safe answer when the model used prose, values, lists, or tables.
+        lines = answer_lines
+    lines = lines[:_MAX_BRIEF_LINES]
     while lines and len("\n".join(lines)) > _MAX_BRIEF_CHARS:
         lines.pop()
-    summary = "\n".join(lines) or "結果：部分完成\n變更：最終摘要未符合 brief 格式。"
+    summary = "\n".join(lines) or "結果：無法安全顯示\n變更：回覆未包含可安全傳送的文字。"
 
     # Canonical parser is the sole media syntax allowlist. Bound paths, count,
     # aggregate size, and final serialized size before reconstructing tags.
