@@ -3308,8 +3308,16 @@ class ContextCompressor(ContextEngine):
         # result remains valid JSON — otherwise downstream providers 400
         # on every subsequent turn until the broken call falls out of
         # the window. See ``_truncate_tool_call_args_json`` docstring.
+        #
+        # Arg truncation IS a real prune: it shrinks what goes on the wire
+        # every subsequent turn, so it must increment ``pruned`` (callers
+        # treat ``pruned == 0`` as "nothing changed" and discard the work).
+        # Previously the return value was ignored here, so a transcript whose
+        # only reclaimable content was oversized tool_call args came back
+        # unmodified and the payload was re-sent every turn. (#84731)
         for i in range(max(0, prune_boundary)):
-            _truncate_tool_call_args_at(i)
+            if _truncate_tool_call_args_at(i):
+                pruned += 1
 
         # Pass 4 (issue #61932): protected-tail pressure demotion.
         # After multiple in-place compactions the transcript can be short
@@ -3341,6 +3349,7 @@ class ContextCompressor(ContextEngine):
                     if _demote_tool_result_at(i, spare_protected_skills=False):
                         pressure_hits += 1
                     if _truncate_tool_call_args_at(i):
+                        pruned += 1
                         pressure_hits += 1
                     if _protected_region_tokens() <= soft_ceiling:
                         break
@@ -3362,6 +3371,7 @@ class ContextCompressor(ContextEngine):
                                 pressure_hits += 1
                         elif result[i].get("role") == "assistant":
                             if _truncate_tool_call_args_at(i):
+                                pruned += 1
                                 pressure_hits += 1
                     # Absolute last resort: even the newest tool body can
                     # be larger than the soft budget alone (one 200KB file

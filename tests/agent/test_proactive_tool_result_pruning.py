@@ -97,6 +97,47 @@ def test_prunes_below_compression_threshold():
 
 
 
+def test_tool_call_arg_truncation_counts_as_prune():
+    """Regression for #84731: oversized tool_call arguments were truncated in
+    memory but the return value was ignored and ``pruned`` never incremented,
+    so when arg truncation was the ONLY reclaimable content the caller's
+    no-op contract (``pruned == 0`` → hand back the input object) threw the
+    truncation away and the full payload was re-sent every subsequent turn.
+    """
+    c = _compressor(
+        proactive_prune_tokens=1000,
+        proactive_prune_min_result_chars=8000,
+        proactive_prune_min_reclaim_tokens=0,
+    )
+    msgs = [{"role": "system", "content": "sys"}]
+    for i in range(10):
+        cid = f"call_{i}"
+        if i == 1:
+            # ~5KB of payload — the only reclaimable content in the transcript.
+            args = '{"cmd": "' + "x" * 5000 + '"}'
+        else:
+            args = '{"cmd": "ls"}'
+        msgs.append(_assistant_call(cid, args=args))
+        # Distinct short results: no dedup (contents differ), no demote
+        # (below min_prune_chars) — so arg truncation is the sole prune.
+        msgs.append(_tool_msg(cid, f"ok-{i}"))
+
+    result, pruned = c.prune_tool_results_only(msgs, current_tokens=5000)
+    assert pruned >= 1, "arg truncation must count as a real prune"
+    assert result is not msgs, "a commit must not return the input object"
+
+    big_args = None
+    for m in result:
+        if m.get("role") != "assistant":
+            continue
+        for tc in m.get("tool_calls") or []:
+            if tc.get("id") == "call_1":
+                big_args = tc["function"]["arguments"]
+    assert big_args is not None
+    assert len(big_args) < 5100, "oversized args must be shrunk on the returned list"
+    assert "...[truncated]" in big_args
+
+
 def test_idempotent():
     c = _compressor(proactive_prune_tokens=48_000, proactive_prune_min_result_chars=8_000)
     msgs = _build(8, big_indices={0, 1, 2})
