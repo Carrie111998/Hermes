@@ -37,14 +37,20 @@ from tests.timeout_budget import scaled
 
 # ── Child deadlines ──────────────────────────────────────────────────────────
 #
-# Every spawn in this file is two generations deep: we launch
-# ``scripts/run_tests_parallel.py``, which launches one ``python -m pytest``
-# worker per probe file. Idle, that costs a few seconds; under memory/CPU
-# pressure on a loaded box it costs several times that. The bounds below are
-# safety nets against a *wedged* runner, not assertions about how fast it is
-# — nothing in this file asserts on elapsed time — so they are sized
+# Spawns in this file come in two depths, and they need differently sized
+# bounds. Both kinds are safety nets against a *wedged* child, not assertions
+# about how fast it is — no bound below is asserted on — so both are sized
 # generously and scaled by ``HERMES_TEST_TIMEOUT_SCALE``. See
-# ``tests/timeout_budget.py`` for the rationale.
+# ``tests/timeout_budget.py`` for the rationale, and note the one rule that
+# governs all of them: a deadline that IS the assertion (the 2.0s poll-round
+# sleep, the ``elapsed <`` bounds in the host-saturation tests) stays small
+# and unscaled, because scaling it would weaken the claim.
+#
+# Two generations — ``spawns_runner``
+# -----------------------------------
+# We launch ``scripts/run_tests_parallel.py``, which launches one
+# ``python -m pytest`` worker per probe file. Idle that costs a few seconds;
+# under memory/CPU pressure on a loaded box, several times that.
 #
 # ``_FILE_TIMEOUT`` is the runner's own per-file deadline for the nested
 # pytest. It stays well below ``_RUNNER_TIMEOUT`` so a wedged *file* is
@@ -63,6 +69,26 @@ _RUNNER_TIMEOUT = _FILE_TIMEOUT_SECONDS * 2
 _TEST_TIMEOUT = _RUNNER_TIMEOUT + scaled(60.0)
 
 spawns_runner = pytest.mark.timeout(_TEST_TIMEOUT)
+
+# One generation — ``spawns_child``
+# ---------------------------------
+# The host-saturation guards below spawn a bare ``python -c`` probe (or a
+# waiter thread), not the runner, so they get a much smaller cap than
+# ``spawns_runner``. Their cost is dominated by interpreter start plus the
+# ``scripts.run_tests_parallel`` import, which is cheap idle and slow under
+# commit pressure — i.e. exactly the condition these tests exist to prevent,
+# so they must tolerate it rather than fail on it.
+#
+# The same ordering rule applies: every inner bound fits inside
+# ``_CHILD_TEST_TIMEOUT``, and ``_CHILD_TEST_TIMEOUT`` exceeds the global
+# ``--timeout=30``. Without the mark, that global cap fires first and a
+# thread-method kill takes the summary line with it — leaving no record of
+# which test died.
+_CHILD_TIMEOUT = scaled(60.0)
+_CHILD_REAP_TIMEOUT = scaled(30.0)
+_CHILD_TEST_TIMEOUT = _CHILD_TIMEOUT + (_CHILD_REAP_TIMEOUT * 2)
+
+spawns_child = pytest.mark.timeout(_CHILD_TEST_TIMEOUT)
 
 
 def _rootdir_flag(probe_root: Path) -> str:
@@ -600,6 +626,7 @@ def test_global_slot_capacity_is_bounded_by_cores() -> None:
     assert run_tests_parallel._global_slot_capacity() <= (os.cpu_count() or 4)
 
 
+@spawns_child
 def test_global_slots_are_exclusive_across_processes(tmp_path: Path) -> None:
     """A slot held by one PROCESS is unavailable to another.
 
@@ -621,11 +648,12 @@ def test_global_slots_are_exclusive_across_processes(tmp_path: Path) -> None:
             """
         )
         out = run_text_capture(
-            [sys.executable, "-c", probe], timeout=60
+            [sys.executable, "-c", probe], timeout=_CHILD_TIMEOUT
         )
         assert "BLOCKED" in out.stdout, out.stdout + out.stderr
 
 
+@spawns_child
 def test_slot_is_released_when_holder_dies(tmp_path: Path) -> None:
     """Slots must be reclaimed by the OS when a holder dies uncleanly.
 
@@ -654,11 +682,11 @@ def test_slot_is_released_when_holder_dies(tmp_path: Path) -> None:
         assert run_tests_parallel._try_acquire_any_slot(1, slot_dir) is None
     finally:
         proc.kill()
-        proc.wait(timeout=30)
+        proc.wait(timeout=_CHILD_REAP_TIMEOUT)
 
     # Killed without any cleanup path running — the OS must have dropped
     # the lock anyway. Poll briefly: Windows releases asynchronously.
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + _CHILD_REAP_TIMEOUT
     handle = None
     while time.monotonic() < deadline:
         handle = run_tests_parallel._try_acquire_any_slot(1, slot_dir)
@@ -696,6 +724,7 @@ def test_commit_gate_gives_up_rather_than_deadlocking() -> None:
     assert waited is False, "gate must report that headroom was never reached"
 
 
+@spawns_child
 def test_waiting_for_a_contended_slot_survives_multiple_poll_rounds(
     tmp_path: Path,
 ) -> None:
@@ -732,7 +761,7 @@ def test_waiting_for_a_contended_slot_survives_multiple_poll_rounds(
     assert not acquired, "waiter acquired a slot that was still held"
 
     holder.__exit__(None, None, None)
-    thread.join(timeout=30)
+    thread.join(timeout=_CHILD_REAP_TIMEOUT)
     assert not failed, f"wait loop raised after release: {failed!r}"
     assert acquired == [True], "waiter never acquired the released slot"
 
