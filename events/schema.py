@@ -381,10 +381,14 @@ class EventType(Enum):
     # loop hit an unhandled stream-accumulation exception that the classifier would
     # otherwise have buried as a silent non-retryable "empty response" (SR-471).
     # Both HIGH so they survive significant_only/digest_only verbosity.
-    # Icons: 📐 = contract/conformance check; 💥 = loop fault at non-retryable
+    # Icons: 📐 = contract/conformance check; 🌀 = loop fault at non-retryable
     # abort.
+    # 🌀 (spiral = the agent loop itself) replaced 💥 on 2026-08-11: 💥 was
+    # already CRON_FAILED's, and both route to watchdog_alerts, so an operator
+    # scanning that feed saw two different failures wearing one glyph. The
+    # cron family keeps 💥/🔥; this is the agent's own loop dying, not a job's.
     BACKEND_CONTRACT_DRIFT = ("backend_contract_drift", Priority.HIGH, "📐")
-    AGENT_LOOP_FAULT = ("agent_loop_fault", Priority.HIGH, "💥")
+    AGENT_LOOP_FAULT = ("agent_loop_fault", Priority.HIGH, "🌀")
 
     # System-resource exhaustion early-warning — added 2026-06-11 after the
     # pagefile-expansion disk burst (commit charge hit 84.2/85.6 GB = 98.4%,
