@@ -300,6 +300,20 @@ ctx.register_platform(
 )
 ```
 
+If the adapter accepts direct recipients in E.164 form, declare that on the
+platform registration:
+
+```python
+ctx.register_platform(
+    # ...
+    accepts_e164_targets=True,
+)
+```
+
+This makes targets such as `my_platform:+15555550100` explicit. The shared
+send parser passes the phone number directly to the adapter instead of trying
+to resolve it as a channel name or consulting the platform's home channel.
+
 The scheduler reads this env var when resolving the home target for `deliver=my_platform` jobs, and also treats the platform as a valid cron target in `_KNOWN_DELIVERY_PLATFORMS`-style checks. If your `env_enablement_fn` seeds a `home_channel` dict (see above), that takes precedence — `cron_deliver_env_var` is the fallback for cron jobs that run before env seeding.
 
 ### Out-of-process cron delivery

@@ -597,12 +597,11 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         if group_id:
             return f"group:{group_id}", None, True
         return None, None, False
-    if platform_name in _PHONE_PLATFORMS:
-        match = _E164_TARGET_RE.fullmatch(target_ref)
-        if match:
-            # Preserve the leading '+' — signal-cli and sms/whatsapp adapters
-            # expect E.164 format for direct recipients.
-            return target_ref.strip(), None, True
+    match = _E164_TARGET_RE.fullmatch(target_ref)
+    if match and _accepts_e164_targets(platform_name):
+        # Preserve the leading '+' — signal-cli and sms/whatsapp adapters
+        # expect E.164 format for direct recipients.
+        return target_ref.strip(), None, True
     if platform_name == "photon":
         # Photon DM chat GUIDs ('any;-;+1555...') are platform-native ids the
         # adapter resolves itself — pass through verbatim instead of bouncing
@@ -618,6 +617,24 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     if platform_name == "xmpp" and "@" in target_ref:
         return target_ref, None, True
     return None, None, False
+
+
+def _accepts_e164_targets(platform_name: str) -> bool:
+    """Return whether a built-in or registered plugin accepts phone targets."""
+    if platform_name in _PHONE_PLATFORMS:
+        return True
+    try:
+        from hermes_cli.plugins import discover_plugins
+        from gateway.platform_registry import platform_registry
+
+        # ``hermes send`` parses its target before loading gateway config, so
+        # make sure standalone platform plugins have registered their lazy
+        # PlatformEntry before consulting the capability.
+        discover_plugins()
+        entry = platform_registry.get(platform_name)
+    except Exception:
+        return False
+    return bool(entry and entry.accepts_e164_targets)
 
 
 def _describe_media_for_mirror(media_files):

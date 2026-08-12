@@ -114,6 +114,11 @@ class PlatformEntry:
     # Max message length for smart-chunking.  0 = no limit.
     max_message_length: int = 0
 
+    # True when direct recipients may be addressed as E.164 phone numbers.
+    # The shared send_message parser uses this to keep ``platform:+1555...``
+    # on the explicit-target path instead of consulting the channel directory.
+    accepts_e164_targets: bool = False
+
     # ── Privacy ──
     # If True, session descriptions redact PII (phone numbers, etc.)
     pii_safe: bool = False
