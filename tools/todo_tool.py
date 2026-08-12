@@ -80,19 +80,28 @@ class TodoStore:
 
                 if item_id in existing:
                     # Update only the fields the LLM actually provided
+                    raw_rationale = t.get("rationale")
+                    next_rationale = (
+                        str(raw_rationale).strip()
+                        if raw_rationale is not None
+                        else ""
+                    )
                     if "content" in t and t["content"]:
                         next_content = self._cap_content(str(t["content"]).strip())
-                        if next_content != existing[item_id]["content"] and not t.get("rationale"):
+                        if next_content != existing[item_id]["content"] and not next_rationale:
                             existing[item_id].pop("rationale", None)
                         existing[item_id]["content"] = next_content
                     if "status" in t and t["status"]:
                         status = str(t["status"]).strip().lower()
                         if status in VALID_STATUSES:
                             existing[item_id]["status"] = status
-                    if "rationale" in t and t["rationale"]:
-                        existing[item_id]["rationale"] = self._cap_rationale(
-                            str(t["rationale"]).strip()
-                        )
+                    if "rationale" in t:
+                        if next_rationale:
+                            existing[item_id]["rationale"] = self._cap_rationale(
+                                next_rationale
+                            )
+                        else:
+                            existing[item_id].pop("rationale", None)
                 else:
                     # New item -- validate fully and append to end
                     validated = self._validate(t)
@@ -210,7 +219,8 @@ class TodoStore:
             status = "pending"
 
         validated = {"id": item_id, "content": content, "status": status}
-        rationale = str(item.get("rationale", "")).strip()
+        raw_rationale = item.get("rationale")
+        rationale = str(raw_rationale).strip() if raw_rationale is not None else ""
         if rationale:
             validated["rationale"] = TodoStore._cap_rationale(rationale)
         return validated
