@@ -2240,10 +2240,19 @@ def run_conversation(
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
+        _has_compressible_content = True
+        _has_content = getattr(_compressor, "has_content_to_compress", None)
+        if callable(_has_content):
+            try:
+                _has_compressible_content = bool(_has_content(messages))
+            except Exception:
+                # Optional context-engine introspection is fail-open.
+                _has_compressible_content = True
         if (
             agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
+            and _has_compressible_content
             and not _preflight_compression_blocked
             and not _defer_preflight(request_pressure_tokens)
             and not _compression_cooldown
@@ -2384,6 +2393,13 @@ def run_conversation(
                     request_pressure_tokens,
                     int(getattr(_compressor, "threshold_tokens", 0) or 0),
                 )
+
+        # Do not turn a rough local estimate into an assistant failure. The
+        # estimate includes tool schemas and can exceed the provider's actual
+        # prompt accounting; the provider overflow handler is the authoritative
+        # recovery path and can compact/retry with the real request. A fatal
+        # pre-API guard here used to stop valid work before the model had a
+        # chance to create the requested content.
         
         # Thinking spinner for quiet mode (animated during API call)
         thinking_spinner = None
@@ -6856,6 +6872,7 @@ def run_conversation(
                 if (
                     agent.compression_enabled
                     and compression_attempts < max_compression_attempts
+                    and getattr(_compressor, "has_content_to_compress", lambda _messages: True)(messages)
                     and _compressor.should_compress(_real_tokens)
                 ):
                     compression_attempts += 1

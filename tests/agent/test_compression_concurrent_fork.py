@@ -821,6 +821,61 @@ def test_restored_anchor_never_creates_consecutive_user_roles() -> None:
     assert not compressed[0].get("_todo_snapshot_synthetic")
 
 
+def test_restored_anchor_is_after_compaction_handoff() -> None:
+    """The resumed model must receive the preserved objective after the summary.
+
+    The handoff prefix says that the first user turn after the summary is the
+    active task.  Putting the anchor before an assistant-role summary makes it
+    historical by construction and leaves the next model turn without an
+    actionable request.
+    """
+    from agent.context_compressor import SUMMARY_PREFIX
+    from agent.conversation_compression import _insert_real_user_anchor
+
+    compressed = [
+        {
+            "role": "assistant",
+            "content": f"{SUMMARY_PREFIX}\nrolled-up work",
+        },
+        {"role": "assistant", "content": "continuing after compaction"},
+    ]
+
+    _insert_real_user_anchor(
+        compressed,
+        {"role": "user", "content": "REAL HUMAN OBJECTIVE"},
+    )
+
+    assert [message["role"] for message in compressed] == [
+        "assistant",
+        "assistant",
+        "user",
+    ]
+    assert compressed[-1]["content"] == "REAL HUMAN OBJECTIVE"
+
+
+def test_restored_anchor_follows_user_role_summary_via_tail() -> None:
+    """Strict-template user summaries still get a post-handoff user turn."""
+    from agent.context_compressor import SUMMARY_PREFIX
+    from agent.conversation_compression import _insert_real_user_anchor
+
+    compressed = [
+        {"role": "user", "content": f"{SUMMARY_PREFIX}\nsummary"},
+        {"role": "assistant", "content": "protected tail"},
+    ]
+
+    _insert_real_user_anchor(
+        compressed,
+        {"role": "user", "content": "REAL HUMAN OBJECTIVE"},
+    )
+
+    assert [message["role"] for message in compressed] == [
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert compressed[-1]["content"] == "REAL HUMAN OBJECTIVE"
+
+
 
 
 def test_compression_persists_child_handoff_immediately(tmp_path: Path) -> None:

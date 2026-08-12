@@ -2031,6 +2031,23 @@ class CompressionSessionClosedError(RuntimeError):
         )
 
 
+class SessionDeletedError(RuntimeError):
+    """A late writer tried to resurrect a session deleted in this process.
+
+    Session deletion can race an already-running API executor thread.  The
+    request is cancelled cooperatively, but the provider call may return
+    after the HTTP DELETE has completed.  Keep a process-local tombstone so
+    that its lazy session creation or transcript flush cannot recreate the
+    deleted row.
+    """
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        super().__init__(
+            f"Session {session_id!r} was deleted and cannot accept late writes"
+        )
+
+
 class CompressionSessionBusyError(RuntimeError):
     """A non-owner tried to write while compression owns the session."""
 
@@ -2541,6 +2558,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self.read_only = read_only
 
         self._lock = threading.Lock()
+        # A DELETE must remain authoritative for the lifetime of this
+        # SessionDB. API executor threads can outlive their cancelled
+        # asyncio request, so a late lazy create/append must not resurrect the
+        # row that the request explicitly removed.
+        self._deleted_session_ids: set[str] = set()
+        self._deleted_session_ids_lock = threading.Lock()
         # Read-path split (WAL only): recall/browse queries borrow a
         # read-only connection from a bounded pool so they never queue
         # behind writer flushes on self._lock. See _read_ctx().
@@ -3736,6 +3759,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         crash before the gateway re-records the peer can't strand the child
         without a recoverable routing mapping (#59527).
         """
+        self._assert_session_not_deleted(session_id)
+
         def _do(conn):
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
             conn.execute(
@@ -3858,8 +3883,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
+        self._assert_session_not_deleted(session_id)
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    def mark_session_deleted(self, session_id: str) -> None:
+        """Tombstone *session_id* before cancelling work that may still write.
+
+        This is intentionally process-local.  Session IDs are generated for
+        one conversation lifetime; persisting tombstones would make a future
+        process unable to reuse an explicitly supplied ID after a clean
+        restart.  The gateway calls this before its durable delete, closing
+        the cancellation/late-write race without changing the on-disk schema.
+        """
+        if not session_id:
+            return
+        with self._deleted_session_ids_lock:
+            self._deleted_session_ids.add(session_id)
+
+    def _assert_session_not_deleted(self, session_id: str) -> None:
+        with self._deleted_session_ids_lock:
+            deleted = session_id in self._deleted_session_ids
+        if deleted:
+            raise SessionDeletedError(session_id)
 
     def record_gateway_session_peer(
         self,
@@ -7572,6 +7618,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         (this guard has already needed targeted fixes — see the #74478
         patience note below).
         """
+        self._assert_session_not_deleted(session_id)
         active_lock = conn.execute(
             "SELECT holder FROM compression_locks "
             "WHERE session_id = ? AND expires_at > ?",
@@ -9545,6 +9592,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         accepted for correctness. Returns True if the session was found and
         deleted.
         """
+        # Set the tombstone before acquiring SQLite's write lock.  A late
+        # executor thread must fail closed even if this delete has to wait for
+        # another writer to finish.
+        self.mark_session_deleted(session_id)
         removed_delegate_ids: List[str] = []
         expected_ids = (
             set(expected_delete_ids) if expected_delete_ids is not None else None
@@ -9563,7 +9614,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 }
                 if actual_ids != expected_ids:
                     return False
-            removed_delegate_ids.extend(_delete_delegate_children(conn, [session_id]))
+            removed_delegate_ids.extend(_collect_delegate_child_ids(conn, [session_id]))
+            for delegate_id in removed_delegate_ids:
+                self.mark_session_deleted(delegate_id)
+            _delete_delegate_children(conn, [session_id])
             # Orphan remaining child sessions (branches, etc.) so FK is satisfied.
             conn.execute(
                 "UPDATE sessions SET parent_session_id = NULL "
@@ -9663,6 +9717,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         unique_ids = list({sid for sid in session_ids if isinstance(sid, str) and sid})
         if not unique_ids:
             return 0
+        # Mark requested IDs before waiting for the transaction so late
+        # executor threads cannot recreate a row while bulk deletion is
+        # contending for SQLite's write lock.
+        for session_id in unique_ids:
+            self.mark_session_deleted(session_id)
 
         removed_ids: list[str] = []
         removed_delegate_ids: list[str] = []
@@ -9681,6 +9740,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             existing_placeholders = ",".join("?" * len(existing))
             removed_delegate_ids.extend(_delete_delegate_children(conn, existing))
+            for delegate_id in removed_delegate_ids:
+                self.mark_session_deleted(delegate_id)
             # Orphan remaining children whose parent is in the kill list so the
             # FK constraint stays satisfied. Pin children whose parent
             # is itself in the kill list rather than NULL-ing parents

@@ -94,6 +94,7 @@ from gateway.platforms.base import (
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
+from gateway.turn_lease import SessionTurnLeaseRegistry
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -307,6 +308,27 @@ def _request_service_tier(model_options: Any) -> Any:
     if "fast" in model_options:
         return "priority" if _coerce_request_bool(model_options.get("fast"), default=False) else None
     return _REQUEST_OPTION_MISSING
+
+
+def _request_output_budget(model_options: Any) -> Optional[int]:
+    """Return a validated per-request output-token cap, if supplied.
+
+    Machine-facing callers such as develop-machine need a larger bounded
+    hand-off than the ordinary interactive daemon default. Keep this narrow
+    and request-scoped: arbitrary AIAgent constructor options must not be
+    exposed through the OpenAI-compatible gateway, and a malformed value must
+    fall back to the configured daemon budget rather than causing a 500.
+    """
+    if not isinstance(model_options, dict):
+        return None
+    raw = model_options.get("max_output_tokens", model_options.get("max_tokens"))
+    if isinstance(raw, bool):
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if 1 <= value <= 131_072 else None
 
 
 def _apply_runtime_agent_overrides(
@@ -1427,6 +1449,21 @@ class APIServerAdapter(BasePlatformAdapter):
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
+        # Session-chat requests are synchronous API turns rather than
+        # /v1/runs, so they need their own cancellation index. Otherwise a
+        # deleted watchdog session can keep its already-issued continuation
+        # running and recreate the deleted row in the background.
+        self._active_session_chats: Dict[str, Dict["asyncio.Task", Optional[list]]] = {}
+        # SessionDB owns one durable transcript per session id.  Every API
+        # surface below can reach that same row (including watchdog wake-ups),
+        # so serialise turns by resolved session id before any agent work
+        # starts.  The gateway's platform guards are routing-key scoped and do
+        # not see two callers that use different keys for the same persisted
+        # session.  Without this lease, concurrent model turns can race
+        # compression and transcript persistence, producing the misleading
+        # "session is being compressed by another writer" failure.
+        self._session_turn_leases = SessionTurnLeaseRegistry()
+        self._session_turn_generation = itertools.count(1)
         # Stop is cooperative: the executor thread may outlive the HTTP request.
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
@@ -2679,6 +2716,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         request_reasoning_config = _request_reasoning_config(model_options)
         request_service_tier = _request_service_tier(model_options)
+        request_output_budget = _request_output_budget(model_options)
 
         request_model = _clean_request_string(requested_model)
         request_provider = _clean_request_string(requested_provider)
@@ -2872,6 +2910,27 @@ class APIServerAdapter(BasePlatformAdapter):
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
+        # Native API callers may narrow the tool surface for a single turn
+        # through model_options.  This is deliberately request-scoped: the
+        # API server's configured toolsets remain the default for normal
+        # sessions, while bounded machine-readable hand-offs can use an
+        # explicit empty list without disabling tools for repository work.
+        if isinstance(model_options, dict):
+            requested_enabled = model_options.get("enabled_toolsets")
+            requested_disabled = model_options.get("disabled_toolsets")
+            if isinstance(requested_enabled, list) and all(
+                isinstance(item, str) and item.strip() for item in requested_enabled
+            ):
+                enabled_toolsets = list(dict.fromkeys(item.strip() for item in requested_enabled))
+            if isinstance(requested_disabled, list) and all(
+                isinstance(item, str) and item.strip() for item in requested_disabled
+            ):
+                disabled_toolsets = list(dict.fromkeys(item.strip() for item in requested_disabled))
+            else:
+                disabled_toolsets = None
+        else:
+            disabled_toolsets = None
+
         max_iterations = _current_max_iterations()
 
         # Load fallback provider chain so the API server platform has the
@@ -2905,6 +2964,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "verbose_logging": False,
             "ephemeral_system_prompt": ephemeral_system_prompt or None,
             "enabled_toolsets": enabled_toolsets,
+            "disabled_toolsets": disabled_toolsets,
             "session_id": session_id,
             "platform": "api_server",
             "stream_delta_callback": stream_delta_callback,
@@ -2916,6 +2976,19 @@ class APIServerAdapter(BasePlatformAdapter):
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
         }
+        if request_output_budget is not None:
+            # The API-server daemon's configured max_tokens is intentionally
+            # conservative for ordinary sessions. Bounded machine contracts
+            # may carry their own validated cap through model_options.
+            agent_kwargs["max_tokens"] = request_output_budget
+        # Allow bounded API clients to request provider-level JSON mode without
+        # exposing arbitrary agent constructor kwargs.  This is intentionally
+        # opt-in and request-scoped; normal sessions keep the configured
+        # provider behaviour.
+        if isinstance(model_options, dict) and model_options.get("json_mode") is True:
+            agent_kwargs["request_overrides"] = {
+                "extra_body": {"response_format": {"type": "json_object"}}
+            }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
 
@@ -3544,6 +3617,34 @@ class APIServerAdapter(BasePlatformAdapter):
         session, err = await self._get_existing_session_or_404(session_id)
         if err:
             return err
+        # Session deletion is also used as the final cleanup boundary by
+        # local contract clients. Do not leave a /v1/runs task (and its
+        # underlying oMLX request) alive after its persisted session has been
+        # deleted. A run normally uses its own generated session id, but also
+        # honour an explicitly supplied session_id.
+        run_ids = [session_id]
+        run_ids.extend(
+            run_id
+            for run_id, status in self._run_statuses.items()
+            if status.get("session_id") == session_id and run_id != session_id
+        )
+        for run_id in run_ids:
+            self._stop_active_run(run_id, reason="Session deleted via API")
+        # Session-chat turns do not have a structured run id, but they still
+        # own an asyncio task and (once created) an AIAgent. Interrupt both
+        # before deleting the durable row so an in-flight watchdog
+        # continuation cannot append messages after this request returns.
+        active_chat = self._active_session_chats.pop(session_id, {})
+        current_task = asyncio.current_task()
+        for task, agent_ref in active_chat.items():
+            agent = agent_ref[0] if agent_ref else None
+            if agent is not None:
+                try:
+                    request_hard_interrupt(agent, "Session deleted via API")
+                except Exception:
+                    logger.debug("failed to interrupt deleted session agent", exc_info=True)
+            if task is not current_task and not task.done():
+                task.cancel()
         db = await self._ensure_session_db_async()
         deleted = await asyncio.to_thread(db.delete_session, session_id)
         return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
@@ -3725,11 +3826,13 @@ class APIServerAdapter(BasePlatformAdapter):
             if selection_error:
                 return web.json_response(_openai_error(selection_error), status=400)
         history = await self._conversation_history_for_session(session_id)
+        agent_ref = [None]
         result, usage = await self._run_agent(
             user_message=user_message,
             conversation_history=history,
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
+            agent_ref=agent_ref,
             gateway_session_key=gateway_session_key,
             route=route,
             session_model=session_model,
@@ -4047,6 +4150,9 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+        request_source = str(
+            request.headers.get("X-Hermes-Session-Source", "")
+        ).strip() or self._normalize_session_source(body.get("source") or "api_server")
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -4257,6 +4363,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                session_source=request_source,
                 **agent_overrides,
                 route=route,
             ))
@@ -4278,6 +4385,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                session_source=request_source,
                 **agent_overrides,
                 route=route,
             )
@@ -6080,6 +6188,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        source: str = "api_server",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -6100,12 +6209,39 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return set_session_vars(
             platform="api_server",
+            source=source.strip()[:128] or "api_server",
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
             async_delivery=False,
             cron_session="",
         )
+
+    async def _acquire_session_turn_lease(
+        self,
+        session_id: Optional[str],
+        *,
+        owner_key: str,
+    ):
+        """Serialise API turns that target the same durable session.
+
+        The lease is deliberately acquired in the event-loop layer, before
+        the worker thread creates an agent or writes transcript state.  It is
+        shared by synchronous chat, streaming chat, and structured runs so a
+        watchdog continuation cannot overlap the turn it is meant to recover.
+        """
+        if not session_id:
+            return None
+        generation = next(self._session_turn_generation)
+        return await self._session_turn_leases.acquire(
+            session_id,
+            owner_key=owner_key or "api_server",
+            generation=generation,
+        )
+
+    def _release_session_turn_lease(self, token) -> None:
+        if token is not None:
+            self._session_turn_leases.release(token)
 
     async def _run_agent(
         self,
@@ -6119,6 +6255,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        session_source: str = "api_server",
         requested_model: Optional[str] = None,
         requested_provider: Optional[str] = None,
         model_options: Optional[Dict[str, Any]] = None,
@@ -6158,6 +6295,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
+        session_task = asyncio.current_task()
+        if session_id and session_task is not None:
+            self._active_session_chats.setdefault(session_id, {})[session_task] = agent_ref
 
         def _run():
             from gateway.session_context import clear_session_vars
@@ -6167,6 +6307,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
+                    source=session_source,
                 )
                 agent = None
                 try:
@@ -6337,12 +6478,23 @@ class APIServerAdapter(BasePlatformAdapter):
                         self._shutdown_interruptible_agents.pop(id(agent), None)
                     clear_session_vars(tokens)
 
+        turn_lease = await self._acquire_session_turn_lease(
+            session_id,
+            owner_key=gateway_session_key or session_source or session_id or "api_server",
+        )
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
         try:
             return await loop.run_in_executor(None, _run)
         finally:
             self._inflight_agent_runs -= 1
+            self._release_session_turn_lease(turn_lease)
+            if session_id and session_task is not None:
+                active = self._active_session_chats.get(session_id)
+                if active is not None:
+                    active.pop(session_task, None)
+                    if not active:
+                        self._active_session_chats.pop(session_id, None)
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
@@ -6596,9 +6748,15 @@ class APIServerAdapter(BasePlatformAdapter):
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
         request_profile = _api_request_profile.get()
+        request_source = str(request.headers.get("X-Hermes-Session-Source", "")).strip()
 
         async def _run_and_close():
+            turn_lease = None
             try:
+                turn_lease = await self._acquire_session_turn_lease(
+                    session_id,
+                    owner_key=f"run:{run_id}",
+                )
                 self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
@@ -6685,6 +6843,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 chat_id=session_id or "",
                                 session_key=approval_session_key,
                                 session_id=session_id or "",
+                                source=request_source or "api_server",
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             # /v1/runs runs its own agent lifecycle (no
@@ -6827,6 +6986,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             finally:
+                self._release_session_turn_lease(turn_lease)
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
                 # on an approval Event.  Unregistering here releases those
@@ -7029,30 +7189,26 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
+        if not self._stop_active_run(run_id, reason="Stop requested via API"):
+            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+        return web.json_response({"run_id": run_id, "status": "stopping"})
+
+    def _stop_active_run(self, run_id: str, *, reason: str) -> bool:
+        """Interrupt an active run and mark it for cooperative cancellation."""
         agent = self._active_run_agents.get(run_id)
         task = self._active_run_tasks.get(run_id)
-
         if agent is None and task is None:
-            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+            return False
 
         self._set_run_status(run_id, "stopping", last_event="run.stopping")
         self._stopping_run_ids.add(run_id)
-
         if agent is not None:
             try:
-                request_hard_interrupt(agent, "Stop requested via API")
+                request_hard_interrupt(agent, reason)
             except Exception:
                 pass
-            # The stopped run is abandoned — reap only the background
-            # processes it created (#76115). Epoch-gated inside, so a
-            # concurrent run sharing the same session_id keeps its own
-            # processes; no-op if the run already finished and cleared
-            # its ownership markers.
-            _reap_disconnected_agent_processes(
-                agent, source="api_server_run_stop"
-            )
-
-        return web.json_response({"run_id": run_id, "status": "stopping"})
+            _reap_disconnected_agent_processes(agent, source="api_server_run_stop")
+        return True
 
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically expire transport buffers and terminal status records."""

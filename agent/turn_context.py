@@ -927,7 +927,19 @@ def build_turn_context(
                 getattr(agent, "codex_app_server_auto_compaction", "native"),
             )
         else:
-            _should_compress_now = _compressor.should_compress(_preflight_tokens)
+            _has_compressible_content = True
+            _has_content = getattr(_compressor, "has_content_to_compress", None)
+            if callable(_has_content):
+                try:
+                    _has_compressible_content = bool(_has_content(messages))
+                except Exception:
+                    # A third-party context engine must not prevent a turn;
+                    # its optional introspection hook is fail-open.
+                    _has_compressible_content = True
+            _should_compress_now = (
+                _has_compressible_content
+                and _compressor.should_compress(_preflight_tokens)
+            )
             if not _should_compress_now:
                 # Context is over threshold but compression is blocked
                 # (summary-LLM cooldown or anti-thrashing). Ask should_compress_info
@@ -1026,7 +1038,17 @@ def build_turn_context(
                 agent._last_content_with_tools = None
                 agent._last_content_tools_all_housekeeping = False
                 agent._mute_post_response = False
-                if not _compressor.should_compress(_preflight_tokens):
+                _has_compressible_content = True
+                _has_content = getattr(_compressor, "has_content_to_compress", None)
+                if callable(_has_content):
+                    try:
+                        _has_compressible_content = bool(_has_content(messages))
+                    except Exception:
+                        _has_compressible_content = True
+                if (
+                    not _has_compressible_content
+                    or not _compressor.should_compress(_preflight_tokens)
+                ):
                     break
                 if not _compression_warrants_another_preflight_pass(
                     _orig_tokens,

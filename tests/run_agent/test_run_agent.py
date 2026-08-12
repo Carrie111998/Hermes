@@ -3760,6 +3760,9 @@ class TestRunConversation:
             patch.object(
                 agent.context_compressor, "should_compress", return_value=True
             ),
+            patch.object(
+                agent.context_compressor, "has_content_to_compress", return_value=True
+            ),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
