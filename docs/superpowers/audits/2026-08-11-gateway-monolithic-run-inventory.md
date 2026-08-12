@@ -105,6 +105,83 @@ Proof it is actually fixed rather than merely passing: raising the background de
 (simulating the loaded box) fails **all three** tests on the old code and passes all nine on
 the new. Whole file `250 passed, 1 skipped`.
 
+**✅ The same pattern was then swept across the rest of `tests/gateway/` (2026-08-12) — 43
+more sleep-then-assert sites in 7 files, all fixed.** The matrix instance was not special; it
+was just the one that happened to fire. (A further 10 *inter-chunk* sleeps were tightened to
+`asyncio.sleep(0)` in the same pass: those sit between two enqueues and had to stay **shorter**
+than the batch window for the chunks to merge at all, so they carry the same defect mirrored —
+a stalled loop splits the burst and `assert_called_once` sees two calls. A bare yield gives
+the same interleaving with no window to lose.) Every hit had the same shape: a background task scheduled behind a
+configured delay, a hardcoded sleep chosen as a small multiple of it, then an assertion that
+the deferred work had already happened.
+
+The worst instance was **not** the one that flaked. `test_telegram_text_batching.py` slept
+`0.2s` against an *effective* delay of `0.18s` — a **20 millisecond** margin. The factory
+appears to set `0.1`, but `TelegramAdapter._flush_text_batch` applies adaptive tiers, and a
+short message takes `min(_text_batch_delay_seconds, _TEXT_BATCH_FAST_DELAY_S)` where
+`_TEXT_BATCH_FAST_DELAY_S = 0.18` (`adapter.py:632`). **Raising the configured delay does not
+falsify these tests** — the `min()` caps it. The tier constant must be raised too. This also
+means the delay a test *sets* is not necessarily the delay it *gets*; read the flush.
+
+Measured, not assumed: a nominal `0.1s` flush completes in **~0.217s** on this box when
+otherwise idle, because the task still needs loop turns after its deadline to get through
+`asyncio.shield(handle_message(...))`. Several of these margins were already negative at
+rest. No sleep can express "and then let it finish".
+
+One distinction worth keeping: **a negative probe is starvation-safe, a positive assertion is
+not.** `sleep(0.15); assert_not_called()` against a `0.3s` flush cannot lose the race — asyncio
+fires timer callbacks in deadline order, so the earlier deadline always runs first regardless
+of how late the loop is. Those probes were deliberately left alone. Only the positive halves
+were converted.
+
+Files fixed, each with a module-local drain helper over the handle the production code already
+keeps: `test_text_batching.py` (29 sites, `_pending_text_batch_tasks`),
+`test_telegram_text_batching.py` (14, plus `_pending_photo_batch_tasks` / `_media_group_tasks`),
+`test_whatsapp_text_batching.py` (2), `test_weixin.py` (2), `test_telegram_group_gating.py` (1),
+`test_active_session_text_merge.py` (3, `_text_debounce[key].task`),
+`test_restart_resume_pending.py` (2, `runner._background_tasks`).
+
+Two tests in `test_text_batching.py` could not simply drain: in
+`test_short_chunk_uses_normal_delay` (Telegram + Feishu) the *sleep was the assertion* — it
+proved the normal tier rather than the split tier had been chosen, and draining would pass
+either way. Since no sleep fits between a `0.1s` delay that completes at `0.217s` and a `0.3s`
+one, the discriminator was made structural instead: set the expected branch to `0.0` and the
+wrong branch to `30.0`, then `wait_for(drain, 5.0)`. The correct branch returns at once; the
+wrong one trips the budget. No wall-clock margin remains.
+
+Falsified branch by branch, never on a green run alone — with the delays raised well past the
+old sleep budgets, **old code 41 failures, new code 0**:
+
+| File | old | new |
+|---|---|---|
+| `test_text_batching.py` | 23/23 fail | 22/23 pass¹ |
+| `test_telegram_text_batching.py` | 9 fail | pass |
+| `test_whatsapp_text_batching.py` | 2 fail | pass |
+| `test_active_session_text_merge.py` | 2 fail | pass |
+| `test_weixin.py` + `test_telegram_group_gating.py` | 3 fail | pass |
+| `test_restart_resume_pending.py`² | 2 fail | pass |
+
+¹ The one new-code failure is `test_shield_protects_handle_message_from_cancel`, untouched by
+this sweep: it has its own `wait_for(handle_started, timeout=1.0)` that the artificial `1.5s`
+delay exceeds. A falsifier artifact, not a race — it passes at real delays.
+² No configured delay to raise, so the falsifier slowed the background work itself to `0.5s`.
+
+At real delays: **266 passed** across all seven files, `ruff check` clean.
+
+**Ruled out — do not re-report these.** `test_slack.py`'s watchdog tests set
+`_socket_watchdog_interval_s = 0.01` and sleep `0.01`, which greps as a 1× margin but is a
+bounded poll loop (`for _ in range(40): if cond: break`) — already the correct shape.
+`test_qqbot.py::test_send_waits_and_succeeds_on_reconnect` polls inside `send()` against a
+`5.0s` budget. The `sleep(60)` / `sleep(3600)` hits are stub coroutines simulating hangs.
+
+**Known-remaining, no clean handle — reported rather than papered over.**
+`test_voice_command.py::test_keepalive_sends_silence_frame` sets `_KEEPALIVE_INTERVAL = 0.1`
+and sleeps `0.3`, but `_voice_listen_loop` is a periodic `while` loop with its own `0.2s` tick
+and never completes, so there is no task to await; a poll-until-`send_packet.called` loop
+would be the fix. `test_gateway_shutdown.py::test_drain_active_agents_throttles_status_updates`
+asserts `3 <= call_count <= 4` from wall-clock throttling — the rate *is* the property under
+test, so it is irreducibly timing-based. Neither was widened.
+
 ### A. ✅ FIXED — Stale test scaffolding — 5 — `test_multiplex_adapter_registry.py`
 
 > **✅ FIXED by `e467da742` (2026-08-11), ancestor of `main` and of the deployed branch.**

@@ -22,6 +22,29 @@ def _make_adapter(**extra):
     return WhatsAppAdapter(PlatformConfig(enabled=True, extra=base))
 
 
+async def _drain_text_batches(adapter) -> None:
+    """Await the adapter's pending flush tasks instead of racing a sleep.
+
+    ``_enqueue_text_event`` dispatches from a background task that first sleeps
+    ``_text_batch_delay_seconds``.  These tests used to wait for that with
+    ``await asyncio.sleep(0.2)`` against a 0.05s delay; the margin looks
+    generous but the task still needs loop turns after its deadline to finish
+    dispatching, so on a loaded box ``dispatched`` is still empty when the
+    assertion runs.  The adapter already tracks the task in
+    ``_pending_text_batch_tasks``, so wait on the work itself.
+
+    Snapshot the values first: the flush pops its own key in a ``finally``.
+    ``return_exceptions=True`` keeps this a wait, not an assertion -- a
+    superseded chunk's task is cancelled by design.
+
+    Deliberately no fallback when the map is empty -- if nothing was
+    scheduled, the caller's assertion must still fail.
+    """
+    tasks = tuple(adapter._pending_text_batch_tasks.values())
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 def _event(text):
     src = SessionSource(
         platform=Platform.WHATSAPP,
@@ -81,7 +104,7 @@ def test_rapid_texts_collapse_into_single_dispatch():
         adapter._enqueue_text_event(_event("two"))
         adapter._enqueue_text_event(_event("three"))
         assert dispatched == []  # nothing flushed during the burst
-        await asyncio.sleep(0.2)
+        await _drain_text_batches(adapter)
 
     asyncio.run(_drive())
     assert dispatched == ["one\ntwo\nthree"]
@@ -101,7 +124,7 @@ def test_lone_message_dispatched_alone():
 
     async def _drive():
         adapter._enqueue_text_event(_event("solo"))
-        await asyncio.sleep(0.2)
+        await _drain_text_batches(adapter)
 
     asyncio.run(_drive())
     assert dispatched == ["solo"]

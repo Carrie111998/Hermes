@@ -55,6 +55,29 @@ from tests.gateway.restart_test_helpers import (
 # ---------------------------------------------------------------------------
 
 
+async def _drain_background_tasks(runner) -> None:
+    """Await the runner's spawned tasks instead of guessing at a sleep.
+
+    ``_schedule_resume_pending_sessions`` spawns the resume turn with
+    ``asyncio.create_task`` and registers it in ``runner._background_tasks``
+    (gateway/run.py).  The sentinel-cleanup assertions that follow only hold
+    once that task has actually finished, which ``await asyncio.sleep(0.05)``
+    could only approximate.
+
+    Snapshot the set first: ``add_done_callback(self._background_tasks.discard)``
+    mutates it as tasks finish, which would otherwise raise "Set changed size
+    during iteration".  ``return_exceptions=True`` matters here -- one of these
+    tests deliberately makes the resume turn raise, and the drain must observe
+    that failure rather than re-raise it in place of the assertion.
+
+    Deliberately no fallback when the set is empty -- if nothing was spawned,
+    the caller's assertion must still stand on its own.
+    """
+    tasks = tuple(runner._background_tasks)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 def test_resume_pending_is_cleared_only_after_successful_turn():
     """Interrupted/failed drain results must keep the restart recovery marker.
 
@@ -1791,9 +1814,12 @@ async def test_auto_resume_sets_sentinel_before_task_execution():
     assert runner._running_agents[pending_entry.session_key] is _AGENT_PENDING_SENTINEL
     assert pending_entry.session_key in runner._running_agents_ts
 
-    # Release the task and let it complete.
+    # Release the task and let it complete.  Wait on the task itself, not on
+    # a 50ms guess: _schedule_resume_pending_sessions registers it in
+    # runner._background_tasks, and add_done_callback(discard) mutates that
+    # set as tasks finish, so snapshot before gathering.
     gate.set()
-    await asyncio.sleep(0.05)
+    await _drain_background_tasks(runner)
 
     # After the task completes, the sentinel should be cleaned up.
     assert pending_entry.session_key not in runner._running_agents
@@ -1832,7 +1858,7 @@ async def test_auto_resume_sentinel_cleaned_on_task_failure():
     assert pending_entry.session_key in runner._running_agents
 
     # Let the task run and fail.
-    await asyncio.sleep(0.05)
+    await _drain_background_tasks(runner)
 
     # The sentinel must be cleaned up despite the failure.
     assert pending_entry.session_key not in runner._running_agents
