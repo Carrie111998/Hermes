@@ -360,6 +360,38 @@ class TestThreadContext(unittest.TestCase):
             adapter = EmailAdapter(PlatformConfig(enabled=True))
         return adapter
 
+    def test_thread_context_stored_after_dispatch(self):
+        """Dispatch stores subject, message id, and Reply-All recipients."""
+        import asyncio
+        adapter = self._make_adapter()
+
+        async def noop_handle(event):
+            pass
+
+        adapter.handle_message = noop_handle
+
+        msg_data = {
+            "uid": b"10",
+            "sender_addr": "alice@test.com",
+            "sender_name": "Alice",
+            "to_header": "Agent <hermes@test.com>, Bob <bob@test.com>",
+            "cc_header": "Carol <carol@test.com>",
+            "subject": "Project question",
+            "message_id": "<original@test.com>",
+            "in_reply_to": "",
+            "body": "Hello",
+            "attachments": [],
+            "date": "",
+        }
+
+        asyncio.run(adapter._dispatch_message(msg_data))
+        ctx = adapter._thread_context.get("alice@test.com")
+        self.assertIsNotNone(ctx)
+        assert ctx is not None
+        self.assertEqual(ctx["subject"], "Project question")
+        self.assertEqual(ctx["message_id"], "<original@test.com>")
+        self.assertEqual(ctx["to"], "alice@test.com, bob@test.com")
+        self.assertEqual(ctx["cc"], "carol@test.com")
 
     def test_reply_uses_re_prefix(self):
         """Reply subject should have Re: prefix."""
@@ -381,6 +413,55 @@ class TestThreadContext(unittest.TestCase):
             self.assertEqual(send_call["In-Reply-To"], "<original@test.com>")
             self.assertEqual(send_call["References"], "<original@test.com>")
             self.assertIn("Date", send_call)
+
+    def test_reply_all_preserves_to_and_cc_recipients(self):
+        """A reply keeps all original To/Cc recipients of the thread."""
+        adapter = self._make_adapter()
+        adapter._thread_context["alice@test.com"] = {
+            "subject": "Group planning",
+            "message_id": "<original@test.com>",
+            "to": "alice@test.com, bob@test.com",
+            "cc": "carol@test.com",
+        }
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email("alice@test.com", "Both recipients are included.", None)
+
+            sent = mock_server.send_message.call_args[0][0]
+            self.assertEqual(sent["To"], "alice@test.com, bob@test.com")
+            self.assertEqual(sent["Cc"], "carol@test.com")
+
+    def test_reply_without_cc_context_sets_no_cc_header(self):
+        """Without stored recipients, replies go only to the sender."""
+        adapter = self._make_adapter()
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email("alice@test.com", "Just you and me.", None)
+
+            sent = mock_server.send_message.call_args[0][0]
+            self.assertEqual(sent["To"], "alice@test.com")
+            self.assertIsNone(sent["Cc"])
+
+    def test_reply_all_recipients_excludes_agent_address(self):
+        """The agent's own address never appears in To or Cc, and duplicate
+        addresses are removed case-insensitively (first-seen wins)."""
+        from plugins.platforms.email.adapter import _reply_all_recipients
+
+        result = _reply_all_recipients(
+            to_header="Agent <hermes@test.com>, Bob <bob@test.com>, ALICE@test.com",
+            cc_header="hermes@test.com, Carol <carol@test.com>, bob@test.com",
+            sender_addr="alice@test.com",
+            agent_addr="hermes@test.com",
+        )
+
+        self.assertEqual(result["to"], "alice@test.com, bob@test.com")
+        self.assertEqual(result["cc"], "carol@test.com")
 
 
 class TestSendMethods(unittest.TestCase):

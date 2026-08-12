@@ -33,7 +33,7 @@ from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
-from email.utils import formatdate
+from email.utils import formatdate, getaddresses
 from email import encoders
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -326,6 +326,44 @@ def _extract_email_address(raw: str) -> str:
     if match:
         return match.group(1).strip().lower()
     return raw.strip().lower()
+
+
+def _reply_all_recipients(
+    to_header: str,
+    cc_header: str,
+    sender_addr: str,
+    agent_addr: str,
+) -> Dict[str, str]:
+    """Build Reply-All recipient headers from an inbound message's To/Cc.
+
+    The direct sender is promoted to the front of To, the remaining original
+    To recipients stay in To, Cc recipients stay in Cc, and the agent's own
+    address is dropped from both (it should never mail itself). Addresses are
+    deduplicated case-insensitively while retaining first-seen order and are
+    returned as comma-joined bare addresses.
+    """
+    agent = agent_addr.strip().lower()
+    seen = set()
+    to_addresses: List[str] = []
+    cc_addresses: List[str] = []
+
+    def add(target: List[str], address: str) -> None:
+        normalized = address.strip().lower()
+        if not normalized or normalized == agent or normalized in seen:
+            return
+        seen.add(normalized)
+        target.append(address.strip())
+
+    add(to_addresses, sender_addr)
+    for _name, address in getaddresses([to_header or ""]):
+        add(to_addresses, address)
+    for _name, address in getaddresses([cc_header or ""]):
+        add(cc_addresses, address)
+
+    return {
+        "to": ", ".join(to_addresses) or sender_addr,
+        "cc": ", ".join(cc_addresses),
+    }
 
 
 def _domain_of(address: str) -> str:
@@ -812,6 +850,8 @@ class EmailAdapter(BasePlatformAdapter):
                         "uid": uid,
                         "sender_addr": sender_addr,
                         "sender_name": sender_name,
+                        "to_header": msg.get("To", ""),
+                        "cc_header": msg.get("Cc", ""),
                         "subject": subject,
                         "message_id": message_id,
                         "in_reply_to": in_reply_to,
@@ -948,10 +988,18 @@ class EmailAdapter(BasePlatformAdapter):
                 # only classification that surfaces both.
                 msg_type = MessageType.DOCUMENT
 
-        # Store thread context for reply threading
+        # Store thread context for reply threading. Besides the subject and
+        # Message-ID, keep the original To/Cc recipients so a reply goes to
+        # the whole thread (Reply All) instead of forking it into a 1:1.
         self._thread_context[sender_addr] = {
             "subject": subject,
             "message_id": msg_data["message_id"],
+            **_reply_all_recipients(
+                msg_data.get("to_header", ""),
+                msg_data.get("cc_header", ""),
+                sender_addr,
+                self._address,
+            ),
         }
 
         source = self.build_source(
@@ -1012,10 +1060,14 @@ class EmailAdapter(BasePlatformAdapter):
         """Send an email via SMTP. Runs in executor thread."""
         msg = MIMEMultipart()
         msg["From"] = self._address
-        msg["To"] = to_addr
 
-        # Thread context for reply
+        # Thread context for reply. Restore the original thread's To/Cc
+        # recipients (Reply All); smtplib.send_message derives the SMTP
+        # envelope from these headers, so Cc recipients are delivered too.
         ctx = self._thread_context.get(to_addr, {})
+        msg["To"] = ctx.get("to") or to_addr
+        if ctx.get("cc"):
+            msg["Cc"] = ctx["cc"]
         subject = ctx.get("subject", "Hermes Agent")
         if not subject.startswith("Re:"):
             subject = f"Re: {subject}"
@@ -1127,9 +1179,11 @@ class EmailAdapter(BasePlatformAdapter):
         """Send an email with multiple file attachments via SMTP."""
         msg = MIMEMultipart()
         msg["From"] = self._address
-        msg["To"] = to_addr
 
         ctx = self._thread_context.get(to_addr, {})
+        msg["To"] = ctx.get("to") or to_addr
+        if ctx.get("cc"):
+            msg["Cc"] = ctx["cc"]
         subject = ctx.get("subject", "Hermes Agent")
         if not subject.startswith("Re:"):
             subject = f"Re: {subject}"
@@ -1207,9 +1261,11 @@ class EmailAdapter(BasePlatformAdapter):
         """Send an email with a file attachment via SMTP."""
         msg = MIMEMultipart()
         msg["From"] = self._address
-        msg["To"] = to_addr
 
         ctx = self._thread_context.get(to_addr, {})
+        msg["To"] = ctx.get("to") or to_addr
+        if ctx.get("cc"):
+            msg["Cc"] = ctx["cc"]
         subject = ctx.get("subject", "Hermes Agent")
         if not subject.startswith("Re:"):
             subject = f"Re: {subject}"
