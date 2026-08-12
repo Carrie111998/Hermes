@@ -6990,23 +6990,43 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
+        enable_yolo = _coerce_request_bool(body.get("yolo"), default=False)
         resolve_all = (
-            _coerce_request_bool(body.get("all"), default=False)
+            enable_yolo
+            or _coerce_request_bool(body.get("all"), default=False)
             or _coerce_request_bool(body.get("resolve_all"), default=False)
         )
+        yolo_was_enabled = False
+        disable_yolo = None
         try:
-            from tools.approval import resolve_gateway_approval
+            from tools.approval import (
+                disable_session_yolo,
+                enable_session_yolo,
+                is_session_yolo_enabled,
+                resolve_gateway_approval,
+            )
+            disable_yolo = disable_session_yolo
 
+            yolo_was_enabled = is_session_yolo_enabled(approval_session_key)
+            if enable_yolo and not yolo_was_enabled:
+                enable_session_yolo(approval_session_key)
             resolved = resolve_gateway_approval(
                 approval_session_key,
                 choice,
                 resolve_all=resolve_all,
             )
         except Exception as exc:
+            if enable_yolo and not yolo_was_enabled and disable_yolo is not None:
+                try:
+                    disable_yolo(approval_session_key)
+                except Exception:
+                    pass
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
             return web.json_response(_openai_error(str(exc)), status=500)
 
         if resolved <= 0:
+            if enable_yolo and not yolo_was_enabled and disable_yolo is not None:
+                disable_yolo(approval_session_key)
             return web.json_response(
                 _openai_error(
                     f"Run has no pending approval: {run_id}",
@@ -7034,6 +7054,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "run_id": run_id,
             "choice": choice,
             "resolved": resolved,
+            "yolo_enabled": bool(enable_yolo or yolo_was_enabled),
         })
 
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":

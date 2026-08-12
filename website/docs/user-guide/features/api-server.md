@@ -403,7 +403,7 @@ running.
 
 ### POST /v1/runs/\{run_id\}/approval
 
-Resolve a pending approval for a run that is waiting on a human decision (for example, a tool call gated behind an approval policy). The body carries the approval decision; the run resumes once the decision is recorded. This endpoint is advertised in `/v1/capabilities` as the `run_approval` feature so external UIs can detect support before surfacing an approval prompt.
+Resolve a pending approval for a run that is waiting on a human decision (for example, a tool call gated behind an approval policy). The body carries the approval decision; the run resumes once the decision is recorded. An authenticated client can include `"yolo": true` to atomically resolve every approval already parked for that run and enable run-scoped YOLO before execution resumes; this avoids leaving parallel prompts blocked and applies to later prompts in the same run. The temporary bypass is rolled back if no pending approval matched. This endpoint is advertised in `/v1/capabilities` as the `run_approval` feature so external UIs can detect support before surfacing an approval prompt.
 
 ## Jobs API (background scheduled work)
 

@@ -504,6 +504,61 @@ class TestRunEvents:
                 victim_interrupted.set()
                 attacker_interrupted.set()
 
+    @pytest.mark.asyncio
+    async def test_approval_can_enable_yolo_for_the_active_run(self, auth_adapter):
+        """The approval-card YOLO action resumes now and bypasses later prompts."""
+        app = _create_runs_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, _ = _make_slow_agent()
+                mock_create.return_value = mock_agent
+                start = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "session_id": "browser-session"},
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert start.status == 202
+                run_id = (await start.json())["run_id"]
+                assert agent_ready.wait(timeout=3.0)
+
+                pending = approval_mod._ApprovalEntry({
+                    "command": "bash -c prompt-now",
+                    "description": "current approval",
+                })
+                sibling = approval_mod._ApprovalEntry({
+                    "command": "bash -c prompt-parallel",
+                    "description": "parallel approval",
+                })
+                with approval_mod._lock:
+                    approval_mod._gateway_queues[run_id] = [pending, sibling]
+
+                response = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"choice": "once", "yolo": True},
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                data = await response.json()
+
+                assert response.status == 200
+                assert data["resolved"] == 2
+                assert data["yolo_enabled"] is True
+                assert pending.event.is_set()
+                assert pending.result == "once"
+                assert sibling.event.is_set()
+                assert sibling.result == "once"
+                assert approval_mod.is_session_yolo_enabled(run_id) is True
+
+                stop = await cli.post(
+                    f"/v1/runs/{run_id}/stop",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert stop.status == 200
+                for _ in range(40):
+                    if run_id not in auth_adapter._active_run_tasks:
+                        break
+                    await asyncio.sleep(0.05)
+                assert approval_mod.is_session_yolo_enabled(run_id) is False
+
 
 # ---------------------------------------------------------------------------
 # Run lifecycle TTL sweeping
