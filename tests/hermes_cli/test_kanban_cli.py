@@ -52,6 +52,30 @@ def test_run_slash_create_and_list(kanban_home):
     assert "alice" in out
 
 
+@pytest.mark.parametrize(
+    ("policy", "required", "forbidden"),
+    [("none", False, False), ("required", True, False), ("forbidden", False, True)],
+)
+def test_run_slash_create_source_policy(kanban_home, policy, required, forbidden):
+    payload = json.loads(kc.run_slash(
+        f"create 'policy task' --source-policy {policy} --json"
+    ))
+    with kb.connect() as conn:
+        task = kb.get_task(conn, payload["id"])
+    assert task.source_commit_required is required
+    assert task.source_commit_forbidden is forbidden
+
+
+def test_run_slash_rejects_source_policy_on_qualified_board(kanban_home):
+    kb.ensure_product_board_defaults("strict", switch=True)
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    out = kc.run_slash("create 'policy task' --source-policy required")
+    assert "Default-board execution contract" in out
+
+
 def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
     target = tmp_path / ".worktrees" / "t6-wire"
     target_arg = target.as_posix()

@@ -1693,6 +1693,32 @@ def test_link_happy_path(worker_env):
     assert d["ok"] is True
 
 
+@pytest.mark.parametrize(
+    ("policy", "required", "forbidden"),
+    [("none", False, False), ("required", True, False), ("forbidden", False, True)],
+)
+def test_create_source_policy(worker_env, policy, required, forbidden):
+    from tools import kanban_tools as kt
+    out = kt._handle_create({
+        "title": "policy child", "assignee": "peer", "source_policy": policy,
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    from hermes_cli import kanban_db as kb
+    with kb.connect() as conn:
+        task = kb.get_task(conn, d["task_id"])
+    assert task.source_commit_required is required
+    assert task.source_commit_forbidden is forbidden
+
+
+def test_create_rejects_invalid_source_policy(worker_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_create({
+        "title": "policy child", "assignee": "peer", "source_policy": "maybe",
+    })
+    assert "source_policy" in json.loads(out)["error"]
+
+
 def test_unblock_happy_path(monkeypatch, worker_env):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     from hermes_cli import kanban_db as kb

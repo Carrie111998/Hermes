@@ -397,6 +397,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("title", help="Task title")
     p_create.add_argument("--body", default=None, help="Optional opening post")
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
+    p_create.add_argument(
+        "--source-policy",
+        choices=("none", "required", "forbidden"),
+        default="none",
+        help="Source commit policy for the execution contract.",
+    )
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
     p_create.add_argument("--workspace", default="scratch",
@@ -1729,6 +1735,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
     with kb.connect_closing(board=board) as conn:
         metadata = kb.read_board_metadata(board or kb.get_current_board())
         if kanban_intake.qualification_required(metadata):
+            if args.source_policy != "none":
+                print(
+                    "kanban: non-none source policy is a Default-board execution contract",
+                    file=sys.stderr,
+                )
+                return 2
             receipt = kanban_intake.submit_intake(
                 conn,
                 request={
@@ -1791,6 +1803,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 board=board,
                 workflow_template_id=getattr(args, "workflow_template_id", None),
                 current_step_key=getattr(args, "current_step_key", None),
+                source_commit_required=args.source_policy == "required",
+                source_commit_forbidden=args.source_policy == "forbidden",
             )
         except ValueError as exc:
             print(f"kanban: {exc}", file=sys.stderr)

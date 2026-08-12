@@ -2366,6 +2366,9 @@ def _handle_create(args: dict, **kw) -> str:
     project_id = args.get("project") or args.get("project_id")
     workflow_template_id = args.get("workflow_template_id")
     current_step_key = args.get("current_step_key") or args.get("step_key")
+    source_policy = args.get("source_policy") or "none"
+    if source_policy not in {"none", "required", "forbidden"}:
+        return tool_error("source_policy must be one of: none, required, forbidden")
     project_source_task_id = None
     _inherit_project = workspace_kind is None and workspace_path is None
     if workspace_kind is None:
@@ -2408,6 +2411,10 @@ def _handle_create(args: dict, **kw) -> str:
                 board or kb._board_slug_for_connection(conn)
             )
             if kanban_intake.qualification_required(metadata):
+                if source_policy != "none":
+                    return tool_error(
+                        "non-none source policy is a Default-board execution contract"
+                    )
                 receipt = kanban_intake.submit_intake(
                     conn,
                     request={
@@ -2484,6 +2491,8 @@ def _handle_create(args: dict, **kw) -> str:
                 board=board,
                 workflow_template_id=workflow_template_id,
                 current_step_key=current_step_key,
+                source_commit_required=source_policy == "required",
+                source_commit_forbidden=source_policy == "forbidden",
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -3352,6 +3361,11 @@ KANBAN_CREATE_SCHEMA = {
                     "Use 'backlog' for new product user-story/work cards unless "
                     "a later approved flow intentionally targets another step."
                 ),
+            },
+            "source_policy": {
+                "type": "string",
+                "enum": ["none", "required", "forbidden"],
+                "description": "Default-board execution contract for source commits.",
             },
             "triage": {
                 "type": "boolean",
