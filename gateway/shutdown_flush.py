@@ -283,15 +283,70 @@ def _serialise_value(value: Any) -> Optional[dict]:
     return {"text": str(value)}
 
 
+def _sort_number(value: Any) -> float:
+    """Coerce a spool ordering field to a float; unusable values sort first.
+
+    Ordering fields are read back from JSON on disk and may be missing or
+    corrupt.  A sort key that mixes ``str`` and ``int`` raises ``TypeError``
+    and would abort the entire recovery pass, so anything non-numeric is
+    normalised to ``0.0``.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return float(value)
+
+
+def _order_flush_files(paths) -> list[tuple[Path, Optional[Dict[str, Any]]]]:
+    """Order recovery payloads by drop order — ``(ts, seq, filename)``.
+
+    Recovery used to walk ``sorted(glob("*.json"))``, but spool files are
+    named ``pending-<uuid4>.json`` (see :func:`_write_payload`), so filename
+    order is effectively random.  ``SessionDB`` restores a conversation by
+    AUTOINCREMENT id — true insertion order, never timestamp — so replaying
+    in filename order permanently scrambles the recovered transcript and can
+    separate an assistant tool call from its result.
+
+    The payloads already carry ``ts`` and ``seq``
+    (:func:`spool_dropped_transcript_message`), so this mirrors
+    :func:`drain_transcript_spool`'s ``sorted(entries, key=lambda e: e[:3])``
+    and the live drain and the cross-restart drain agree on replay order.
+
+    Returns ``(path, payload)`` pairs in replay order.  A file whose payload
+    cannot be parsed sorts last, by name, and is returned with ``None`` so
+    the caller reports it through its own error handling.
+    """
+    entries = []
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = None
+        if not isinstance(payload, dict):
+            entries.append(((1, 0.0, 0.0, path.name), path, None))
+            continue
+        entries.append((
+            (
+                0,
+                _sort_number(payload.get("ts")),
+                _sort_number(payload.get("seq")),
+                path.name,
+            ),
+            path,
+            payload,
+        ))
+    entries.sort(key=lambda entry: entry[0])
+    return [(path, payload) for _key, path, payload in entries]
+
+
 def recover_pending_to_db(
     session_db=None,
 ) -> int:
     """Recover flushed pending messages into state.db via SessionDB.
 
-    Reads all ``*.json`` files from the flush directory, inserts messages
-    using ``SessionDB.append_message`` (so FTS indexing, session metadata
-    updates, and all required columns are handled correctly), and deletes
-    the flush file on success.
+    Reads all ``*.json`` files from the flush directory in drop order,
+    inserts messages using ``SessionDB.append_message`` (so FTS indexing,
+    session metadata updates, and all required columns are handled
+    correctly), and deletes the flush file on success.
 
     Parameters
     ----------
@@ -305,7 +360,7 @@ def recover_pending_to_db(
         Number of messages recovered.
     """
     flush_dir = _get_flush_dir()
-    flush_files = sorted(flush_dir.glob("*.json"))
+    flush_files = _order_flush_files(flush_dir.glob("*.json"))
     if not flush_files:
         return 0
 
@@ -317,9 +372,12 @@ def recover_pending_to_db(
         own_db = True
 
     recovered = 0
-    for path in flush_files:
+    for path, payload in flush_files:
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload is None:
+                # Unparseable on the ordering pass — re-read so the failure
+                # is raised and reported here exactly as it was before.
+                payload = json.loads(path.read_text(encoding="utf-8"))
             # Agent-history snapshots use a different schema (reason +
             # messages list) and are meant for manual operator recovery,
             # not automatic DB insertion. Skip them silently.
