@@ -118,10 +118,10 @@ class AgentSandboxBackend(BaseEnvironment):
                 claim_name = self.client.list_all_sandboxes(label_selector=f"hermes_task_id={task_id}")[0]
                 self._sandbox = self.client.get_sandbox(claim_name)
             except IndexError:
-                logger.info(f"agent-sandbox: The requested sandbox with label_selector=\"hermes_task_id={task_id}\" wasn't found.")
+                logger.info("agent-sandbox: The requested sandbox with label_selector=\"hermes_task_id=%s\" wasn't found.", task_id)
                 self._sandbox = None
             except Exception as e:
-                logger.warning(f"agent-sandbox: Error: {e}\nhermes_task_id={task_id}")
+                logger.warning("agent-sandbox: Error: %s\nhermes_task_id=%s", e, task_id)
                 self._sandbox = None
         if self._sandbox is None:
             self._sandbox = self.client.create_sandbox(
@@ -231,10 +231,10 @@ class AgentSandboxBackend(BaseEnvironment):
                 if not self._persistent:
                     claim_name = self._sandbox.claim_name
                     self._sandbox.terminate()
-                    logger.info(f"agent-sandbox: deleted sandbox with claim name \"{claim_name}\"")
+                    logger.info("agent-sandbox: deleted sandbox with claim name '%s'", claim_name)
                 else:
                     self._sandbox.close_connection()
                 self._sandbox = None
                 logger.info(f"agent-sandbox: clean up succeeded")
             except Exception as e:
-                logger.warning(f"agent-sandbox: cleanup failed: {e}")
+                logger.warning("agent-sandbox: cleanup failed: %s", e)
