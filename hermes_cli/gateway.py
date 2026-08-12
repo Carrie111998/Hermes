@@ -1556,7 +1556,9 @@ def _gateway_has_active_supervisor() -> bool:
 
             if gateway_windows.is_task_registered():
                 task_status = gateway_windows.query_task_status()
-                state = (task_status.get("State") or "").lower()
+                # query_task_status() returns the lowercase "status" key, not
+                # "State" (the scheduled-task schema uses lower-case field names).
+                state = (task_status.get("status") or "").lower()
                 # "Running" => the scheduled task currently has the gateway
                 # process alive and supervised.  "Ready"/"Queued"/"Disabled"
                 # mean it is not actively running the gateway right now.

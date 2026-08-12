@@ -101,8 +101,36 @@ def _collect_proxy_env() -> dict[str, str]:
     return collected
 
 
+def _proxy_value_is_cmd_safe(value: str) -> bool:
+    """Reject proxy values that cannot be safely forwarded to the Windows launchers.
+
+    The VBS launcher quotes values safely, but the ``.cmd`` launcher (and the
+    ``proxy-env.txt`` it loads via ``for /f``) assign them as ``set "KEY=VALUE"``,
+    where a ``"`` would close the quote and inject, CR/LF would add script lines,
+    and ``%`` would trigger env-var expansion. The live ``_build_gateway_argv``
+    (direct-spawn) path is unaffected because there a value is just a Popen env
+    entry, not shell text. Legitimate proxy URLs (http/https/socks5) never contain
+    these characters, so rejecting them only drops pathological values.
+    """
+    if not value:
+        return False
+    rejected = set('\r\n"%|&<>()^')
+    if rejected & set(value):
+        return False
+    return not any(ord(c) < 0x20 for c in value)
+
+
 def get_proxy_env_snapshot_path(hermes_home: str) -> Path:
     return Path(hermes_home) / "gateway-service" / "proxy-env.json"
+
+
+def get_proxy_env_txt_path(hermes_home: str) -> Path:
+    """Flat ``KEY=VALUE`` proxy file loaded by the ``.cmd`` launcher via ``for /f``.
+
+    Keeping the values in a runtime-read file (instead of interpolating them into
+    the script text) makes the launcher immune to CMD metacharacter injection.
+    """
+    return Path(hermes_home) / "gateway-service" / "proxy-env.txt"
 
 
 def _write_proxy_env_snapshot(hermes_home: str) -> None:
@@ -114,12 +142,25 @@ def _write_proxy_env_snapshot(hermes_home: str) -> None:
     spawning process's own environment carries.
     """
     try:
-        snapshot = _collect_proxy_env()
+        snapshot = {
+            k: v for k, v in _collect_proxy_env().items() if _proxy_value_is_cmd_safe(v)
+        }
         path = get_proxy_env_snapshot_path(hermes_home)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(snapshot), encoding="utf-8", newline="")
         tmp.replace(path)
+        # Flat KEY=VALUE file the .cmd launcher loads at runtime via `for /f`,
+        # so proxy values are never interpolated into the script text.
+        txt_path = get_proxy_env_txt_path(hermes_home)
+        if snapshot:
+            txt_path.write_text(
+                "\r\n".join(f"{k}={v}" for k, v in snapshot.items()) + "\r\n",
+                encoding="utf-8",
+                newline="",
+            )
+        else:
+            txt_path.write_text("", encoding="utf-8", newline="")
     except Exception:
         pass
 
@@ -503,12 +544,20 @@ def _build_gateway_cmd_script(
     # Forward proxy env captured at install time so the gateway can reach
     # Telegram/Discord/HTTP through the user's proxy (issue #83683). The
     # Scheduled Task / Startup run outside the user's interactive shell, so
-    # without this the gateway launched on logon has no proxy. These `set`
-    # lines MUST precede the gateway invocation below: a manual CMD launch runs
-    # the python command as a blocking foreground process, so any `set` emitted
-    # after it would execute only after the gateway exits and never reach it.
-    for _pk, _pv in _collect_proxy_env().items():
-        lines.append(f'set "{_pk}={_pv}"')
+    # without this the gateway launched on logon has no proxy.
+    #
+    # The values are loaded at runtime from proxy-env.txt via `for /f` rather
+    # than interpolated here: a proxy value containing & | " ^ % or a line break
+    # cannot escape the assignment or inject a command (hardened per PR #83720
+    # review). This block MUST precede the gateway invocation below — a manual
+    # CMD launch runs python as a blocking foreground process, so any `set`
+    # emitted after it would run only after the gateway exits.
+    _proxy_txt = str(get_proxy_env_txt_path(hermes_home))
+    lines.append(f'if exist "{_proxy_txt}" (')
+    lines.append(
+        f'  for /f "usebackq tokens=1* delims==" %%k in ("{_proxy_txt}") do set "%%k=%%l"'
+    )
+    lines.append(")")
 
     prog_args = [python_exe_path, "-m", "hermes_cli.main"]
     if profile_arg:

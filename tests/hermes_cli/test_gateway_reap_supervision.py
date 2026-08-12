@@ -156,7 +156,7 @@ class TestGatewayHasActiveSupervisor:
         import hermes_cli.gateway_windows as gw_win
 
         monkeypatch.setattr(gw_win, "is_task_registered", lambda: True)
-        monkeypatch.setattr(gw_win, "query_task_status", lambda: {"State": "Running"})
+        monkeypatch.setattr(gw_win, "query_task_status", lambda: {"status": "running"})
         monkeypatch.setattr(gw_win, "_gateway_pids", lambda: [])
         assert gateway._gateway_has_active_supervisor() is True
 
@@ -168,7 +168,7 @@ class TestGatewayHasActiveSupervisor:
         import hermes_cli.gateway_windows as gw_win
 
         monkeypatch.setattr(gw_win, "is_task_registered", lambda: True)
-        monkeypatch.setattr(gw_win, "query_task_status", lambda: {"State": "Ready"})
+        monkeypatch.setattr(gw_win, "query_task_status", lambda: {"status": "ready"})
         monkeypatch.setattr(gw_win, "_gateway_pids", lambda: [999])
         assert gateway._gateway_has_active_supervisor() is True
 

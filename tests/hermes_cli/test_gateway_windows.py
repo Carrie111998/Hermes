@@ -75,33 +75,71 @@ def test_build_gateway_argv_keeps_venv_console_python_for_uv_venv(monkeypatch, t
 
 
 def test_build_gateway_cmd_script_forwards_proxy_env(monkeypatch):
-    """The .cmd launcher must bake the user's proxy env so a logon/Startup
+    """The .cmd launcher must forward the user's proxy env so a logon/Startup
     gateway (running outside the interactive shell) still reaches Telegram/
-    Discord/HTTP (issue #83683). The proxy `set` lines must come BEFORE the
-    blocking python invocation — otherwise a manual CMD launch never passes
-    them to the gateway process (reviewer note on PR #83720)."""
+    Discord/HTTP (issue #83683). Proxy values are loaded at RUNTIME from
+    proxy-env.txt via `for /f` — they must NOT be interpolated into the script
+    text, so a value containing & | " ^ % or a line break cannot inject a
+    command (reviewer note on PR #83720). The loader must still precede the
+    blocking python invocation."""
     monkeypatch.setenv("TELEGRAM_PROXY", "socks5://127.0.0.1:1080")
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.com:8080")
     content = gateway_windows._build_gateway_cmd_script(
         r"C:\venv\Scripts\python.exe", r"C:\Hermes", r"C:\Hermes", "--profile work"
     )
-    assert 'set "TELEGRAM_PROXY=socks5://127.0.0.1:1080"' in content
-    assert 'set "HTTPS_PROXY=http://proxy.example.com:8080"' in content
+    # No inline interpolation -> injection-safe.
+    assert 'set "TELEGRAM_PROXY=socks5://127.0.0.1:1080"' not in content
+    assert 'set "HTTPS_PROXY=http://proxy.example.com:8080"' not in content
+    # The runtime loader is present and references proxy-env.txt.
+    assert 'for /f "usebackq tokens=1* delims==" %%k in' in content
+    assert "proxy-env.txt" in content
     # Base vars still present.
     assert 'set "HERMES_HOME=C:\\Hermes"' in content
 
-    # Ordering invariant: every proxy export must precede the gateway command
+    # Ordering invariant: the loader block must precede the gateway command
     # line (the blocking invocation). A `set` after it never reaches the child.
     lines = content.split("\r\n")
-    proxy_idx = next(
-        i for i, ln in enumerate(lines) if ln.startswith('set "TELEGRAM_PROXY=')
+    loader_idx = next(
+        i for i, ln in enumerate(lines) if ln.startswith("  for /f")
     )
     invoke_idx = next(
         i for i, ln in enumerate(lines) if "hermes_cli.main" in ln
     )
-    assert proxy_idx < invoke_idx, (
-        f"proxy export (line {proxy_idx}) must precede gateway invocation (line {invoke_idx})"
+    assert loader_idx < invoke_idx, (
+        f"proxy loader (line {loader_idx}) must precede gateway invocation (line {invoke_idx})"
     )
+
+
+def test_proxy_env_snapshot_rejects_cmd_unsafe_values(monkeypatch, tmp_path):
+    """Proxy values containing CMD metacharacters / line breaks must be dropped
+    from the snapshot (and the proxy-env.txt loaded by the .cmd launcher) so
+    they can never escape the `set "KEY=VALUE"` assignment (PR #83720 review).
+    A safe URL is kept; dangerous payloads never reach the launchers."""
+    import json as _json
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+
+    monkeypatch.setenv("TELEGRAM_PROXY", "socks5://127.0.0.1:1080")
+    monkeypatch.setenv("HTTPS_PROXY", 'http://x" & echo HACKED & rem ')
+    monkeypatch.setenv("HTTP_PROXY", "http://y\r\n& whoami")
+    monkeypatch.setenv("ALL_PROXY", "socks5://z%SYSTEMROOT%")
+
+    gateway_windows._write_proxy_env_snapshot(str(hermes_home))
+
+    json_path = gateway_windows.get_proxy_env_snapshot_path(str(hermes_home))
+    txt_path = gateway_windows.get_proxy_env_txt_path(str(hermes_home))
+    written = _json.loads(json_path.read_text(encoding="utf-8"))
+    txt = txt_path.read_text(encoding="utf-8")
+
+    # Safe value kept; dangerous values dropped.
+    assert written.get("TELEGRAM_PROXY") == "socks5://127.0.0.1:1080"
+    assert "HTTPS_PROXY" not in written
+    assert "HTTP_PROXY" not in written
+    assert "ALL_PROXY" not in written
+    # The flat file must not carry the injectable payloads.
+    assert "HACKED" not in txt
+    assert "whoami" not in txt
 
 
 def test_build_gateway_vbs_script_forwards_proxy_env(monkeypatch):
