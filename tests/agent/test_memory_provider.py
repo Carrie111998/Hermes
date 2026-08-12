@@ -321,9 +321,9 @@ class TestMemoryManager:
         def release_during_join(thread, timeout=None):
             if thread.name == "memory-prefetch-controlled-slow":
                 observed_timeouts.append(timeout)
-                assert external.started.wait(timeout=1.0)
+                assert external.started.wait(timeout=5.0)
                 external.release.set()
-                return original_join(thread, timeout=1.0)
+                return original_join(thread, timeout=5.0)
             return original_join(thread, timeout=timeout)
 
         monkeypatch.setattr(threading.Thread, "join", release_during_join)

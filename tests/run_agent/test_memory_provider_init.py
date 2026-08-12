@@ -229,9 +229,12 @@ def test_missing_memory_prefetch_timeout_preserves_default():
 
 
 def test_memory_prefetch_timeout_is_registered_in_default_config():
+    from typing import cast
+
     from hermes_cli.config_defaults import DEFAULT_CONFIG
 
-    assert DEFAULT_CONFIG["memory"]["prefetch_timeout"] == 8.0
+    memory_config = cast(dict[str, object], DEFAULT_CONFIG["memory"])
+    assert memory_config["prefetch_timeout"] == 8.0
 
 
 def test_real_config_reaches_memory_manager_under_temporary_hermes_home(
