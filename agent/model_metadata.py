@@ -3256,6 +3256,22 @@ def _estimate_message_chars(msg: Dict[str, Any]) -> int:
     return len(str(_wire_message_shadow(msg)))
 
 
+def _message_shadow_for_preflight(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Shadow of a message for preflight token estimates.
+
+    Like ``_wire_message_shadow`` but also strips stale thinking fields
+    (``reasoning`` / ``reasoning_content``) that transports only replay
+    on the newest assistant turn (#73624).  Older turns' reasoning is
+    dropped or padded to a one-space echo at send time, so charging it
+    in preflight inflates the estimate past the real wire size and can
+    trigger compaction on sessions that would otherwise fit (#84371).
+    """
+    shadow = _wire_message_shadow(msg)
+    shadow.pop("reasoning", None)
+    shadow.pop("reasoning_content", None)
+    return shadow
+
+
 def _estimate_message_tokens_without_images(msg: Dict[str, Any]) -> int:
     """Token estimate for a message shadow with image payloads stripped."""
     if not isinstance(msg, dict):
@@ -3263,11 +3279,50 @@ def _estimate_message_tokens_without_images(msg: Dict[str, Any]) -> int:
     return estimate_tokens_rough(str(_wire_message_shadow(msg)))
 
 
+def estimate_messages_tokens_rough(
+    messages: List[Dict[str, Any]],
+    *,
+    image_cost: int = 1500,
+    exclude_stale_thinking: bool = False,
+) -> int:
+    """Rough token estimate for a message list (pre-flight only).
+
+    Image parts (base64 PNG/JPEG) are counted as a flat ~1500 tokens per
+    image — the Anthropic pricing model — instead of counting raw base64
+    character length. Without this, a single ~1MB screenshot would be
+    estimated at ~250K tokens and trigger premature context compression.
+
+    Per-message results are memoized (see ``_estimate_message_tokens_cached``)
+    keyed on a deep *identity fingerprint* of the message, so re-walking a
+    long history every iteration only pays for messages whose object graph
+    actually changed. The memo is exact: equal fingerprints imply identical
+    leaf objects and structure, hence an identical estimate.
+
+    When ``exclude_stale_thinking`` is True, ``reasoning`` / ``reasoning_content``
+    are stripped from the shadow before counting. Those fields are only
+    replayed for the newest assistant turn on non-Codex transports (#73624);
+    charging them on every message inflates preflight past the actual wire
+    size and can cause compaction dead-loops on reasoning-heavy sessions
+    (#84371). The default is False to preserve existing behavior.
+    """
+    total = 0
+    for msg in messages:
+        if exclude_stale_thinking and isinstance(msg, dict):
+            msg_for_estimate = _message_shadow_for_preflight(msg)
+        else:
+            msg_for_estimate = msg
+        total += _estimate_message_tokens_cached(
+            msg_for_estimate, image_cost
+        )
+    return total
+
+
 def estimate_request_tokens_rough(
     messages: List[Dict[str, Any]],
     *,
     system_prompt: str = "",
     tools: Optional[List[Dict[str, Any]]] = None,
+    exclude_stale_thinking: bool = False,
 ) -> int:
     """Rough token estimate for a full chat-completions request.
 
@@ -3276,12 +3331,18 @@ def estimate_request_tokens_rough(
     tools enabled, schemas alone can add 20-30K tokens — a significant
     blind spot when only counting messages. Image content is counted
     at a flat per-image cost (see estimate_messages_tokens_rough).
+
+    ``exclude_stale_thinking`` is forwarded to ``estimate_messages_tokens_rough``
+    so preflight and request sizing share the same stale-thinking policy (#84371).
     """
     total = 0
     if system_prompt:
         total += estimate_tokens_rough(system_prompt)
     if messages:
-        total += estimate_messages_tokens_rough(messages)
+        total += estimate_messages_tokens_rough(
+            messages,
+            exclude_stale_thinking=exclude_stale_thinking,
+        )
     if tools:
         total += _estimate_tools_tokens_rough(tools)
     return total
