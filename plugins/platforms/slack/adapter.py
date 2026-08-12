@@ -262,6 +262,16 @@ _slash_user_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     default=None,
 )
 
+# The Slack app can present replies from several isolated Hermes profiles while
+# keeping one Socket Mode connection.  This context is set only for an inbound
+# user turn (including a continued thread), so cron and other synthetic sends
+# retain the Slack app's normal identity.
+_profile_persona: contextvars.ContextVar[Optional[Dict[str, str]]] = (
+    contextvars.ContextVar("_profile_persona", default=None)
+)
+_PROFILE_PERSONA_METADATA_KEY = "_slack_profile_persona"
+_SLASH_USER_ID_METADATA_KEY = "_slack_slash_user_id"
+
 
 @dataclass
 class _ThreadContextCache:
@@ -961,10 +971,18 @@ class SlackAdapter(BasePlatformAdapter):
         # user never clicks would otherwise leak its entry forever. Keys may
         # be workspace-scoped markers (team_id, ts) in multi-workspace mode.
         self._approval_resolved: Dict[Any, bool] = {}
+        # Approval prompt marker -> the already-authorized Slack user who
+        # triggered the agent turn. Interactive payloads do not carry the
+        # Hermes profile stamp, so re-running profile-scoped auth on a button
+        # click can reject the same owner who was authorized at message intake.
+        # Binding the button to its requester preserves least privilege without
+        # widening SLACK_ALLOWED_USERS globally.
+        self._approval_requesters: Dict[Any, str] = {}
         self._APPROVAL_RESOLVED_MAX = 1000
         # Same guard for clarify prompts (interactive multiple-choice
         # buttons); mirrors _approval_resolved.
         self._clarify_resolved: Dict[Any, bool] = {}
+        self._clarify_requesters: Dict[Any, str] = {}
         self._CLARIFY_RESOLVED_MAX = 1000
         # Track timestamps of messages sent by the bot so we can respond
         # to thread replies even without an explicit @mention.
@@ -1028,6 +1046,17 @@ class SlackAdapter(BasePlatformAdapter):
         # commands that arrived without a workspace id.
         # Each value: {"response_url": str, "ts": float}
         self._slash_command_contexts: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+        # Durable Slack thread -> profile bindings for configured profile
+        # invocations. Values contain only public routing/display metadata;
+        # credentials never enter this store.
+        self._profile_thread_routes: Dict[str, Dict[str, str]] = {}
+        self._PROFILE_THREAD_ROUTES_MAX = 5000
+        # Capture the default gateway-owned path now. During a routed turn the
+        # process-wide HERMES_HOME scope temporarily points at the selected
+        # profile; recomputing then would split one Slack route store across
+        # multiple profile homes.
+        self._profile_route_store = self._profile_route_store_path()
+        self._load_profile_thread_routes()
         # Socket Mode resilience: track runtime connection state so we can
         # self-heal when Slack silently drops the websocket.
         self._app_token: Optional[str] = None
@@ -1035,6 +1064,13 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+        # The Slack SDK performs its own reconnect while the websocket is
+        # momentarily disconnected.  Do not tear the handler down on the first
+        # failed probe: doing so can close the SDK's shared aiohttp session
+        # while its reconnect coroutine is still inside connect(), leaving a
+        # zombie task that retries "Session is closed" forever.
+        self._socket_unhealthy_since_monotonic: Optional[float] = None
+        self._socket_reconnect_grace_s = 30.0
         # Monotonic timestamp of the most recent Socket Mode handler (re)start,
         # used to grant a grace window for the first ping/pong after connect.
         self._socket_handler_started_monotonic: Optional[float] = None
@@ -1193,7 +1229,26 @@ class SlackAdapter(BasePlatformAdapter):
         task = asyncio.create_task(self._handler.start_async())
         self._socket_mode_task = task
         self._socket_handler_started_monotonic = time.monotonic()
+        self._socket_unhealthy_since_monotonic = None
         task.add_done_callback(self._on_socket_mode_task_done)
+
+    def _socket_restart_grace_elapsed(self) -> bool:
+        """Return True only after a transport fault survives the grace window.
+
+        A single disconnected/stale observation commonly occurs while
+        slack_sdk is already replacing its websocket.  Waiting for a second,
+        sustained observation lets that native reconnect finish and prevents
+        the watchdog from racing it.  Missing/stopped top-level handler tasks
+        remain immediate restart conditions because no SDK reconnect can
+        recover those states.
+        """
+        now = time.monotonic()
+        if self._socket_unhealthy_since_monotonic is None:
+            self._socket_unhealthy_since_monotonic = now
+            return False
+        return (
+            now - self._socket_unhealthy_since_monotonic
+        ) >= self._socket_reconnect_grace_s
 
     async def _stop_socket_mode_handler(self) -> None:
         """Stop Socket Mode handler and task.
@@ -1318,21 +1373,33 @@ class SlackAdapter(BasePlatformAdapter):
 
                 task = self._socket_mode_task
                 if task is None:
+                    self._socket_unhealthy_since_monotonic = None
                     await self._restart_socket_mode("socket task missing")
                     continue
 
                 if task.done():
+                    self._socket_unhealthy_since_monotonic = None
                     await self._restart_socket_mode("socket task stopped")
                     continue
 
                 connected = await self._socket_transport_connected()
-                if connected is False:
-                    await self._restart_socket_mode("transport disconnected")
-                elif self._socket_ping_pong_stale():
+                stale = self._socket_ping_pong_stale()
+                if connected is False or stale:
+                    if not self._socket_restart_grace_elapsed():
+                        continue
+                    reason = (
+                        "transport disconnected"
+                        if connected is False
+                        else "ping/pong stale"
+                    )
                     # is_connected() can lie when the aiohttp session is closed
                     # but the client keeps retrying; ping/pong staleness catches
                     # that wedged-zombie case that the bool check above misses.
-                    await self._restart_socket_mode("ping/pong stale")
+                    await self._restart_socket_mode(reason)
+                else:
+                    # A native Slack SDK reconnect completed within the grace
+                    # window, so a future fault must start a fresh observation.
+                    self._socket_unhealthy_since_monotonic = None
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - defensive logging
@@ -1528,6 +1595,202 @@ class SlackAdapter(BasePlatformAdapter):
             return self._slash_command_contexts.pop(key, None)
 
         return None
+
+    def _profile_invocation_specs(self) -> Dict[str, Dict[str, Any]]:
+        """Return configured Slack invocation aliases keyed by slash name.
+
+        Configuration lives under ``gateway.slack.profile_invocations`` and is
+        deliberately opt-in. Example::
+
+            profile_invocations:
+              - profile: nami
+                slash: nami
+                aliases: [nami, "나미"]
+                display_name: Nami
+                icon_emoji: ":hermes_nami:"
+        """
+        # Display customization is truthful only when the gateway will also
+        # honor source.profile for runtime/session selection. Fail closed on a
+        # single-profile gateway instead of showing "Nami" while running Luffy.
+        from agent.secret_scope import is_multiplex_active
+
+        if not is_multiplex_active():
+            return {}
+        raw = self.config.extra.get("profile_invocations", [])
+        if not isinstance(raw, list):
+            return {}
+        specs: Dict[str, Dict[str, Any]] = {}
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            profile = str(item.get("profile") or "").strip().lower()
+            slash = str(item.get("slash") or profile).strip().lower().lstrip("/")
+            if not profile or not slash or not re.fullmatch(r"[a-z0-9_-]{1,32}", slash):
+                continue
+            try:
+                from hermes_cli.profiles import profile_exists, validate_profile_name
+
+                validate_profile_name(profile)
+                if not profile_exists(profile):
+                    logger.error(
+                        "[Slack] Profile invocation /%s targets missing profile %s",
+                        slash,
+                        profile,
+                    )
+                    continue
+            except (ImportError, ValueError, OSError):
+                continue
+            aliases = item.get("aliases") or [profile]
+            if isinstance(aliases, str):
+                aliases = [aliases]
+            aliases = [
+                str(alias).strip().casefold()
+                for alias in aliases
+                if str(alias).strip()
+            ]
+            if profile.casefold() not in aliases:
+                aliases.append(profile.casefold())
+            icon = str(item.get("icon_emoji") or "").strip()
+            if icon and not (icon.startswith(":") and icon.endswith(":")):
+                icon = f":{icon.strip(':')}:"
+            specs[slash] = {
+                "profile": profile,
+                "slash": slash,
+                "aliases": aliases,
+                "display_name": str(item.get("display_name") or profile.title())[:80],
+                "icon_emoji": icon,
+            }
+        return specs
+
+    def profile_persona_for_name(self, profile_name: str) -> Optional[Dict[str, Any]]:
+        """Return the configured, validated Slack persona for a profile.
+
+        Outbound delegation transcripts use this public resolver instead of
+        trusting caller-supplied username/icon metadata.  That keeps visual
+        attribution limited to real multiplex profiles in the operator's
+        allowlist.
+        """
+        wanted = str(profile_name or "").strip().lower()
+        if not wanted:
+            return None
+        for spec in self._profile_invocation_specs().values():
+            if str(spec.get("profile") or "").lower() == wanted:
+                return dict(spec)
+        return None
+
+    def _profile_route_store_path(self) -> _Path:
+        captured = getattr(self, "_profile_route_store", None)
+        if captured is not None:
+            return captured
+        configured = str(self.config.extra.get("profile_invocation_store") or "").strip()
+        if configured:
+            return _Path(configured).expanduser()
+        from hermes_constants import get_hermes_home
+
+        return _Path(get_hermes_home()) / "gateway" / "slack-profile-invocations.json"
+
+    def _load_profile_thread_routes(self) -> None:
+        try:
+            payload = json.loads(self._profile_route_store_path().read_text(encoding="utf-8"))
+            routes = payload.get("routes", {}) if isinstance(payload, dict) else {}
+            if isinstance(routes, dict):
+                self._profile_thread_routes = {
+                    str(key): value
+                    for key, value in routes.items()
+                    if isinstance(value, dict) and value.get("profile")
+                }
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning("[Slack] Could not load profile thread routes: %s", exc)
+
+    def _save_profile_thread_routes(self) -> None:
+        path = self._profile_route_store_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(
+                json.dumps({"version": 1, "routes": self._profile_thread_routes}, sort_keys=True),
+                encoding="utf-8",
+            )
+            os.replace(tmp, path)
+        except OSError as exc:
+            logger.warning("[Slack] Could not persist profile thread routes: %s", exc)
+
+    @staticmethod
+    def _profile_thread_key(team_id: str, channel_id: str, thread_ts: str) -> str:
+        return "\x1f".join((str(team_id or ""), str(channel_id), str(thread_ts)))
+
+    def _bind_profile_thread(
+        self, team_id: str, channel_id: str, thread_ts: str, spec: Dict[str, Any]
+    ) -> None:
+        if not thread_ts:
+            return
+        key = self._profile_thread_key(team_id, channel_id, thread_ts)
+        self._profile_thread_routes[key] = {
+            "profile": str(spec["profile"]),
+            "display_name": str(spec.get("display_name") or ""),
+            "icon_emoji": str(spec.get("icon_emoji") or ""),
+        }
+        if len(self._profile_thread_routes) > self._PROFILE_THREAD_ROUTES_MAX:
+            excess = len(self._profile_thread_routes) - self._PROFILE_THREAD_ROUTES_MAX
+            for old_key in list(self._profile_thread_routes)[:excess]:
+                self._profile_thread_routes.pop(old_key, None)
+        self._save_profile_thread_routes()
+
+    def _continued_profile_spec(
+        self, team_id: str, channel_id: str, thread_ts: Optional[str]
+    ) -> Optional[Dict[str, str]]:
+        if not thread_ts:
+            return None
+        stored = self._profile_thread_routes.get(
+            self._profile_thread_key(team_id, channel_id, thread_ts)
+        )
+        if not stored:
+            return None
+        # Configuration is the authority. A stale/tampered route file must not
+        # keep invoking a profile that the operator removed from Slack.
+        configured = {
+            str(spec["profile"]): spec
+            for spec in self._profile_invocation_specs().values()
+        }
+        return configured.get(str(stored.get("profile") or ""))
+
+    def _match_profile_alias(
+        self, text: str
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        stripped = str(text or "").lstrip()
+        folded = stripped.casefold()
+        for spec in self._profile_invocation_specs().values():
+            for alias in sorted(spec["aliases"], key=len, reverse=True):
+                if folded == alias:
+                    return spec, ""
+                if folded.startswith(alias) and len(stripped) > len(alias):
+                    boundary = stripped[len(alias)]
+                    if boundary.isspace() or boundary in ":：,-":
+                        return spec, stripped[len(alias) :].lstrip(" \t:：,-")
+        return None, text
+
+    def _profile_slash_source_allowed(self, source: Any) -> bool:
+        """Apply Slack's user/channel gates before a crew slash dispatch."""
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        auth_fn = getattr(runner, "_is_user_authorized", None)
+        if source.user_id and callable(auth_fn) and not auth_fn(source):
+            logger.warning(
+                "[Slack] Early reject of unauthorized profile slash user %s in channel %s",
+                source.user_id,
+                source.chat_id,
+            )
+            return False
+        if source.chat_type != "dm":
+            allowed_channels = self._slack_allowed_channels()
+            if allowed_channels and source.chat_id not in allowed_channels:
+                logger.info(
+                    "[Slack] Ignoring profile slash in non-allowed channel %s",
+                    source.chat_id,
+                )
+                return False
+        return True
 
     async def _send_slash_ephemeral(
         self,
@@ -2066,6 +2329,8 @@ class SlackAdapter(BasePlatformAdapter):
             import re as _re
 
             _slash_names = [name for name, _d, _h in slack_native_slashes()]
+            _slash_names.extend(self._profile_invocation_specs())
+            _slash_names = list(dict.fromkeys(_slash_names))
             if _slash_names:
                 _slash_pattern = _re.compile(
                     r"^/(?:" + "|".join(_re.escape(n) for n in _slash_names) + r")$"
@@ -2076,10 +2341,16 @@ class SlackAdapter(BasePlatformAdapter):
             @self._app.command(_slash_pattern)
             async def handle_hermes_command(ack, command):
                 slash = (command.get("command") or "").lstrip("/")
-                await ack(
-                    response_type="ephemeral",
-                    text=f"Running `/{slash}`…",
-                )
+                if slash in self._profile_invocation_specs():
+                    # A profile slash produces one public customized response.
+                    # Acknowledge silently so Slack does not leave a stale
+                    # ephemeral "Running" placeholder behind.
+                    await ack()
+                else:
+                    await ack(
+                        response_type="ephemeral",
+                        text=f"Running `/{slash}`…",
+                    )
                 await self._handle_slash_command(command)
 
             # Register Block Kit action handlers for approval buttons
@@ -2447,6 +2718,31 @@ class SlackAdapter(BasePlatformAdapter):
         ignored = self._slack_ignored_channels()
         return "*" in ignored or parent_channel_id in ignored
 
+    async def _process_message_background(
+        self, event: MessageEvent, session_key: str
+    ) -> None:
+        """Restore the Slack persona carried by this queued event.
+
+        Context variables are copied when a task is created, but busy-session
+        follow-ups are drained by a task created from the previous turn.  Read
+        the event's own value here so a profile switch cannot inherit the
+        prior turn's display identity.  An absent value deliberately clears
+        the persona for ordinary slash commands and synthetic events.
+        """
+        persona = event.metadata.get(_PROFILE_PERSONA_METADATA_KEY)
+        persona_token = _profile_persona.set(
+            persona if isinstance(persona, dict) else None
+        )
+        slash_user_id = event.metadata.get(_SLASH_USER_ID_METADATA_KEY)
+        slash_token = _slash_user_id.set(
+            str(slash_user_id) if slash_user_id else None
+        )
+        try:
+            await super()._process_message_background(event, session_key)
+        finally:
+            _slash_user_id.reset(slash_token)
+            _profile_persona.reset(persona_token)
+
     async def send(
         self,
         chat_id: str,
@@ -2470,12 +2766,24 @@ class SlackAdapter(BasePlatformAdapter):
         thread_ts = None
         try:
             team_id = self._metadata_team_id(metadata)
+            persona = _profile_persona.get()
+            metadata_persona = (
+                metadata.get(_PROFILE_PERSONA_METADATA_KEY)
+                if isinstance(metadata, dict)
+                else None
+            )
+            if isinstance(metadata_persona, dict):
+                resolved_persona = self.profile_persona_for_name(
+                    metadata_persona.get("profile")
+                )
+                if resolved_persona is not None:
+                    persona = resolved_persona
             # Check for a pending slash-command context.  When the user ran a
             # native slash command (e.g. /q, /stop, /model), the initial ack
             # already showed an ephemeral "Running /cmd…" message.  If we have
             # a stashed response_url for this channel, replace that ack with
             # the actual command reply ephemerally instead of posting publicly.
-            slash_ctx = self._pop_slash_context(chat_id, team_id)
+            slash_ctx = None if persona else self._pop_slash_context(chat_id, team_id)
             if slash_ctx:
                 ephemeral_result = await self._send_slash_ephemeral(
                     slash_ctx,
@@ -2562,6 +2870,11 @@ class SlackAdapter(BasePlatformAdapter):
                     # Only broadcast the first chunk of the first reply
                     if broadcast and i == 0:
                         kwargs["reply_broadcast"] = True
+                if persona:
+                    if persona.get("display_name"):
+                        kwargs["username"] = persona["display_name"]
+                    if persona.get("icon_emoji"):
+                        kwargs["icon_emoji"] = persona["icon_emoji"]
 
                 try:
                     last_result = await self._get_client(
@@ -2589,6 +2902,13 @@ class SlackAdapter(BasePlatformAdapter):
             # replies without requiring @mention.
             sent_ts = last_result.get("ts") if last_result else None
             if sent_ts:
+                if persona:
+                    self._bind_profile_thread(
+                        team_id,
+                        chat_id,
+                        thread_ts or str(sent_ts),
+                        persona,
+                    )
                 self._bot_message_ts.add(
                     self._workspace_message_marker(team_id, sent_ts)
                 )
@@ -6319,6 +6639,29 @@ class SlackAdapter(BasePlatformAdapter):
             },
         )
 
+        # Resolve explicit ``@App <alias> ...`` invocations only after Slack's
+        # authorization/channel/mention gates above have accepted the event.
+        # A thread binding then keeps later unqualified replies on the same
+        # profile, including after a gateway restart.
+        profile_spec = None
+        continued_profile_spec = self._continued_profile_spec(
+            team_id, channel_id, thread_ts
+        )
+        if not is_command_text and (
+            is_mentioned or is_one_to_one_dm or continued_profile_spec is not None
+        ):
+            profile_spec, routed_text = self._match_profile_alias(msg_event.text)
+            if profile_spec:
+                msg_event.text = routed_text or "/profile"
+        if profile_spec is None:
+            profile_spec = continued_profile_spec
+        if profile_spec:
+            source.profile = str(profile_spec["profile"])
+            if thread_ts:
+                self._bind_profile_thread(team_id, channel_id, thread_ts, profile_spec)
+        msg_event.metadata[_PROFILE_PERSONA_METADATA_KEY] = profile_spec
+        msg_event.metadata[_SLASH_USER_ID_METADATA_KEY] = None
+
         # Only react when bot is directly addressed (1:1 DM or @mention).
         # MPIMs are shared surfaces: reacting to every group-DM message (even
         # when unmentioned) is visible noise to the whole group, so they must
@@ -6362,7 +6705,11 @@ class SlackAdapter(BasePlatformAdapter):
                 )[-self._PROCESSED_MESSAGE_TS_MAX :]
                 self._processed_message_ts = dict(newest_items)
 
-        await self.handle_message(msg_event)
+        _profile_token = _profile_persona.set(profile_spec)
+        try:
+            await self.handle_message(msg_event)
+        finally:
+            _profile_persona.reset(_profile_token)
 
     # ----- Approval button support (Block Kit) -----
 
@@ -6460,11 +6807,18 @@ class SlackAdapter(BasePlatformAdapter):
             msg_ts = result.get("ts", "")
             if msg_ts:
                 team_id = self._metadata_team_id(metadata)
-                self._approval_resolved[
-                    self._workspace_message_marker(team_id, msg_ts)
-                ] = False
+                approval_marker = self._workspace_message_marker(team_id, msg_ts)
+                self._approval_resolved[approval_marker] = False
+                requester_user_id = str(
+                    (metadata or {}).get("slack_requester_user_id") or ""
+                ).strip()
+                if requester_user_id:
+                    self._approval_requesters[approval_marker] = requester_user_id
                 self._trim_oldest_dict_entries(
                     self._approval_resolved, self._APPROVAL_RESOLVED_MAX
+                )
+                self._trim_oldest_dict_entries(
+                    self._approval_requesters, self._APPROVAL_RESOLVED_MAX
                 )
 
             return SendResult(success=True, message_id=msg_ts, raw_response=result)
@@ -6643,14 +6997,26 @@ class SlackAdapter(BasePlatformAdapter):
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
 
-            result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+            team_id = self._metadata_team_id(metadata)
+            result = await self._get_client(
+                chat_id, team_id=team_id
+            ).chat_postMessage(**kwargs)
             msg_ts = result.get("ts", "")
             if msg_ts:
                 # Mark unresolved so the action handler's atomic-pop guard can
                 # reject double-clicks (mirrors _approval_resolved).
-                self._clarify_resolved[msg_ts] = False
+                clarify_marker = self._workspace_message_marker(team_id, msg_ts)
+                self._clarify_resolved[clarify_marker] = False
+                requester_user_id = str(
+                    (metadata or {}).get("slack_requester_user_id") or ""
+                ).strip()
+                if requester_user_id:
+                    self._clarify_requesters[clarify_marker] = requester_user_id
                 self._trim_oldest_dict_entries(
                     self._clarify_resolved, self._CLARIFY_RESOLVED_MAX
+                )
+                self._trim_oldest_dict_entries(
+                    self._clarify_requesters, self._CLARIFY_RESOLVED_MAX
                 )
 
             return SendResult(success=True, message_id=msg_ts, raw_response=result)
@@ -6879,11 +7245,17 @@ class SlackAdapter(BasePlatformAdapter):
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
 
-        if not self._is_interactive_user_authorized(
-            user_id,
-            channel_id=channel_id,
-            user_name=user_name,
-            team_id=team_id,
+        approval_key = self._workspace_message_marker(team_id, msg_ts)
+        # Older or metadata-poor send paths key prompts by timestamp only.
+        # Select that key before requester authorization so the initiating
+        # user receives the same least-privilege exception in both cases.
+        if msg_ts in self._approval_resolved:
+            approval_key = msg_ts
+        expected_requester = self._approval_requesters.get(approval_key)
+        requester_matches = bool(expected_requester and user_id == expected_requester)
+
+        if not requester_matches and not self._is_interactive_user_authorized(
+            user_id, channel_id=channel_id, user_name=user_name, team_id=team_id
         ):
             logger.warning(
                 "[Slack] Unauthorized approval click by %s (%s) - ignoring",
@@ -6919,11 +7291,9 @@ class SlackAdapter(BasePlatformAdapter):
         # may have been stored without a team id (metadata-poor send path)
         # while the click event carries one, and that mismatch must not
         # swallow a legitimate first click.
-        approval_key = self._workspace_message_marker(team_id, msg_ts)
-        if msg_ts in self._approval_resolved:
-            approval_key = msg_ts
         if self._approval_resolved.pop(approval_key, True):
             return
+        self._approval_requesters.pop(approval_key, None)
 
         # Resolve the approval FIRST — this unblocks the agent thread. Render
         # after, so a click that lands past the approval timeout (count == 0)
@@ -7036,13 +7406,18 @@ class SlackAdapter(BasePlatformAdapter):
         message = body.get("message", {})
         msg_ts = message.get("ts", "")
         channel_id = body.get("channel", {}).get("id", "")
+        team_id = self._event_team_id({}, body)
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
 
-        if not self._is_interactive_user_authorized(
-            user_id,
-            channel_id=channel_id,
-            user_name=user_name,
+        clarify_key = self._workspace_message_marker(team_id, msg_ts)
+        if msg_ts in self._clarify_resolved:
+            clarify_key = msg_ts
+        expected_requester = self._clarify_requesters.get(clarify_key)
+        requester_matches = bool(expected_requester and user_id == expected_requester)
+
+        if not requester_matches and not self._is_interactive_user_authorized(
+            user_id, channel_id=channel_id, user_name=user_name, team_id=team_id
         ):
             logger.warning(
                 "[Slack] Unauthorized clarify click by %s (%s) - ignoring",
@@ -7058,8 +7433,9 @@ class SlackAdapter(BasePlatformAdapter):
 
         # Double-click guard — atomic pop; first caller gets False (proceed),
         # any later click gets the True default and bails (mirrors approval).
-        if self._clarify_resolved.pop(msg_ts, True):
+        if self._clarify_resolved.pop(clarify_key, True):
             return
+        self._clarify_requesters.pop(clarify_key, None)
 
         # Preserve the original question so the resolved message keeps context.
         original_text = ""
@@ -7669,12 +8045,37 @@ class SlackAdapter(BasePlatformAdapter):
         user_id = command.get("user_id", "")
         channel_id = command.get("channel_id", "")
         team_id = command.get("team_id", "")
+        profile_spec = self._profile_invocation_specs().get(slash_name)
+        profile_routed_text = None
+        if profile_spec is None and slash_name in {"hermes", ""}:
+            # Slack caps apps at 25 slash commands.  Long-lived Hermes apps
+            # may already be at that limit, so keep the single-entry-point
+            # form useful as a no-slot fallback: ``/hermes nami ...``.
+            profile_spec, profile_routed_text = self._match_profile_alias(raw_text)
+
+        # Crew slashes must obey the same hard channel kill switch as normal
+        # Slack messages. Stop before stamping source.profile or invoking the
+        # gateway so an ignored channel cannot consume another profile's turn.
+        if profile_spec and self._is_ignored_channel(channel_id):
+            logger.info(
+                "[Slack] Ignoring profile slash /%s in ignored channel %s",
+                slash_name,
+                channel_id,
+            )
+            return
 
         # Track which workspace owns this channel
         if team_id and channel_id:
             self._remember_channel_team(channel_id, team_id)
 
-        if slash_name in {"hermes", ""}:
+        if profile_spec:
+            # Crew/profile slashes are prompts, not gateway control commands.
+            # Their reply is public and uses the selected profile's display
+            # identity; ordinary native slashes keep the existing ephemeral
+            # response path.
+            routed = raw_text if profile_routed_text is None else profile_routed_text
+            text = routed.strip() or "/profile"
+        elif slash_name in {"hermes", ""}:
             # Legacy /hermes <subcommand> [args] routing + free-form questions.
             # Empty slash_name falls into this branch for backward compat
             # with any caller that didn't populate command["command"].
@@ -7749,6 +8150,12 @@ class SlackAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             scope_id=team_id or None,
         )
+        if profile_spec:
+            if not self._profile_slash_source_allowed(source):
+                return
+            source.profile = str(profile_spec["profile"])
+            if thread_id:
+                self._bind_profile_thread(team_id, channel_id, thread_id, profile_spec)
 
         event = MessageEvent(
             text=text,
@@ -7757,6 +8164,10 @@ class SlackAdapter(BasePlatformAdapter):
             ),
             source=source,
             raw_message=command,
+            metadata={
+                _PROFILE_PERSONA_METADATA_KEY: profile_spec,
+                _SLASH_USER_ID_METADATA_KEY: user_id or None,
+            },
         )
 
         # Stash the Slack response_url so the first reply for this
@@ -7766,7 +8177,13 @@ class SlackAdapter(BasePlatformAdapter):
         # questions via "/hermes <question>" must produce public replies so
         # the whole channel can see the agent's answer.
         response_url = command.get("response_url", "")
-        if response_url and user_id and channel_id and text.startswith("/"):
+        if (
+            not profile_spec
+            and response_url
+            and user_id
+            and channel_id
+            and text.startswith("/")
+        ):
             context_key = (
                 (str(team_id), str(channel_id), str(user_id))
                 if team_id
@@ -7804,9 +8221,11 @@ class SlackAdapter(BasePlatformAdapter):
         # Set the ContextVar so send() can match the correct stashed
         # response_url even when multiple users slash concurrently.
         _slash_user_id_token = _slash_user_id.set(user_id or None)
+        _profile_token = _profile_persona.set(profile_spec)
         try:
             await self.handle_message(event)
         finally:
+            _profile_persona.reset(_profile_token)
             _slash_user_id.reset(_slash_user_id_token)
 
     def _build_thread_session_key(
@@ -8990,14 +9409,11 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
     legacy ``slack_cfg`` block that used to live in
     ``gateway/config.py::load_gateway_config()`` before this migration.
 
-    The SlackAdapter reads its runtime configuration via ``os.getenv()``
-    throughout the connect / handle code paths, so rather than rewrite those
-    call sites to read from ``PlatformConfig.extra``, this hook keeps the
-    existing env-driven model and owns the YAML→env translation here, next to
-    the adapter that consumes it. Env vars take precedence over YAML — every
-    assignment is guarded by ``not os.getenv(...)`` so explicit env vars
-    survive a config.yaml update. Returns ``None`` because no extras are
-    seeded into ``PlatformConfig.extra`` directly (everything flows through env).
+    Most SlackAdapter settings are env-driven. Profile invocation metadata is
+    intentionally different: it is structured, non-secret configuration read
+    from ``PlatformConfig.extra`` at dispatch time. Preserve those keys when
+    the Slack block lives under ``gateway.platforms.slack`` so live YAML loads
+    match adapters constructed directly in tests.
     """
     if "require_mention" in slack_cfg and not os.getenv("SLACK_REQUIRE_MENTION"):
         os.environ["SLACK_REQUIRE_MENTION"] = str(slack_cfg["require_mention"]).lower()
@@ -9049,7 +9465,11 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         if isinstance(ic, list):
             ic = ",".join(str(v) for v in ic)
         os.environ["SLACK_IGNORED_CHANNELS"] = str(ic)
-    return None  # all settings flow through env; nothing to merge into extras
+    extras = {}
+    for key in ("profile_invocations", "profile_invocation_store"):
+        if key in slack_cfg:
+            extras[key] = slack_cfg[key]
+    return extras or None
 
 
 def _is_connected(config) -> bool:

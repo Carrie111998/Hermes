@@ -122,6 +122,21 @@ class TestSlackExecApproval:
             assert e["value"] == "agent:main:slack:group:C1:1111"
 
     @pytest.mark.asyncio
+    async def test_binds_prompt_to_authorized_requester(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+
+        await adapter.send_exec_approval(
+            chat_id="C1",
+            command="ps -p 123 -o pid=,command=",
+            session_key="session-key",
+            metadata={"slack_team_id": "T1", "slack_requester_user_id": "U_OWNER"},
+        )
+
+        assert adapter._approval_requesters[("T1", "1234.5678")] == "U_OWNER"
+
+    @pytest.mark.asyncio
     async def test_smart_deny_owner_override_hides_persistent_buttons(self):
         adapter = _make_adapter()
         mock_client = adapter._team_clients["T1"]
@@ -204,6 +219,145 @@ class TestSlackApprovalAction:
 
         ack.assert_called_once()
         mock_resolve.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_original_requester_can_click_without_profile_stamp(self):
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter, auth_fn=lambda _source: False)
+        marker = ("T1", "1234.5678")
+        adapter._approval_resolved[marker] = False
+        adapter._approval_requesters[marker] = "U_OWNER"
+
+        ack = AsyncMock()
+        body = {
+            "team": {"id": "T1"},
+            "message": {"ts": "1234.5678", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": "owner", "id": "U_OWNER"},
+        }
+        action = {"action_id": "hermes_approve_once", "value": "session-key"}
+        adapter._team_clients["T1"].chat_update = AsyncMock()
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
+            await adapter._handle_approval_action(ack, body, action)
+
+        resolve.assert_called_once_with("session-key", "once")
+        assert marker not in adapter._approval_requesters
+
+    @pytest.mark.asyncio
+    async def test_different_user_cannot_use_requester_bound_button(self):
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter, auth_fn=lambda _source: False)
+        marker = ("T1", "1234.5678")
+        adapter._approval_resolved[marker] = False
+        adapter._approval_requesters[marker] = "U_OWNER"
+
+        ack = AsyncMock()
+        body = {
+            "team": {"id": "T1"},
+            "message": {"ts": "1234.5678", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": "mallory", "id": "U_ATTACKER"},
+        }
+        action = {"action_id": "hermes_approve_once", "value": "session-key"}
+
+        with patch("tools.approval.resolve_gateway_approval") as resolve:
+            await adapter._handle_approval_action(ack, body, action)
+
+        resolve.assert_not_called()
+        assert adapter._approval_requesters[marker] == "U_OWNER"
+
+    @pytest.mark.asyncio
+    async def test_requester_binding_supports_metadata_poor_prompt_key(self):
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter, auth_fn=lambda _source: False)
+        adapter._approval_resolved["1234.5678"] = False
+        adapter._approval_requesters["1234.5678"] = "U_OWNER"
+
+        ack = AsyncMock()
+        body = {
+            "team": {"id": "T1"},
+            "message": {"ts": "1234.5678", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": "owner", "id": "U_OWNER"},
+        }
+        action = {"action_id": "hermes_approve_once", "value": "session-key"}
+        adapter._team_clients["T1"].chat_update = AsyncMock()
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
+            await adapter._handle_approval_action(ack, body, action)
+
+        resolve.assert_called_once_with("session-key", "once")
+        assert "1234.5678" not in adapter._approval_requesters
+
+
+class TestSlackClarifyAction:
+    @pytest.mark.asyncio
+    async def test_binds_prompt_to_authorized_requester(self):
+        adapter = _make_adapter()
+        adapter._team_clients["T1"].chat_postMessage = AsyncMock(
+            return_value={"ts": "1234.5678"}
+        )
+
+        await adapter.send_clarify(
+            chat_id="C1",
+            question="Proceed?",
+            choices=["Yes", "No"],
+            clarify_id="clarify-1",
+            session_key="session-key",
+            metadata={"slack_team_id": "T1", "slack_requester_user_id": "U_OWNER"},
+        )
+
+        marker = ("T1", "1234.5678")
+        assert adapter._clarify_resolved[marker] is False
+        assert adapter._clarify_requesters[marker] == "U_OWNER"
+
+    @pytest.mark.asyncio
+    async def test_original_requester_can_answer_without_profile_stamp(self):
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter, auth_fn=lambda _source: False)
+        marker = ("T1", "1234.5678")
+        adapter._clarify_resolved[marker] = False
+        adapter._clarify_requesters[marker] = "U_OWNER"
+        adapter._team_clients["T1"].chat_update = AsyncMock()
+
+        ack = AsyncMock()
+        body = {
+            "team": {"id": "T1"},
+            "message": {"ts": "1234.5678", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": "owner", "id": "U_OWNER"},
+        }
+        action = {"action_id": "hermes_clarify_choice_0", "value": "clarify-1|0"}
+
+        with patch("tools.clarify_gateway.resolve_gateway_clarify", return_value=True) as resolve:
+            await adapter._handle_clarify_action(ack, body, action)
+
+        resolve.assert_called_once_with("clarify-1", "choice 1")
+        assert marker not in adapter._clarify_requesters
+
+    @pytest.mark.asyncio
+    async def test_different_user_cannot_answer_requester_bound_prompt(self):
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter, auth_fn=lambda _source: False)
+        marker = ("T1", "1234.5678")
+        adapter._clarify_resolved[marker] = False
+        adapter._clarify_requesters[marker] = "U_OWNER"
+
+        ack = AsyncMock()
+        body = {
+            "team": {"id": "T1"},
+            "message": {"ts": "1234.5678", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": "mallory", "id": "U_ATTACKER"},
+        }
+        action = {"action_id": "hermes_clarify_choice_0", "value": "clarify-1|0"}
+
+        with patch("tools.clarify_gateway.resolve_gateway_clarify") as resolve:
+            await adapter._handle_clarify_action(ack, body, action)
+
+        resolve.assert_not_called()
+        assert adapter._clarify_requesters[marker] == "U_OWNER"
 
 
 class TestSlackInteractiveAuth:
@@ -840,4 +994,3 @@ class TestSlackReactionAuthorizationGate:
         assert "U_RANDO" in runner.auth_checked
         assert runner.handled == []
         adapter.handle_message.assert_not_called()
-

@@ -905,6 +905,8 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    profile_name: Optional[str] = None,
+    profile_soul: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -919,6 +921,15 @@ def _build_child_system_prompt(
         "",
         f"YOUR TASK:\n{goal}",
     ]
+    if profile_name:
+        parts.insert(
+            1,
+            "\nSPECIALIST PROFILE:\n"
+            f"You are acting as the configured Hermes profile '{profile_name}'. "
+            "Keep that profile's identity and remit while completing only the delegated task.",
+        )
+    if profile_soul:
+        parts.insert(2, f"\nPROFILE IDENTITY:\n{profile_soul}")
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
     if workspace_path and str(workspace_path).strip():
@@ -973,6 +984,36 @@ def _build_child_system_prompt(
             f"is capped at max_spawn_depth={max_spawn_depth}. {child_note}"
         )
     return "\n".join(parts)
+
+
+def _resolve_delegated_profile(profile: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Validate a model-selected specialist profile and load its SOUL only.
+
+    Delegation remains a fresh, isolated child session.  Loading the target
+    profile's SOUL gives the child the durable specialist identity without
+    importing that profile's credentials, memory, or mutable runtime state.
+    """
+    if profile is None or not str(profile).strip():
+        return None, None
+    from hermes_cli.profiles import (
+        get_profile_dir,
+        normalize_profile_name,
+        profile_exists,
+        validate_profile_name,
+    )
+
+    canonical = normalize_profile_name(str(profile))
+    validate_profile_name(canonical)
+    if canonical == "default" or not profile_exists(canonical):
+        raise ValueError(f"Unknown delegated profile: {canonical}")
+    soul_path = get_profile_dir(canonical) / "SOUL.md"
+    try:
+        soul = soul_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        soul = ""
+    except OSError as exc:
+        raise ValueError(f"Could not read delegated profile {canonical}") from exc
+    return canonical, soul or None
 
 
 def _resolve_workspace_hint(parent_agent) -> Optional[str]:
@@ -1074,6 +1115,7 @@ def _build_child_progress_callback(
     model: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
     session_ref: Optional[Dict[str, Any]] = None,
+    profile_name: Optional[str] = None,
 ) -> Optional[callable]:
     """Build a callback that relays child agent tool calls to the parent display.
 
@@ -1121,6 +1163,8 @@ def _build_child_progress_callback(
             kw["model"] = model
         if toolsets is not None:
             kw["toolsets"] = list(toolsets)
+        if profile_name is not None:
+            kw["profile_name"] = profile_name
         # The child's own session id — filled into the shared ref once the
         # child agent exists (the callback is built first), so every relayed
         # event lets UIs open/inspect the subagent's session directly.
@@ -1325,6 +1369,8 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    profile_name: Optional[str] = None,
+    profile_soul: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1434,6 +1480,8 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        profile_name=profile_name,
+        profile_soul=profile_soul,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1458,6 +1506,7 @@ def _build_child_agent(
         model=effective_model_for_cb,
         toolsets=child_toolsets,
         session_ref=child_session_ref,
+        profile_name=profile_name,
     )
 
     # Each subagent gets its own iteration budget capped at max_iterations
@@ -1669,6 +1718,7 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    child._delegated_profile = profile_name
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
@@ -3137,6 +3187,7 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    profile: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -3235,7 +3286,12 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
+        single_task: Dict[str, Any] = {
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "profile": profile,
+        }
         if output_schema is not None:
             single_task["output_schema"] = output_schema
         task_list = [single_task]
@@ -3246,6 +3302,7 @@ def delegate_task(
         return tool_error("No tasks provided.")
 
     # Validate each task has a goal
+    resolved_task_profiles: List[tuple[Optional[str], Optional[str]]] = []
     for i, task in enumerate(task_list):
         if not isinstance(task, dict):
             return tool_error(
@@ -3253,6 +3310,11 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+        try:
+            resolved_profile, profile_soul = _resolve_delegated_profile(task.get("profile"))
+        except ValueError as exc:
+            return tool_error(str(exc))
+        resolved_task_profiles.append((resolved_profile, profile_soul))
 
     # Batch-only quality gate: catch malformed fan-outs (placeholder goals,
     # unexpanded multi-word template markers, 1-task batches) before any
@@ -3331,6 +3393,7 @@ def delegate_task(
     # subagent-lifecycle API).
     children = []
     for i, t in enumerate(task_list):
+        resolved_profile, profile_soul = resolved_task_profiles[i]
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
@@ -3362,6 +3425,8 @@ def delegate_task(
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
             role=effective_role,
+            profile_name=resolved_profile,
+            profile_soul=profile_soul,
         )
         # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.
@@ -4254,6 +4319,15 @@ DELEGATE_TASK_SCHEMA = {
                                 "require only fields you will actually read."
                             ),
                         },
+                        "profile": {
+                            "type": "string",
+                            "description": (
+                                "Existing Hermes specialist profile whose SOUL identity should be "
+                                "used and whose configured Slack persona should label the visible "
+                                "delegation transcript. The child remains an isolated delegated "
+                                "session and does not inherit that profile's credentials or memory."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -4273,6 +4347,14 @@ DELEGATE_TASK_SCHEMA = {
                     "Optional JSON Schema for the single-goal form — the "
                     "subagent's final answer must validate against it "
                     "(same semantics as tasks[].output_schema)."
+                ),
+            },
+            "profile": {
+                "type": "string",
+                "description": (
+                    "Existing Hermes specialist profile for this single delegated task. "
+                    "Uses its SOUL identity and Slack persona while keeping credentials and "
+                    "memory isolated."
                 ),
             },
             "background": {
@@ -4346,6 +4428,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        profile=args.get("profile"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
         parent_agent=kw.get("parent_agent"),

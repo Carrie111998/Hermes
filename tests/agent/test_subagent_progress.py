@@ -14,7 +14,7 @@ import pytest
 from unittest.mock import MagicMock
 
 from agent.display import KawaiiSpinner
-from tools.delegate_tool import _build_child_progress_callback
+from tools.delegate_tool import _build_child_progress_callback, _build_child_system_prompt
 
 
 # =========================================================================
@@ -99,6 +99,31 @@ class TestBuildChildProgressCallback:
         summary_text = summary_call.kwargs.get("preview") or summary_call.args[2]
         assert "tool_0" in summary_text
         assert "tool_4" in summary_text
+
+    def test_profile_identity_is_relayed_on_every_child_event(self):
+        parent = MagicMock()
+        parent._delegate_spinner = None
+        parent.tool_progress_callback = MagicMock()
+
+        cb = _build_child_progress_callback(
+            0, "check numbers", parent, profile_name="nami"
+        )
+        cb("subagent.start", preview="check numbers")
+        cb("subagent.text", preview="answer")
+        cb("subagent.complete", status="completed", summary="answer")
+
+        assert [call.kwargs["profile_name"] for call in parent.tool_progress_callback.call_args_list] == [
+            "nami", "nami", "nami"
+        ]
+
+    def test_profile_soul_is_in_child_prompt(self):
+        prompt = _build_child_system_prompt(
+            "check numbers",
+            profile_name="nami",
+            profile_soul="You are the finance specialist.",
+        )
+        assert "configured Hermes profile 'nami'" in prompt
+        assert "You are the finance specialist." in prompt
 
 
     def test_parallel_callbacks_independent(self):
@@ -265,4 +290,3 @@ class TestBatchFlush:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
