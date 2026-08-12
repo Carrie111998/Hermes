@@ -148,7 +148,9 @@ const renderRow = (session: SessionInfo) =>
       onDelete={noop}
       onPin={noop}
       onResume={noop}
+      onToggleUnread={noop}
       session={session}
+      unread={false}
     />
   )
 
@@ -192,7 +194,9 @@ describe('SidebarSessionRow running arc', () => {
             onDelete={noop}
             onPin={noop}
             onResume={noop}
+            onToggleUnread={noop}
             session={session}
+            unread={false}
           />
         ))}
       </>
@@ -218,7 +222,9 @@ describe('SidebarSessionRow', () => {
         onDelete={noop}
         onPin={noop}
         onResume={noop}
+        onToggleUnread={noop}
         session={makeSession({ title: 'Hermes doctor health check results' })}
+        unread={false}
       />
     )
 
@@ -306,7 +312,9 @@ describe('SidebarSessionRow', () => {
         onDelete={noop}
         onPin={noop}
         onResume={noop}
+        onToggleUnread={noop}
         session={makeSession({ title: 'Local session' })}
+        unread={false}
       />
     )
 
@@ -322,11 +330,13 @@ describe('SidebarSessionRow', () => {
         onDelete={noop}
         onPin={noop}
         onResume={noop}
+        onToggleUnread={noop}
         session={makeSession({
           handoff_platform: 'telegram',
           handoff_state: 'active',
           title: 'Continued from Telegram'
         })}
+        unread={false}
       />
     )
 
