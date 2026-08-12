@@ -915,6 +915,24 @@ def contacts_create(args):
     }, indent=2))
 
 
+def contacts_delete(args):
+    resource_name = args.resource_name
+    if not resource_name.startswith("people/"):
+        resource_name = f"people/{resource_name}"
+
+    if _gws_binary():
+        _run_gws(
+            ["people", "people", "deleteContact"],
+            params={"resourceName": resource_name},
+        )
+        print(json.dumps({"status": "deleted", "resourceName": resource_name}, indent=2))
+        return
+
+    service = build_service("people", "v1")
+    service.people().deleteContact(resourceName=resource_name).execute()
+    print(json.dumps({"status": "deleted", "resourceName": resource_name}, indent=2))
+
+
 # =========================================================================
 # Sheets
 # =========================================================================
@@ -1268,6 +1286,10 @@ def main():
     p.add_argument("--email", default="")
     p.add_argument("--phone", default="")
     p.set_defaults(func=contacts_create)
+
+    p = con_sub.add_parser("delete")
+    p.add_argument("resource_name", help="Contact resourceName, e.g. 'people/c123' (the 'people/' prefix is optional)")
+    p.set_defaults(func=contacts_delete)
 
     # --- Sheets ---
     sh = sub.add_parser("sheets")

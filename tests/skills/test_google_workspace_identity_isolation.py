@@ -117,10 +117,13 @@ class TestStructuralIsolation:
         assert "https://www.googleapis.com/auth/gmail.modify" not in zee_scopes
         assert "https://www.googleapis.com/auth/gmail.readonly" in zee_scopes
         assert "https://www.googleapis.com/auth/gmail.compose" in zee_scopes
-        # Contacts: full read/write for Zee, read-only for JID.
+        # Contacts: full read/write for both identities (JID upgraded from
+        # contacts.readonly after Zee's PR #16 shipped) — each identity's own
+        # scope, resolved independently, never shared state between them.
         assert "https://www.googleapis.com/auth/contacts" in zee_scopes
         assert "https://www.googleapis.com/auth/contacts.readonly" not in zee_scopes
-        assert "https://www.googleapis.com/auth/contacts.readonly" in jid_scopes
+        assert "https://www.googleapis.com/auth/contacts" in jid_scopes
+        assert "https://www.googleapis.com/auth/contacts.readonly" not in jid_scopes
 
     def test_simulated_jid_turn_only_touches_jid_credential_file(self, api_module, tmp_path):
         """Write a sentinel token for jid, resolve as jid, confirm only jid's
