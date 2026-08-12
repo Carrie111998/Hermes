@@ -1157,6 +1157,44 @@ def _emit_post_tool_call_hook(
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
+def _validate_tool_args_against_schema(name: str, args: Any) -> Optional[str]:
+    """Reject a tool call missing schema-``required`` arguments (fail-open).
+
+    Only *key absence* of ``parameters.required`` fields counts as invalid —
+    the same contract as ``tools.tool_search.validate_deferred_call_args``.
+    No type/null checking: ``coerce_tool_args`` already repairs types
+    downstream. Returns a JSON error string when a required arg is missing,
+    ``None`` when the call should dispatch. Never blocks a legitimate call on
+    a validator bug.
+    """
+    if not isinstance(args, dict):
+        return None
+    try:
+        from tools.registry import registry as _registry
+
+        schema = _registry.get_schema(name)
+        if not isinstance(schema, dict):
+            return None
+        params = schema.get("parameters")
+        if not isinstance(params, dict):
+            return None
+        required = params.get("required")
+        if not isinstance(required, list) or not required:
+            return None
+        missing = [r for r in required if isinstance(r, str) and r not in args]
+        if not missing:
+            return None
+        return tool_error(
+            f"tool_call to '{name}' is missing required argument(s): "
+            f"{', '.join(missing)}. The tool was NOT invoked.",
+            effect_disposition="not_started",
+            retryable=True,
+        )
+    except Exception:  # pragma: no cover — never block dispatch on validator bugs
+        logger.debug("schema validation for %s failed (fail-open)", name, exc_info=True)
+        return None
+
+
 def handle_function_call(
     function_name: str,
     function_args: Dict[str, Any],
@@ -1337,6 +1375,13 @@ def handle_function_call(
     try:
         if function_name in _AGENT_LOOP_TOOLS:
             return tool_error(f"{function_name} must be handled by the agent loop")
+
+        # Validate the (coerced + middleware-transformed) args against the
+        # tool's schema before any authorization or side effect (TL-01). A
+        # tool with required fields used to execute with {}.
+        _schema_err = _validate_tool_args_against_schema(function_name, function_args)
+        if _schema_err is not None:
+            return _schema_err
 
         # Check plugin hooks for a block/approve directive (unless caller
         # already checked — e.g. run_agent._invoke_tool passes skip=True to

@@ -97,8 +97,14 @@ class TestHandleFunctionCallIntegration:
         target = all_tools[0]
         original = _registry._tools[target].handler
         _registry._tools[target].handler = boom
+        # Satisfy the schema's required fields (if any) so the call reaches the
+        # handler instead of being rejected pre-dispatch by schema validation.
+        schema = _registry.get_schema(target)
+        params = (schema or {}).get("parameters") or {}
+        required = params.get("required") or []
+        args = {r: "" for r in required}
         try:
-            result_str = handle_function_call(target, {})
+            result_str = handle_function_call(target, args)
         finally:
             _registry._tools[target].handler = original
 

@@ -25,6 +25,58 @@ class TestHandleFunctionCall:
             assert "error" in result
             assert "agent loop" in result["error"].lower()
 
+    def test_missing_required_arg_is_rejected_before_dispatch(self, monkeypatch):
+        """A tool call missing a schema-required argument must not execute."""
+        from tools.registry import registry as _reg
+
+        _reg.register(
+            name="_tl01_required_tool",
+            toolset="test",
+            schema={
+                "name": "_tl01_required_tool",
+                "description": "d",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"x": {"type": "string"}},
+                    "required": ["x"],
+                },
+            },
+            handler=lambda **kw: "RAN",
+        )
+        dispatched = []
+        monkeypatch.setattr(
+            _reg, "dispatch", lambda name, args, **kw: dispatched.append(name) or "RAN"
+        )
+        try:
+            out = json.loads(
+                handle_function_call(
+                    "_tl01_required_tool",
+                    {},
+                    task_id="t",
+                    session_id="s",
+                    tool_call_id="c",
+                    skip_pre_tool_call_hook=True,
+                )
+            )
+            assert dispatched == []  # never dispatched
+            assert "NOT invoked" in out["error"]
+            assert "x" in out["error"]
+            assert out["effect_disposition"] == "not_started"
+
+            # A valid call still dispatches.
+            ok = handle_function_call(
+                "_tl01_required_tool",
+                {"x": "hi"},
+                task_id="t",
+                session_id="s",
+                tool_call_id="c",
+                skip_pre_tool_call_hook=True,
+            )
+            assert ok == "RAN"
+            assert dispatched == ["_tl01_required_tool"]
+        finally:
+            _reg.deregister("_tl01_required_tool")
+
     def test_unknown_tool_returns_error(self):
         result = json.loads(handle_function_call("totally_fake_tool_xyz", {}))
         assert "error" in result
@@ -43,7 +95,7 @@ class TestHandleFunctionCall:
             patch("hermes_cli.plugins.has_hook", return_value=True),
             patch("hermes_cli.plugins.invoke_hook") as mock_invoke_hook,
         ):
-            handle_function_call("web_search", {"q": "test"}, task_id="t1")
+            handle_function_call("web_search", {"query": "test"}, task_id="t1")
 
         kwargs_by_hook = {
             c.args[0]: c.kwargs for c in mock_invoke_hook.call_args_list
@@ -90,7 +142,7 @@ class TestHandleFunctionCall:
             patch("hermes_cli.plugins.has_hook", return_value=False),
             patch("hermes_cli.plugins.invoke_hook") as mock_invoke_hook,
         ):
-            result = handle_function_call("web_search", {"q": "test"}, task_id="t1")
+            result = handle_function_call("web_search", {"query": "test"}, task_id="t1")
 
         assert result == '{"ok":true}'
         fired = {c.args[0] for c in mock_invoke_hook.call_args_list}
@@ -135,16 +187,16 @@ class TestHandleFunctionCall:
         result = json.loads(
             handle_function_call(
                 "web_search",
-                {"q": "test"},
+                {"query": "test"},
                 task_id="task-1",
                 tool_call_id="tool-1",
                 session_id="session-1",
             )
         )
 
-        assert seen["execution_args"] == {"q": "test", "rewritten": True}
-        assert seen["dispatch"][1] == {"q": "test", "rewritten": True, "wrapped": True}
-        assert result["args"] == {"q": "test", "rewritten": True, "wrapped": True}
+        assert seen["execution_args"] == {"query": "test", "rewritten": True}
+        assert seen["dispatch"][1] == {"query": "test", "rewritten": True, "wrapped": True}
+        assert result["args"] == {"query": "test", "rewritten": True, "wrapped": True}
         expected_trace = [{"source": "test-middleware", "reason": "rewrite"}]
         pre_call = next(call for call in hook_calls if call[0] == "pre_tool_call")
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
@@ -170,7 +222,7 @@ class TestHandleFunctionCall:
         result = json.loads(
             handle_function_call(
                 "web_search",
-                {"q": "test"},
+                {"query": "test"},
                 task_id="task-1",
                 session_id="session-1",
                 tool_call_id="tool-1",
@@ -288,7 +340,7 @@ class TestPreToolCallBlocking:
         monkeypatch.setattr("tools.file_tools.notify_other_tool_call",
                             lambda task_id: notifications.append(task_id))
 
-        result = json.loads(handle_function_call("web_search", {"q": "test"}, task_id="t1"))
+        result = json.loads(handle_function_call("web_search", {"query": "test"}, task_id="t1"))
         assert result == {"error": "Blocked"}
         assert notifications == []
 
