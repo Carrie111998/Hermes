@@ -12,9 +12,11 @@ Config keys this provider responds to::
       extract_backend: "exa"     # explicit per-capability
       backend: "exa"             # shared fallback for both
 
-Env var::
+Env vars::
 
     EXA_API_KEY=...    # https://exa.ai (paid tier; free trial available)
+    EXA_BASE_URL=...   # optional override of https://api.exa.ai
+                       # (self-hosted Exa-compatible endpoint or proxy)
 
 The previous in-tree implementation lived at
 ``tools.web_tools._exa_search`` / ``_exa_extract``; this file is the
@@ -60,6 +62,12 @@ def _get_exa_client() -> Any:
             "Get your API key at https://exa.ai"
         )
 
+    # Optional override of the Exa API base URL (e.g. a self-hosted Exa-compatible
+    # endpoint or a corporate proxy). Mirrors the TAVILY_BASE_URL convention used
+    # by the Tavily provider. Falls back to the SDK default (https://api.exa.ai)
+    # when unset.
+    base_url = get_provider_env("EXA_BASE_URL") or None
+
     try:
         from tools.lazy_deps import ensure as _lazy_ensure
 
@@ -71,7 +79,7 @@ def _get_exa_client() -> Any:
 
     from exa_py import Exa  # noqa: WPS433 — deliberately lazy
 
-    client = Exa(api_key=api_key)
+    client = Exa(api_key=api_key, base_url=base_url) if base_url else Exa(api_key=api_key)
     client.headers["x-exa-integration"] = "hermes-agent"
     _wt._exa_client = client
     return client
