@@ -408,6 +408,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `on_session_end` | Observer | Canonically at each turn finalization; CLI/TUI exits have additional reduced legacy shapes. Return ignored. | Canonical: `session_id`, `task_id`, `turn_id`, `completed`, `failed`, `interrupted`, `turn_exit_reason`, `model`, `platform`; exit paths may add `reason`/`api_request_id` and omit fields. | IDs, model/platform, and outcome; canonical payload has no message body. |
 | `on_session_finalize` | Observer | CLI/TUI/gateway teardown through `finalize_session`; gateway shutdown or expiry may finalize without a reset. Return ignored. | Surface-dependent `session_id`, `platform`, optionally `reason`, `old_session_id`, `new_session_id` | Session and routing identifiers. |
 | `on_session_reset` | Observer | CLI/TUI session boundary and gateway after the replacement session exists; return ignored. | CLI: `session_id`, `platform`, `reason`; TUI: `session_id`, `platform`; gateway: those plus `reason`, `old_session_id`, `new_session_id` | Session and routing identifiers. |
+| `codex_app_server_event` | Observer | Immediately after a supported Codex App Server lifecycle notification is received and before Hermes projects it to its existing UI callbacks. Return ignored. | `event`, `session_id`, `task_id`, `runtime`, `process_id` | Bounded lifecycle metadata only. Prompt, model output, reasoning, command text, arguments, output, deltas, and token usage are excluded. |
 | `on_skill_lifecycle` | Observer | After an authoritative skill-usage state change; return ignored. | `action`, `skill_name`, `provenance`, `task_id`, `session_id`, `use_count`, `reused`, `reuse_after_patch` | Exposes the local skill name and provenance. |
 | `subagent_start` | Observer | Child constructed and about to run; return ignored. | `parent_session_id`, `parent_turn_id`, `parent_subagent_id`, `child_session_id`, `child_subagent_id`, `child_role`, `child_goal` | Child goal may contain user/project content. |
 | `subagent_stop` | Observer | Child exit; return ignored. | `parent_session_id`, `parent_turn_id`, `child_session_id`, `child_role`, `child_summary`, `child_status`, `tool_call_history`, `duration_ms` | Summary and redacted tool-history metadata may reveal project structure. |
@@ -419,6 +420,30 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `kanban_task_blocked` | Observer | After a blocked transition; the dependency-wait path fires before its transaction exits. Return ignored. | `task_id`, `profile_name`, `board`, `assignee`, `run_id`, `reason` | Reason may contain project/user content. |
 
 ---
+
+### `codex_app_server_event`
+
+Fires for the bounded lifecycle subset `thread/started`, `turn/started`, `item/started`, `item/completed`, and `turn/completed` when Hermes runs a turn through the Codex App Server runtime. High-volume deltas and token-usage notifications do not fire this hook.
+
+The nested `event` uses schema `hermes.codex_app_server_event.v1`. It contains only thread, turn, and item identity/status metadata, item path/change kind, exit code, and duration where the Codex event provides them. It deliberately excludes prompt text, assistant text, reasoning, command strings, arguments, command output, deltas, model configuration, and token usage. `session_id`, `task_id`, and `process_id` let an external observer correlate the notification to the owning Hermes process without changing Hermes task state.
+
+```python
+def observe_codex_runtime(
+    event: dict,
+    session_id: str | None,
+    task_id: str | None,
+    runtime: str,
+    process_id: int,
+    **kwargs,
+):
+    if event["method"] == "turn/completed":
+        record_lifecycle_receipt(event, session_id, task_id, process_id)
+
+def register(ctx):
+    ctx.register_hook("codex_app_server_event", observe_codex_runtime)
+```
+
+Observer exceptions are isolated from the Codex turn and existing Hermes progress callbacks. Plugins should return quickly and move network or durable processing to their own bounded background path.
 
 ### `pre_tool_call`
 

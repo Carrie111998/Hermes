@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
@@ -357,6 +358,135 @@ _CODEX_TOOL_ITEM_TYPES = frozenset(
     {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"}
 )
 
+_CODEX_PLUGIN_OBSERVER_METHODS = frozenset(
+    {
+        "thread/started",
+        "turn/started",
+        "item/started",
+        "item/completed",
+        "turn/completed",
+    }
+)
+_CODEX_PLUGIN_OBSERVER_SCHEMA = "hermes.codex_app_server_event.v1"
+
+
+def _observer_string(value: Any, *, limit: int = 1024) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return value[:limit]
+
+
+def _sanitize_codex_app_server_event(note: Any) -> dict[str, Any] | None:
+    """Return the bounded public plugin shape for one app-server event.
+
+    This is intentionally not a raw JSON-RPC passthrough. Prompt/model text,
+    reasoning deltas, commands, tool arguments, tool output, and arbitrary
+    provider fields never cross the plugin boundary.
+    """
+    if not isinstance(note, dict):
+        return None
+    method = note.get("method")
+    if method not in _CODEX_PLUGIN_OBSERVER_METHODS:
+        return None
+    params = note.get("params")
+    if not isinstance(params, dict):
+        params = {}
+
+    safe_params: dict[str, Any] = {}
+    thread_id = _observer_string(params.get("threadId"), limit=256)
+    if thread_id is not None:
+        safe_params["threadId"] = thread_id
+    thread = params.get("thread")
+    if isinstance(thread, dict):
+        nested_thread_id = _observer_string(thread.get("id"), limit=256)
+        if nested_thread_id is not None:
+            safe_params["thread"] = {"id": nested_thread_id}
+
+    turn_id = _observer_string(params.get("turnId"), limit=256)
+    if turn_id is not None:
+        safe_params["turnId"] = turn_id
+    turn = params.get("turn")
+    if isinstance(turn, dict):
+        safe_turn: dict[str, str] = {}
+        nested_turn_id = _observer_string(turn.get("id"), limit=256)
+        turn_status = _observer_string(turn.get("status"), limit=80)
+        if nested_turn_id is not None:
+            safe_turn["id"] = nested_turn_id
+        if turn_status is not None:
+            safe_turn["status"] = turn_status
+        if safe_turn:
+            safe_params["turn"] = safe_turn
+
+    item = params.get("item")
+    if isinstance(item, dict):
+        safe_item: dict[str, Any] = {}
+        for field, limit in (
+            ("id", 256),
+            ("type", 80),
+            ("status", 80),
+            ("path", 1024),
+        ):
+            value = _observer_string(item.get(field), limit=limit)
+            if value is not None:
+                safe_item[field] = value
+        for field in ("exitCode", "durationMs"):
+            value = item.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                safe_item[field] = value
+        changes = item.get("changes")
+        if isinstance(changes, list):
+            safe_changes: list[dict[str, Any]] = []
+            for change in changes[:100]:
+                if not isinstance(change, dict):
+                    continue
+                path = _observer_string(change.get("path"), limit=1024)
+                if path is None:
+                    continue
+                safe_change: dict[str, Any] = {"path": path}
+                kind = change.get("kind")
+                if isinstance(kind, dict):
+                    kind_type = _observer_string(kind.get("type"), limit=80)
+                    if kind_type is not None:
+                        safe_change["kind"] = {"type": kind_type}
+                safe_changes.append(safe_change)
+            if safe_changes:
+                safe_item["changes"] = safe_changes
+        if safe_item:
+            safe_params["item"] = safe_item
+
+    return {
+        "schemaVersion": _CODEX_PLUGIN_OBSERVER_SCHEMA,
+        "method": method,
+        "params": safe_params,
+    }
+
+
+def _notify_codex_app_server_observers(agent: Any, note: Any) -> None:
+    event = _sanitize_codex_app_server_event(note)
+    if event is None:
+        return
+    try:
+        from hermes_cli.plugins import has_hook, invoke_hook
+
+        if not has_hook("codex_app_server_event"):
+            return
+        invoke_hook(
+            "codex_app_server_event",
+            event=event,
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            task_id=str(getattr(agent, "_current_task_id", "") or ""),
+            runtime="codex_app_server",
+            process_id=os.getpid(),
+        )
+    except Exception:
+        # Observer code can never make the owner runtime fail. PluginManager
+        # already isolates individual callbacks; this outer guard also covers
+        # discovery/registry failures.
+        logger.warning(
+            "codex app-server plugin observer dispatch failed",
+            exc_info=True,
+        )
+
 # Internal MCP server that wraps Hermes' native tools for codex. When
 # codex calls back through it, the inner dispatch runs in a SEPARATE
 # hermes-tools-mcp-server subprocess that has no access to the parent
@@ -648,6 +778,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     def on_event(note: dict) -> None:
         if not isinstance(note, dict):
             return
+        _notify_codex_app_server_observers(agent, note)
         method = note.get("method") or ""
         params = note.get("params") or {}
         if not isinstance(params, dict):
