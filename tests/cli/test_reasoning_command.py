@@ -30,11 +30,23 @@ class TestParseReasoningConfig(unittest.TestCase):
         self.assertEqual(result, {"enabled": False})
 
     def test_valid_levels(self):
-        for level in ("low", "medium", "high", "xhigh", "max", "ultra", "minimal"):
+        for level in ("low", "high", "max"):
             result = self._parse(level)
             self.assertIsNotNone(result)
             self.assertTrue(result.get("enabled"))
             self.assertEqual(result["effort"], level)
+
+    def test_legacy_aliases_are_mapped(self):
+        for legacy, canonical in (
+            ("minimal", "low"),
+            ("medium", "high"),
+            ("xhigh", "max"),
+            ("ultra", "max"),
+        ):
+            result = self._parse(legacy)
+            self.assertIsNotNone(result)
+            self.assertTrue(result.get("enabled"))
+            self.assertEqual(result["effort"], canonical)
 
 
     def test_unknown_returns_none(self):
@@ -95,7 +107,7 @@ class TestHandleReasoningCommand(unittest.TestCase):
         """Plain /reasoning <level> is session-scoped — no config write."""
         from hermes_cli.cli_commands_mixin import CLICommandsMixin
 
-        stub = self._make_cli(reasoning_config={"enabled": True, "effort": "medium"})
+        stub = self._make_cli(reasoning_config={"enabled": True, "effort": "high"})
         with patch("cli.save_config_value") as save_config, patch("cli._cprint"):
             CLICommandsMixin._handle_reasoning_command(stub, "/reasoning high")
 
@@ -124,11 +136,11 @@ class TestHandleReasoningCommand(unittest.TestCase):
             _notify_session_boundary=MagicMock(),
         )
 
-        with patch.dict(CLI_CONFIG.setdefault("agent", {}), {"reasoning_effort": "medium"}):
+        with patch.dict(CLI_CONFIG.setdefault("agent", {}), {"reasoning_effort": "high"}):
             HermesCLI.new_session(stub, silent=True)
 
-        self.assertEqual(stub.reasoning_config, {"enabled": True, "effort": "medium"})
-        self.assertEqual(agent.reasoning_config, {"enabled": True, "effort": "medium"})
+        self.assertEqual(stub.reasoning_config, {"enabled": True, "effort": "high"})
+        self.assertEqual(agent.reasoning_config, {"enabled": True, "effort": "high"})
         agent.reset_session_state.assert_called_once()
 
     def test_new_session_resets_service_tier_and_model_from_config(self):
@@ -171,7 +183,7 @@ class TestHandleReasoningCommand(unittest.TestCase):
         )
         with patch.dict(
             CLI_CONFIG.setdefault("agent", {}),
-            {"reasoning_effort": "medium", "service_tier": "normal"},
+            {"reasoning_effort": "high", "service_tier": "normal"},
         ), patch.dict(
             CLI_CONFIG,
             {"model": {"default": "config-default-model", "provider": "openrouter"}},

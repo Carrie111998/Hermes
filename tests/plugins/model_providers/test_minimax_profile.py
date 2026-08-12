@@ -174,7 +174,7 @@ class TestMinimaxM3OpenAIReasoningWireShape:
             messages=[{"role": "user", "content": "ping"}],
             tools=None,
             provider_profile=profile,
-            reasoning_config={"enabled": True, "effort": "medium"},
+            reasoning_config={"enabled": True, "effort": "high"},
             base_url="https://api.minimax.io/v1",
         )
         assert kwargs["extra_body"] == {

@@ -49,7 +49,7 @@ class TestOllamaCloudReasoningEffort:
 
     # ── low / medium / high pass through ───────────────────────────
 
-    @pytest.mark.parametrize("effort", ["low", "medium", "high"])
+    @pytest.mark.parametrize("effort", ["low", "high", "max"])
     def test_standard_efforts_pass_through(self, ollama_cloud_profile, effort):
         _, top_level = ollama_cloud_profile.build_api_kwargs_extras(
             supports_reasoning=True,

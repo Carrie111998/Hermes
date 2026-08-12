@@ -3278,16 +3278,16 @@ class CLICommandsMixin:
             # Show current state
             rc = self.reasoning_config
             if rc is None:
-                level = "medium (default)"
+                level = "high (default)"
             elif rc.get("enabled") is False:
                 level = "none (disabled)"
             else:
-                level = rc.get("effort", "medium")
+                level = rc.get("effort", "high")
             display_state = "on ✓" if self.show_reasoning else "off"
             full_state = "full" if getattr(self, "reasoning_full", False) else "clamped to 10 lines"
             _cprint(f"  {_ACCENT}Reasoning effort:  {level}{_RST}")
             _cprint(f"  {_ACCENT}Reasoning display: {display_state} ({full_state}){_RST}")
-            _cprint(f"  {_DIM}Usage: /reasoning <none|minimal|low|medium|high|xhigh|max|ultra|show|hide|full|clamp> [--global]{_RST}")
+            _cprint(f"  {_DIM}Usage: /reasoning <none|low|high|max|show|hide|full|clamp> [--global]{_RST}")
             return
 
         arg = parts[1].strip().lower()

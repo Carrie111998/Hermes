@@ -52,45 +52,36 @@ class TestCopilotReasoningEffortClamp:
         )
         assert extra_body["reasoning"] == {"effort": "xhigh"}
 
-    def test_xhigh_downgrades_to_high_when_unsupported(self, copilot_profile, monkeypatch):
-        """A model whose catalog lacks xhigh gets the nearest weaker level."""
+    def test_max_downgrades_to_high_when_unsupported(self, copilot_profile, monkeypatch):
+        """A model whose catalog lacks max gets the nearest weaker level."""
         _patch_efforts(monkeypatch, ["low", "medium", "high"])
         extra_body, _ = copilot_profile.build_api_kwargs_extras(
             model="o-series-model",
-            reasoning_config={"effort": "xhigh"},
+            reasoning_config={"effort": "max"},
             supports_reasoning=True,
         )
         assert extra_body["reasoning"] == {"effort": "high"}
 
-    def test_minimal_downgrades_to_low_when_unsupported(self, copilot_profile, monkeypatch):
-        _patch_efforts(monkeypatch, ["low", "medium", "high"])
-        extra_body, _ = copilot_profile.build_api_kwargs_extras(
-            model="o-series-model",
-            reasoning_config={"effort": "minimal"},
-            supports_reasoning=True,
-        )
-        assert extra_body["reasoning"] == {"effort": "low"}
-
-    def test_unsupported_effort_falls_back_to_medium(self, copilot_profile, monkeypatch):
-        """An effort not in the set, with no specific rule, falls to medium."""
+    def test_unsupported_effort_falls_back_to_high(self, copilot_profile, monkeypatch):
+        """An effort not in the set, with no specific rule, falls to high."""
         _patch_efforts(monkeypatch, ["low", "medium", "high"])
         extra_body, _ = copilot_profile.build_api_kwargs_extras(
             model="some-model",
             reasoning_config={"effort": "garbage"},
             supports_reasoning=True,
         )
-        assert extra_body["reasoning"] == {"effort": "medium"}
+        assert extra_body["reasoning"] == {"effort": "high"}
 
-    def test_falls_back_to_first_supported_when_no_medium(self, copilot_profile, monkeypatch):
-        """If medium isn't supported either, pick the first supported level."""
-        _patch_efforts(monkeypatch, ["low", "high"])
+    def test_falls_back_to_first_supported_when_no_high(self, copilot_profile, monkeypatch):
+        """If high isn't supported, pick the first supported level."""
+        _patch_efforts(monkeypatch, ["low", "max"])
         extra_body, _ = copilot_profile.build_api_kwargs_extras(
             model="weird-model",
-            reasoning_config={"effort": "xhigh"},
+            reasoning_config={"effort": "max"},
             supports_reasoning=True,
         )
-        # xhigh not supported, high IS supported → high wins via the xhigh rule.
-        assert extra_body["reasoning"] == {"effort": "high"}
+        # max IS in supported set → max wins.
+        assert extra_body["reasoning"] == {"effort": "max"}
 
     def test_first_supported_when_no_rule_matches(self, copilot_profile, monkeypatch):
         _patch_efforts(monkeypatch, ["low", "high"])
@@ -99,4 +90,4 @@ class TestCopilotReasoningEffortClamp:
             reasoning_config={"effort": "garbage"},
             supports_reasoning=True,
         )
-        assert extra_body["reasoning"] == {"effort": "low"}
+        assert extra_body["reasoning"] == {"effort": "high"}

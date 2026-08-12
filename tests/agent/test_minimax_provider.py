@@ -80,7 +80,7 @@ class TestMinimaxThinkingSupport:
             messages=[{"role": "user", "content": "hello"}],
             tools=None,
             max_tokens=4096,
-            reasoning_config={"enabled": True, "effort": "medium"},
+            reasoning_config={"enabled": True, "effort": "high"},
         )
         assert "thinking" in kwargs
         assert kwargs["thinking"]["type"] == "enabled"
@@ -107,7 +107,7 @@ class TestMinimaxThinkingSupport:
             messages=[{"role": "user", "content": "hello"}],
             tools=None,
             max_tokens=4096,
-            reasoning_config={"enabled": True, "effort": "medium"},
+            reasoning_config={"enabled": True, "effort": "high"},
         )
         assert "thinking" in kwargs
 

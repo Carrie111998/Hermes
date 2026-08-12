@@ -565,7 +565,7 @@ def init_agent(
             Provided by the platform layer (CLI or gateway). If None, the clarify tool returns an error.
         max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
         reasoning_config (Dict): OpenRouter reasoning configuration override (e.g. {"effort": "none"} to disable thinking).
-            If None, defaults to {"enabled": True, "effort": "medium"} for OpenRouter. Set to disable/customize reasoning.
+            If None, defaults to {"enabled": True, "effort": "high"} for OpenRouter. Set to disable/customize reasoning.
         prefill_messages (List[Dict]): Messages to prepend to conversation history as prefilled context.
             Useful for injecting a few-shot example or priming the model's response style.
             Example: [{"role": "user", "content": "Hi!"}, {"role": "assistant", "content": "Hello!"}]

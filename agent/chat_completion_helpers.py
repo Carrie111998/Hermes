@@ -2453,7 +2453,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             else:
                 summary_extra_body["reasoning"] = {
                     "enabled": True,
-                    "effort": "medium"
+                    "effort": "high"
                 }
         if _is_nous:
             from agent.portal_tags import nous_portal_tags as _portal_tags

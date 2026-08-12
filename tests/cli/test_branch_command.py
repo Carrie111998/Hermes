@@ -39,7 +39,7 @@ def cli_instance(tmp_path, session_db):
     cli.session_id = "20260403_120000_abc123"
     cli.model = "anthropic/claude-sonnet-4.6"
     cli.max_turns = 90
-    cli.reasoning_config = {"enabled": True, "effort": "medium"}
+    cli.reasoning_config = {"enabled": True, "effort": "high"}
     cli.session_start = datetime.now()
     cli._pending_title = None
     cli._resumed = False

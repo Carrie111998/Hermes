@@ -24,7 +24,7 @@ class TestSwitchModelReasoningOverride:
         agent._client_kwargs = {"api_key": "test-key", "base_url": "https://api.openai.com/v1"}
         agent._use_prompt_caching = False
         agent._use_native_cache_layout = False
-        agent.reasoning_config = {"enabled": True, "effort": "medium"}
+        agent.reasoning_config = {"enabled": True, "effort": "high"}
         agent._fallback_activated = False
         agent._fallback_index = 0
         agent._fallback_chain = []
@@ -112,7 +112,7 @@ class TestSwitchModelReasoningOverride:
         agent._rate_limited_until = 0
         agent.model = "fallback-model"
         agent.provider = "openai"
-        agent.reasoning_config = {"enabled": True, "effort": "medium"}
+        agent.reasoning_config = {"enabled": True, "effort": "high"}
         agent.context_compressor = MagicMock()
         agent.base_url = ""
         # Mock the methods restore_primary_runtime calls

@@ -51,7 +51,7 @@ def test_clamped_effort_is_still_checked_against_allowed_options(effort):
     )
     assert (
         resolve_lmstudio_effort(
-            {"enabled": True, "effort": effort}, ["low", "medium", "high", "xhigh"]
+            {"enabled": True, "effort": effort}, ["low", "high", "xhigh"]
         )
         == "xhigh"
     )

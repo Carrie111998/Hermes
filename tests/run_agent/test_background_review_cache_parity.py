@@ -46,7 +46,7 @@ def _make_agent_stub(agent_cls):
     agent.disabled_toolsets = ["spotify", "feishu_doc"]
     # Non-None so the test catches reasoning_config NOT being inherited —
     # which would put the fork into a different Anthropic cache namespace.
-    agent.reasoning_config = {"enabled": True, "effort": "medium"}
+    agent.reasoning_config = {"enabled": True, "effort": "high"}
     # Non-empty so tests catch prefill/provider-routing NOT being inherited —
     # prefills sit right after the system message in the request body, and
     # OpenRouter provider pins decide WHICH upstream's cache gets hit.

@@ -71,7 +71,7 @@ class TestCustomReasoningWireShape:
         assert tl == {"reasoning_effort": "none"}
 
     @pytest.mark.parametrize(
-        "effort", ["minimal", "low", "medium", "high", "xhigh", "max"]
+        "effort", ["low", "high", "max"]
     )
     def test_enabled_effort_goes_top_level(self, custom_profile, effort):
         """enabled + effort → TOP-LEVEL reasoning_effort, passed through verbatim.

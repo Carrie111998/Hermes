@@ -46,7 +46,7 @@ class TestZaiThinkingWireShape:
 
     def test_enabled_sends_enabled_marker(self, zai_profile):
         extra_body, top_level = zai_profile.build_api_kwargs_extras(
-            reasoning_config={"enabled": True, "effort": "medium"}, model="glm-5"
+            reasoning_config={"enabled": True, "effort": "high"}, model="glm-5"
         )
         assert extra_body == {"thinking": {"type": "enabled"}}
         assert top_level == {}
@@ -76,7 +76,7 @@ class TestZaiGLM52ReasoningEffort:
         assert extra_body == {"thinking": {"type": "enabled"}}
         assert top_level == {"reasoning_effort": "high"}
 
-    @pytest.mark.parametrize("effort", ["low", "medium", "minimal"])
+    @pytest.mark.parametrize("effort", ["low", "high"])
     def test_lower_efforts_clamp_up_to_high(self, zai_profile, effort):
         """GLM-5.2's minimum thinking level is high — lower Hermes levels
         clamp onto it."""

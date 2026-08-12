@@ -47,7 +47,7 @@ class TestKimiCodingAnthropicThinking:
             messages=[{"role": "user", "content": "hello"}],
             tools=None,
             max_tokens=4096,
-            reasoning_config={"enabled": True, "effort": "medium"},
+            reasoning_config={"enabled": True, "effort": "high"},
             base_url="https://api.minimax.io/anthropic",
         )
         assert "thinking" in kwargs
@@ -61,7 +61,7 @@ class TestKimiCodingAnthropicThinking:
             messages=[{"role": "user", "content": "hello"}],
             tools=None,
             max_tokens=4096,
-            reasoning_config={"enabled": True, "effort": "medium"},
+            reasoning_config={"enabled": True, "effort": "high"},
             base_url=None,
         )
         assert "thinking" in kwargs
