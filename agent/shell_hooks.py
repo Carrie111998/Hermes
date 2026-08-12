@@ -124,6 +124,21 @@ emitted by each built-in hook site.
     child_status    – exit status string (e.g. "success", "error")
     tool_call_history – redacted tool name/input summary/byte counts/status list
     duration_ms     – wall-clock time of the child run in milliseconds
+
+``cron_job_failed`` (emitted from ``cron/scheduler.py`` when a scheduled
+job fails):::
+
+    job_id          – cron job id (e.g. "abc123def456")
+    job_name        – job name, or the job id when unnamed
+    profile         – Hermes profile the job belongs to ("" when default)
+    error           – human-readable failure text
+    last_run_at     – job's last_run_at value before this run, if any
+    job             – the full job dict (schedule, prompt, script, deliver,
+                      skills, etc.) — useful for reactive self-healing
+                      scripts that need to inspect or rewrite the job
+
+The payload is delivered to the hook script on stdin as JSON (see
+``_serialize_payload``); all fields above arrive under ``extra``.
 """
 
 from __future__ import annotations

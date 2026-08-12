@@ -151,6 +151,36 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     return f"⚠️ Cron '{job_name}' failed: {cleaned}"
 
 
+def _fire_cron_job_failed_hook(job: dict, error: str | None) -> None:
+    """Fire the ``cron_job_failed`` lifecycle hook on a failed cron run.
+
+    Gives reactive consumers (shell hooks, outbound webhooks, plugins) a
+    programmatic failure signal without polling ``jobs.json`` or wrapping
+    per-job delivery paths.  Best-effort: a hook that raises must never
+    crash the scheduler or mask the original job failure — this mirrors the
+    defensive pattern used by the ``on_session_end`` hook in
+    ``agent/turn_finalizer.py``.
+
+    Fired from the worker thread that ran the job, so blocking hook scripts
+    (``subprocess.run`` inside ``agent/shell_hooks.py``) do not freeze the
+    scheduler's event loop or the main gateway loop.
+    """
+    try:
+        from hermes_cli.plugins import invoke_hook as _invoke_hook
+
+        _invoke_hook(
+            "cron_job_failed",
+            job_id=job.get("id", ""),
+            job_name=job.get("name") or job.get("id") or "",
+            profile=job.get("profile", ""),
+            error=error or "",
+            last_run_at=job.get("last_run_at") or "",
+            job=job,
+        )
+    except Exception as exc:
+        logger.warning("cron_job_failed hook failed: %s", exc)
+
+
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the fully-assembled prompt trips the
     injection scanner. Caught in run_job so the operator sees a clean
@@ -4743,6 +4773,11 @@ def run_one_job(
                 )
             else:
                 deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
+            # Fire the cron_job_failed hook on failure — before delivery so a
+            # broken hook (or a blocking hook script) can never suppress or
+            # delay the failure message itself; hook failures are swallowed.
+            if not success:
+                _fire_cron_job_failed_hook(job, error)
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.

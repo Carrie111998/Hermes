@@ -216,6 +216,13 @@ VALID_HOOKS: Set[str] = {
     "kanban_task_claimed",
     "kanban_task_completed",
     "kanban_task_blocked",
+    # Cron job lifecycle hooks. Fired by cron/scheduler.py from the worker
+    # thread that ran the job. Observers only: return values are ignored.
+    #
+    # cron_job_failed kwargs: job_id: str, job_name: str, profile: str,
+    #   error: str, last_run_at: str, job: dict (full job spec — schedule,
+    #   prompt, script, deliver, skills — for reactive self-healing).
+    "cron_job_failed",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
