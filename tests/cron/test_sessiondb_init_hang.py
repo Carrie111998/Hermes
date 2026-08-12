@@ -171,6 +171,56 @@ class TestSessionDbInitTimeout:
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["session_db"] is None
 
+    def test_timeout_log_renders_the_fractional_bound(self, tmp_path, monkeypatch, caplog):
+        """The timeout message must print the ACTUAL bound, not round it to 0.
+
+        ``%.0f`` rendered a 0.2s bound as "did not return within 0s". That is
+        not merely imprecise — 0 is this very function's sentinel for
+        *unlimited* (see the ``if _session_db_timeout > 0`` branch), so an
+        operator reading that line concludes no timeout was in force at the
+        exact moment one fired. Observed live 2026-08-11.
+        """
+        monkeypatch.setenv("HERMES_CRON_SESSION_DB_TIMEOUT", "0.2")
+        wedge = _WedgedSessionDb()
+        job = {"id": "wedged-sessiondb", "name": "test", "prompt": "hello"}
+
+        try:
+            with patch("cron.scheduler._hermes_home", tmp_path), \
+                 patch("cron.scheduler._resolve_origin", return_value=None), \
+                 patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+                 patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+                 patch("hermes_state.SessionDB", side_effect=wedge), \
+                 patch(
+                     "hermes_cli.runtime_provider.resolve_runtime_provider",
+                     return_value=_PROVIDER,
+                 ), \
+                 patch("run_agent.AIAgent") as mock_agent_cls:
+                mock_agent_cls.return_value.run_conversation.return_value = {
+                    "final_response": "ok"
+                }
+                with caplog.at_level("ERROR"):
+                    run_job(job)
+
+        finally:
+            wedge.release.set()
+
+        rendered = [
+            rec.getMessage()
+            for rec in caplog.records
+            if "SessionDB init did not return" in rec.getMessage()
+        ]
+        assert rendered, (
+            "Expected the SessionDB init timeout to be logged; got: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+        line = rendered[0]
+        assert "0.2s" in line, f"Timeout bound not rendered faithfully: {line!r}"
+        # The specific inversion: 0 is the sentinel for UNLIMITED, so this
+        # exact substring tells the operator the opposite of what happened.
+        assert "within 0s" not in line, (
+            f"Sub-second bound rendered as the unlimited sentinel: {line!r}"
+        )
+
     def test_invalid_timeout_env_falls_back_to_default(self, tmp_path, monkeypatch, caplog):
         """A malformed HERMES_CRON_SESSION_DB_TIMEOUT logs a warning and still
         bounds the call (mirrors HERMES_CRON_TIMEOUT's own fallback)."""
@@ -258,6 +308,61 @@ class TestSessionDbInitTimeout:
         )
         assert success is True
         assert mock_agent_cls.call_args.kwargs["session_db"] is None
+
+
+class TestNoTimeoutIsRenderedAsTheUnlimitedSentinel:
+    """Sweep for the sibling instances of the ``%.0f``-on-a-timeout defect.
+
+    ``run_job``'s three timeouts all document ``0 = unlimited``
+    (HERMES_CRON_SESSION_DB_TIMEOUT at the ``> 0`` branch,
+    HERMES_CRON_TIMEOUT, HERMES_CRON_HARD_TIMEOUT). Any renderer that
+    truncates toward zero therefore turns a live sub-second bound into the
+    sentinel meaning *no bound* — the operator reads the opposite of what
+    happened.
+
+    The wall-clock and inactivity messages are emitted from a monitor thread
+    that a unit test cannot reach cheaply, so this asserts on the format
+    strings themselves. Anchored on the message text, not line numbers, so it
+    survives edits above it.
+    """
+
+    @staticmethod
+    def _source() -> str:
+        import cron.scheduler
+
+        return Path(cron.scheduler.__file__).read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize(
+        "anchor",
+        [
+            "SessionDB init did not return",
+            "exceeded wall-clock limit",
+            "idle for",
+        ],
+    )
+    def test_timeout_render_does_not_truncate_to_zero(self, anchor):
+        source = self._source()
+        offenders = [
+            line.strip()
+            for line in source.splitlines()
+            if anchor in line and "%.0f" in line
+        ]
+        assert not offenders, (
+            f"{anchor!r} still renders a timeout with %.0f, which prints any "
+            f"sub-second bound as the '0 = unlimited' sentinel: {offenders}"
+        )
+
+    @pytest.mark.parametrize(
+        "expr",
+        ["int(_cron_hard_limit)", "int(_cron_inactivity_limit)"],
+    )
+    def test_raised_timeout_message_does_not_truncate_the_limit(self, expr):
+        """The TimeoutError text an operator sees in the job record has the
+        same hazard as the log line it accompanies."""
+        assert expr not in self._source(), (
+            f"{expr} truncates a sub-second limit to the '0 = unlimited' "
+            "sentinel in the raised TimeoutError message"
+        )
 
 
 class TestDispatchGuardReleasedAfterHang:
