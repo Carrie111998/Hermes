@@ -113,6 +113,21 @@ def agent_runtime_owns_post_tool_hook(agent: Any, function_name: str) -> bool:
     return bool(memory_manager and memory_manager.has_tool(function_name))
 
 
+def _defang_trajectory_closing_tags(text: str) -> str:
+    """Defang a literal closing tag in raw content before interpolation.
+
+    A model's reasoning or tool output can contain a literal ``</think>``,
+    ``</tool_call>`` or ``</tool_response>``. Interpolating it verbatim into a
+    structural envelope would close the tag early, letting trailing content read
+    as a new structural element (or a control token). Escape the closing-tag
+    start (``</`` → ``<\\/``) so it can never terminate the envelope; opening
+    tags are left intact.
+    """
+    if not text:
+        return text
+    return text.replace("</", "<\\/")
+
+
 def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_query: str, completed: bool) -> List[Dict[str, Any]]:
     """
     Convert internal message format to trajectory format for saving.
@@ -174,7 +189,7 @@ def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_que
                 
                 # Prepend reasoning in <think> tags if available (native thinking tokens)
                 if msg.get("reasoning") and msg["reasoning"].strip():
-                    content = f"<think>\n{msg['reasoning']}\n</think>\n"
+                    content = f"<think>\n{_defang_trajectory_closing_tags(msg['reasoning'])}\n</think>\n"
                 
                 if msg.get("content") and msg["content"].strip():
                     # Convert any <REASONING_SCRATCHPAD> tags to <think> tags
@@ -198,7 +213,7 @@ def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_que
                         "name": tool_call["function"]["name"],
                         "arguments": arguments
                     }
-                    content += f"<tool_call>\n{json.dumps(tool_call_json, ensure_ascii=False)}\n</tool_call>\n"
+                    content += f"<tool_call>\n{_defang_trajectory_closing_tags(json.dumps(tool_call_json, ensure_ascii=False))}\n</tool_call>\n"
                 
                 # Ensure every gpt turn has a <think> block (empty if no reasoning)
                 # so the format is consistent for training data
@@ -232,11 +247,11 @@ def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_que
                         if tool_index < len(msg["tool_calls"])
                         else "unknown"
                     )
-                    tool_response += json.dumps({
+                    tool_response += _defang_trajectory_closing_tags(json.dumps({
                         "tool_call_id": tool_msg.get("tool_call_id", ""),
                         "name": tool_name,
                         "content": tool_content
-                    }, ensure_ascii=False)
+                    }, ensure_ascii=False))
                     tool_response += "\n</tool_response>"
                     tool_responses.append(tool_response)
                     j += 1
@@ -256,7 +271,7 @@ def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_que
                 
                 # Prepend reasoning in <think> tags if available (native thinking tokens)
                 if msg.get("reasoning") and msg["reasoning"].strip():
-                    content = f"<think>\n{msg['reasoning']}\n</think>\n"
+                    content = f"<think>\n{_defang_trajectory_closing_tags(msg['reasoning'])}\n</think>\n"
                 
                 # Convert any <REASONING_SCRATCHPAD> tags to <think> tags
                 # (used when native thinking is disabled and model reasons via XML)
@@ -1982,6 +1997,24 @@ def prompt_caching_disabled_from_config() -> bool:
     return cache_ttl_means_disabled(ttl)
 
 
+def prompt_cache_ttl_from_config() -> Optional[str]:
+    """Return the configured prompt-cache tier for agent-less request paths.
+
+    MoA and auxiliary fallbacks can plan a request without a live ``AIAgent``
+    snapshot.  Those paths must use the same configured tier as the primary
+    loop instead of silently falling back to ``5m``.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        value = (load_config_readonly().get("prompt_caching", {}) or {}).get(
+            "cache_ttl", "5m"
+        )
+    except Exception:
+        return "5m"
+    return value if value in {"5m", "1h"} else "5m"
+
+
 def blank_cache_policy_stub(cache_disabled: Optional[bool] = None):
     """Build the destination-identity-blank stub for ``anthropic_prompt_cache_policy``.
 
@@ -2015,6 +2048,8 @@ def plan_cache_sections_for_destination(
     api_mode: str,
     model: str,
     cache_disabled: Optional[bool] = None,
+    cache_ttl: Optional[str] = None,
+    static_system_prefix: Optional[str] = None,
 ) -> Tuple[list, list]:
     """Plan request-local cache sections for one resolved destination.
 
@@ -2032,9 +2067,18 @@ def plan_cache_sections_for_destination(
     disable into the blank policy stub. When omitted, the live config is
     consulted so MoA/auxiliary paths cannot re-enable markers after the
     user turned caching off (#76085).
+
+    ``cache_ttl`` threads the operator's configured tier (default ``5m``)
+    into the destination plan so MoA/auxiliary requests stop regressing to
+    the 5m default while the main loop honors ``1h`` (#84733); it is
+    clamped per-destination by :func:`effective_cache_ttl` (Qwen → 5m).
+    ``static_system_prefix`` threads the builder-declared stable prefix so
+    the destination system prompt receives the same early breakpoint the
+    main loop applies instead of marking the whole prompt as a breakpoint.
     """
     from agent.prompt_caching import (
         build_prompt_cache_plan,
+        effective_cache_ttl,
         strip_anthropic_cache_control,
         strip_anthropic_tool_cache_control,
     )
@@ -2054,7 +2098,15 @@ def plan_cache_sections_for_destination(
     plan = build_prompt_cache_plan(
         messages,
         tools,
+        cache_ttl=effective_cache_ttl(
+            cache_ttl or prompt_cache_ttl_from_config() or "5m",
+            provider=provider,
+            model=model,
+        ),
         native_anthropic=native_layout,
+        static_system_prefix=(
+            static_system_prefix if isinstance(static_system_prefix, str) else None
+        ),
         direct_native_tool_cache=_direct_native_anthropic_tool_cache_capability(
             stub,
             provider=provider,
