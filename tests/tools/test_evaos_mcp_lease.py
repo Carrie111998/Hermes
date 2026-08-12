@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -18,9 +17,6 @@ from tools.evaos_mcp_lease import (
 )
 from tools.mcp_schema_cache import config_fingerprint
 from tools.mcp_tool import MCPServerTask
-
-_GRANT_HANDLE = "epg_" + ("a" * 32)
-
 
 class _Response:
     def __init__(self, status_code: int, payload: dict):
@@ -38,15 +34,12 @@ def _write_secret(path, value: str):
 
 def _source(tmp_path, *, app_slug="google_sheets", profile_key="profile-a"):
     broker = tmp_path / "broker"
-    grants = tmp_path / "provider-grants.json"
     _write_secret(broker, "broker-secret-under-test\n")
-    _write_secret(grants, json.dumps({app_slug: _GRANT_HANDLE}))
     values = {
         "EVAOS_DESKTOP_RUNTIME_SESSION_URL": (
             "https://example.supabase.co/functions/v1/desktop-runtime-session"
         ),
         "PIPEDREAM_AGENT_BROKER_SECRET_FILE": str(broker),
-        "PIPEDREAM_PROVIDER_GRANT_FILE": str(grants),
     }
     source = EvaosLeaseSource(
         profile_key=profile_key,
@@ -116,8 +109,11 @@ async def test_lease_request_uses_only_root_configured_profile_route(tmp_path):
         "action": "pipedream_mcp_lease",
         "app_slug": "google_sheets",
     }
-    assert calls[0][1]["X-Evaos-Provider-Grant"] == _GRANT_HANDLE
-    assert "PIPEDREAM_PROVIDER_GRANT_FILE" in settings_read
+    # adapter#89: no per-app grant handle is sent, and the grant-file setting is
+    # never even looked up. Pipedream Connect MCP requires no such handle, and
+    # the compat edge fn derives x-pd-external-user-id server-side.
+    assert "X-Evaos-Provider-Grant" not in calls[0][1]
+    assert "PIPEDREAM_PROVIDER_GRANT_FILE" not in settings_read
     assert not {
         "account_id",
         "profile",
@@ -197,7 +193,7 @@ async def test_http_auth_refreshes_and_retries_exactly_once_after_401(tmp_path):
     async def transport(url, headers, payload):
         nonlocal calls
         calls += 1
-        assert headers["X-Evaos-Provider-Grant"] == _GRANT_HANDLE
+        assert "X-Evaos-Provider-Grant" not in headers
         return _Response(
             200,
             _lease_payload(
@@ -250,18 +246,14 @@ def test_source_accepts_systemd_loadcredential_copy(
     credentials = tmp_path / "credentials"
     credentials.mkdir(mode=0o700)
     broker = credentials / "pipedream_broker"
-    grants = credentials / "pipedream_grants"
     _write_secret(broker, "broker-secret-under-test\n")
-    _write_secret(grants, json.dumps({"google_sheets": _GRANT_HANDLE}))
     broker.chmod(mode)
-    grants.chmod(mode)
     monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credentials))
     values = {
         "EVAOS_DESKTOP_RUNTIME_SESSION_URL": (
             "https://example.supabase.co/functions/v1/desktop-runtime-session"
         ),
         "PIPEDREAM_AGENT_BROKER_SECRET_FILE": str(broker),
-        "PIPEDREAM_PROVIDER_GRANT_FILE": str(grants),
     }
     source = EvaosLeaseSource(
         profile_key="profile-a",
@@ -284,18 +276,14 @@ def test_source_accepts_service_owned_0400_systemd_copy(
     credentials = tmp_path / "credentials"
     credentials.mkdir(mode=0o700)
     broker = credentials / "pipedream_broker"
-    grants = credentials / "pipedream_grants"
     _write_secret(broker, "broker-secret-under-test\n")
-    _write_secret(grants, json.dumps({"google_sheets": _GRANT_HANDLE}))
     broker.chmod(0o400)
-    grants.chmod(0o400)
     monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credentials))
     values = {
         "EVAOS_DESKTOP_RUNTIME_SESSION_URL": (
             "https://example.supabase.co/functions/v1/desktop-runtime-session"
         ),
         "PIPEDREAM_AGENT_BROKER_SECRET_FILE": "%d/pipedream_broker",
-        "PIPEDREAM_PROVIDER_GRANT_FILE": "%d/pipedream_grants",
     }
     source = EvaosLeaseSource(
         profile_key="profile-a",
@@ -496,11 +484,8 @@ async def test_managed_config_mounts_through_r5_lease(
     profile.mkdir()
     credentials.mkdir(mode=0o700)
     broker = credentials / "pipedream_broker"
-    grants = credentials / "pipedream_grants"
     _write_secret(broker, "broker-secret-under-test\n")
-    _write_secret(grants, json.dumps({"google_sheets": _GRANT_HANDLE}))
     broker.chmod(0o400)
-    grants.chmod(0o400)
     monkeypatch.setenv("HERMES_HOME", str(profile))
     monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credentials))
     monkeypatch.setenv(
@@ -508,7 +493,9 @@ async def test_managed_config_mounts_through_r5_lease(
         "https://example.supabase.co/functions/v1/desktop-runtime-session",
     )
     monkeypatch.setenv("PIPEDREAM_AGENT_BROKER_SECRET_FILE", str(broker))
-    monkeypatch.setenv("PIPEDREAM_PROVIDER_GRANT_FILE", str(grants))
+    # adapter#89 regression: NO grant file exists and no grant setting is set.
+    monkeypatch.delenv("PIPEDREAM_PROVIDER_GRANT_FILE", raising=False)
+    assert not (credentials / "pipedream_grants").exists()
 
     mint_calls = []
 
@@ -562,7 +549,7 @@ async def test_managed_config_mounts_through_r5_lease(
         "action": "pipedream_mcp_lease",
         "app_slug": "google_sheets",
     }
-    assert mint_calls[0][1]["X-Evaos-Provider-Grant"] == _GRANT_HANDLE
+    assert "X-Evaos-Provider-Grant" not in mint_calls[0][1]
     assert mounted["url"] == "https://remote.mcp.pipedream.net/v3"
     assert {
         name: mounted["headers"][name]

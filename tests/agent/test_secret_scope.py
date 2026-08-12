@@ -268,20 +268,20 @@ class TestEnvFileParsing:
         alpha_managed.mkdir(parents=True)
         beta_managed.mkdir()
         (alpha_home / ".env").write_text(
-            "PIPEDREAM_PROVIDER_GRANT_FILE=/user/alpha\n",
+            "API_SERVER_KEY=/user/alpha\n",
             encoding="utf-8",
         )
         (beta_home / ".env").write_text(
-            "PIPEDREAM_PROVIDER_GRANT_FILE=/user/beta\n",
+            "API_SERVER_KEY=/user/beta\n",
             encoding="utf-8",
         )
         (alpha_managed / ".env").write_text(
-            "PIPEDREAM_PROVIDER_GRANT_FILE=%d/provider-alpha\n"
+            "API_SERVER_KEY=%d/apikey-alpha\n"
             "CREDENTIALS_DIRECTORY=/wrong/managed-alpha\n",
             encoding="utf-8",
         )
         (beta_managed / ".env").write_text(
-            "PIPEDREAM_PROVIDER_GRANT_FILE=%d/provider-beta\n"
+            "API_SERVER_KEY=%d/apikey-beta\n"
             "CREDENTIALS_DIRECTORY=/wrong/managed-beta\n",
             encoding="utf-8",
         )
@@ -298,11 +298,11 @@ class TestEnvFileParsing:
         alpha_scope = ss.build_profile_secret_scope(alpha_home)
         beta_scope = ss.build_profile_secret_scope(beta_home)
 
-        assert alpha_scope["PIPEDREAM_PROVIDER_GRANT_FILE"] == (
-            "%d/provider-alpha"
+        assert alpha_scope["API_SERVER_KEY"] == (
+            "%d/apikey-alpha"
         )
-        assert beta_scope["PIPEDREAM_PROVIDER_GRANT_FILE"] == (
-            "%d/provider-beta"
+        assert beta_scope["API_SERVER_KEY"] == (
+            "%d/apikey-beta"
         )
         assert "CREDENTIALS_DIRECTORY" not in alpha_scope
         assert "CREDENTIALS_DIRECTORY" not in beta_scope
@@ -310,8 +310,8 @@ class TestEnvFileParsing:
         ss.set_multiplex_active(True)
         alpha_token = ss.set_secret_scope(alpha_scope)
         try:
-            assert ss.get_secret("PIPEDREAM_PROVIDER_GRANT_FILE") == (
-                "%d/provider-alpha"
+            assert ss.get_secret("API_SERVER_KEY") == (
+                "%d/apikey-alpha"
             )
             assert ss.get_secret("CREDENTIALS_DIRECTORY") == (
                 "/run/credentials/evaos-shared-gateway.service"
@@ -321,8 +321,8 @@ class TestEnvFileParsing:
 
         beta_token = ss.set_secret_scope(beta_scope)
         try:
-            assert ss.get_secret("PIPEDREAM_PROVIDER_GRANT_FILE") == (
-                "%d/provider-beta"
+            assert ss.get_secret("API_SERVER_KEY") == (
+                "%d/apikey-beta"
             )
         finally:
             ss.reset_secret_scope(beta_token)

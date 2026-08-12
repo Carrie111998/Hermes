@@ -1,15 +1,19 @@
 """Managed evaOS authentication for Pipedream MCP transports.
 
 The desktop runtime receives only a short-lived MCP lease.  The deployment
-broker secret and profile-scoped per-app provider grant are read from
-root-owned files only while minting that lease.  They are never persisted in
-the manager, included in errors, or exposed to MCP tool/model surfaces.
+broker secret is read from a root-owned file only while minting that lease.
+It is never persisted in the manager, included in errors, or exposed to MCP
+tool/model surfaces.
+
+The mint request carries only ``{action, app_slug}``: the per-user Pipedream
+identity is resolved SERVER-SIDE by the desktop-runtime-session edge function
+from the profile that owns the broker secret.  No per-app grant handle,
+catalog, alias or client-side identity key is sent or required.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
 import stat
@@ -24,7 +28,6 @@ import httpx
 
 _APP_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _ACCOUNT_ID_RE = re.compile(r"^apn_[A-Za-z0-9_-]+$")
-_GRANT_HANDLE_RE = re.compile(r"^[A-Za-z0-9._~:-]{16,512}$")
 _CREDENTIAL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _LEASE_ENDPOINT_PATH = "/functions/v1/desktop-runtime-session"
 _MCP_ORIGIN = ("https", "remote.mcp.pipedream.net")
@@ -48,7 +51,6 @@ class EvaosLeaseError(RuntimeError):
 class _LeaseSourceMaterial:
     endpoint: str
     broker_secret: str
-    provider_grant: str
     app_slug: str
 
 
@@ -84,15 +86,8 @@ def _default_profile_resolver() -> str:
     return str(get_hermes_home().expanduser().resolve())
 
 
-def _reject_duplicate_pairs(pairs):
-    result = dict(pairs)
-    if len(result) != len(pairs):
-        raise ValueError("duplicate provider grant key")
-    return result
-
-
 class EvaosLeaseSource:
-    """Resolve the current profile's broker secret and selected app grant."""
+    """Resolve the current profile's broker secret for a managed app."""
 
     def __init__(
         self,
@@ -265,30 +260,6 @@ class EvaosLeaseSource:
             raise EvaosLeaseError("managed MCP broker secret file is malformed")
         return value
 
-    def _provider_grant(self) -> str:
-        raw = self._secure_file_text(
-            self._setting("PIPEDREAM_PROVIDER_GRANT_FILE"),
-            label="managed MCP provider grant file",
-        )
-        try:
-            grant_map = json.loads(raw, object_pairs_hook=_reject_duplicate_pairs)
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise EvaosLeaseError("managed MCP provider grant map is malformed") from exc
-        if not isinstance(grant_map, dict) or not grant_map:
-            raise EvaosLeaseError("managed MCP provider grant map is malformed")
-        if any(
-            not isinstance(app_slug, str)
-            or not _APP_SLUG_RE.fullmatch(app_slug)
-            or not isinstance(handle, str)
-            or not _GRANT_HANDLE_RE.fullmatch(handle)
-            for app_slug, handle in grant_map.items()
-        ):
-            raise EvaosLeaseError("managed MCP provider grant map is malformed")
-        selected = grant_map.get(self._app_slug)
-        if selected is None:
-            raise EvaosLeaseError("managed MCP provider grant is unavailable")
-        return selected
-
     def read(self) -> _LeaseSourceMaterial:
         try:
             current_profile = self._profile_resolver()
@@ -299,7 +270,6 @@ class EvaosLeaseSource:
         return _LeaseSourceMaterial(
             endpoint=self._endpoint(),
             broker_secret=self._broker_secret(),
-            provider_grant=self._provider_grant(),
             app_slug=self._app_slug,
         )
 
@@ -387,7 +357,6 @@ class EvaosLeaseManager:
         request_headers = {
             "Content-Type": "application/json",
             "X-Evaos-Desktop-Broker-Secret": material.broker_secret,
-            "X-Evaos-Provider-Grant": material.provider_grant,
         }
         request_body = {
             "action": "pipedream_mcp_lease",
@@ -402,7 +371,7 @@ class EvaosLeaseManager:
         status_code = getattr(response, "status_code", None)
         if status_code != 200:
             if status_code == 401:
-                message = "managed MCP broker or provider grant was rejected"
+                message = "managed MCP broker secret was rejected"
             elif status_code == 403:
                 message = "managed MCP profile authority is no longer valid"
             elif status_code == 400:

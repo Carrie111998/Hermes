@@ -115,8 +115,11 @@ _GLOBAL_ENV_EXACT = frozenset({
     "API_SERVER_ENABLED", "API_SERVER_HOST", "API_SERVER_PORT",
     "API_SERVER_CORS_ORIGINS",
     # Managed evaOS desktop broker location.  The endpoint, shared broker
-    # secret path, and systemd credential directory are deployment-level; the
-    # per-profile provider grant pointer intentionally remains scoped.
+    # secret path, and systemd credential directory are deployment-level.
+    # There is deliberately no per-app provider grant pointer here or
+    # anywhere else: the Pipedream mint request carries only
+    # ``{action, app_slug}`` and the per-user identity is resolved
+    # server-side, so no per-profile grant file exists to scope (#89).
     "EVAOS_DESKTOP_RUNTIME_SESSION_URL",
     "PIPEDREAM_AGENT_BROKER_SECRET_FILE",
     "CREDENTIALS_DIRECTORY",
