@@ -14,6 +14,21 @@ _spec.loader.exec_module(plugin)
 from src.registry import SubagentRegistry
 
 
+@pytest.fixture(autouse=True)
+def _isolate_persist_store(tmp_path, monkeypatch):
+    """Point the persist store at a temp dir and reset the registry per test.
+
+    The plugin now persists on subagent_start/stop and restores on register(),
+    so every test must isolate the disk store from the real HERMES_HOME store
+    and start from a clean in-memory registry.
+    """
+    monkeypatch.setattr(
+        plugin, "default_persist_root", lambda: str(tmp_path / "subagent-handles")
+    )
+    plugin.registry = SubagentRegistry()
+    return plugin.registry
+
+
 class MockCtx:
     def __init__(self) -> None:
         self._plugins = {}

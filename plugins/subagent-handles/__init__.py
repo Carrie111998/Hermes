@@ -1,7 +1,14 @@
 import logging
 from src.registry import SubagentHandle, registry
+from src.persister import default_persist_root
 
 logger = logging.getLogger(__name__)
+
+
+def _get_persister():
+    from src.persister import SessionPersister
+
+    return SessionPersister(default_persist_root())
 
 
 def _on_subagent_start(**kwargs: object) -> None:
@@ -25,6 +32,11 @@ def _on_subagent_start(**kwargs: object) -> None:
             role=str(child_role) if child_role else "",
         )
         registry.register(handle)
+        # Persist immediately so a crash mid-run doesn't lose the handle.
+        try:
+            _get_persister().checkpoint(handle)
+        except Exception:
+            logger.debug("subagent_start checkpoint failed", exc_info=True)
     except ValueError:
         # Duplicate — already registered; keep existing handle.
         pass
@@ -43,6 +55,11 @@ def _on_subagent_stop(**kwargs: object) -> None:
         for handle in registry:
             if handle.session_id == target:
                 registry.set_state(handle.subagent_id, "done")
+                # Persist the terminal state so a later session sees 'done'.
+                try:
+                    _get_persister().checkpoint(handle)
+                except Exception:
+                    logger.debug("subagent_stop checkpoint failed", exc_info=True)
                 break
     except Exception:
         logger.debug("subagent_stop registry update failed", exc_info=True)
@@ -60,3 +77,11 @@ def register(ctx) -> None:
         _register_tools(ctx)
     except Exception:
         logger.debug("subagent_send/cancel tool registration failed", exc_info=True)
+
+    # Restore handles persisted by a previous process run. This is the
+    # restart-survival path: if a prior session registered children then
+    # crashed, this session can reclaim and steer them.
+    try:
+        _get_persister().restore(registry)
+    except Exception:
+        logger.debug("subagent_start restore from disk failed", exc_info=True)

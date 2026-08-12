@@ -63,3 +63,89 @@ def test_checkpoint_atomic():
         p.checkpoint(SubagentHandle(subagent_id="a1", session_id="s1", goal="g1"))
         assert os.listdir(root) == ["a1.json"]
         assert not os.path.exists(os.path.join(root, "a1.json.tmp"))
+
+
+# --- Integration: hooks persist, plugin load restores (restart survival) ---
+
+def test_hook_start_checkpoints_to_disk(monkeypatch, tmp_path):
+    """subagent_start hook must write the handle to the persist store."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "subagent_handles_plugin", os.path.join(os.path.dirname(__file__), "..", "__init__.py")
+    )
+    plugin = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(plugin)
+
+    store = tmp_path / "subagent-handles"
+    monkeypatch.setattr(plugin, "default_persist_root", lambda: str(store))
+
+    plugin._on_subagent_start(
+        child_subagent_id="sa-restart-1",
+        child_session_id="sess-restart-1",
+        child_goal="persist me",
+        parent_subagent_id="p1",
+        child_role="coder",
+    )
+
+    assert (store / "sa-restart-1.json").exists()
+
+
+def test_register_restores_persisted_handles(monkeypatch, tmp_path):
+    """plugin.register() must reclaim handles persisted by a prior run."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "subagent_handles_plugin", os.path.join(os.path.dirname(__file__), "..", "__init__.py")
+    )
+    plugin = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(plugin)
+
+    store = tmp_path / "subagent-handles"
+    store.mkdir(parents=True, exist_ok=True)
+    p = SessionPersister(str(store))
+    p.checkpoint(SubagentHandle(subagent_id="sa-old", session_id="sess-old", goal="old run"))
+
+    monkeypatch.setattr(plugin, "default_persist_root", lambda: str(store))
+
+    class FakeCtx:
+        def register_plugin(self, *a, **k): pass
+        def register_hook(self, *a, **k): pass
+        def register_tool(self, *a, **k): pass
+
+    # Start from a clean in-memory registry to prove restore (the disk store
+    # holds the only copy of sa-old), not in-memory carryover.
+    plugin.registry = SubagentRegistry()
+
+    plugin.register(FakeCtx())
+
+    handle = plugin.registry.resolve("sa-old")
+    assert handle is not None
+    assert handle.state == "running"
+
+
+def test_stop_hook_persists_done_state(monkeypatch, tmp_path):
+    """subagent_stop must persist the terminal 'done' state."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "subagent_handles_plugin", os.path.join(os.path.dirname(__file__), "..", "__init__.py")
+    )
+    plugin = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(plugin)
+
+    store = tmp_path / "subagent-handles"
+    monkeypatch.setattr(plugin, "default_persist_root", lambda: str(store))
+
+    plugin._on_subagent_start(
+        child_subagent_id="sa-x",
+        child_session_id="sess-x",
+        child_goal="g",
+        parent_subagent_id=None,
+    )
+    plugin._on_subagent_stop(child_session_id="sess-x")
+
+    p = SessionPersister(str(store))
+    loaded = p.load("sa-x")
+    assert loaded is not None
+    assert loaded.state == "done"

@@ -7,6 +7,18 @@ from typing import Dict, Optional
 from src.registry import SubagentHandle, SubagentRegistry
 
 
+def default_persist_root() -> str:
+    """Return the default disk-backed store root under HERMES_HOME.
+
+    Scoped to the active profile and shared by the start/stop hooks and the
+    cancel tool so all writers land in the same store (survive-restart parity).
+    """
+    _home = os.environ.get(
+        "HERMES_HOME", os.path.join(os.path.expanduser("~"), "AppData", "Local", "hermes")
+    )
+    return os.path.join(_home, "state", "subagent-handles")
+
+
 @dataclass
 class SessionPersister:
     root: str

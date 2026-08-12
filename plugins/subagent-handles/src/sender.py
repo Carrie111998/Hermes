@@ -54,6 +54,14 @@ def handle_cancel_subagent(params: Dict[str, Any]) -> Dict[str, Any]:
     updated = registry.set_state(subagent_id, "cancelled")
     if not updated:
         return {"ok": False, "error": f"subagent_id={subagent_id!r} could not be cancelled", "subagent_id": subagent_id}
+    # Persist the cancelled state so a later session sees it (same store as
+    # the hooks use — survive-restart parity with start/stop).
+    try:
+        from src.persister import SessionPersister, default_persist_root
+
+        SessionPersister(default_persist_root()).checkpoint(handle)
+    except Exception:
+        logger.debug("cancel_subagent checkpoint failed", exc_info=True)
     return {
         "ok": True,
         "subagent_id": subagent_id,
