@@ -42,6 +42,7 @@ from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
+from agent.memory_provenance import classify_user_memory_intent
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
@@ -680,6 +681,20 @@ def build_turn_context(
 
     # Preserve the original user message (no nudge injection).
     original_user_message = persist_user_message if persist_user_message is not None else user_message
+
+    # Establish host-owned causal provenance before any model tool can run.
+    # Display-typed turns are synthetic timeline events; background-review
+    # agents are never allowed to inherit user authority from their prompt.
+    _memory_turn_synthetic = bool(
+        persist_user_display_kind
+        or getattr(agent, "_memory_write_origin", "assistant_tool") == "background_review"
+        or getattr(agent, "_memory_write_context", "foreground") == "background_review"
+    )
+    agent._memory_user_turn_synthetic = _memory_turn_synthetic
+    agent._memory_user_intent = classify_user_memory_intent(
+        original_user_message,
+        synthetic=_memory_turn_synthetic,
+    )
 
     # Track memory nudge trigger (turn-based, checked here).
     should_review_memory = False

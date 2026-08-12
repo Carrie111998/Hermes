@@ -27,6 +27,7 @@ from unittest.mock import patch
 import pytest
 
 from agent.turn_context import build_turn_context
+from agent.memory_provenance import EXPLICIT_REMEMBER, NONE
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -104,3 +105,32 @@ def test_a_real_user_turn_stays_untyped(agent_db):
 
     row, = [r for r in db.get_messages_as_conversation(sid) if r["role"] == "user"]
     assert row.get("display_kind") is None
+
+
+def test_real_turn_provenance_reaches_memory_write_metadata(agent_db):
+    agent, _db, _sid = agent_db
+
+    _build(
+        agent,
+        user_message="Remember this for future sessions: use SQLite.",
+        persist_user_message="Remember this for future sessions: use SQLite.",
+    )
+
+    assert agent._memory_user_intent == EXPLICIT_REMEMBER
+    metadata = agent._build_memory_write_metadata(task_id="task-1", tool_call_id="call-1")
+    assert metadata["host_confirmed_user_memory"] is True
+    assert metadata["user_memory_intent"] == EXPLICIT_REMEMBER
+
+
+def test_synthetic_turn_provenance_fails_closed_for_memory_write(agent_db):
+    agent, _db, _sid = agent_db
+
+    _build(
+        agent,
+        user_message="Remember this for future sessions: synthetic content.",
+        persist_user_message="Remember this for future sessions: synthetic content.",
+        persist_user_display_kind="auto_continue",
+    )
+
+    assert agent._memory_user_intent == NONE
+    assert agent._build_memory_write_metadata()["host_confirmed_user_memory"] is False
