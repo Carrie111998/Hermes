@@ -527,6 +527,39 @@ class TestWindowsAbsolutePathFolding:
         assert key is None
 
 
+class TestSingleSegmentPosixHomeFolding:
+    def test_absolute_ssh_write_requires_approval(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/root")
+
+        dangerous, key, _ = detect_dangerous_command(
+            "cat key >> /root/.ssh/authorized_keys"
+        )
+
+        assert dangerous is True
+        assert key is not None
+
+    @pytest.mark.parametrize("home", ["/", "C:\\"])
+    def test_filesystem_root_is_not_treated_as_home(self, monkeypatch, home):
+        monkeypatch.setenv("HOME", home)
+
+        dangerous, key, _ = detect_dangerous_command(
+            "cat key >> /root/.ssh/authorized_keys"
+        )
+
+        assert dangerous is False
+        assert key is None
+
+    def test_nested_same_name_is_not_treated_as_home(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/root")
+
+        dangerous, key, _ = detect_dangerous_command(
+            "cat key >> /srv/root/.ssh/authorized_keys"
+        )
+
+        assert dangerous is False
+        assert key is None
+
+
 class TestProjectSensitiveTeePattern:
     def test_tee_to_dotenv_with_trailing_file_arg_requires_approval(self):
         # tee writes to every file argument, so `.env` is overwritten even when

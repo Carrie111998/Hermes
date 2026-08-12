@@ -1129,24 +1129,25 @@ def _home_prefix_fold_regex(path: str):
     patterns (``~/.ssh/authorized_keys``) still match. The trailing tail is
     required (``+``), so a bare home with no path under it is not folded.
 
-    Returns ``None`` for an unset or degenerate path — one with fewer than two
-    components below the root — so a stray HOME / HERMES_HOME such as ``/``,
-    ``C:\\`` or ``""`` cannot rewrite unrelated filesystem prefixes. Cached
-    because the resolved home is stable across calls on this hot path.
+    Returns ``None`` for an unset or filesystem-root path, so a stray HOME /
+    HERMES_HOME such as ``/``, ``C:\\`` or ``""`` cannot rewrite unrelated
+    filesystem prefixes. Single-segment POSIX homes such as ``/root`` are
+    valid. Cached because the resolved home is stable across calls on this hot
+    path.
     """
     if not path:
         return None
     components = [c for c in re.split(r"[/\\]+", path) if c]
-    # Require at least two non-empty components below the root. For POSIX this
-    # mirrors the historical ``count("/") >= 2`` guard (``/home/alice`` folds,
-    # ``/home`` does not); for Windows it rejects a bare drive root (``C:\\``)
-    # while accepting a real home (``C:\\Users\\alice``).
-    if len(components) < 2:
+    posix_absolute = path.startswith("/")
+    # POSIX has no drive component, so one component is a valid home. Other
+    # spellings keep the two-component guard, which rejects Windows drive roots.
+    if not components or (not posix_absolute and len(components) < 2):
         return None
     body = r"[/\\]+".join(re.escape(c) for c in components)
-    # Optional leading root separator (POSIX ``/`` or UNC ``\\``); a Windows
-    # drive letter is captured as the first component.
-    return re.compile(r"[/\\]*" + body + _PATH_TAIL)
+    # Keep the root separator mandatory for POSIX paths: besides preserving
+    # absoluteness, this prevents /root from matching the suffix of /srv/root.
+    root = r"[/\\]+" if posix_absolute else r"[/\\]*"
+    return re.compile(root + body + _PATH_TAIL)
 
 
 def _fold_home_prefixes(command: str, paths, replacement: str) -> str:
