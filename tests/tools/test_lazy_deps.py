@@ -448,3 +448,32 @@ class TestInstallSpecs:
         result = ld.install_specs(["honcho-ai==2.2.0"])
         assert result.ok is False
         assert "disk on fire" in result.stderr
+
+
+class TestLazyInstallLock:
+    def test_lock_acquires_and_releases(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(ld, "_lazy_install_lock_path", lambda: tmp_path / "lazy.lock")
+        with ld._lazy_install_lock():
+            pass  # no exception — lock acquired and released
+
+    def test_ensure_rechecks_under_lock_and_skips_pip(self, monkeypatch):
+        """A concurrent process installing between check and lock must make the
+        in-lock re-check skip the second install."""
+        monkeypatch.setitem(ld.LAZY_DEPS, "test.recheck", ("zzzfake>=1",))
+        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+
+        calls = {"missing": 0}
+
+        def fake_missing(feature):
+            calls["missing"] += 1
+            # First call (pre-lock): missing. Second call (in-lock re-check):
+            # a concurrent process already installed it → satisfied.
+            return ("zzzfake>=1",) if calls["missing"] == 1 else ()
+
+        monkeypatch.setattr(ld, "feature_missing", fake_missing)
+        monkeypatch.setattr(
+            ld, "_venv_pip_install",
+            lambda *a, **kw: pytest.fail("pip should not be called — feature already installed"),
+        )
+        ld.ensure("test.recheck", prompt=False)  # no exception, pip skipped
+        assert calls["missing"] == 2

@@ -75,6 +75,8 @@ import site
 import subprocess
 import sys
 import sysconfig
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -82,6 +84,67 @@ from typing import Any, Callable, Optional
 from hermes_cli._subprocess_compat import windows_hide_flags
 
 logger = logging.getLogger(__name__)
+
+# Cross-process file lock for the lazy-install critical section (fcntl on
+# POSIX, msvcrt on Windows). Mirrors tools.memory_tool._file_lock.
+_fcntl = None
+_msvcrt = None
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - Windows
+    try:
+        import msvcrt as _msvcrt
+    except ImportError:  # pragma: no cover
+        pass
+
+
+def _lazy_install_lock_path() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home()) / "lazy_deps.lock"
+    except Exception:
+        return Path(tempfile.gettempdir()) / "hermes_lazy_deps.lock"
+
+
+@contextmanager
+def _lazy_install_lock():
+    """Serialize check-wipe-install-stamp across processes.
+
+    Two first-uses of the same feature used to both run ``_venv_pip_install``
+    into the same target, and a durable-target ABI wipe (``_ensure_target_ready``
+    ``rmtree``) could interleave with another process installing/importing.
+    """
+    lock_path = _lazy_install_lock_path()
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:  # pragma: no cover - best-effort
+        yield
+        return
+    if _fcntl is None and _msvcrt is None:  # pragma: no cover - exotic platform
+        yield
+        return
+    fd = open(lock_path, "a+", encoding="utf-8")
+    try:
+        if _fcntl is not None:
+            _fcntl.flock(fd, _fcntl.LOCK_EX)
+        else:
+            fd.seek(0)
+            _msvcrt.locking(fd.fileno(), _msvcrt.LK_LOCK, 1)
+        yield
+    finally:
+        if _fcntl is not None:
+            try:
+                _fcntl.flock(fd, _fcntl.LOCK_UN)
+            except OSError:  # pragma: no cover
+                pass
+        elif _msvcrt is not None:
+            try:
+                fd.seek(0)
+                _msvcrt.locking(fd.fileno(), _msvcrt.LK_UNLCK, 1)
+            except OSError:  # pragma: no cover
+                pass
+        fd.close()
 
 
 # =============================================================================
@@ -941,7 +1004,14 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
             )
 
     logger.info("Lazy-installing %s for feature %r", " ".join(missing), feature)
-    result = _venv_pip_install(missing)
+    with _lazy_install_lock():
+        # Re-check under the lock — a concurrent process may have installed the
+        # feature between our first check and now, so don't double-install.
+        missing = feature_missing(feature)
+        if not missing:
+            logger.info("Feature %r installed by a concurrent process; skipping", feature)
+            return
+        result = _venv_pip_install(missing)
     if not result.success:
         # Surface the actual pip error so the user can debug PyPI-side
         # issues (404 quarantine, network down, etc.).
