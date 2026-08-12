@@ -1274,6 +1274,7 @@ def _redecorate_prompt_cache_for_provider(
             native_anthropic=agent._use_native_cache_layout,
             static_system_prefix=static if isinstance(static, str) else None,
             direct_native_tool_cache=direct_tool_cache,
+            model=agent.model,
         )
         messages = plan.messages
         planned_tools = plan.tools
@@ -2121,6 +2122,7 @@ def run_conversation(
                     else None
                 ),
                 direct_native_tool_cache=agent._direct_native_anthropic_tool_cache_capability(),
+                model=agent.model,
             )
             api_messages = _initial_cache_plan.messages
             tools_for_api = _initial_cache_plan.tools

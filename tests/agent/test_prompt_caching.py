@@ -467,3 +467,56 @@ class TestStripAnthropicCacheControl:
 
 
 
+
+
+# =========================================================================
+# Effective TTL (Qwen 1h → 5m clamp)
+# =========================================================================
+
+def _collect_markers(messages):
+    markers = []
+    for m in messages or []:
+        cc = m.get("cache_control")
+        if cc:
+            markers.append(cc)
+        content = m.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("cache_control"):
+                    markers.append(part["cache_control"])
+    return markers
+
+
+class TestEffectiveCacheTtl:
+    def test_qwen_1h_is_clamped_to_5m(self):
+        from agent.prompt_caching import effective_cache_ttl
+
+        assert effective_cache_ttl("1h", model="qwen3.6-plus") == "5m"
+        assert effective_cache_ttl("1h", model="Qwen3-Plus") == "5m"  # case-insensitive
+        assert effective_cache_ttl("1h", model="qwen-max") == "5m"
+        # Non-Qwen routes keep the requested TTL.
+        assert effective_cache_ttl("1h", model="claude-3-5-sonnet") == "1h"
+        assert effective_cache_ttl("1h", model="") == "1h"
+        # 5m never changes.
+        assert effective_cache_ttl("5m", model="qwen3.6-plus") == "5m"
+
+    def test_qwen_route_never_emits_1h_marker(self):
+        from agent.prompt_caching import build_prompt_cache_plan
+
+        msgs = [{"role": "user", "content": "hello"}]
+        qwen_plan = build_prompt_cache_plan(
+            msgs, None, cache_ttl="1h", model="qwen3.6-plus"
+        )
+        qwen_markers = _collect_markers(qwen_plan.messages)
+        assert qwen_markers, "expected cache markers on the qwen plan"
+        assert all(m.get("ttl") != "1h" for m in qwen_markers), (
+            "qwen route must not emit an unsupported 1h marker (docs: 5m explicit cache)"
+        )
+
+        claude_plan = build_prompt_cache_plan(
+            msgs, None, cache_ttl="1h", model="claude-3-5-sonnet"
+        )
+        claude_markers = _collect_markers(claude_plan.messages)
+        assert any(m.get("ttl") == "1h" for m in claude_markers), (
+            "non-qwen route must keep the requested 1h marker"
+        )
