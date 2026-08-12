@@ -135,11 +135,14 @@ class AcmeProfile(ProviderProfile):
         时需要此方法。默认：({}, {})。"""
         return {}, {}
 
-    def fetch_models(self, *, api_key=None, timeout=8.0) -> list[str] | None:
+    def fetch_models(self, *, api_key=None, base_url=None, timeout=8.0) -> list[str] | None:
         """实时目录获取。默认使用 Bearer 认证访问 {models_url or base_url}/models。
         以下情况需覆盖：自定义认证（Anthropic）、无 REST 端点（Bedrock → None），
-        或公开/无认证目录（OpenRouter）。"""
-        return super().fetch_models(api_key=api_key, timeout=timeout)
+        或公开/无认证目录（OpenRouter）。
+        
+        使用较窄签名（仅 api_key/timeout）覆盖的第三方插件会通过签名检查自动检测，
+        并在调用时不传递 base_url。"""
+        return super().fetch_models(api_key=api_key, base_url=base_url, timeout=timeout)
 ```
 
 ## Hook 参考示例
