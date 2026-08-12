@@ -1591,6 +1591,27 @@ def _docker_persistent_home_host_root() -> Optional[Path]:
     return root if root.is_dir() else None
 
 
+def _is_docker_container_hermes_path(candidate: Path) -> bool:
+    """True for container paths under ``/root/.hermes`` (credential + cache)."""
+    posix = candidate.as_posix()
+    return posix == "/root/.hermes" or posix.startswith("/root/.hermes/")
+
+
+def _docker_untranslated_hermes_path_must_not_host_resolve(candidate: Path) -> bool:
+    """Refuse host fallback for Docker ``/root/.hermes`` paths that are not cache mounts.
+
+    ``_translate_docker_container_media_path`` already skips the persistent
+    ``/root`` home bind for these paths so sandbox copies of ``auth.json`` /
+    ``.env`` cannot sneak past the host denylist. If translation then returns
+    None, ``validate_media_delivery_path`` must not ``resolve()`` the container
+    path against the gateway host — a root-run gateway has a real
+    ``/root/.hermes/auth.json`` that would otherwise be delivered.
+    """
+    if os.getenv("TERMINAL_ENV", "").strip().lower() != "docker":
+        return False
+    return _is_docker_container_hermes_path(candidate)
+
+
 def _cache_dir_container_mounts() -> List[Tuple[Path, Path]]:
     """(host, container) pairs for the auto-mounted Hermes cache dirs.
 
@@ -1652,7 +1673,7 @@ def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
         # the home mount would resolve to sandbox-home copies OUTSIDE the
         # host-side credential denylist prefixes — refuse instead so the
         # normal "container path doesn't exist on host" rejection applies.
-        if not candidate.as_posix().startswith("/root/.hermes"):
+        if not _is_docker_container_hermes_path(candidate):
             mounts.append((default_home, Path("/root")))
 
     if not mounts:
@@ -1725,6 +1746,12 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     translated = _translate_docker_container_media_path(expanded)
     if translated is not None:
         resolved = translated
+    elif _docker_untranslated_hermes_path_must_not_host_resolve(expanded):
+        # Translation already refused /root/.hermes credential paths (they are
+        # not cache mounts). Falling back to host resolve would treat the
+        # gateway's own /root/.hermes/auth.json as the container file whenever
+        # the process runs as root.
+        return None
     else:
         try:
             resolved = expanded.resolve(strict=True)

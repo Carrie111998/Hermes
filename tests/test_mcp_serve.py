@@ -43,6 +43,15 @@ def sessions_dir(tmp_path):
     return sdir
 
 
+def _bump_state_db_mtime(path):
+    """Advance state.db mtime_ns so EventBridge's poll gate opens."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_bytes(b"placeholder")
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+
+
 @pytest.fixture
 def sample_sessions():
     return {
@@ -1303,6 +1312,7 @@ class TestEventBridgePollE2E:
 
         db_path = tmp_path / "state.db"
         db_path.write_text("placeholder")
+        monkeypatch.setattr(mcp_serve, "_state_db_path", lambda: db_path)
         session_id = "20260329_150000_history"
         monkeypatch.setattr(
             mcp_serve, "_load_sessions_index",
@@ -1335,7 +1345,7 @@ class TestEventBridgePollE2E:
             "id": 2, "role": "assistant", "content": "arrived after start",
             "timestamp": "2026-03-29T15:05:00",
         })
-        os.utime(db_path, None)  # bump mtime so the poll gate opens
+        _bump_state_db_mtime(db_path)
         bridge._poll_once(DB())
         events = bridge.poll_events(after_cursor=0)["events"]
         assert len(events) == 1
@@ -1349,6 +1359,7 @@ class TestEventBridgePollE2E:
 
         db_path = tmp_path / "state.db"
         db_path.write_text("placeholder")
+        monkeypatch.setattr(mcp_serve, "_state_db_path", lambda: db_path)
         index: dict = {}
         messages: dict = {}
         monkeypatch.setattr(mcp_serve, "_load_sessions_index", lambda: dict(index))
@@ -1373,7 +1384,7 @@ class TestEventBridgePollE2E:
             "id": 1, "role": "user", "content": "hello after baseline",
             "timestamp": "2026-03-29T15:10:00",
         }]
-        os.utime(db_path, None)
+        _bump_state_db_mtime(db_path)
         bridge._poll_once(DB())
 
         events = bridge.poll_events(after_cursor=0)["events"]

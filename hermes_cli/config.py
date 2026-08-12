@@ -3102,7 +3102,7 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
     if config_path is None:
         config_path = get_config_path()
     try:
-        config_path.stat()
+        file_stat = config_path.stat()
     except FileNotFoundError:
         return
     except OSError as exc:
@@ -3110,6 +3110,15 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
             f"Refusing to overwrite {config_path}: existing config.yaml cannot be accessed "
             f"({exc}). Fix the file permissions or move it aside first."
         ) from exc
+
+    # Root bypasses DAC, so open() succeeds on mode 000. Treat a file with no
+    # permission bits as unreadable anyway — otherwise a chmod 000 config is
+    # silently replaced with defaults.
+    if stat.S_IMODE(file_stat.st_mode) == 0:
+        raise RuntimeError(
+            f"Refusing to overwrite {config_path}: existing config.yaml is mode 000 "
+            "(unreadable). Fix the file permissions or move it aside first."
+        )
 
     try:
         with open(config_path, "rb") as f:
