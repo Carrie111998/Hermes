@@ -900,11 +900,19 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     # Read timeout from environment variable, default to 300 seconds (5 minutes)
                     # to accommodate slower systems like Unraid NAS
                     npm_install_timeout = env_int("WHATSAPP_NPM_INSTALL_TIMEOUT", 300)
-                    install_result = subprocess.run(
+                    # run_text_capture, not capture_output=True: _npm_bin is
+                    # npm.cmd on Windows, so the direct child is cmd.exe and the
+                    # install runs in a node grandchild that inherits the
+                    # capture pipes. subprocess.run would kill only cmd.exe on
+                    # timeout and then block re-draining a pipe that never
+                    # reaches EOF, so npm_install_timeout would not bound this
+                    # at all — a wedged registry would hang gateway startup
+                    # silently instead of failing after 5 minutes.
+                    from hermes_cli._subprocess_compat import run_text_capture
+
+                    install_result = run_text_capture(
                         [_npm_bin, "install", "--silent"],
                         cwd=str(bridge_dir),
-                        capture_output=True,
-                        text=True,
                         timeout=npm_install_timeout,
                         env=with_hermes_node_path(),
                     )

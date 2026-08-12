@@ -33,7 +33,7 @@ import signal
 import subprocess
 import sys
 import tempfile
-from typing import Sequence
+from typing import Mapping, Optional, Sequence
 
 __all__ = [
     "IS_WINDOWS",
@@ -339,6 +339,8 @@ def run_text_capture(
     *,
     timeout: float,
     cwd: str | os.PathLike | None = None,
+    env: Mapping[str, str] | None = None,
+    stdin: int | None = subprocess.DEVNULL,
 ) -> subprocess.CompletedProcess:
     """``subprocess.run(argv, capture_output=True, text=True, timeout=timeout)``
     that reliably honours ``timeout`` on Windows.
@@ -374,9 +376,19 @@ def run_text_capture(
     working. May raise ``OSError`` / ``FileNotFoundError`` at spawn, also like
     ``subprocess.run``.
 
-    ``cwd`` is passed straight through to :class:`subprocess.Popen` for callers
-    that must run the command from a particular directory (``npm audit`` in
-    ``hermes doctor``, for one).
+    ``cwd`` and ``env`` are passed straight through to :class:`subprocess.Popen`
+    for callers that must run the command from a particular directory
+    (``npm audit`` in ``hermes doctor``, for one) or under a doctored
+    environment (the Node-ecosystem callers all prepend Hermes' managed Node to
+    ``PATH`` via ``with_hermes_node_path()``).
+
+    ``stdin`` defaults to ``DEVNULL`` rather than inheriting the parent's.
+    Inheriting is the second way this call can outlive its timeout: a child that
+    prompts (``npm`` asking to install a missing peer, ``bash -i`` reading a
+    profile) blocks on a read from a stdin nobody is driving, and in a gateway
+    daemon there is no terminal behind it at all. Every caller of this helper
+    wants a non-interactive probe, so closing stdin is the right default; pass
+    ``stdin=None`` to opt back into inheritance.
     """
     if IS_WINDOWS:
         popen_kwargs: dict = {"creationflags": _CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW}
@@ -392,7 +404,9 @@ def run_text_capture(
             list(argv),
             stdout=out_f,
             stderr=err_f,
+            stdin=stdin,
             cwd=cwd,
+            env=dict(env) if env is not None else None,
             **popen_kwargs,
         )
         try:
