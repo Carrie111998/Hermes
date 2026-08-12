@@ -65,6 +65,24 @@ const complete = (text: string) =>
 const completePreviewed = (text: string) =>
   act(() => handleEvent!({ payload: { text, response_previewed: true }, session_id: SID, type: 'message.complete' }))
 
+const toolStart = (toolId = 'tool-1', name = 'terminal') =>
+  act(() =>
+    handleEvent!({
+      payload: { name, tool_id: toolId },
+      session_id: SID,
+      type: 'tool.start'
+    })
+  )
+
+const toolComplete = (toolId = 'tool-1', name = 'terminal') =>
+  act(() =>
+    handleEvent!({
+      payload: { name, tool_id: toolId },
+      session_id: SID,
+      type: 'tool.complete'
+    })
+  )
+
 function getState(): ClientSessionState {
   return sessionStates.get(SID) ?? createClientSessionState()
 }
@@ -202,6 +220,31 @@ describe('useMessageStream interim text sealing', () => {
     expect(texts.filter(t => t === 'same reply')).toHaveLength(1)
   })
 
+  it('settles identical final after real tool.start/tool.complete without double-bubble (JohnZhong #76191)', async () => {
+    await mountStream()
+    await start()
+
+    // Exact gateway sequence reported against main / older heads:
+    // message.start → message.interim → tool.start → tool.complete → message.complete
+    // The tool-reseed path must not mint a second assistant bubble for the same reply.
+    await interim('same reply')
+    await toolStart('tool-reseed-1', 'terminal')
+    await toolComplete('tool-reseed-1', 'terminal')
+    await complete('same reply')
+
+    const texts = assistantMessages()
+    expect(texts.filter(t => t === 'same reply')).toHaveLength(1)
+
+    const assistants = getState().messages.filter(m => m.role === 'assistant' && !m.hidden)
+    const reply = assistants.find(m => chatMessageText(m) === 'same reply')
+    expect(reply).toBeTruthy()
+    // Tool events should have attached a tool-call part on the settled row.
+    const partTypes = (reply?.parts ?? []).map(part => part.type)
+    expect(partTypes).toContain('tool-call')
+    expect(partTypes).toContain('text')
+    expect(reply?.interim).not.toBe(true)
+  })
+
   it('settles a prefix-extended final onto a non-previewed interim (streamed + trailing delta)', async () => {
     await mountStream()
     await start()
@@ -215,6 +258,40 @@ describe('useMessageStream interim text sealing', () => {
     const texts = assistantMessages()
     expect(texts.filter(t => t.includes('partial'))).toHaveLength(1)
     expect(texts[0]).toBe('partial answer continued')
+  })
+
+
+  it('does not delete an earlier distinct interim when collapsing post-seal stream (R9 scope)', async () => {
+    await mountStream()
+    await start()
+
+    await interim('first narration segment')
+    await delta('The answer is 42.')
+    await interim('The answer is 42.')
+    await delta(' Verified.')
+    await complete('The answer is 42. Verified.')
+
+    const texts = assistantMessages()
+    expect(texts).toContain('first narration segment')
+    expect(texts.filter(t => t === 'The answer is 42. Verified.')).toHaveLength(1)
+    expect(texts).toHaveLength(2)
+  })
+
+  it('collapses sealed interim + trailing post-seal deltas into one final bubble (R9 / double-bubble)', async () => {
+    await mountStream()
+    await start()
+
+    // Real double-bubble class: interim seals the stream (streamId cleared),
+    // then more deltas arrive before complete. Those mint a fresh stream
+    // bubble; complete must not leave BOTH the sealed interim and the final.
+    await delta('The answer is 42.')
+    await interim('The answer is 42.')
+    await delta(' Verified.')
+    await complete('The answer is 42. Verified.')
+
+    const texts = assistantMessages()
+    expect(texts).toHaveLength(1)
+    expect(texts[0]).toBe('The answer is 42. Verified.')
   })
 
   it('appends a genuinely different final as its own bubble (two real assistant segments)', async () => {
