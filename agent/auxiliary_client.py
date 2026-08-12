@@ -3269,7 +3269,21 @@ def _compat_runtime_main() -> Optional[Dict[str, Any]]:
     )
     if values == _RUNTIME_MAIN_COMPAT_SNAPSHOT:
         return None
-    return dict(zip(_MAIN_RUNTIME_FIELDS, values))
+    # ``reset_runtime_main`` deliberately restores only the ContextVar.  Its
+    # compatibility mirrors remain at the last published value so legacy
+    # introspection still works, and a later direct patch may change just one
+    # field.  Returning the complete mirror tuple here would turn that partial
+    # patch into a new runtime containing stale provider/model identity (for
+    # example, an endpoint patch could unexpectedly route through old OpenAI).
+    # Surface only fields that actually differ from the last published tuple;
+    # config/runtime readers fill the untouched fields from their own source.
+    return {
+        field: value
+        for field, value, snapshot in zip(
+            _MAIN_RUNTIME_FIELDS, values, _RUNTIME_MAIN_COMPAT_SNAPSHOT
+        )
+        if value != snapshot
+    }
 
 
 def _runtime_main_value(field: str) -> Any:

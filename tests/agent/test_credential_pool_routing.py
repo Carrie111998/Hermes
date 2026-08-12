@@ -377,6 +377,18 @@ class TestFailureAttribution:
         (hermes_home / "auth.json").write_text(
             json.dumps({"version": 1, "credential_pool": {"anthropic": entries}})
         )
+        # These tests model a pool containing exactly the entries supplied by
+        # the caller. Do not let a developer's ambient Claude Code/OAuth files
+        # add a second credential and turn the single-entry assertion into a
+        # real-home-dependent rotation test.
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_hermes_oauth_credentials",
+            lambda: None,
+        )
         from agent.credential_pool import load_pool
 
         return load_pool("anthropic")
@@ -542,4 +554,3 @@ class TestFailureAttribution:
 
         failed = {e.id: e for e in pool.entries()}["cred-1"]
         assert failed.failure_reason != "billing"
-
