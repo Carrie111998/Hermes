@@ -912,7 +912,9 @@ def _(rid, params: dict) -> dict:
     without closing siblings. It ALSO reports ``foreign`` rows — recently-active
     sessions that exist only in state.db (cron runs, CLI one-shots, messaging
     turns written by other processes, subagent children with a run in flight)
-    — so clients can paint cross-process liveness from the same poll.
+    — so clients can paint cross-process liveness from the same poll. Foreign
+    rows must show REAL activity (last_active within the 90s heartbeat-ish
+    window); ``is_active`` alone would paint reopened/orphan rows live.
     """
     current = str(params.get("current_session_id") or "")
     try:
@@ -948,8 +950,10 @@ def _(rid, params: dict) -> dict:
     # events never reach clients. The shared SQLite file is the one thing they
     # all move (#58671); report recently-active rows here so clients can paint
     # them from the same poll. Same 300s recency window ``/api/sessions`` uses
-    # for its ``is_active`` flag. Best-effort: a failed DB probe must never
-    # break the in-memory answer.
+    # for its ``is_active`` flag, then narrowed to a REAL-ACTIVITY window
+    # (~1.5x the 60s agent heartbeat) — is_active alone would keep painting
+    # reopened/orphan rows live for up to 5 min (#liveness-stale-end).
+    # Best-effort: a failed DB probe must never break the in-memory answer.
     try:
         db = _get_db()
         if db is not None:
@@ -962,7 +966,7 @@ def _(rid, params: dict) -> dict:
                 if s.get("ended_at") is not None:
                     continue
                 last_active = float(s.get("last_active") or s.get("started_at") or 0)
-                if (now - last_active) >= 300:
+                if (now - last_active) >= _FOREIGN_LIVE_ACTIVITY_S:
                     continue
                 rows.append(
                     {

@@ -12680,6 +12680,17 @@ def test_session_active_list_reports_foreign_db_rows(monkeypatch):
                     "message_count": 9,
                     "ended_at": None,
                 },
+                {
+                    "id": "quiet_cli_session",
+                    "source": "cli",
+                    "model": "m",
+                    "title": "Quiet",
+                    "started_at": now - 400,
+                    "last_active": now - 200,
+                    "last_activity_description": "",
+                    "message_count": 5,
+                    "ended_at": None,
+                },
             ]
 
     previous_sessions = dict(server._sessions)
@@ -12709,6 +12720,9 @@ def test_session_active_list_reports_foreign_db_rows(monkeypatch):
     assert foreign["description"] == "executing tool"
     # A row outside the 300s recency window is NOT reported.
     assert "old_cli_session" not in rows
+    # A row inside 300s but outside the REAL-ACTIVITY window (90s) is NOT
+    # reported either: is_active alone would paint reopened/orphan rows live.
+    assert "quiet_cli_session" not in rows
 
 
 def test_session_resume_does_not_reopen_ended_session(monkeypatch):

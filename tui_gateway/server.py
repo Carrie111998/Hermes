@@ -8054,6 +8054,12 @@ def _session_lookup_key(session: dict, *, fallback: str = "") -> str:
     )
 
 
+# Janela de atividade REAL para foreign rows do active_list (~1.5x o heartbeat
+# de 60s do agente). is_active (300s) sozinho pintaria linhas reabertas/órfãs
+# como vivas por até 5 min (#liveness-stale-end).
+_FOREIGN_LIVE_ACTIVITY_S = 90.0
+
+
 def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
     for sid, session in list(_sessions.items()):
         if session.get("_finalized"):
