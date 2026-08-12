@@ -43,14 +43,14 @@ def _patch_efforts(monkeypatch, efforts):
 
 class TestCopilotReasoningEffortClamp:
     def test_supported_effort_forwarded_verbatim(self, copilot_profile, monkeypatch):
-        """xhigh is forwarded unchanged when the catalog lists it."""
-        _patch_efforts(monkeypatch, ["minimal", "low", "medium", "high", "xhigh"])
+        """max is forwarded unchanged when the catalog lists it."""
+        _patch_efforts(monkeypatch, ["low", "high", "max"])
         extra_body, _ = copilot_profile.build_api_kwargs_extras(
             model="gpt-5.5",
-            reasoning_config={"effort": "xhigh"},
+            reasoning_config={"effort": "max"},
             supports_reasoning=True,
         )
-        assert extra_body["reasoning"] == {"effort": "xhigh"}
+        assert extra_body["reasoning"] == {"effort": "max"}
 
     def test_max_downgrades_to_high_when_unsupported(self, copilot_profile, monkeypatch):
         """A model whose catalog lacks max gets the nearest weaker level."""

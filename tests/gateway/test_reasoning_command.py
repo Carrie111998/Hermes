@@ -68,7 +68,7 @@ class TestReasoningCommand:
 
     def test_parse_reasoning_command_args_accepts_ascii_and_smart_global_flags(self):
         assert gateway_run.GatewayRunner._parse_reasoning_command_args("high --global") == ("high", True)
-        assert gateway_run.GatewayRunner._parse_reasoning_command_args("—global xhigh") == ("xhigh", True)
+        assert gateway_run.GatewayRunner._parse_reasoning_command_args("—global max") == ("max", True)
 
     @pytest.mark.asyncio
     async def test_reasoning_command_reloads_current_state_from_config(self, tmp_path, monkeypatch):
@@ -83,7 +83,7 @@ class TestReasoningCommand:
         monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
 
         runner = _make_runner()
-        runner._reasoning_config = {"enabled": True, "effort": "xhigh"}
+        runner._reasoning_config = {"enabled": True, "effort": "max"}
         runner._show_reasoning = False
 
         result = await runner._handle_reasoning_command(_make_event("/reasoning"))
@@ -95,14 +95,14 @@ class TestReasoningCommand:
 
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("effort", ["max", "ultra"])
+    @pytest.mark.parametrize("effort", ["max"])
     async def test_handle_reasoning_command_accepts_extended_efforts(
         self, tmp_path, monkeypatch, effort
     ):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
         (hermes_home / "config.yaml").write_text(
-            "agent:\n  reasoning_effort: medium\n", encoding="utf-8"
+            "agent:\n  reasoning_effort: high\n", encoding="utf-8"
         )
         monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
 
@@ -128,9 +128,9 @@ class TestReasoningCommand:
         runner = _make_runner()
         source = _make_event("/reasoning").source
         session_key = runner._session_key_for_source(source)
-        runner._session_reasoning_overrides[session_key] = {"enabled": True, "effort": "xhigh"}
+        runner._session_reasoning_overrides[session_key] = {"enabled": True, "effort": "max"}
 
-        assert runner._resolve_session_reasoning_config(source=source) == {"enabled": True, "effort": "xhigh"}
+        assert runner._resolve_session_reasoning_config(source=source) == {"enabled": True, "effort": "max"}
 
 
     def test_run_agent_includes_enabled_mcp_servers_in_gateway_toolsets(self, tmp_path, monkeypatch):

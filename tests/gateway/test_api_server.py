@@ -209,7 +209,7 @@ class TestAdapterInit:
         )
         monkeypatch.setattr(
             "gateway.run.GatewayRunner._load_reasoning_config",
-            staticmethod(lambda model="": {"enabled": True, "effort": "xhigh"}),
+            staticmethod(lambda model="": {"enabled": True, "effort": "max"}),
         )
         monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
         monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
@@ -220,7 +220,7 @@ class TestAdapterInit:
         agent = adapter._create_agent(session_id="api-session")
 
         assert isinstance(agent, FakeAgent)
-        assert captured["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+        assert captured["reasoning_config"] == {"enabled": True, "effort": "max"}
         assert captured["checkpoints_enabled"] is True
         assert captured["checkpoint_max_snapshots"] == 7
         assert captured["checkpoint_max_total_size_mb"] == 321

@@ -91,7 +91,7 @@ class TestSwitchModelReasoningOverride:
             "client_kwargs": {},
             "use_prompt_caching": True,
             "use_native_cache_layout": False,
-            "reasoning_config": {"enabled": True, "effort": "xhigh"},
+            "reasoning_config": {"enabled": True, "effort": "max"},
             "compressor_model": "claude-opus-4.5",
             "compressor_base_url": "",
             "compressor_api_key": "",
@@ -122,5 +122,5 @@ class TestSwitchModelReasoningOverride:
 
         result = restore_primary_runtime(agent)
         assert result is True
-        assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
+        assert agent.reasoning_config == {"enabled": True, "effort": "max"}
 

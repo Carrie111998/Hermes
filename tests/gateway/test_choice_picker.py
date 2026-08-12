@@ -101,11 +101,11 @@ class TestReasoningChoicePicker:
         await runner._handle_reasoning_command(event)
         on_choice = adapter.calls[0]["on_choice_selected"]
 
-        reply = await on_choice(event.source.chat_id, "ultra")
+        reply = await on_choice(event.source.chat_id, "max")
 
-        assert "ultra" in reply
+        assert "max" in reply
         override = runner._session_reasoning_overrides.get(session_key)
-        assert override == {"enabled": True, "effort": "ultra"}
+        assert override == {"enabled": True, "effort": "max"}
 
 
 class TestFastChoicePicker:

@@ -38,8 +38,8 @@ class TestOllamaCloudReasoningEffort:
 
     # ── xhigh / max → max ──────────────────────────────────────────
 
-    @pytest.mark.parametrize("effort", ["xhigh", "max", "MAX", "  Max  "])
-    def test_xhigh_and_max_normalize_to_max(self, ollama_cloud_profile, effort):
+    @pytest.mark.parametrize("effort", ["max", "MAX", "  Max  "])
+    def test_max_normalizes_to_max(self, ollama_cloud_profile, effort):
         extra_body, top_level = ollama_cloud_profile.build_api_kwargs_extras(
             supports_reasoning=True,
             reasoning_config={"enabled": True, "effort": effort},
@@ -118,13 +118,13 @@ class TestOllamaCloudReasoningEffort:
         )
         assert top_level == {}
 
-    def test_minimal_effort_omitted(self, ollama_cloud_profile):
-        """``minimal`` is a real Hermes effort level but is not documented for
-        Ollama Cloud's /v1/chat/completions, so it is omitted rather than sent
-        verbatim (which could trigger a 400)."""
+    def test_unrecognized_effort_omitted(self, ollama_cloud_profile):
+        """``bogus`` is not a recognized Hermes effort level and is not
+        documented for Ollama Cloud's /v1/chat/completions, so it is omitted
+        rather than sent verbatim (which could trigger a 400)."""
         _, top_level = ollama_cloud_profile.build_api_kwargs_extras(
             supports_reasoning=True,
-            reasoning_config={"enabled": True, "effort": "minimal"},
+            reasoning_config={"enabled": True, "effort": "bogus"},
         )
         assert top_level == {}
 
@@ -140,7 +140,7 @@ class TestOllamaCloudFullKwargsIntegration:
             messages=[{"role": "user", "content": "ping"}],
             tools=None,
             provider_profile=ollama_cloud_profile,
-            reasoning_config={"enabled": True, "effort": "xhigh"},
+            reasoning_config={"enabled": True, "effort": "max"},
             base_url="https://ollama.com/v1",
             provider_name="ollama-cloud",
             supports_reasoning=True,
@@ -160,7 +160,7 @@ class TestOllamaCloudCapabilityGating:
         resolves thinking capability from /api/show, and we don't send a
         meaningless field to e.g. gemma3 / qwen3-coder."""
         extra_body, top_level = ollama_cloud_profile.build_api_kwargs_extras(
-            reasoning_config={"enabled": True, "effort": "xhigh"},
+            reasoning_config={"enabled": True, "effort": "max"},
             supports_reasoning=False,
         )
         assert extra_body == {}

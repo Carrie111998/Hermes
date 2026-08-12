@@ -1190,7 +1190,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": ""}
         MockAgent.return_value = MagicMock()
         parent = _make_mock_parent()
-        parent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+        parent.reasoning_config = {"enabled": True, "effort": "max"}
 
         _build_child_agent(
             task_index=0, goal="test", context=None, toolsets=None,
@@ -1198,7 +1198,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
             task_count=1,
         )
         call_kwargs = MockAgent.call_args[1]
-        self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
+        self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "max"})
 
     @patch("tools.delegate_tool._load_config")
     @patch("run_agent.AIAgent")
@@ -1207,7 +1207,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": "low"}
         MockAgent.return_value = MagicMock()
         parent = _make_mock_parent()
-        parent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+        parent.reasoning_config = {"enabled": True, "effort": "max"}
 
         _build_child_agent(
             task_index=0, goal="test", context=None, toolsets=None,
