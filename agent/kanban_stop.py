@@ -21,6 +21,14 @@ _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
 
 _DEFAULT_MAX_ATTEMPTS = 2
 
+# Stable content marker for SessionDB-projected stop nudges. The task id makes
+# the full message dynamic, while underscore metadata is not projected back
+# into conversation history.
+KANBAN_STOP_NUDGE_PREFIX = (
+    "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
+    "terminal state for the board.\n\n"
+)
+
 
 def kanban_stop_nudge_enabled() -> bool:
     """Return whether the kanban stop-guard is active for this process.
@@ -86,9 +94,7 @@ def build_kanban_stop_nudge(
         return None
 
     tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
-    return (
-        "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
-        "terminal state for the board.\n\n"
+    return KANBAN_STOP_NUDGE_PREFIX + (
         f"Task `{tid}` is still `running`. Ending now without a board tool "
         "causes a protocol violation (clean exit with no "
         "`kanban_complete` / `kanban_block`).\n\n"
@@ -102,6 +108,7 @@ def build_kanban_stop_nudge(
 
 
 __all__ = [
+    "KANBAN_STOP_NUDGE_PREFIX",
     "build_kanban_stop_nudge",
     "kanban_stop_nudge_enabled",
     "session_called_kanban_terminal",

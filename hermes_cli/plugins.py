@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Union
 
 from hermes_constants import get_hermes_home
+from agent.verify_hooks import PRE_VERIFY_CONTINUE_NUDGE_PREFIX
 from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
@@ -2722,7 +2723,7 @@ def get_pre_verify_continue_message(
             continue
         message = result.get("message") or result.get("reason")
         if isinstance(message, str) and message.strip():
-            return message.strip()
+            return PRE_VERIFY_CONTINUE_NUDGE_PREFIX + message.strip()
 
     return None
 

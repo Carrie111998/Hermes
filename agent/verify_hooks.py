@@ -20,6 +20,14 @@ from utils import is_truthy_value
 
 DEFAULT_MAX_VERIFY_NUDGES = 3
 
+# ``pre_verify`` hooks return user-controlled continuation text, so the nudge
+# has no fixed body that survives SessionDB projection. Prefix every accepted
+# directive with this stable marker so compaction can still distinguish the
+# projected role="user" row from a human-authored turn.
+PRE_VERIFY_CONTINUE_NUDGE_PREFIX = (
+    "[System: A pre-verify hook requested another agent turn.]\n\n"
+)
+
 # Shipped guidance appended to the verification-stop nudge when code lacks fresh
 # verification evidence. Wording mirrors the user-facing "clean your work"
 # workflow, but does not create its own extra model turn.
@@ -64,6 +72,7 @@ def _agent_cfg(config: Optional[dict[str, Any]]) -> dict[str, Any]:
 __all__ = [
     "CODING_VERIFY_GUIDANCE",
     "DEFAULT_MAX_VERIFY_NUDGES",
+    "PRE_VERIFY_CONTINUE_NUDGE_PREFIX",
     "coding_verify_guidance",
     "max_verify_nudges",
 ]

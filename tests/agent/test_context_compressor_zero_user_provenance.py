@@ -20,6 +20,8 @@ from agent.conversation_compression import (
     _ensure_compressed_has_user_turn,
     compress_context,
 )
+from agent.kanban_stop import build_kanban_stop_nudge
+from hermes_cli.plugins import get_pre_verify_continue_message
 from hermes_state import SessionDB
 from tools.todo_tool import TODO_INJECTION_HEADER
 
@@ -331,6 +333,51 @@ def test_real_task_wins_over_trailing_dropped_tools_continuation_nudge(compresso
 
     idx = compressor._find_last_user_message_idx(messages, head_end=0)
     assert idx == 0, "nudge was selected as the anchor instead of the human task"
+    assert messages[idx]["content"] == human["content"]
+
+
+def test_dynamic_retry_nudges_are_synthetic_after_projection(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda *_args, **_kwargs: [
+            {"action": "continue", "message": "Run the focused regression tests."}
+        ],
+    )
+    pre_verify_nudge = get_pre_verify_continue_message()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_dynamic")
+    kanban_nudge = build_kanban_stop_nudge(messages=[])
+
+    assert pre_verify_nudge is not None
+    assert kanban_nudge is not None
+    for content in (pre_verify_nudge, kanban_nudge):
+        projected = {"role": "user", "content": content}
+        assert ContextCompressor._is_synthetic_compression_user_turn(projected) is True
+
+
+def test_real_task_wins_over_trailing_dynamic_retry_nudges(compressor, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda *_args, **_kwargs: [
+            {"decision": "block", "reason": "Inspect the generated diff first."}
+        ],
+    )
+    pre_verify_nudge = get_pre_verify_continue_message()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_dynamic")
+    kanban_nudge = build_kanban_stop_nudge(messages=[])
+
+    human = {"role": "user", "content": "Refactor the auth module and add tests."}
+    messages = [
+        human,
+        {"role": "assistant", "content": "I will verify the changes."},
+        {"role": "user", "content": pre_verify_nudge},
+        {"role": "assistant", "content": "I will finish the board handoff."},
+        {"role": "user", "content": kanban_nudge},
+    ]
+
+    idx = compressor._find_last_user_message_idx(messages, head_end=0)
+    assert idx == 0, "dynamic retry nudge was selected instead of the human task"
     assert messages[idx]["content"] == human["content"]
 
 
