@@ -6,6 +6,7 @@ TelegramNotifier, TelegramMirror, WhatsAppEscalator, and DigestComposer.
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime
 from types import MappingProxyType
@@ -13,6 +14,8 @@ from typing import Mapping, Optional
 
 from events.outcomes import OutcomeState, OutcomeVerdict, marker_for_verdict
 from events.schema import Event, EventType, Priority
+
+logger = logging.getLogger(__name__)
 
 # Priority -> colored dot (matches severity)
 PRIORITY_EMOJI = {
@@ -659,3 +662,37 @@ def boot_summary_body(payload: dict, *, max_listed: int = 5) -> str:
         lines.append("No failing steps were named.")
     lines.append("Full detail: tray Boot panel.")
     return "\n".join(lines)
+
+
+# ── runtime drift signal (report, never repair) ─────────────────────────────
+#
+# EVENT_TYPE_EMOJI has drifted from EventType four times (2026-04-27 twice,
+# 2026-05-29, 2026-08-11 — the last hid all twelve DevFlow Delegation Plane
+# icons for five days). events.coverage now guards that pairing, but only where
+# a developer is: the pre-commit hook, pytest, `python -m events.coverage`. All
+# three are bypassed by `git commit --no-verify` and by any checkout where
+# pre-commit was never installed, and none of them make a *running gateway* say
+# anything — event_icon() just returns "" and the header renders with a
+# double-space gap.
+#
+# So the process shipping the incomplete table reports it, once, at import.
+# Non-fatal: a missing icon is cosmetic, and raising here would take the
+# gateway down over it.
+#
+# This publishes the RECORD of what is missing. It must never back-fill
+# EVENT_TYPE_EMOJI: coverage.TableSpec.resolve() reads this table *after*
+# importing this module, so a table that healed itself here would make
+# coverage_gaps() report zero forever and silently disarm the shipped guard.
+#
+# Since EVENT_TYPE_EMOJI became a view derived from EventType.icon, this call
+# can no longer fire: a member with no icon fails at EventType class creation,
+# so `import events.formatting` would not get this far. It stays as the runtime
+# detector for the day the derivation is replaced by a hand-maintained dict —
+# the same reason coverage.REQUIRED_TOTAL keeps its now-tautological entry.
+# EVENT_TYPES_WITHOUT_ICON is therefore expected to be (); a non-empty value
+# means the table stopped deriving.
+from events.coverage import log_missing_members  # noqa: E402 - table must exist
+
+EVENT_TYPES_WITHOUT_ICON = log_missing_members(
+    EVENT_TYPE_EMOJI, "events.formatting.EVENT_TYPE_EMOJI", logger
+)

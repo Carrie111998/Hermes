@@ -34,6 +34,13 @@ where the gateway is:
     added, not on some later test run.
   * ``tests/events/test_event_type_coverage.py`` — the same checks as tests.
 
+…with one non-fatal exception. All three of those are commit-time, so all three
+are bypassed by ``git commit --no-verify`` and by any checkout where pre-commit
+was never installed, and none of them make a *running* gateway say anything.
+:func:`log_missing_members` closes that residual gap: each required-total table
+calls it at the bottom of its own module and gets ONE ``logger.error`` naming
+every absent member. It reports; it never repairs — see its docstring.
+
 Discovery, not just a hand-written list
 ---------------------------------------
 :func:`discover_tables` walks the whole ``events`` package and finds every
@@ -55,6 +62,7 @@ safety net — a blind spot in the very check whose job is to have none.
 from __future__ import annotations
 
 import importlib
+import logging
 import pkgutil
 from collections.abc import Mapping as _MappingABC
 from dataclasses import dataclass
@@ -70,6 +78,7 @@ __all__ = [
     "KNOWN_PARTIAL",
     "MANIFEST",
     "missing_members",
+    "log_missing_members",
     "coverage_gaps",
     "discover_tables",
     "unclassified_tables",
@@ -214,6 +223,51 @@ def missing_members(table: Mapping[EventType, object]) -> List[str]:
     icon is exactly the defect the 2026-04-19 SECRET_DETECTED fix was about.
     """
     return [et.type_string for et in EventType if not table.get(et)]
+
+
+def log_missing_members(
+    table: Mapping[EventType, object],
+    qualname: str,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[str, ...]:
+    """Emit ONE ``logger.error`` naming every EventType absent from ``table``.
+
+    This is the *runtime* half of the guard, and the only half a running
+    gateway can reach. Everything else in this module fires where a developer
+    is — the pre-commit hook, pytest, ``python -m events.coverage`` — so all of
+    it is bypassed by ``git commit --no-verify`` and by any checkout (an agent
+    worktree, a fresh machine) where pre-commit was never installed. Call this
+    from the bottom of the module that owns a required-total table, so the
+    process that is actually shipping the incomplete table says so.
+
+    Non-fatal by construction, for the reason in this module's docstring: a
+    missing icon is a cosmetic notification defect, and raising here would turn
+    it into a gateway that will not boot. One line, at ERROR so it survives the
+    default level, then normal service.
+
+    It RECORDS the gap; it must never repair it. Back-filling ``table`` here
+    would make :meth:`TableSpec.resolve` — which reads the live table *after*
+    importing the owning module — see a complete table forever, silently
+    disarming :func:`coverage_gaps`, the CLI, the hook, and the tests. Return
+    the record; leave the table exactly as the source declared it.
+
+    Costs one dict lookup per enum member at import. Returns the missing type
+    strings so the caller can publish them as a module constant, which is also
+    what proves the check ran.
+    """
+    missing = tuple(missing_members(table))
+    if missing:
+        (logger or logging.getLogger(__name__)).error(
+            "%s is missing an entry for %d of %d EventType members, which will "
+            "ship as a degraded notification for each: %s. Fix: add one entry "
+            "per type to %s (do not suppress this line).",
+            qualname,
+            len(missing),
+            len(list(EventType)),
+            ", ".join(missing),
+            qualname,
+        )
+    return missing
 
 
 def coverage_gaps(

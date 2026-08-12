@@ -382,6 +382,18 @@ class TestBackendSelection:
 class TestParallelClientConfig:
     """Test suite for Parallel client initialization."""
 
+    @pytest.fixture(autouse=True)
+    def _neutralize_lazy_install_gate(self, monkeypatch):
+        """Make the ``parallel`` stub installed in setup_method reachable.
+
+        ``_get_parallel_client`` runs ``tools.lazy_deps.ensure`` before
+        importing the SDK, and that gate resolves availability from
+        distribution metadata rather than ``sys.modules`` — so with
+        parallel-web absent from the venv it raises ImportError and the stub
+        is never reached.
+        """
+        monkeypatch.setattr("tools.lazy_deps.ensure", lambda *a, **k: None)
+
     def setup_method(self):
         import tools.web_tools
         tools.web_tools._parallel_client = None

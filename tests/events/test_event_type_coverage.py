@@ -11,6 +11,8 @@ must be total, and which discovers EventType-keyed tables by walking the package
 so a table added later is covered without a new hand-written test.
 """
 
+import importlib
+import logging
 from collections.abc import Mapping
 
 import pytest
@@ -358,3 +360,134 @@ def test_discovery_dedupes_a_re_exported_table(monkeypatch):
     assert "events.outcomes.EVENT_TYPE_EMOJI" in matches[0].qualnames
     # And the alias must not trip the undeclared-table guard.
     assert not unclassified_tables(tables)
+
+
+# ── the runtime half of the guard ───────────────────────────────────────────
+#
+# Everything above runs where a *developer* is: the pre-commit hook, pytest,
+# `python -m events.coverage`. All three are bypassed by `git commit
+# --no-verify` and by any checkout where pre-commit was never installed, and
+# none of them say anything from a *running gateway*. These tests cover the
+# non-fatal import-time signal that closes that residual gap.
+#
+# The signal RECORDS the gap; it must never repair it. A table that
+# back-filled itself at import would make TableSpec.resolve() — which reads the
+# live table AFTER importing the owning module — see a complete table forever,
+# permanently disarming every check above.
+
+class TestLogMissingMembers:
+    """events.coverage.log_missing_members: report, never repair."""
+
+    def _table(self, drop=()):
+        dropped = set(drop)
+        return {
+            et: "x" for et in EventType if et.type_string not in dropped
+        }
+
+    def test_total_table_returns_empty_and_logs_nothing(self, caplog):
+        with caplog.at_level(logging.DEBUG):
+            missing = coverage.log_missing_members(
+                self._table(), "events.fake.TABLE"
+            )
+        assert missing == ()
+        assert caplog.records == []
+
+    def test_names_every_offender_in_one_error_record(self, caplog):
+        gone = [et.type_string for et in EventType][:3]
+        with caplog.at_level(logging.DEBUG):
+            missing = coverage.log_missing_members(
+                self._table(drop=gone), "events.fake.TABLE"
+            )
+
+        assert missing == tuple(gone)
+        assert len(caplog.records) == 1, (
+            "the signal must cost exactly one log line per process, not one "
+            "per missing member"
+        )
+        record = caplog.records[0]
+        assert record.levelno == logging.ERROR
+        assert "events.fake.TABLE" in record.getMessage()
+        for type_string in gone:
+            assert type_string in record.getMessage(), (
+                f"{type_string} is missing but was not named; a report that "
+                f"names some of the drift has understated it every time"
+            )
+
+    def test_a_falsy_value_counts_as_missing(self, caplog):
+        table = self._table()
+        blank = next(iter(EventType))
+        table[blank] = ""
+        with caplog.at_level(logging.DEBUG):
+            missing = coverage.log_missing_members(table, "events.fake.TABLE")
+        assert missing == (blank.type_string,), (
+            "an empty icon renders the same double-space header gap as no key "
+            "at all, so it must count as missing here exactly as it does in "
+            "missing_members()"
+        )
+
+    def test_does_not_back_fill_the_table_it_inspects(self, caplog):
+        gone = [et.type_string for et in EventType][:2]
+        table = self._table(drop=gone)
+        before = dict(table)
+        with caplog.at_level(logging.DEBUG):
+            coverage.log_missing_members(table, "events.fake.TABLE")
+        assert table == before, (
+            "the runtime signal must expose the record, never fill the table: "
+            "a self-healing table makes coverage_gaps() report zero forever"
+        )
+
+    def test_logs_through_the_caller_supplied_logger(self, caplog):
+        logger = logging.getLogger("events.fake.owner")
+        gone = [next(iter(EventType)).type_string]
+        with caplog.at_level(logging.DEBUG):
+            coverage.log_missing_members(
+                self._table(drop=gone), "events.fake.TABLE", logger=logger
+            )
+        assert caplog.records[0].name == "events.fake.owner", (
+            "the line must be attributed to the module that owns the table, "
+            "so an operator reading gateway logs knows what to fix"
+        )
+
+
+class TestRequiredTotalTablesSignalAtRuntime:
+    """Each required-total table publishes its own import-time record.
+
+    The constant existing at all is the proof that the module ran the check;
+    it is assigned from the return value of the same call that logs.
+    """
+
+    def test_event_type_emoji_has_no_missing_icons(self):
+        import events.formatting as formatting
+
+        assert formatting.EVENT_TYPES_WITHOUT_ICON == (), (
+            "these EventType members ship with no notification icon: "
+            f"{formatting.EVENT_TYPES_WITHOUT_ICON}"
+        )
+
+    def test_routing_policy_has_no_unmapped_types(self):
+        import events.routing_policy as routing_policy
+
+        assert routing_policy.EVENT_TYPES_WITHOUT_POLICY == (), (
+            "these EventType members have no routing policy: "
+            f"{routing_policy.EVENT_TYPES_WITHOUT_POLICY}"
+        )
+
+    @pytest.mark.parametrize(
+        "module_name, attribute, record_name",
+        [
+            ("events.formatting", "EVENT_TYPE_EMOJI", "EVENT_TYPES_WITHOUT_ICON"),
+            ("events.routing_policy", "_POLICY", "EVENT_TYPES_WITHOUT_POLICY"),
+        ],
+    )
+    def test_record_agrees_with_the_manifest_check(
+        self, module_name, attribute, record_name
+    ):
+        """The runtime record and the commit-time check must not diverge."""
+        module = importlib.import_module(module_name)
+        spec = next(
+            s for s in REQUIRED_TOTAL
+            if s.module == module_name and s.attribute == attribute
+        )
+        assert list(getattr(module, record_name)) == missing_members(
+            spec.resolve()
+        )
