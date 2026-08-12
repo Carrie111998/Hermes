@@ -648,11 +648,12 @@ class SignalAdapter(BasePlatformAdapter):
             return
 
         # Get data message — also check editMessage (edited messages contain
-        # their updated dataMessage inside editMessage.dataMessage)
-        data_message = (
-            envelope_data.get("dataMessage")
-            or (envelope_data.get("editMessage") or {}).get("dataMessage")
-        )
+        # their updated dataMessage inside editMessage.dataMessage).
+        edit_message: Dict[str, Any] = {}
+        data_message = envelope_data.get("dataMessage")
+        if not data_message:
+            edit_message = envelope_data.get("editMessage") or {}
+            data_message = edit_message.get("dataMessage")
         if not data_message:
             return
 
@@ -796,14 +797,23 @@ class SignalAdapter(BasePlatformAdapter):
                 # WhatsApp/Slack/BlueBubbles/Mattermost).
                 msg_type = MessageType.DOCUMENT
 
-        # The data-message timestamp is the quote/reaction/receipt identity.
-        # It normally matches the envelope timestamp, which remains a
-        # compatibility fallback for older signal-cli envelope shapes.
-        raw_ts_ms = data_message.get("timestamp") or envelope_data.get("timestamp", 0)
-        ts_ms = _parse_signal_timestamp(raw_ts_ms) or 0
-        if ts_ms:
+        # A normal data-message timestamp is both the event time and its native
+        # quote/reaction identity. An edit has a fresh data-message timestamp,
+        # while targetSentTimestamp identifies the original displayed message.
+        # Keep those concepts separate so replies to edits quote the message
+        # Signal actually replaced.
+        data_ts_ms = _parse_signal_timestamp(data_message.get("timestamp"))
+        envelope_ts_ms = _parse_signal_timestamp(envelope_data.get("timestamp"))
+        event_ts_ms = data_ts_ms or envelope_ts_ms or 0
+        target_ts_ms = _parse_signal_timestamp(
+            edit_message.get("targetSentTimestamp")
+        )
+        message_ts_ms = target_ts_ms or event_ts_ms
+        if event_ts_ms:
             try:
-                timestamp = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+                timestamp = datetime.fromtimestamp(
+                    event_ts_ms / 1000, tz=timezone.utc
+                )
             except (ValueError, OSError):
                 timestamp = datetime.now(tz=timezone.utc)
         else:
@@ -819,10 +829,10 @@ class SignalAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
             timestamp=timestamp,
-            message_id=str(ts_ms) if ts_ms else None,
+            message_id=str(message_ts_ms) if message_ts_ms else None,
             raw_message={
                 "sender": sender,
-                "timestamp_ms": ts_ms,
+                "timestamp_ms": message_ts_ms,
                 "quote": quote_data if quote_data else None,
             },
             reply_to_message_id=reply_to_id,

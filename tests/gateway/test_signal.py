@@ -1154,6 +1154,61 @@ class TestSignalAutomaticQuoteRouting:
 
         assert captured["event"].message_id == "1712345678000"
 
+    @pytest.mark.asyncio
+    async def test_edited_message_quotes_original_target_timestamp(
+        self, monkeypatch
+    ):
+        from gateway.platforms.base import (
+            _reply_anchor_for_event,
+            _thread_metadata_for_source,
+        )
+
+        adapter = _make_signal_adapter(monkeypatch)
+        captured_event = {}
+
+        async def fake_handle(event):
+            captured_event["event"] = event
+
+        adapter.handle_message = fake_handle
+        await adapter._handle_envelope({
+            "envelope": {
+                "sourceNumber": "+15551230000",
+                "sourceUuid": "68680952-6d86-45bc-85e0-1a4d186d53ee",
+                "timestamp": 1712345680000,
+                "editMessage": {
+                    "targetSentTimestamp": 1712345678000,
+                    "dataMessage": {
+                        "timestamp": 1712345680000,
+                        "message": "edited question",
+                    },
+                },
+            },
+        })
+
+        event = captured_event["event"]
+        anchor = _reply_anchor_for_event(event)
+        metadata = _thread_metadata_for_source(event.source, anchor)
+        assert event.message_id == "1712345678000"
+        assert event.raw_message["timestamp_ms"] == 1712345678000
+        assert int(event.timestamp.timestamp() * 1000) == 1712345680000
+
+        adapter._stop_typing_indicator = AsyncMock()
+        adapter._resolve_recipient = AsyncMock(return_value="+15551230000")
+        mock_rpc, captured_rpc = _stub_rpc({"timestamp": 1712345681000})
+        adapter._rpc = mock_rpc
+        result = await adapter.send(
+            chat_id=event.source.chat_id,
+            content="answer",
+            reply_to=anchor,
+            metadata=metadata,
+        )
+
+        assert result.success is True
+        assert captured_rpc[0]["params"]["quoteTimestamp"] == 1712345678000
+        assert captured_rpc[0]["params"]["quoteAuthor"] == (
+            "68680952-6d86-45bc-85e0-1a4d186d53ee"
+        )
+
 
 class TestSignalQuoteExtraction:
     """Verify Signal reply quote fields are propagated to MessageEvent."""
