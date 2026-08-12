@@ -13,6 +13,21 @@ method = _registry.method
 _profile_scoped = _registry.profile_scoped
 
 
+def _reopen_if_finalized(db, session_id: str) -> None:
+    """O primeiro turno real é o que reabre uma sessão finalizada — abrir o
+    chat (session.resume) é leitura e não mexe em ended_at (#liveness-stale-end)."""
+    if not session_id:
+        return
+    try:
+        row = db.get_session(session_id)
+    except Exception:
+        return
+    if row is None:
+        return
+    if row.get("ended_at") is not None:
+        db.reopen_session(session_id)
+
+
 def _pending_reaction_notes(session: dict) -> str:
     """Note block describing reactions the user added since the last turn, or "".
 
@@ -111,6 +126,12 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    # Abrir o chat é LEITURA (session.resume não reabre linha finalizada);
+    # o primeiro turno real é o que reabre — sem isso o turno escreveria numa
+    # linha "morta" e o liveness/estado da linha ficaria inconsistente
+    # (#liveness-stale-end).
+    if (db := _get_db()) is not None:
+        _reopen_if_finalized(db, str(session.get("session_key") or ""))
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     # Which desktop window this message was typed into. Rewritten on every

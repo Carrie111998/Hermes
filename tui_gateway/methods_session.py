@@ -449,7 +449,6 @@ def _(rid, params: dict) -> dict:
             source = _resolve_session_source(str(params.get("source") or "").strip() or None)
             lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
             try:
-                db.reopen_session(target)
                 # The child's OWN conversation only — include_ancestors would prepend
                 # the parent's transcript onto the subagent's branch.
                 # repair_alternation: this resume feeds LIVE REPLAY (the loaded
@@ -530,7 +529,6 @@ def _(rid, params: dict) -> dict:
             # the deferred build wires the remaining per-session callbacks.
             _enable_gateway_prompts()
             try:
-                db.reopen_session(target)
                 # One lineage SELECT feeds both projections (#67142-adjacent perf,
                 # from the desktop audit): the model-fed copy is alternation-repaired
                 # (raw_history → sanitize_replay_history → the resumed session's
@@ -618,7 +616,6 @@ def _(rid, params: dict) -> dict:
             else None
         )
         try:
-            db.reopen_session(target)
             # One lineage SELECT feeds both projections (see the interactive resume
             # above): the model-fed copy is alternation-repaired for LIVE REPLAY, the
             # display copy stays verbatim.

@@ -12759,6 +12759,48 @@ def test_session_resume_does_not_reopen_ended_session(monkeypatch):
     assert fake.reopened == [], f"resume reabriu sessão finalizada: {fake.reopened}"
 
 
+def test_reopen_if_finalized_only_reopens_ended_rows():
+    """#liveness-stale-end: o primeiro turno (prompt.submit) reabre só linhas
+    com ended_at set — linhas abertas, inexistentes ou com erro de DB ficam
+    intocadas."""
+    from tui_gateway.methods_prompt import _reopen_if_finalized
+
+    class _DB:
+        def __init__(self, row):
+            self.row = row
+            self.reopened = []
+            self.raise_on_get = False
+
+        def get_session(self, session_id):
+            if self.raise_on_get:
+                raise OSError("db locked")
+            return self.row
+
+        def reopen_session(self, session_id):
+            self.reopened.append(session_id)
+
+    ended = _DB({"id": "s1", "ended_at": 123.0})
+    _reopen_if_finalized(ended, "s1")
+    assert ended.reopened == ["s1"]
+
+    open_row = _DB({"id": "s1", "ended_at": None})
+    _reopen_if_finalized(open_row, "s1")
+    assert open_row.reopened == []
+
+    missing = _DB(None)
+    _reopen_if_finalized(missing, "s1")
+    assert missing.reopened == []
+
+    broken = _DB({"id": "s1", "ended_at": 123.0})
+    broken.raise_on_get = True
+    _reopen_if_finalized(broken, "s1")
+    assert broken.reopened == []
+
+    noop = _DB({"id": "s1", "ended_at": 123.0})
+    _reopen_if_finalized(noop, "")
+    assert noop.reopened == []
+
+
 
 def test_session_activate_returns_inflight_stream_before_completion(monkeypatch):
     """Switching into a still-running live session must hydrate partial output.
