@@ -183,6 +183,48 @@ class TestRecordFileMutationResult:
 
         assert "/tmp/a.py" in agent._turn_failed_file_mutations
         assert agent._turn_failed_file_mutations["/tmp/a.py"]["applied"] is True
+        assert agent._turn_failed_file_mutations["/tmp/a.py"]["validation_failed"] is True
+
+    def test_partial_v4a_apply_failure_keeps_all_targets_unresolved(self):
+        agent = _bare_agent()
+        args = {
+            "mode": "patch",
+            "patch": (
+                "*** Begin Patch\n"
+                "*** Add File: /tmp/first.py\n"
+                "+first = True\n"
+                "*** Add File: /tmp/second.py\n"
+                "+second = True\n"
+                "*** End Patch\n"
+            ),
+        }
+        result = json.dumps({
+            "success": False,
+            "files_created": ["/tmp/first.py"],
+            "applied": True,
+            "error": (
+                "Apply phase failed (state may be inconsistent — run `git diff` "
+                "to assess): Failed to add /tmp/second.py: file not found"
+            ),
+        })
+
+        agent._record_file_mutation_result(
+            "patch", args, result, is_error=True,
+        )
+
+        assert set(agent._turn_failed_file_mutations) == {
+            "/tmp/first.py",
+            "/tmp/second.py",
+        }
+        assert agent._turn_failed_file_mutations["/tmp/first.py"]["applied"] is True
+        assert agent._turn_failed_file_mutations["/tmp/second.py"]["applied"] is False
+        assert agent._turn_file_mutation_paths == {"/tmp/first.py"}
+
+        footer = agent._format_file_mutation_failure_footer(
+            agent._turn_failed_file_mutations,
+        )
+        assert "modified before patch failed" in footer
+        assert "not modified" in footer
 
     def test_patch_with_lsp_diagnostics_counts_as_landed(self):
         agent = _bare_agent()
@@ -205,7 +247,7 @@ class TestRecordFileMutationResult:
             "patch",
             {"mode": "replace", "path": "/tmp/a.py", "old_string": "x", "new_string": "y"},
             result,
-            is_error=True,
+            is_error=False,
         )
 
         assert agent._turn_failed_file_mutations == {}

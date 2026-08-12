@@ -24,7 +24,11 @@ def tool_may_have_side_effect(tool_name: str) -> bool:
 
 
 def file_mutation_result_landed(tool_name: str, result: Any) -> bool:
-    """Return True when a file mutation result proves the write landed."""
+    """Return whether any requested edit physically landed.
+
+    This remains true for a V4A patch that applied only some operations before
+    a later operation failed.
+    """
     if tool_name not in FILE_MUTATING_TOOL_NAMES or not isinstance(result, str):
         return False
     try:
@@ -33,8 +37,6 @@ def file_mutation_result_landed(tool_name: str, result: Any) -> bool:
         return False
     if not isinstance(data, dict):
         return False
-    # Validation failures deliberately carry a top-level error to force the
-    # agent to repair the file, but they can still have changed it.
     if data.get("applied") is True:
         return True
     if data.get("error"):

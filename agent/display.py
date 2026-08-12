@@ -17,7 +17,10 @@ from typing import Any
 
 from utils import safe_json_loads
 from agent.redact import redact_sensitive_text
-from agent.tool_result_classification import file_mutation_result_landed
+from agent.tool_result_classification import (
+    file_mutation_result_landed,
+    file_mutation_validation_failed,
+)
 
 # ANSI escape codes for coloring tool failure indicators
 _RED = "\033[31m"
@@ -1274,10 +1277,12 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
     """
     if result is None:
         return False, ""
-    if file_mutation_result_landed(tool_name, result):
-        return False, ""
-
     data = safe_json_loads(result)
+    if file_mutation_result_landed(tool_name, result):
+        if file_mutation_validation_failed(tool_name, result):
+            return False, ""
+        if not data.get("error"):
+            return False, ""
 
     # Terminal: non-zero exit code is the canonical failure signal.
     if tool_name == "terminal":
@@ -1506,5 +1511,3 @@ def get_cute_tool_message(
 # =========================================================================
 # Honcho session line (one-liner with clickable OSC 8 hyperlink)
 # =========================================================================
-
-

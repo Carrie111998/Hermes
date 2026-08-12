@@ -28,6 +28,21 @@ def test_validation_failure_is_landed_but_requires_repair():
     assert file_mutation_validation_failed("patch", result) is True
 
 
+def test_partial_v4a_apply_failure_is_landed_but_is_an_ordinary_error():
+    result = json.dumps({
+        "success": False,
+        "files_created": ["first.py"],
+        "applied": True,
+        "error": (
+            "Apply phase failed (state may be inconsistent — run `git diff` "
+            "to assess): second.py: file not found"
+        ),
+    })
+
+    assert file_mutation_result_landed("patch", result) is True
+    assert file_mutation_validation_failed("patch", result) is False
+
+
 
 
 

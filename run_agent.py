@@ -3280,21 +3280,30 @@ class AIAgent:
             return
         landed = file_mutation_result_landed(tool_name, result)
         validation_failed = file_mutation_validation_failed(tool_name, result)
+        landed_paths: List[str] = []
         if landed:
+            landed_paths = _extract_landed_file_mutation_paths(tool_name, args, result)
             changed = getattr(self, "_turn_file_mutation_paths", None)
             if changed is not None:
-                changed.update(_extract_landed_file_mutation_paths(tool_name, args, result))
-        if (is_error and not landed) or validation_failed:
+                changed.update(landed_paths)
+        if is_error or validation_failed:
             preview = _extract_error_preview(result)
             for path in targets:
-                # Keep the first ordinary failure, but replace it when a
-                # later edit actually landed and failed validation: that
-                # state is more urgent and materially different.
-                if path not in state or validation_failed:
+                path_applied = path in landed_paths
+                if landed and len(targets) == 1 and landed_paths:
+                    # Tool results commonly resolve a relative single target
+                    # to an absolute path, so exact string equality can fail.
+                    path_applied = True
+                partial_failure = is_error and landed and not validation_failed
+                # Keep the first ordinary failure unless a later failed call
+                # actually changed this path; that state is materially newer.
+                if path not in state or validation_failed or (partial_failure and path_applied):
                     state[path] = {
                         "tool": tool_name,
                         "error_preview": preview,
-                        "applied": landed,
+                        "applied": path_applied,
+                        "validation_failed": validation_failed,
+                        "partial_failure": partial_failure,
                     }
         elif not validation_failed:
             for path in targets:
@@ -3383,11 +3392,15 @@ class AIAgent:
                 break
             preview = (info.get("error_preview") or "").strip()
             tool = info.get("tool") or "patch"
+            if info.get("validation_failed"):
+                state_note = "modified; validation failed"
+            elif info.get("partial_failure") and info.get("applied"):
+                state_note = "modified before patch failed"
+            else:
+                state_note = "not modified"
             if preview:
-                state_note = "modified; validation failed" if info.get("applied") else "not modified"
                 lines.append(f"  • `{path}` — [{tool}; {state_note}] {preview}")
             else:
-                state_note = "modified; validation failed" if info.get("applied") else "not modified"
                 lines.append(f"  • `{path}` — [{tool}; {state_note}] failed")
             shown += 1
         remaining = len(failed) - shown
