@@ -12,7 +12,7 @@ import re
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.config import load_env
@@ -1782,6 +1782,64 @@ class CredentialPool:
         entry = available[0]
         self._current_id = entry.id
         return entry
+
+    def select_from_sources(
+        self,
+        allowed_sources: Iterable[str],
+        *,
+        refresh: bool = True,
+    ) -> Optional[PooledCredential]:
+        """Select an available entry whose source is explicitly allowed.
+
+        Unlike ``entries()``, this uses the same availability filtering as
+        normal runtime selection, so exhausted or DEAD rows cannot satisfy a
+        constrained provider route. The selection and cursor update happen under
+        the pool lock so a rejected generic entry is never left as current.
+        """
+        sources = {str(source or "") for source in allowed_sources}
+        sources.discard("")
+        if not sources:
+            return None
+
+        with self._lock:
+            available = [
+                entry
+                for entry in self._available_entries(clear_expired=True, refresh=refresh)
+                if entry.source in sources
+            ]
+            if not available:
+                current = self._current_unlocked()
+                if current is not None and current.source not in sources:
+                    self._current_id = None
+                self._log_no_available_entries()
+                return None
+
+            self._last_no_entries_log_at = None
+
+            if self._strategy == STRATEGY_RANDOM:
+                entry = random.choice(available)
+                self._current_id = entry.id
+                return entry
+
+            if self._strategy == STRATEGY_LEAST_USED and len(available) > 1:
+                entry = min(available, key=lambda e: e.request_count)
+                updated = replace(entry, request_count=entry.request_count + 1)
+                self._replace_entry(entry, updated)
+                self._current_id = entry.id
+                return updated
+
+            if self._strategy == STRATEGY_ROUND_ROBIN and len(available) > 1:
+                entry = available[0]
+                rotated = [candidate for candidate in self._entries if candidate.id != entry.id]
+                rotated.append(replace(entry, priority=len(self._entries) - 1))
+                self._entries = [replace(candidate, priority=idx) for idx, candidate in enumerate(rotated)]
+                self._persist()
+                self._current_id = entry.id
+                return self._current_unlocked() or entry
+
+            entry = available[0]
+            self._current_id = entry.id
+            return entry
 
     def peek(self) -> Optional[PooledCredential]:
         # Single lock acquisition for the whole read; call the unlocked

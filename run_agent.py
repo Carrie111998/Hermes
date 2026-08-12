@@ -5158,9 +5158,13 @@ class AIAgent:
             return False
 
         try:
-            from hermes_cli.copilot_auth import resolve_copilot_token
+            from hermes_cli.auth import PROVIDER_REGISTRY, _resolve_copilot_token_for_runtime
+            from hermes_cli.copilot_auth import get_copilot_api_token
 
-            new_token, token_source = resolve_copilot_token()
+            raw_token, token_source = _resolve_copilot_token_for_runtime()
+            if not isinstance(raw_token, str) or not raw_token.strip():
+                return False
+            new_token, refreshed_base_url = get_copilot_api_token(raw_token)
         except Exception as exc:
             logger.debug("Copilot credential refresh failed: %s", exc)
             return False
@@ -5169,6 +5173,12 @@ class AIAgent:
             return False
 
         new_token = new_token.strip()
+        refreshed_base_url = (refreshed_base_url or "").strip().rstrip("/")
+        if refreshed_base_url:
+            default_base_url = PROVIDER_REGISTRY["copilot"].inference_base_url.rstrip("/")
+            current_base_url = str(self.base_url or "").strip().rstrip("/")
+            if not current_base_url or current_base_url == default_base_url:
+                self.base_url = refreshed_base_url
 
         self.api_key = new_token
         self._client_kwargs["api_key"] = self.api_key

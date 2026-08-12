@@ -349,21 +349,21 @@ def _select_pool_entry_for_runtime(
     pool: CredentialPool,
     model_cfg: Dict[str, Any],
 ) -> Optional[PooledCredential]:
-    entry = pool.select()
     if provider != "copilot":
-        return entry
+        return pool.select()
 
     allowed_sources = _configured_copilot_pool_sources(model_cfg)
     if allowed_sources is None:
-        return entry
-    if entry is not None and getattr(entry, "source", "") in allowed_sources:
-        return entry
+        return pool.select()
 
-    for candidate in pool.entries():
-        if getattr(candidate, "source", "") not in allowed_sources:
-            continue
-        if getattr(candidate, "runtime_api_key", None) or getattr(candidate, "access_token", ""):
-            return candidate
+    select_from_sources = getattr(pool, "select_from_sources", None)
+    if callable(select_from_sources):
+        return select_from_sources(allowed_sources)
+
+    entry = pool.select()
+    entry_source = getattr(entry, "source", "")
+    if entry is not None and (entry_source in allowed_sources or entry_source == "pool"):
+        return entry
     return None
 
 

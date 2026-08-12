@@ -158,6 +158,9 @@ def test_configured_copilot_pool_keeps_pinned_endpoint(monkeypatch):
         def select(self):
             return entry
 
+        def select_from_sources(self, _allowed_sources):
+            return entry
+
     monkeypatch.setattr(rp, "_get_model_config", lambda: dict(model_cfg))
     monkeypatch.setattr(rp, "load_pool", lambda _provider: _Pool())
     monkeypatch.setattr(rp, "credential_pool_matches_provider", lambda *a, **k: True)
@@ -169,6 +172,72 @@ def test_configured_copilot_pool_keeps_pinned_endpoint(monkeypatch):
     assert resolved["source"] == "env:COPILOT_GITHUB_TOKEN"
     assert resolved["api_mode"] == "codex_responses"
     assert resolved["base_url"] == "https://api.business.githubcopilot.com"
+
+
+def test_configured_copilot_pool_skips_unavailable_allowed_entry(monkeypatch):
+    """Strict Copilot pool selection must not pick exhausted/dead allowed rows."""
+    from agent.credential_pool import (
+        AUTH_TYPE_API_KEY,
+        CredentialPool,
+        PooledCredential,
+        STATUS_DEAD,
+        STATUS_EXHAUSTED,
+    )
+
+    model_cfg = {
+        "provider": "copilot",
+        "default": "gpt-5.5",
+        "api_mode": "codex_responses",
+        "base_url": "https://api.business.githubcopilot.com",
+    }
+    pool = CredentialPool(
+        provider="copilot",
+        entries=[
+            PooledCredential(
+                provider="copilot",
+                id="generic-github",
+                label="generic-github",
+                auth_type=AUTH_TYPE_API_KEY,
+                priority=0,
+                source="env:GITHUB_TOKEN",
+                access_token="generic-api-token",
+            ),
+            PooledCredential(
+                provider="copilot",
+                id="copilot-env-cooling-down",
+                label="copilot-env-cooling-down",
+                auth_type=AUTH_TYPE_API_KEY,
+                priority=1,
+                source="env:COPILOT_GITHUB_TOKEN",
+                access_token="copilot-api-token",
+                last_status=STATUS_EXHAUSTED,
+                last_status_at=time.time(),
+                last_error_reset_at=time.time() + 3600,
+            ),
+            PooledCredential(
+                provider="copilot",
+                id="copilot-env-dead",
+                label="copilot-env-dead",
+                auth_type=AUTH_TYPE_API_KEY,
+                priority=2,
+                source="env:COPILOT_GITHUB_TOKEN",
+                access_token="dead-copilot-api-token",
+                last_status=STATUS_DEAD,
+                last_status_at=time.time(),
+            ),
+        ],
+    )
+    monkeypatch.setattr(rp, "_get_model_config", lambda: dict(model_cfg))
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: pool)
+
+    selected = rp._select_pool_entry_for_runtime(
+        provider="copilot",
+        pool=pool,
+        model_cfg=model_cfg,
+    )
+
+    assert selected is None
+    assert pool.current() is None
 
 
 def test_configured_copilot_real_pool_rejects_github_token(monkeypatch):
