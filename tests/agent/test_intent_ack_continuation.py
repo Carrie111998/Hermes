@@ -119,6 +119,171 @@ def test_all_path_drops_workspace_requirement():
 # ── detector: guardrails that hold regardless of workspace ───────────────────
 
 
+def test_real_final_answer_does_not_fire():
+    a = _agent(True, "chat_completions")
+    final = "Done. The server is healthy and there are no critical errors in the logs."
+    msgs = [{"role": "user", "content": REPRO_USER}]
+    assert not looks_like_codex_intermediate_ack(a, REPRO_USER, final, msgs, require_workspace=False)
+
+
+def test_conversational_reply_without_action_verb_does_not_fire():
+    a = _agent(True, "chat_completions")
+    brainstorm = "I'll help you think through the tradeoffs here."
+    msgs = [{"role": "user", "content": "help me decide"}]
+    assert not looks_like_codex_intermediate_ack(
+        a, "help me decide", brainstorm, msgs, require_workspace=False
+    )
+
+
+def test_opted_in_mid_task_ack_still_fires_after_a_tool_ran():
+    """primefit stalls mid-task after todo/terminal — prior tools must not abort."""
+    a = _agent(True, "chat_completions")
+    msgs = [
+        {"role": "user", "content": REPRO_USER},
+        {"role": "tool", "content": "health check result"},
+    ]
+    assert looks_like_codex_intermediate_ack(
+        a, REPRO_USER, REPRO_ACK, msgs, require_workspace=False
+    )
+
+
+def test_codex_only_path_still_blocks_after_a_tool_ran():
+    a = _agent("auto", "codex_responses")
+    msgs = [
+        {"role": "user", "content": CODE_USER},
+        {"role": "tool", "content": "file list"},
+    ]
+    assert not looks_like_codex_intermediate_ack(
+        a, CODE_USER, CODE_ACK, msgs, require_workspace=True
+    )
+
+
+PT_AUDIT_USER = (
+    "audite o Hermes: stalls continue, Discord 50006 e o que falta após o fix"
+)
+
+
+def test_portuguese_vou_ack_fires_when_opted_in():
+    a = _agent(True, "chat_completions")
+    ack = (
+        "Vou retomar a auditoria dos erros do Hermes: carrego o skill de "
+        "self-audit, busco a sessão anterior e leio o ground truth do repo."
+    )
+    msgs = [{"role": "user", "content": PT_AUDIT_USER}]
+    assert looks_like_codex_intermediate_ack(
+        a, PT_AUDIT_USER, ack, msgs, require_workspace=False
+    )
+
+
+def test_portuguese_continuando_mid_task_ack_after_todo_fires():
+    a = _agent(True, "chat_completions")
+    ack = "Continuando: stalls pós-12:23, gateway e Discord 50006."
+    msgs = [
+        {"role": "user", "content": PT_AUDIT_USER},
+        {"role": "assistant", "content": "updating todos"},
+        {"role": "tool", "content": "todos updated", "tool_name": "todo"},
+    ]
+    assert looks_like_codex_intermediate_ack(
+        a, PT_AUDIT_USER, ack, msgs, require_workspace=False
+    )
+
+
+def test_portuguese_refazendo_after_shell_error_fires():
+    a = _agent(True, "chat_completions")
+    ack = "Syntax do shell quebrou. Refazendo com comandos simples."
+    msgs = [
+        {"role": "user", "content": PT_AUDIT_USER},
+        {"role": "tool", "content": "syntax error"},
+    ]
+    assert looks_like_codex_intermediate_ack(
+        a, PT_AUDIT_USER, ack, msgs, require_workspace=False
+    )
+
+
+def test_portuguese_agora_next_step_ack_after_config_fix_fires():
+    a = _agent(True, "chat_completions")
+    ack = "Config já aplicado. Agora Discord 50006 + restart — sem anunciar."
+    msgs = [
+        {"role": "user", "content": PT_AUDIT_USER},
+        {"role": "tool", "content": "config updated"},
+    ]
+    assert looks_like_codex_intermediate_ack(
+        a, PT_AUDIT_USER, ack, msgs, require_workspace=False
+    )
+
+
+def test_portuguese_final_answer_does_not_fire():
+    a = _agent(True, "chat_completions")
+    final = (
+        "Pronto. O gateway está estável, o Discord 50006 está contido e não "
+        "há stalls pendentes."
+    )
+    msgs = [{"role": "user", "content": PT_AUDIT_USER}]
+    assert not looks_like_codex_intermediate_ack(
+        a, PT_AUDIT_USER, final, msgs, require_workspace=False
+    )
+
+
+def test_portuguese_present_tense_commitment_after_tools():
+    a = _agent(True, "chat_completions")
+    msgs = [{"role": "tool", "content": "x"}]
+    assert looks_like_codex_intermediate_ack(
+        a, "user", "Fecho a auditoria e corrijo os erros restantes.", msgs, require_workspace=False
+    )
+    assert not looks_like_codex_intermediate_ack(
+        a, "user", "Próximo: uma ideia criativa sem ação.", msgs, require_workspace=False
+    )
+
+
+def test_20260727_android_escrevo_rodo_stall_fires():
+    a = _agent(True, "chat_completions")
+    msgs = [
+        {"role": "user", "content": "continue as tarefas pendentes"},
+        {"role": "tool", "content": "ContentRepository written"},
+    ]
+    assert looks_like_codex_intermediate_ack(
+        a,
+        "continue",
+        "Escrevo teste OfflineCache e rodo gate Gradle JDK17 agora.",
+        msgs,
+        require_workspace=False,
+    )
+
+
+def test_20260727_diario_oficial_montando_gravando_stall_fires():
+    a = _agent(True, "chat_completions")
+    msgs = [
+        {"role": "user", "content": "analise isso e me de ideias"},
+        {"role": "tool", "content": "browser result"},
+    ]
+    assert looks_like_codex_intermediate_ack(
+        a,
+        "analise",
+        "Montando o plano completo com veredicto de canal, arquitetura e riscos.",
+        msgs,
+        require_workspace=False,
+    )
+    assert looks_like_codex_intermediate_ack(
+        a,
+        "analise",
+        "Evidência suficiente. Gravando plano com canais, arquitetura e riscos reais.",
+        msgs,
+        require_workspace=False,
+    )
+
+
+def test_completed_portuguese_answer_does_not_false_continue_on_salvo():
+    a = _agent(True, "chat_completions")
+    msgs = [{"role": "tool", "content": "x"}]
+    assert not looks_like_codex_intermediate_ack(
+        a,
+        "u",
+        "Pronto. O plano está salvo e os riscos estão documentados.",
+        msgs,
+        require_workspace=False,
+    )
+
+
 
 
 

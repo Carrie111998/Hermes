@@ -6347,6 +6347,18 @@ def run_conversation(
             
             # Check for tool calls
             if assistant_message.tool_calls:
+                # Real (substantive) tool work means the previous intent-ack
+                # continuation succeeded — reset so later mid-task acks can
+                # continue too. Housekeeping-only turns (todo/memory/
+                # session_search/skill_manage) must NOT refill the ack budget.
+                _ACK_HOUSEKEEPING_TOOLS = frozenset({
+                    "memory", "todo", "skill_manage", "session_search",
+                })
+                if any(
+                    tc.function.name not in _ACK_HOUSEKEEPING_TOOLS
+                    for tc in assistant_message.tool_calls
+                ):
+                    codex_ack_continuations = 0
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
                 
@@ -7329,7 +7341,7 @@ def run_conversation(
                 if (
                     _ack_mode != "off"
                     and agent.valid_tool_names
-                    and codex_ack_continuations < 2
+                    and codex_ack_continuations < 4
                     and agent._looks_like_codex_intermediate_ack(
                         user_message=user_message,
                         assistant_content=final_response,

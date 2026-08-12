@@ -3512,11 +3512,20 @@ def looks_like_codex_intermediate_ack(
     is ``true`` or a model-list), so general autonomous workflows ("I'll run a
     health check on the server", "I'll start the deployment") — which carry a
     future-ack and an action verb but no filesystem reference — are caught too.
-    The future-ack + short-content + no-prior-tools + action-verb requirements
-    always apply, which is what keeps conversational "I'll help you brainstorm"
-    replies from tripping it.
+
+    Opted-in mode also keeps mid-task Portuguese/English intent acks after tools
+    already ran (todo/terminal loops that announce the next step then
+    ``finish_reason=stop``). The historical codex-only path still refuses once a
+    tool message is present. Future-ack + short-content + action-verb (or a
+    progressive intent form that implies the action) still gate conversational
+    "I'll help you brainstorm" replies.
     """
-    if any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages):
+    has_prior_tool = any(
+        isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages
+    )
+    # Codex-only / workspace-scoped path: preserve the original no-prior-tools
+    # guard. Opted-in (all api_modes) must continue mid-task after tools.
+    if has_prior_tool and require_workspace:
         return False
 
     assistant_text = agent._strip_think_blocks(assistant_content or "").strip().lower()
@@ -3525,8 +3534,57 @@ def looks_like_codex_intermediate_ack(
     if len(assistant_text) > 1200:
         return False
 
-    has_future_ack = bool(
-        re.search(r"\b(i['’]ll|i will|let me|i can do that|i can help with that)\b", assistant_text)
+    # Progressive PT/EN forms both announce intent and imply an action.
+    progressive_intent = bool(
+        re.search(
+            r"\b("
+            r"continuando|seguindo|retomando|aplicando|refazendo|fechando|"
+            r"auditando|confirmando|cruzando|procurando|verificando|lendo|"
+            r"investigando|checando|implementando|validando|reiniciando|"
+            r"plugando|atualizando|editando|configurando|instalando|entregando|"
+            r"puxando|escrevendo|corrigindo|coletando|compilando|reinjetando|"
+            r"montando|gravando|rodando|executando|testando|salvando|gerando|"
+            r"continuing|following up|retrying|re-?running|restarting|updating|"
+            r"checking|fixing|wiring|plugging|applying|validating|"
+            r"writing|saving|building|running|testing|generating"
+            r")\b",
+            assistant_text,
+        )
+    )
+    # Pronoun/aux commitments ("I'll", "vou") announce intent but do NOT imply
+    # a concrete action by themselves — otherwise conversational replies like
+    # "I'll help you think through the tradeoffs here." false-continue.
+    # Finite PT verbs (fecho/corrijo/plugo/escrevo/rodo) and progressive forms
+    # DO imply action. Session stalls often use present-tense 1st person without
+    # "vou"/"I'll" ("Escrevo teste…", "Rodo gate Gradle").
+    commitment_pronoun = bool(
+        re.search(
+            r"\b("
+            r"i['’]ll|i will|let me|i can do that|i can help with that|"
+            r"vou|irei|vamos|deixa eu|deixe[- ]me|deixa[- ]me"
+            r")\b",
+            assistant_text,
+        )
+    )
+    commitment_verb = bool(
+        re.search(
+            r"\b("
+            r"fecho|entrego|aplico|volto|sigo|faço|confirmo|valido|cruzo|plugo|"
+            r"corrij[oa]|reinicio|atualizo|edito|configuro|instalo|puxo|"
+            r"escrevo|rodo|monto|gravo|executo|testo|gero|leio|busco|"
+            r"abro|implemento|verifico|audito|compilo|reinjeto"
+            r")\b",
+            assistant_text,
+        )
+    )
+    soft_continue = bool(
+        re.search(
+            r"\b(agora|next|próximo|proximo|próxima|proxima)\b",
+            assistant_text,
+        )
+    )
+    has_future_ack = (
+        progressive_intent or commitment_pronoun or commitment_verb or soft_continue
     )
     if not has_future_ack:
         return False
@@ -3551,6 +3609,59 @@ def looks_like_codex_intermediate_ack(
         "walkthrough",
         "report back",
         "summarize",
+        "restart",
+        "verificar",
+        "checar",
+        "analis",
+        "revis",
+        "explorar",
+        "abrir",
+        "rodar",
+        "execut",
+        "testar",
+        "corrig",
+        "corrij",
+        "fech",
+        "auditor",
+        "buscar",
+        "procur",
+        "encontr",
+        "inspecion",
+        "auditar",
+        "carreg",
+        "reinici",
+        "aplicar",
+        "implement",
+        "investig",
+        "cruzar",
+        "fechar",
+        "continuar",
+        "retomar",
+        "validar",
+        "comandos",
+        "discord",
+        "gateway",
+        "stall",
+        "adapter",
+        "config",
+        "logs",
+        "sess",
+        "plug",
+        "atualiz",
+        "edit",
+        "configur",
+        "instal",
+        "entreg",
+        "pux",
+        "escrev",
+        "colet",
+        "compil",
+        "wiring",
+        "todo",
+        "mcp",
+        "composio",
+        "omniroute",
+        "primefit",
     )
     workspace_markers = (
         "directory",
@@ -3568,13 +3679,16 @@ def looks_like_codex_intermediate_ack(
         "path",
     )
 
-    assistant_mentions_action = any(marker in assistant_text for marker in action_markers)
+    has_action_marker = any(marker in assistant_text for marker in action_markers)
+    # Pronoun-only ("I'll help you brainstorm") must NOT count as action.
+    assistant_mentions_action = (
+        progressive_intent or commitment_verb or has_action_marker
+    )
     if not assistant_mentions_action:
         return False
 
-    # Opted-in (all-api_mode) path: a future-ack + action verb + no prior tool
-    # call is enough — the user asked us to keep going when the model only
-    # announces intent, regardless of whether a filesystem is involved.
+    # Opted-in (all-api_mode) path: a future-ack + action verb is enough —
+    # including mid-task after tools — regardless of filesystem references.
     if not require_workspace:
         return True
 
