@@ -4590,6 +4590,151 @@ def test_dependency_source_base_selects_required_parent_receipt(kanban_home, tmp
         assert kb._dependency_source_base(conn, child, repo) == _head_sha(repo)
 
 
+def test_dependency_source_base_uses_latest_completed_receipt(kanban_home, tmp_path):
+    repo = tmp_path / "completed-receipt-repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        parent_id = kb.create_task(
+            conn, title="Parent", workspace_kind="worktree", workspace_path=str(repo),
+            source_commit_required=True,
+        )
+        parent = kb.claim_task(conn, parent_id)
+        assert parent is not None and parent.current_run_id is not None
+        (repo / "first.txt").write_text("first\n", encoding="utf-8")
+        assert kb.complete_task(conn, parent_id, expected_run_id=parent.current_run_id)
+        first_sha = _head_sha(repo)
+        conn.execute(
+            "UPDATE task_runs SET ended_at = ended_at + 100 WHERE id = ?",
+            (parent.current_run_id,),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at, metadata) "
+            "VALUES (?, 'crashed', 'crashed', 200, 300, ?)",
+            (parent_id, json.dumps({"source_completion_receipt": {"commit_sha": first_sha}})),
+        )
+        child_id = kb.create_task(conn, title="Child", parents=[parent_id])
+        child = kb.get_task(conn, child_id)
+        assert child is not None
+        assert kb._dependency_source_base(conn, child, repo) == first_sha
+
+
+def test_dependency_source_base_deduplicates_identical_receipts(kanban_home, tmp_path):
+    repo = tmp_path / "duplicate-receipt-repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        parents = []
+        shared_sha = _head_sha(repo)
+        for title in ("One", "Two"):
+            parent_id = kb.create_task(
+                conn, title=title, workspace_kind="worktree", workspace_path=str(repo),
+                source_commit_required=True,
+            )
+            parent = kb.claim_task(conn, parent_id)
+            assert parent is not None and parent.current_run_id is not None
+            (repo / f"{title.lower()}.txt").write_text(f"{title}\n", encoding="utf-8")
+            assert kb.complete_task(conn, parent_id, expected_run_id=parent.current_run_id)
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps({"source_completion_receipt": {"commit_sha": shared_sha}}), parent.current_run_id),
+            )
+            parents.append(parent_id)
+        child_id = kb.create_task(conn, title="Child", parents=parents)
+        child = kb.get_task(conn, child_id)
+        assert child is not None
+        assert kb._dependency_source_base(conn, child, repo) == shared_sha
+
+
+def test_resolve_worktree_workspace_rejects_divergent_receipts_before_materializing(
+    kanban_home, tmp_path, monkeypatch
+):
+    board = "dependency-source-divergence"
+    kb.create_board(board, name="Dependency Source", preset="generic")
+    repo = tmp_path / "divergent-receipts-repo"
+    _init_git_repo(repo)
+    subprocess.run(["git", "-C", str(repo), "checkout", "-b", "side"], check=True,
+                   capture_output=True, text=True)
+    second_sha = _commit_file(repo, "second.txt", "second\n", "second")
+    subprocess.run(["git", "-C", str(repo), "checkout", "main"], check=True,
+                   capture_output=True, text=True)
+    first_sha = _commit_file(repo, "first.txt", "first\n", "first")
+    target = repo / ".worktrees" / "child"
+    monkeypatch.setattr(kb, "_story_base_branch", lambda *args, **kwargs: None)
+    monkeypatch.setattr(kb, "_handoff_v2_enabled", lambda _meta: False)
+    with kb.connect(board=board) as conn:
+        parents = []
+        for title, sha in (("One", first_sha), ("Two", second_sha)):
+            parent_id = kb.create_task(
+                conn, title=title, board=board, workspace_kind="worktree", workspace_path=str(repo),
+                source_commit_required=True,
+            )
+            parent = kb.claim_task(conn, parent_id)
+            assert parent is not None and parent.current_run_id is not None
+            (repo / f"{title.lower()}.txt").write_text(f"{title}\n", encoding="utf-8")
+            assert kb.complete_task(conn, parent_id, expected_run_id=parent.current_run_id)
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps({"source_completion_receipt": {"commit_sha": sha}}),
+                 parent.current_run_id),
+            )
+            parents.append(parent_id)
+        child_id = kb.create_task(
+            conn, title="Child", board=board, parents=parents, workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        child = kb.get_task(conn, child_id)
+        assert child is not None
+        with pytest.raises(RuntimeError, match="diverge"):
+            kb._resolve_worktree_workspace(child, board=board, conn=conn)
+    assert not target.exists()
+    assert not kb._git_branch_exists(repo, f"wt/{child_id}")
+
+
+def test_dependency_source_base_linear_multi_parent_uses_descendant(kanban_home, tmp_path):
+    repo = tmp_path / "linear-multi-parent-repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        parent_ids = []
+        for title in ("Ancestor", "Descendant"):
+            parent_id = kb.create_task(conn, title=title, workspace_kind="worktree", workspace_path=str(repo), source_commit_required=True)
+            parent = kb.claim_task(conn, parent_id)
+            assert parent is not None and parent.current_run_id is not None
+            (repo / f"{title.lower()}.txt").write_text(title, encoding="utf-8")
+            assert kb.complete_task(conn, parent_id, expected_run_id=parent.current_run_id)
+            parent_ids.append(parent_id)
+        child_id = kb.create_task(conn, title="Child", parents=parent_ids)
+        child = kb.get_task(conn, child_id)
+        assert child is not None
+        assert kb._dependency_source_base(conn, child, repo) == _head_sha(repo)
+
+
+def test_dependency_source_flow_resolves_parent_and_child_worktrees(kanban_home, tmp_path):
+    board = "dependency-source-e2e"
+    kb.create_board(board, name="Dependency Source E2E", preset="generic")
+    repo = tmp_path / "dependency-source-e2e-repo"
+    _init_git_repo(repo)
+    with kb.connect(board=board) as conn:
+        parent_id = kb.create_task(
+            conn, title="Parent", board=board, assignee="developer",
+            workspace_kind="worktree", workspace_path=str(repo),
+            source_commit_required=True,
+        )
+        parent = kb.get_task(conn, parent_id)
+        assert parent is not None
+        parent_ws, parent_branch = kb._resolve_worktree_workspace(parent, board=board, conn=conn)
+        conn.execute("UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(parent_ws), parent_id))
+        (parent_ws / "parent.txt").write_text("parent content\n", encoding="utf-8")
+        claimed = kb.claim_task(conn, parent_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.complete_task(conn, parent_id, expected_run_id=claimed.current_run_id)
+        child_id = kb.create_task(conn, title="Child", board=board, parents=[parent_id], workspace_kind="worktree", workspace_path=str(repo), source_commit_required=True)
+        child = kb.get_task(conn, child_id)
+        assert child is not None and child.status == "ready"
+        child_ws, child_branch = kb._resolve_worktree_workspace(child, board=board, conn=conn)
+    assert parent_ws != child_ws
+    assert parent_branch != child_branch
+    assert (child_ws / "parent.txt").read_text(encoding="utf-8") == "parent content\n"
+
+
 def test_complete_task_required_source_commits_before_terminal_update_and_persists_receipt(
     kanban_home, tmp_path
 ):

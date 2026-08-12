@@ -13191,6 +13191,7 @@ def _dependency_source_base(
             "SELECT t.status, t.source_commit_required, r.metadata "
             "FROM tasks t LEFT JOIN task_runs r ON r.id = ("
             "SELECT id FROM task_runs WHERE task_id = t.id AND ended_at IS NOT NULL "
+            "AND outcome = 'completed' "
             "ORDER BY id DESC LIMIT 1) "
             "WHERE t.id = ?",
             (parent_id,),
@@ -13222,14 +13223,15 @@ def _dependency_source_base(
         if result.returncode != 0 or len(resolved_sha) != 40:
             raise RuntimeError(f"required source parent {parent_id} receipt is foreign or invalid")
         resolved.append((parent_id, resolved_sha))
+    resolved_shas = list(dict.fromkeys(sha for _, sha in resolved))
     candidates = []
-    for candidate_id, candidate in resolved:
+    for candidate in resolved_shas:
         if all(
             subprocess.run(
                 ["git", "-C", str(repo_root), "merge-base", "--is-ancestor", other, candidate],
                 capture_output=True, timeout=30, check=False,
             ).returncode == 0
-            for _, other in resolved
+            for other in resolved_shas
         ):
             candidates.append(candidate)
     if len(candidates) != 1:
@@ -13550,16 +13552,14 @@ def _resolve_worktree_workspace(
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if base_branch is None and conn is not None:
         base_branch = _story_base_branch(conn, task.id, board=board)
-        if base_branch is None and task.workspace_path and not _handoff_v2_enabled(
-            product_board_metadata(board)
-        ):
-            base_branch = _dependency_source_base(
-                conn, task, _git_toplevel(Path(task.workspace_path)) or Path(".")
-            )
     base = base_branch or "HEAD"
 
     def ensure_epic_base(repo_root: Path) -> None:
-        if base_branch is None or _git_branch_exists(repo_root, base_branch):
+        if (
+            base_branch is None
+            or not _handoff_v2_enabled(product_board_metadata(board))
+            or _git_branch_exists(repo_root, base_branch)
+        ):
             return
         epic_id, start_point = _epic_base_start_point(conn, task, repo_root)
         if _ensure_epic_branch(repo_root, base_branch, start_point=start_point):
