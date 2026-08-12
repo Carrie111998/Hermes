@@ -327,11 +327,25 @@ def sync_import(
         }
         if table_exists else {}
     )
+    foreign_owned: set[str] = set()
+    for source_id, task in by_id.items():
+        marker = task.metadata.get("hermes_kanban") or {}
+        owner = marker.get("import_id")
+        if owner and owner != import_id:
+            results.append(ImportResult(
+                source_id,
+                "conflict",
+                marker.get("task_id"),
+                f"source is owned by importer {owner!r}",
+            ))
+            foreign_owned.add(source_id)
     known_profiles = set(kb.list_profiles_on_disk())
 
     # Existing imports are mirror-only. A source-side transition back to a
     # runnable state is a conflict; Kanban remains the single lifecycle owner.
     for source_id, row in ledger.items():
+        if source_id in foreign_owned:
+            continue
         task = by_id.get(source_id)
         native = kb.get_task(conn, row["task_id"])
         if task is None:
@@ -361,6 +375,7 @@ def sync_import(
     pending = [
         task for task in by_id.values()
         if task.source_id not in ledger
+        and task.source_id not in foreign_owned
         and task.source_id not in duplicate_ids
         and task.status in _SOURCE_RUNNABLE | {"importing"}
     ]

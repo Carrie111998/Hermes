@@ -264,6 +264,24 @@ def test_concurrent_import_ids_create_one_native_card(import_env):
     assert sorted(result.action for result in outcomes) == ["conflict", "imported"]
 
 
+def test_later_import_id_rejects_existing_foreign_ownership(import_env):
+    _write(import_env, "one", {
+        "id": "ext-1", "title": "One", "status": "pending", "assignee": "worker",
+    })
+    with kb.connect_closing() as conn:
+        imported = sync_import(
+            conn, adapter=MarkdownAdapter(import_env), import_id="pool-a",
+        )
+        conflict = sync_import(
+            conn, adapter=MarkdownAdapter(import_env), import_id="pool-b",
+        )
+        assert [(row.source_id, row.action, row.task_id) for row in conflict] == [
+            ("ext-1", "conflict", imported[0].task_id),
+        ]
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM task_imports").fetchone()[0] == 1
+
+
 def test_watch_mirrors_lifecycle_changes_without_manual_rerun(import_env, monkeypatch):
     path = _write(import_env, "one", {
         "id": "ext-1", "title": "One", "status": "pending", "assignee": "worker",
