@@ -108,26 +108,35 @@ start. The renderer resolves liveness on a three-rung ladder, weakest first:
 
 1. **DB-derived fallback** (`$foreignLiveSessionIds`, store/foreign-live.ts):
    a refreshed list row with `is_active` (backend: `ended_at IS NULL` and
-   `now - last_active < 300`) and NO runtime in `$sessionStates` is claimed
-   as `working`. This is the only rung that sees sessions running in other
-   processes — CLI one-shots, cron runs, messaging turns, other profiles'
-   serves — which never emit events on this window's transports. It paints
-   within the sessions.changed refresh cadence (~2s server floor, 10s client
-   tick gap).
+   `now - last_active < 300`) AND a REAL recent activity stamp
+   (`last_activity_at` within 90s, ~1.5x the agent's 60s heartbeat) and NO
+   runtime in `$sessionStates` is claimed as `working`. The 90s activity
+   gate keeps reopened/orphan rows from painting live for up to 5 minutes.
+   This is the only rung that sees sessions running in other processes —
+   CLI one-shots, cron runs, messaging turns, other profiles' serves — which
+   never emit events on this window's transports. It paints within the
+   sessions.changed refresh cadence (~2s server floor, 10s client tick gap).
 2. **`session.active_list` rehydration** (use-background-sync.ts): the polled
    snapshot of this gateway's in-memory sessions, plus DB-derived `foreign`
-   rows the backend now reports. Restores liveness after reconnects and
-   paints foreign rows near-instantly.
+   rows the backend now reports (same 90s real-activity gate). Restores
+   liveness after reconnects and paints foreign rows near-instantly.
 3. **Live stream events** (the normal path): authoritative, always wins — the
    fallback predicate excludes any id with a runtime in `$sessionStates`, and
    the rehydrate path refuses to clobber an existing runtime with a `foreign`
    row.
 
 Rules: a real event outranks a DB stamp; absence clears (a row leaving the
-300s window or gaining `ended_at` drops the claim on the next refresh); the
-fallback never creates runtime state — it claims stored ids only, through
-`lineageAliases`, so compression rotation stays correct. Activity captions on
-foreign rows read `last_activity_description` from the same refreshed rows.
+90s activity window, the 300s `is_active` window, or gaining `ended_at` drops
+the claim on the next refresh); the fallback never creates runtime state — it
+claims stored ids only, through `lineageAliases`, so compression rotation
+stays correct. Activity captions on foreign rows read
+`last_activity_description` from the same refreshed rows.
+
+Mounting is read-only: `session.resume` never reopens an ended row; the first
+real turn (`prompt.submit`) reopens it via `_reopen_if_finalized`. Orphaned
+one-shot rows (cli/acp/cron/subagent) with no durable activity for 24h are
+finalized once per serve startup (`heal_orphan_sessions`, end_reason
+`orphan_heal`); chat-like rows (desktop/tui/gateway) stay open by design.
 
 ## Cross everything as an observable ladder
 

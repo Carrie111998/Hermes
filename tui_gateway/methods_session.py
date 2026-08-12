@@ -305,6 +305,13 @@ def _(rid, params: dict) -> dict:
 
 @method("session.resume")
 def _(rid, params: dict) -> dict:
+    """Resume a session: register it live and read its stored transcript.
+
+    Read-only MOUNT: this never reopens an ended DB row (ended_at stays set)
+    — a session that closed is only reopened by the first real turn
+    (prompt.submit -> _reopen_if_finalized) so opening a chat cannot paint
+    liveness by itself (#liveness-stale-end).
+    """
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
