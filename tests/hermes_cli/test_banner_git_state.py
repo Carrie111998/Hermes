@@ -41,3 +41,58 @@ def test_get_git_banner_state_reads_origin_and_head(tmp_path):
     assert state == {"upstream": "b2f477a3", "local": "af8aad31", "ahead": 3}
 
 
+def test_check_via_local_git_ssh_fastpath_ahead_not_behind(tmp_path):
+    """SSH fast path must not report an ahead (carried) HEAD as behind."""
+    from hermes_cli import banner
+
+    repo_dir = tmp_path / "repo"
+    (repo_dir / ".git").mkdir(parents=True)
+
+    def fake_git_stdout(args, *, cwd, timeout=5):
+        if args == ["remote", "get-url", "origin"]:
+            return "git@github.com:NousResearch/hermes-agent.git"
+        if args == ["rev-parse", "HEAD"]:
+            return "62dcb471"  # carried commit, tip differs from origin/main
+        if args == ["rev-list", "--count", "HEAD..origin/main"]:
+            return "0"  # HEAD is a descendant of origin/main, i.e. ahead
+        raise AssertionError(f"unexpected git call: {args}")
+
+    with (
+        patch.object(banner, "_git_stdout", side_effect=fake_git_stdout),
+        patch.object(
+            banner, "_check_via_rev", return_value=banner.UPDATE_AVAILABLE_NO_COUNT
+        ),
+    ):
+        behind = banner._check_via_local_git(repo_dir)
+
+    assert behind == 0
+
+
+def test_check_via_local_git_ssh_fastpath_genuinely_behind(tmp_path):
+    """SSH fast path still reports the real count when actually behind."""
+    from hermes_cli import banner
+
+    repo_dir = tmp_path / "repo"
+    (repo_dir / ".git").mkdir(parents=True)
+
+    def fake_git_stdout(args, *, cwd, timeout=5):
+        if args == ["remote", "get-url", "origin"]:
+            return "git@github.com:NousResearch/hermes-agent.git"
+        if args == ["rev-parse", "HEAD"]:
+            return "62dcb471"
+        if args == ["rev-list", "--count", "HEAD..origin/main"]:
+            return "3"
+        raise AssertionError(f"unexpected git call: {args}")
+
+    with (
+        patch.object(banner, "_git_stdout", side_effect=fake_git_stdout),
+        patch.object(
+            banner, "_check_via_rev", return_value=banner.UPDATE_AVAILABLE_NO_COUNT
+        ),
+    ):
+        behind = banner._check_via_local_git(repo_dir)
+
+    assert behind == 3
+
+
+

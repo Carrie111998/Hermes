@@ -222,6 +222,21 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         checked = _check_via_rev(head_rev) if head_rev else None
         if checked == UPDATE_AVAILABLE_NO_COUNT:
+            # Tip SHAs differ, but the checkout may be *ahead* of origin/main
+            # (a local carried commit), not behind. `git ls-remote` only
+            # compares SHAs, so fall back to counting the real commits behind
+            # the local tracking ref: an ahead/diverged checkout must not be
+            # misreported as "1 commit behind", which would nudge the user to
+            # run `hermes update` and wipe their carried work. Mirrors the
+            # full-clone count below.
+            behind_count = _git_stdout(
+                ["rev-list", "--count", "HEAD..origin/main"], cwd=repo_dir
+            )
+            if behind_count is not None:
+                try:
+                    return int(behind_count)
+                except ValueError:
+                    pass
             return 1
         return checked
 
