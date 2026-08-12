@@ -855,8 +855,12 @@ class TestInlineShellExpansion:
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
             patch(
                 "agent.skill_commands._load_skills_config",
+                # 60s, not 5s: the snippet runs under `bash -c`, and Git Bash
+                # cold-start on Windows was measured at 3-15s, so a 5s budget
+                # makes this fail as "[inline-shell timeout ...]". The test is
+                # about substitution happening, not about latency.
                 return_value={"template_vars": True, "inline_shell": True,
-                              "inline_shell_timeout": 5},
+                              "inline_shell_timeout": 60},
             ),
         ):
             _make_skill(
@@ -878,19 +882,25 @@ class TestInlineShellExpansion:
             patch(
                 "agent.skill_commands._load_skills_config",
                 return_value={"template_vars": True, "inline_shell": True,
-                              "inline_shell_timeout": 5},
+                              "inline_shell_timeout": 60},
             ),
         ):
             skill_dir = _make_skill(
                 tmp_path,
                 "dyn-cwd",
-                body="Here: !`pwd`",
+                # `cat` of a file that only exists in the skill dir, not
+                # `pwd`: the snippet runs under bash, and on Windows bash's
+                # `pwd` prints an MSYS path (/c/Users/...) that never equals
+                # str(skill_dir). Reading a skill-dir-relative file proves the
+                # CWD contract without depending on path spelling.
+                body="Here: !`cat cwd-marker.txt`",
             )
+            (skill_dir / "cwd-marker.txt").write_text("CWD_IS_SKILL_DIR\n")
             scan_skill_commands()
             msg = build_skill_invocation_message("/dyn-cwd")
 
         assert msg is not None
-        assert f"Here: {skill_dir}" in msg
+        assert "Here: CWD_IS_SKILL_DIR" in msg
 
     def test_inline_shell_timeout_does_not_break_message(self, tmp_path):
         with (

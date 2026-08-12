@@ -432,7 +432,12 @@ class TestSkillView:
                 return_value={
                     "template_vars": True,
                     "inline_shell": True,
-                    "inline_shell_timeout": 5,
+                    # Not 5s: run_inline_shell spawns `bash -c`, and Git Bash
+                    # cold-start on Windows was measured at 3-15s on this box,
+                    # so a 5s budget turns this into an intermittent
+                    # "[inline-shell timeout ...]" failure. The test is about
+                    # substitution happening at all, not about latency.
+                    "inline_shell_timeout": 60,
                 },
             ),
         ):
@@ -1187,9 +1192,12 @@ class TestSkillViewCollisionDetection:
         assert "Ambiguous skill name 'explore-codebase'" in result["error"]
         assert "matches" in result
         assert len(result["matches"]) == 2
-        # Both paths surfaced
-        assert any("foundations/runtime" in p for p in result["matches"])
-        assert any("external" in p for p in result["matches"])
+        # Both paths surfaced.  ``matches`` holds absolute *filesystem* paths,
+        # so they are native-separated (backslashes on Windows) — normalize
+        # before asserting rather than assuming posix.
+        surfaced = [Path(p).as_posix() for p in result["matches"]]
+        assert any("foundations/runtime" in p for p in surfaced)
+        assert any("external" in p for p in surfaced)
         assert "hint" in result
 
     def test_top_level_local_collides_with_external(self, tmp_path):
