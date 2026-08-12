@@ -87,6 +87,7 @@ describe('useBackgroundQueueDrain', () => {
       expect(submitText).toHaveBeenCalledWith('continue in the background', {
         attachments: [],
         fromQueue: true,
+        queueDeliveryId: expect.any(String),
         sessionId: 'rt-session-a',
         storedSessionId: 'stored-session-a'
       })
@@ -191,6 +192,7 @@ describe('useBackgroundQueueDrain', () => {
       expect(submitText).toHaveBeenCalledWith('resume then send', {
         attachments: [],
         fromQueue: true,
+        queueDeliveryId: expect.any(String),
         sessionId: null,
         storedSessionId: 'stored-session-a'
       })

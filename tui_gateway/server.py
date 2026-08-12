@@ -7560,6 +7560,28 @@ def _enqueue_prompt(
     session["queued_prompt"] = queued
 
 
+_QUEUE_DELIVERY_DEDUP_LIMIT = 256
+
+
+def _queued_delivery_seen(session: dict, delivery_id: str | None) -> bool:
+    """Return whether this durable Desktop queue entry was already accepted."""
+    return bool(delivery_id and delivery_id in session.get("_accepted_queue_delivery_ids", ()))
+
+
+def _record_queued_delivery(session: dict, delivery_id: str | None) -> None:
+    if not delivery_id:
+        return
+    accepted = session.setdefault("_accepted_queue_delivery_ids", {})
+    accepted[delivery_id] = None
+    while len(accepted) > _QUEUE_DELIVERY_DEDUP_LIMIT:
+        accepted.pop(next(iter(accepted)))
+
+
+def _forget_queued_delivery(session: dict, delivery_id: str | None) -> None:
+    if delivery_id:
+        session.get("_accepted_queue_delivery_ids", {}).pop(delivery_id, None)
+
+
 def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
     """Interrupt a busy turn without blocking the RPC reader or session lock.
 
@@ -7596,7 +7618,13 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    queued: bool = False,
+    queue_delivery_id: str | None = None,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -7669,7 +7697,10 @@ def _handle_busy_submit(
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
+        if _queued_delivery_seen(session, queue_delivery_id):
+            return _ok(rid, {"status": "duplicate"})
         _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        _record_queued_delivery(session, queue_delivery_id)
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without

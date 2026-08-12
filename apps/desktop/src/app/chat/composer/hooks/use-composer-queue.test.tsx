@@ -73,6 +73,57 @@ describe('useComposerQueue park integration', () => {
     expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
   })
 
+  it('reuses one delivery id when a queued send loses its client promise across remount', async () => {
+    let settleFirst: (accepted: boolean) => void = () => undefined
+    const firstResult = new Promise<boolean>(resolve => {
+      settleFirst = resolve
+    })
+    const onSubmit = vi.fn<ChatBarProps['onSubmit']>(() => firstResult)
+    const queueEditRef: { current: QueueEditState | null } = { current: null }
+
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'run this exactly once' })
+
+    const first = renderHook(() =>
+      useComposerQueue({
+        activeQueueSessionKey: SESSION_KEY,
+        attachments: [],
+        busy: false,
+        clearDraft: () => undefined,
+        draftRef: { current: '' },
+        focusInput: () => undefined,
+        loadIntoComposer: () => undefined,
+        onCancel: vi.fn(),
+        onSubmit,
+        queueEditRef,
+        queueSessionKey: SESSION_KEY,
+        sessionId: 'rt-session-queue-hook'
+      })
+    )
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    first.unmount()
+
+    // Compression/session rotation remounts the drainer before the original
+    // RPC promise settles. The gateway may already have accepted the turn, so
+    // replaying the durable local entry here would execute it twice (#84417).
+    const second = renderQueueHook()
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    await waitFor(() => expect(second.onSubmit).toHaveBeenCalledTimes(1))
+    expect(onSubmit.mock.calls[0]?.[1]).toMatchObject({
+      queueDeliveryId: expect.any(String)
+    })
+    expect(second.onSubmit.mock.calls[0]?.[1]).toMatchObject({
+      queueDeliveryId: onSubmit.mock.calls[0]?.[1]?.queueDeliveryId
+    })
+    expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
+
+    settleFirst(true)
+  })
+
   it('holds a parked queue at the idle settle (the Stop edge)', async () => {
     enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'halted' })
     parkQueuedPrompts(SESSION_KEY)

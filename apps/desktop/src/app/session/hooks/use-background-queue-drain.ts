@@ -122,6 +122,7 @@ export function useBackgroundQueueDrain({
             submitTextRef.current(liveEntry.text, {
               attachments: liveEntry.attachments,
               fromQueue: true,
+              queueDeliveryId: liveEntry.id,
               sessionId: runtimeSessionId,
               storedSessionId: sessionKey
             })

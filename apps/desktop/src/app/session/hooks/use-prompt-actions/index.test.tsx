@@ -1753,12 +1753,16 @@ describe('usePromptActions submit / queue drain semantics', () => {
       />
     )
 
-    const accepted = await handle!.submitText('queued message', { fromQueue: true })
+    const accepted = await handle!.submitText('queued message', {
+      fromQueue: true,
+      queueDeliveryId: 'queued-stable-id'
+    })
 
     expect(accepted).toBe(true)
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       {
+        queue_delivery_id: 'queued-stable-id',
         queued: true,
         session_id: RUNTIME_SESSION_ID,
         text: 'queued message'

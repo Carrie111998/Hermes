@@ -138,6 +138,31 @@ def test_busy_helper_retries_when_turn_finished(monkeypatch):
     assert session.get("queued_prompt") is None
 
 
+def test_queue_delivery_retry_is_acknowledged_without_starting_a_second_turn(monkeypatch):
+    """A lost Desktop RPC result may resend one durable queue entry (#84417)."""
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    agent = types.SimpleNamespace(interrupt=lambda: None)
+    session = _session(agent=agent, running=True)
+    server._sessions["sid"] = session
+    params = {
+        "session_id": "sid",
+        "text": "run this exactly once",
+        "queued": True,
+        "queue_delivery_id": "queued-stable-id",
+    }
+    try:
+        first = server._methods["prompt.submit"]("first", params)
+        session["running"] = False
+        second = server._methods["prompt.submit"]("retry", params)
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert first["result"]["status"] == "queued"
+    assert second["result"]["status"] == "duplicate"
+    assert session["queued_prompt"]["text"] == "run this exactly once"
+    assert session.get("queued_prompts") is None
+
+
 
 
 

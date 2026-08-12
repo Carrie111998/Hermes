@@ -111,6 +111,11 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    queue_delivery_id = params.get("queue_delivery_id") if params.get("queued") else None
+    if queue_delivery_id is not None:
+        if not isinstance(queue_delivery_id, str) or not queue_delivery_id.strip() or len(queue_delivery_id) > 200:
+            return _err(rid, 4004, "queue_delivery_id must be a non-empty string of at most 200 characters")
+        queue_delivery_id = queue_delivery_id.strip()
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     # Which desktop window this message was typed into. Rewritten on every
@@ -147,6 +152,7 @@ def _(rid, params: dict) -> dict:
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            queue_delivery_id=queue_delivery_id,
         )
         if busy_response is not None:
             return busy_response
@@ -301,6 +307,9 @@ def _(rid, params: dict) -> dict:
                     )
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
+        if _queued_delivery_seen(session, queue_delivery_id):
+            return _ok(rid, {"status": "duplicate"})
+        _record_queued_delivery(session, queue_delivery_id)
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
@@ -328,6 +337,7 @@ def _(rid, params: dict) -> dict:
         from hermes_state import is_disk_full_error
 
         with session["history_lock"]:
+            _forget_queued_delivery(session, queue_delivery_id)
             session["running"] = False
             session["last_active"] = time.time()
             _clear_inflight_turn(session)

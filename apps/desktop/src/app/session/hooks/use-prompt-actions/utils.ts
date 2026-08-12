@@ -535,6 +535,10 @@ export interface SubmitTextOptions {
    *  dispatcher passes the invocation (`/work fix the leak`) here. */
   displayText?: string
   fromQueue?: boolean
+  /** Stable id of a durable composer-queue entry. Reused across retries and
+   *  remounts so the gateway can acknowledge an already-accepted drain without
+   *  starting the same user turn again. */
+  queueDeliveryId?: string
   /** Runtime session id to submit into. Queue drains pass this so a
    *  backgrounded/source session cannot be replaced by the current foreground
    *  session between enqueue and drain. */
