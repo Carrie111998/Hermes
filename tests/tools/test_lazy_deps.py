@@ -146,6 +146,86 @@ class TestEnsure:
         assert ld._lazy_install_lock_path().parent == target.parent
         assert ld._lazy_install_lock_path().parent != target
 
+    def test_durable_lock_canonicalizes_symlink_alias(self, monkeypatch, tmp_path):
+        real_target = tmp_path / "real-target"
+        real_target.mkdir()
+        alias_target = tmp_path / "alias-target"
+        alias_target.symlink_to(real_target, target_is_directory=True)
+
+        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(real_target))
+        real_lock = ld._lazy_install_lock_path()
+        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(alias_target))
+        alias_lock = ld._lazy_install_lock_path()
+
+        assert real_target.resolve() == alias_target.resolve()
+        assert real_lock == alias_lock
+
+    @pytest.mark.skipif(
+        not hasattr(os, "fork") or ld.fcntl is None,
+        reason="requires POSIX fork and flock",
+    )
+    def test_fork_child_closes_inherited_lock_descriptor(self, tmp_path):
+        """A child must release the lock description inherited from its parent."""
+        result = tmp_path / "child-result"
+        worker = tmp_path / "fork-worker.py"
+        worker.write_text(
+            textwrap.dedent(
+                """
+                import os
+                from pathlib import Path
+                import signal
+                import time
+
+                import tools.lazy_deps as ld
+
+                result = Path(os.environ["FORK_RESULT"])
+                holder = os.fork()
+                if holder == 0:
+                    with ld._lazy_install_lock():
+                        read_fd, write_fd = os.pipe()
+                        child = os.fork()
+                        if child == 0:
+                            os.close(write_fd)
+                            # Wait for the lock-holding parent to exit abruptly.
+                            os.read(read_fd, 1)
+                            os.close(read_fd)
+                            signal.alarm(2)
+                            with ld._lazy_install_lock():
+                                result.write_text("acquired", encoding="utf-8")
+                            os._exit(0)
+                        os.close(read_fd)
+                        os.close(write_fd)
+                        os._exit(0)
+
+                os.waitpid(holder, 0)
+                deadline = time.monotonic() + 4
+                while not result.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                raise SystemExit(0 if result.exists() else 1)
+                """
+            ),
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env.update(
+            {
+                "FORK_RESULT": str(result),
+                "HERMES_LAZY_INSTALL_TARGET": str(tmp_path / "lazy-target"),
+                "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+            }
+        )
+
+        completed = subprocess.run(
+            [sys.executable, str(worker)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert result.read_text(encoding="utf-8") == "acquired"
+
     def test_already_satisfied_is_noop(self, monkeypatch):
         # If the package is importable, ensure() returns without calling pip.
         monkeypatch.setitem(ld.LAZY_DEPS, "test.satisfied", ("zzzfake>=1",))

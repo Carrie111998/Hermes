@@ -403,23 +403,50 @@ _TARGET_STAMP_NAME = ".python-abi"
 # concurrently. The file lock lives OUTSIDE the durable target so an ABI wipe
 # cannot delete the lock that protects it.
 _LAZY_INSTALL_THREAD_LOCK = threading.Lock()
+_LAZY_INSTALL_HANDLE_LOCK = threading.Lock()
+_LAZY_INSTALL_OPEN_HANDLES: set[Any] = set()
 _LAZY_INSTALL_LOCK_NAME = ".hermes-lazy-install.lock"
 
 
-def _reset_lazy_install_thread_lock_after_fork() -> None:
-    """A child must not inherit a lock held by a vanished parent thread."""
-    global _LAZY_INSTALL_THREAD_LOCK
+def _before_lazy_install_fork() -> None:
+    """Freeze the handle registry while Python duplicates file descriptors."""
+    _LAZY_INSTALL_HANDLE_LOCK.acquire()
+
+
+def _after_lazy_install_fork_parent() -> None:
+    _LAZY_INSTALL_HANDLE_LOCK.release()
+
+
+def _after_lazy_install_fork_child() -> None:
+    """Drop inherited lock descriptions and reset vanished-thread locks."""
+    global _LAZY_INSTALL_THREAD_LOCK, _LAZY_INSTALL_HANDLE_LOCK
+    for handle in tuple(_LAZY_INSTALL_OPEN_HANDLES):
+        try:
+            handle.close()
+        except OSError:
+            pass
+    _LAZY_INSTALL_OPEN_HANDLES.clear()
     _LAZY_INSTALL_THREAD_LOCK = threading.Lock()
+    # The registry lock was acquired by the pre-fork hook in the parent and is
+    # inherited as locked; replace it because its owning thread may not exist.
+    _LAZY_INSTALL_HANDLE_LOCK = threading.Lock()
 
 
 if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_reset_lazy_install_thread_lock_after_fork)
+    os.register_at_fork(
+        before=_before_lazy_install_fork,
+        after_in_parent=_after_lazy_install_fork_parent,
+        after_in_child=_after_lazy_install_fork_child,
+    )
 
 
 def _lazy_install_lock_path() -> Path:
     target = _lazy_install_target()
     if target is not None:
-        return target.parent / f".{target.name}.lazy-install.lock"
+        canonical_target = target.resolve(strict=False)
+        return canonical_target.parent / f".{canonical_target.name}.lazy-install.lock"
+    # Keep venv-scoped installs tied to the active venv. Resolving
+    # sys.executable can escape a symlinked venv to the base interpreter.
     return Path(sys.executable).parent.parent / _LAZY_INSTALL_LOCK_NAME
 
 
@@ -430,8 +457,12 @@ def _lazy_install_lock() -> Iterator[None]:
         lock_path = _lazy_install_lock_path()
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         # Append mode creates the file atomically without ever truncating a
-        # sibling process's lock. Windows needs at least one byte to lock.
-        handle = lock_path.open("a+b")
+        # sibling process's lock. Hold the registry mutex across open+register
+        # so a concurrent fork cannot inherit an untracked descriptor. Windows
+        # needs at least one byte to lock.
+        with _LAZY_INSTALL_HANDLE_LOCK:
+            handle = lock_path.open("a+b")
+            _LAZY_INSTALL_OPEN_HANDLES.add(handle)
         if msvcrt is not None:
             handle.seek(0, os.SEEK_END)
             if handle.tell() == 0:
@@ -469,6 +500,8 @@ def _lazy_install_lock() -> Iterator[None]:
                     msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
                 except OSError:
                     pass
+            with _LAZY_INSTALL_HANDLE_LOCK:
+                _LAZY_INSTALL_OPEN_HANDLES.discard(handle)
             handle.close()
 
 
