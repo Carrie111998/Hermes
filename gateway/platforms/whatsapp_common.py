@@ -76,8 +76,8 @@ class WhatsAppBehaviorMixin:
 
     DEFAULT_REPLY_PREFIX: str = "⚕ *Hermes Agent*\n────────────\n"
 
-    _OUTBOUND_INVISIBLE_CHARS_RE = re.compile(r"[\\u200b\\u2060\\u2063\\ufeff]")
-    _OUTBOUND_ODD_SPACE_RE = re.compile(r"[\\u00a0\\u1680\\u180e\\u2000-\\u200a\\u202f\\u205f\\u3000]")
+    _OUTBOUND_INVISIBLE_CHARS_RE = re.compile(r"[​⁠⁣﻿]")
+    _OUTBOUND_ODD_SPACE_RE = re.compile(r"[  ᠎ -   　]")
 
     @classmethod
     def _sanitize_outbound_text(cls, content: str) -> str:
