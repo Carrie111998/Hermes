@@ -314,13 +314,20 @@ def _prune_durable_records() -> None:
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
     now = time.time()
+    # ``result`` comes from the injected runner. The public completion event
+    # already carries the independently sanitized, bounded timeout evidence;
+    # retaining the pre-sanitized tail in result_json would re-expose it via
+    # get_durable_delegation(). Preserve all legacy result metadata, but never
+    # persist this untrusted display payload.
+    durable_result = dict(result)
+    durable_result.pop("partial_output_tail", None)
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
                event_json=?, result_json=?, delivery_state='pending'
                WHERE delegation_id=?""",
             (event.get("status", "completed"), event.get("completed_at", now), now,
-             json.dumps(event), json.dumps(result), event["delegation_id"]),
+             json.dumps(event), json.dumps(durable_result), event["delegation_id"]),
         )
 
 
@@ -985,6 +992,50 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
+    # A single background timeout is normalized through this event boundary
+    # before process_registry formats it. Treat the runner result as untrusted:
+    # validate the shape, force-redact complete strings before truncating, and
+    # fail closed on any malformed entry or redactor failure.
+    partial_tail = result.get("partial_output_tail")
+    if (
+        status == "timeout"
+        and result.get("partial") is True
+        and isinstance(partial_tail, list)
+        and partial_tail
+    ):
+        try:
+            from agent.redact import redact_sensitive_text
+
+            safe_partial_tail = []
+            for entry in partial_tail[-8:]:
+                if (
+                    not isinstance(entry, dict)
+                    or not isinstance(entry.get("tool"), str)
+                    or not isinstance(entry.get("preview"), str)
+                    or not isinstance(entry.get("is_error"), bool)
+                ):
+                    raise ValueError("invalid partial output tail entry")
+                # ``tool`` is display-only here and comes from the untrusted
+                # runner result. Do not echo it across the security boundary:
+                # arbitrary identifier-looking text can still be a secret.
+                safe_partial_tail.append(
+                    {
+                        "tool": "tool",
+                        "preview": redact_sensitive_text(
+                            entry["preview"], force=True
+                        )[:600],
+                        "is_error": entry["is_error"],
+                    }
+                )
+        except Exception:
+            logger.warning(
+                "Failed to sanitize async delegation timeout evidence; "
+                "dropping output tail",
+                exc_info=True,
+            )
+        else:
+            evt["partial"] = True
+            evt["partial_output_tail"] = safe_partial_tail
     # Routing origin captured at dispatch (see _capture_routing_origin):
     # additive, lets the gateway reconstruct a full SessionSource (incl.
     # scope_id for relay tenant egress) when its own caches are cold.
