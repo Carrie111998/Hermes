@@ -372,14 +372,40 @@ def review_commit(cwd: str, message: str, push: bool) -> dict:
     return {"ok": True}
 
 
+def _resolve_push_remote(cwd: str, branch: str) -> str | None:
+    """The remote a push of ``branch`` should target, or ``None`` when ambiguous.
+
+    Deliberately does NOT fall back to ``origin``. In a fork checkout ``origin``
+    is often the UPSTREAM project (``~/.hermes/agent-src`` is exactly that), so
+    guessing it publishes private work to a public repo and pins the branch's
+    tracking there. Follows git's own precedence, then accepts a lone remote as
+    unambiguous; anything else is the caller's decision, not ours.
+    """
+    for key in (f"branch.{branch}.pushRemote", "remote.pushDefault"):
+        configured = _git_out(cwd, ["config", "--get", key]).strip()
+        if configured:
+            return configured
+    remotes = _git_out(cwd, ["remote"]).split()
+    return remotes[0] if len(remotes) == 1 else None
+
+
 def _review_push(cwd: str) -> None:
     upstream = _git_out(cwd, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).strip()
     if upstream:
         _git_ok(cwd, ["push"])
         return
     branch = _git_out(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]).strip()
-    if branch and branch != "HEAD":
-        _git_ok(cwd, ["push", "-u", "origin", branch])
+    if not branch or branch == "HEAD":
+        return
+    remote = _resolve_push_remote(cwd, branch)
+    if not remote:
+        raise RuntimeError(
+            f"'{branch}' has no upstream and no push remote is configured. "
+            "Refusing to guess 'origin' -- in a fork checkout that is often the "
+            "upstream project. Set branch.<name>.pushRemote or remote.pushDefault, "
+            "or push manually."
+        )
+    _git_ok(cwd, ["push", "-u", remote, branch])
 
 
 def review_push(cwd: str) -> dict:
