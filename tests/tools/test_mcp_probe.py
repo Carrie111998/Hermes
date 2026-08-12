@@ -1,10 +1,18 @@
-"""Tests for the parallel-discovery outer-timeout policy in tools.mcp_tool.
+"""Tests for the ``connect_timeout`` policy in tools.mcp_tool.
 
 Covers ``probe_mcp_server_tools()`` and the sibling site in
 ``register_mcp_servers()``: both gather per-server connects in parallel under
 an enclosing ``_run_on_mcp_loop`` bound, and both must scale that bound off the
 largest *sanitized* ``connect_timeout`` so a slow-but-legitimately-configured
 server is not cancelled before its own budget elapses.
+
+Also covers the two *transport* connect paths that consume the same setting —
+``MCPServerTask._run_http`` and ``MCPServerTask._run_stdio``. They read
+``connect_timeout`` once and feed it to the transport's client timeout and to
+the ``asyncio.wait_for`` that bounds the ``initialize()`` handshake, so they
+must read it through ``_sanitized_connect_timeout`` too: the outer bound and
+the inner deadlines are only consistent if every reader applies the same
+policy.
 """
 
 import asyncio
@@ -364,3 +372,232 @@ class TestSanitizedConnectTimeout:
         result = mcp._sanitized_connect_timeout({"connect_timeout": good_value})
         assert result == float(good_value)
         assert isinstance(result, float)
+
+
+# --- transport connect paths -------------------------------------------------
+#
+# ``_run_http`` and ``_run_stdio`` each read ``connect_timeout`` once and hand
+# it to the transport client AND to the ``asyncio.wait_for`` bounding
+# ``session.initialize()``. The helpers below drive the real coroutines against
+# fake transports and report the value that read resolved to, so every
+# assertion is a bounded value check — no test ever awaits a real deadline.
+
+_UNUSABLE_CONNECT_TIMEOUTS = [
+    float("nan"),    # YAML `.nan`  -> a deadline that is not a deadline
+    float("inf"),    # YAML `.inf`  -> a deadline that never elapses
+    float("-inf"),   # YAML `-.inf`
+    0,               # non-positive: connect can never succeed
+    -5,              # negative
+    "not-a-number",  # unparseable
+    None,            # explicit null in config.yaml
+    [30],            # wrong YAML shape
+]
+
+_UNUSABLE_IDS = [
+    "nan", "inf", "-inf", "zero", "negative", "unparseable", "none", "list",
+]
+
+
+class _ProbeStop(Exception):
+    """Raised by a fake transport once it has recorded the resolved timeout.
+
+    Unwinding immediately keeps these tests to a pure value comparison: a
+    regression shows up as a wrong number, never as a hung suite.
+    """
+
+
+class _FakeAsyncCM:
+    """Minimal async context manager yielding a fixed value."""
+
+    def __init__(self, value):
+        self._value = value
+
+    async def __aenter__(self):
+        return self._value
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+class _RecordingAsyncio:
+    """Delegating ``asyncio`` stand-in that records ``wait_for`` deadlines.
+
+    ``tools.mcp_tool`` reaches ``wait_for`` through its own module-level
+    ``asyncio`` binding, so replacing that binding captures the deadline the
+    stdio connect path resolved without patching the global module. The call
+    at index ``stop_at`` is short-circuited with ``_ProbeStop`` instead of
+    being awaited.
+    """
+
+    def __init__(self, recorded, stop_at):
+        self._recorded = recorded
+        self._stop_at = stop_at
+
+    def wait_for(self, awaitable, timeout=None):
+        self._recorded.append(timeout)
+        if len(self._recorded) != self._stop_at:
+            return asyncio.wait_for(awaitable, timeout)
+        close = getattr(awaitable, "close", None)
+        if close is not None:
+            close()  # never-awaited coroutine would warn otherwise
+        raise _ProbeStop
+
+    def __getattr__(self, name):
+        return getattr(asyncio, name)
+
+
+def _resolved_http_connect_timeout(config, branch):
+    """Return the connect timeout ``_run_http`` handed to its transport.
+
+    ``branch`` picks which of the three transports the single
+    ``connect_timeout`` read feeds: ``"sse"``, ``"streamable_http"``
+    (mcp >= 1.24) or ``"legacy_http"`` (mcp < 1.24).
+    """
+    pytest.importorskip("mcp")
+    import tools.mcp_tool as mcp
+
+    captured = {}
+
+    def fake_sse_client(**kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        raise _ProbeStop
+
+    def fake_streamable_http_client(_url, http_client=None, **_kwargs):
+        captured["timeout"] = http_client.timeout.connect
+        raise _ProbeStop
+
+    def fake_streamablehttp_client(_url, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        raise _ProbeStop
+
+    server = mcp.MCPServerTask("connect-timeout-probe")
+    full_config = dict(config, url="https://example.invalid/mcp")
+    if branch == "sse":
+        full_config["transport"] = "sse"
+
+    async def drive():
+        with patch.object(mcp, "_MCP_HTTP_AVAILABLE", True), \
+             patch.object(mcp, "_MCP_NEW_HTTP", branch != "legacy_http"), \
+             patch.object(mcp, "sse_client", fake_sse_client), \
+             patch.object(mcp, "streamable_http_client",
+                          fake_streamable_http_client, create=True), \
+             patch.object(mcp, "streamablehttp_client",
+                          fake_streamablehttp_client, create=True):
+            with pytest.raises(_ProbeStop):
+                await server._run_http(full_config)
+
+    asyncio.run(drive())
+    return captured["timeout"]
+
+
+def _resolved_stdio_connect_timeout(config):
+    """Return the deadline ``_run_stdio`` handed to the handshake ``wait_for``."""
+    pytest.importorskip("mcp")
+    import tools.mcp_tool as mcp
+
+    recorded = []
+    server = mcp.MCPServerTask("connect-timeout-probe")
+    full_config = dict(config, command="fake-mcp", args=[])
+
+    def fake_stdio_client(*_args, **_kwargs):
+        return _FakeAsyncCM((object(), object()))
+
+    def fake_client_session(*_args, **_kwargs):
+        session = MagicMock()
+        session.initialize = AsyncMock()
+        return _FakeAsyncCM(session)
+
+    async def drive():
+        with patch.object(mcp, "stdio_client", fake_stdio_client), \
+             patch.object(mcp, "ClientSession", fake_client_session), \
+             patch.object(mcp, "_resolve_stdio_command", lambda c, e: (c, e)), \
+             patch.object(mcp, "_write_stderr_log_header", lambda *_a, **_k: None), \
+             patch.object(mcp, "_get_mcp_stderr_log", lambda: None), \
+             patch("tools.osv_check.check_package_for_malware", lambda *_a, **_k: None), \
+             patch.object(mcp, "asyncio", _RecordingAsyncio(recorded, stop_at=2)):
+            with pytest.raises(_ProbeStop):
+                await server._run_stdio(full_config)
+
+    asyncio.run(drive())
+    # recorded[0] is the OSV malware preflight bound; recorded[1] is the
+    # handshake deadline under test.
+    return recorded[1]
+
+
+class TestHttpTransportConnectTimeout:
+    """``_run_http``'s ``connect_timeout`` read feeds the transport's client
+    timeout and the ``initialize()`` ``wait_for`` on all three branches.
+
+    Left unsanitized, a YAML ``.inf`` yields a handshake deadline that never
+    elapses — the server accepts the connection, never answers ``initialize``,
+    and the connect coroutine parks forever; ``.nan`` yields a deadline that is
+    not a deadline at all (the loop's timer heap trips it on an arbitrary
+    wake-up, killing a healthy handshake); ``0``/negative can never connect;
+    and an unparseable value raises out of the middle of the transport setup
+    instead of falling back. All four are the same defect: the value never
+    passed through ``_sanitized_connect_timeout``.
+    """
+
+    @pytest.mark.parametrize("branch", ["sse", "streamable_http", "legacy_http"])
+    @pytest.mark.parametrize(
+        "bad_value", _UNUSABLE_CONNECT_TIMEOUTS, ids=_UNUSABLE_IDS
+    )
+    def test_unusable_value_falls_back_to_the_default(self, branch, bad_value):
+        import tools.mcp_tool as mcp
+
+        resolved = _resolved_http_connect_timeout(
+            {"connect_timeout": bad_value}, branch
+        )
+
+        assert resolved == float(mcp._DEFAULT_CONNECT_TIMEOUT), (
+            f"{branch} transport resolved connect_timeout={bad_value!r} to "
+            f"{resolved!r} — an unusable deadline reached the transport"
+        )
+
+    @pytest.mark.parametrize("branch", ["sse", "streamable_http", "legacy_http"])
+    def test_valid_value_is_still_honoured(self, branch):
+        """Sanitizing must not flatten every server to the default."""
+        resolved = _resolved_http_connect_timeout({"connect_timeout": 300}, branch)
+
+        assert resolved == 300.0
+
+    @pytest.mark.parametrize("branch", ["sse", "streamable_http", "legacy_http"])
+    def test_missing_value_uses_the_default(self, branch):
+        import tools.mcp_tool as mcp
+
+        resolved = _resolved_http_connect_timeout({}, branch)
+
+        assert resolved == float(mcp._DEFAULT_CONNECT_TIMEOUT)
+
+
+class TestStdioTransportConnectTimeout:
+    """``_run_stdio`` bounds its ``initialize()`` handshake with the same
+    setting (#59349), so it needs the same sanitization: an ``.inf`` deadline
+    never elapses, which is precisely the hang that bound was added to stop,
+    and the spawned child is only reaped when the connect unwinds.
+    """
+
+    @pytest.mark.parametrize(
+        "bad_value", _UNUSABLE_CONNECT_TIMEOUTS, ids=_UNUSABLE_IDS
+    )
+    def test_unusable_value_falls_back_to_the_default(self, bad_value):
+        import tools.mcp_tool as mcp
+
+        resolved = _resolved_stdio_connect_timeout({"connect_timeout": bad_value})
+
+        assert resolved == float(mcp._DEFAULT_CONNECT_TIMEOUT), (
+            f"stdio transport resolved connect_timeout={bad_value!r} to "
+            f"{resolved!r} — an unusable handshake deadline was applied"
+        )
+
+    def test_valid_value_is_still_honoured(self):
+        resolved = _resolved_stdio_connect_timeout({"connect_timeout": 300})
+
+        assert resolved == 300.0
+
+    def test_missing_value_uses_the_default(self):
+        import tools.mcp_tool as mcp
+
+        resolved = _resolved_stdio_connect_timeout({})
+
+        assert resolved == float(mcp._DEFAULT_CONNECT_TIMEOUT)
