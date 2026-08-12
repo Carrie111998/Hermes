@@ -27,6 +27,10 @@ const LOCAL_PREVIEW_URL_RE = /(^|\s)https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0
 const LOCAL_PREVIEW_ONLY_RE = /^https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?\/?$/i
 const URL_ONLY_LINE_RE = /^\s*https?:\/\/\S+\s*$/i
 const CITATION_MARKER_RE = /(?<=[\p{L}\p{N})\].,!?:;"'”’])\[(?:\d+(?:\s*,\s*\d+)*)\](?!\()/gu
+export const EXCALIDRAW_CHAT_LINK_PREFIX = '/__hermes_excalidraw_relative__/'
+
+const BARE_EXCALIDRAW_LINK_TARGET_RE =
+  /(?<!!)(\]\(\s*)(?![./]|[a-z][a-z\d+.-]*:)([^)\s]+\.excalidraw(?:[?#][^)\s]*)?)(?=\s*\))/gi
 
 /**
  * Returns true when `body` contains a line that's exactly `marker` (modulo
@@ -145,18 +149,24 @@ function autoLinkRawUrls(text: string): string {
   })
 }
 
-function normalizeVisibleProse(text: string): string {
+function exposeBareExcalidrawLinks(text: string): string {
+  return text.replace(BARE_EXCALIDRAW_LINK_TARGET_RE, `$1${EXCALIDRAW_CHAT_LINK_PREFIX}$2`)
+}
+
+function normalizeVisibleProse(text: string, allowBareExcalidrawLinks: boolean): string {
   return text
     .split(INLINE_CODE_SPLIT_RE)
-    .map(part =>
-      part.startsWith('`')
-        ? part
-        : linkifySessionRefs(
-            autoLinkRawUrls(
-              part.replace(/`{3,}/g, '').replace(LOCAL_PREVIEW_URL_RE, '$1').replace(CITATION_MARKER_RE, '')
-            )
-          )
-    )
+    .map(part => {
+      if (part.startsWith('`')) {
+        return part
+      }
+
+      const normalized = linkifySessionRefs(
+        autoLinkRawUrls(part.replace(/`{3,}/g, '').replace(LOCAL_PREVIEW_URL_RE, '$1').replace(CITATION_MARKER_RE, ''))
+      )
+
+      return allowBareExcalidrawLinks ? exposeBareExcalidrawLinks(normalized) : normalized
+    })
     .join('')
 }
 
@@ -478,7 +488,7 @@ function normalizeFenceBlocks(text: string): string {
   return out.join('\n')
 }
 
-export function preprocessMarkdown(text: string): string {
+export function preprocessMarkdown(text: string, options: { allowBareExcalidrawLinks?: boolean } = {}): string {
   const cleaned = text.replace(REASONING_BLOCK_RE, '').replace(PREVIEW_MARKER_RE, '')
   const scrubbed = scrubBacktickNoise(cleaned)
   const normalizedFences = normalizeFenceBlocks(scrubbed)
@@ -514,7 +524,12 @@ export function preprocessMarkdown(text: string): string {
       // blocks stay intact. The HTML-depth clamp belongs here for the same
       // reason: a fenced block renders as code and never reaches rehype-raw,
       // so escaping tags inside one would corrupt the listing for nothing.
-      const transformed = clampHtmlNestingDepth(normalizeVisibleProse(stripPreviewTargets(normalizeProseMath(part))))
+      const transformed = clampHtmlNestingDepth(
+        normalizeVisibleProse(
+          stripPreviewTargets(normalizeProseMath(part)),
+          options.allowBareExcalidrawLinks === true
+        )
+      )
 
       return leading + transformed + trailing
     })

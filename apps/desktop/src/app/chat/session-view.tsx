@@ -49,6 +49,8 @@ export interface SessionView {
   $messagesEmpty: ReadableAtom<boolean>
   $lastVisibleIsUser: ReadableAtom<boolean>
   $cwd: ReadableAtom<string>
+  $profile: ReadableAtom<string>
+  $runtime: ReadableAtom<string>
   $model: ReadableAtom<string>
   $provider: ReadableAtom<string>
   $fast: ReadableAtom<boolean>
@@ -75,6 +77,7 @@ function primaryField<T>(select: (state: ClientSessionState) => T, $draft: Reada
 }
 
 const $primaryMessages = primaryField<ChatMessage[]>(state => state.messages, $messages)
+const $emptySessionScope = computed($activeSessionId, () => '')
 
 /**
  * Turn-busy for the workspace pane. A selected stored session that has no
@@ -92,6 +95,7 @@ export const PRIMARY_SESSION_VIEW: SessionView = {
   $awaitingResponse: primaryField<boolean>(state => state.awaitingResponse, $awaitingResponse),
   $busy: $primaryBusy,
   $cwd: primaryField<string>(state => state.cwd, $currentCwd),
+  $profile: primaryField<string>(state => state.profile, $emptySessionScope),
   $fast: primaryField<boolean>(state => state.fast, $currentFastMode),
   $lastVisibleIsUser: computed($primaryMessages, lastVisibleMessageIsUser),
   $messages: $primaryMessages,
@@ -99,6 +103,7 @@ export const PRIMARY_SESSION_VIEW: SessionView = {
   $model: primaryField<string>(state => state.model, $currentModel),
   $provider: primaryField<string>(state => state.provider, $currentProvider),
   $reasoningEffort: primaryField<string>(state => state.reasoningEffort, $currentReasoningEffort),
+  $runtime: primaryField<string>(state => state.runtime, $emptySessionScope),
   $runtimeId: $activeSessionId,
   $storedId: $selectedStoredSessionId
 }

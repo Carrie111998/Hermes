@@ -7,9 +7,11 @@ import {
   type SyntaxHighlighterProps,
   tailBoundedRemend
 } from '@assistant-ui/react-streamdown'
+import { useStore } from '@nanostores/react'
 import type { code as streamdownCode } from '@streamdown/code'
 import { type ComponentProps, memo, useEffect, useMemo, useState } from 'react'
 
+import { useSessionView } from '@/app/chat/session-view'
 import { ExpandableBlock } from '@/components/chat/expandable-block'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { chunkByLines, SyntaxHighlighter } from '@/components/chat/shiki-highlighter'
@@ -34,6 +36,8 @@ import {
 import { previewTargetFromMarkdownHref } from '@/lib/preview-targets'
 import { sessionRefFromMarkdownHref } from '@/lib/session-refs'
 import { cn } from '@/lib/utils'
+import { type ExcalidrawChatScope, excalidrawIdentityFromChatHref } from '@/plugins/excalidraw/chat-link'
+import { openDrawing } from '@/plugins/excalidraw/store'
 
 import { ArtifactCard } from './artifact-card'
 import { SessionRefLink } from './directive-text'
@@ -91,9 +95,9 @@ function useCodePlugin(): CodePlugin | null {
 // Replaces Streamdown's `parseIncompleteMarkdown` (full-text remend per
 // flush) with a tail-bounded repair. Must stay module-scope so the prop
 // identity is stable across renders.
-function preprocessWithTailRepair(text: string): string {
+function preprocessWithTailRepair(text: string, allowBareExcalidrawLinks = false): string {
   try {
-    return tailBoundedRemend(preprocessMarkdown(text))
+    return tailBoundedRemend(preprocessMarkdown(text, { allowBareExcalidrawLinks }))
   } catch {
     return text
   }
@@ -250,7 +254,36 @@ function childrenToText(children: unknown): string {
   return ''
 }
 
-function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a'>) {
+function MarkdownLink({
+  children,
+  className,
+  href,
+  onClick,
+  scope,
+  ...props
+}: ComponentProps<'a'> & { scope: ExcalidrawChatScope }) {
+  const drawing = excalidrawIdentityFromChatHref(href, scope)
+
+  if (drawing) {
+    return (
+      <a
+        className={cn('ref wrap-anywhere', className)}
+        href={href}
+        onClick={event => {
+          onClick?.(event)
+
+          if (!event.defaultPrevented) {
+            event.preventDefault()
+            openDrawing(drawing, '')
+          }
+        }}
+        {...props}
+      >
+        {children}
+      </a>
+    )
+  }
+
   const mediaPath = mediaPathFromMarkdownHref(href)
 
   if (mediaPath) {
@@ -475,6 +508,25 @@ function MarkdownTextSurface({
   // render as code cards. The expensive Shiki pass is deferred by
   // `SyntaxHighlighter` below when `isStreaming` is true, and the code plugin
   // itself arrives async (useCodePlugin) so shiki never blocks cold start.
+  const view = useSessionView()
+  const cwd = useStore(view.$cwd)
+  const profile = useStore(view.$profile)
+  const runtime = useStore(view.$runtime)
+  const canOpenExcalidrawLinks = Boolean(cwd && profile && runtime)
+
+  const preprocess = useMemo(
+    () => (value: string) => preprocessWithTailRepair(value, canOpenExcalidrawLinks),
+    [canOpenExcalidrawLinks]
+  )
+
+  const MarkdownLinkForSession = useMemo(
+    () =>
+      function MarkdownLinkForSession(props: ComponentProps<'a'>) {
+        return <MarkdownLink {...props} scope={{ cwd, profile, runtime }} />
+      },
+    [cwd, profile, runtime]
+  )
+
   const code = useCodePlugin()
   const plugins = useMemo(() => (code ? { math: mathPlugin, code } : { math: mathPlugin }), [code])
 
@@ -499,7 +551,7 @@ function MarkdownTextSurface({
           // `my-*` here on purpose.
           <p className={cn('wrap-anywhere leading-(--dt-line-height)', className)} {...props} />
         ),
-        a: MarkdownLink,
+        a: MarkdownLinkForSession,
         // Inline code must not vote when an ancestor resolves `dir="auto"`
         // (HTML's algorithm skips descendants that carry their own dir),
         // mirroring the CSS isolate that already keeps it out of the
@@ -595,7 +647,7 @@ function MarkdownTextSurface({
           )
         }
       }) as StreamdownTextComponents,
-    [disableArtifacts, isStreaming]
+    [MarkdownLinkForSession, disableArtifacts, isStreaming]
   )
 
   if (text.length > MAX_MARKDOWN_CHARS) {
@@ -640,7 +692,7 @@ function MarkdownTextSurface({
         parseIncompleteMarkdown={false}
         parseMarkdownIntoBlocksFn={parseMarkdownIntoBlocksCached}
         plugins={plugins}
-        preprocess={preprocessWithTailRepair}
+        preprocess={preprocess}
       />
     </ErrorBoundary>
   )

@@ -394,6 +394,15 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         }
       }
 
+      if (sessionId && event.profile?.trim() && event.runtime?.trim()) {
+        const profile = normalizeProfileKey(event.profile)
+        const runtime = event.runtime.trim()
+
+        updateSessionState(sessionId, state =>
+          state.profile && state.runtime ? state : { ...state, profile, runtime }
+        )
+      }
+
       const isActiveEvent = !!sessionId && sessionId === activeSessionIdRef.current
 
       const replaySessionId = approvalReplaySessionId(event.type, activeSessionIdRef.current, sessionId)

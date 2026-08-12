@@ -1,7 +1,7 @@
 ---
 name: excalidraw
 description: "Hand-drawn Excalidraw JSON diagrams (arch, flow, seq)."
-version: 1.0.1
+version: 1.0.2
 author: Hermes Agent
 license: MIT
 dependencies: []
@@ -26,8 +26,11 @@ Generate `.excalidraw` files for architecture diagrams, flowcharts, sequence dia
 1. **Load this skill** (you already did)
 2. **Write the elements JSON** -- an array of Excalidraw element objects
 3. **Save the file** using `write_file` to create a `.excalidraw` file
-4. **Only after `write_file` succeeds**, call `open_excalidraw` with the saved absolute path to request opening it in the Desktop Excalidraw pane
-5. **Optionally upload** for a shareable link using `scripts/upload.py` via `terminal`
+4. **Only after `write_file` succeeds**, include an explicit Markdown file link in the final response:
+   `[Open <filename>.excalidraw](<path>.excalidraw)`
+5. Use a path relative to the session working directory when the file is inside it; otherwise use the absolute path. The link target itself must end in `.excalidraw` so Hermes Desktop can route the click into its Excalidraw pane.
+6. Call `open_excalidraw` only when the user explicitly asks to open the drawing immediately. Do not open a pane merely because the file was created; the Markdown link lets the user choose.
+7. **Optionally upload** for a shareable link using `scripts/upload.py` via `terminal`
 
 ### Saving a Diagram
 
@@ -46,6 +49,14 @@ Wrap your elements array in the standard `.excalidraw` envelope and save with `w
 ```
 
 Save to any path, e.g. `~/diagrams/my_diagram.excalidraw`.
+
+After saving `diagrams/system.excalidraw` from the session working directory, finish with:
+
+```markdown
+[Open system.excalidraw](diagrams/system.excalidraw)
+```
+
+Do not return only a code-formatted path such as `` `diagrams/system.excalidraw` ``; it is not clickable.
 
 ### Uploading for a Shareable Link
 
