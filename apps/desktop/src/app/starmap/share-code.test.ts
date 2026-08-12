@@ -100,6 +100,25 @@ describe('share-code', () => {
     expect(decodeShareCode(encodeShareCode(sampleGraph())).memory).toHaveLength(0)
   })
 
+  it('exports wiki nodes through the v3 compatibility shape', () => {
+    const g = sampleGraph()
+    g.nodes.push({
+      category: 'wiki',
+      createdBy: 'wiki',
+      id: 'wiki:project.md',
+      kind: 'wiki',
+      label: 'Project',
+      pinned: false,
+      state: 'active',
+      timestamp: 1_700_010_000,
+      useCount: 0
+    })
+
+    const decoded = decodeShareCode(encodeShareCode(g))
+    expect(decoded.nodes.at(-1)?.kind).toBe('skill')
+    expect(decoded.nodes.at(-1)?.label).toBe('Project')
+  })
+
   it('rebuilds clusters from node categories', () => {
     const decoded = decodeShareCode(encodeShareCode(sampleGraph()))
 

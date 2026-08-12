@@ -236,19 +236,39 @@ def _node_meta(node: dict[str, Any]) -> str:
 
 
 class _ChartBucket:
-    __slots__ = ("label", "ts", "skills", "memories", "nodes", "rec")
+    __slots__ = ("label", "ts", "skills", "memories", "wiki", "nodes", "rec")
 
     def __init__(self, label: str, ts: float):
         self.label = label
         self.ts = ts
         self.skills = 0
         self.memories = 0
+        self.wiki = 0
         self.nodes: list[dict[str, Any]] = []
         self.rec = 1.0
 
     @property
     def total(self) -> int:
-        return self.skills + self.memories
+        return self.skills + self.memories + self.wiki
+
+
+def _count_bucket_node(bucket: _ChartBucket, node: dict[str, Any]) -> None:
+    kind = node.get("kind")
+    if kind == "memory":
+        bucket.memories += 1
+    elif kind == "wiki":
+        bucket.wiki += 1
+    else:
+        bucket.skills += 1
+
+
+def _node_style(node: dict[str, Any]) -> tuple[str, str]:
+    kind = node.get("kind")
+    if kind == "memory":
+        return STYLE_MEMORY, MEMORY_GLYPH
+    if kind == "wiki":
+        return STYLE_WIKI, WIKI_GLYPH
+    return STYLE_SKILL, SKILL_GLYPH
 
 
 def _period_key(ts: float, granularity: str) -> tuple[int, ...]:
@@ -281,10 +301,7 @@ def _build_chart_buckets(nodes: list[dict[str, Any]], rec: dict[str, Any], max_r
             idx = int(_clamp(math.floor(rec["rec"].get(str(node.get("id", "")), 0.0) * n_bins), 0, n_bins - 1))
             b = buckets[idx]
             b.nodes.append(node)
-            if node.get("kind") == "memory":
-                b.memories += 1
-            else:
-                b.skills += 1
+            _count_bucket_node(b, node)
         return buckets
 
     chosen: Optional[list[_ChartBucket]] = None
@@ -300,10 +317,7 @@ def _build_chart_buckets(nodes: list[dict[str, Any]], rec: dict[str, Any], max_r
                 bucket = _ChartBucket(_period_label(ts, granularity), ts)
                 groups[key] = bucket
             bucket.nodes.append(node)
-            if node.get("kind") == "memory":
-                bucket.memories += 1
-            else:
-                bucket.skills += 1
+            _count_bucket_node(bucket, node)
         # For short spans, keep the useful day-by-day graph even when the caller
         # asked for fewer rows; terminal scrollback is better than collapsing a
         # month of activity into one unreadable bar.
@@ -324,10 +338,7 @@ def _build_chart_buckets(nodes: list[dict[str, Any]], rec: dict[str, Any], max_r
             idx = int(_clamp(math.floor(r * n_bins), 0, n_bins - 1))
             b = chosen[idx]
             b.nodes.append(node)
-            if node.get("kind") == "memory":
-                b.memories += 1
-            else:
-                b.skills += 1
+            _count_bucket_node(b, node)
 
     min_ts, max_ts = rec.get("minTs"), rec.get("maxTs")
     span = (max_ts - min_ts) if min_ts is not None and max_ts is not None and max_ts > min_ts else 0
@@ -347,13 +358,13 @@ def _bucket_nodes(bucket: _ChartBucket, memory_lookup: Optional[dict[str, dict[s
     # Chronological within the slice so the TUI tree reads oldest → newest.
     ordered = sorted(bucket.nodes, key=lambda n: _to_ts(n.get("timestamp")) or bucket.ts)
     for node in ordered:
-        style = STYLE_MEMORY if node.get("kind") == "memory" else STYLE_SKILL
+        style, glyph = _node_style(node)
         raw_label = str(node.get("label") or node.get("id") or "unknown").strip()
         memory = (memory_lookup or {}).get(str(node.get("id", "")))
         out.append(
             {
                 "id": str(node.get("id", "")),
-                "glyph": MEMORY_GLYPH if node.get("kind") == "memory" else SKILL_GLYPH,
+                "glyph": glyph,
                 "label": _node_label(node),
                 "fullLabel": raw_label,
                 "meta": _node_meta(node),
@@ -381,6 +392,7 @@ def _bucket_rows(buckets: list[_ChartBucket], payload: dict[str, Any]) -> list[d
                 "date": format_date(bucket.ts),
                 "skills": bucket.skills,
                 "memories": bucket.memories,
+                "wiki": bucket.wiki,
                 "total": bucket.total,
                 "category": cat,
                 "color": cmap.get(cat) if cat else None,
@@ -400,7 +412,7 @@ def _category_counts(payload: dict[str, Any]) -> list[tuple[str, int]]:
         return clusters
     counts: dict[str, int] = {}
     for node in payload.get("nodes", []):
-        if node.get("kind") == "memory":
+        if node.get("kind") != "skill":
             continue
         cat = str(node.get("category") or "skill")
         counts[cat] = counts.get(cat, 0) + 1
@@ -428,7 +440,7 @@ def category_legend(payload: dict[str, Any], limit: int = 4) -> list[dict[str, A
 def _bucket_category(bucket: _ChartBucket) -> Optional[str]:
     counts: dict[str, int] = {}
     for node in bucket.nodes:
-        if node.get("kind") == "memory":
+        if node.get("kind") != "skill":
             continue
         cat = str(node.get("category") or "skill")
         counts[cat] = counts.get(cat, 0) + 1
@@ -493,22 +505,28 @@ def render_graph(payload: dict[str, Any], *, cols: int = 80, rows: int = 16, rev
         ink = recency_ink(bucket.rec)
         bar_len = max(1, round((bucket.total / max_total) * bar_w)) if bucket.total else 0
         skill_len = round((bucket.skills / bucket.total) * bar_len) if bucket.total else 0
+        wiki_len = round((bucket.wiki / bucket.total) * bar_len) if bucket.total else 0
         if bucket.skills and skill_len == 0:
             skill_len = 1
-        memory_len = bar_len - skill_len
+        if bucket.wiki and wiki_len == 0 and bar_len > skill_len:
+            wiki_len = 1
+        memory_len = max(0, bar_len - skill_len - wiki_len)
         if bucket.memories and memory_len == 0 and bar_len > 1:
             memory_len = 1
-            skill_len = bar_len - 1
+            if wiki_len > skill_len and wiki_len > 0:
+                wiki_len -= 1
+            elif skill_len > 0:
+                skill_len -= 1
 
         node = _bucket_label_node(bucket)
         marker = ""
         if node and len(labels) < 6:
             marker = _LABEL_KEYS[len(labels)]
-            style = STYLE_MEMORY if node.get("kind") == "memory" else STYLE_SKILL
+            style, glyph = _node_style(node)
             labels.append(
                 {
                     "key": marker,
-                    "glyph": MEMORY_GLYPH if node.get("kind") == "memory" else SKILL_GLYPH,
+                    "glyph": glyph,
                     "label": _node_label(node),
                     "meta": _node_meta(node),
                     "style": style,
@@ -528,6 +546,8 @@ def render_graph(payload: dict[str, Any], *, cols: int = 80, rows: int = 16, rev
         if skill_len:
             # Bar colored by the day's dominant category — a learning heatmap.
             row.append(["━" * skill_len, STYLE_SKILL, ink, cat_hex])
+        if wiki_len:
+            row.append([WIKI_GLYPH + ("━" * (wiki_len - 1)), STYLE_WIKI, max(0.65, ink)])
         if memory_len:
             if memory_len == 1:
                 mem_trail = "◆"
@@ -543,6 +563,9 @@ def render_graph(payload: dict[str, Any], *, cols: int = 80, rows: int = 16, rev
         if bucket.memories:
             row.append(["+", STYLE_DIM, 0.6])
             row.append([str(bucket.memories), STYLE_MEMORY, max(0.72, ink)])
+        if bucket.wiki:
+            row.append(["+", STYLE_DIM, 0.6])
+            row.append([str(bucket.wiki), STYLE_WIKI, max(0.72, ink)])
         if i == visible_bucket_count - 1:
             row.append(["  ◀ now", STYLE_LABEL, 0.9])
         elif bucket.total == max_total and max_total > 1:

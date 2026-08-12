@@ -49,6 +49,7 @@ interface BucketRow {
   memories: number
   nodes: BucketNode[]
   skills: number
+  wiki: number
 }
 
 interface FramesResponse {
@@ -531,7 +532,7 @@ function TreeLine({ active, palette, row, t }: { active: boolean; palette: Starm
           { color: bucket.color ? fadeHex(palette, bucket.color, 0.85) : t.color.label, text: bucket.label },
           {
             color: t.color.muted,
-            text: ` · ${bucket.skills} skills · ${bucket.memories} memories${bucket.category ? ` · ${bucket.category}` : ''}`
+            text: ` · ${bucket.skills} skills · ${bucket.memories} memories · ${bucket.wiki} wiki${bucket.category ? ` · ${bucket.category}` : ''}`
           }
         ]}
         t={t}

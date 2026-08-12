@@ -8,6 +8,7 @@ interface TimelineProps {
   axis: TimeAxis
   // Colour for memory stars — matches the map's memory glyph.
   memoryColor?: string
+  wikiColor?: string
   onScrub: (reveal: number) => void
   onTogglePlay: () => void
   playing: boolean
@@ -24,7 +25,7 @@ interface RevealSignal {
 interface Star {
   delay: number
   duration: number
-  kind: 'memory' | 'skill'
+  kind: 'memory' | 'skill' | 'wiki'
   leftPct: number
   opacity: number
   size: number
@@ -69,6 +70,7 @@ function buildStars(axis: TimeAxis): Star[] {
     // every quieter bucket down to the 1-star floor and read as blank.
     const count = Math.max(1, Math.round(Math.sqrt(intensity) * MAX_STARS_PER_BUCKET))
     const skillCount = Math.round((b.skill / b.total) * count)
+    const wikiCount = Math.round((b.wiki / b.total) * count)
     const r = rng(i * 9973 + 7)
     const slot = 1 / n
     const center = (i + 0.5) / n
@@ -82,7 +84,7 @@ function buildStars(axis: TimeAxis): Star[] {
       stars.push({
         delay: r() * 3,
         duration: 2.4 + r() * 2.6,
-        kind: s < skillCount ? 'skill' : 'memory',
+        kind: s < skillCount ? 'skill' : s < skillCount + wikiCount ? 'wiki' : 'memory',
         leftPct: Math.max(0, Math.min(1, center + jitter)) * 100,
         // Brighter, slightly larger stars are rarer.
         opacity: 0.5 + r() * 0.5,
@@ -107,6 +109,7 @@ export const Timeline = memo(function Timeline({
   onTogglePlay,
   playing,
   revealStore,
+  wikiColor = 'var(--theme-primary)',
   ringStops = []
 }: TimelineProps) {
   const trackRef = useRef<HTMLDivElement | null>(null)
@@ -178,7 +181,8 @@ export const Timeline = memo(function Timeline({
     }
   }
 
-  const colorFor = (kind: Star['kind']) => (kind === 'skill' ? 'var(--theme-primary)' : memoryColor)
+  const colorFor = (kind: Star['kind']) =>
+    kind === 'skill' ? 'var(--theme-primary)' : kind === 'wiki' ? wikiColor : memoryColor
 
   return (
     <div className="pointer-events-auto flex w-[28rem] max-w-full items-center gap-3 [-webkit-app-region:no-drag]">

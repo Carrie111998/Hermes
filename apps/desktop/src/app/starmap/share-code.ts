@@ -37,7 +37,7 @@ function writeNode(w: BitWriter, n: StarmapNode, dict: Dict, minTs: number, span
   w.varint(Math.max(0, n.useCount | 0))
   w.uint(idxOf(STATES, n.state), 2)
   w.uint(idxOf(MEM_SOURCES, n.memorySource ?? 'none'), 2)
-  w.uint(idxOf(CREATED_BY, n.createdBy ?? 'none'), 2)
+  w.uint(idxOf(CREATED_BY, n.createdBy === 'wiki' ? 'none' : (n.createdBy ?? 'none')), 2)
   w.bit(n.pinned)
 
   // Time as a 12-bit POSITION within [minTs, maxTs] — not an absolute epoch.

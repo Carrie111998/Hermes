@@ -57,6 +57,7 @@ export interface TimeBucket {
   memory: number
   skill: number
   total: number
+  wiki: number
 }
 
 export interface TimeAxis {
@@ -75,7 +76,7 @@ export interface TimeAxis {
 export function buildTimeAxis(graph: StarmapGraph, bucketCount = 48): TimeAxis {
   const { maxTs, minTs, rec, timed } = computeRecency(graph.nodes)
   const n = Math.max(1, bucketCount)
-  const buckets: TimeBucket[] = Array.from({ length: n }, () => ({ memory: 0, skill: 0, total: 0 }))
+  const buckets: TimeBucket[] = Array.from({ length: n }, () => ({ memory: 0, skill: 0, total: 0, wiki: 0 }))
 
   for (const node of graph.nodes) {
     const r = rec.get(node.id) ?? 0
@@ -85,6 +86,8 @@ export function buildTimeAxis(graph: StarmapGraph, bucketCount = 48): TimeAxis {
 
     if (node.kind === 'memory') {
       b.memory += 1
+    } else if (node.kind === 'wiki') {
+      b.wiki += 1
     } else {
       b.skill += 1
     }

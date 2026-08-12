@@ -201,7 +201,7 @@ export function drawScene(scene: Scene): DrawResult {
 
   const erec = (rec: number) => (frontier > 0 ? clamp(rec / frontier, 0, 1) : 1)
   const { h, w } = size
-  const { bandInk, base, bg, c, chipBg, darkTheme, inkInv, memoryInk, skillInk } = palette
+  const { bandInk, base, bg, c, chipBg, darkTheme, inkInv, memoryInk, skillInk, wikiInk } = palette
   const { bandAlpha, lightSize, ringAlpha, sheen } = RING_PARAMS[darkTheme ? 'dark' : 'light']
 
   let animating = false
@@ -508,7 +508,7 @@ export function drawScene(scene: Scene): DrawResult {
     const sy = projY(n.y * posScale)
 
     ctx.globalAlpha = vis
-    const nodeInk = nodeHigh ? base : n.kind === 'memory' ? memoryInk : skillInk
+    const nodeInk = nodeHigh ? base : n.kind === 'memory' ? memoryInk : n.kind === 'wiki' ? wikiInk : skillInk
     const shape = NODE_SHAPE[n.kind]
 
     if (shape === 'circle') {

@@ -6,7 +6,7 @@ import { useThemeEpoch } from '@/hooks/use-theme-epoch'
 import { createDoubleTapDetector, isSmartZoomWheel } from '@/lib/trackpad-gestures'
 import type { StarmapGraph } from '@/types/hermes'
 
-import { computePalette, memoryInkFor, resolveRgb, rgba } from './color'
+import { computePalette, memoryInkFor, resolveRgb, rgba, wikiInkFor } from './color'
 import { RING_OUTER, TILT, ZOOM_MAX, ZOOM_MIN } from './constants'
 import { clamp, distToSegmentSq, fitScale, fitViewport, nodeRadius } from './geometry'
 import { NodeContextMenu, type NodeMenuTarget } from './node-context-menu'
@@ -162,6 +162,7 @@ export function StarMap({
   // Memory's swatch color — the same complementary-of-primary the canvas uses,
   // so the legend matches the rendered diamonds exactly.
   const [memoryColor, setMemoryColor] = useState('var(--theme-secondary)')
+  const [wikiColor, setWikiColor] = useState('var(--theme-primary)')
 
   // Time scrubber: reveal 1 = the whole map (idle default); lower values hide
   // not-yet-reached nodes so playing/scrubbing "builds it up". revealRef feeds
@@ -484,6 +485,7 @@ export function StarMap({
         style.getPropertyValue('--background').trim() || style.getPropertyValue('--dt-background').trim() || '#000'
 
       setMemoryColor(rgba(memoryInkFor(resolveRgb(val), resolveRgb(bgVal)), 0.9))
+      setWikiColor(rgba(wikiInkFor(resolveRgb(val)), 0.9))
     }
   }, [size, themeEpoch])
 
@@ -956,6 +958,7 @@ export function StarMap({
           playing={playing}
           revealStore={revealStore}
           ringStops={ringStops}
+          wikiColor={wikiColor}
         />
       </div>
 

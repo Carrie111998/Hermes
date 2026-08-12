@@ -99,6 +99,7 @@ export interface StarmapPalette {
   label: Rgb
   memory: Rgb
   skill: Rgb
+  wiki: Rgb
 }
 
 /** Derive the Star Map inks from the theme primary + foreground color. */
@@ -115,7 +116,8 @@ export function deriveStarmapPalette(primaryHex: string, fgHex: string): Starmap
     // Memories are drillable, so they wear the primary "clickable" ink; skills
     // are dead-ends and get the muted complement.
     memory: mix(primary, base, dark ? 0.12 : 0.18),
-    skill: mix(complementaryInk(primary), bg, 0.45)
+    skill: mix(complementaryInk(primary), bg, 0.45),
+    wiki: mix(primary, complementaryInk(primary), 0.5)
   }
 }
 
@@ -133,11 +135,13 @@ export function fadeInk(palette: StarmapPalette, style: string, alpha: number): 
       ? palette.skill
       : style === 'memory'
         ? palette.memory
-        : style === 'label'
-          ? palette.label
-          : style === 'dim'
-            ? palette.dim
-            : null
+        : style === 'wiki'
+          ? palette.wiki
+          : style === 'label'
+            ? palette.label
+            : style === 'dim'
+              ? palette.dim
+              : null
 
   if (!base) {
     return undefined

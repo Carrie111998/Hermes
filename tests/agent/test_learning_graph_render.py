@@ -101,6 +101,22 @@ def test_bars_render_skills_and_memories():
     assert render.STYLE_MEMORY in styles
 
 
+def test_wiki_nodes_keep_third_kind_in_terminal_payload():
+    payload = _payload(skills=0, memories=0)
+    payload["nodes"].append(
+        {"id": "wiki:page.md", "label": "Page", "kind": "wiki", "timestamp": 1_700_000_000, "category": "wiki"}
+    )
+    payload["clusters"] = [{"category": "wiki", "count": 1}]
+    payload["stats"]["wiki_nodes"] = 1
+
+    out = render.render_frames(payload, cols=60, rows=20, frames=2)
+
+    assert out["buckets"][0]["wiki"] == 1
+    assert out["buckets"][0]["skills"] == 0
+    assert out["buckets"][0]["nodes"][0]["glyph"] == render.WIKI_GLYPH
+    assert out["buckets"][0]["nodes"][0]["style"] == render.STYLE_WIKI
+
+
 
 
 

@@ -105,6 +105,10 @@ export function memoryInkFor(primary: Rgb, bg: Rgb): Rgb {
   return mixRgb(complementaryInk(primary), bg, 0.45)
 }
 
+export function wikiInkFor(primary: Rgb): Rgb {
+  return mixRgb(primary, complementaryInk(primary), 0.5)
+}
+
 // Resolve the theme-derived palette once per theme change — the resolveRgb probe
 // does a getImageData readback, so this stays out of the per-frame path. Node
 // groups borrow restrained tint from the theme; structure stays foreground ink.
@@ -133,6 +137,7 @@ export function computePalette(canvas: HTMLCanvasElement): Palette {
     inkInv: darkTheme ? 'rgba(0,0,0,1)' : 'rgba(255,255,255,1)',
     memoryInk: memoryInkFor(primary, bg),
     primary,
-    skillInk: mixRgb(primary, base, darkTheme ? 0.12 : 0.18)
+    skillInk: mixRgb(primary, base, darkTheme ? 0.12 : 0.18),
+    wikiInk: wikiInkFor(primary)
   }
 }
