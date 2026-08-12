@@ -1805,7 +1805,14 @@ def _sessions_repair(_engine: HermesConsoleEngine, args: list[str]) -> str:
         if not db_path.exists():
             print(f"No session database at {db_path} (nothing to repair).")
             return
-        reason = _db_opens_cleanly(db_path)
+        # Deep check, matching `hermes sessions repair` — this is the
+        # unbounded path, so it runs the FTS rank=1 integrity-check that
+        # `hermes doctor` skips by default. Minutes on a multi-GB database.
+        print(
+            f"Checking {db_path} (deep check — re-reads every indexed "
+            "message; this can take minutes on a large database)…"
+        )
+        reason = _db_opens_cleanly(db_path, include_fts_integrity=True)
         if reason is None:
             print(f"{db_path} opens cleanly; no repair needed.")
             return

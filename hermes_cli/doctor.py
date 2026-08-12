@@ -229,6 +229,31 @@ def _fail_and_issue(text: str, detail: str, fix: str, issues: list[str]) -> None
 _STATE_DB_PROBE_TIMEOUT_ENV = "HERMES_DOCTOR_DB_PROBE_TIMEOUT"
 _STATE_DB_PROBE_TIMEOUT_DEFAULT = 5.0
 
+# `hermes doctor --deep` additionally runs the FTS5 rank=1 'integrity-check',
+# the only probe that detects an index rowid whose messages row is gone
+# (external content, schema v32). It is deliberately NOT in the default run.
+# Measured 2026-08-11 on a consistent snapshot of the production state.db
+# (VACUUM INTO, then the v32 cutover: 4891 MB, 575,962 messages, 1.38 GB of
+# indexed text; box CPU-saturated by unrelated work, so these are pessimistic):
+#
+#     rank=1 FTS integrity-check   70.3s first / 71.5s repeat
+#     rank=0 (the weaker form)     27.4s   — detects neither failure mode
+#     PRAGMA integrity_check      116.8s   — on this COMPACTED snapshot
+#
+# 70s against a 5s default budget is not a tuning question. And the failure
+# mode it finds is bounded, invisible to searches rather than corrupting them
+# (search_messages INNER JOINs messages on the index rowid, so orphans are
+# filtered out), and repairable at any later time by 'rebuild' — so it does
+# not earn a minute on every `hermes doctor`.
+#
+# First run ≈ repeat run, because the cost is tokenisation rather than I/O: a
+# hot page cache bought nothing. That also means the figure is stable, unlike
+# PRAGMA integrity_check — the same scan that took 116.8s compacted is the one
+# documented at >12 minutes on the live, fragmented 5.1 GB file. Which is
+# exactly why the two get separate budgets below.
+_STATE_DB_FTS_PROBE_TIMEOUT_ENV = "HERMES_DOCTOR_FTS_PROBE_TIMEOUT"
+_STATE_DB_FTS_PROBE_TIMEOUT_DEFAULT = 300.0
+
 
 def _state_db_probe_budget() -> float:
     """Return the state.db probe budget in seconds (env-overridable)."""
@@ -421,6 +446,24 @@ def _audit_npm_target(
             )
     except Exception:
         pass
+
+
+def _state_db_fts_probe_budget() -> float:
+    """Return the --deep FTS integrity-check budget in seconds.
+
+    Separate from the general probe budget on purpose: the two checks differ
+    by an order of magnitude on the same file (70s vs >12 min), so one shared
+    deadline would spend everything on ``PRAGMA integrity_check`` and report
+    "unknown" for the check ``--deep`` was invoked to run.
+    """
+    raw = os.getenv(_STATE_DB_FTS_PROBE_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return _STATE_DB_FTS_PROBE_TIMEOUT_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        return _STATE_DB_FTS_PROBE_TIMEOUT_DEFAULT
+    return value if value > 0 else _STATE_DB_FTS_PROBE_TIMEOUT_DEFAULT
 
 
 # Deprecated / legacy config keys still read for back-compat. Doctor surfaces
@@ -1642,6 +1685,73 @@ def run_doctor(args):
                     "For the full check (no time limit): hermes sessions repair --check-only"
                 )
                 _write_reason = None
+            # The FTS rank=1 integrity-check is a separate, separately-budgeted
+            # probe — see _STATE_DB_FTS_PROBE_TIMEOUT_DEFAULT. It is the only
+            # check that surfaces an index rowid whose messages row is gone;
+            # everything above passes on such a database.
+            if not bool(getattr(args, "deep", False)):
+                check_info(
+                    "Full-text index verification was skipped (~70s on a 5 GB "
+                    "state.db) — run 'hermes doctor --deep' for it."
+                )
+            else:
+                from hermes_state import check_state_db_fts_integrity
+
+                _fts_reason = None
+                _fts_unknown = False
+                try:
+                    _fts_reason = check_state_db_fts_integrity(
+                        state_db_path,
+                        timeout_seconds=_state_db_fts_probe_budget(),
+                    )
+                except StateDbProbeTimeout as _fts_timeout:
+                    # Same rule as the probe above: out of budget is "unknown",
+                    # never "corrupt", and never a trigger for --fix. It is
+                    # equally not "healthy" — _fts_unknown keeps the clean
+                    # branch below from turning a check that never finished
+                    # into a green line.
+                    _fts_unknown = True
+                    check_warn(
+                        f"{_DHH}/state.db full-text index check did not finish "
+                        "in budget",
+                        f"({_fts_timeout})",
+                    )
+                    check_info(
+                        "This is not a corruption report. Raise the budget with "
+                        f"{_STATE_DB_FTS_PROBE_TIMEOUT_ENV}, or run "
+                        "'hermes sessions repair --check-only' (no time limit)."
+                    )
+                if _fts_unknown:
+                    pass  # already reported as unknown
+                elif _fts_reason is None:
+                    check_ok(
+                        f"{_DHH}/state.db full-text index verifies against its content"
+                    )
+                else:
+                    check_warn(
+                        f"{_DHH}/state.db full-text index does not match its content",
+                        f"({_fts_reason})",
+                    )
+                    if should_fix:
+                        from hermes_state import SessionDB
+
+                        _fts_db = SessionDB(db_path=state_db_path)
+                        try:
+                            _rebuilt = _fts_db.rebuild_fts()
+                        finally:
+                            _fts_db.close()
+                        check_ok(
+                            "Rebuilt the state.db full-text index",
+                            f"({_rebuilt} index(es) rebuilt)",
+                        )
+                        fixed_count += 1
+                    else:
+                        issues.append(
+                            "state.db full-text index is out of sync with "
+                            "messages — run 'hermes doctor --deep --fix' to "
+                            "rebuild it (searches silently omit the affected "
+                            "messages until then)"
+                        )
             if _write_reason is not None:
                 check_warn(
                     f"{_DHH}/state.db fails a write-health probe (FTS index may be corrupt)",
