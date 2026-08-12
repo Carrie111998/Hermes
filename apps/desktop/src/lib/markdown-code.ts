@@ -276,12 +276,31 @@ function codeSignals(body: string): CodeSignals {
 // A sentence-ending punctuation mark followed by whitespace or end-of-line.
 // Real wrapped prose has these; config/structured listings almost never do.
 const SENTENCE_PUNCTUATION_RE = /[.!?](?:\s|$)/
-// `Key value` or `Key: value` / `Key = value` — the shape of a config
-// directive (`Host example`, `Port 22`, `HostName 10.0.0.1`) or a settings
-// line. The key is a bare identifier, so this does NOT match ordinary prose
-// sentences (which start with a capitalized word but continue with lowercase
-// prose, not a single value token).
-const CONFIG_LINE_RE = /^[A-Za-z0-9_][\w.-]*(?:\s+\S|\s*[:=]\s*\S)/
+// `Key: value` / `Key = value` — a settings/directive line with an explicit
+// separator. Unambiguous config shape.
+const CONFIG_SEPARATOR_LINE_RE = /^[A-Za-z0-9_][\w.-]*\s*[:=]\s*\S/
+// A bare identifier that could be a config key (`Host`, `Port`, `HostName`,
+// `API_KEY`). Used only for the short `Key value` directive form below.
+const CONFIG_KEY_RE = /^[A-Za-z0-9_][\w.-]*$/
+
+// True when a single line looks like a config directive rather than prose.
+// Either an explicit `Key: value` / `Key = value`, or a short whitespace
+// directive of 2-3 tokens led by an identifier (`Host example`, `Port 22`,
+// `HostName 10.0.0.1`). The token cap is what separates it from prose — a
+// real sentence line has more words than a config directive, so a
+// punctuation-less prose fragment like `the quick brown fox jumps` (5 tokens)
+// is NOT treated as config.
+function isConfigDirectiveLine(line: string): boolean {
+  const trimmed = line.trim()
+
+  if (CONFIG_SEPARATOR_LINE_RE.test(trimmed)) {
+    return true
+  }
+
+  const tokens = trimmed.split(/\s+/)
+
+  return tokens.length >= 2 && tokens.length <= 3 && CONFIG_KEY_RE.test(tokens[0])
+}
 
 /**
  * True when a fenced block looks like structured / config / tabular text
@@ -295,7 +314,7 @@ const CONFIG_LINE_RE = /^[A-Za-z0-9_][\w.-]*(?:\s+\S|\s*[:=]\s*\S)/
  *     prose is not indented line-by-line, but config stanzas are
  *     (`Host x` / `    HostName y`).
  *   - No sentence-ending punctuation AND a majority of lines are
- *     `Key value` / `Key: value` directives.
+ *     `Key value` / `Key: value` directives (see isConfigDirectiveLine).
  */
 export function isLikelyStructuredText(body: string): boolean {
   const lines = body.split('\n').filter(line => line.trim())
@@ -312,7 +331,7 @@ export function isLikelyStructuredText(body: string): boolean {
     return false
   }
 
-  const configLines = lines.filter(line => CONFIG_LINE_RE.test(line.trim())).length
+  const configLines = lines.filter(line => isConfigDirectiveLine(line)).length
 
   return configLines >= Math.max(2, Math.ceil(lines.length * 0.6))
 }
