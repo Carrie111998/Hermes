@@ -10181,6 +10181,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if canonical not in {"resume", "sessions"}:
             self._pending_resume_sessions = None
 
+        if cmd_original == "/":
+            _cprint(f"{_DIM}{_ACCENT}A bare / is not a command. Type /help for available commands.{_RST}")
+            return True
+        if cmd_original.startswith("/") and cmd_original[1:2].isspace():
+            corrected = f"/{cmd_original[1:].lstrip()}"
+            _cprint(f"{_ACCENT}Invalid slash command: remove the space after /. Try: {corrected}{_RST}")
+            return True
+
         if canonical in {"quit", "exit"}:
             # Parse --delete flag: /exit --delete also removes the current
             # session's transcripts + SQLite history. Ported from

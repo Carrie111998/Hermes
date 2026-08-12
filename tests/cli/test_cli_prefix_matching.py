@@ -15,6 +15,36 @@ def _make_cli():
 
 
 class TestSlashCommandPrefixMatching:
+    def test_space_after_slash_shows_focused_syntax_hint(self):
+        """Whitespace after / is a syntax error, not an empty command prefix."""
+        cli_obj = _make_cli()
+        printed = []
+
+        with patch.object(cli_obj, '_handle_background_command') as mock_background, \
+             patch("cli._cprint", side_effect=printed.append):
+            result = cli_obj.process_command("/ btw patch what means")
+
+        assert result is True
+        mock_background.assert_not_called()
+        assert len(printed) == 1
+        assert "remove" in printed[0].lower()
+        assert "space" in printed[0].lower()
+        assert "/btw patch what means" in printed[0]
+
+    def test_bare_slash_points_to_help_without_enumerating_matches(self):
+        """A bare / should give one useful next step instead of every match."""
+        cli_obj = _make_cli()
+        printed = []
+
+        with patch("cli._cprint", side_effect=printed.append):
+            result = cli_obj.process_command("/")
+
+        assert result is True
+        assert len(printed) == 1
+        assert "/help" in printed[0]
+        assert "Did you mean" not in printed[0]
+        assert "/background" not in printed[0]
+
     def test_unique_prefix_dispatches_command(self):
         """/con should dispatch to /config when it uniquely matches."""
         cli_obj = _make_cli()
