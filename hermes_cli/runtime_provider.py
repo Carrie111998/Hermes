@@ -56,6 +56,17 @@ from hermes_cli.providers import is_official_openai_host
 from utils import base_url_host_matches, base_url_hostname, env_int
 
 
+def _deepseek_runtime_api_mode(model: str = "") -> str:
+    """Resolve DeepSeek's wire after applying its API model normalization."""
+    try:
+        from hermes_cli.model_normalize import normalize_model_for_provider
+
+        model = normalize_model_for_provider(model, "deepseek")
+    except Exception:
+        pass
+    return deepseek_api_mode(model)
+
+
 def _getenv(name: str, default: str = "") -> str:
     """Profile-scoped replacement for ``os.getenv`` on credential/provider reads.
 
@@ -576,7 +587,7 @@ def _resolve_runtime_from_pool_entry(
         if provider == "deepseek":
             # DeepSeek is dual-wire by model. Never let a persisted mode from
             # one model survive a model switch.
-            api_mode = deepseek_api_mode(effective_model)
+            api_mode = _deepseek_runtime_api_mode(effective_model)
         elif opencode_provider_family(provider) is not None:
             # Re-derive api_mode from the effective model rather than the
             # persisted api_mode: the opencode providers serve both
@@ -1758,7 +1769,9 @@ def _resolve_explicit_runtime(
             configured_provider = str(model_cfg.get("provider") or "").strip().lower()
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
             if provider == "deepseek":
-                api_mode = deepseek_api_mode(target_model or model_cfg.get("default", ""))
+                api_mode = _deepseek_runtime_api_mode(
+                    target_model or model_cfg.get("default", "")
+                )
             elif configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
                 api_mode = configured_mode
             else:
@@ -2413,7 +2426,7 @@ def resolve_runtime_provider(
             from hermes_cli.models import opencode_provider_family
             if provider == "deepseek":
                 _effective = target_model or model_cfg.get("default", "")
-                api_mode = deepseek_api_mode(_effective)
+                api_mode = _deepseek_runtime_api_mode(_effective)
             elif opencode_provider_family(provider) is not None:
                 # opencode-zen/go must always re-derive api_mode from the
                 # target model (not the stale persisted api_mode), because

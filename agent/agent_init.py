@@ -716,9 +716,18 @@ def init_agent(
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
     if agent.provider == "deepseek":
-        # DeepSeek is model-dependent: only V4 Flash accepts Responses. Do not
-        # let a stale persisted/explicit mode route V4 Pro to an unsupported
-        # endpoint when AIAgent is constructed outside the runtime resolver.
+        # DeepSeek routing is model-capability-dependent. Do not let a stale
+        # persisted/explicit mode route a model to an unsupported endpoint when
+        # AIAgent is constructed outside the runtime resolver.
+        # Normalize retired aliases before looking up capabilities; the general
+        # normalization pass below otherwise runs too late and could leave a
+        # normalized Responses-capable model on Chat Completions for its first turn.
+        try:
+            from hermes_cli.model_normalize import normalize_model_for_provider
+
+            agent.model = normalize_model_for_provider(agent.model, agent.provider)
+        except Exception:
+            pass
         from hermes_cli.providers import deepseek_api_mode
 
         agent.api_mode = deepseek_api_mode(agent.model)
