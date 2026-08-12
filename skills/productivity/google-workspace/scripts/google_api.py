@@ -915,6 +915,64 @@ def contacts_create(args):
     }, indent=2))
 
 
+def contacts_update(args):
+    resource_name = args.resource_name
+    if not resource_name.startswith("people/"):
+        resource_name = f"people/{resource_name}"
+
+    person = {}
+    update_fields = []
+    if args.name:
+        person["names"] = [{"givenName": args.name}]
+        update_fields.append("names")
+    if args.email:
+        person["emailAddresses"] = [{"value": args.email}]
+        update_fields.append("emailAddresses")
+    if args.phone:
+        person["phoneNumbers"] = [{"value": args.phone}]
+        update_fields.append("phoneNumbers")
+
+    if not update_fields:
+        print("ERROR: at least one of --name, --email, --phone is required", file=sys.stderr)
+        sys.exit(1)
+    person_fields = ",".join(update_fields)
+
+    if _gws_binary():
+        # updateContact requires the current etag (optimistic concurrency) —
+        # fetch it first rather than guessing/omitting it.
+        existing = _run_gws(
+            ["people", "people", "get"],
+            params={"resourceName": resource_name, "personFields": person_fields},
+        )
+        person["etag"] = existing.get("etag", "")
+        result = _run_gws(
+            ["people", "people", "updateContact"],
+            params={"resourceName": resource_name, "updatePersonFields": person_fields},
+            body=person,
+        )
+        print(json.dumps({
+            "status": "updated",
+            "resourceName": result.get("resourceName", resource_name),
+        }, indent=2))
+        return
+
+    service = build_service("people", "v1")
+    existing = service.people().get(
+        resourceName=resource_name, personFields=person_fields,
+    ).execute()
+    person["etag"] = existing.get("etag", "")
+    result = service.people().updateContact(
+        resourceName=resource_name,
+        updatePersonFields=person_fields,
+        body=person,
+    ).execute()
+    print(json.dumps({
+        "status": "updated",
+        "resourceName": result.get("resourceName", resource_name),
+    }, indent=2))
+
+
+
 def contacts_delete(args):
     resource_name = args.resource_name
     if not resource_name.startswith("people/"):
@@ -1286,6 +1344,13 @@ def main():
     p.add_argument("--email", default="")
     p.add_argument("--phone", default="")
     p.set_defaults(func=contacts_create)
+
+    p = con_sub.add_parser("update")
+    p.add_argument("resource_name", help="Contact resourceName, e.g. 'people/c123' (the 'people/' prefix is optional)")
+    p.add_argument("--name", default="")
+    p.add_argument("--email", default="")
+    p.add_argument("--phone", default="")
+    p.set_defaults(func=contacts_update)
 
     p = con_sub.add_parser("delete")
     p.add_argument("resource_name", help="Contact resourceName, e.g. 'people/c123' (the 'people/' prefix is optional)")
