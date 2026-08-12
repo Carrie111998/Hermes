@@ -439,6 +439,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Optional
 
@@ -6144,10 +6145,176 @@ def cmd_gui(args: argparse.Namespace):
     sys.exit(launch_result.returncode)
 
 
+class _DashboardPids(list):
+    """PIDs of running dashboards, plus whether the scan actually succeeded.
+
+    The scan used to return a bare ``[]`` on any error, which is
+    indistinguishable from "no dashboards are running".  On Windows 11 that
+    conflation was total: ``wmic`` has been removed from the OS, so every
+    scan raised ``FileNotFoundError``, returned ``[]``, and made
+    ``hermes dashboard --stop`` print a false clean while ``hermes update``
+    silently skipped the stale-backend reaper it exists to run.
+
+    Subclassing ``list`` keeps every existing caller and test working
+    unchanged (``== []``, ``not pids``, iteration, ``sorted()``), while
+    giving the user-visible paths a way to tell "nothing found" from
+    "couldn't look".  Read the flag through ``_scan_ok()``, never directly:
+    tests routinely patch the scan with a plain list, which must keep
+    behaving like a successful empty scan.
+    """
+
+    def __init__(
+        self,
+        pids: Iterable[int] = (),
+        *,
+        scan_ok: bool = True,
+        scan_error: str | None = None,
+    ) -> None:
+        super().__init__(pids)
+        self.scan_ok = scan_ok
+        self.scan_error = scan_error
+
+
+def _scan_ok(pids) -> bool:
+    """True unless *pids* came from a process-table scan that failed."""
+    return getattr(pids, "scan_ok", True)
+
+
+def _scan_error(pids) -> str:
+    """Human-readable reason a scan failed (never empty)."""
+    return getattr(pids, "scan_error", None) or "process table unavailable"
+
+
+# The long-lived server subcommands.  ``serve`` is the same server headless
+# (the desktop app spawns it as its backend).
+_DASHBOARD_SUBCOMMANDS = ("dashboard", "serve")
+
+
+def _dashboard_command_tokens(command: str | Sequence[str] | None) -> list[str]:
+    """Normalize a command line to comparable tokens.
+
+    Accepts either an argv list (what ``psutil.Process.cmdline()`` returns,
+    already split and unquoted) or a raw command-line string.  Strings are
+    split quote-aware so a quoted Windows path with spaces
+    (``"C:\\Program Files\\...\\hermes.exe"``) survives as one token.
+    Tokens are unquoted, slash-normalized and lowercased so Windows and
+    POSIX spellings of the same command compare equal.
+    """
+    if command is None:
+        return []
+    if isinstance(command, str):
+        try:
+            raw = shlex.split(command, posix=False)
+        except ValueError:
+            raw = command.split()
+    else:
+        raw = [str(part) for part in command]
+    return [t.strip("\"'").replace("\\", "/").lower() for t in raw]
+
+
+def _is_python_interpreter_token(token: str) -> bool:
+    """True when *token* names a Python interpreter (``python``, ``py.exe``…)."""
+    basename = token.rsplit("/", 1)[-1]
+    return basename.startswith("python") or basename in ("py", "py.exe")
+
+
+def _dashboard_command_subcommand(
+    command: str | Sequence[str] | None,
+) -> str | None:
+    """Return the Hermes subcommand a command line invokes, or None.
+
+    Substring matching against patterns like ``"hermes_cli.main dashboard"``
+    cannot express this: Hermes's ``_apply_profile_override`` strips
+    ``--profile``/``-p`` before argparse sees argv, so the selector legally
+    sits *between* the entrypoint and the subcommand — the live server here
+    runs ``python -m hermes_cli.main -p default dashboard --port 9119``,
+    which no adjacent-words pattern matches.  The console-script form
+    ``"...\\hermes.exe" dashboard`` misses for a different reason: ``.exe"``
+    occupies the byte the pattern expects a space in.
+
+    So: locate the entrypoint token, then return the first positional token
+    after it, skipping profile selectors.  Being anchored to the entrypoint
+    (rather than scanning the whole line for the word) preserves the intent
+    of the old explicit-patterns list — a chat session discussing
+    "dashboard", or a test runner pointed at ``tests/dashboard/``, is not a
+    server — without a greedy regex.
+
+    The entrypoint basename must match *exactly*.  ``hermes-session-bridge``
+    also takes a ``serve`` subcommand and also runs long-lived; a prefix
+    match would reap it.
+    """
+    return _dashboard_subcommand_from_tokens(_dashboard_command_tokens(command))
+
+
+def _dashboard_subcommand_from_tokens(tokens: list[str]) -> str | None:
+    """``_dashboard_command_subcommand`` over already-normalized tokens."""
+    if not tokens:
+        return None
+
+    entry: int | None = None
+    for i, token in enumerate(tokens):
+        basename = token.rsplit("/", 1)[-1]
+        # Module form: `python -m hermes_cli.main ...`
+        if token == "hermes_cli.main":
+            if i > 0 and tokens[i - 1] == "-m":
+                entry = i
+                break
+            continue
+        # Console script (`hermes`/`hermes.exe`) or the script path
+        # (`.../hermes_cli/main.py`).  Both are argv[0], or argv[1] behind an
+        # interpreter — which is what keeps `grep hermes dashboard` out.
+        is_console_script = basename in ("hermes", "hermes.exe")
+        is_script_path = token == "hermes_cli/main.py" or token.endswith(
+            "/hermes_cli/main.py"
+        )
+        if not (is_console_script or is_script_path):
+            continue
+        if i == 0 or _is_python_interpreter_token(tokens[i - 1]):
+            entry = i
+            break
+
+    if entry is None:
+        return None
+
+    i = entry + 1
+    while i < len(tokens):
+        token = tokens[i]
+        # `--profile X` / `-p X` consume a value; `--profile=X` / `-p=X` don't.
+        # Consuming the value matters: a profile literally named "dashboard"
+        # must not be mistaken for the subcommand.
+        if token in ("--profile", "-p"):
+            i += 2
+            continue
+        if token.startswith("--profile=") or token.startswith("-p="):
+            i += 1
+            continue
+        if token.startswith("-"):
+            i += 1
+            continue
+        return token
+    return None
+
+
+def _looks_like_dashboard_command_line(
+    command: str | Sequence[str] | None,
+) -> bool:
+    """True when *command* runs the long-lived dashboard/serve server.
+
+    ``hermes dashboard --status`` and ``--stop`` share the subcommand but
+    are short-lived management commands.  They must not count as servers:
+    ``--status`` would list itself, and ``--stop`` would kill the process
+    invoking it.
+    """
+    tokens = _dashboard_command_tokens(command)
+    if _dashboard_subcommand_from_tokens(tokens) not in _DASHBOARD_SUBCOMMANDS:
+        return False
+    return not any(t in ("--status", "--stop") for t in tokens)
+
+
 def _find_stale_dashboard_pids(
     *,
     exclude_pids: set[int] | None = None,
-) -> list[int]:
+) -> _DashboardPids:
     """Return PIDs of ``hermes dashboard`` processes other than ourselves.
 
     ``hermes dashboard`` is a long-lived server process commonly started and
@@ -6171,96 +6338,62 @@ def _find_stale_dashboard_pids(
     backend process; ``_kill_stale_dashboard_processes`` reads it and
     passes it here.  (#37532)
 
-    Returns an empty list on any scan error (missing ps/wmic, timeout, etc.).
+    The result is a ``_DashboardPids`` — a list that also carries whether
+    the scan itself succeeded.  On failure the list is empty *and*
+    ``_scan_ok()`` is False, so callers can say "couldn't look" instead of
+    reporting a false clean.
     """
-    patterns = [
-        "hermes dashboard",
-        "hermes_cli.main dashboard",
-        "hermes_cli/main.py dashboard",
-        # The headless backend (`hermes serve`) is the same long-lived server
-        # under a different command name — the desktop app spawns it. Reap it
-        # on update for the same frontend/backend-mismatch reason.
-        "hermes serve",
-        "hermes_cli.main serve",
-        "hermes_cli/main.py serve",
-    ]
-    self_pid = os.getpid()
+    # Exclude the whole ancestor chain, not just os.getpid(): the console
+    # script runs as a parent/child pair (`hermes.exe` spawning
+    # `python.exe …hermes.exe`), so this scan executes in the CHILD and the
+    # wrapper parent would otherwise match its own invocation — making
+    # `--status` list itself and `--stop` kill the process running it.
+    # Mirrors `hermes_cli.gateway._scan_gateway_pids` (#13242).
+    try:
+        from hermes_cli.gateway import _get_ancestor_pids
+
+        self_pids = _get_ancestor_pids()
+    except Exception:
+        self_pids = {os.getpid()}
     dashboard_pids: list[int] = []
 
+    # psutil (a hard dependency) reads the process table in-process on every
+    # platform, so there is no win32/posix fork and no console spawn here.
+    # The old Windows branch shelled out to `wmic`, which Microsoft removed
+    # in Windows 11 — every scan on this host raised FileNotFoundError and
+    # was swallowed into an empty result.
     try:
-        if sys.platform == "win32":
-            # wmic may emit text in the system code page (for example cp936
-            # on zh-CN systems), not UTF-8. In text mode, subprocess output
-            # decoding depends on Python's configuration (locale-dependent
-            # by default, or UTF-8 in UTF-8 mode). The important protection
-            # here is errors="ignore": it prevents a reader-thread
-            # UnicodeDecodeError from leaving result.stdout=None and turning
-            # the later .split() into an AttributeError (#17049).
-            # CREATE_NO_WINDOW hides the conhost flash: this scan can run from
-            # the windowless pythonw.exe desktop/gateway backend during an
-            # update, where a bare wmic spawn would pop a console window.
-            from hermes_cli._subprocess_compat import windows_hide_flags
+        import psutil
+    except Exception as exc:
+        return _DashboardPids(scan_ok=False, scan_error=f"psutil unavailable: {exc}")
 
-            result = subprocess.run(
-                ["wmic", "process", "get", "ProcessId,CommandLine", "/FORMAT:LIST"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                encoding="utf-8",
-                errors="ignore",
-                creationflags=windows_hide_flags(),
-            )
-            if result.returncode != 0 or result.stdout is None:
-                return []
-            current_cmd = ""
-            for line in result.stdout.split("\n"):
-                line = line.strip()
-                if line.startswith("CommandLine="):
-                    current_cmd = line[len("CommandLine=") :]
-                elif line.startswith("ProcessId="):
-                    pid_str = line[len("ProcessId=") :]
-                    if (
-                        any(p in current_cmd for p in patterns)
-                        and int(pid_str) != self_pid
-                    ):
-                        try:
-                            dashboard_pids.append(int(pid_str))
-                        except ValueError:
-                            pass
-        else:
-            # Linux / macOS: scan the process table via ps and match against
-            # the same explicit patterns list used on Windows.  Using ps
-            # (rather than `pgrep -f "hermes.*dashboard"`) keeps us consistent
-            # with `hermes_cli.gateway._scan_gateway_pids` and avoids the
-            # greedy regex matching unrelated cmdlines that merely contain
-            # both words (e.g. a chat session discussing "dashboard").
-            result = subprocess.run(
-                ["ps", "-A", "-o", "pid=,command="],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode == 0:
-                for line in getattr(result, "stdout", "").split("\n"):
-                    stripped = line.strip()
-                    if not stripped or "grep" in stripped:
-                        continue
-                    parts = stripped.split(None, 1)
-                    if len(parts) != 2:
-                        continue
-                    try:
-                        pid = int(parts[0])
-                    except ValueError:
-                        continue
-                    command = parts[1]
-                    if any(p in command for p in patterns) and pid != self_pid:
-                        dashboard_pids.append(pid)
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return []
+    try:
+        proc_iter = psutil.process_iter(["pid", "cmdline"])
+    except Exception as exc:
+        return _DashboardPids(scan_ok=False, scan_error=str(exc))
+
+    try:
+        for proc in proc_iter:
+            try:
+                info = proc.info
+                pid = info.get("pid")
+                cmdline = info.get("cmdline")
+            except Exception:
+                # NoSuchProcess / AccessDenied on a single process is normal
+                # churn on a busy box, not a failed scan.
+                continue
+            if pid is None or not cmdline or int(pid) in self_pids:
+                continue
+            if _looks_like_dashboard_command_line(cmdline):
+                dashboard_pids.append(int(pid))
+    except Exception as exc:
+        # The walk itself died partway: whatever we collected is not a
+        # trustworthy answer, so report the scan as failed.
+        return _DashboardPids(dashboard_pids, scan_ok=False, scan_error=str(exc))
 
     if exclude_pids:
         dashboard_pids = [p for p in dashboard_pids if p not in exclude_pids]
-    return dashboard_pids
+    return _DashboardPids(dashboard_pids)
 
 
 def _print_curator_first_run_notice() -> None:
@@ -6432,6 +6565,15 @@ def _kill_stale_dashboard_processes(
             exclude = parsed
 
     pids = _find_stale_dashboard_pids(exclude_pids=exclude)
+    if not _scan_ok(pids):
+        # Never silently skip: this reaper is the only thing standing between
+        # `hermes update` and a stale backend serving old Python against the
+        # new JS bundle.  If we couldn't look, say so.
+        print()
+        print(f"⚠ Could not scan the process table ({_scan_error(pids)})")
+        print("  A dashboard may still be running the pre-update code.")
+        print("  Check with:  hermes dashboard --status")
+        return
     if not pids:
         return
 
@@ -6450,10 +6592,18 @@ def _kill_stale_dashboard_processes(
                     text=True,
                     timeout=10,
                 )
+                message = (result.stderr or result.stdout or "").strip()
                 if result.returncode == 0:
                     killed.append(pid)
+                elif "not found" in message.lower():
+                    # Already gone.  Each dashboard runs as a parent/child
+                    # pair on Windows (`hermes.exe` → `python.exe …hermes.exe`)
+                    # and the scan matches both, so killing the parent
+                    # routinely takes the child down before its own taskkill
+                    # lands.  That's the outcome we wanted, not a failure.
+                    killed.append(pid)
                 else:
-                    failed.append((pid, (result.stderr or result.stdout or "").strip()))
+                    failed.append((pid, message))
             except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
                 failed.append((pid, str(e)))
     else:
@@ -12383,12 +12533,21 @@ def _render_distribution_plan(plan) -> None:
 def _report_dashboard_status() -> int:
     """Print ``hermes dashboard`` PIDs and return the count.
 
-    Uses the same detection logic as ``_find_stale_dashboard_pids`` (the
-    current process is excluded, but since ``hermes dashboard --status``
-    runs in a short-lived CLI process that never matches the pattern,
-    the exclusion is irrelevant here).
+    Uses the same detection logic as ``_find_stale_dashboard_pids``.  Self
+    exclusion is load-bearing here, contrary to what this docstring used to
+    claim: ``hermes dashboard --status`` *does* carry the ``dashboard``
+    subcommand, and on Windows it runs as a wrapper/child pair, so without
+    both guards (the ``--status``/``--stop`` flag check and the ancestor
+    chain) this command lists itself.
+
+    Returns ``-1`` when the process-table scan failed, which is *not* the
+    same as the 0 of a genuinely idle box.
     """
     pids = _find_stale_dashboard_pids()
+    if not _scan_ok(pids):
+        print(f"⚠ Could not scan the process table ({_scan_error(pids)})")
+        print("  Unable to tell whether a dashboard is running.")
+        return -1
     if not pids:
         print("No hermes dashboard processes running.")
         return 0
@@ -12410,6 +12569,15 @@ def _report_dashboard_status() -> int:
                         )
         except (OSError, ValueError):
             pass
+        if not cmdline:
+            # No /proc (Windows, macOS): psutil already backs the scan, so
+            # reuse it rather than leaving the user a bare PID to guess at.
+            try:
+                import psutil
+
+                cmdline = " ".join(psutil.Process(pid).cmdline())
+            except Exception:
+                cmdline = ""
         if cmdline:
             print(f"    PID {pid}: {cmdline}")
         else:
@@ -12594,6 +12762,12 @@ def cmd_dashboard(args):
     # --stop: kill any running dashboards and exit, no deps needed.
     if getattr(args, "stop", False):
         pids = _find_stale_dashboard_pids()
+        if not _scan_ok(pids):
+            # Exit non-zero: we stopped nothing and verified nothing, so a
+            # script must not read this as "the dashboard is down".
+            print(f"⚠ Could not scan the process table ({_scan_error(pids)})")
+            print("  Nothing was stopped — the scan never completed.")
+            sys.exit(1)
         if not pids:
             print("No hermes dashboard processes running.")
             sys.exit(0)

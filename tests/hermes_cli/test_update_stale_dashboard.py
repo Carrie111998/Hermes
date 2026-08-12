@@ -59,129 +59,126 @@ def _refresh_bindings_against_live_module():
     yield
 
 
-def _ps_line(pid: int, cmd: str) -> str:
-    """Format a line as it would appear in ``ps -A -o pid=,command=`` output."""
-    return f"{pid:>7} {cmd}"
+class _FakeProc:
+    """Stand-in for a ``psutil.Process`` as yielded by ``process_iter``."""
+
+    def __init__(self, pid, cmdline):
+        self.info = {"pid": pid, "cmdline": cmdline}
 
 
-def _ps_runner(stdout: str):
-    """Build a subprocess.run side_effect that only stubs ps -A calls.
+def _fake_process_table(*procs):
+    """Patch ``psutil.process_iter`` to yield *procs*.
 
-    Any other subprocess.run invocation (e.g. taskkill on Windows) is
-    handed back as a successful no-op.  This lets tests exercise the real
-    scan path without having to re-stub every unrelated subprocess call
-    made later in ``_kill_stale_dashboard_processes``.
+    The scan reads the process table through psutil on every platform
+    (there is no ``ps``/``wmic`` spawn any more), so stubbing psutil is
+    how these tests drive it.  ``cmdline`` is an argv list, matching what
+    psutil really returns.
     """
-    def _side_effect(args, *a, **kw):
-        if isinstance(args, (list, tuple)) and args and args[0] == "ps":
-            return MagicMock(returncode=0, stdout=stdout, stderr="")
-        # Any other subprocess.run (e.g. taskkill) — benign success stub.
-        return MagicMock(returncode=0, stdout="", stderr="")
-    return _side_effect
+    import psutil
+
+    return patch.object(
+        psutil, "process_iter", lambda attrs=None, ad_value=None: iter(procs)
+    )
 
 
 class TestFindStaleDashboardPids:
-    """Unit tests for the ps/wmic-based detection step."""
+    """Unit tests for the psutil-based detection step.
+
+    Deeper coverage of the command-line matcher and of the scan-failure
+    signalling lives in ``test_dashboard_process_scan.py``.
+    """
 
     def test_no_matches_returns_empty(self):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout=_ps_line(111, "/usr/bin/python3 -m some.other.module")
-                + "\n"
-                + _ps_line(222, "/usr/bin/bash")
-                + "\n",
-                stderr="",
-            )
+        with _fake_process_table(
+            _FakeProc(111, ["/usr/bin/python3", "-m", "some.other.module"]),
+            _FakeProc(222, ["/usr/bin/bash"]),
+        ):
             assert _find_stale_dashboard_pids() == []
 
     def test_matches_running_dashboard(self):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout=_ps_line(12345, "python3 -m hermes_cli.main dashboard --port 9119") + "\n",
-                stderr="",
-            )
+        with _fake_process_table(
+            _FakeProc(12345, ["python3", "-m", "hermes_cli.main",
+                              "dashboard", "--port", "9119"]),
+        ):
             assert _find_stale_dashboard_pids() == [12345]
 
     def test_multiple_matches(self):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout="\n".join([
-                    _ps_line(12345, "python3 -m hermes_cli.main dashboard --port 9119"),
-                    _ps_line(12346, "hermes dashboard --port 9120 --no-open"),
-                    _ps_line(12347, "python /home/x/hermes_cli/main.py dashboard"),
-                ]) + "\n",
-                stderr="",
-            )
+        with _fake_process_table(
+            _FakeProc(12345, ["python3", "-m", "hermes_cli.main",
+                              "dashboard", "--port", "9119"]),
+            _FakeProc(12346, ["hermes", "dashboard", "--port", "9120", "--no-open"]),
+            _FakeProc(12347, ["python", "/home/x/hermes_cli/main.py", "dashboard"]),
+        ):
             assert sorted(_find_stale_dashboard_pids()) == [12345, 12346, 12347]
 
+    def test_matches_dashboard_behind_a_profile_selector(self):
+        """The live :9119 server's real argv — ``-p default`` sits between
+        the entrypoint and the subcommand, which the old adjacent-words
+        substring patterns could not match at all."""
+        with _fake_process_table(
+            _FakeProc(33940, ["python.exe", "-m", "hermes_cli.main",
+                              "-p", "default", "dashboard", "--port", "9119",
+                              "--host", "127.0.0.1", "--no-open"]),
+        ):
+            assert _find_stale_dashboard_pids() == [33940]
+
     def test_self_pid_excluded(self):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout="\n".join([
-                    _ps_line(os.getpid(), "python3 -m hermes_cli.main dashboard"),
-                    _ps_line(12345, "hermes dashboard --port 9119"),
-                ]) + "\n",
-                stderr="",
-            )
+        with _fake_process_table(
+            _FakeProc(os.getpid(), ["python3", "-m", "hermes_cli.main", "dashboard"]),
+            _FakeProc(12345, ["hermes", "dashboard", "--port", "9119"]),
+        ):
             pids = _find_stale_dashboard_pids()
         assert os.getpid() not in pids
         assert 12345 in pids
 
-    def test_ps_not_found_returns_empty(self):
-        with patch("subprocess.run", side_effect=FileNotFoundError):
-            assert _find_stale_dashboard_pids() == []
+    def test_scan_failure_is_distinguishable_from_empty(self):
+        """A failed scan must NOT read as "no dashboards running".
 
-    def test_ps_timeout_returns_empty(self):
-        import subprocess as sp
-        with patch("subprocess.run", side_effect=sp.TimeoutExpired("ps", 10)):
-            assert _find_stale_dashboard_pids() == []
+        This is the defect that made ``--stop`` print a false clean on
+        Windows 11, where the old ``wmic`` transport no longer exists.
+        """
+        import psutil
+
+        def _boom(attrs=None, ad_value=None):
+            raise OSError("process table unavailable")
+
+        with patch.object(psutil, "process_iter", _boom):
+            pids = _find_stale_dashboard_pids()
+        assert list(pids) == []
+        assert pids.scan_ok is False
 
     def test_unrelated_process_containing_word_dashboard_not_matched(self):
         """Guards against greedy pgrep-style matching catching chat sessions
         or unrelated processes whose cmdline happens to contain 'dashboard'.
         """
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout="\n".join([
-                    _ps_line(12345, "python3 -m hermes_cli.main dashboard --port 9119"),
-                    _ps_line(22222, "python3 -m hermes_cli.main chat -q 'rewrite my dashboard'"),
-                    _ps_line(33333, "node /opt/grafana/dashboard-server.js"),
-                ]) + "\n",
-                stderr="",
-            )
+        with _fake_process_table(
+            _FakeProc(12345, ["python3", "-m", "hermes_cli.main",
+                              "dashboard", "--port", "9119"]),
+            _FakeProc(22222, ["python3", "-m", "hermes_cli.main", "chat",
+                              "-q", "rewrite my dashboard"]),
+            _FakeProc(33333, ["node", "/opt/grafana/dashboard-server.js"]),
+        ):
             pids = _find_stale_dashboard_pids()
         assert pids == [12345]
 
-    def test_grep_lines_ignored(self):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout="\n".join([
-                    _ps_line(99999, "grep hermes dashboard"),
-                    _ps_line(12345, "hermes dashboard --port 9119"),
-                ]) + "\n",
-                stderr="",
-            )
+    def test_grep_for_the_pattern_is_ignored(self):
+        with _fake_process_table(
+            _FakeProc(99999, ["grep", "hermes", "dashboard"]),
+            _FakeProc(12345, ["hermes", "dashboard", "--port", "9119"]),
+        ):
             pids = _find_stale_dashboard_pids()
         assert 99999 not in pids
         assert 12345 in pids
 
-    def test_invalid_pid_lines_skipped(self):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout="\n".join([
-                    "notapid hermes dashboard --bad",
-                    _ps_line(12345, "hermes dashboard --port 9119"),
-                    "   ",
-                ]) + "\n",
-                stderr="",
-            )
+    def test_processes_without_a_readable_cmdline_are_skipped(self):
+        """Kernel threads and protected processes report an empty/absent
+        cmdline; they must be skipped rather than abort the scan."""
+        with _fake_process_table(
+            _FakeProc(4, []),
+            _FakeProc(8, None),
+            _FakeProc(None, ["hermes", "dashboard"]),
+            _FakeProc(12345, ["hermes", "dashboard", "--port", "9119"]),
+        ):
             pids = _find_stale_dashboard_pids()
         assert pids == [12345]
 
@@ -189,16 +186,11 @@ class TestFindStaleDashboardPids:
         """exclude_pids removes specific PIDs from the result — used by
         the Desktop Electron app to protect its own backend child.  (#37532)
         """
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout="\n".join([
-                    _ps_line(11111, "hermes dashboard --port 9119"),
-                    _ps_line(22222, "hermes dashboard --port 9120"),
-                    _ps_line(33333, "hermes dashboard --port 9121"),
-                ]) + "\n",
-                stderr="",
-            )
+        with _fake_process_table(
+            _FakeProc(11111, ["hermes", "dashboard", "--port", "9119"]),
+            _FakeProc(22222, ["hermes", "dashboard", "--port", "9120"]),
+            _FakeProc(33333, ["hermes", "dashboard", "--port", "9121"]),
+        ):
             # Exclude the desktop-managed backend PID
             pids = _find_stale_dashboard_pids(exclude_pids={22222})
         assert 11111 in pids
@@ -207,25 +199,22 @@ class TestFindStaleDashboardPids:
 
     def test_exclude_pids_none_is_noop(self):
         """Passing exclude_pids=None (the default) changes nothing."""
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout=_ps_line(12345, "hermes dashboard --port 9119") + "\n",
-                stderr="",
-            )
+        with _fake_process_table(
+            _FakeProc(12345, ["hermes", "dashboard", "--port", "9119"]),
+        ):
             pids = _find_stale_dashboard_pids(exclude_pids=None)
         assert pids == [12345]
 
     def test_exclude_all_pids_returns_empty(self):
         """If all matched PIDs are excluded, the result is empty."""
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout=_ps_line(12345, "hermes dashboard --port 9119") + "\n",
-                stderr="",
-            )
+        with _fake_process_table(
+            _FakeProc(12345, ["hermes", "dashboard", "--port", "9119"]),
+        ):
             pids = _find_stale_dashboard_pids(exclude_pids={12345})
         assert pids == []
+        # Still a successful scan — the box was searched, matches were
+        # found, and the caller asked for them to be filtered out.
+        assert pids.scan_ok is True
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX kill semantics")
@@ -361,6 +350,33 @@ class TestKillStaleDashboardWindows:
         assert "✓ stopped PID 12345" in out
         assert "✓ stopped PID 12346" in out
 
+    def test_already_gone_process_counts_as_stopped(self, monkeypatch, capsys):
+        """A PID that died before its taskkill is a success, not a failure.
+
+        On Windows each dashboard is a parent/child pair — ``hermes.exe``
+        spawning ``python.exe ...\\hermes.exe`` — and the scan legitimately
+        matches both.  Killing the parent takes the child with it, so the
+        child's taskkill then reports 'not found'.  That is the outcome we
+        wanted; printing '✗ failed to stop' for it would be alarming noise
+        on a perfectly successful stop.
+        """
+        monkeypatch.setattr(sys, "platform", "win32")
+
+        def fake_run(args, *a, **kw):
+            return MagicMock(
+                returncode=128, stdout="",
+                stderr='ERROR: The process "12346" not found.',
+            )
+
+        with patch("hermes_cli.main._find_stale_dashboard_pids",
+                   return_value=[12346]), \
+             patch("subprocess.run", side_effect=fake_run):
+            _kill_stale_dashboard_processes()
+
+        out = capsys.readouterr().out
+        assert "✓ stopped PID 12346" in out
+        assert "✗ failed" not in out
+
     def test_taskkill_failure_is_reported(self, monkeypatch, capsys):
         monkeypatch.setattr(sys, "platform", "win32")
 
@@ -386,51 +402,41 @@ class TestBackCompatAlias:
         assert _warn_stale_dashboard_processes is _kill_stale_dashboard_processes
 
 
-class TestWindowsWmicEncoding:
-    """Regression tests for #17049 — the Windows wmic branch must not crash
-    `hermes update` on non-UTF-8 system locales (e.g. cp936 on zh-CN).
+class TestWindowsScanTransport:
+    """The scan must not shell out on Windows.
+
+    History: the Windows branch used to run ``wmic``, which brought two
+    problems this class now guards the absence of.
+
+    - #17049: wmic emits text in the system code page (cp936 on zh-CN), so
+      the call needed ``encoding='utf-8', errors='ignore'`` to stop a
+      reader-thread UnicodeDecodeError from leaving ``stdout=None`` and
+      turning the later ``.split()`` into an AttributeError.
+    - 2026-08-12: Microsoft removed wmic from Windows 11 outright, so the
+      spawn raised FileNotFoundError and the scan silently returned [].
+
+    Reading the process table in-process through psutil retires both: there
+    is no decoding step and no executable to be missing.  Asserting "no
+    subprocess at all" is the strictly stronger contract, and it also
+    subsumes the old CREATE_NO_WINDOW requirement (a spawn that never
+    happens cannot flash a console window from ``pythonw.exe``).
     """
 
-    def test_wmic_invoked_with_utf8_ignore_errors(self, monkeypatch):
-        """The wmic subprocess.run call must pass encoding='utf-8' and
-        errors='ignore' so the subprocess reader thread cannot raise
-        UnicodeDecodeError on non-UTF-8 wmic output."""
+    def test_scan_spawns_no_subprocess_on_windows(self, monkeypatch):
         monkeypatch.setattr(sys, "platform", "win32")
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout=(
-                    "CommandLine=python -m hermes_cli.main dashboard\n"
-                    "ProcessId=12345\n"
-                ),
-                stderr="",
-            )
-            _find_stale_dashboard_pids()
+        with _fake_process_table(
+            _FakeProc(12345, ["python", "-m", "hermes_cli.main", "dashboard"]),
+        ), patch("subprocess.run") as mock_run:
+            assert _find_stale_dashboard_pids() == [12345]
+        mock_run.assert_not_called()
 
-        # The wmic call is the first subprocess.run invocation.
-        assert mock_run.called, "subprocess.run was not invoked"
-        wmic_call = mock_run.call_args_list[0]
-        kwargs = wmic_call.kwargs
-        assert kwargs.get("encoding") == "utf-8", (
-            "encoding kwarg must be 'utf-8' so wmic output is decoded "
-            "deterministically rather than via the implicit reader-thread "
-            "default that crashes on non-UTF-8 locales (#17049)."
-        )
-        assert kwargs.get("errors") == "ignore", (
-            "errors kwarg must be 'ignore' so undecodable bytes don't take "
-            "down the reader thread (#17049)."
-        )
-
-    def test_wmic_returns_none_stdout_does_not_crash(self, monkeypatch):
-        """If subprocess.run returns successfully but stdout is None — which
-        is what Python 3.11 leaves behind when the reader thread silently
-        crashed on UnicodeDecodeError before this fix landed — detection
-        must short-circuit instead of raising AttributeError on
-        ``None.split('\\n')`` and aborting `hermes update` (#17049)."""
+    def test_undecodable_cmdline_bytes_do_not_crash_the_scan(self, monkeypatch):
+        """A cmdline carrying surrogates (what a non-UTF-8 locale yields)
+        must be matched-or-skipped, never raise — `hermes update` used to
+        abort here (#17049)."""
         monkeypatch.setattr(sys, "platform", "win32")
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0, stdout=None, stderr=""
-            )
-            # Must not raise.
-            assert _find_stale_dashboard_pids() == []
+        with _fake_process_table(
+            _FakeProc(999, ["C:\\\udcff\udcfe\\python.exe", "-m", "weird.module"]),
+            _FakeProc(12345, ["hermes", "dashboard"]),
+        ):
+            assert _find_stale_dashboard_pids() == [12345]

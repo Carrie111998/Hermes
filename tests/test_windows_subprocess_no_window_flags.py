@@ -211,7 +211,17 @@ def test_gateway_pid_scan_hides_wmic_and_powershell_windows(monkeypatch):
     ]
 
 
-def test_stale_dashboard_windows_scan_hides_wmic(monkeypatch):
+def test_stale_dashboard_windows_scan_spawns_nothing(monkeypatch):
+    """The dashboard scan satisfies the windowless contract by not spawning.
+
+    This test used to assert CREATE_NO_WINDOW on a ``wmic`` probe, so that
+    the scan wouldn't flash a console when it ran from the windowless
+    ``pythonw.exe`` desktop/gateway backend during an update.  wmic has
+    since been removed from Windows 11 and the scan reads the process table
+    in-process via psutil, which cannot open a console at all — the
+    stronger form of the same guarantee.
+    """
+    import psutil
     from hermes_cli import main
     from hermes_cli import _subprocess_compat
 
@@ -219,15 +229,20 @@ def test_stale_dashboard_windows_scan_hides_wmic(monkeypatch):
 
     def fake_run(cmd, **kwargs):
         captured.append((cmd, kwargs))
-        return _Completed(stdout="CommandLine=hermes dashboard\nProcessId=123\n")
+        return _Completed(stdout="")
+
+    class _Proc:
+        info = {"pid": 123, "cmdline": ["hermes", "dashboard"]}
 
     monkeypatch.setattr(main.sys, "platform", "win32")
     monkeypatch.setattr(_subprocess_compat, "IS_WINDOWS", True)
-    monkeypatch.setattr(_subprocess_compat, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
     monkeypatch.setattr(main.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        psutil, "process_iter", lambda attrs=None, ad_value=None: iter([_Proc()])
+    )
 
     assert main._find_stale_dashboard_pids() == [123]
-    assert captured[0][1]["creationflags"] == _CREATE_NO_WINDOW
+    assert captured == [], f"scan must not spawn a subprocess: {captured}"
 
 
 def test_gateway_force_kill_hides_taskkill_window(monkeypatch):
