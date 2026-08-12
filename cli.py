@@ -770,6 +770,8 @@ def load_cli_config() -> Dict[str, Any]:
     if isinstance(sessions_config, dict):
         if "cjk_fts" in sessions_config:
             os.environ["HERMES_CJK_FTS"] = str(sessions_config["cjk_fts"])
+        if "fts5" in sessions_config:
+            os.environ["HERMES_FTS5"] = str(sessions_config["fts5"])
         if "search_slow_ms" in sessions_config:
             os.environ["HERMES_SEARCH_SLOW_MS"] = str(
                 sessions_config["search_slow_ms"]

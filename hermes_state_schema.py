@@ -28,6 +28,7 @@ from hermes_state_common import (
     _FTS_CJK_TRIGGERS,
     _FTS_TRIGGERS,
     _ephemeral_child_sql,
+    _fts5_config_enabled,
 )
 
 # Moved methods logged under the "hermes_state" logger before the split;
@@ -107,6 +108,10 @@ class SessionSchemaMixin:
             )
 
     def _sqlite_supports_fts5(self, cursor: sqlite3.Cursor) -> bool:
+        # config.yaml sessions.fts5 opt-out (issue #69603): when disabled,
+        # report FTS5 unavailable so startup takes the no-FTS path.
+        if not _fts5_config_enabled():
+            return False
         try:
             cursor.execute("CREATE VIRTUAL TABLE temp._hermes_fts5_probe USING fts5(x)")
             cursor.execute("DROP TABLE temp._hermes_fts5_probe")

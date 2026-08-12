@@ -1,3 +1,4 @@
+import os
 """Shared module-level constants for the SessionDB family of modules.
 
 Extracted verbatim from hermes_state.py so the SessionDB mixin modules
@@ -621,3 +622,16 @@ AFTER UPDATE OF content, tool_name, tool_calls ON messages BEGIN
     );
 END;
 """
+
+
+def _fts5_config_enabled() -> bool:
+    """config.yaml ``sessions.fts5`` (default on), via its env bridge.
+
+    Opt-out for the FTS5 write-corruption class (issue #69603): when False,
+    startup takes the no-FTS path (drop sync triggers, LIKE search fallback).
+    Lives in hermes_state_common so both hermes_state and hermes_state_schema
+    can use it without an import cycle.
+    """
+    return os.getenv("HERMES_FTS5", "1").strip().lower() not in (
+        "0", "false", "off", "no",
+    )
