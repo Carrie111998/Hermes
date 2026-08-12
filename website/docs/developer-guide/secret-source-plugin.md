@@ -30,9 +30,22 @@ The orchestrator (`agent.secret_sources.registry.apply_all`) owns everything sec
 
 ```
 ~/.hermes/plugins/my-vault/
-├── plugin.yaml      # name, description
+├── plugin.yaml      # name, description, provides_secret_sources
 └── __init__.py      # SecretSource subclass + register(ctx)
 ```
+
+Declare the source name in the manifest so the pre-dotenv bootstrap can select
+this plugin without importing unrelated enabled plugins:
+
+```yaml
+name: my-vault
+kind: standalone
+provides_secret_sources:
+  - myvault
+```
+
+Direct `ctx.register_secret_source(...)` calls remain detectable for older
+plugins, but new plugins should include the declaration.
 
 ## The SecretSource ABC
 

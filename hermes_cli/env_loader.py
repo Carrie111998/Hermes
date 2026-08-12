@@ -198,6 +198,8 @@ def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
     if not cfg:
         return {}
 
+    _discover_configured_secret_source_plugins(home, cfg)
+
     try:
         from agent.secret_scope import _is_global_env, load_env_file
         from agent.secret_sources.registry import apply_all
@@ -642,6 +644,8 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     except ImportError:
         return
 
+    _discover_configured_secret_source_plugins(home_path, cfg)
+
     try:
         report = apply_all(cfg, home_path)
     except Exception:  # noqa: BLE001 — belt-and-braces; apply_all shouldn't raise
@@ -692,6 +696,50 @@ def _apply_external_secret_sources(home_path: Path) -> None:
             print(f"  {src.label}: {warn}", file=sys.stderr)
     for conflict in report.conflicts:
         print(f"  Secret sources: {conflict}", file=sys.stderr)
+
+
+def _discover_configured_secret_source_plugins(
+    home_path: Path,
+    secrets_cfg: dict,
+) -> None:
+    """Register configured plugin sources before ``apply_all`` validates them.
+
+    Dotenv loading precedes ordinary plugin discovery in several entrypoints.
+    The optional ``secrets.sources`` list and source-specific config sections
+    can both select an installed plugin source. Only unknown configured source
+    names trigger a restricted scan of enabled native plugins beneath the
+    explicit ``home_path``.
+
+    This helper only discovers/registers plugins; fetching remains exclusively
+    in the subsequent ``apply_all`` call.  Discovery failures are deliberately
+    swallowed without interpolating the exception: startup is fail-open and an
+    exception raised by third-party code may contain credential material.
+    """
+    if not isinstance(secrets_cfg, dict):
+        return
+
+    configured = {
+        name
+        for name, value in secrets_cfg.items()
+        if isinstance(name, str) and isinstance(value, dict)
+    }
+    explicit = secrets_cfg.get("sources")
+    if isinstance(explicit, list):
+        configured.update(name for name in explicit if isinstance(name, str))
+    if not configured:
+        return
+
+    try:
+        from agent.secret_sources.registry import get_source
+
+        unknown = {name for name in configured if get_source(name) is None}
+        if not unknown:
+            return
+        from hermes_cli.plugins import discover_configured_secret_source_plugins
+
+        discover_configured_secret_source_plugins(home_path, unknown)
+    except Exception:  # noqa: BLE001 — plugin discovery must not block startup
+        return
 
 
 def _remediation_hint(source_name: str, error_kind, secrets_cfg: dict) -> str:
