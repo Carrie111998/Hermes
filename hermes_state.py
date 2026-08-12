@@ -1396,7 +1396,13 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
 # enumerate causes (e.g. the cron scheduler's explainer-variant suppression)
 # must iterate this tuple instead of hardcoding the list, so adding a bucket
 # can never silently desynchronize them.
-PERSISTENCE_ERROR_CAUSES = ("locked", "compression", "disk", "unknown")
+PERSISTENCE_ERROR_CAUSES = (
+    "locked",
+    "compression",
+    "turn_lease",
+    "disk",
+    "unknown",
+)
 
 
 def classify_persistence_error(exc_or_str) -> str:
@@ -1413,6 +1419,9 @@ def classify_persistence_error(exc_or_str) -> str:
       database write lock); transient, retry-later guidance applies.
     * ``"compression"`` — a live compression lease refused the transcript
       write; the database itself is healthy and unlocked.
+    * ``"turn_lease"`` — a presented session-turn-lease holder no longer
+      owns the conversation (expired, released, or reclaimed); fail-fast
+      fencing, not a storage fault.
     * ``"disk"``    — disk full / read-only / permission-shaped failures
       (delegates the disk-full patterns to :func:`is_disk_full_error` so the
       two classifiers can never drift apart — e.g. ENOSPC).
@@ -1425,9 +1434,13 @@ def classify_persistence_error(exc_or_str) -> str:
     # writer" / "Compression lease lost") contains neither "locked" nor
     # "busy", so it must be matched by type and by phrase (for strings that
     # survived RPC wrapping).
+    if isinstance(exc_or_str, SessionTurnLeaseLostError):
+        return "turn_lease"
     if isinstance(exc_or_str, CompressionSessionBusyError):
         return "compression"
     text = str(exc_or_str).lower()
+    if "turn lease" in text:
+        return "turn_lease"
     if "being compressed" in text or "compression lease" in text:
         return "compression"
     if (
@@ -2049,6 +2062,16 @@ class SessionCompressionInProgressError(CompressionSessionBusyError):
 
     Subclassing keeps every existing ``except CompressionSessionBusyError``
     handler working unchanged.
+    """
+
+
+class SessionTurnLeaseLostError(RuntimeError):
+    """A transcript write presented a turn-lease holder that no longer owns it.
+
+    Fail-fast fencing: do not retry inside ``_execute_write``. The caller
+    either still thinks it owns the conversation after expiry/reclaim, or
+    the lease row is gone. A later writer may already be persisting a
+    newer turn; landing this write would interleave a stale reply.
     """
 
 
@@ -7779,7 +7802,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return None
 
     def _check_transcript_write_guards(
-        self, conn, session_id: str, compression_lock_holder: Optional[str]
+        self,
+        conn,
+        session_id: str,
+        compression_lock_holder: Optional[str],
+        turn_lease_holder: Optional[str] = None,
     ) -> None:
         """Transcript-append admission checks, run INSIDE the write txn.
 
@@ -7800,6 +7827,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             raise SessionCompressionInProgressError(
                 f"Session {session_id!r} is being compressed by another writer"
             )
+        if turn_lease_holder:
+            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            lease = conn.execute(
+                "SELECT holder, expires_at FROM session_turn_leases "
+                "WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if (
+                lease is None
+                or lease["holder"] != turn_lease_holder
+                or float(lease["expires_at"]) <= time.time()
+            ):
+                raise SessionTurnLeaseLostError(
+                    f"Session turn lease lost; refusing transcript write "
+                    f"for {session_id!r}"
+                )
         session = conn.execute(
             "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
             (session_id,),
@@ -7879,6 +7922,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         display_kind: Optional[str] = None,
         display_metadata: Optional[Dict[str, Any]] = None,
         compression_lock_holder: Optional[str] = None,
+        turn_lease_holder: Optional[str] = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -7937,7 +7981,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         def _do(conn):
             self._check_transcript_write_guards(
-                conn, session_id, compression_lock_holder
+                conn,
+                session_id,
+                compression_lock_holder,
+                turn_lease_holder=turn_lease_holder,
             )
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
@@ -7999,6 +8046,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         messages: List[Dict[str, Any]],
         compression_lock_holder: Optional[str] = None,
+        turn_lease_holder: Optional[str] = None,
         chunk_rows: Optional[int] = None,
     ) -> int:
         """Append multiple messages atomically in ONE write transaction.
@@ -8038,12 +8086,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     session_id,
                     messages[start:start + chunk_rows],
                     compression_lock_holder=compression_lock_holder,
+                    turn_lease_holder=turn_lease_holder,
                 )
             return inserted_total
 
         def _do(conn):
             self._check_transcript_write_guards(
-                conn, session_id, compression_lock_holder
+                conn,
+                session_id,
+                compression_lock_holder,
+                turn_lease_holder=turn_lease_holder,
             )
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, messages
