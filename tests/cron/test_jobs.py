@@ -22,6 +22,8 @@ from cron.jobs import (
     claim_dispatch,
     claim_job_for_fire,
     heartbeat_run_claim,
+    mark_preflight_alerted,
+    clear_preflight_alerted,
     get_due_jobs,
     save_job_output,
     _hermes_now,
@@ -740,6 +742,92 @@ class TestGetDueJobs:
             assert get_due_jobs() == [], f"double-dispatched at +{gap}s"
 
 
+    def test_recurring_job_not_redispatched_while_running(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A durable run claim extends the running guard across processes."""
+        from cron.jobs import _hermes_now
+
+        t0 = _hermes_now()
+        due_at = (t0 - timedelta(seconds=5)).isoformat()
+        save_jobs([{
+            "id": "long-recurring", "name": "R", "prompt": "long report",
+            "schedule": {"kind": "interval", "minutes": 1},
+            "next_run_at": due_at, "enabled": True, "state": "scheduled",
+        }])
+
+        first = get_due_jobs(claim_recurring=True)
+        assert [job["id"] for job in first] == ["long-recurring"]
+        assert get_job("long-recurring").get("run_claim") is not None
+
+        for gap in (61, 130):
+            monkeypatch.setattr(
+                "cron.jobs._hermes_now",
+                lambda t0=t0, gap=gap: t0 + timedelta(seconds=gap),
+            )
+            assert get_due_jobs() == [], f"recurring job redispatched at +{gap}s"
+
+
+    def test_recurring_run_claim_expires_after_worker_stops(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A failed final ledger/store write cannot wedge recurrence forever."""
+        monkeypatch.delenv("HERMES_CRON_TIMEOUT", raising=False)
+        from cron.jobs import _hermes_now, _oneshot_run_claim_ttl_seconds
+
+        now = _hermes_now()
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        ttl = _oneshot_run_claim_ttl_seconds()
+        due_at = (now - timedelta(seconds=5)).isoformat()
+        stale_claim_at = (now - timedelta(seconds=ttl + 1)).isoformat()
+        save_jobs([{
+            "id": "stale-recurring", "name": "R", "prompt": "retry safely",
+            "schedule": {"kind": "interval", "minutes": 1},
+            "next_run_at": due_at, "enabled": True, "state": "scheduled",
+            "run_claim": {"at": stale_claim_at, "by": "dead-worker"},
+        }])
+
+        due = get_due_jobs(claim_recurring=True)
+        assert [job["id"] for job in due] == ["stale-recurring"]
+        replacement = get_job("stale-recurring")["run_claim"]
+        assert replacement["at"] == now.isoformat()
+        assert replacement["by"] != "dead-worker"
+
+
+    def test_recurring_run_claim_heartbeat_extends_ownership_past_ttl(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        monkeypatch.delenv("HERMES_CRON_TIMEOUT", raising=False)
+        from cron.jobs import _hermes_now, _oneshot_run_claim_ttl_seconds
+
+        ttl = _oneshot_run_claim_ttl_seconds()
+        t0 = _hermes_now()
+        due_at = (t0 - timedelta(seconds=5)).isoformat()
+        save_jobs([{
+            "id": "heartbeat-recurring", "name": "R", "prompt": "x",
+            "schedule": {"kind": "interval", "minutes": 1},
+            "next_run_at": due_at, "enabled": True, "state": "scheduled",
+        }])
+        assert [job["id"] for job in get_due_jobs(claim_recurring=True)] == [
+            "heartbeat-recurring"
+        ]
+        owner = get_job("heartbeat-recurring")["run_claim"]["by"]
+
+        monkeypatch.setattr(
+            "cron.jobs._hermes_now",
+            lambda: t0 + timedelta(seconds=ttl - 60),
+        )
+        assert heartbeat_run_claim(
+            "heartbeat-recurring", expected_owner=owner
+        ) is True
+
+        monkeypatch.setattr(
+            "cron.jobs._hermes_now",
+            lambda: t0 + timedelta(seconds=ttl + 10),
+        )
+        assert get_due_jobs() == []
+
+
     def test_run_claim_heartbeat_keeps_long_run_claimed_past_ttl(
         self, tmp_cron_dir, monkeypatch
     ):
@@ -803,6 +891,40 @@ class TestGetDueJobs:
             "at": original_at,
             "by": "new-owner",
         }
+
+
+    def test_mark_job_run_rejects_stale_attempt_owner(self, tmp_cron_dir):
+        """A resumed old attempt cannot clear or overwrite its successor."""
+        next_run = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        replacement_claim = {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "by": "replacement-owner",
+        }
+        save_jobs([{
+            "id": "reclaimed-completion", "name": "R", "prompt": "x",
+            "schedule": {"kind": "interval", "minutes": 60},
+            "next_run_at": next_run, "enabled": True, "state": "scheduled",
+            "last_status": None,
+            "run_claim": replacement_claim,
+        }])
+
+        assert mark_job_run(
+            "reclaimed-completion",
+            success=False,
+            error="late old failure",
+            expected_run_claim_owner="old-owner",
+        ) is False
+        persisted = get_job("reclaimed-completion")
+        assert persisted["run_claim"] == replacement_claim
+        assert persisted["last_status"] is None
+        assert persisted["next_run_at"] == next_run
+
+        assert mark_job_run(
+            "reclaimed-completion",
+            success=True,
+            expected_run_claim_owner="replacement-owner",
+        ) is True
+        assert get_job("reclaimed-completion")["run_claim"] is None
 
 
 class TestEnabledToolsets:
@@ -988,6 +1110,19 @@ class TestSaveJobOutput:
         assert output_file.exists()
         assert output_file.read_text() == "# Results\nEverything ok."
         assert "test123" in str(output_file)
+
+    def test_same_timestamp_outputs_remain_attempt_unique(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        fixed = datetime(2026, 8, 11, 1, 2, 3, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: fixed)
+
+        first = save_job_output("same-tick", "first")
+        second = save_job_output("same-tick", "second")
+
+        assert first != second
+        assert first.read_text() == "first"
+        assert second.read_text() == "second"
 
 
 class TestCronOutputRetention:
@@ -1215,10 +1350,6 @@ class TestJobsJsonUtf8Bom:
 
         loaded = load_jobs()
         assert [j["id"] for j in loaded] == ["plainjob01"]
-
-
-
-
 class TestAdvanceNextRuns:
     """Tests for advance_next_runs() — the batched due-set advance.
 
@@ -1280,6 +1411,28 @@ class TestAdvanceNextRuns:
             saves.__setitem__(0, saves[0] + 1), real_save(*a, **k))[1])
         assert advance_next_runs(one_ids + ["missing-id"]) == 0
         assert saves[0] == 0
+
+    def test_exact_owner_mapping_preserves_successor_schedule(self, tmp_cron_dir):
+        from cron.jobs import advance_next_runs
+
+        rec_ids, _ = self._make_due(
+            tmp_cron_dir, n_recurring=1, n_oneshot=0
+        )
+        job_id = rec_ids[0]
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] == job_id:
+                job["run_claim"] = {
+                    "at": _hermes_now().isoformat(),
+                    "by": "successor-owner",
+                }
+                successor_next = job["next_run_at"]
+        save_jobs(jobs)
+
+        assert advance_next_runs({job_id: "stale-owner"}) == 0
+        stored = get_job(job_id)
+        assert stored["run_claim"]["by"] == "successor-owner"
+        assert stored["next_run_at"] == successor_next
 
     def test_wrapper_semantics_unchanged(self, tmp_cron_dir):
         """advance_next_run keeps its per-job contract over the batch."""
@@ -1354,3 +1507,75 @@ class TestCompletedOneshotRetentionSweep:
         assert updated["enabled"] is True
         assert updated["state"] == "scheduled"
         assert updated["next_run_at"] is not None
+
+
+class TestAttemptLifecycleFences:
+    """Every attempt-owned durable mutation is one exact-owner CAS."""
+
+    @staticmethod
+    def _claimed_oneshot(owner: str = "attempt-a"):
+        return {
+            "id": "lifecycle-job",
+            "name": "lifecycle",
+            "prompt": "run",
+            "enabled": True,
+            "state": "scheduled",
+            "schedule": {"kind": "once", "run_at": _hermes_now().isoformat()},
+            "repeat": {"times": 1, "completed": 0},
+            "run_claim": {"at": _hermes_now().isoformat(), "by": owner},
+        }
+
+    def test_dispatch_claim_rejects_replaced_owner_without_consuming_successor(
+        self, tmp_cron_dir
+    ):
+        successor = self._claimed_oneshot("attempt-b")
+        save_jobs([successor])
+
+        assert claim_dispatch(
+            successor["id"], expected_run_claim_owner="attempt-a"
+        ) is False
+
+        stored = get_job(successor["id"])
+        assert stored is not None
+        assert stored["run_claim"]["by"] == "attempt-b"
+        assert stored["repeat"]["completed"] == 0
+        assert stored["enabled"] is True
+
+    def test_dispatch_claim_missing_job_fails_closed_for_claimed_attempt(
+        self, tmp_cron_dir
+    ):
+        save_jobs([])
+        assert claim_dispatch(
+            "missing", expected_run_claim_owner="attempt-a"
+        ) is False
+
+    def test_output_save_rejects_replaced_owner_without_writing_file(
+        self, tmp_cron_dir
+    ):
+        successor = self._claimed_oneshot("attempt-b")
+        save_jobs([successor])
+
+        assert save_job_output(
+            successor["id"],
+            "stale output",
+            expected_run_claim_owner="attempt-a",
+        ) is None
+
+        output_dir = tmp_cron_dir / "cron" / "output" / successor["id"]
+        assert not output_dir.exists() or list(output_dir.glob("*.md")) == []
+
+    def test_preflight_marker_rejects_replaced_owner(self, tmp_cron_dir):
+        successor = self._claimed_oneshot("attempt-b")
+        successor["preflight_alerted"] = True
+        save_jobs([successor])
+
+        assert mark_preflight_alerted(
+            successor["id"], expected_run_claim_owner="attempt-a"
+        ) is None
+        assert clear_preflight_alerted(
+            successor["id"], expected_run_claim_owner="attempt-a"
+        ) is None
+
+        stored = get_job(successor["id"])
+        assert stored["run_claim"]["by"] == "attempt-b"
+        assert stored["preflight_alerted"] is True

@@ -23,9 +23,11 @@ def _reset_scheduler_state():
     import cron.scheduler as sched
 
     sched._running_job_ids.clear()
+    sched._running_run_claim_owners.clear()
     sched._interrupted_job_ids.clear()
     yield
     sched._running_job_ids.clear()
+    sched._running_run_claim_owners.clear()
     sched._interrupted_job_ids.clear()
 
 
@@ -111,6 +113,70 @@ class TestMarkRunningJobsInterrupted:
             marked = sched.mark_running_jobs_interrupted("shutdown")
 
         assert marked == ["job-2"]
+
+    def test_profile_scoped_manual_run_marks_its_store_with_exact_owner(
+        self, tmp_path
+    ):
+        import cron.jobs as jobs
+        import cron.scheduler as sched
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        default_home = (tmp_path / "default").resolve()
+        ops_home = (tmp_path / "profiles" / "ops").resolve()
+        job_id = "same-id"
+
+        def save_claimed(home, owner):
+            with jobs.use_cron_store(home):
+                jobs.save_jobs(
+                    [
+                        {
+                            "id": job_id,
+                            "name": "manual run",
+                            "prompt": "work",
+                            "schedule": {"kind": "interval", "minutes": 60},
+                            "enabled": True,
+                            "state": "scheduled",
+                            "run_claim": {
+                                "at": "2026-08-11T00:00:00+00:00",
+                                "by": owner,
+                            },
+                        }
+                    ]
+                )
+
+        save_claimed(default_home, "default-owner")
+        save_claimed(ops_home, "ops-owner")
+
+        ops_token = set_hermes_home_override(ops_home)
+        try:
+            assert sched.try_register_running_job(
+                job_id,
+                profile_scoped=True,
+                attempt_owner="ops-owner",
+            )
+        finally:
+            reset_hermes_home_override(ops_token)
+
+        default_token = set_hermes_home_override(default_home)
+        try:
+            marked = sched.mark_running_jobs_interrupted("gateway shutdown")
+        finally:
+            reset_hermes_home_override(default_token)
+
+        assert marked == [job_id]
+        with jobs.use_cron_store(default_home):
+            default_job = jobs.get_job(job_id)
+        with jobs.use_cron_store(ops_home):
+            ops_job = jobs.get_job(job_id)
+
+        assert default_job["run_claim"]["by"] == "default-owner"
+        assert default_job.get("last_status") is None
+        assert ops_job["run_claim"] is None
+        assert ops_job["last_status"] == "error"
+        assert ops_job["last_error"] == "gateway shutdown"
 
 
 class TestIsInterrupted:

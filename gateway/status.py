@@ -311,8 +311,9 @@ def _get_process_start_time(pid: int) -> Optional[int]:
         pass
 
     # No /proc (macOS / Windows): psutil is a hard dependency and exposes a
-    # cross-platform creation time.  Quantize to centiseconds so repeated reads
-    # of the same process compare equal without float-precision fragility.
+    # cross-platform creation time.  Keep this persisted gateway-record format
+    # unchanged for rolling compatibility; see get_stable_process_start_time()
+    # for new coordination records that need a cross-interpreter fingerprint.
     try:
         import psutil  # type: ignore
         return int(round(psutil.Process(pid).create_time() * 100))
@@ -323,6 +324,34 @@ def _get_process_start_time(pid: int) -> Optional[int]:
 def get_process_start_time(pid: int) -> Optional[int]:
     """Public wrapper for retrieving a process start time when available."""
     return _get_process_start_time(pid)
+
+
+def get_stable_process_start_time(pid: int) -> Optional[int]:
+    """Return a host-stable fingerprint for new coordination records.
+
+    macOS psutil 7.2 adjusts public ``create_time()`` using an interpreter-local
+    boot-time baseline, so NTP corrections can make the same live PID differ by
+    seconds between Gateway and Desktop. Prefer the raw platform monotonic value
+    for new leases/ledgers, while leaving legacy gateway PID records on their
+    existing unversioned format during rolling upgrades.
+    """
+    stat_path = Path(f"/proc/{pid}/stat")
+    try:
+        return int(stat_path.read_text(encoding="utf-8").split()[21])
+    except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
+        pass
+
+    try:
+        import psutil  # type: ignore
+
+        process = psutil.Process(pid)
+        try:
+            created_at = process._proc.create_time(monotonic=True)
+        except (AttributeError, TypeError):
+            created_at = process.create_time()
+        return int(round(created_at * 100))
+    except Exception:
+        return None
 
 
 def _read_process_cmdline(pid: int) -> Optional[str]:
@@ -686,24 +715,19 @@ def _running_pid_cache_signature(
 
 
 def _cleanup_invalid_pid_path(pid_path: Path, *, cleanup_stale: bool) -> None:
-    """Delete a stale gateway PID file (and its sibling lock metadata).
+    """Delete stale PID metadata without unlinking the runtime lock inode.
 
     Called from ``get_running_pid()`` after the runtime lock has already been
-    confirmed inactive, so the on-disk metadata is known to belong to a dead
-    process.  Unlike ``remove_pid_file()`` (which defensively refuses to delete
-    a PID file whose ``pid`` field differs from ``os.getpid()`` to protect
-    ``--replace`` handoffs), this path force-unlinks both files so the next
-    startup sees a clean slate.
+    observed inactive. That observation cannot make a later pathname unlink
+    safe: another starter can acquire the same inode immediately after the
+    probe. Keep ``gateway.lock`` permanently as a reusable coordination inode;
+    the eventual lock winner rewrites its contents through the held handle.
     """
     if not cleanup_stale:
         return
     _clear_running_pid_cache()
     try:
         pid_path.unlink(missing_ok=True)
-    except Exception:
-        pass
-    try:
-        _get_gateway_lock_path(pid_path).unlink(missing_ok=True)
     except Exception:
         pass
 
@@ -880,19 +904,11 @@ def acquire_gateway_runtime_lock() -> bool:
     try:
         handle = open(path, "a+", encoding="utf-8")
     except PermissionError:
-        # Stale root-owned lock file from a previous launchd Background
-        # session that ran as root (same failure mode handled in
-        # is_gateway_runtime_lock_active).  The parent directory owner can
-        # unlink files even when they don't own them, so remove the stale
-        # lock and retry once with a fresh file.
-        try:
-            path.unlink()
-        except OSError:
-            return False
-        try:
-            handle = open(path, "a+", encoding="utf-8")
-        except OSError:
-            return False
+        # We cannot prove whether a root-owned inode is actively flocked.
+        # Unlinking it would let two processes hold locks on different inodes.
+        # Fail closed and require the operator/service manager to repair owner
+        # permissions after stopping the prior Gateway.
+        return False
     if not _try_acquire_file_lock(handle):
         handle.close()
         return False
@@ -930,15 +946,9 @@ def is_gateway_runtime_lock_active(lock_path: Optional[Path] = None) -> bool:
     try:
         handle = open(resolved_lock_path, "a+", encoding="utf-8")
     except PermissionError:
-        # Stale root-owned lock file from a previous launchd Background
-        # session that ran as root.  The parent directory owner can unlink
-        # files even when they don't own them, so remove the stale lock
-        # and report inactive — the new process will create a fresh one.
-        try:
-            resolved_lock_path.unlink()
-        except OSError:
-            pass
-        return False
+        # Inability to open is not proof that no process holds this inode.
+        # Treat it as active; unlinking an unknown flock pathname is unsafe.
+        return True
     try:
         if _try_acquire_file_lock(handle):
             _release_file_lock(handle)
@@ -2200,12 +2210,33 @@ def get_running_pid(
         recorded_start = record.get("start_time")
         current_start = _get_process_start_time(pid)
         if recorded_start is not None and current_start is not None and current_start != recorded_start:
+            # Legacy macOS psutil timestamps can drift between interpreters.
+            # The actively-held flock proves some process owns this runtime;
+            # when the recorded PID is alive and its *live, readable* command
+            # line still identifies a Gateway for this profile, treat it as the
+            # predecessor. This lets --replace terminate it safely while never
+            # unlinking the active lock pathname. An unreadable command line
+            # remains ambiguous and fails closed.
+            live_cmdline = _read_process_cmdline(pid)
+            if (
+                sys.platform == "darwin"
+                and abs(current_start - recorded_start) <= 500
+                and live_cmdline
+                and looks_like_gateway_runtime_command_line(live_cmdline)
+                and _command_line_belongs_to_profile(
+                    live_cmdline, resolved_pid_path.parent
+                )
+            ):
+                return pid
             continue
 
         if _record_matches_live_gateway_pid(record, pid):
             return pid
 
-    _cleanup_invalid_pid_path(resolved_pid_path, cleanup_stale=cleanup_stale)
+    # The runtime lock is actively flocked. Even when its metadata is malformed
+    # or uses an older start-time format, never unlink the pathname: flock stays
+    # attached to the old inode, and a replacement could otherwise create and
+    # lock a new inode while the original Gateway is still alive.
     if pid_path is None:
         runtime_pid = get_runtime_status_running_pid()
         if runtime_pid is not None:

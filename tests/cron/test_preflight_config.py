@@ -108,6 +108,50 @@ def _run_job_patched(job, tmp_path, *, resolve=None, skill_view=None):
 
 
 class TestMissingProviderKeyBlocks:
+    def test_claimed_preflight_marker_uses_exact_attempt_owner(self, tmp_path):
+        job = _job(
+            run_claim={
+                "at": "2026-01-01T00:00:00+00:00",
+                "by": "attempt-a",
+            }
+        )
+        with patch(
+            "cron.jobs.mark_preflight_alerted", return_value=False
+        ) as mark_alerted:
+            success, _out, _final, error, _agent = _run_job_patched(
+                job, tmp_path, resolve=_AuthErrorFactory()
+            )
+
+        assert success is False
+        assert "blocked_config" in error
+        mark_alerted.assert_called_once_with(
+            job["id"], expected_run_claim_owner="attempt-a"
+        )
+
+    def test_claimed_preflight_clear_uses_exact_attempt_owner(self, tmp_path):
+        job = _job(
+            model="test-model",
+            preflight_alerted=True,
+            run_claim={
+                "at": "2026-01-01T00:00:00+00:00",
+                "by": "attempt-a",
+            },
+        )
+        with patch(
+            "cron.jobs.clear_preflight_alerted", return_value=True
+        ) as clear_alerted, patch(
+            "cron.scheduler.heartbeat_run_claim", return_value=True
+        ):
+            success, _out, _final, error, _agent = _run_job_patched(
+                job, tmp_path
+            )
+
+        assert success is True
+        assert error is None
+        clear_alerted.assert_called_once_with(
+            job["id"], expected_run_claim_owner="attempt-a"
+        )
+
     def test_missing_key_blocked_config_no_agent(self, tmp_path):
         """Missing provider key (AuthError, no fallback chain) → blocked_config,
         agent never constructed, no LLM run burned."""
@@ -129,7 +173,7 @@ class TestMissingProviderKeyBlocks:
         job = _job()
         deliveries = []
 
-        def fake_deliver(job, content, adapters=None, loop=None):
+        def fake_deliver(job, content, adapters=None, loop=None, **_kwargs):
             deliveries.append(content)
             return None
 
@@ -233,7 +277,7 @@ class TestOptOut:
         job = _job()
         deliveries = []
 
-        def fake_deliver(job, content, adapters=None, loop=None):
+        def fake_deliver(job, content, adapters=None, loop=None, **_kwargs):
             deliveries.append(content)
             return None
 

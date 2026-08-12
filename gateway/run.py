@@ -40,6 +40,7 @@ import sys
 import signal
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -27460,6 +27461,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         acquire_gateway_runtime_lock,
         get_running_pid,
         get_process_start_time,
+        get_stable_process_start_time,
         release_gateway_runtime_lock,
         remove_pid_file,
         terminate_pid,
@@ -27982,6 +27984,26 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         cron_start_kwargs["can_dispatch"] = lambda: not (
             runner._draining or runner._external_drain_active
         )
+        # Published by the provider thread only after Gateway startup reaches
+        # the cron-running boundary. Desktop uses the profile-local lease to
+        # yield dispatch without confusing another profile's Gateway (and a
+        # multiplex Gateway publishes this owner into every served profile).
+        gateway_pid = os.getpid()
+        gateway_started_at = get_stable_process_start_time(gateway_pid)
+        if gateway_started_at is None:
+            # A lease without a stable PID-reuse guard cannot be reclaimed
+            # safely after a crash. Fail closed: leave the lease absent so a
+            # profile-local Desktop ticker can retain ownership, and keep this
+            # Gateway ticker from dispatching concurrently.
+            logger.error(
+                "Gateway cron ticker disabled: stable process fingerprint "
+                "is unavailable"
+            )
+            cron_start_kwargs["can_dispatch"] = lambda: False
+        else:
+            cron_start_kwargs["gateway_owner_id"] = (
+                f"p{gateway_pid}-s{gateway_started_at}-{uuid.uuid4().hex}"
+            )
     cron_thread = threading.Thread(
         target=cron_provider.start,
         args=(cron_stop,),

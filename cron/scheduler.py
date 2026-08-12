@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -34,14 +35,14 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
 # the module) fail with ModuleNotFoundError for hermes_time et al.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_process_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import (
     _expand_env_vars,
@@ -290,8 +291,21 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.jobs import (
+    _oneshot_run_claim_ttl_seconds,
+    advance_next_runs,
+    claim_dispatch,
+    get_due_jobs,
+    heartbeat_run_claim,
+    mark_job_run,
+    release_run_claim,
+    save_job_output,
+)
+from cron.executions import (
+    create_execution,
+    finish_execution,
+    mark_execution_running,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -334,6 +348,7 @@ def _is_cron_silence_response(text: str) -> bool:
 _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
+_running_run_claim_owners: dict[str, str] = {}
 _running_lock = threading.Lock()
 
 # Job IDs the gateway shutdown path force-killed the tool subprocess of
@@ -344,6 +359,7 @@ _running_lock = threading.Lock()
 # plausible-looking final response from truncated output — can never
 # overwrite the interrupted status with a false "ok" (#60432).
 _interrupted_job_ids: set = set()
+_interrupted_run_claim_owners: dict[str, Optional[str]] = {}
 
 
 def get_running_job_ids() -> "frozenset[str]":
@@ -362,10 +378,39 @@ def get_running_job_ids() -> "frozenset[str]":
     blind to them (#60432).
     """
     with _running_lock:
-        return frozenset(_running_job_ids)
+        return frozenset(
+            str(running_key).rsplit("\0", 1)[-1]
+            for running_key in _running_job_ids
+        )
 
 
-def try_register_running_job(job_id: str) -> bool:
+def _running_job_key(job_id: str, *, profile_scoped: bool) -> str:
+    """Return the legacy bare ID or the active profile's in-flight key."""
+    if not profile_scoped:
+        return job_id
+    return f"{_get_hermes_home().resolve()}\0{job_id}"
+
+
+def is_running_job(job_id: str, *, profile_scoped: bool = False) -> bool:
+    """Whether ``job_id`` is registered in the requested profile scope.
+
+    A legacy bare registration has no recoverable profile identity, so it
+    conservatively blocks a scoped lookup. Scoped registrations from another
+    profile do not: identical job IDs are valid in independent cron stores.
+    """
+    running_key = _running_job_key(job_id, profile_scoped=profile_scoped)
+    with _running_lock:
+        return running_key in _running_job_ids or (
+            profile_scoped and job_id in _running_job_ids
+        )
+
+
+def try_register_running_job(
+    job_id: str,
+    *,
+    profile_scoped: bool = False,
+    attempt_owner: Optional[str] = None,
+) -> bool:
     """Atomically add ``job_id`` to the in-flight running set.
 
     Returns False (without registering) when the job is already mid-run —
@@ -380,18 +425,46 @@ def try_register_running_job(job_id: str) -> bool:
     gateway shutdown drain, #60432) and ``mark_running_jobs_interrupted``.
     Callers MUST pair a successful registration with
     ``release_running_job`` in a ``finally`` block.
+
+    ``profile_scoped=False`` preserves the historical bare-ID API for older
+    callers and tests. Manual/background attempts pass ``profile_scoped=True``
+    plus their immutable claim owner so shutdown can target the correct cron
+    store and make an exact-owner terminal write.
     """
+    running_key = _running_job_key(job_id, profile_scoped=profile_scoped)
     with _running_lock:
-        if job_id in _running_job_ids:
+        if running_key in _running_job_ids or (
+            profile_scoped and job_id in _running_job_ids
+        ):
             return False
-        _running_job_ids.add(job_id)
+        _running_job_ids.add(running_key)
+        if attempt_owner:
+            _running_run_claim_owners[running_key] = attempt_owner
         return True
 
 
-def release_running_job(job_id: str) -> None:
-    """Remove ``job_id`` from the in-flight running set (idempotent)."""
+def release_running_job(
+    job_id: str,
+    *,
+    profile_scoped: bool = False,
+    attempt_owner: Optional[str] = None,
+) -> bool:
+    """Remove an in-flight registration, optionally fencing by owner.
+
+    Legacy bare-ID calls remain idempotent. Scoped manual/background callers
+    provide ``attempt_owner`` so a stale attempt cannot discard its successor's
+    in-process registration.
+    """
+    running_key = _running_job_key(job_id, profile_scoped=profile_scoped)
     with _running_lock:
-        _running_job_ids.discard(job_id)
+        if attempt_owner is not None and (
+            _running_run_claim_owners.get(running_key) != attempt_owner
+        ):
+            return False
+        existed = running_key in _running_job_ids
+        _running_job_ids.discard(running_key)
+        _running_run_claim_owners.pop(running_key, None)
+        return existed
 
 
 def mark_running_jobs_interrupted(reason: str) -> list:
@@ -419,19 +492,80 @@ def mark_running_jobs_interrupted(reason: str) -> list:
     Returns the list of job IDs marked, for the caller to log.
     """
     with _running_lock:
-        job_ids = list(_running_job_ids)
-        _interrupted_job_ids.update(job_ids)
+        attempts = []
+        for running_key in _running_job_ids:
+            key_text = str(running_key)
+            if "\0" in key_text:
+                profile_home, job_id = key_text.rsplit("\0", 1)
+            else:
+                profile_home, job_id = None, key_text
+            attempts.append(
+                (
+                    key_text,
+                    profile_home,
+                    job_id,
+                    _running_run_claim_owners.get(key_text),
+                )
+            )
+        _interrupted_job_ids.update(
+            interrupt_key
+            for interrupt_key, _home, _job_id, _owner in attempts
+        )
+        _interrupted_run_claim_owners.update(
+            {
+                interrupt_key: owner
+                for interrupt_key, _home, _job_id, owner in attempts
+            }
+        )
     marked = []
-    for job_id in job_ids:
+    for _interrupt_key, profile_home, job_id, claim_owner in attempts:
         try:
-            mark_job_run(job_id, False, reason)
-            marked.append(job_id)
+            mark_kwargs = (
+                {"expected_run_claim_owner": claim_owner}
+                if claim_owner
+                else {}
+            )
+            if profile_home is None:
+                marked_result = mark_job_run(
+                    job_id, False, reason, **mark_kwargs
+                )
+            else:
+                from cron.jobs import use_cron_store
+                from hermes_constants import (
+                    reset_hermes_home_override,
+                    set_hermes_home_override,
+                )
+
+                home_token = set_hermes_home_override(profile_home)
+                try:
+                    with use_cron_store(Path(profile_home)):
+                        marked_result = mark_job_run(
+                            job_id, False, reason, **mark_kwargs
+                        )
+                finally:
+                    reset_hermes_home_override(home_token)
+            # Legacy/mocked mark_job_run returned None on success. Only an
+            # explicit False means the attempt token lost its CAS.
+            if marked_result is not False:
+                marked.append(job_id)
+            else:
+                with _running_lock:
+                    if (
+                        _interrupted_run_claim_owners.get(_interrupt_key)
+                        == claim_owner
+                    ):
+                        _interrupted_job_ids.discard(_interrupt_key)
+                        _interrupted_run_claim_owners.pop(
+                            _interrupt_key, None
+                        )
         except Exception as e:
             logger.warning("Failed to mark job %s interrupted: %s", job_id, e)
     return marked
 
 
-def _is_interrupted(job_id: str) -> bool:
+def _is_interrupted(
+    job_id: str, *, expected_run_claim_owner: Optional[str] = None
+) -> bool:
     """Non-destructive peek at whether the shutdown path has marked
     ``job_id`` interrupted (see ``mark_running_jobs_interrupted``).
 
@@ -443,10 +577,23 @@ def _is_interrupted(job_id: str) -> bool:
     flag: the later, authoritative check (right before ``last_status`` is
     written) still needs to see it."""
     with _running_lock:
-        return job_id in _interrupted_job_ids
+        scoped_key = f"{_get_hermes_home().resolve()}\0{job_id}"
+        for key in (scoped_key, job_id):
+            if key not in _interrupted_job_ids:
+                continue
+            flagged_owner = _interrupted_run_claim_owners.get(key)
+            if (
+                expected_run_claim_owner is None
+                or flagged_owner is None
+                or flagged_owner == expected_run_claim_owner
+            ):
+                return True
+        return False
 
 
-def _consume_interrupted_flag(job_id: str) -> bool:
+def _consume_interrupted_flag(
+    job_id: str, *, expected_run_claim_owner: Optional[str] = None
+) -> bool:
     """Return True and clear the flag if the shutdown path already marked
     ``job_id`` interrupted (see ``mark_running_jobs_interrupted``).
 
@@ -455,8 +602,19 @@ def _consume_interrupted_flag(job_id: str) -> bool:
     the flag from leaking across a later, unrelated run of the same job ID
     (recurring jobs reuse their ID every fire)."""
     with _running_lock:
-        if job_id in _interrupted_job_ids:
-            _interrupted_job_ids.discard(job_id)
+        scoped_key = f"{_get_hermes_home().resolve()}\0{job_id}"
+        for key in (scoped_key, job_id):
+            if key not in _interrupted_job_ids:
+                continue
+            flagged_owner = _interrupted_run_claim_owners.get(key)
+            if (
+                expected_run_claim_owner is not None
+                and flagged_owner is not None
+                and flagged_owner != expected_run_claim_owner
+            ):
+                continue
+            _interrupted_job_ids.discard(key)
+            _interrupted_run_claim_owners.pop(key, None)
             return True
         return False
 
@@ -1178,16 +1336,35 @@ def _resolve_home_env_var(platform_name: str) -> str:
     return _plugin_cron_env_var(name)
 
 
+def _profile_scoped_env(name: str) -> str:
+    """Read profile-local dotenv data when a secret scope is active.
+
+    Multiplex workers share ``os.environ``; it can only represent the process
+    profile.  ``build_profile_secret_scope`` snapshots each selected profile's
+    dotenv values, so delivery routing must use that scope before falling back
+    to the legacy single-profile process environment.
+    """
+    try:
+        from agent.secret_scope import current_secret_scope, get_secret
+
+        if current_secret_scope() is not None:
+            return str(get_secret(name) or "")
+    except Exception:
+        logger.debug("Failed to read profile-scoped value %s", name, exc_info=True)
+        return ""
+    return os.getenv(name, "")
+
+
 def _get_home_target_chat_id(platform_name: str) -> str:
     """Return the configured home target chat/room ID for a delivery platform."""
     env_var = _resolve_home_env_var(platform_name)
     if not env_var:
         return ""
-    value = os.getenv(env_var, "")
+    value = _profile_scoped_env(env_var)
     if not value:
         legacy = _LEGACY_HOME_TARGET_ENV_VARS.get(env_var)
         if legacy:
-            value = os.getenv(legacy, "")
+            value = _profile_scoped_env(legacy)
     return value
 
 
@@ -1206,14 +1383,14 @@ def _get_home_target_thread_id(platform_name: str) -> Optional[str]:
     if not env_var:
         return None
     if platform_name.lower() == "telegram":
-        cron_thread = os.getenv("TELEGRAM_CRON_THREAD_ID", "").strip()
+        cron_thread = _profile_scoped_env("TELEGRAM_CRON_THREAD_ID").strip()
         if cron_thread:
             return cron_thread
-    value = os.getenv(f"{env_var}_THREAD_ID", "").strip()
+    value = _profile_scoped_env(f"{env_var}_THREAD_ID").strip()
     if not value:
         legacy = _LEGACY_HOME_TARGET_ENV_VARS.get(env_var)
         if legacy:
-            value = os.getenv(f"{legacy}_THREAD_ID", "").strip()
+            value = _profile_scoped_env(f"{legacy}_THREAD_ID").strip()
     return value or None
 
 
@@ -1477,6 +1654,7 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
+    ownership_guard: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
@@ -1491,6 +1669,8 @@ def _send_media_via_adapter(
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
     for media_path, _is_voice in media_files:
+        if ownership_guard is not None and not ownership_guard():
+            return
         try:
             ext = Path(media_path).suffix.lower()
             route_platform = platform if platform is not None else getattr(adapter, "platform", None)
@@ -1602,7 +1782,15 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    *,
+    claim_ownership_lost: Optional[threading.Event] = None,
+    expected_run_claim_owner: Optional[str] = None,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1613,6 +1801,32 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     Returns None on success, or an error string on failure.
     """
+    ownership_error = "Run claim ownership was lost during delivery."
+
+    def _delivery_owned(phase: str) -> bool:
+        if claim_ownership_lost is not None and claim_ownership_lost.is_set():
+            return False
+        if expected_run_claim_owner is None:
+            return True
+        try:
+            owned = heartbeat_run_claim(
+                job["id"], expected_owner=expected_run_claim_owner
+            )
+        except Exception:
+            owned = False
+            logger.warning(
+                "Job '%s': could not verify run claim before delivery phase %s",
+                job.get("id"),
+                phase,
+                exc_info=True,
+            )
+        if not owned and claim_ownership_lost is not None:
+            claim_ownership_lost.set()
+        return owned
+
+    if not _delivery_owned("target resolution"):
+        return ownership_error
+
     targets = _resolve_delivery_targets(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
@@ -1690,6 +1904,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     delivery_errors = []
 
     for target in targets:
+        if not _delivery_owned("target"):
+            return ownership_error
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
@@ -1862,6 +2078,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             and loop is not None
             and not thread_id  # never override an explicit origin thread/topic
         ):
+            if not _delivery_owned("continuation thread creation"):
+                return ownership_error
             new_thread_id = _open_continuable_cron_thread(
                 job, runtime_adapter, chat_id, loop,
             )
@@ -1900,7 +2118,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             )
             route_via_dm_topic = is_ambiguous_telegram_topic and _is_channel_dm_topic(
                 runtime_adapter, chat_id, loop, job["id"],
-            )
+            ) if _delivery_owned("Telegram topic probe") else False
+            if not _delivery_owned("post-topic-probe"):
+                return ownership_error
             if route_via_dm_topic:
                 # Genuine Bot API channel Direct-Messages topic (#22773 mode 2):
                 # routed via direct_messages_topic_id, no bare thread_id.
@@ -1939,6 +2159,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 adapter_ok = True
                 timed_out = False
                 if text_to_send:
+                    if not _delivery_owned("live text send"):
+                        return ownership_error
                     from agent.async_utils import safe_schedule_threadsafe
 
                     router = DeliveryRouter(config, adapters)
@@ -2084,7 +2306,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # payload is already assumed delivered (#38922).  Record the
                 # skipped attachments so the drop is visible rather than silently
                 # lost.
+                if not _delivery_owned("post-live-send"):
+                    return ownership_error
                 if adapter_ok and not timed_out and media_files:
+                    if not _delivery_owned("live media send"):
+                        return ownership_error
                     routed_media_metadata = dict(media_metadata or {})
                     if transport is not None and transport.is_relay:
                         routed_media_metadata["_relay_logical_platform"] = platform.value
@@ -2102,6 +2328,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         loop,
                         job,
                         platform=platform,
+                        ownership_guard=lambda: _delivery_owned(
+                            "live media item"
+                        ),
                     )
                 elif timed_out and media_files:
                     msg = (
@@ -2117,6 +2346,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     # Seed the thread session only now that delivery into it
                     # succeeded (deferred from thread-open above).
                     if opened_thread_id and not thread_seeded:
+                        if not _delivery_owned("thread session seed"):
+                            return ownership_error
                         _seed_cron_thread_session(
                             job, runtime_adapter, platform_name, chat_id,
                             opened_thread_id, mirror_text,
@@ -2128,12 +2359,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     # session — the flat row is otherwise absent for a
                     # chat_postMessage delivery, so the brief would be lost).
                     if in_channel_surface and mirror_this_target and not thread_seeded:
+                        if not _delivery_owned("channel session seed"):
+                            return ownership_error
                         inchannel_seeded = _seed_cron_channel_session(
                             job, runtime_adapter, platform_name, chat_id,
                             mirror_text, is_dm=is_dm_target,
                             user_id=origin_user_id,
                             chat_name=origin.get("chat_name"),
                         )
+                    if not _delivery_owned("live delivery mirror"):
+                        return ownership_error
                     _maybe_mirror_cron_delivery(
                         job, platform_name, chat_id, mirror_text,
                         thread_id=thread_id, user_id=origin_user_id,
@@ -2152,6 +2387,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     )
 
         if not delivered:
+            if not _delivery_owned("standalone fallback"):
+                return ownership_error
             if transport is not None and transport.is_relay:
                 # Relay owns the logical destination and its connector owns the
                 # platform credential. A native retry could duplicate delivery
@@ -2175,7 +2412,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            if not _delivery_owned("standalone send"):
+                return ownership_error
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                cleaned_delivery_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                ownership_guard=lambda: _delivery_owned("standalone item"),
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -2204,7 +2451,24 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        if not _delivery_owned("standalone thread submit"):
+                            return ownership_error
+                        delivery_context = contextvars.copy_context()
+                        future = pool.submit(
+                            delivery_context.run,
+                            asyncio.run,
+                            _send_to_platform(
+                                platform,
+                                pconfig,
+                                chat_id,
+                                cleaned_delivery_content,
+                                thread_id=thread_id,
+                                media_files=media_files,
+                                ownership_guard=lambda: _delivery_owned(
+                                    "standalone thread item"
+                                ),
+                            ),
+                        )
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
@@ -2229,6 +2493,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
 
+            if not _delivery_owned("post-standalone send"):
+                return ownership_error
             if result and result.get("error"):
                 # Include target context (platform/chat) so a bare error string
                 # like "Discord send failed: TimeoutError: " is attributable.
@@ -2240,6 +2506,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
 
+            if not _delivery_owned("standalone delivery mirror"):
+                return ownership_error
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
             _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, mirror_text,
@@ -2256,6 +2524,99 @@ _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 _RUN_CLAIM_HEARTBEAT_SECONDS = 60.0
+_RUN_CLAIM_SELF_FENCE_FRACTION = 0.75
+
+
+def _run_claim_self_fence_seconds() -> float:
+    """Stop an unverifiable worker before a peer may reclaim its token."""
+    return max(
+        0.001,
+        _oneshot_run_claim_ttl_seconds() * _RUN_CLAIM_SELF_FENCE_FRACTION,
+    )
+
+
+def _run_claim_owner(job: dict) -> str:
+    claim = job.get("run_claim")
+    return str(claim.get("by") or "") if isinstance(claim, dict) else ""
+
+
+def _start_run_claim_heartbeat(
+    job: dict,
+    *,
+    thread_name: str,
+    ownership_lost: Optional[threading.Event] = None,
+) -> tuple[threading.Event, threading.Event, threading.Thread] | None:
+    """Start a profile-scoped heartbeat for one immutable attempt token.
+
+    The builtin scheduler starts this before executor submission, so the claim
+    remains live while a job waits in a persistent pool as well as while its
+    worker runs. Direct/external paths also retain their inner script/agent
+    heartbeats because they do not pass through that pool.
+    """
+    owner = _run_claim_owner(job)
+    if not owner:
+        return None
+
+    job_id = str(job.get("id") or "")
+    ownership_lost = ownership_lost or threading.Event()
+    if ownership_lost.is_set():
+        raise RuntimeError("run was cancelled before claim heartbeat startup")
+    if not heartbeat_run_claim(job_id, expected_owner=owner):
+        raise RuntimeError("run claim is no longer owned by this attempt")
+
+    stop = threading.Event()
+    heartbeat_context = contextvars.copy_context()
+
+    def _heartbeat_loop() -> None:
+        last_success = time.monotonic()
+        while not stop.wait(_RUN_CLAIM_HEARTBEAT_SECONDS):
+            try:
+                if not heartbeat_run_claim(job_id, expected_owner=owner):
+                    ownership_lost.set()
+                    return
+                last_success = time.monotonic()
+            except Exception:
+                logger.debug(
+                    "Job '%s': transient run_claim heartbeat failure; retrying",
+                    job_id,
+                    exc_info=True,
+                )
+                # Store availability errors do not prove that a successor owns
+                # the attempt. Keep retrying: while the store is unavailable a
+                # peer cannot safely claim either, and a definite later CAS
+                # mismatch will set ownership_lost.
+                if (
+                    time.monotonic() - last_success
+                    >= _run_claim_self_fence_seconds()
+                ):
+                    logger.error(
+                        "Job '%s': run claim could not be renewed before "
+                        "the self-fence deadline; cancelling stale attempt",
+                        job_id,
+                    )
+                    ownership_lost.set()
+                    return
+                continue
+
+    heartbeat_thread = threading.Thread(
+        target=heartbeat_context.run,
+        args=(_heartbeat_loop,),
+        name=thread_name,
+        daemon=True,
+    )
+    heartbeat_thread.start()
+    return stop, ownership_lost, heartbeat_thread
+
+
+def _stop_run_claim_heartbeat(
+    heartbeat: tuple[threading.Event, threading.Event, threading.Thread] | None,
+) -> None:
+    if heartbeat is None:
+        return
+    stop, _ownership_lost, thread = heartbeat
+    stop.set()
+    if thread is not threading.current_thread():
+        thread.join(timeout=1.0)
 
 
 def _get_script_timeout() -> int:
@@ -2349,9 +2710,80 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
+class _CronScriptClaimLost(RuntimeError):
+    """Raised after terminating a script whose immutable attempt was replaced."""
+
+
+def _terminate_cron_script_process(proc: subprocess.Popen) -> None:
+    """Best-effort terminate the script's isolated process tree."""
+    if sys.platform == "win32":
+        try:
+            from gateway.status import terminate_pid
+
+            terminate_pid(proc.pid, force=True)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=2.0)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        return
+
+    # Cancellable scripts are spawned in a fresh POSIX session, whose process
+    # group ID is the leader PID. Signal the group so a shell script cannot
+    # leave grandchildren running after its scheduler attempt loses ownership.
+    pgid = proc.pid
+    killpg = getattr(os, "killpg", None)
+    if killpg is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return
+    sigterm = getattr(signal, "SIGTERM", 15)
+    sigkill = getattr(signal, "SIGKILL", sigterm)
+    try:
+        killpg(pgid, sigterm)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline:
+        try:
+            killpg(pgid, 0)
+        except ProcessLookupError:
+            break
+        except (PermissionError, OSError):
+            break
+        try:
+            proc.poll()
+        except Exception:
+            pass
+        time.sleep(0.02)
+    else:
+        try:
+            killpg(pgid, sigkill)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    try:
+        proc.wait(timeout=1.0)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -2384,6 +2816,9 @@ def _run_job_script(
             mutated, avoiding the global-side-effect bug where a cron
             job's ``os.chdir()`` leaks into concurrent gateway sessions
             (#69396).
+        cancel_event: When set, terminate the isolated script process group
+            before returning. Claimed cron attempts use this to fence stale
+            scripts after a successor replaces their immutable run token.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -2468,15 +2903,64 @@ def _run_job_script(
         # NEVER mutate the Python process cwd — that would leak into
         # concurrent gateway sessions (#69396).
         _script_cwd = workdir or str(path.parent)
-        result = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=script_timeout,
-            cwd=_script_cwd,
-            env=env,
-            **popen_kwargs,
-        )
+        if cancel_event is None:
+            # Preserve the historical direct helper behavior and its platform
+            # decoding contract. Claimed runs always take the cancellable path
+            # below via _run_job_script_with_claim_heartbeat.
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=script_timeout,
+                cwd=_script_cwd,
+                env=env,
+                **popen_kwargs,
+            )
+        else:
+            if cancel_event.is_set():
+                raise _CronScriptClaimLost(
+                    "Run claim ownership was lost before script execution."
+                )
+            cancellable_kwargs = dict(popen_kwargs)
+            if sys.platform == "win32":
+                cancellable_kwargs["creationflags"] = (
+                    int(cancellable_kwargs.get("creationflags", 0))
+                    | int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+                )
+            else:
+                cancellable_kwargs["start_new_session"] = True
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                cwd=_script_cwd,
+                env=env,
+                **cancellable_kwargs,
+            )
+            deadline = time.monotonic() + script_timeout
+            while True:
+                if cancel_event.is_set():
+                    _terminate_cron_script_process(proc)
+                    raise _CronScriptClaimLost(
+                        "Run claim ownership was lost during script execution."
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _terminate_cron_script_process(proc)
+                    raise subprocess.TimeoutExpired(argv, script_timeout)
+                try:
+                    stdout, stderr = proc.communicate(timeout=min(0.1, remaining))
+                    result = subprocess.CompletedProcess(
+                        argv,
+                        proc.returncode,
+                        stdout=stdout,
+                        stderr=stderr,
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
 
@@ -2502,49 +2986,72 @@ def _run_job_script(
 
     except subprocess.TimeoutExpired:
         return False, f"Script timed out after {script_timeout}s: {path}"
+    except _CronScriptClaimLost as exc:
+        return False, str(exc)
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
 
 
 def _run_job_script_with_claim_heartbeat(
-    job: dict, script_path: str, workdir: Optional[str] = None,
+    job: dict,
+    script_path: str,
+    workdir: Optional[str] = None,
+    claim_ownership_lost: Optional[threading.Event] = None,
 ) -> tuple[bool, str]:
-    """Run a cron script while keeping its owned one-shot claim fresh.
+    """Run a cron script while keeping its durable run claim fresh.
 
     Script execution is synchronous and may legitimately outlive the stale
     claim TTL.  Without a concurrent heartbeat, another scheduler process can
-    mistake the live run for a dead owner and dispatch the same one-shot again.
-    Recurring jobs and unclaimed/manual runs have no durable one-shot claim and
-    therefore use the ordinary script path without starting a thread.
+    mistake the live run for a dead owner and dispatch the same job again.
+    Unclaimed/manual runs use the ordinary script path without a heartbeat.
 
     The claim owner is captured from the dispatched job and never re-read from
     storage.  ``heartbeat_run_claim`` compares that stable owner before every
     refresh, so a stale runner cannot extend a replacement owner's claim.
     """
-    schedule = job.get("schedule")
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
-    if not (
-        isinstance(schedule, dict)
-        and schedule.get("kind") == "once"
-        and owner
-    ):
+    if not owner:
         return _run_job_script(script_path, workdir=workdir)
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
+    has_outer_heartbeat = claim_ownership_lost is not None
+    ownership_lost = claim_ownership_lost or threading.Event()
     heartbeat_context = contextvars.copy_context()
 
+    try:
+        if not heartbeat_run_claim(job_id, expected_owner=owner):
+            ownership_lost.set()
+            return False, "Run claim ownership was lost before script execution."
+    except Exception:
+        return False, "Run claim ownership could not be verified before script execution."
+
     def _heartbeat_loop() -> None:
+        last_success = time.monotonic()
         while not stop.wait(_RUN_CLAIM_HEARTBEAT_SECONDS):
             try:
-                heartbeat_run_claim(job_id, expected_owner=owner)
+                if not heartbeat_run_claim(job_id, expected_owner=owner):
+                    ownership_lost.set()
+                    return
+                last_success = time.monotonic()
             except Exception:
                 logger.debug(
-                    "Job '%s': script run_claim heartbeat failed",
+                    "Job '%s': transient script run_claim heartbeat failure; retrying",
                     job_id,
                     exc_info=True,
                 )
+                if (
+                    time.monotonic() - last_success
+                    >= _run_claim_self_fence_seconds()
+                ):
+                    logger.error(
+                        "Job '%s': script claim could not be renewed before "
+                        "the self-fence deadline; terminating script",
+                        job_id,
+                    )
+                    ownership_lost.set()
+                    return
 
     heartbeat_thread = threading.Thread(
         target=heartbeat_context.run,
@@ -2560,10 +3067,30 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir)
+        if not has_outer_heartbeat:
+            return False, (
+                "Run claim heartbeat could not start; refusing to execute "
+                "an unfenced script."
+            )
+        # run_one_job's lifecycle heartbeat still owns this shared loss Event.
+        # Keep the process cancellable by that outer fence.
+        return _run_job_script(
+            script_path,
+            workdir=workdir,
+            cancel_event=ownership_lost,
+        )
 
     try:
-        return _run_job_script(script_path, workdir=workdir)
+        if ownership_lost.is_set():
+            return False, "Run claim ownership was lost before script execution."
+        result = _run_job_script(
+            script_path,
+            workdir=workdir,
+            cancel_event=ownership_lost,
+        )
+        if ownership_lost.is_set():
+            return False, "Run claim ownership was lost during script execution."
+        return result
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -3166,8 +3693,11 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
 
 
 def run_job(
-    job: dict, *, defer_agent_teardown: Optional[list] = None,
+    job: dict,
+    *,
+    defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
+    claim_ownership_lost: Optional[threading.Event] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -3191,6 +3721,11 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    claim_ownership_lost = claim_ownership_lost or threading.Event()
+
+    if claim_ownership_lost.is_set():
+        error = "Run claim ownership was lost before job execution."
+        return False, "", "", error
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -3221,7 +3756,14 @@ def run_job(
         try:
             from hermes_cli.env_loader import load_hermes_dotenv
 
-            load_hermes_dotenv(hermes_home=_get_hermes_home())
+            if _get_hermes_home().resolve() == get_process_hermes_home().resolve():
+                load_hermes_dotenv(hermes_home=_get_hermes_home())
+            else:
+                logger.debug(
+                    "Job '%s': secondary profile no_agent run uses scoped "
+                    "delivery config; skipping process env reload",
+                    job_id,
+                )
         except Exception:
             logger.debug(
                 "Job '%s': no_agent .env reload failed", job_id, exc_info=True
@@ -3247,7 +3789,10 @@ def run_job(
 
         try:
             ok, output = _run_job_script_with_claim_heartbeat(
-                job, script_path, workdir=_job_workdir,
+                job,
+                script_path,
+                workdir=_job_workdir,
+                claim_ownership_lost=claim_ownership_lost,
             )
         except Exception as exc:
             logger.exception(
@@ -3321,7 +3866,10 @@ def run_job(
 
     _monitor_context: Optional[str] = None
     if job_has_monitor(job):
-        _mon = check_monitor(job)
+        _mon = check_monitor(
+            job,
+            claim_ownership_lost=claim_ownership_lost,
+        )
         _mon_now = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
         if not _mon.ok:
             # Source failure is an ERROR, never a change: alert the user so
@@ -3423,7 +3971,13 @@ def run_job(
         if _session_db_timeout > 0:
             _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             try:
-                _session_db = _session_db_pool.submit(SessionDB).result(timeout=_session_db_timeout)
+                # Pass the path explicitly: ContextVars do not automatically
+                # cross ThreadPoolExecutor boundaries, and SessionDB() would
+                # otherwise fall back to the process/default profile state.db.
+                _session_db = _session_db_pool.submit(
+                    SessionDB,
+                    db_path=_get_hermes_home() / "state.db",
+                ).result(timeout=_session_db_timeout)
             finally:
                 # Don't wait for a wedged connect() to unwind — abandon the
                 # worker thread (same pattern as the agent inactivity timeout
@@ -3431,7 +3985,7 @@ def run_job(
                 _session_db_pool.shutdown(wait=False)
         else:
             # 0 = unlimited (legacy behavior, opt-in for debugging)
-            _session_db = SessionDB()
+            _session_db = SessionDB(db_path=_get_hermes_home() / "state.db")
     except concurrent.futures.TimeoutError:
         logger.error(
             "Job '%s': SessionDB init did not return within %.0fs — proceeding "
@@ -3449,8 +4003,14 @@ def run_job(
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script_with_claim_heartbeat(job, script_path)
+        prerun_script = _run_job_script_with_claim_heartbeat(
+            job,
+            script_path,
+            claim_ownership_lost=claim_ownership_lost,
+        )
         _ran_ok, _script_output = prerun_script
+        if claim_ownership_lost.is_set():
+            return False, "", "", "Run claim ownership was lost during pre-run script."
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
@@ -3672,8 +4232,18 @@ def run_job(
             load_hermes_dotenv,
             reset_secret_source_cache,
         )
-        reset_secret_source_cache()
-        load_hermes_dotenv(hermes_home=_get_hermes_home())
+        if _get_hermes_home().resolve() == get_process_hermes_home().resolve():
+            reset_secret_source_cache()
+            load_hermes_dotenv(hermes_home=_get_hermes_home())
+        else:
+            # A multiplex/profile override is context-local but os.environ is
+            # process-global. Loading a secondary .env here would overwrite the
+            # primary profile for concurrent chat/cron workers. Credentials and
+            # delivery routing resolve from the active ProfileSecretScope.
+            logger.debug(
+                "Job '%s': using profile secret scope; skipping process env reload",
+                job_id,
+            )
 
         delivery_target = _resolve_delivery_target(job)
         if delivery_target:
@@ -3839,7 +4409,21 @@ def run_job(
                     # marker so a FUTURE config break re-alerts.
                     try:
                         from cron.jobs import clear_preflight_alerted
-                        clear_preflight_alerted(job_id)
+                        cleared = clear_preflight_alerted(
+                            job_id,
+                            expected_run_claim_owner=(
+                                _run_claim_owner(job) or None
+                            ),
+                        )
+                        if _run_claim_owner(job) and cleared is None:
+                            claim_ownership_lost.set()
+                            return (
+                                False,
+                                "",
+                                "",
+                                "Run claim ownership was lost while clearing "
+                                "preflight state.",
+                            )
                     except Exception:
                         pass
         except Exception:
@@ -3859,7 +4443,19 @@ def run_job(
             already_alerted = False
             try:
                 from cron.jobs import mark_preflight_alerted
-                already_alerted = mark_preflight_alerted(job_id)
+                already_alerted = mark_preflight_alerted(
+                    job_id,
+                    expected_run_claim_owner=(_run_claim_owner(job) or None),
+                )
+                if _run_claim_owner(job) and already_alerted is None:
+                    claim_ownership_lost.set()
+                    return (
+                        False,
+                        "",
+                        "",
+                        "Run claim ownership was lost while recording "
+                        "preflight state.",
+                    )
             except Exception:
                 logger.debug(
                     "Job '%s': could not persist preflight alert marker",
@@ -4124,36 +4720,85 @@ def run_job(
         _cron_timeout = _cron_inactivity_seconds()
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
         _POLL_INTERVAL = 5.0
-        # Keep the one-shot run_claim fresh while the run is alive (#62002):
+        # Keep the durable run_claim fresh while the run is alive (#62002):
         # the claim TTL is a dead-owner detector, but without a heartbeat a
         # run that legitimately outlives it (stream stall, laptop asleep
         # mid-run) is indistinguishable from a dead tick — another process
         # re-dispatches it and get_due_jobs stale-removes the job record out
         # from under the live run. Refreshing the claim from this monitor
         # keeps "expired claim" meaning "owner died".
-        _job_schedule = job.get("schedule")
-        _is_oneshot = (
-            isinstance(_job_schedule, dict) and _job_schedule.get("kind") == "once"
-        )
         _run_claim = job.get("run_claim")
-        _run_claim_owner = (
+        _active_run_claim_owner = (
             str(_run_claim.get("by") or "") if isinstance(_run_claim, dict) else ""
         )
         _last_claim_heartbeat = time.monotonic()
+        _last_claim_success = _last_claim_heartbeat
 
         def _heartbeat_run_claim_if_due():
-            nonlocal _last_claim_heartbeat
-            if not _is_oneshot or not _run_claim_owner:
+            nonlocal _last_claim_heartbeat, _last_claim_success
+            if not _active_run_claim_owner:
                 return
             _mono = time.monotonic()
             if _mono - _last_claim_heartbeat < _RUN_CLAIM_HEARTBEAT_SECONDS:
                 return
             _last_claim_heartbeat = _mono
             try:
-                heartbeat_run_claim(job_id, expected_owner=_run_claim_owner)
+                if not heartbeat_run_claim(
+                    job_id, expected_owner=_active_run_claim_owner
+                ):
+                    claim_ownership_lost.set()
+                else:
+                    _last_claim_success = time.monotonic()
             except Exception:
                 logger.debug(
-                    "Job '%s': run_claim heartbeat failed", job_name, exc_info=True
+                    "Job '%s': transient run_claim heartbeat failure; retrying",
+                    job_name,
+                    exc_info=True,
+                )
+                if (
+                    time.monotonic() - _last_claim_success
+                    >= _run_claim_self_fence_seconds()
+                ):
+                    claim_ownership_lost.set()
+
+        def _interrupt_if_claim_lost() -> bool:
+            if not claim_ownership_lost.is_set():
+                return False
+            if hasattr(agent, "interrupt"):
+                try:
+                    agent.interrupt("Cron run claim ownership was lost")
+                except Exception:
+                    logger.debug(
+                        "Job '%s': failed to interrupt stale attempt",
+                        job_name,
+                        exc_info=True,
+                    )
+            return True
+
+        # Construction can load plugins/MCP transports and SessionDB setup can
+        # take seconds. Revalidate at the last boundary before the paid agent
+        # call/tool loop is submitted; a successor that replaced the token
+        # during setup must prevent this stale attempt from starting.
+        if _active_run_claim_owner:
+            try:
+                still_owned = (
+                    not claim_ownership_lost.is_set()
+                    and heartbeat_run_claim(
+                        job_id, expected_owner=_active_run_claim_owner
+                    )
+                )
+            except Exception:
+                still_owned = False
+                logger.warning(
+                    "Job '%s': could not verify run claim before agent submit",
+                    job_id,
+                    exc_info=True,
+                )
+            if not still_owned:
+                claim_ownership_lost.set()
+                raise RuntimeError(
+                    "Run claim ownership was lost before agent execution; "
+                    "the API/tool loop was not started."
                 )
 
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -4166,17 +4811,24 @@ def run_job(
         _audit_t_start = time.monotonic()
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
         _inactivity_timeout = False
+        _claim_lost_during_run = False
         try:
             if _cron_inactivity_limit is None:
-                # Unlimited — no inactivity watchdog, but a one-shot still
-                # needs its run_claim heartbeat, so poll instead of blocking.
-                if _is_oneshot:
+                # Unlimited — no inactivity watchdog, but a claimed run still
+                # needs its heartbeat, so poll instead of blocking.
+                if _active_run_claim_owner:
                     result = None
                     while True:
+                        if _interrupt_if_claim_lost():
+                            _claim_lost_during_run = True
+                            break
                         done, _ = concurrent.futures.wait(
                             {_cron_future}, timeout=_POLL_INTERVAL,
                         )
                         if done:
+                            if _interrupt_if_claim_lost():
+                                _claim_lost_during_run = True
+                                break
                             result = _cron_future.result()
                             break
                         _heartbeat_run_claim_if_due()
@@ -4185,13 +4837,22 @@ def run_job(
             else:
                 result = None
                 while True:
+                    if _interrupt_if_claim_lost():
+                        _claim_lost_during_run = True
+                        break
                     done, _ = concurrent.futures.wait(
                         {_cron_future}, timeout=_POLL_INTERVAL,
                     )
                     if done:
+                        if _interrupt_if_claim_lost():
+                            _claim_lost_during_run = True
+                            break
                         result = _cron_future.result()
                         break
                     _heartbeat_run_claim_if_due()
+                    if _interrupt_if_claim_lost():
+                        _claim_lost_during_run = True
+                        break
                     # Agent still running — check inactivity.
                     _idle_secs = 0.0
                     if hasattr(agent, "get_activity_summary"):
@@ -4208,6 +4869,12 @@ def run_job(
             raise
         finally:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
+
+        if _claim_lost_during_run:
+            raise RuntimeError(
+                "Run claim ownership was lost during agent execution; "
+                "stale attempt was interrupted."
+            )
 
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.
@@ -4537,8 +5204,87 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
 
 
 def run_one_job(
-    job: dict, *, adapters=None, loop=None, verbose: bool = False,
+    job: dict,
+    *,
+    adapters=None,
+    loop=None,
+    verbose: bool = False,
     extra_prompt: Optional[str] = None,
+    _attempt_outcome: Optional[dict] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> bool:
+    """Fence one claimed attempt before executing any job side effect.
+
+    ``cancel_event`` lets an owning dispatch surface cancel the same script /
+    agent rail used for durable run-claim loss.  The immutable claim token
+    remains the authority for terminal writes; the event only stops work.
+    """
+    heartbeat = None
+    expected_owner = _run_claim_owner(job)
+    if expected_owner:
+        try:
+            heartbeat = _start_run_claim_heartbeat(
+                job,
+                thread_name="cron-attempt-claim-heartbeat",
+                ownership_lost=cancel_event,
+            )
+        except Exception as exc:
+            _consume_interrupted_flag(
+                job["id"], expected_run_claim_owner=expected_owner
+            )
+            try:
+                release_run_claim(
+                    job["id"], expected_owner=expected_owner
+                )
+            except Exception:
+                logger.debug(
+                    "Job '%s': could not release lost pre-run claim",
+                    job.get("id"),
+                    exc_info=True,
+                )
+            execution_id = job.get("execution_id")
+            if not execution_id:
+                execution_id = create_execution(
+                    job["id"], source="direct"
+                )["id"]
+            finish_execution(
+                execution_id,
+                success=False,
+                error=f"Run claim ownership lost before execution: {exc}",
+            )
+            logger.warning(
+                "Job '%s' not executed because attempt %r no longer owns "
+                "its run claim",
+                job.get("name", job.get("id")),
+                expected_owner,
+            )
+            return False
+    try:
+        claim_ownership_lost = (
+            heartbeat[1] if heartbeat is not None else cancel_event
+        )
+        return _run_one_job_body(
+            job,
+            adapters=adapters,
+            loop=loop,
+            verbose=verbose,
+            extra_prompt=extra_prompt,
+            claim_ownership_lost=claim_ownership_lost,
+            attempt_outcome=_attempt_outcome,
+        )
+    finally:
+        _stop_run_claim_heartbeat(heartbeat)
+
+
+def _run_one_job_body(
+    job: dict,
+    *,
+    adapters=None,
+    loop=None,
+    verbose: bool = False,
+    extra_prompt: Optional[str] = None,
+    claim_ownership_lost: Optional[threading.Event] = None,
+    attempt_outcome: Optional[dict] = None,
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -4554,9 +5300,30 @@ def run_one_job(
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    expected_run_claim_owner = _run_claim_owner(job) or None
+    if attempt_outcome is not None:
+        attempt_outcome.clear()
+        attempt_outcome.update(
+            success=False,
+            error=None,
+            output_file=None,
+            terminal_recorded=False,
+        )
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+    if claim_ownership_lost is not None and claim_ownership_lost.is_set():
+        _consume_interrupted_flag(
+            job["id"], expected_run_claim_owner=expected_run_claim_owner
+        )
+        finish_execution(
+            execution_id,
+            success=False,
+            error="Run claim ownership was lost before execution.",
+        )
+        return False
+    _scope_token = None
+    _reset_secret_scope = None
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -4565,7 +5332,12 @@ def run_one_job(
         # use advance_next_run) and infinite/no-repeat jobs. This lives here in
         # the shared body so BOTH the built-in ticker and the external provider
         # (Chronos fire_due) get at-most-times semantics.
-        if not claim_dispatch(job["id"]):
+        dispatch_kwargs = (
+            {"expected_run_claim_owner": expected_run_claim_owner}
+            if expected_run_claim_owner
+            else {}
+        )
+        if not claim_dispatch(job["id"], **dispatch_kwargs):
             logger.info(
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]),
@@ -4575,7 +5347,17 @@ def run_one_job(
                 success=False,
                 error="Dispatch claim rejected; execution was not started.",
             )
-            return True  # not an error — already handled/removed
+            if expected_run_claim_owner:
+                _consume_interrupted_flag(
+                    job["id"],
+                    expected_run_claim_owner=expected_run_claim_owner,
+                )
+                if attempt_outcome is not None:
+                    attempt_outcome["error"] = (
+                        "Run claim ownership was lost before dispatch."
+                    )
+                return False
+            return True  # legacy/unclaimed dispatch limit was already handled
 
         # The attempt is claimed durably before executor/provider dispatch and
         # becomes running only immediately before the actual run.
@@ -4597,6 +5379,7 @@ def run_one_job(
         _scope_token = set_secret_scope(
             build_profile_secret_scope(_get_hermes_home())
         )
+        _reset_secret_scope = reset_secret_scope
         # Defer the cron agent's async-resource teardown until AFTER delivery.
         # run_job normally closes the agent (and reaps stale async clients) in
         # its finally block; doing that before _deliver_result runs means the
@@ -4607,8 +5390,10 @@ def run_one_job(
         _deferred_agents: list = []
         try:
             success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents,
+                job,
+                defer_agent_teardown=_deferred_agents,
                 extra_prompt=extra_prompt,
+                claim_ownership_lost=claim_ownership_lost,
             )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
@@ -4619,8 +5404,6 @@ def run_one_job(
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
             raise
-        finally:
-            reset_secret_scope(_scope_token)
 
         # Everything from here through delivery runs with the agent still live
         # (deferred teardown). Wrap it ALL in a try/finally so that if any step
@@ -4631,7 +5414,32 @@ def run_one_job(
         delivery_error = None
         blocked_config = False
         try:
-            output_file = save_job_output(job["id"], output)
+            save_kwargs = (
+                {"expected_run_claim_owner": expected_run_claim_owner}
+                if expected_run_claim_owner
+                else {}
+            )
+            output_file = save_job_output(job["id"], output, **save_kwargs)
+            if expected_run_claim_owner and output_file is None:
+                _consume_interrupted_flag(
+                    job["id"],
+                    expected_run_claim_owner=expected_run_claim_owner,
+                )
+                if attempt_outcome is not None:
+                    attempt_outcome["error"] = (
+                        "Run claim ownership was lost before output publication."
+                    )
+                finish_execution(
+                    execution_id,
+                    success=False,
+                    error=(
+                        "Run claim ownership was lost before output publication; "
+                        "stale output was suppressed."
+                    ),
+                )
+                return False
+            if attempt_outcome is not None and output_file is not None:
+                attempt_outcome["output_file"] = str(output_file)
             if verbose:
                 logger.info("Output saved to: %s", output_file)
 
@@ -4642,11 +5450,42 @@ def run_one_job(
             # "this run was interrupted" summary instead of that response.
             # Peek-only: the flag stays set for the authoritative check
             # right before mark_job_run below.
-            if success and _is_interrupted(job["id"]):
+            if success and _is_interrupted(
+                job["id"],
+                expected_run_claim_owner=expected_run_claim_owner,
+            ):
                 success = False
                 error = (
                     "Interrupted by gateway shutdown before the run finished "
                     "(tool subprocess was killed mid-flight)."
+                )
+
+            attempt_ownership_lost = bool(
+                claim_ownership_lost is not None
+                and claim_ownership_lost.is_set()
+            )
+            if expected_run_claim_owner and not attempt_ownership_lost:
+                try:
+                    attempt_ownership_lost = not heartbeat_run_claim(
+                        job["id"],
+                        expected_owner=expected_run_claim_owner,
+                    )
+                except Exception:
+                    # Delivery is an external side effect. If ownership cannot
+                    # be verified at that boundary, fail closed; the later
+                    # terminal CAS still protects durable job state.
+                    attempt_ownership_lost = True
+                    logger.warning(
+                        "Job '%s': could not verify run claim before delivery; "
+                        "suppressing output",
+                        job["id"],
+                        exc_info=True,
+                    )
+            if attempt_ownership_lost:
+                success = False
+                error = (
+                    "Run claim ownership was lost before delivery; stale "
+                    "attempt output was suppressed."
                 )
 
             # Deliver the final response to the origin/target chat.
@@ -4664,7 +5503,9 @@ def run_one_job(
             blocked_config = blocked_config_silent or (
                 bool(error) and BLOCKED_CONFIG_MARKER in str(error)
             )
-            if blocked_config and not success:
+            if attempt_ownership_lost:
+                deliver_content = ""
+            elif blocked_config and not success:
                 # Blocked-config alert: bypass the generic failure summarizer
                 # (whose auth/timeout heuristics would mislabel this as a
                 # provider runtime failure) — say plainly that config
@@ -4704,7 +5545,24 @@ def run_one_job(
                     and not _resolve_delivery_targets(job)
                 )
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    delivery_error = _deliver_result(
+                        job,
+                        deliver_content,
+                        adapters=adapters,
+                        loop=loop,
+                        claim_ownership_lost=claim_ownership_lost,
+                        expected_run_claim_owner=expected_run_claim_owner,
+                    )
+                    if (
+                        expected_run_claim_owner
+                        and claim_ownership_lost is not None
+                        and claim_ownership_lost.is_set()
+                    ):
+                        success = False
+                        error = (
+                            "Run claim ownership was lost during delivery; "
+                            "later side effects were suppressed."
+                        )
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
@@ -4722,14 +5580,55 @@ def run_one_job(
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-        if not _consume_interrupted_flag(job["id"]):
-            if blocked_config:
-                mark_job_run(
-                    job["id"], success, error, delivery_error=delivery_error,
-                    status="blocked_config",
+        interrupted = _consume_interrupted_flag(
+            job["id"], expected_run_claim_owner=expected_run_claim_owner
+        )
+        terminal_recorded = False
+        if not interrupted:
+            mark_kwargs = (
+                {"expected_run_claim_owner": expected_run_claim_owner}
+                if expected_run_claim_owner
+                else {}
+            )
+            mark_result = mark_job_run(
+                job["id"],
+                success,
+                error,
+                delivery_error=delivery_error,
+                status="blocked_config" if blocked_config else None,
+                **mark_kwargs,
+            )
+            terminal_recorded = not (
+                expected_run_claim_owner and mark_result is False
+            )
+        else:
+            # The shutdown path already wrote this exact attempt's terminal
+            # failure before clearing its run claim.
+            terminal_recorded = True
+            success = False
+            error = (
+                "Interrupted by gateway shutdown before this attempt "
+                "completed."
+            )
+            should_deliver = False
+            delivery_error = None
+        if expected_run_claim_owner and not terminal_recorded:
+            ownership_error = (
+                "Run claim ownership was lost before terminal state commit."
+            )
+            if attempt_outcome is not None:
+                attempt_outcome.update(
+                    success=False,
+                    error=ownership_error,
+                    terminal_recorded=False,
                 )
-            else:
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+            finish_execution(
+                execution_id,
+                success=False,
+                error=ownership_error,
+                delivery_outcome="suppressed",
+            )
+            return False
         normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
         if delivery_error:
             delivery_outcome = "failed"
@@ -4745,6 +5644,12 @@ def run_one_job(
             error=error,
             delivery_outcome=delivery_outcome,
         )
+        if attempt_outcome is not None:
+            attempt_outcome.update(
+                success=bool(success),
+                error=error,
+                terminal_recorded=terminal_recorded,
+            )
         return True
 
     except BaseException as e:  # noqa: BLE001 — deliberate: see below
@@ -4760,8 +5665,23 @@ def run_one_job(
         _err_text = str(e) or type(e).__name__
         logger.error("Error processing job %s: %s", job['id'], _err_text)
         try:
-            if not _consume_interrupted_flag(job["id"]):
-                mark_job_run(job["id"], False, _err_text)
+            interrupted = _consume_interrupted_flag(
+                job["id"], expected_run_claim_owner=expected_run_claim_owner
+            )
+            if not interrupted:
+                mark_kwargs = (
+                    {"expected_run_claim_owner": expected_run_claim_owner}
+                    if expected_run_claim_owner
+                    else {}
+                )
+                mark_result = mark_job_run(
+                    job["id"], False, _err_text, **mark_kwargs
+                )
+                if expected_run_claim_owner and mark_result is False:
+                    _err_text = (
+                        "Run claim ownership was lost before terminal failure "
+                        "could be recorded."
+                    )
         except Exception as record_err:
             # Never let bookkeeping mask the original interruption.
             logger.error(
@@ -4777,7 +5697,12 @@ def run_one_job(
             )
         if not isinstance(e, Exception):
             raise
+        if attempt_outcome is not None:
+            attempt_outcome.update(success=False, error=_err_text)
         return False
+    finally:
+        if _scope_token is not None and _reset_secret_scope is not None:
+            _reset_secret_scope(_scope_token)
 
 
 def _notify_provider_jobs_changed() -> None:
@@ -4884,6 +5809,7 @@ def tick(
             lock_fd.close()
         return 0
 
+    pending_run_claims: dict[str, str] = {}
     try:
         # Global emergency stop (`hermes pause`): skip dispatch entirely while
         # the ESTOP sentinel exists. Never touches in-flight runs — due jobs
@@ -4900,7 +5826,11 @@ def tick(
             logger.debug("Cron dispatch paused while gateway drains existing work")
             return 0
 
-        due_jobs = get_due_jobs()
+        due_jobs = get_due_jobs(claim_recurring=True)
+        for claimed_job in due_jobs:
+            claimed_owner = _run_claim_owner(claimed_job)
+            if claimed_owner:
+                pending_run_claims[claimed_owner] = claimed_job["id"]
 
         if not due_jobs:
             # Idle tick: skip config load + pool partitioning entirely
@@ -4927,7 +5857,12 @@ def tick(
         # bumping next_run_at forward so the grace window never expires.
         # mark_job_run() overwrites next_run_at on completion.
         # Batched: one load + one save for the whole due set, not one per job.
-        advance_next_runs([job["id"] for job in due_jobs])
+        advance_next_runs(
+            {
+                job["id"]: (_run_claim_owner(job) or None)
+                for job in due_jobs
+            }
+        )
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
@@ -4983,6 +5918,25 @@ def tick(
             membership is released in the worker's finally block.
             """
             job_id = job["id"]
+            running_key = f"{_get_hermes_home().resolve()}\0{job_id}"
+            claim_owner = _run_claim_owner(job)
+
+            def _release_unsubmitted_claim() -> None:
+                if not claim_owner:
+                    return
+                try:
+                    release_run_claim(job_id, expected_owner=claim_owner)
+                except Exception:
+                    logger.warning(
+                        "Job '%s': could not release unsubmitted run claim",
+                        job.get("name", job_id),
+                        exc_info=True,
+                    )
+                else:
+                    # Keep the pending entry on transient failure so tick's
+                    # outer finally gets one more exact-owner release attempt.
+                    pending_run_claims.pop(claim_owner, None)
+
             # A tick can race gateway teardown: once the interpreter is
             # finalizing, ``pool.submit`` raises "cannot schedule new futures
             # after interpreter shutdown" and crashes the tick. Skip cleanly —
@@ -4993,31 +5947,134 @@ def tick(
                     "Job '%s' not dispatched — interpreter is shutting down",
                     job.get("name", job_id),
                 )
+                _release_unsubmitted_claim()
                 return None
-            if not try_register_running_job(job_id):
-                logger.info("Job '%s' already running — skipping", job.get("name", job_id))
+            with _running_lock:
+                already_running = (
+                    running_key in _running_job_ids
+                    or job_id in _running_job_ids  # legacy/test injection
+                )
+                if not already_running:
+                    _running_job_ids.add(running_key)
+                    if claim_owner:
+                        _running_run_claim_owners[running_key] = claim_owner
+            if already_running:
+                logger.info(
+                    "Job '%s' already running — skipping",
+                    job.get("name", job_id),
+                )
+                _release_unsubmitted_claim()
                 return None
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
-            execution = create_execution(job_id, source="builtin")
+            try:
+                execution = create_execution(job_id, source="builtin")
+            except Exception:
+                with _running_lock:
+                    _running_job_ids.discard(running_key)
+                    _running_run_claim_owners.pop(running_key, None)
+                _release_unsubmitted_claim()
+                raise
             dispatched_job = dict(job, execution_id=execution["id"])
             _ctx = contextvars.copy_context()
+            try:
+                queue_heartbeat = _start_run_claim_heartbeat(
+                    dispatched_job,
+                    thread_name="cron-queued-claim-heartbeat",
+                )
+            except Exception as heartbeat_err:
+                with _running_lock:
+                    _running_job_ids.discard(running_key)
+                    _running_run_claim_owners.pop(running_key, None)
+                finish_execution(
+                    execution["id"],
+                    success=False,
+                    error=f"Run-claim heartbeat startup failed: {heartbeat_err}",
+                )
+                logger.error(
+                    "Job '%s' not dispatched because its durable claim "
+                    "heartbeat could not start: %s",
+                    job.get("name", job_id),
+                    heartbeat_err,
+                )
+                _release_unsubmitted_claim()
+                return None
 
-            def _run_and_release(j=dispatched_job, ctx=_ctx):
+            def _run_and_release(
+                j=dispatched_job,
+                ctx=_ctx,
+                heartbeat=queue_heartbeat,
+                key=running_key,
+            ):
                 try:
-                    return ctx.run(_process_job, j)
+                    def _run_if_owned() -> bool:
+                        if heartbeat is not None:
+                            _stop, ownership_lost, _thread = heartbeat
+                            owner = _run_claim_owner(j)
+                            claim_error = None
+                            try:
+                                owned = (
+                                    not ownership_lost.is_set()
+                                    and heartbeat_run_claim(
+                                        j["id"], expected_owner=owner
+                                    )
+                                )
+                            except Exception as exc:
+                                owned = False
+                                claim_error = exc
+                            if not owned:
+                                _consume_interrupted_flag(
+                                    j["id"],
+                                    expected_run_claim_owner=owner or None,
+                                )
+                                try:
+                                    release_run_claim(
+                                        j["id"], expected_owner=owner
+                                    )
+                                except Exception:
+                                    logger.warning(
+                                        "Job '%s': failed to release unverifiable "
+                                        "queued claim",
+                                        j["id"],
+                                        exc_info=True,
+                                    )
+                                detail = (
+                                    f" ({claim_error})" if claim_error else ""
+                                )
+                                finish_execution(
+                                    j["execution_id"],
+                                    success=False,
+                                    error=(
+                                        "Run claim ownership lost while queued; "
+                                        f"execution was not started{detail}."
+                                    ),
+                                )
+                                return False
+                        return _process_job(j)
+
+                    return ctx.run(_run_if_owned)
                 finally:
-                    release_running_job(j["id"])
+                    _stop_run_claim_heartbeat(heartbeat)
+                    with _running_lock:
+                        _running_job_ids.discard(key)
+                        _running_run_claim_owners.pop(key, None)
 
             try:
-                return pool.submit(_run_and_release)
+                future = pool.submit(_run_and_release)
+                if claim_owner:
+                    pending_run_claims.pop(claim_owner, None)
+                return future
             except Exception as submit_err:
-                release_running_job(job_id)
+                _stop_run_claim_heartbeat(queue_heartbeat)
+                with _running_lock:
+                    _running_job_ids.discard(running_key)
+                    _running_run_claim_owners.pop(running_key, None)
                 finish_execution(
                     execution["id"],
                     success=False,
                     error=f"Executor dispatch failed: {submit_err}",
                 )
+                _release_unsubmitted_claim()
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.
                 if isinstance(submit_err, RuntimeError) and _interpreter_shutting_down(submit_err):
@@ -5113,6 +6170,19 @@ def tick(
 
         return sum(_results)
     finally:
+        for pending_owner, pending_job_id in list(pending_run_claims.items()):
+            try:
+                release_run_claim(
+                    pending_job_id,
+                    expected_owner=pending_owner,
+                )
+            except Exception:
+                logger.warning(
+                    "Job '%s': could not release claim after tick aborted "
+                    "before executor submission",
+                    pending_job_id,
+                    exc_info=True,
+                )
         if fcntl:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)

@@ -1,10 +1,13 @@
 """Tests for cron/scheduler.py — origin resolution, delivery routing, and error logging."""
 
 import contextlib
+import asyncio
+import concurrent.futures
 import itertools
 import json
 import logging
 import os
+import threading
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -104,6 +107,44 @@ class TestResolveOrigin:
         """
         job = {"origin": non_dict_origin}
         assert _resolve_origin(job) is None
+
+
+class TestProfileScopedHomeRouting:
+    def test_two_concurrent_profiles_resolve_their_own_home_and_thread(
+        self, tmp_path, monkeypatch
+    ):
+        from agent import secret_scope as ss
+        import cron.scheduler as scheduler
+
+        homes = [tmp_path / "alpha", tmp_path / "beta"]
+        expected = [("alpha-chat", "11"), ("beta-chat", "22")]
+        for home, (chat_id, thread_id) in zip(homes, expected):
+            home.mkdir()
+            (home / ".env").write_text(
+                f"TELEGRAM_HOME_CHANNEL={chat_id}\n"
+                f"TELEGRAM_HOME_CHANNEL_THREAD_ID={thread_id}\n",
+                encoding="utf-8",
+            )
+
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "process-chat")
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL_THREAD_ID", "999")
+        barrier = threading.Barrier(2)
+
+        def resolve(home):
+            token = ss.set_secret_scope(ss.build_profile_secret_scope(home))
+            try:
+                barrier.wait(timeout=2)
+                return (
+                    scheduler._get_home_target_chat_id("telegram"),
+                    scheduler._get_home_target_thread_id("telegram"),
+                )
+            finally:
+                ss.reset_secret_scope(token)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            actual = list(pool.map(resolve, homes))
+
+        assert actual == expected
 
 
 class TestResolveDeliveryTarget:
@@ -418,6 +459,153 @@ class TestDeliverResultWrapping:
         voice_call = adapter.send_voice.call_args
         assert voice_call[1]["audio_path"] == str(media_path)
 
+    def test_claim_loss_during_first_target_stops_media_mirror_and_fanout(
+        self, monkeypatch
+    ):
+        """An in-flight send is irreversible, but no later side effect may start."""
+        from gateway.config import Platform
+
+        lost = threading.Event()
+        scheduled = []
+        media_calls = []
+        mirror_calls = []
+        pconfig = MagicMock(enabled=True, extra={})
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
+        adapter = MagicMock()
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        class _ResultFuture:
+            def result(self, timeout=None):
+                lost.set()
+                return MagicMock(success=True, raw_response=None)
+
+        def fake_schedule(coro, _loop):
+            coro.close()
+            scheduled.append(True)
+            return _ResultFuture()
+
+        targets = [
+            {"platform": "discord", "chat_id": "first"},
+            {"platform": "discord", "chat_id": "second"},
+        ]
+        with patch("cron.scheduler._resolve_delivery_targets", return_value=targets), \
+             patch("cron.scheduler._resolve_origin", return_value={}), \
+             patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("gateway.delivery.resolve_delivery_transport") as resolve_transport, \
+             patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_schedule), \
+             patch("gateway.platforms.base.BasePlatformAdapter.extract_media",
+                   return_value=(["/tmp/media"], "text")), \
+             patch("gateway.platforms.base.BasePlatformAdapter.filter_media_delivery_paths",
+                   return_value=["/tmp/media"]), \
+             patch("cron.scheduler._send_media_via_adapter",
+                   side_effect=lambda *_a, **_kw: media_calls.append(True)), \
+             patch("cron.scheduler._maybe_mirror_cron_delivery",
+                   side_effect=lambda *_a, **_kw: mirror_calls.append(True)), \
+             patch("cron.scheduler.heartbeat_run_claim", return_value=True):
+            resolve_transport.return_value = MagicMock(
+                config=pconfig, adapter=adapter, is_relay=False
+            )
+            result = _deliver_result(
+                {"id": "loss-fanout", "deliver": "discord"},
+                "text\nMEDIA:/tmp/media",
+                adapters={Platform.DISCORD: adapter},
+                loop=loop,
+                claim_ownership_lost=lost,
+                expected_run_claim_owner="attempt-a",
+            )
+
+        assert result is not None
+        assert "ownership" in result.lower()
+        assert scheduled == [True]
+        assert media_calls == []
+        assert mirror_calls == []
+
+    def test_standalone_sender_gets_guard_for_internal_fanout(self):
+        """The standalone transport must re-check ownership between API calls."""
+        from gateway.config import Platform
+
+        lost = threading.Event()
+        calls = []
+        pconfig = MagicMock(enabled=True, extra={})
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
+
+        async def standalone_send(*_args, ownership_guard=None, **_kwargs):
+            assert ownership_guard is not None
+            assert ownership_guard()
+            calls.append("first")
+            lost.set()
+            if ownership_guard():
+                calls.append("second")
+            return {"error": "Delivery ownership lost during standalone send"}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send), \
+             patch("cron.scheduler.heartbeat_run_claim", return_value=True):
+            result = _deliver_result(
+                {
+                    "id": "standalone-loss",
+                    "deliver": "origin",
+                    "origin": {"platform": "discord", "chat_id": "first"},
+                },
+                "scheduled result",
+                claim_ownership_lost=lost,
+                expected_run_claim_owner="attempt-a",
+            )
+
+        assert calls == ["first"]
+        assert result is not None
+        assert "ownership" in result.lower()
+
+    def test_standalone_thread_fallback_copies_secret_scope(
+        self, tmp_path, monkeypatch
+    ):
+        """The RuntimeError fallback must keep the secondary profile context."""
+        from agent import secret_scope as ss
+        from gateway.config import Platform
+
+        (tmp_path / ".env").write_text(
+            "OPENROUTER_BASE_URL=https://secondary.invalid/v1\n",
+            encoding="utf-8",
+        )
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        observed = []
+
+        async def fake_send(*_args, **_kwargs):
+            observed.append(
+                (ss.current_secret_scope(), ss.get_secret("OPENROUTER_BASE_URL"))
+            )
+            return {"success": True}
+
+        async def invoke_inside_running_loop():
+            return _deliver_result(
+                {
+                    "id": "secondary-fallback",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                },
+                "hello",
+            )
+
+        scope_token = ss.set_secret_scope(ss.build_profile_secret_scope(tmp_path))
+        try:
+            with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+                 patch("tools.send_message_tool._send_to_platform",
+                       side_effect=fake_send):
+                result = asyncio.run(invoke_inside_running_loop())
+        finally:
+            ss.reset_secret_scope(scope_token)
+
+        assert result is None
+        assert len(observed) == 1
+        assert observed[0][0] is not None
+        assert observed[0][1] == "https://secondary.invalid/v1"
+
 
 class TestDeliverResultErrorReturns:
     """Verify _deliver_result returns error strings on failure, None on success."""
@@ -442,6 +630,78 @@ class TestDeliverResultErrorReturns:
 
 
 class TestRunJobSessionPersistence:
+    def test_run_job_interrupts_agent_after_definite_claim_loss(
+        self, tmp_path, monkeypatch
+    ):
+        """A successor CAS stops a live stale agent before it can deliver."""
+        import cron.scheduler as scheduler
+
+        claim_lost = threading.Event()
+        agent_started = threading.Event()
+        agent_interrupted = threading.Event()
+        interrupt_reasons = []
+        fake_db = MagicMock()
+        agent = MagicMock()
+
+        def run_conversation(_prompt):
+            agent_started.set()
+            agent_interrupted.wait(timeout=2)
+            return {"final_response": "stale output"}
+
+        def interrupt(reason):
+            interrupt_reasons.append(reason)
+            agent_interrupted.set()
+
+        agent.run_conversation.side_effect = run_conversation
+        agent.interrupt.side_effect = interrupt
+        agent.get_activity_summary.return_value = {
+            "seconds_since_activity": 0.0,
+            "last_activity_desc": "test",
+            "current_tool": None,
+            "api_call_count": 1,
+            "max_iterations": 60,
+        }
+
+        real_wait = concurrent.futures.wait
+        monkeypatch.setattr(
+            scheduler.concurrent.futures,
+            "wait",
+            lambda futures, timeout=None: real_wait(futures, timeout=0.01),
+        )
+
+        def lose_claim_after_agent_starts():
+            assert agent_started.wait(timeout=2)
+            claim_lost.set()
+
+        loss_thread = threading.Thread(target=lose_claim_after_agent_starts)
+        loss_thread.start()
+        with (
+            patch("cron.scheduler._hermes_home", tmp_path),
+            patch("cron.scheduler._resolve_origin", return_value=None),
+            patch("hermes_cli.env_loader.load_hermes_dotenv"),
+            patch("hermes_cli.env_loader.reset_secret_source_cache"),
+            patch("hermes_state.SessionDB", return_value=fake_db),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "test-key",
+                    "base_url": "https://example.invalid/v1",
+                    "provider": "openrouter",
+                    "api_mode": "chat_completions",
+                },
+            ),
+            patch("run_agent.AIAgent", return_value=agent),
+        ):
+            success, _output, _response, error = run_job(
+                {"id": "lost-live-claim", "name": "test", "prompt": "hello"},
+                claim_ownership_lost=claim_lost,
+            )
+        loss_thread.join(timeout=2)
+
+        assert success is False
+        assert "ownership was lost" in (error or "").lower()
+        assert interrupt_reasons == ["Cron run claim ownership was lost"]
+
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
         job = {
             "id": "test-job",
@@ -1007,6 +1267,7 @@ class TestSilentDelivery:
             False,
             "Agent completed but produced empty response (model error, timeout, or misconfiguration)",
             delivery_error=None,
+            status=None,
         )
 
 
@@ -1268,7 +1529,7 @@ class TestParallelTick:
         barrier = threading.Barrier(2, timeout=5)
         call_order = []
 
-        def mock_run_job(job, *, defer_agent_teardown=None, **kw):
+        def mock_run_job(job, *, defer_agent_teardown=None, **_kwargs):
             """Each job hits a barrier — both must be active simultaneously."""
             call_order.append(("start", job["id"]))
             barrier.wait()  # blocks until both threads reach here
@@ -1302,7 +1563,7 @@ class TestParallelTick:
         from gateway.session_context import get_session_env
         seen = {}
 
-        def mock_run_job(job, *, defer_agent_teardown=None, **kw):
+        def mock_run_job(job, *, defer_agent_teardown=None, **_kwargs):
             origin = job.get("origin", {})
             # run_job sets ContextVars — verify each job sees its own
             from gateway.session_context import set_session_vars, clear_session_vars
@@ -1974,5 +2235,3 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-
-

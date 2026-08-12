@@ -4460,6 +4460,7 @@ class MessageSender:
         chat_id: str,
         message: str,
         media_files: Optional[List[Tuple[str, bool]]] = None,
+        ownership_guard=None,
     ) -> Dict[str, Any]:
         """Send text + media via Yuanbao (used by the ``send_message`` tool).
 
@@ -4471,14 +4472,31 @@ class MessageSender:
         adapter = self._adapter
         last_result: Optional["SendResult"] = None
 
+        def _owned() -> bool:
+            if ownership_guard is None:
+                return True
+            try:
+                return bool(ownership_guard())
+            except Exception:
+                logger.exception("Yuanbao standalone delivery ownership guard failed")
+                return False
+
+        ownership_error = {
+            "error": "Delivery ownership lost during standalone send"
+        }
+
         # 1. Send text
         if message.strip():
+            if not _owned():
+                return ownership_error
             last_result = await adapter.send(chat_id, message)
             if not last_result.success:
                 return {"error": f"Yuanbao send failed: {last_result.error}"}
 
         # 2. Iterate media_files, dispatch by file extension
         for media_path, _is_voice in media_files or []:
+            if not _owned():
+                return ownership_error
             ext = Path(media_path).suffix.lower()
             if ext in self.IMAGE_EXTS:
                 last_result = await adapter.send_image_file(chat_id, media_path)
@@ -4818,9 +4836,15 @@ class OutboundManager:
     async def send_direct(
         self, chat_id: str, message: str,
         media_files: Optional[List[Tuple[str, bool]]] = None,
+        ownership_guard=None,
     ) -> Dict[str, Any]:
         """Send text + media (used by send_message tool)."""
-        return await self.sender.send_direct(chat_id, message, media_files)
+        return await self.sender.send_direct(
+            chat_id,
+            message,
+            media_files,
+            ownership_guard=ownership_guard,
+        )
 
     async def start_typing(self, chat_id: str) -> None:
         """Start reply heartbeat (RUNNING)."""
@@ -5293,6 +5317,12 @@ async def send_yuanbao_direct(
     chat_id: str,
     message: str,
     media_files: Optional[List[Tuple[str, bool]]] = None,
+    ownership_guard=None,
 ) -> Dict[str, Any]:
     """Delegate to ``OutboundManager.send_direct``."""
-    return await adapter._outbound.send_direct(chat_id, message, media_files)
+    return await adapter._outbound.send_direct(
+        chat_id,
+        message,
+        media_files,
+        ownership_guard=ownership_guard,
+    )
