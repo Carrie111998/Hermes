@@ -1357,6 +1357,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 await adapter_self._dispatch_discord_message(message)
 
             @self._client.event
+            async def on_message_edit(before: DiscordMessage, after: DiscordMessage):
+                # Delegate to an adapter method so the routing rules are
+                # unit-testable without driving a real Discord client.
+                await adapter_self._handle_message_edit(before, after)
+
+            @self._client.event
             async def on_voice_state_update(member, before, after):
                 """Track voice channel join/leave events."""
                 # Only track channels where the bot is connected
@@ -1434,14 +1440,23 @@ class DiscordAdapter(BasePlatformAdapter):
         message: Any,
         *,
         claim: bool,
+        skip_id_dedup: bool = False,
     ) -> tuple[bool, bool]:
-        """Return ``(admitted, role_authorized)`` for one Discord event."""
+        """Return ``(admitted, role_authorized)`` for one Discord event.
+
+        ``skip_id_dedup`` bypasses the message-id dedup entirely. It exists for
+        ``MESSAGE_UPDATE``: an edit reuses the original ``message.id``, which
+        the first dispatch already claimed, so both the claiming and the
+        non-claiming branch would reject every edit. Callers that set it are
+        responsible for their own replay protection.
+        """
         message_id = str(getattr(message, "id", ""))
-        if claim:
-            if self._dedup.is_duplicate(message_id):
+        if not skip_id_dedup:
+            if claim:
+                if self._dedup.is_duplicate(message_id):
+                    return False, False
+            elif self._dedup.contains(message_id):
                 return False, False
-        elif self._dedup.contains(message_id):
-            return False, False
         if message.author == self._client.user:
             return False, False
         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
@@ -1502,6 +1517,69 @@ class DiscordAdapter(BasePlatformAdapter):
                     return False, False
 
         return True, role_authorized
+
+    async def _handle_message_edit(self, before: Any, after: Any) -> bool:
+        """Route a ``MESSAGE_UPDATE`` that newly addresses the bot.
+
+        Discord fires this for every edit, including the ones it generates
+        itself when it resolves a link preview. An edit is treated as a new
+        user turn only when the text actually changed *and* the edit newly
+        addresses us: not mentioned in ``before``, mentioned in ``after``.
+        Without that delta a typo fix on a message we already answered would
+        produce a second reply.
+
+        The same rule is why free-response channels, bot threads and
+        ``DISCORD_REQUIRE_MENTION=false`` need no special case here: in those
+        contexts the original message was already answered, so its edit is a
+        correction to a finished turn rather than a new one. Superseding an
+        answered turn is tracked separately in #63566.
+
+        DMs are the one exception, and deliberately so: every DM is addressed
+        to us, so there is no "newly addressed" transition to detect and any
+        genuine content change is taken as a new turn.
+        """
+        if not self._ready_event.is_set():
+            try:
+                await asyncio.wait_for(self._ready_event.wait(), timeout=30.0)
+            except asyncio.TimeoutError:
+                pass
+
+        # Discord reuses MESSAGE_UPDATE to attach link-preview embeds; those
+        # carry the original content and are not a user edit.
+        if before.content == after.content:
+            return False
+
+        # Without a timestamp every edit of this message collapses onto one
+        # dedup key, so a later genuine edit would be swallowed as a replay.
+        if not after.edited_at:
+            return False
+
+        # Author, message type, allow-list, bot policy and role authorization
+        # are exactly the inbound gates. Only the id dedup has to be skipped:
+        # the original dispatch already claimed this id, so both dedup branches
+        # would reject the edit.
+        admitted, role_authorized = self._discord_message_admission(
+            after, claim=False, skip_id_dedup=True,
+        )
+        if not admitted:
+            return False
+
+        if not isinstance(after.channel, discord.DMChannel):
+            # Use the same mention test as admission, so the two gates cannot
+            # disagree: the resolved mentions list OR a raw <@ID> / <@!ID>
+            # token in the content.
+            if self._self_is_explicitly_mentioned(before):
+                return False
+            if not self._self_is_explicitly_mentioned(after):
+                return False
+
+        # Edits share message.id with the original, so key replay protection on
+        # the edit timestamp instead: a RESUME that redelivers the same edit is
+        # suppressed while a second genuine edit still gets through.
+        if self._dedup.is_duplicate(f"edit:{after.id}:{after.edited_at.isoformat()}"):
+            return False
+
+        return await self._handle_message(after, role_authorized=role_authorized)
 
     async def _dispatch_discord_message(self, message: Any) -> bool:
         """Apply Discord ingress policy and dispatch one live event."""
