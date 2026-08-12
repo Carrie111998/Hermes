@@ -7655,6 +7655,11 @@ def _handle_busy_submit(
     with session["history_lock"]:
         if not session.get("running"):
             return None
+        # A replay acknowledgement must be side-effect free. In particular,
+        # do not claim ambient attachments that were added after the original
+        # queued delivery was accepted; they belong to the next prompt.
+        if _queued_delivery_seen(session, queue_delivery_id):
+            return _ok(rid, {"status": "duplicate"})
         image_paths = list(session.get("attached_images", []))
         if image_paths:
             # Claim at submission time. A later paste must not be consumed by

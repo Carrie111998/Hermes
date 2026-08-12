@@ -163,6 +163,33 @@ def test_queue_delivery_retry_is_acknowledged_without_starting_a_second_turn(mon
     assert session.get("queued_prompts") is None
 
 
+def test_busy_queue_delivery_retry_does_not_claim_a_later_attachment(monkeypatch):
+    """Duplicate acknowledgement must not consume the next prompt's image."""
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    session = _session(
+        running=True,
+        attached_images=["/tmp/next.png"],
+        _accepted_queue_delivery_ids={"queued-stable-id": None},
+    )
+    server._sessions["sid"] = session
+    try:
+        response = server._methods["prompt.submit"](
+            "retry",
+            {
+                "session_id": "sid",
+                "text": "already accepted",
+                "queued": True,
+                "queue_delivery_id": "queued-stable-id",
+            },
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response["result"]["status"] == "duplicate"
+    assert session["attached_images"] == ["/tmp/next.png"]
+    assert session.get("queued_prompt") is None
+
+
 
 
 
