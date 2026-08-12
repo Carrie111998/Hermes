@@ -1561,11 +1561,14 @@ def cleanup_gateway_state_files() -> list[str]:
         startup conflict-check refuses to run.
       - ``gateway.lock``: the runtime exclusive-access lock the dead
         process was holding.
-      - ``gateway-locks/*.lock``: per-platform session-claim files
-        (whatsapp-session, telegram-bot-token) — the M2 stale-PID
-        recheck handles these in-process, but cleaning them up between
-        manual stop+start lets the new gateway acquire them
-        immediately on first attempt.
+      - ``<lock-dir>/*.lock``: per-platform session-claim files
+        (whatsapp-session, telegram-bot-token) whose recorded pid is
+        dead — the M2 stale-PID recheck handles these in-process, but
+        cleaning them up between manual stop+start lets the new gateway
+        acquire them immediately on first attempt. Claims held by a live
+        pid are left alone: the lock dir is machine-local and shared
+        across profiles, and nothing holds these files open, so the OS
+        offers no protection against evicting a running gateway.
       - ``platforms/*/.session.lock`` etc.: best-effort, swallow errors
         if the platform layout has moved.
 
@@ -1576,8 +1579,13 @@ def cleanup_gateway_state_files() -> list[str]:
     gateway-restart-cluster-2026-04-30.md, paired with the ADR-0022
     Phase-7 lockfile-cleanup memory note.
     """
-    from gateway.status import _get_pid_path, _get_gateway_lock_path
-    from hermes_constants import get_hermes_home
+    from gateway.status import (
+        _get_gateway_lock_path,
+        _get_lock_dir,
+        _get_pid_path,
+        _pid_exists,
+        _read_json_file,
+    )
 
     removed: list[str] = []
     candidates: list[Path] = []
@@ -1588,14 +1596,44 @@ def cleanup_gateway_state_files() -> list[str]:
     except Exception:
         pass
 
-    # Per-platform scoped locks live under ``gateway-locks/`` next to the
-    # profile root. Glob them rather than enumerating known scopes — new
-    # platforms get cleanup for free.
+    # Per-platform scoped locks live in the MACHINE-LOCAL lock directory,
+    # NOT under HERMES_HOME: _get_lock_dir() resolves
+    # ``$HERMES_GATEWAY_LOCK_DIR``, else ``$XDG_STATE_HOME/hermes/
+    # gateway-locks``, else ``~/.local/state/hermes/gateway-locks``. This
+    # globbed ``get_hermes_home()/'gateway-locks'`` until 2026-08-12 — a
+    # path nothing has ever written — so the scope-lock half of this
+    # cleanup was a silent no-op while still reporting success. Glob rather
+    # than enumerating known scopes so new platforms get cleanup for free.
+    #
+    # These need a THIRD staleness test, different from the two above.
+    # acquire_scoped_lock() writes the record and CLOSES it (_write_json_file),
+    # so nobody holds a scope lock open and the OS will not refuse to delete a
+    # live one the way it does for gateway.lock. Unlinking on sight would evict
+    # a running gateway's claim — and deleting a live whatsapp-session claim is
+    # how you end up re-pairing by QR. The directory is machine-local, shared
+    # across profiles, so the victim need not even be this profile's gateway.
+    # Mirror acquire_scoped_lock() instead: read the record, treat it as stale
+    # only when its pid is gone.
+    #
+    # Deliberately MORE conservative than acquire_scoped_lock(): no start_time
+    # PID-reuse check and no argv/cmdline oracle, and an unreadable or pid-less
+    # record is KEPT. A wrong "stale" here deletes a live claim, while a wrong
+    # "live" costs one extra acquire attempt — the in-process M2 stale-PID
+    # recheck takes such locks over anyway. ``~/laptop-start.ps1`` implements
+    # the same three predicates; keep them in step.
     try:
-        home = get_hermes_home()
-        locks_dir = home / "gateway-locks"
+        locks_dir = _get_lock_dir()
         if locks_dir.exists():
-            candidates.extend(locks_dir.glob("*.lock"))
+            for lock_file in locks_dir.glob("*.lock"):
+                record = _read_json_file(lock_file)
+                if not isinstance(record, dict):
+                    continue
+                try:
+                    claim_pid = int(record["pid"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not _pid_exists(claim_pid):
+                    candidates.append(lock_file)
     except Exception:
         pass
 
