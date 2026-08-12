@@ -18,8 +18,11 @@ a mocked connection would prove nothing about it.
 """
 
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -111,6 +114,62 @@ def test_concurrent_acquire_grants_exactly_one_winner(tmp_path):
     verify = SessionDB(db_path)
     try:
         assert verify.get_turn_lease_holder("shared") == winners[0]
+    finally:
+        verify.close()
+
+
+_CHILD_ACQUIRE = """
+import sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from hermes_state import SessionDB
+
+db_path, start_at, holder = Path(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
+db = SessionDB(db_path)
+try:
+    while time.time() < start_at:   # converge the racers on a wall-clock start
+        time.sleep(0.001)
+    print("WON" if db.try_acquire_turn_lease(
+        "shared", holder, ttl_seconds=60) else "LOST")
+finally:
+    db.close()
+"""
+
+
+def test_separate_os_processes_grant_exactly_one_winner(tmp_path):
+    """The literal claim: real OS processes, one state.db, one winner.
+
+    The sibling thread test races separate ``SessionDB`` instances, which is
+    enough to reach SQLite — but it still shares one interpreter. This spawns
+    actual subprocesses, so nothing is shared: separate interpreters, separate
+    connections, no GIL in common. That is the configuration #67442 is about
+    (a CLI process and a gateway process on one session), so it is worth
+    proving directly rather than by extrapolation.
+    """
+    repo_root = str(Path(__file__).resolve().parents[2])
+    db_path = tmp_path / "state.db"
+    SessionDB(db_path).close()  # create the schema before the race
+
+    start_at = time.time() + 2.0  # leave room for interpreter startup
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", _CHILD_ACQUIRE, repo_root,
+             str(db_path), str(start_at), f"proc:{i}"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        for i in range(3)
+    ]
+    results = []
+    for p in procs:
+        out, err = p.communicate(timeout=120)
+        assert p.returncode == 0, f"child failed: {err}"
+        results.append(out.strip())
+
+    assert results.count("WON") == 1, f"expected exactly one winner, got {results}"
+
+    verify = SessionDB(db_path)
+    try:
+        assert verify.get_turn_lease_holder("shared") is not None
     finally:
         verify.close()
 
