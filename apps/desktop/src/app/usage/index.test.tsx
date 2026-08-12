@@ -240,6 +240,84 @@ describe('UsageView', () => {
     expect(screen.getByText(/30d session market-equivalent: \$7\.00/)).toBeTruthy()
   })
 
+  it('uses the backend-reconciled market value for a mixed estimated and included session', async () => {
+    gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) => {
+      if (method === 'usage.overview') {
+        return Promise.resolve({
+          ...usageOverviewFixture,
+          overview: {
+            ...usageOverviewFixture.overview,
+            estimated_cost: 2.17,
+            cost_buckets: {
+              estimated: {
+                sessions: 1,
+                cost_usd: 2.17,
+                input_tokens: 102_000,
+                output_tokens: 58_000,
+                at_market_cost_usd: 7
+              },
+              included: {
+                sessions: 0,
+                cost_usd: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                at_market_cost_usd: 0
+              },
+              unknown: { sessions: 0, cost_usd: 0, input_tokens: 0, output_tokens: 0 }
+            }
+          }
+        })
+      }
+
+      return Promise.resolve(responseFor(method, params))
+    })
+
+    renderUsage()
+
+    const marketCostLabel = await screen.findByText('Market equiv.')
+    expect(within(marketCostLabel.closest('div')!).getByText('$7.00')).toBeTruthy()
+    expect(screen.getByText(/30d session market-equivalent: \$7\.00/)).toBeTruthy()
+  })
+
+  it('renders mixed-session market value as unavailable when backend evidence is explicitly incomplete', async () => {
+    gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) => {
+      if (method === 'usage.overview') {
+        return Promise.resolve({
+          ...usageOverviewFixture,
+          overview: {
+            ...usageOverviewFixture.overview,
+            estimated_cost: 2.17,
+            cost_buckets: {
+              estimated: {
+                sessions: 1,
+                cost_usd: 2.17,
+                input_tokens: 102_000,
+                output_tokens: 58_000,
+                at_market_cost_usd: null
+              },
+              included: {
+                sessions: 0,
+                cost_usd: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                at_market_cost_usd: 0
+              },
+              unknown: { sessions: 0, cost_usd: 0, input_tokens: 0, output_tokens: 0 }
+            }
+          }
+        })
+      }
+
+      return Promise.resolve(responseFor(method, params))
+    })
+
+    renderUsage()
+
+    const marketCostLabel = await screen.findByText('Market equiv.')
+    expect(within(marketCostLabel.closest('div')!).getByText('—')).toBeTruthy()
+    expect(screen.getByText(/30d session market-equivalent: —/)).toBeTruthy()
+  })
+
   it('renders the session market equivalent as unavailable when any cost is unknown', async () => {
     gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) => {
       if (method === 'usage.overview') {

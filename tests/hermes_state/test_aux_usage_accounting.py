@@ -338,6 +338,85 @@ class TestInsightsAuxTotals:
         assert sum(bucket["sessions"] for bucket in buckets.values()) == overview["total_sessions"] == 1
         assert sum(m["api_calls"] for m in models) == 2
 
+    def test_mixed_included_and_estimated_session_keeps_complete_market_value(self, db):
+        """A priced aux row must not hide the included main route's list value."""
+        from agent.insights import InsightsEngine
+
+        db.create_session("mixed", source="cli", model="gpt-5.6-sol")
+        db.update_token_counts(
+            "mixed",
+            model="gpt-5.6-sol",
+            billing_provider="openai-codex",
+            billing_mode="subscription_included",
+            input_tokens=1_000_000,
+            output_tokens=500_000,
+            estimated_cost_usd=0.0,
+            cost_status="included",
+            api_call_count=1,
+        )
+        db.record_auxiliary_usage(
+            "mixed",
+            "compression",
+            model="aux-model",
+            billing_provider="custom",
+            input_tokens=50,
+            output_tokens=5,
+            estimated_cost_usd=2.5,
+        )
+        db.flush_token_counts()
+        with db._lock:
+            db._conn.execute(
+                "UPDATE session_model_usage SET cost_status='estimated', "
+                "cost_source='provider' WHERE session_id='mixed' AND task='compression'"
+            )
+            db._conn.commit()
+
+        overview = InsightsEngine(db).generate(days=30)["overview"]
+        estimated = overview["cost_buckets"]["estimated"]
+
+        assert estimated["sessions"] == 1
+        assert estimated["cost_usd"] == pytest.approx(2.5)
+        assert estimated["at_market_cost_usd"] == pytest.approx(22.5)
+
+    def test_mixed_session_market_value_is_unknown_when_included_sku_has_no_public_price(self, db):
+        """Known aux spend cannot make an unresolved included comparison partial."""
+        from agent.insights import InsightsEngine
+
+        db.create_session("mixed-unknown", source="cli", model="codex-plan-only-model")
+        db.update_token_counts(
+            "mixed-unknown",
+            model="codex-plan-only-model",
+            billing_provider="openai-codex",
+            billing_mode="subscription_included",
+            input_tokens=1_000,
+            output_tokens=500,
+            estimated_cost_usd=0.0,
+            cost_status="included",
+            api_call_count=1,
+        )
+        db.record_auxiliary_usage(
+            "mixed-unknown",
+            "compression",
+            model="aux-model",
+            billing_provider="custom",
+            input_tokens=50,
+            output_tokens=5,
+            estimated_cost_usd=2.5,
+        )
+        db.flush_token_counts()
+        with db._lock:
+            db._conn.execute(
+                "UPDATE session_model_usage SET cost_status='estimated', "
+                "cost_source='provider' WHERE session_id='mixed-unknown' AND task='compression'"
+            )
+            db._conn.commit()
+
+        estimated = InsightsEngine(db).generate(days=30)["overview"]["cost_buckets"]["estimated"]
+
+        assert estimated["sessions"] == 1
+        assert estimated["cost_usd"] == pytest.approx(2.5)
+        assert estimated["at_market_cost_usd"] is None
+
     def test_aux_usage_does_not_inherit_main_loop_billing_route(self, db):
         """An underspecified auxiliary row remains unknown, not plan-included."""
         from agent.insights import InsightsEngine

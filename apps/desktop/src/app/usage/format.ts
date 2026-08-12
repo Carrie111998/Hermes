@@ -1,6 +1,7 @@
 import type {
   DailyUsage,
   ModelUsage,
+  UsageCostBucket,
   UsageMeterBucket,
   UsageMeterEvent,
   UsageMeterRoute,
@@ -133,19 +134,30 @@ export function meterEstimatedCost(
 }
 
 export function reportMarketEquivalent(report: UsageReport): number | null {
-  const estimated = report.totals.cost
+  const estimated = report.totals.cost_buckets.estimated
   const included = report.totals.cost_buckets.included
   const unknown = report.totals.cost_buckets.unknown
 
-  if (estimated == null || (unknown?.sessions ?? 0) > 0) {
+  if (report.totals.cost == null || (unknown?.sessions ?? 0) > 0) {
     return null
   }
 
-  if (!included || included.sessions <= 0) {
-    return estimated
+  const bucketMarketValue = (bucket: UsageCostBucket | null, legacyFallback?: number): number | null => {
+    if (!bucket || bucket.sessions <= 0) {
+      return 0
+    }
+
+    if (bucket.at_market_cost_usd === undefined) {
+      return legacyFallback ?? null
+    }
+
+    return bucket.at_market_cost_usd
   }
 
-  return included.at_market_cost_usd == null ? null : estimated + included.at_market_cost_usd
+  const estimatedMarket = bucketMarketValue(estimated, estimated?.cost_usd ?? 0)
+  const includedMarket = bucketMarketValue(included)
+
+  return estimatedMarket == null || includedMarket == null ? null : estimatedMarket + includedMarket
 }
 
 export function modelTokens(model: ModelUsage): number | null {

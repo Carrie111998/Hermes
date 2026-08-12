@@ -460,7 +460,8 @@ class InsightsEngine:
         included_cost_sessions = 0
         cost_buckets = {
             "estimated": {"sessions": 0, "cost_usd": 0.0,
-                          "input_tokens": 0, "output_tokens": 0},
+                          "input_tokens": 0, "output_tokens": 0,
+                          "at_market_cost_usd": 0.0},
             "included": {"sessions": 0, "cost_usd": 0.0,
                          "input_tokens": 0, "output_tokens": 0,
                          "at_market_cost_usd": 0.0},
@@ -493,9 +494,15 @@ class InsightsEngine:
             bucket["cost_usd"] += sum(row["estimated_cost_usd"] for row in rows)
             bucket["input_tokens"] += sum(row["input_tokens"] for row in rows)
             bucket["output_tokens"] += sum(row["output_tokens"] for row in rows)
-            if status == "included":
-                included_cost_sessions += 1
-                market_values = [_estimate_at_market_cost(row) for row in rows]
+            if status != "unknown":
+                market_values = [
+                    _estimate_at_market_cost(row)
+                    if row["cost_bucket"] == "included"
+                    else row["estimated_cost_usd"]
+                    if row["cost_bucket"] == "estimated"
+                    else None
+                    for row in rows
+                ]
                 if (
                     bucket["at_market_cost_usd"] is None
                     or any(value is None for value in market_values)
@@ -503,6 +510,8 @@ class InsightsEngine:
                     bucket["at_market_cost_usd"] = None
                 else:
                     bucket["at_market_cost_usd"] += sum(market_values)
+            if status == "included":
+                included_cost_sessions += 1
             elif status == "unknown":
                 unknown_cost_sessions += 1
 
