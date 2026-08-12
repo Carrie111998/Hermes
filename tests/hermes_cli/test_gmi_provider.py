@@ -28,6 +28,22 @@ from hermes_cli.models import (
 from agent.auxiliary_client import resolve_provider_client
 from agent.model_metadata import get_model_context_length
 
+# Importing this module also warms ``run_doctor``'s two heaviest lazy imports
+# at collection time, which is what keeps the ``run_doctor`` test below under
+# the repo's 30s ``--timeout`` cap. See ``conftest_doctor_externals``.
+from tests.hermes_cli.conftest_doctor_externals import (  # noqa: E402
+    stub_doctor_externals,
+)
+
+
+@pytest.fixture(autouse=True)
+def _stub_doctor_externals(monkeypatch):
+    """Keep ``run_doctor`` off ``install_doctor.probe`` / ``gh auth status`` /
+    ``agent-browser --version`` -- ~31s of host subprocesses per call that none
+    of these tests assert on. See ``conftest_doctor_externals`` for the
+    measurements and the rationale."""
+    stub_doctor_externals(monkeypatch)
+
 
 @pytest.fixture(autouse=True)
 def _clear_provider_env(monkeypatch):

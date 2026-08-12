@@ -20,10 +20,12 @@ def test_delegation_default_toolsets_removed_from_cli_config():
     runtime CLI_CONFIG dict because CLI_CONFIG is populated by deep-merging
     the user's ~/.hermes/config.yaml over the defaults (cli.py:359-366).
     A contributor who still has the legacy key set in their own config
-    would cause a false failure, and HERMES_HOME patching via conftest
-    doesn't help because cli._hermes_home is frozen at module import time
-    (cli.py:76) — before any autouse fixture can fire. Source inspection
-    sidesteps all of that: it tests the defaults literal directly.
+    would cause a false failure. (Historically HERMES_HOME patching via
+    conftest could not help either, because cli._hermes_home was frozen at
+    module import time — before any autouse fixture can fire. That snapshot is
+    now a None sentinel behind cli._resolve_hermes_home(); see
+    tests/cli/test_cli_hermes_home_binding.py.) Source inspection sidesteps
+    all of that: it tests the defaults literal directly.
     """
     from cli import load_cli_config
 

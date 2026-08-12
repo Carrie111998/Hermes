@@ -224,6 +224,21 @@ class TestStaleBridgeHandshake:
 
 
 class TestDepRefreshStamp:
+    """The dependency install runs through ``run_text_capture``, not
+    ``subprocess.run``.
+
+    ``_npm_bin`` is ``npm.cmd`` on Windows, so the direct child is cmd.exe and
+    the install itself runs in a node grandchild that inherits the capture
+    pipes; ``subprocess.run`` would kill only cmd.exe on timeout and then block
+    forever re-draining a pipe that never reaches EOF. Every test here patches
+    that seam. Patching ``subprocess.run`` instead does not merely miss -- it
+    lets a REAL ``npm install`` run against the tmp_path bridge dir, which is
+    what turned two of these red and quietly made
+    ``test_skips_install_when_stamp_fresh`` unfalsifiable: its
+    ``assert_not_called`` watched a mock the install could no longer reach, so
+    it would have passed even if the install had run on every connect.
+    """
+
     @pytest.mark.asyncio
     async def test_skips_install_when_stamp_fresh(self, tmp_path):
         bridge_dir = _setup_bridge_dir(tmp_path)
@@ -241,7 +256,7 @@ class TestDepRefreshStamp:
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
              patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
              patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
-             patch("subprocess.run") as mock_run, \
+             patch("hermes_cli._subprocess_compat.run_text_capture") as mock_run, \
              patch("subprocess.Popen", return_value=mock_proc), \
              patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
             await adapter.connect()
@@ -267,7 +282,8 @@ class TestDepRefreshStamp:
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
              patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
              patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
-             patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run, \
+             patch("hermes_cli._subprocess_compat.run_text_capture",
+                   return_value=MagicMock(returncode=0, stdout="", stderr="")) as mock_run, \
              patch("subprocess.Popen", return_value=mock_proc), \
              patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
             await adapter.connect()
@@ -293,14 +309,15 @@ class TestDepRefreshStamp:
         def _npm_install(*args, **kwargs):
             # npm creates node_modules as a side effect
             (bridge_dir / "node_modules").mkdir(exist_ok=True)
-            return MagicMock(returncode=0)
+            return MagicMock(returncode=0, stdout="", stderr="")
 
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
              patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
              patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
              patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
-             patch("subprocess.run", side_effect=_npm_install) as mock_run, \
+             patch("hermes_cli._subprocess_compat.run_text_capture",
+                   side_effect=_npm_install) as mock_run, \
              patch("subprocess.Popen", return_value=mock_proc), \
              patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
             await adapter.connect()

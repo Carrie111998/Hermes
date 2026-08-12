@@ -1322,13 +1322,18 @@ def test_make_agent_accepts_list_system_prompt(server, monkeypatch):
 # ── Config I/O ───────────────────────────────────────────────────────
 
 
-def test_config_load_missing(server, tmp_path):
-    server._hermes_home = tmp_path
+def test_config_load_missing(server, tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
     assert server._load_cfg() == {}
 
 
-def test_config_roundtrip(server, tmp_path):
-    server._hermes_home = tmp_path
+def test_config_roundtrip(server, tmp_path, monkeypatch):
+    # monkeypatch, not a bare assignment: the ``server`` fixture does not
+    # restore module attributes, so a raw ``server._hermes_home = tmp_path``
+    # left a deleted tmpdir pinned on the module for every later test in the
+    # process — and silently disarmed the live-home resolution the seam exists
+    # to provide.
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
     server._save_cfg({"model": "test/model"})
     assert server._load_cfg()["model"] == "test/model"
 

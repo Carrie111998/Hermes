@@ -42,20 +42,45 @@ def _ssl_err(message: str) -> SSLConfigurationError:
     return SSLConfigurationError(f"{message}\n{_repair_hint()}")
 
 
+# Bundles already parsed successfully in this process, keyed by file identity
+# (resolved path + size + mtime). Loading a CA bundle means asking OpenSSL to
+# parse ~150 PEM certificates and then decoding every one of them into a Python
+# dict for the emptiness check — measured at 3.8-9.4s per call on a Windows dev
+# box. That was paid on EVERY AIAgent construction, because agent_init calls
+# this guard unconditionally: a test file building a handful of agents spent
+# minutes here, and under the nightly gate's per-test --timeout individual
+# tests were killed mid-construction.
+#
+# This is a preventive startup check whose answer is a property of a file, so
+# re-deriving it per agent buys nothing. Keying on (path, size, mtime_ns) rather
+# than caching a bare "already ran" flag keeps it honest: a different bundle, or
+# the same path rewritten, is a different key and gets revalidated — which is
+# what the guard's own tests rely on as they point certifi at successive
+# tmp_path files. Only successes are cached; failures are rare and re-checked.
+_VALIDATED_BUNDLES: set[tuple[str, int, int]] = set()
+
+
 def _validate_bundle_path(label: str, value: str, *, require_substantial: bool = False) -> None:
     path = Path(value).expanduser()
     if not path.exists():
         raise _ssl_err(f"{label} points to a missing CA bundle: {value}")
     if not path.is_file():
         raise _ssl_err(f"{label} does not point to a CA bundle file: {value}")
-    if require_substantial and path.stat().st_size < 1024:
+    stat = path.stat()
+    if require_substantial and stat.st_size < 1024:
         raise _ssl_err(f"{label} at {value} appears corrupted (too small)")
+
+    cache_key = (str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+    if cache_key in _VALIDATED_BUNDLES:
+        return
+
     try:
         ctx = ssl.create_default_context(cafile=str(path))
     except Exception as exc:
         raise _ssl_err(f"{label} CA bundle at {value} cannot be loaded: {exc}") from exc
     if not ctx.get_ca_certs():
         raise _ssl_err(f"{label} CA bundle at {value} did not load any certificates")
+    _VALIDATED_BUNDLES.add(cache_key)
 
 
 def verify_ca_bundle() -> None:

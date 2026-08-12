@@ -462,10 +462,19 @@ def _uninstall_profile(profile) -> None:
     hermes_invocation = [_sys.executable, "-m", "hermes_cli.main", "--profile", name]
     for subcmd in ("stop", "uninstall"):
         try:
+            # DEVNULL, not capture_output=True: nothing reads this output — the
+            # call is fire-and-check-nothing, with only the timeout mattering.
+            # And `hermes gateway stop|uninstall` is a whole CLI that shells
+            # out again (taskkill/schtasks on Windows, systemctl/launchctl on
+            # POSIX), so the real work is always a grandchild; on Windows it
+            # inherits the capture pipe handles and holds the write end open,
+            # so the pipe never reaches EOF and the 60s never fires. Dropping
+            # the pipe restores the bound at zero cost.
             subprocess.run(
                 hermes_invocation + ["gateway", subcmd],
-                capture_output=True,
-                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
                 timeout=60,
                 check=False,
             )

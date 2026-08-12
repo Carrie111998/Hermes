@@ -198,15 +198,44 @@ class TestDerivedConstants:
         survivors = {
             name: value
             for name, value in vars(run).items()
-            if isinstance(value, Path) and name != "_hermes_home"
+            if isinstance(value, Path) and name not in ("_hermes_home", "_env_path")
         }
         assert not survivors, (
             "module-level Path constants survived import; each is a fresh "
             f"import-time snapshot of the Hermes home: {survivors}"
         )
-        # The two that used to exist, named explicitly so a regression is obvious.
-        assert not hasattr(run, "_env_path")
+        # Consumed inside the import-time config->env bridge, then dropped.
         assert not hasattr(run, "_config_path")
+
+    def test_env_path_name_survives_for_the_tests_that_patch_it(self):
+        """``_env_path`` is deliberately KEPT even though nothing reads it.
+
+        Deleting it as "dead code" broke seven tests that do
+        ``monkeypatch.setattr(gateway_run, "_env_path", ...)`` — monkeypatch
+        raises when the attribute is absent. It is safe to keep precisely
+        because no runtime code reads it, so it cannot leak a stale home.
+        """
+        assert hasattr(run, "_env_path"), (
+            "_env_path was removed; that breaks the 7 tests in "
+            "test_discord_channel_prompts / test_fast_command / "
+            "test_reasoning_command that monkeypatch it"
+        )
+        assert isinstance(run._env_path, Path)
+
+    def test_env_path_is_never_read_at_runtime(self):
+        """Keeping the name is only safe while nothing reads it.
+
+        A runtime read would silently reintroduce the import-time snapshot.
+        """
+        src = Path(run.__file__).read_text(encoding="utf-8")
+        reads = [
+            line.strip()
+            for line in src.splitlines()
+            if "_env_path" in line
+            and not line.lstrip().startswith("#")
+            and "_env_path = " not in line
+        ]
+        assert not reads, f"_env_path is read at runtime: {reads}"
 
 
 class TestResolverChoiceIsDeliberate:

@@ -20,6 +20,7 @@ from typing import Any, NamedTuple, Optional
 from hermes_constants import (
     get_hermes_home,
     get_hermes_home_override,
+    get_process_hermes_home,
     reset_hermes_home_override,
     set_hermes_home_override,
 )
@@ -38,9 +39,42 @@ from tui_gateway.transport import (
 
 logger = logging.getLogger(__name__)
 
-_hermes_home = get_hermes_home()
+# Resolved per use, NOT baked into a module constant at import.  Under pytest
+# the autouse ``_hermetic_environment`` fixture redirects ``HERMES_HOME`` to a
+# per-test tempdir only AFTER collection has imported this module, so a constant
+# captured here holds the developer's REAL ``~/.hermes``.  Four use sites below
+# are writes — ``_save_cfg`` (the user's live config.yaml), the two ``images/``
+# sites, and ``paste.collapse`` — and nothing structural stopped a test from
+# reaching them.  See GBrain concepts/import-time-hermes-home-snapshot-bug.
+#
+# ``_hermes_home`` stays as an override seam so the existing
+# ``monkeypatch.setattr(server, "_hermes_home", tmp_path)`` tests keep working.
+_hermes_home: Optional[Path] = None
+
+
+def _resolve_hermes_home() -> Path:
+    """Return the gateway's Hermes home, resolved at call time.
+
+    ``get_process_hermes_home()`` rather than ``get_hermes_home()``, on purpose.
+    The import-time constant this replaces was evaluated with no context-local
+    override active, so the launch home is exactly what it captured, and every
+    use site below runs on the RPC dispatch thread — outside the per-turn
+    ``set_hermes_home_override`` scope opened by the turn dispatcher.  Following
+    the override would therefore be a behaviour change, not a fix.
+
+    ``_profile_home`` depends on this directly: it compares a candidate profile
+    against the LAUNCH home to decide whether an override is needed at all, so
+    resolving it through the override would make it answer "already the launch
+    profile" for whatever profile the caller was scoped to.
+    """
+    if _hermes_home is not None:
+        return Path(_hermes_home)
+    return get_process_hermes_home()
+
+
 load_hermes_dotenv(
-    hermes_home=_hermes_home, project_env=Path(__file__).parent.parent / ".env"
+    hermes_home=_resolve_hermes_home(),
+    project_env=Path(__file__).parent.parent / ".env",
 )
 
 
@@ -53,7 +87,37 @@ load_hermes_dotenv(
 # AND re-emits a one-line summary to stderr so the TUI can surface it in
 # Activity — exactly what was missing when the voice-mode turns started
 # exiting the gateway mid-TTS.
-_CRASH_LOG = os.path.join(_hermes_home, "logs", "tui_gateway_crash.log")
+#
+# Resolved per write, NOT baked into a module constant at import.  Both hooks
+# below are installed process-wide the moment this module is imported, so every
+# process that merely imports it — 45 test modules, a scratch script, a REPL —
+# routes its unhandled exceptions here.  A constant resolved at import time
+# captured whatever ``HERMES_HOME`` was set then, which under pytest is the
+# developer's REAL home: ``tests/conftest.py``'s autouse ``_hermetic_environment``
+# fixture redirects ``HERMES_HOME`` to a per-test tempdir only AFTER collection
+# has imported this module.  Unrelated crashes therefore landed in the user's
+# live ~/.hermes/logs/tui_gateway_crash.log, indistinguishable from real gateway
+# forensics.  See GBrain concepts/import-time-hermes-home-snapshot-bug.
+#
+# ``_CRASH_LOG`` stays as an override seam so existing
+# ``monkeypatch.setattr(server, "_CRASH_LOG", ...)`` tests keep working.
+_CRASH_LOG: Optional[str] = None
+
+
+def _crash_log_path() -> str:
+    """Return the panic-log path, resolved at call time.
+
+    ``get_process_hermes_home()`` rather than ``get_hermes_home()``: the panic
+    log is a process-level forensic asset for the gateway, and resolving it
+    through the context-local override would scatter a turn's crash record into
+    whichever profile home that turn happened to be scoped to (the turn
+    dispatcher's ``except`` block runs while its ``set_hermes_home_override``
+    is still active).  No override is active at import, so this is the exact
+    live equivalent of what the old import-time constant captured.
+    """
+    if _CRASH_LOG is not None:
+        return _CRASH_LOG
+    return os.path.join(get_process_hermes_home(), "logs", "tui_gateway_crash.log")
 
 
 def _panic_hook(exc_type, exc_value, exc_tb):
@@ -61,8 +125,8 @@ def _panic_hook(exc_type, exc_value, exc_tb):
 
     trace = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
     try:
-        os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
-        with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(_crash_log_path()), exist_ok=True)
+        with open(_crash_log_path(), "a", encoding="utf-8") as f:
             f.write(
                 f"\n=== unhandled exception · {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
             )
@@ -93,8 +157,8 @@ def _thread_panic_hook(args):
         traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)
     )
     try:
-        os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
-        with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(_crash_log_path()), exist_ok=True)
+        with open(_crash_log_path(), "a", encoding="utf-8") as f:
             f.write(
                 f"\n=== thread exception · {time.strftime('%Y-%m-%d %H:%M:%S')} "
                 f"· thread={args.thread.name} ===\n"
@@ -1079,7 +1143,7 @@ def _profile_home(profile: str | None) -> Path | None:
     except Exception:
         return None
     # Already the launch profile? No override needed.
-    if home.resolve() == Path(_hermes_home).resolve():
+    if home.resolve() == _resolve_hermes_home().resolve():
         return None
     return home if (home / "state.db").exists() or home.exists() else None
 
@@ -2245,7 +2309,7 @@ def _load_cfg() -> dict:
         # launch profile's _hermes_home. Cache is keyed on the resolved path, so
         # profiles don't clobber each other.
         override = get_hermes_home_override()
-        home = override if isinstance(override, str) and override else _hermes_home
+        home = override if isinstance(override, str) and override else _resolve_hermes_home()
         p = Path(home) / "config.yaml"
         mtime = p.stat().st_mtime if p.exists() else None
         with _cfg_lock:
@@ -2291,7 +2355,7 @@ def _save_cfg(cfg: dict):
 
     from hermes_cli.config import atomic_config_write
 
-    path = _hermes_home / "config.yaml"
+    path = _resolve_hermes_home() / "config.yaml"
     atomic_config_write(path, cfg)
     with _cfg_lock:
         _cfg_cache = copy.deepcopy(cfg)
@@ -10497,8 +10561,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
 
             trace = traceback.format_exc()
             try:
-                os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
-                with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+                os.makedirs(os.path.dirname(_crash_log_path()), exist_ok=True)
+                with open(_crash_log_path(), "a", encoding="utf-8") as f:
                     f.write(
                         f"\n=== turn-dispatcher exception · "
                         f"{time.strftime('%Y-%m-%d %H:%M:%S')} · sid={sid} ===\n"
@@ -10585,7 +10649,7 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5027, f"clipboard unavailable: {e}")
 
     session["image_counter"] = session.get("image_counter", 0) + 1
-    img_dir = _hermes_home / "images"
+    img_dir = _resolve_hermes_home() / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
     img_path = (
         img_dir
@@ -10733,7 +10797,7 @@ def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: 
     the existing native-image-attach pipeline. Returns the written path.
     """
     session["image_counter"] = session.get("image_counter", 0) + 1
-    img_dir = _hermes_home / "images"
+    img_dir = _resolve_hermes_home() / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     img_path = img_dir / f"{prefix}_{ts}_{session['image_counter']}{ext}"
@@ -12459,7 +12523,7 @@ def _(rid, params: dict) -> dict:
     if key == "profile":
         from hermes_constants import display_hermes_home
 
-        return _ok(rid, {"home": str(_hermes_home), "display": display_hermes_home()})
+        return _ok(rid, {"home": str(_resolve_hermes_home()), "display": display_hermes_home()})
     if key == "project":
         cfg_terminal = _load_cfg().get("terminal") or {}
         raw = str(params.get("cwd", "") or cfg_terminal.get("cwd", "") or "").strip()
@@ -12590,7 +12654,7 @@ def _(rid, params: dict) -> dict:
         display = _load_cfg().get("display")
         return _ok(rid, {"value": _display_mouse_tracking(display)})
     if key == "mtime":
-        cfg_path = _hermes_home / "config.yaml"
+        cfg_path = _resolve_hermes_home() / "config.yaml"
         try:
             return _ok(
                 rid, {"mtime": cfg_path.stat().st_mtime if cfg_path.exists() else 0}
@@ -13104,15 +13168,26 @@ def _(rid, params: dict) -> dict:
             # has all API keys in os.environ.
             from tools.environments.local import _sanitize_subprocess_env
             sanitized_env = _sanitize_subprocess_env(os.environ.copy())
-            r = subprocess.run(
-                qc.get("command", ""),
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                stdin=subprocess.DEVNULL,
-                env=sanitized_env,
-            )
+            # run_text_capture, not subprocess.run: with shell=True the real
+            # command is always a grandchild of cmd.exe, and a grandchild
+            # inheriting capture PIPES defeats `timeout` outright on Windows.
+            # It captures into temp files, so the 30s bound actually holds
+            # (+ up to ~10s for the synchronous best-effort tree-kill).
+            from hermes_cli._subprocess_compat import run_text_capture
+            try:
+                r = run_text_capture(
+                    qc.get("command", ""),
+                    shell=True,
+                    timeout=30,
+                    env=sanitized_env,
+                )
+            except subprocess.TimeoutExpired:
+                # Newly reachable: on Windows the pipe-based call could not
+                # time out at all here, so this path had no handler. Without
+                # one the exception escapes — and unlike shell.exec this
+                # handler is NOT in _LONG_HANDLERS, so it runs inline on the
+                # main stdin loop, where an escape takes the gateway down.
+                return _err(rid, 5002, "quick command timed out (30s)")
             output = (
                 (r.stdout or "")
                 + ("\n" if r.stdout and r.stderr else "")
@@ -13648,7 +13723,7 @@ def _(rid, params: dict) -> dict:
 
     _paste_counter += 1
     line_count = text.count("\n") + 1
-    paste_dir = _hermes_home / "pastes"
+    paste_dir = _resolve_hermes_home() / "pastes"
     paste_dir.mkdir(parents=True, exist_ok=True)
 
     from datetime import datetime
@@ -15532,7 +15607,7 @@ def _(rid, params: dict) -> dict:
                 "title": "Environment",
                 "rows": [
                     ["Working Dir", os.getcwd()],
-                    ["Config File", str(_hermes_home / "config.yaml")],
+                    ["Config File", str(_resolve_hermes_home() / "config.yaml")],
                 ],
             },
         ]
@@ -16003,9 +16078,15 @@ def _(rid, params: dict) -> dict:
     except ImportError:
         return _err(rid, 5001, "shell.exec unavailable: approval safety module not importable")
     try:
-        r = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=30, cwd=os.getcwd(),
-            stdin=subprocess.DEVNULL,
+        # run_text_capture, not subprocess.run: this handler runs arbitrary
+        # user shell commands, so the child is cmd.exe and the real command is
+        # ALWAYS a grandchild holding the capture pipe's write end open. Under
+        # subprocess.run that makes `timeout` unenforceable on Windows — a
+        # single wedged command would hang the whole gateway RPC thread, since
+        # nothing else bounds this call. Temp-file capture keeps the 30s bound.
+        from hermes_cli._subprocess_compat import run_text_capture
+        r = run_text_capture(
+            cmd, shell=True, timeout=30, cwd=os.getcwd(),
         )
         return _ok(
             rid,

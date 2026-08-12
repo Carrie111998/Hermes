@@ -4135,6 +4135,25 @@ class AIAgent:
         try:
             import httpx as _httpx
 
+            # Reuse one process-wide default TLS context instead of letting
+            # httpx build a fresh one for each of the three `verify=True` sites
+            # below (both no-proxy mounts and the client). Each build re-parses
+            # certifi's ~150-cert bundle — profiled at 5.0s apiece here, i.e.
+            # 15.0s of the 15.7s a warm AIAgent() construction cost, all of it
+            # in `load_verify_locations`. Same fix, same reasoning as
+            # agent.process_bootstrap.build_keepalive_http_client, which this
+            # method mirrors; both copies need it because agent startup goes
+            # through this one.
+            #
+            # Narrow on purpose: only the literal `True` default is swapped for
+            # the shared stock context. A custom SSLContext, `False`, or a CA
+            # path from per-provider ssl_ca_cert / HERMES_CA_BUNDLE is passed
+            # through untouched, so no verification behaviour changes.
+            if verify is True:
+                from agent.process_bootstrap import _default_ssl_context
+
+                verify = _default_ssl_context()
+
             # Explicitly read proxy settings so requests route through
             # HTTP_PROXY / HTTPS_PROXY / NO_PROXY correctly.
             _proxy = _get_proxy_for_base_url(base_url)

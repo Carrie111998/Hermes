@@ -247,16 +247,24 @@ class WebhookRouteProcessor:
         try:
             from tools.environments.local import _sanitize_subprocess_env
 
-            popen_kwargs = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
-            result = subprocess.run(
+            from hermes_cli._subprocess_compat import run_text_capture
+
+            # run_text_capture, not capture_output=True: a route script is
+            # arbitrary user code, invoked once per inbound webhook, and such
+            # scripts routinely shell out again. On Windows a grandchild
+            # inherits the capture pipe handles and holds the write end open,
+            # so the pipe never reaches EOF: subprocess.run kills only the
+            # direct child (bash/python) at ``script_timeout_seconds`` and then
+            # blocks re-draining forever, hanging the webhook handler — the one
+            # thing ``script_timeout_seconds`` exists to prevent. Temp-file
+            # capture has no pipes to drain, and applies the CREATE_NO_WINDOW
+            # this site was passing as a bare 0x08000000 itself.
+            result = run_text_capture(
                 argv,
                 input=json.dumps(payload),
-                capture_output=True,
-                text=True,
                 timeout=self.script_timeout_seconds,
                 cwd=str(path.parent),
                 env=_sanitize_subprocess_env(os.environ.copy()),
-                **popen_kwargs,
             )
         except subprocess.TimeoutExpired:
             logger.warning("[webhook] script timed out: %s", path)

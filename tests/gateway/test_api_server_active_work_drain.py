@@ -314,7 +314,14 @@ class TestDrainAdmission:
                 await body_read_started.wait()
 
                 assert adapter._pending_agent_requests == 1
-                drain_task = asyncio.create_task(runner._drain_active_agents(2.0))
+                # 30s budget, not 2s: the assertion below is "the drain did NOT
+                # time out", and the drain returns as soon as the in-flight
+                # request finishes — so a generous budget costs nothing on the
+                # passing path but stops a slow aiohttp round trip under gate
+                # load from being misread as a drain that failed to wait. The
+                # "it blocks while work is pending" half is still proven by the
+                # not-done() check 0.1s in, which a larger budget cannot weaken.
+                drain_task = asyncio.create_task(runner._drain_active_agents(30.0))
                 await asyncio.sleep(0.1)
                 assert not drain_task.done()
 

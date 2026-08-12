@@ -101,8 +101,10 @@ async def test_reset_does_not_block_event_loop_during_cleanup():
 
     def slow_close():
         close_started.set()
-        # Block the WORKER thread (not the loop) until released.
-        release.wait(timeout=5)
+        # Block the WORKER thread (not the loop) until released. The timeout is
+        # only a leak guard — the test always sets `release` — so it is set well
+        # beyond the observation window below rather than racing it.
+        release.wait(timeout=60)
 
     runner = _make_runner_with_cached_agent(slow_close)
 
@@ -126,10 +128,24 @@ async def test_reset_does_not_block_event_loop_during_cleanup():
         await asyncio.sleep(0.005)
     assert close_started.is_set(), "close() never ran"
 
-    # Now sample ticks while close() is STILL blocking. If the loop were
-    # frozen (pre-fix inline call), this stays ~0.
+    # Now accumulate ticks while close() is STILL blocking. If the loop were
+    # frozen (pre-fix inline call), no tick can ever land and this exits on the
+    # deadline with ticks_during_block == 0.
+    #
+    # Wait FOR the ticks rather than sampling a fixed 0.1s window: the
+    # heartbeat sleeps 0.005s, but Windows' timer granularity is ~15.6ms, so
+    # even a perfectly idle loop only manages ~6 ticks in 100ms — the old
+    # `sleep(0.1)` then `>= 5` had almost no headroom and produced 2 under the
+    # gate's 24 workers. The deadline stays well inside slow_close()'s block so
+    # every tick counted is still one observed during cleanup.
+    TARGET_TICKS = 5
     ticks_at_block = ticks["n"]
-    await asyncio.sleep(0.1)
+    deadline = time.monotonic() + 5.0
+    while (
+        ticks["n"] - ticks_at_block < TARGET_TICKS
+        and time.monotonic() < deadline
+    ):
+        await asyncio.sleep(0.005)
     ticks_during_block = ticks["n"] - ticks_at_block
 
     release.set()
@@ -137,7 +153,7 @@ async def test_reset_does_not_block_event_loop_during_cleanup():
     stop.set()
     await hb
 
-    assert ticks_during_block >= 5, (
+    assert ticks_during_block >= TARGET_TICKS, (
         f"event loop was blocked during agent cleanup (#35994): only "
         f"{ticks_during_block} ticks while close() was running"
     )

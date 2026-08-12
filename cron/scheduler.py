@@ -44,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron import wake_channel
 from hermes_constants import get_hermes_home
-from hermes_cli._subprocess_compat import resolve_windows_git_bash, windows_hide_flags
+from hermes_cli._subprocess_compat import resolve_windows_git_bash, run_text_capture
 from hermes_cli.config import load_config, _expand_env_vars
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
@@ -3427,23 +3427,24 @@ def _run_job_script(script_path: str, timeout_s=None) -> tuple[bool, str]:
     try:
         from tools.environments.local import _sanitize_subprocess_env
 
-        popen_kwargs = {}
-        if sys.platform == "win32":
-            popen_kwargs = {
-                "creationflags": windows_hide_flags(),
-                "encoding": "utf-8",
-                "errors": "replace",
-            }
         env = _sanitize_subprocess_env(os.environ.copy())
         env.update(env_overlay)
-        result = subprocess.run(
+        # run_text_capture, not capture_output=True: a script slot runs an
+        # arbitrary user script, and scripts routinely shell out again (a .sh
+        # that calls curl, a .py that drives git). On Windows the grandchild
+        # inherits the capture pipe handles and keeps the write end open, so
+        # the pipe never reaches EOF — subprocess.run kills only the direct
+        # child (bash/python) at ``script_timeout`` and then blocks forever
+        # re-draining. That wedges the scheduler thread, not just this job.
+        # Temp-file capture has no pipes to drain, so the budget holds.
+        # It also applies CREATE_NO_WINDOW itself (the console-flash flag
+        # windows_hide_flags supplied here) and decodes as utf-8/replace,
+        # which is what the encoding/errors kwargs asked for.
+        result = run_text_capture(
             argv,
-            capture_output=True,
-            text=True,
             timeout=script_timeout,
             cwd=str(path.parent),
             env=env,
-            **popen_kwargs,
         )
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
@@ -4414,10 +4415,11 @@ def _run_job_impl(
             # 0 = unlimited (legacy behavior, opt-in for debugging)
             _session_db = SessionDB()
     except concurrent.futures.TimeoutError:
+        # %g, not %.0f: a sub-second timeout rounded to "0s", and 0 is this
+        # function's sentinel for *unlimited* — so the log claimed the exact
+        # opposite of what had just happened. %g keeps 10.0 as "10" and shows
+        # 0.2 as "0.2".
         logger.error(
-            # %g, not %.0f: 0 is this function's sentinel for UNLIMITED, so
-            # rounding a sub-second bound down to "0s" tells the operator the
-            # opposite of what happened (observed live 2026-08-11 at 0.2s).
             "Job '%s': SessionDB init did not return within %gs — proceeding "
             "without a session store for this run instead of blocking it "
             "forever",

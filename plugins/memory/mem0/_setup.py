@@ -851,9 +851,14 @@ def _install_provider_deps(llm_id: str, embedder_id: str, vector_id: str) -> Non
     for dep in sorted(deps):
         try:
             print(f"  Installing {dep}...")
+            # DEVNULL, not capture_output=True: nothing here reads the output,
+            # and on Windows a capture pipe inherited by a build-backend
+            # grandchild keeps its write end open, so `timeout=60` never fires
+            # — subprocess.run kills only the direct child, then blocks
+            # re-draining a pipe that can no longer reach EOF.
             subprocess.run(
                 ["uv", "pip", "install", "--python", sys.executable, dep],
-                capture_output=True, timeout=60,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60,
             )
             print(f"  ✓ Installed {dep}")
         except Exception:

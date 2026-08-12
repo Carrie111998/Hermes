@@ -43,6 +43,50 @@ Usage:
     hermes claw migrate --dry-run  # Preview migration without changes
 """
 
+# ── Single module identity under `python -m hermes_cli.main` ─────────────
+# runpy executes this file as `__main__` WITHOUT populating
+# `sys.modules["hermes_cli.main"]`, so the first lazy `from hermes_cli.main
+# import ...` anywhere downstream re-executes this entire module body under a
+# second, separate module object. Publishing `__main__` under the real name
+# closes that: every later import resolves to the module that is actually
+# running, and the body executes exactly once.
+#
+# This matters for correctness, not speed. The duplicate import is cheap —
+# ~0.17s end-to-end at the real call site, of which only ~7ms is the body
+# executing (everything it imports is already warm); the rest is re-reading and
+# unmarshalling this file's bytecode. Measured 2026-08-11; next to a ~50s
+# gateway boot it is noise, and it is NOT the 19s gap visible between
+# `gateway.start` and the duplicate `gateway.spawn` in gateway-exit-diag.log —
+# that gap is `from gateway.run import start_gateway`.
+#
+# What it actually cost was correctness: it forked every module-level global in
+# this file into two copies. Whoever mutates `hermes_cli.main.X` at runtime and
+# whoever reads it then disagree, depending only on which module object each
+# side happened to reach. It also re-ran `_apply_profile_override()` mid-flight
+# in an already-booted gateway.
+#
+# The importer that exposed this was `gateway.code_skew._fingerprint()`, called
+# from `start_gateway()`'s first statement — confirmed by a live traceback, not
+# by reading (2026-08-11, `python -m hermes_cli.main gateway run`).
+#
+# Guarded on `__spec__` so it only fires for the `-m hermes_cli.main` launch:
+# a direct `python path/to/main.py` run has `__spec__ is None` and must not
+# claim a package name it was not imported under.
+if __name__ == "__main__" and globals().get("__spec__") is not None:
+    import sys as _sys
+
+    if __spec__.name == "hermes_cli.main" and "hermes_cli.main" not in _sys.modules:
+        _sys.modules["hermes_cli.main"] = _sys.modules["__main__"]
+        # Mirror what the import system would have done, so `import
+        # hermes_cli.main` followed by attribute access still resolves.
+        try:
+            import hermes_cli as _hermes_cli_pkg
+
+            _hermes_cli_pkg.main = _sys.modules["__main__"]
+        except Exception:  # pragma: no cover - package is already imported here
+            pass
+    del _sys
+
 # IMPORTANT: hermes_bootstrap must be the very first import — it sets up
 # UTF-8 stdio on Windows so print()/subprocess children don't hit
 # UnicodeEncodeError with non-ASCII characters.  No-op on POSIX.
@@ -668,7 +712,25 @@ def _apply_profile_override() -> None:
             sys.argv = sys.argv[:start] + sys.argv[start + consume :]
 
 
+_RAW_ARGV_BEFORE_PROFILE_STRIP = list(sys.argv)
 _apply_profile_override()
+
+# Earliest-possible gateway spawn record. `_apply_profile_override()` above is
+# what makes this point viable at all: it resolves HERMES_HOME, so the log's
+# location is finally knowable — and it is still ~50s ahead of `run_gateway()`,
+# which sits behind this module's remaining imports plus plugin discovery
+# (measured 50.6s from process creation on a real Windows boot, 2026-08-11).
+#
+# That window is where a double-spawn's losing racer dies, so it cannot stay
+# unrecorded. Uses a distinct `gateway.spawn` tag and a stdlib-only module so
+# the write costs nothing and cannot perturb `gateway.start` pair detection;
+# the argv gate keeps every non-gateway `hermes` command from writing at all.
+try:
+    from hermes_cli.gateway_diag import emit_gateway_spawn_diag
+
+    emit_gateway_spawn_diag(_RAW_ARGV_BEFORE_PROFILE_STRIP)
+except Exception:
+    pass  # a diagnostic must never block CLI startup
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
@@ -9705,7 +9767,7 @@ def _cold_start_windows_gateway_after_update() -> None:
         return
 
     try:
-        pid = gateway_windows._spawn_detached()
+        pid = gateway_windows._spawn_detached(reason="update:windows-cold-start")
     except Exception as exc:
         logger.debug("Could not cold-start Windows gateway after update: %s", exc)
         return

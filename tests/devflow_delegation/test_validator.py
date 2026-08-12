@@ -9,7 +9,17 @@ def _target(**overrides):
     values = dict(
         repo="fixture",
         checkout_path="/fixture",
-        command_timeout_seconds=5,
+        # Headroom, not a timing assertion: every test using this default
+        # asserts on exit codes and output, never on duration. 5s stopped
+        # being headroom once validation moved to ``run_text_capture`` —
+        # capturing into temp files means CREATE_NO_WINDOW, and on Windows
+        # that allocates a fresh hidden console (a conhost spawn) per child,
+        # measured at ~1.2s on top of an interpreter start that is already
+        # ~1.8s on a loaded box. Trivial `python -c` commands were landing at
+        # 3.8s idle and tipping past 5s under batch load, so these tests
+        # flaked as "timed_out". The one test that genuinely exercises the
+        # timeout path overrides this with its own 1s budget below.
+        command_timeout_seconds=30,
         test_commands=((sys.executable, "-c", "print('tests passed')"),),
         required_checks=("test",),
     )

@@ -30,6 +30,16 @@ if os.name == "posix":
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
 from gateway.config import coerce_systemd_watchdog_seconds, load_gateway_config
+
+# Shared with hermes_cli.main, which writes the earlier `gateway.spawn` record
+# from a point where importing this module would itself cost seconds.
+from hermes_cli.gateway_diag import (
+    SPAWN_SITE_ENV as GATEWAY_SPAWN_SITE_ENV,
+    launch_identity as _launch_identity,
+    process_start_age_s as _process_start_age_s,
+    register_exit_hook as _register_exit_hook,
+    write_diag as _gateway_exit_diag,
+)
 from gateway.status import pid_exists, terminate_pid
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
@@ -4107,6 +4117,11 @@ def _spawn_detached_gateway() -> bool:
                 stdin=subprocess.DEVNULL,
                 stdout=out,
                 stderr=err,
+                # Inherit the ambient environment, plus the spawn-site stamp the
+                # child echoes into its gateway.start diag record. Without it
+                # this path would report a null site, which is supposed to mean
+                # "launched by something that isn't ours".
+                env={**os.environ, GATEWAY_SPAWN_SITE_ENV: "launchd-fallback:detached"},
                 **windows_detach_popen_kwargs(),
             )
     except OSError:
@@ -4992,7 +5007,51 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         force: Skip the supervised-gateway conflict guard and start even when a
                systemd/launchd service is already supervising this profile.
     """
+    # The root-in-official-Docker guard runs before *anything* writes to
+    # $HERMES_HOME — including the diagnostic below. Leaving a root-owned
+    # logs/gateway-exit-diag.log behind is one of the exact breakages the
+    # guard exists to prevent. It's an O(1) geteuid() check, so keeping it
+    # first costs nothing.
     _guard_official_docker_root_gateway()
+
+    # ── Spawn record, written as early as possible ───────────────────────
+    # ``gateway.start`` is the artifact used to detect double-spawns: a PAIR
+    # of records for a single launch is the signature. It used to be emitted
+    # only after the duplicate-process guards, the systemd unit refresh and
+    # ``from gateway.run import start_gateway`` (~23s of imports on its own)
+    # — measured 58s after process creation on 2026-08-10 (PID 46600: created
+    # 23:30:04, record written 23:31:02).
+    #
+    # That delay blinded the diagnostic during precisely the phase a
+    # double-spawn casualty dies in: the losing racer trips
+    # ``_guard_existing_gateway_process_conflict()`` below, which sys.exit(1)s
+    # long before the old write point, so it left no trace in any log (the
+    # 23:31:10 PID 54392 mystery). Write first, then do the expensive work.
+    #
+    # Every field here is knowable at entry: the two console-control values
+    # are pure reads of env + stdin, so they're computed now and reused by
+    # the handler-installation block below rather than splitting the record.
+    #
+    # The launch-attribution fields (_launch_identity) are repeated here rather
+    # than left to `gateway.spawn` alone: this record is what double-spawn
+    # analysis keys on, and it must stand on its own when the earlier record is
+    # missing — a gateway launched by something that never imports
+    # hermes_cli.main writes no `gateway.spawn` at all.
+    try:
+        _stdin_is_tty = bool(sys.stdin and sys.stdin.isatty())
+    except (ValueError, OSError):
+        _stdin_is_tty = False
+    _absorb_windows_console_controls = _windows_gateway_should_absorb_console_controls()
+    _gateway_exit_diag(
+        "gateway.start",
+        replace=replace,
+        argv=list(sys.argv),
+        **_launch_identity(),
+        stdin_is_tty=_stdin_is_tty,
+        absorb_windows_console_controls=_absorb_windows_console_controls,
+        proc_age_s=_process_start_age_s(),
+    )
+
     _guard_named_profile_under_multiplexer(force=force)
     _guard_supervised_gateway_conflict(force=force)
     _guard_existing_gateway_process_conflict(replace=replace)
@@ -5003,11 +5062,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     # needs to obey the banner's "Press Ctrl+C to stop" contract.
     # Service-style launchers set HERMES_GATEWAY_DETACHED=1; older wrappers
     # without the marker are handled by the non-TTY fallback.
-    try:
-        _stdin_is_tty = bool(sys.stdin and sys.stdin.isatty())
-    except (ValueError, OSError):
-        _stdin_is_tty = False
-    _absorb_windows_console_controls = _windows_gateway_should_absorb_console_controls()
+    # (Both values were resolved at function entry for the spawn record.)
     if _absorb_windows_console_controls:
         try:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -5081,46 +5136,18 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     # normal operation, and the emitted lines are opt-in via the
     # HERMES_GATEWAY_EXIT_DIAG env var (default: on while we're still
     # chasing the Windows lifecycle bug).
-    import atexit as _atexit
+    #
+    # The ``gateway.start`` record for this run was already written at
+    # function entry — see the comment there for why it can't wait until here.
+    # The atexit record binds its destination here, at registration, rather
+    # than resolving HERMES_HOME when it fires: the interpreter runs it after
+    # everything else, including a test's env teardown. See
+    # ``gateway_diag.register_exit_hook``.
     import traceback as _traceback
-    from datetime import datetime as _dt, timezone as _tz
 
-    def _exit_diag(tag: str, **extra: object) -> None:
-        if os.environ.get("HERMES_GATEWAY_EXIT_DIAG", "1") != "1":
-            return
-        try:
-            from hermes_constants import get_hermes_home as _ghh
+    _exit_diag = _gateway_exit_diag
 
-            log_dir = _ghh() / "logs"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            ts = _dt.now(_tz.utc).isoformat()
-            line = {
-                "ts": ts,
-                "tag": tag,
-                "pid": os.getpid(),
-                "python": sys.version.split()[0],
-                "platform": sys.platform,
-                **extra,
-            }
-            import json as _json
-
-            with open(log_dir / "gateway-exit-diag.log", "a", encoding="utf-8") as f:
-                f.write(_json.dumps(line, default=str) + "\n")
-        except Exception:
-            pass  # never let the diagnostic itself crash the gateway
-
-    _exit_diag(
-        "gateway.start",
-        replace=replace,
-        argv=sys.argv,
-        stdin_is_tty=_stdin_is_tty,
-        absorb_windows_console_controls=_absorb_windows_console_controls,
-    )
-
-    def _atexit_hook() -> None:
-        _exit_diag("atexit.hook", sys_exc=repr(sys.exc_info()))
-
-    _atexit.register(_atexit_hook)
+    _register_exit_hook()
 
     # Portable, app-level respawn-storm circuit breaker. launchd/systemd have
     # their own throttles, but this backstop works on every platform (and covers
@@ -7321,7 +7348,13 @@ def _gateway_command_inner(args):
             try:
                 gateway_windows.restart()
                 return
-            except (subprocess.CalledProcessError, RuntimeError, OSError):
+            except (subprocess.SubprocessError, RuntimeError, OSError):
+                # SubprocessError, not CalledProcessError: subprocess.
+                # TimeoutExpired is a SIBLING of CalledProcessError, not a
+                # subclass, so a taskkill that blew its budget escaped this
+                # recovery arm entirely and reached the user as a traceback
+                # with the gateway down (2026-08-11).
+                #
                 # restart() spawns the replacement BEFORE it waits for
                 # readiness, so a slow boot makes it raise while a perfectly
                 # healthy gateway is still coming up. The generic path below

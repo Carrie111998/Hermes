@@ -139,10 +139,18 @@ def _run_brv(args: List[str], timeout: int = _QUERY_TIMEOUT,
     env["PATH"] = brv_bin_dir + os.pathsep + env.get("PATH", "")
 
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            timeout=timeout, cwd=effective_cwd, env=env,
-            stdin=subprocess.DEVNULL,
+        # run_text_capture, not capture_output=True: ``brv`` is installed via
+        # `npm install -g byterover-cli`, so on Windows it resolves to brv.cmd,
+        # a batch shim — cmd.exe is the direct child and node.exe is already a
+        # grandchild. The grandchild inherits the capture pipe handles and
+        # holds the write end open, so the pipe never reaches EOF and
+        # ``timeout`` never fires: subprocess.run kills cmd.exe and then blocks
+        # re-draining. This runs on the memory-provider query path, so a hang
+        # here stalls the agent turn.
+        from hermes_cli._subprocess_compat import run_text_capture
+
+        result = run_text_capture(
+            cmd, timeout=timeout, cwd=effective_cwd, env=env,
         )
         stdout = result.stdout.strip()
         stderr = result.stderr.strip()

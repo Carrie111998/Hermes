@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -571,7 +570,14 @@ def test_cli_version_preserves_full_normalized_bounded_stdout(
     def run(*_args: object, **_kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(returncode=0, stdout=next(outputs))
 
-    monkeypatch.setattr(subprocess, "run", run)
+    # Stubbed on the helper, not subprocess.run: `claude`/`codex` are npm
+    # installs, so resolve_cli_executable hands back a .cmd batch shim on
+    # Windows — cmd.exe is the direct child and node.exe is already a
+    # grandchild that would inherit and hold open a capture pipe. _cli_version
+    # therefore runs through run_text_capture.
+    import hermes_cli._subprocess_compat as _spc
+
+    monkeypatch.setattr(_spc, "run_text_capture", run)
 
     assert _cli_version(["codex", "--version"]) == (
         "codex-cli 1.2.3-beta.1+build.7\nrelease channel: preview"

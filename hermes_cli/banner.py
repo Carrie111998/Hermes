@@ -176,10 +176,23 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     Returns 0 if up-to-date, ``UPDATE_AVAILABLE_NO_COUNT`` if behind,
     or ``None`` on failure.
     """
+    # Imported lazily: banner.py is on the `hermes` startup path and this
+    # branch only runs when the update check misses its cache.
+    from hermes_cli._subprocess_compat import run_text_capture
+
     try:
-        result = subprocess.run(
+        # run_text_capture, not capture_output=True: ls-remote against an https
+        # URL forks git-remote-https, and on Windows a credential helper
+        # (git-credential-manager.exe) on top of that. Those grandchildren
+        # inherit the capture pipe handles and hold the write end open, so the
+        # pipe never reaches EOF and the 10s never fires — subprocess.run kills
+        # git and then blocks re-draining. This runs on the CLI banner path, so
+        # the hang wedges `hermes` itself. The +1 conhost spawn the helper
+        # costs is paid only when the update check misses its cache
+        # (_UPDATE_CHECK_CACHE_SECONDS), not on every invocation.
+        result = run_text_capture(
             ["git", "ls-remote", _UPSTREAM_REPO_URL, "refs/heads/main"],
-            capture_output=True, text=True, timeout=10,
+            timeout=10,
         )
     except Exception:
         return None
@@ -217,9 +230,17 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         if is_shallow:
             fetch_args += ["--depth", "1"]
         fetch_args.append("--quiet")
+        # DEVNULL, not capture_output=True: nothing reads this output (the
+        # refs are re-read by _git_stdout below), and a network fetch forks
+        # git-remote-https plus a credential helper. On Windows those
+        # grandchildren inherit the capture pipe handles and hold the write end
+        # open, so the pipe never reaches EOF and the 10s here never bounds the
+        # call. Discarding the output removes the pipe entirely — no helper, no
+        # conhost cost, and the timeout works again.
         subprocess.run(
             fetch_args,
-            capture_output=True, timeout=10,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, timeout=10,
             cwd=str(repo_dir),
         )
     except Exception:
@@ -503,8 +524,34 @@ def get_latest_release_tag(repo_dir: Optional[Path] = None) -> Optional[tuple]:
     return _latest_release_cache
 
 
+_version_label_cache: Optional[str] = None
+
+
 def format_banner_version_label() -> str:
-    """Return the version label shown in the startup banner title."""
+    """Return the version label shown in the startup banner title.
+
+    Computed once per process. ``get_git_banner_state()`` shells out to git on
+    every call — three subprocesses, each guarded by a 5s timeout whose failure
+    is swallowed into a None/fallback state. Process spawn is slow and
+    load-sensitive on Windows, so under load one call could lose that race and
+    silently return the bare ``Hermes Agent vX (date)`` while another returned
+    the full ``· upstream … · local … (+N carried commits)`` form. Two callers
+    in the same process then disagreed about the version string — which is how
+    the nightly gate caught this, via test_version_command comparing the
+    /version command's output against a second call to this function.
+
+    Caching is correct as well as cheaper: the git state this describes cannot
+    change during the process's lifetime, and a banner label that differs
+    between two reads in one process is simply wrong.
+    """
+    global _version_label_cache  # noqa: PLW0603 — process-wide lazy singleton
+    if _version_label_cache is not None:
+        return _version_label_cache
+    _version_label_cache = _compute_banner_version_label()
+    return _version_label_cache
+
+
+def _compute_banner_version_label() -> str:
     base = f"Hermes Agent v{VERSION} ({RELEASE_DATE})"
     state = get_git_banner_state()
     if not state:
