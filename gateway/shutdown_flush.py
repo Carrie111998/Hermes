@@ -365,6 +365,12 @@ def _transcript_append_kwargs(
     def _if_assistant(key: str) -> Any:
         return message.get(key) if assistant_only else None
 
+    # Only a *missing* timestamp falls back to the payload clock.  A truthiness
+    # test would rewrite epoch 0, which is a valid timestamp.
+    timestamp = message.get("timestamp")
+    if timestamp is None:
+        timestamp = payload.get("ts")
+
     return {
         "session_id": session_id,
         "role": role,
@@ -381,7 +387,7 @@ def _transcript_append_kwargs(
             message.get("platform_message_id") or message.get("message_id")
         ),
         "observed": bool(message.get("observed")),
-        "timestamp": message.get("timestamp") or payload.get("ts"),
+        "timestamp": timestamp,
         # The api_content sidecar is the exact bytes sent to the API for this
         # row; gateway/session.py requires it to survive "any gateway-side
         # persistence path or the next turn's replay diverges at this row".
