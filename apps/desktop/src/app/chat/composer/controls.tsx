@@ -376,8 +376,7 @@ function DictationButton({
   const c = t.composer
   const active = state.active || status !== 'idle'
 
-  const aria =
-    status === 'recording' ? c.stopDictation : status === 'transcribing' ? c.transcribingDictation : c.voiceDictation
+  const aria = status === 'idle' ? c.voiceDictation : c.stopDictation
 
   return (
     <Tip label={aria}>
@@ -392,7 +391,7 @@ function DictationButton({
           status === 'transcribing' && 'bg-primary/10 text-primary'
         )}
         data-active={active}
-        disabled={disabled || !state.enabled || status === 'transcribing'}
+        disabled={disabled || !state.enabled}
         onClick={() => {
           triggerHaptic(active ? 'close' : 'open')
           onToggle()

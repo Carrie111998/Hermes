@@ -4168,6 +4168,7 @@ function fetchJson(url, token, options: any = {}) {
       }
     )
 
+    options.onRequest?.(() => req.destroy(new Error('Request canceled')))
     req.on('error', reject)
     req.setTimeout(timeoutMs, () => {
       req.destroy(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
@@ -6056,6 +6057,7 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
     } as any)
 
     setJsonRequestHeaders(request)
+    options.onRequest?.(() => request.abort())
 
     let timedOut = false
 
@@ -10717,7 +10719,32 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
   return { ...(base as any), sessions: merged.slice(offset, offset + limit), total, profile_totals: profileTotals }
 }
 
-ipcMain.handle('hermes:api', async (_event, request) => {
+const activeApiRequests = new Map<string, () => void>()
+const canceledApiRequests = new Set<string>()
+
+function apiRequestKey(senderId: number, requestId: unknown) {
+  const id = typeof requestId === 'string' ? requestId.slice(0, 128) : ''
+
+  return id ? `${senderId}:${id}` : ''
+}
+
+ipcMain.on('hermes:api:cancel', (event, requestId) => {
+  const key = apiRequestKey(event.sender.id, requestId)
+
+  if (!key) {
+    return
+  }
+
+  const cancel = activeApiRequests.get(key)
+
+  if (cancel) {
+    cancel()
+  } else {
+    canceledApiRequests.add(key)
+  }
+})
+
+ipcMain.handle('hermes:api', async (event, request) => {
   // Remote-profile session requests would otherwise hit the local primary off
   // each profile's on-disk state.db — fine for local profiles, but a remote
   // profile's sessions live on its remote host, so the UI's IDs 404 (or mutations
@@ -10742,6 +10769,23 @@ ipcMain.handle('hermes:api', async (_event, request) => {
   const requestPath = pathWithGlobalRemoteProfile(request.path, profile, profileRouteOptions(profile))
 
   const url = `${connection.baseUrl}${requestPath}`
+  const requestKey = apiRequestKey(event.sender.id, request?.requestId)
+  const onRequest = requestKey
+    ? (cancel: () => void) => {
+        activeApiRequests.set(requestKey, cancel)
+
+        if (canceledApiRequests.delete(requestKey)) {
+          cancel()
+        }
+      }
+    : undefined
+  const finish = <T>(promise: Promise<T>) =>
+    promise.finally(() => {
+      if (requestKey) {
+        activeApiRequests.delete(requestKey)
+        canceledApiRequests.delete(requestKey)
+      }
+    })
 
   // OAuth gateways authenticate REST via EITHER a native bearer token
   // (cookieless RFC 8252 flow) OR the HttpOnly session cookie held in the OAuth
@@ -10765,27 +10809,36 @@ ipcMain.handle('hermes:api', async (_event, request) => {
     const restAuth = resolveOauthRestAuth(nativeAt)
 
     if (restAuth.kind === 'bearer') {
-      return fetchJson(url, null, {
+      return finish(
+        fetchJson(url, null, {
+          method: request?.method,
+          body: request?.body,
+          timeoutMs,
+          bearer: restAuth.token,
+          onRequest
+        })
+      )
+    }
+
+    return finish(
+      fetchJsonViaOauthSession(url, {
         method: request?.method,
         body: request?.body,
         timeoutMs,
-        bearer: restAuth.token
+        onRequest
       })
-    }
-
-    return fetchJsonViaOauthSession(url, {
-      method: request?.method,
-      body: request?.body,
-      timeoutMs
-    })
+    )
   }
 
-  return fetchJson(url, connection.token, {
-    method: request?.method,
-    body: request?.body,
-    upload: request?.upload,
-    timeoutMs
-  })
+  return finish(
+    fetchJson(url, connection.token, {
+      method: request?.method,
+      body: request?.body,
+      upload: request?.upload,
+      timeoutMs,
+      onRequest
+    })
+  )
 })
 
 // One deduper per cross-window cue — the choke point every window shares. Main
