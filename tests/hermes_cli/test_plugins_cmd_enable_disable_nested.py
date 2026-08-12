@@ -177,12 +177,13 @@ class TestEnableDisableNested:
 
     @patch("hermes_cli.config.save_config")
     @patch("hermes_cli.config.load_config")
+    @patch("hermes_cli.plugins_cmd._toolsets_used_outside_plugin", return_value=set())
     @patch(
         "hermes_cli.plugins_cmd._get_plugin_toolset_keys",
         return_value=["demo-admin", "demo-read"],
     )
     def test_toggle_synchronizes_every_plugin_toolset(
-        self, mock_keys, mock_load, mock_save,
+        self, mock_keys, mock_shared, mock_load, mock_save,
     ):
         from hermes_cli.plugins_cmd import _toggle_plugin_toolset
 
@@ -220,6 +221,46 @@ class TestEnableDisableNested:
 
         assert config["platform_toolsets"]["cli"] == ["web"]
         assert config["platform_toolsets"]["telegram"] == ["web"]
+        mock_save.assert_called_once_with(config)
+
+    @patch("hermes_cli.config.save_config")
+    @patch("hermes_cli.config.load_config")
+    @patch(
+        "hermes_cli.plugins_cmd._toolsets_used_outside_plugin",
+        return_value={"shared"},
+    )
+    @patch(
+        "hermes_cli.plugins_cmd._get_plugin_toolset_keys",
+        return_value=["current", "shared"],
+    )
+    def test_disable_unions_remembered_keys_and_retains_shared_toolsets(
+        self, mock_keys, mock_shared, mock_load, mock_save,
+    ):
+        from hermes_cli.plugins_cmd import _toggle_plugin_toolset
+
+        config = {
+            "plugins": {
+                "entries": {
+                    "demo": {"toolsets": ["obsolete", "shared"]},
+                },
+            },
+            "platform_toolsets": {
+                "cli": ["web", "obsolete", "current", "shared"],
+            },
+        }
+        mock_load.return_value = config
+
+        _toggle_plugin_toolset("demo", enable=False)
+
+        mock_shared.assert_called_once_with(
+            "demo", {"current", "obsolete", "shared"},
+        )
+        assert config["plugins"]["entries"]["demo"]["toolsets"] == [
+            "current",
+            "obsolete",
+            "shared",
+        ]
+        assert config["platform_toolsets"]["cli"] == ["web", "shared"]
         mock_save.assert_called_once_with(config)
 
     @patch("hermes_cli.plugins_cmd._resolve_tool_override_grant")

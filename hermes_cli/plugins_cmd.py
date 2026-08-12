@@ -1972,6 +1972,35 @@ def _get_plugin_toolset_keys(name: str) -> list[str]:
     return sorted(toolset_keys)
 
 
+def _toolsets_used_outside_plugin(name: str, candidates: set[str]) -> set[str]:
+    """Return candidate toolsets that still contain tools not owned by *name*."""
+    if not candidates:
+        return set()
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+        from tools.registry import registry
+
+        manager = get_plugin_manager()
+        owned_tools: set[str] = set()
+        for key, loaded in manager._plugins.items():
+            if key == name or loaded.manifest.name == name:
+                owned_tools.update(loaded.tools_registered)
+                break
+
+        shared: set[str] = set()
+        for toolset_key in candidates:
+            if any(
+                tool_name not in owned_tools
+                for tool_name in registry.get_tool_names_for_toolset(toolset_key)
+            ):
+                shared.add(toolset_key)
+        return shared
+    except Exception:
+        # Fail closed: if ownership cannot be established, keep the toolset
+        # exposed rather than hiding unrelated built-in or plugin tools.
+        return set(candidates)
+
+
 def _toggle_plugin_toolset(name: str, *, enable: bool) -> None:
     """Add or remove a plugin's toolset from platform_toolsets for all platforms.
 
@@ -1985,22 +2014,27 @@ def _toggle_plugin_toolset(name: str, *, enable: bool) -> None:
     entry = entries.setdefault(name, {}) if isinstance(entries, dict) else {}
 
     mapping_changed = False
-    toolset_keys = _get_plugin_toolset_keys(name)
+    remembered = entry.get("toolsets") if isinstance(entry, dict) else None
+    remembered_keys = {
+        key for key in remembered if isinstance(key, str) and key
+    } if isinstance(remembered, list) else set()
+    discovered_keys = set(_get_plugin_toolset_keys(name))
+    toolset_keys = discovered_keys if enable else discovered_keys | remembered_keys
     if toolset_keys and isinstance(entry, dict):
         # Preserve the plugin→toolsets mapping for future disable/repair calls,
         # when disabled plugin code is deliberately not imported.
-        if entry.get("toolsets") != toolset_keys:
-            entry["toolsets"] = toolset_keys
+        remembered_value = sorted(toolset_keys)
+        if entry.get("toolsets") != remembered_value:
+            entry["toolsets"] = remembered_value
             mapping_changed = True
-    elif not enable and isinstance(entry, dict):
-        remembered = entry.get("toolsets")
-        toolset_keys = (
-            sorted({key for key in remembered if isinstance(key, str) and key})
-            if isinstance(remembered, list)
-            else []
-        )
     if not toolset_keys:
         return
+
+    removable_keys = (
+        toolset_keys - _toolsets_used_outside_plugin(name, toolset_keys)
+        if not enable
+        else set()
+    )
 
     platform_toolsets = config.get("platform_toolsets")
     if not isinstance(platform_toolsets, dict):
@@ -2012,19 +2046,19 @@ def _toggle_plugin_toolset(name: str, *, enable: bool) -> None:
         if not isinstance(ts_list, list):
             continue
         if enable:
-            for toolset_key in toolset_keys:
+            for toolset_key in sorted(toolset_keys):
                 if toolset_key not in ts_list:
                     ts_list.append(toolset_key)
                     changed = True
         else:
-            filtered = [key for key in ts_list if key not in toolset_keys]
+            filtered = [key for key in ts_list if key not in removable_keys]
             if filtered != ts_list:
                 ts_list[:] = filtered
                 changed = True
 
     # If enabling and no platforms have toolset lists yet, add to "cli" at minimum
     if enable and not changed and not platform_toolsets:
-        platform_toolsets["cli"] = list(toolset_keys)
+        platform_toolsets["cli"] = sorted(toolset_keys)
         changed = True
 
     if changed or mapping_changed:
