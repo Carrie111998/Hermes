@@ -743,6 +743,18 @@ class A2AAdapter(BasePlatformAdapter):
         protocol.metrics.inbound_total += 1
 
         rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
+        # Bind the session identity for this A2A context so session-aware
+        # tooling (kanban _maybe_auto_subscribe, notifier routing) can send
+        # notifications back to the peer's context. os.environ is used
+        # deliberately: the forwarded-profile path spawns a subprocess that
+        # must inherit these, and get_session_env falls back to os.environ
+        # when no ContextVar is bound.
+        try:
+            os.environ["HERMES_SESSION_PLATFORM"] = "a2a"
+            os.environ["HERMES_SESSION_CHAT_ID"] = context_id
+            os.environ["HERMES_SESSION_THREAD_ID"] = task_id
+        except Exception as exc:
+            logger.warning("A2A: set_session_env unavailable: %s", exc)
         # Remember which peer owns this context so an out-of-band send with
         # no pending waiter can be pushed back to the caller's session.
         # Bounded: drop the oldest entry past _MAX_CONTEXT_PEERS (dicts keep
