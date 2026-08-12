@@ -85,6 +85,17 @@ describe('UsageView', () => {
     expect(renderedSurface.querySelector('[title]')).toBeNull()
   })
 
+  it('delegates vertical scrolling to the surrounding pane owner', async () => {
+    renderUsage()
+
+    const heading = await screen.findByRole('heading', { name: 'Usage deck' })
+    const usageSurface = heading.closest('main')
+
+    expect(usageSurface).toBeTruthy()
+    expect(usageSurface?.classList.contains('overflow-y-auto')).toBe(false)
+    expect(usageSurface?.classList.contains('overflow-auto')).toBe(false)
+  })
+
   it('loads all telemetry surfaces and renders macro plus cost-truth data', async () => {
     renderUsage()
 
@@ -215,6 +226,8 @@ describe('UsageView', () => {
           overview: {
             ...usageOverviewFixture.overview,
             estimated_cost: 2.17,
+            included_cost_sessions: 1,
+            unknown_cost_sessions: 0,
             cost_buckets: {
               estimated: { sessions: 1, cost_usd: 2.17, input_tokens: 18_000, output_tokens: 7_000 },
               included: {
@@ -248,6 +261,8 @@ describe('UsageView', () => {
           overview: {
             ...usageOverviewFixture.overview,
             estimated_cost: 2.17,
+            included_cost_sessions: 0,
+            unknown_cost_sessions: 0,
             cost_buckets: {
               estimated: {
                 sessions: 1,
@@ -326,6 +341,8 @@ describe('UsageView', () => {
           overview: {
             ...usageOverviewFixture.overview,
             estimated_cost: 2.17,
+            included_cost_sessions: 1,
+            unknown_cost_sessions: 0,
             cost_buckets: {
               estimated: { sessions: 1, cost_usd: 2.17, input_tokens: 18_000, output_tokens: 7_000 },
               included: {

@@ -18,6 +18,8 @@ export type UsageTotals = {
   total_tokens: number | null
   cost: number | null
   actual_cost: number | null
+  included_cost_sessions: number | null
+  unknown_cost_sessions: number | null
   tool_calls: number | null
   skill_calls: number | null
   cost_buckets: {
@@ -79,7 +81,7 @@ export type NamedUsage = {
 export type UsageReport = {
   empty: boolean
   generated_at: string | null
-  period_days: number
+  period_days: number | null
   source: string | null
   days: DailyUsage[]
   models: ModelUsage[]
@@ -92,7 +94,7 @@ export type UsageReport = {
 }
 
 export type UsageOverviewResponse = {
-  days: number
+  days?: number
   source_filter: string | null
   empty: boolean
   generated_at?: number
@@ -133,33 +135,33 @@ export type UsageOverviewResponse = {
     cost_status?: string
     has_pricing?: boolean
   }>
-  platforms: Array<{
+  platforms?: Array<{
     platform: string
-    sessions: number
-    total_tokens: number
+    sessions?: number
+    total_tokens?: number
   }>
-  tools: Array<{
+  tools?: Array<{
     tool: string
-    count: number
-    percentage: number
+    count?: number
+    percentage?: number
   }>
-  skills: {
-    summary: {
-      total_skill_loads: number
-      total_skill_edits: number
-      total_skill_actions: number
-      distinct_skills_used: number
+  skills?: {
+    summary?: {
+      total_skill_loads?: number
+      total_skill_edits?: number
+      total_skill_actions?: number
+      distinct_skills_used?: number
     }
-    top_skills: Array<{
+    top_skills?: Array<{
       skill: string
-      total_count: number
+      total_count?: number
     }>
   }
   activity: Partial<{
-    by_hour: Array<{ hour: number; count: number }>
+    by_hour: Array<{ hour?: number; count?: number }>
   }>
-  top_sessions: TopSession[]
-  daily_series: Array<{
+  top_sessions?: TopSession[]
+  daily_series?: Array<{
     date: string
     sessions?: number
     input_tokens?: number

@@ -138,7 +138,20 @@ export function reportMarketEquivalent(report: UsageReport): number | null {
   const included = report.totals.cost_buckets.included
   const unknown = report.totals.cost_buckets.unknown
 
-  if (report.totals.cost == null || (unknown?.sessions ?? 0) > 0) {
+  const expectedEstimatedSessions =
+    report.totals.sessions != null &&
+    report.totals.included_cost_sessions != null &&
+    report.totals.unknown_cost_sessions != null
+      ? Math.max(0, report.totals.sessions - report.totals.included_cost_sessions - report.totals.unknown_cost_sessions)
+      : null
+
+  if (
+    report.totals.cost == null ||
+    (unknown?.sessions ?? 0) > 0 ||
+    (report.totals.unknown_cost_sessions ?? 0) > 0 ||
+    ((report.totals.included_cost_sessions ?? 0) > 0 && !included) ||
+    ((expectedEstimatedSessions ?? 0) > 0 && !estimated)
+  ) {
     return null
   }
 

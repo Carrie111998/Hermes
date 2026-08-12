@@ -1,9 +1,5 @@
 import type { CostStatus, UsageCostBucket, UsageOverviewResponse, UsageReport } from './types'
 
-function numberOrZero(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0
-}
-
 function numberOrNull(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
@@ -95,6 +91,21 @@ export function normalizeUsageOverview(response: UsageOverviewResponse): UsageRe
   })
 
   const costBuckets = overview.cost_buckets
+  const estimatedBucket = normalizeCostBucket(costBuckets?.estimated)
+  const includedBucket = normalizeCostBucket(costBuckets?.included)
+  const unknownBucket = normalizeCostBucket(costBuckets?.unknown)
+  const includedCostSessions = numberOrNull(overview.included_cost_sessions)
+  const unknownCostSessions = numberOrNull(overview.unknown_cost_sessions)
+  const rawOverviewCost = numberOrNull(overview.estimated_cost)
+
+  const hasPricedOrIncludedCoverage =
+    (estimatedBucket?.sessions ?? 0) > 0 ||
+    (includedBucket?.sessions ?? 0) > 0 ||
+    (includedCostSessions ?? 0) > 0 ||
+    models.some(model => model.cost_status === 'estimated' || model.cost_status === 'included')
+
+  const overviewCost =
+    rawOverviewCost == null || (rawOverviewCost === 0 && !hasPricedOrIncludedCoverage) ? null : rawOverviewCost
 
   return {
     empty,
@@ -102,7 +113,7 @@ export function normalizeUsageOverview(response: UsageOverviewResponse): UsageRe
       typeof response.generated_at === 'number' && Number.isFinite(response.generated_at)
         ? new Date(response.generated_at * 1000).toISOString()
         : null,
-    period_days: numberOrZero(response.days),
+    period_days: numberOrNull(response.days),
     source: response.source_filter ?? null,
     days: (response.daily_series ?? []).map(day => ({
       date: day.date,
@@ -114,21 +125,31 @@ export function normalizeUsageOverview(response: UsageOverviewResponse): UsageRe
       cost: numberOrNull(day.estimated_cost_usd)
     })),
     models,
-    platforms: (response.platforms ?? []).map(platform => ({
-      platform: platform.platform || 'unknown',
-      sessions: numberOrZero(platform.sessions),
-      total_tokens: numberOrZero(platform.total_tokens)
-    })),
-    activity: (response.activity?.by_hour ?? []).map(entry => ({
-      hour: numberOrZero(entry.hour),
-      sessions: numberOrZero(entry.count)
-    })),
+    platforms: (response.platforms ?? []).flatMap(platform => {
+      const sessions = numberOrNull(platform.sessions)
+      const totalTokens = numberOrNull(platform.total_tokens)
+
+      return sessions == null || totalTokens == null
+        ? []
+        : [{ platform: platform.platform || 'unknown', sessions, total_tokens: totalTokens }]
+    }),
+    activity: (response.activity?.by_hour ?? []).flatMap(entry => {
+      const hour = numberOrNull(entry.hour)
+      const sessions = numberOrNull(entry.count)
+
+      return hour == null || sessions == null ? [] : [{ hour, sessions }]
+    }),
     top_sessions: response.top_sessions ?? [],
-    tools: (response.tools ?? []).map(tool => ({ name: tool.tool || 'unknown', count: numberOrZero(tool.count) })),
-    skills: (response.skills?.top_skills ?? []).map(skill => ({
-      name: skill.skill || 'unknown',
-      count: numberOrZero(skill.total_count)
-    })),
+    tools: (response.tools ?? []).flatMap(tool => {
+      const count = numberOrNull(tool.count)
+
+      return count == null ? [] : [{ name: tool.tool || 'unknown', count }]
+    }),
+    skills: (response.skills?.top_skills ?? []).flatMap(skill => {
+      const count = numberOrNull(skill.total_count)
+
+      return count == null ? [] : [{ name: skill.skill || 'unknown', count }]
+    }),
     totals: {
       sessions: overviewMetric(overview.total_sessions, empty),
       api_calls:
@@ -140,17 +161,19 @@ export function normalizeUsageOverview(response: UsageOverviewResponse): UsageRe
       cache_read_tokens: overviewMetric(overview.total_cache_read_tokens, empty),
       cache_write_tokens: overviewMetric(overview.total_cache_write_tokens, empty),
       total_tokens: overviewMetric(overview.total_tokens, empty),
-      cost: numberOrNull(overview.estimated_cost),
+      cost: overviewCost,
       actual_cost:
         overview.actual_cost_available === true
           ? numberOrNull(overview.actual_cost)
           : null,
+      included_cost_sessions: includedCostSessions,
+      unknown_cost_sessions: unknownCostSessions,
       tool_calls: overviewMetric(overview.total_tool_calls, empty),
       skill_calls: overviewMetric(response.skills?.summary?.total_skill_actions, empty),
       cost_buckets: {
-        estimated: normalizeCostBucket(costBuckets?.estimated),
-        included: normalizeCostBucket(costBuckets?.included),
-        unknown: normalizeCostBucket(costBuckets?.unknown)
+        estimated: estimatedBucket,
+        included: includedBucket,
+        unknown: unknownBucket
       }
     }
   }

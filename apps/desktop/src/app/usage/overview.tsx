@@ -11,6 +11,7 @@ import { usageDarkStyle } from './dark-style'
 import {
   cacheRatio,
   dailyMetricValue,
+  EMPTY_VALUE,
   formatCompact,
   formatCurrency,
   formatNumber,
@@ -78,7 +79,7 @@ export function MacroStrip({ meter, meterUnavailable, report }: MacroStripProps)
       <StatCell
         icon={<CreditCard className="size-3.5" />}
         label={u.macro.marketCost}
-        meta={u.macro.rangeEstimate(report.period_days)}
+        meta={report.period_days == null ? EMPTY_VALUE : u.macro.rangeEstimate(report.period_days)}
         tone="estimated"
         value={formatCurrency(marketEquivalent, locale)}
       />
@@ -107,13 +108,13 @@ export function MacroStrip({ meter, meterUnavailable, report }: MacroStripProps)
       <StatCell
         icon={<Activity className="size-3.5" />}
         label={u.macro.calls}
-        meta={u.macro.range(report.period_days)}
+        meta={report.period_days == null ? EMPTY_VALUE : u.macro.range(report.period_days)}
         value={formatNumber(report.totals.api_calls, locale)}
       />
       <StatCell
         icon={<Layers3 className="size-3.5" />}
         label={u.macro.sessions}
-        meta={u.macro.range(report.period_days)}
+        meta={report.period_days == null ? EMPTY_VALUE : u.macro.range(report.period_days)}
         value={formatNumber(report.totals.sessions, locale)}
       />
       <StatCell
@@ -194,14 +195,16 @@ function BurnChart({ metric, report }: { metric: UsageMetric; report: UsageRepor
           <p className="font-mono text-2xl font-semibold tabular-nums text-foreground">
             {metricLabel(metric, total, locale)}
           </p>
-          <p className="text-[11px] text-muted-foreground">{u.chart.periodTotal(report.period_days)}</p>
+          <p className="text-[11px] text-muted-foreground">
+            {report.period_days == null ? EMPTY_VALUE : u.chart.periodTotal(report.period_days)}
+          </p>
         </div>
         <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
           {u.chart.cumulativeTrace}
         </p>
       </div>
       <svg
-        aria-label={u.chart.aria(metric, report.period_days)}
+        aria-label={report.period_days == null ? u.chart.title : u.chart.aria(metric, report.period_days)}
         className="h-48 w-full overflow-visible"
         preserveAspectRatio="none"
         role="img"
@@ -417,7 +420,9 @@ function CostTruth({ meter, meterUnavailable, report }: MacroStripProps) {
         ))}
       </div>
       <p className="mt-3 text-[10px] leading-4 text-muted-foreground">
-        {u.cost.rangeComparison(formatCurrency(marketEquivalent, locale), report.period_days)}
+        {report.period_days == null
+          ? EMPTY_VALUE
+          : u.cost.rangeComparison(formatCurrency(marketEquivalent, locale), report.period_days)}
       </p>
     </div>
   )

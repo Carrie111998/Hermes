@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { usageOverviewFixture } from './fixtures.test-util'
+import { reportMarketEquivalent } from './format'
 import { normalizeUsageOverview } from './normalize'
 import type { UsageOverviewResponse } from './types'
 
@@ -106,5 +107,87 @@ describe('normalizeUsageOverview', () => {
 
     expect(omitted.totals.cost_buckets.included?.at_market_cost_usd).toBeUndefined()
     expect(malformed.totals.cost_buckets.included?.at_market_cost_usd).toBeNull()
+  })
+
+  it('keeps unknown-only cost unavailable while preserving a proven included zero', () => {
+    const unknownOnly = normalizeUsageOverview({
+      ...usageOverviewFixture,
+      models: [{ model: 'unknown-route', cost: 0, cost_status: 'unknown', has_pricing: false }],
+      overview: {
+        ...usageOverviewFixture.overview,
+        estimated_cost: 0,
+        included_cost_sessions: 0,
+        unknown_cost_sessions: 1,
+        cost_buckets: {
+          estimated: { sessions: 0, cost_usd: 0, input_tokens: 0, output_tokens: 0 },
+          included: { sessions: 0, cost_usd: 0, input_tokens: 0, output_tokens: 0 },
+          unknown: { sessions: 1, cost_usd: 0, input_tokens: 1_000, output_tokens: 500 }
+        }
+      }
+    })
+
+    const includedOnly = normalizeUsageOverview({
+      ...usageOverviewFixture,
+      models: [{ model: 'included-route', cost: 0, cost_status: 'included', has_pricing: true }],
+      overview: {
+        ...usageOverviewFixture.overview,
+        estimated_cost: 0,
+        included_cost_sessions: 1,
+        unknown_cost_sessions: 0,
+        cost_buckets: {
+          estimated: { sessions: 0, cost_usd: 0, input_tokens: 0, output_tokens: 0 },
+          included: {
+            sessions: 1,
+            cost_usd: 0,
+            input_tokens: 1_000_000,
+            output_tokens: 500_000,
+            at_market_cost_usd: 20
+          },
+          unknown: { sessions: 0, cost_usd: 0, input_tokens: 0, output_tokens: 0 }
+        }
+      }
+    })
+
+    expect(unknownOnly.totals.cost).toBeNull()
+    expect(reportMarketEquivalent(unknownOnly)).toBeNull()
+    expect(includedOnly.totals.cost).toBe(0)
+    expect(reportMarketEquivalent(includedOnly)).toBe(20)
+  })
+
+  it('omits malformed secondary telemetry instead of fabricating zeros', () => {
+    const report = normalizeUsageOverview({
+      ...usageOverviewFixture,
+      days: Number.NaN,
+      activity: { by_hour: [{ hour: Number.NaN, count: 3 }, { hour: 4, count: Number.NaN }] },
+      platforms: [{ platform: 'desktop' }],
+      skills: { summary: {}, top_skills: [{ skill: 'invalid' }] },
+      tools: [{ tool: 'invalid' }]
+    })
+
+    expect(report.period_days).toBeNull()
+    expect(report.activity).toEqual([])
+    expect(report.platforms).toEqual([])
+    expect(report.skills).toEqual([])
+    expect(report.tools).toEqual([])
+    expect(report.totals.skill_calls).toBeNull()
+  })
+
+  it('fails closed when included-session evidence exists without its comparison bucket', () => {
+    const report = normalizeUsageOverview({
+      ...usageOverviewFixture,
+      overview: {
+        ...usageOverviewFixture.overview,
+        estimated_cost: 2.17,
+        included_cost_sessions: 1,
+        unknown_cost_sessions: 0,
+        cost_buckets: {
+          estimated: { sessions: 1, cost_usd: 2.17, input_tokens: 18_000, output_tokens: 7_000 },
+          unknown: { sessions: 0, cost_usd: 0, input_tokens: 0, output_tokens: 0 }
+        } as UsageOverviewResponse['overview']['cost_buckets']
+      }
+    })
+
+    expect(report.totals.cost_buckets.included).toBeNull()
+    expect(reportMarketEquivalent(report)).toBeNull()
   })
 })

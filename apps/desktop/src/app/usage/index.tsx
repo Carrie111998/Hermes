@@ -164,7 +164,7 @@ export function UsageView({ requestGateway }: UsageViewProps) {
     const message = overviewQuery.error instanceof Error ? overviewQuery.error.message : u.error.description
 
     return (
-      <main className="usage-deck dark h-full min-h-0 overflow-y-auto" style={darkStyle}>
+      <main className="usage-deck dark min-h-full" style={darkStyle}>
         <div className={`mx-auto w-full ${PAGE_MAX_W} ${PAGE_INSET_X} py-6 pb-24`}>
           <ErrorState description={message} title={u.error.title}>
             <Button className="mx-auto" onClick={() => void overviewQuery.refetch()} variant="outline">
@@ -180,7 +180,7 @@ export function UsageView({ requestGateway }: UsageViewProps) {
   const report = overviewQuery.data
 
   return (
-    <main className="usage-deck dark h-full min-h-0 overflow-y-auto" style={darkStyle}>
+    <main className="usage-deck dark min-h-full" style={darkStyle}>
       <div className={`mx-auto w-full ${PAGE_MAX_W} ${PAGE_INSET_X} py-4 pb-24`}>
         <header className="mb-4 border-b border-border pb-4">
           <div className="flex flex-wrap items-start justify-between gap-4">
