@@ -1419,6 +1419,29 @@ def _notify_context_engine_turn_complete(
         )
 
 
+def _invalid_json_recovery_content(tool_calls, invalid_json_args):
+    """Map each tool call to its recovery message, keyed by call index.
+
+    ``invalid_json_args`` is a list of ``(index, name, error)``. A valid
+    sibling call that happens to share a name with an invalid call must NOT
+    inherit the invalid call's error — matching is by index, never by name
+    (two parallel calls to the same tool used to collide).
+    """
+    invalid_indices = {i for i, _, _ in invalid_json_args}
+    results = {}
+    for idx, tc in enumerate(tool_calls):
+        if idx in invalid_indices:
+            err = next(e for i, _, e in invalid_json_args if i == idx)
+            results[idx] = (
+                f"Error: Invalid JSON arguments. {err}. "
+                f"For tools with no required parameters, use an empty object: {{}}. "
+                f"Please retry with valid JSON."
+            )
+        else:
+            results[idx] = "Skipped: other tool call in this response had invalid JSON."
+    return results
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -6457,7 +6480,7 @@ def run_conversation(
                 # Validate tool call arguments are valid JSON
                 # Handle empty strings as empty objects (common model quirk)
                 invalid_json_args = []
-                for tc in assistant_message.tool_calls:
+                for _idx, tc in enumerate(assistant_message.tool_calls):
                     args = tc.function.arguments
                     if isinstance(args, (dict, list)):
                         tc.function.arguments = json.dumps(args)
@@ -6480,7 +6503,7 @@ def run_conversation(
                             # invalid-name error result below. Don't let its
                             # broken args trigger the whole-turn JSON retry.
                             continue
-                        invalid_json_args.append((tc.function.name, str(e)))
+                        invalid_json_args.append((_idx, tc.function.name, str(e)))
                 
                 if invalid_json_args:
                     # Check if the invalid JSON is due to truncation rather
@@ -6491,8 +6514,8 @@ def run_conversation(
                     # (after stripping whitespace) are cut off mid-stream.
                     _truncated = any(
                         not (tc.function.arguments or "").rstrip().endswith(("}", "]"))
-                        for tc in assistant_message.tool_calls
-                        if tc.function.name in {n for n, _ in invalid_json_args}
+                        for _tidx, tc in enumerate(assistant_message.tool_calls)
+                        if _tidx in {i for i, _, _ in invalid_json_args}
                     )
                     if _truncated:
                         agent._vprint(
@@ -6519,7 +6542,7 @@ def run_conversation(
                     # Track retries for invalid JSON arguments
                     agent._invalid_json_retries += 1
 
-                    tool_name, error_msg = invalid_json_args[0]
+                    tool_name, error_msg = invalid_json_args[0][1], invalid_json_args[0][2]
                     agent._buffer_vprint(f"⚠️  Invalid JSON in tool call arguments for '{tool_name}': {error_msg}")
 
                     if agent._invalid_json_retries < 3:
@@ -6537,17 +6560,11 @@ def run_conversation(
                         messages.append(recovery_assistant)
                         
                         # Respond with tool error results for each tool call
-                        invalid_names = {name for name, _ in invalid_json_args}
-                        for tc in assistant_message.tool_calls:
-                            if tc.function.name in invalid_names:
-                                err = next(e for n, e in invalid_json_args if n == tc.function.name)
-                                tool_result = (
-                                    f"Error: Invalid JSON arguments. {err}. "
-                                    f"For tools with no required parameters, use an empty object: {{}}. "
-                                    f"Please retry with valid JSON."
-                                )
-                            else:
-                                tool_result = "Skipped: other tool call in this response had invalid JSON."
+                        recovery_content = _invalid_json_recovery_content(
+                            assistant_message.tool_calls, invalid_json_args
+                        )
+                        for _tidx, tc in enumerate(assistant_message.tool_calls):
+                            tool_result = recovery_content[_tidx]
                             messages.append({
                                 "role": "tool",
                                 "name": tc.function.name,
