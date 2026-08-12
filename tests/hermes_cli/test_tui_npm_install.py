@@ -91,6 +91,38 @@ def test_make_tui_argv_uses_bundled_tui_when_workspace_missing(
 # ── _workspace_root helper ──────────────────────────────────────────
 
 
+def test_workspace_root_finds_nested_npm_workspace(tmp_path: Path, main_mod) -> None:
+    root = tmp_path / "repo"
+    desktop = root / "apps" / "desktop"
+    desktop.mkdir(parents=True)
+    (root / "package.json").write_text('{"workspaces":["apps/*"]}', encoding="utf-8")
+    (root / "package-lock.json").write_text("{}", encoding="utf-8")
+    (desktop / "package.json").write_text("{}", encoding="utf-8")
+
+    assert main_mod._workspace_root(desktop) == root
+    cwd, args = main_mod._termux_workspace_install_context(desktop)
+    assert cwd == root
+    assert args == (
+        "--workspace",
+        "apps/desktop",
+        "--include-workspace-root=false",
+    )
+
+
+def test_workspace_root_prefers_package_own_lockfile(tmp_path: Path, main_mod) -> None:
+    root = tmp_path / "repo"
+    desktop = root / "apps" / "desktop"
+    desktop.mkdir(parents=True)
+    (root / "package.json").write_text('{"workspaces":["apps/*"]}', encoding="utf-8")
+    (root / "package-lock.json").write_text("{}", encoding="utf-8")
+    (desktop / "package.json").write_text("{}", encoding="utf-8")
+    (desktop / "package-lock.json").write_text("{}", encoding="utf-8")
+
+    assert main_mod._workspace_root(desktop) == desktop
+    assert main_mod._termux_workspace_install_context(desktop) == (desktop, ())
+
+
+
 
 
     # (Smoke test: just confirm _tui_need_npm_install doesn't crash)

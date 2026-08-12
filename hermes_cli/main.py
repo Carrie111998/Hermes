@@ -1609,29 +1609,30 @@ to avoid false-positive reinstalls on every launch.
 
 
 def _workspace_root(dir: Path) -> Path:
-    """Return the npm workspace root for *dir*.
+    """Return the nearest npm workspace root that owns *dir*.
 
-    In a workspace checkout the single ``package-lock.json`` and hoisted
-    ``node_modules/`` live at the workspace root (the parent of the
-    sub-package directory).  Heuristic: if *dir* has a ``package.json``
-    but **no** ``package-lock.json``, and its **parent** has a
-    ``package-lock.json``, the parent is the workspace root.
-    Otherwise *dir* itself is the root (standalone project or
-    prebuilt-bundle layout).
+    Workspace packages do not have to be direct children of the repository
+    root: Hermes includes nested members such as ``apps/desktop``. A package
+    with its own ``package-lock.json`` is always treated as standalone;
+    otherwise walk ancestors and use the nearest directory that contains both
+    the workspace ``package.json`` and its single ``package-lock.json``.
 
-    Used by ``_tui_need_npm_install``, ``_make_tui_argv``, and
-    ``_build_web_ui`` so that lockfile/node_modules resolution and
-    ``npm install`` cwd stay consistent — a single helper prevents
-    the checks from diverging if someone accidentally creates a
-    sub-package lockfile (e.g. running ``npm install`` in the wrong
-    directory).
+    Used by ``_tui_need_npm_install``, ``_make_tui_argv``, and frontend build
+    helpers so lockfile/node_modules resolution and npm's install cwd stay
+    consistent. In particular, nested workspaces must install from the root
+    where npm hoists dev-tool shims such as ``vite`` and ``tsc``.
     """
-    if (
-        (dir / "package.json").is_file()
-        and not (dir / "package-lock.json").is_file()
-        and (dir.parent / "package-lock.json").is_file()
-    ):
-        return dir.parent
+    if not (dir / "package.json").is_file():
+        return dir
+    if (dir / "package-lock.json").is_file():
+        return dir
+
+    for ancestor in dir.parents:
+        if (
+            (ancestor / "package.json").is_file()
+            and (ancestor / "package-lock.json").is_file()
+        ):
+            return ancestor
     return dir
 
 
