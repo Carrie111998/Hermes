@@ -24,7 +24,28 @@ _MEMORY_FILES = {"memory": "MEMORY.md", "profile": "USER.md"}
 
 
 def parse_node_kind(node_id: str) -> str:
-    return "memory" if node_id.startswith("memory:") else "skill"
+    if node_id.startswith("memory:"):
+        return "memory"
+    return "wiki" if node_id.startswith("wiki:") else "skill"
+
+
+def _wiki_path(node_id: str) -> tuple[Path, str]:
+    if not node_id.startswith("wiki:"):
+        raise ValueError(f"bad wiki node id: {node_id!r}")
+    relative = node_id[5:]
+    if not relative:
+        raise ValueError(f"bad wiki node id: {node_id!r}")
+    from agent.learning_graph import _wiki_root
+
+    root = _wiki_root().resolve()
+    path = (root / relative).resolve()
+    try:
+        normalized = path.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ValueError(f"bad wiki node id: {node_id!r}") from exc
+    if normalized != relative or path.suffix.lower() != ".md":
+        raise ValueError(f"bad wiki node id: {node_id!r}")
+    return path, normalized
 
 
 def _memories_dir() -> Path:
@@ -93,12 +114,23 @@ def node_detail(node_id: str) -> dict[str, Any]:
 
 
 def _node_detail(node_id: str) -> dict[str, Any]:
-    if parse_node_kind(node_id) == "memory":
+    kind = parse_node_kind(node_id)
+    if kind == "memory":
         source, gidx = _parse_memory_id(node_id)
         _, chunks, local = _locate_memory(source, gidx)
         body = chunks[local].strip()
 
         return {"ok": True, "kind": "memory", "id": node_id, "label": body.splitlines()[0][:80], "content": body}
+
+    if kind == "wiki":
+        path, _ = _wiki_path(node_id)
+        if not path.is_file():
+            return {"ok": False, "message": f"wiki page '{node_id[5:]}' not found"}
+        content = path.read_text(encoding="utf-8")
+        from agent.learning_graph import _frontmatter
+
+        label = str(_frontmatter(content[:4000]).get("title") or path.stem)
+        return {"ok": True, "kind": "wiki", "id": node_id, "label": label, "content": content}
 
     from tools.skill_manager_tool import _find_skill
 
@@ -123,7 +155,12 @@ def _node_detail(node_id: str) -> dict[str, Any]:
 
 def delete_node(node_id: str) -> dict[str, Any]:
     try:
-        return _delete_memory(node_id) if parse_node_kind(node_id) == "memory" else _delete_skill(node_id)
+        kind = parse_node_kind(node_id)
+        if kind == "memory":
+            return _delete_memory(node_id)
+        if kind == "wiki":
+            return _exclude_wiki(node_id)
+        return _delete_skill(node_id)
     except (ValueError, IndexError) as exc:
         return {"ok": False, "message": str(exc)}
 
@@ -151,12 +188,36 @@ def _delete_memory(node_id: str) -> dict[str, Any]:
     return {"ok": True, "message": f"deleted memory from {path.name}"}
 
 
+def _exclude_wiki(node_id: str) -> dict[str, Any]:
+    import json
+
+    from agent.learning_graph import _wiki_exclusions
+    from hermes_constants import get_hermes_home
+
+    path, relative = _wiki_path(node_id)
+    if not path.is_file():
+        return {"ok": False, "message": f"wiki page '{relative}' not found"}
+    excluded = _wiki_exclusions()
+    excluded.add(relative)
+    index = get_hermes_home() / "journey" / "wiki-excluded.json"
+    index.parent.mkdir(parents=True, exist_ok=True)
+    temp = index.with_suffix(".tmp")
+    temp.write_text(json.dumps(sorted(excluded), indent=2) + "\n", encoding="utf-8")
+    temp.replace(index)
+    return {"ok": True, "message": f"removed wiki page '{relative}' from journey (file kept)"}
+
+
 # ── Edit ────────────────────────────────────────────────────────────────────
 
 
 def edit_node(node_id: str, content: str) -> dict[str, Any]:
     try:
-        return _edit_memory(node_id, content) if parse_node_kind(node_id) == "memory" else _edit_skill(node_id, content)
+        kind = parse_node_kind(node_id)
+        if kind == "memory":
+            return _edit_memory(node_id, content)
+        if kind == "wiki":
+            return _edit_wiki(node_id, content)
+        return _edit_skill(node_id, content)
     except (ValueError, IndexError) as exc:
         return {"ok": False, "message": str(exc)}
 
@@ -184,6 +245,18 @@ def _edit_memory(node_id: str, content: str) -> dict[str, Any]:
     _write_memory(path, chunks)
 
     return {"ok": True, "message": f"updated memory in {path.name}"}
+
+
+def _edit_wiki(node_id: str, content: str) -> dict[str, Any]:
+    path, relative = _wiki_path(node_id)
+    if not path.is_file():
+        return {"ok": False, "message": f"wiki page '{relative}' not found"}
+    if not content.strip():
+        return {"ok": False, "message": "empty wiki page — edit the source file instead"}
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(content, encoding="utf-8")
+    temp.replace(path)
+    return {"ok": True, "message": f"updated wiki page '{relative}'"}
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────

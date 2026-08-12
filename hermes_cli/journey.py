@@ -104,7 +104,7 @@ def _frame_renderable(payload, *, cols, rows, reveal, color):
 
     title = Text()
     title.append("✦ Journey ", style=f"bold {_TITLE_COLOR}" if color else None)
-    title.append("· learned skills & memories over time", style="grey62" if color else None)
+    title.append("· learned skills, memories & wiki pages over time", style="grey62" if color else None)
     parts.append(title)
 
     legend_line = Text("  ")
@@ -245,7 +245,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
         console.print("[grey62]No learning yet.[/grey62]")
         return 0
     for node in nodes:
-        glyph = "◆" if node.get("kind") == "memory" else "●"
+        glyph = {"memory": "◆", "wiki": "⬡"}.get(node.get("kind"), "●")
         date = format_date(node.get("timestamp"))
         console.print(f"[grey54]{node['id']}[/grey54]  {glyph} {node.get('label', '')}  [grey54]{date}[/grey54]")
     return 0
@@ -278,7 +278,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     if not detail.get("ok"):
         print(f"  {detail.get('message', 'not found')}")
         return 1
-    suffix = ".md" if detail["kind"] == "skill" else ".txt"
+    suffix = ".md" if detail["kind"] in {"skill", "wiki"} else ".txt"
     edited = _open_in_editor(detail["content"], suffix=suffix)
     if edited is None or edited.strip() == detail["content"].strip():
         print("  no changes")
@@ -336,13 +336,13 @@ def register_cli(parent: argparse.ArgumentParser) -> None:
     p_list.add_argument("--force-color", action="store_true", help=argparse.SUPPRESS)
     p_list.set_defaults(func=_cmd_list)
 
-    p_del = sub.add_parser("delete", help="Delete a learned skill (archived) or memory by node id.")
-    p_del.add_argument("node", help="Node id (skill name or memory:<source>:<index>; see `journey list`).")
+    p_del = sub.add_parser("delete", help="Remove a learned skill, memory, or wiki node.")
+    p_del.add_argument("node", help="Node id (skill, memory:<source>:<index>, or wiki:<path>; see `journey list`).")
     p_del.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt.")
     p_del.set_defaults(func=_cmd_delete)
 
-    p_edit = sub.add_parser("edit", help="Edit a learned skill or memory by node id in $EDITOR.")
-    p_edit.add_argument("node", help="Node id (skill name or memory:<source>:<index>; see `journey list`).")
+    p_edit = sub.add_parser("edit", help="Edit a learned skill, memory, or wiki page in $EDITOR.")
+    p_edit.add_argument("node", help="Node id (skill, memory:<source>:<index>, or wiki:<path>; see `journey list`).")
     p_edit.set_defaults(func=_cmd_edit)
 
 

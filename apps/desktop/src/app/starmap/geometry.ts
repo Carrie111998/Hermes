@@ -23,6 +23,9 @@ export function nodeRadius(n: StarmapNode): number {
   if (n.kind === 'memory') {
     return 4.4
   }
+  if (n.kind === 'wiki') {
+    return 4
+  }
 
   const base = n.state === 'archived' || n.state === 'stale' ? 2.4 : 3
 

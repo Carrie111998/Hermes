@@ -889,7 +889,7 @@ export function StarMap({
     setSelectedId(node.id)
     setMenuTarget({
       id: node.id,
-      kind: node.kind === 'memory' ? 'memory' : 'skill',
+      kind: node.kind,
       label: node.label,
       x: e.clientX,
       y: e.clientY
@@ -971,6 +971,9 @@ export function StarMap({
         </span>
         <span className="flex items-center gap-1.5">
           <span className="inline-block size-2 rotate-45" style={{ backgroundColor: memoryColor }} /> memory
+        </span>
+        <span className="flex items-center gap-1.5">
+          <span className="inline-block text-[0.7rem] text-[var(--theme-primary)]">⬡</span> wiki
         </span>
         <span className="text-[0.58rem] text-muted-foreground/65">core = oldest · outer = newer</span>
         <RevealLabel axis={timeAxis} revealStore={revealStore} />

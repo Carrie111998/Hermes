@@ -220,6 +220,79 @@ def _memory_cards() -> list[dict[str, Any]]:
     return cards
 
 
+def _journey_config() -> dict[str, Any]:
+    """Journey settings without importing the heavyweight CLI config stack."""
+    try:
+        from agent.skill_utils import _load_raw_config
+
+        config = _load_raw_config()
+    except Exception:
+        return {}
+    journey = config.get("journey")
+    return journey if isinstance(journey, dict) else {}
+
+
+def _wiki_root() -> Path:
+    """Resolve the wiki skill's logical ``wiki.path`` configuration."""
+    try:
+        from agent.skill_utils import resolve_skill_config_values
+
+        values = resolve_skill_config_values(
+            [{"key": "wiki.path", "default": "~/wiki", "description": "Wiki directory"}]
+        )
+        value = values.get("wiki.path")
+    except Exception:
+        value = None
+    return Path(str(value or "~/wiki")).expanduser()
+
+
+def _wiki_exclusions() -> set[str]:
+    path = get_hermes_home() / "journey" / "wiki-excluded.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return set()
+    return {str(item) for item in raw if isinstance(item, str)} if isinstance(raw, list) else set()
+
+
+def _wiki_cards() -> list[dict[str, Any]]:
+    """Read configured wiki pages in stable relative-path order."""
+    if _journey_config().get("include_wiki", True) is False:
+        return []
+    root = _wiki_root()
+    if not root.is_dir():
+        return []
+    excluded = _wiki_exclusions()
+    cards: list[dict[str, Any]] = []
+    for path in sorted(root.rglob("*.md"), key=lambda p: p.as_posix().lower()):
+        if any(part in {".git", "node_modules", ".archive"} for part in path.parts):
+            continue
+        try:
+            relative = path.relative_to(root).as_posix()
+            if relative in excluded:
+                continue
+            text = path.read_text(encoding="utf-8")
+            stat = path.stat()
+        except (OSError, ValueError):
+            continue
+        fm = _frontmatter(text[:4000])
+        timestamp = None
+        for key in ("date", "created", "created_at", "updated", "updated_at"):
+            timestamp = _to_int_ts(fm.get(key))
+            if timestamp is not None:
+                break
+        cards.append(
+            {
+                "path": relative,
+                "title": str(fm.get("title") or path.stem).strip() or path.stem,
+                "body": text[:1200],
+                "timestamp": timestamp or _to_int_ts(stat.st_mtime),
+                "relatedSkills": _related(fm),
+            }
+        )
+    return cards
+
+
 def _tokenize(text: str) -> set[str]:
     return {t for t in re.split(r"[^a-z0-9]+", text.lower()) if len(t) >= 3}
 
@@ -242,6 +315,50 @@ def _memory_skill_edges(memory_cards: list[dict[str, Any]], skills: list[SkillNo
         scored.sort(key=lambda x: (-x[0], x[1]))
         for _, skill_name in scored[:4]:
             edges.append((mem_id, skill_name))
+    return edges
+
+
+def _wiki_skill_edges(cards: list[dict[str, Any]], skills: list[SkillNode]) -> list[tuple[str, str]]:
+    """Bounded lexical/declarative links from wiki pages to skills."""
+    edges: list[tuple[str, str]] = []
+    known = {skill.name for skill in skills}
+    skill_meta = [(s, _tokenize(s.name), s.name.lower()) for s in skills]
+    for card in cards:
+        wiki_id = f"wiki:{card['path']}"
+        declared = [name for name in card.get("relatedSkills", []) if name in known]
+        text = f"{card.get('title', '')}\n{card.get('body', '')}".lower()
+        tokens = _tokenize(text)
+        scored: list[tuple[int, str]] = []
+        for skill, skill_tokens, skill_name in skill_meta:
+            if skill.name in declared:
+                continue
+            score = (6 if skill_name in text else 0) + len(skill_tokens & tokens)
+            if score > 0:
+                scored.append((score, skill.name))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        for name in [*declared, *(name for _, name in scored[:4])]:
+            edge = (wiki_id, name)
+            if edge not in edges:
+                edges.append(edge)
+    return edges
+
+
+def _wiki_memory_edges(
+    wiki_cards: list[dict[str, Any]], memory_cards: list[dict[str, Any]]
+) -> list[tuple[str, str]]:
+    """Link each wiki page to its strongest lexically-overlapping memories."""
+    memories = [
+        (f"memory:{card['source']}:{idx}", _tokenize(f"{card.get('title', '')} {card.get('body', '')}"))
+        for idx, card in enumerate(memory_cards)
+    ]
+    edges: list[tuple[str, str]] = []
+    for card in wiki_cards:
+        tokens = _tokenize(f"{card.get('title', '')} {card.get('body', '')}")
+        scored = sorted(
+            ((len(tokens & mem_tokens), mem_id) for mem_id, mem_tokens in memories),
+            key=lambda item: (-item[0], item[1]),
+        )
+        edges.extend((f"wiki:{card['path']}", mem_id) for score, mem_id in scored[:2] if score > 0)
     return edges
 
 
@@ -268,13 +385,18 @@ def build_learning_graph() -> dict[str, Any]:
     skill_edges = build_edges(learned_skills)
     memory_cards = _memory_cards()
     memory_edges = _memory_skill_edges(memory_cards, list(learned_skills.values()))
+    wiki_cards = _wiki_cards()
+    wiki_skill_edges = _wiki_skill_edges(wiki_cards, list(learned_skills.values()))
+    wiki_memory_edges = _wiki_memory_edges(wiki_cards, memory_cards)
 
-    edges = skill_edges + memory_edges
+    edges = skill_edges + memory_edges + wiki_skill_edges + wiki_memory_edges
     clusters: dict[str, int] = {}
     for node in learned_skills.values():
         clusters[node.category] = clusters.get(node.category, 0) + 1
     if memory_cards:
         clusters["memory"] = len(memory_cards)
+    if wiki_cards:
+        clusters["wiki"] = len(wiki_cards)
 
     graph_nodes = [
         {
@@ -305,6 +427,21 @@ def build_learning_graph() -> dict[str, Any]:
                 "pinned": False,
             }
         )
+    for card in wiki_cards:
+        graph_nodes.append(
+            {
+                "id": f"wiki:{card['path']}",
+                "label": card["title"],
+                "kind": "wiki",
+                "wikiPath": card["path"],
+                "timestamp": card.get("timestamp"),
+                "category": "wiki",
+                "useCount": 0,
+                "state": "active",
+                "createdBy": "wiki",
+                "pinned": False,
+            }
+        )
 
     return {
         "nodes": graph_nodes,
@@ -314,10 +451,14 @@ def build_learning_graph() -> dict[str, Any]:
             for c, n in sorted(clusters.items(), key=lambda kv: -kv[1])
         ],
         "memory": memory_cards,
+        "wiki": wiki_cards,
         "stats": {
             **density_stats(learned_skills, skill_edges),
             "memory_nodes": len(memory_cards),
             "memory_skill_edges": len(memory_edges),
+            "wiki_nodes": len(wiki_cards),
+            "wiki_skill_edges": len(wiki_skill_edges),
+            "wiki_memory_edges": len(wiki_memory_edges),
             "learned_skills": len(learned_skills),
         },
     }

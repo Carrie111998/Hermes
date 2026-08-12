@@ -661,12 +661,13 @@ export interface UsageStats {
   total: number
 }
 
-/** One graph node in the star map (learned skill or memory chunk). */
+/** One graph node in the star map (learned skill, memory chunk, or wiki page). */
 export interface StarmapNode {
   id: string
   label: string
-  kind: 'memory' | 'skill'
+  kind: 'memory' | 'skill' | 'wiki'
   memorySource?: 'memory' | 'profile'
+  wikiPath?: string
   timestamp?: null | number
   category: string
   useCount: number
@@ -694,11 +695,21 @@ export interface StarmapMemoryCard {
   body: string
 }
 
+export interface StarmapWikiCard {
+  body: string
+  path: string
+  relatedSkills: string[]
+  timestamp?: null | number
+  title: string
+}
+
 export interface StarmapGraph {
   nodes: StarmapNode[]
   edges: StarmapEdge[]
   clusters: StarmapCluster[]
   memory: StarmapMemoryCard[]
+  /** Present on backends that expose wiki pages as first-class journey nodes. */
+  wiki?: StarmapWikiCard[]
   stats: Record<string, unknown>
 }
 

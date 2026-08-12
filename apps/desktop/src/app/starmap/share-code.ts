@@ -29,7 +29,9 @@ const finiteTs = (v?: null | number): null | number =>
   typeof v === 'number' && Number.isFinite(v) ? Math.max(0, Math.round(v)) : null
 
 function writeNode(w: BitWriter, n: StarmapNode, dict: Dict, minTs: number, span: number): void {
-  w.uint(idxOf(KINDS, n.kind), 1)
+  // v3 share codes predate wiki nodes; export them as skill-shaped visuals
+  // rather than changing the established bit schema.
+  w.uint(idxOf(KINDS, n.kind === 'wiki' ? 'skill' : n.kind), 1)
   w.varint(dict.id(trim(n.label || '')))
   w.varint(dict.id(n.category || ''))
   w.varint(Math.max(0, n.useCount | 0))

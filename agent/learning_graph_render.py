@@ -32,12 +32,14 @@ AGE_MID = 0.52
 STYLE_BG = "bg"
 STYLE_SKILL = "skill"
 STYLE_MEMORY = "memory"
+STYLE_WIKI = "wiki"
 STYLE_LABEL = "label"
 STYLE_DIM = "dim"
 
 # Legend glyphs mirror NODE_SHAPE (skill = circle, memory = diamond).
 SKILL_GLYPH = "●"
 MEMORY_GLYPH = "◆"
+WIKI_GLYPH = "⬡"
 _LABEL_KEYS = tuple("123456789abc")
 
 Run = list  # [text, style, alpha, hex?]
@@ -193,6 +195,7 @@ def derive_palette(primary_hex: str, *, dark: bool = True) -> dict[str, str]:
         # → muted complement.
         "memory": rgb_to_hex(mix_rgb(primary, base, 0.12 if dark else 0.18)),
         "skill": rgb_to_hex(mix_rgb(_complementary_ink(primary), bg, 0.45)),
+        "wiki": rgb_to_hex(mix_rgb(primary, _complementary_ink(primary), 0.5)),
         "label": rgb_to_hex(mix_rgb(base, bg, 0.35)),
         "dim": rgb_to_hex(mix_rgb(base, bg, 0.7)),
         "bg": rgb_to_hex(bg),
@@ -203,6 +206,8 @@ def _node_score(node: dict[str, Any], rec: float) -> float:
     """Pick which visible objects deserve map markers + label rows."""
     if node.get("kind") == "memory":
         return 3.5 + rec
+    if node.get("kind") == "wiki":
+        return 3.0 + rec
     use = float(node.get("useCount", 0) or 0)
     return rec * 2 + math.sqrt(max(0.0, use)) + (2.0 if node.get("pinned") else 0.0)
 
@@ -216,6 +221,8 @@ def _node_meta(node: dict[str, Any]) -> str:
     if node.get("kind") == "memory":
         source = "profile memory" if node.get("memorySource") == "profile" else "memory"
         return f"{source} · {format_date(_to_ts(node.get('timestamp')))}"
+    if node.get("kind") == "wiki":
+        return f"wiki · {format_date(_to_ts(node.get('timestamp')))}"
     bits = [str(node.get("category") or "skill"), format_date(_to_ts(node.get("timestamp")))]
     count = int(node.get("useCount", 0) or 0)
     if count:
@@ -559,11 +566,13 @@ def render_graph(payload: dict[str, Any], *, cols: int = 80, rows: int = 16, rev
 
 def build_legend(payload: dict[str, Any]) -> list[dict[str, Any]]:
     nodes = payload.get("nodes", [])
-    skills = sum(1 for n in nodes if n.get("kind") != "memory")
+    skills = sum(1 for n in nodes if n.get("kind") == "skill")
     memories = sum(1 for n in nodes if n.get("kind") == "memory")
+    wiki = sum(1 for n in nodes if n.get("kind") == "wiki")
     return [
         {"glyph": SKILL_GLYPH, "style": STYLE_SKILL, "label": f"skills ({skills})"},
         {"glyph": MEMORY_GLYPH, "style": STYLE_MEMORY, "label": f"memories ({memories})"},
+        {"glyph": WIKI_GLYPH, "style": STYLE_WIKI, "label": f"wiki ({wiki})"},
     ]
 
 
@@ -595,8 +604,9 @@ def build_summary(payload: dict[str, Any]) -> list[str]:
     lines: list[str] = []
     learned = stats.get("learned_skills", stats.get("nodes", 0))
     mem = stats.get("memory_nodes", 0)
+    wiki = stats.get("wiki_nodes", 0)
     edges = stats.get("related_edges", 0)
-    lines.append(f"{learned} learned skills · {mem} memories · {edges} skill links")
+    lines.append(f"{learned} learned skills · {mem} memories · {wiki} wiki pages · {edges} skill links")
     extra = []
     if stats.get("memory_skill_edges"):
         extra.append(f"{stats['memory_skill_edges']} memory↔skill links")

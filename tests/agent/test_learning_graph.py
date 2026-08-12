@@ -8,6 +8,8 @@ change-detector.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from agent import learning_graph
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
@@ -55,6 +57,57 @@ def test_memory_is_cards_split_on_separator(tmp_path):
     assert all(c["source"] in {"memory", "profile"} for c in graph["memory"])
     assert all("timestamp" in c for c in graph["memory"])
     assert any(n["kind"] == "memory" for n in graph["nodes"])
+
+
+def test_wiki_pages_are_first_class_nodes_with_real_dates_and_edges(tmp_path):
+    home = tmp_path / ".hermes"
+    wiki = tmp_path / "wiki"
+    page = wiki / "projects" / "launch.md"
+    page.parent.mkdir(parents=True)
+    page.write_text(
+        "---\ntitle: Launch Notes\ndate: 2024-02-03\nrelated_skills: [release-workflow]\n---\n\nLaunch checklist and supplier notes.",
+        encoding="utf-8",
+    )
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        f"skills:\n  config:\n    wiki:\n      path: {wiki.as_posix()}\n",
+        encoding="utf-8",
+    )
+    token = set_hermes_home_override(home)
+    try:
+        graph = learning_graph.build_learning_graph()
+    finally:
+        reset_hermes_home_override(token)
+
+    node = next(n for n in graph["nodes"] if n["id"] == "wiki:projects/launch.md")
+    assert node["kind"] == "wiki"
+    assert node["label"] == "Launch Notes"
+    assert node["timestamp"] == int(datetime(2024, 2, 3, tzinfo=timezone.utc).timestamp())
+    assert graph["wiki"][0]["path"] == "projects/launch.md"
+    assert graph["stats"]["wiki_nodes"] == 1
+
+    skill = learning_graph.SkillNode(name="release-workflow", category="dev")
+    edges = learning_graph._wiki_skill_edges(graph["wiki"], [skill])
+    assert ("wiki:projects/launch.md", "release-workflow") in edges
+
+
+def test_journey_can_opt_out_of_wiki_nodes(tmp_path):
+    home = tmp_path / ".hermes"
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    (wiki / "page.md").write_text("# Hidden", encoding="utf-8")
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        f"journey:\n  include_wiki: false\nskills:\n  config:\n    wiki:\n      path: {wiki.as_posix()}\n",
+        encoding="utf-8",
+    )
+    token = set_hermes_home_override(home)
+    try:
+        graph = learning_graph.build_learning_graph()
+    finally:
+        reset_hermes_home_override(token)
+
+    assert not any(n["kind"] == "wiki" for n in graph["nodes"])
 
 
 
