@@ -23,6 +23,46 @@ class FakeTty extends EventEmitter {
 
 const tick = () => new Promise<void>(resolve => queueMicrotask(resolve))
 
+/**
+ * The invariant all three tests share: the screen was erased, and the content
+ * was repainted *after* the erase — a clean repaint rather than a partial diff
+ * over drifted cells.
+ *
+ * Written as a helper purely so a failure is diagnosable. This assertion has
+ * failed once on CI (on #183's run, both the burst and the same-dimension
+ * cases) with:
+ *
+ *     AssertionError: expected 128 to be less than -1
+ *
+ * which says only that the erase landed at byte 128 and the text never landed
+ * at all — not which frame path ran, and not what was written instead. It has
+ * not reproduced since: it passed on the very next CI run, and 23 local runs
+ * (isolated, under CPU contention, and as part of the full package suite) are
+ * all green, so the mechanism is still unknown.
+ *
+ * The assertion is deliberately NOT loosened. "Erase written, content never
+ * repainted" is precisely the drift bug these tests exist to catch, so a
+ * weaker check could hide a real intermittent renderer race. Instead the frame
+ * bytes ride along in the message, so the next occurrence explains itself.
+ */
+function expectErasedThenRepainted(out: string, text: string): void {
+  const erasedAt = out.indexOf(ERASE_SCREEN)
+  const paintedAt = out.lastIndexOf(text)
+
+  expect(out).toContain(ERASE_SCREEN)
+  expect(out).toContain(CURSOR_HOME)
+  expect(
+    paintedAt,
+    `the erase was written but ${JSON.stringify(text)} was never repainted — ` +
+      `the final frame is not a clean repaint. Frame: ${JSON.stringify(out)}`
+  ).not.toBe(-1)
+  expect(
+    paintedAt,
+    `${JSON.stringify(text)} was repainted at ${paintedAt}, before the erase at ` +
+      `${erasedAt} — the erase would wipe it. Frame: ${JSON.stringify(out)}`
+  ).toBeGreaterThan(erasedAt)
+}
+
 describe('Ink resize healing', () => {
   it('heals same-dimension alt-screen resize events with an erase before repaint', async () => {
     const stdout = new FakeTty()
@@ -49,10 +89,7 @@ describe('Ink resize healing', () => {
     // The heal may also erase scrollback (CSI 3J interposed between 2J and H)
     // depending on which recovery path runs, so assert the invariant — screen
     // erased, then content repainted after — rather than an exact byte run.
-    const out = stdout.chunks.join('')
-    expect(out).toContain(ERASE_SCREEN)
-    expect(out).toContain(CURSOR_HOME)
-    expect(out.indexOf(ERASE_SCREEN)).toBeLessThan(out.lastIndexOf('hello'))
+    expectErasedThenRepainted(stdout.chunks.join(''), 'hello')
 
     ink.unmount()
   })
@@ -105,10 +142,7 @@ describe('Ink resize healing', () => {
     // semantic invariant rather than an exact byte sequence: the screen was
     // erased and the content was repainted AFTER the erase — i.e. the final
     // frame is a clean repaint, not a partial diff over drifted cells.
-    const out = stdout.chunks.join('')
-    expect(out).toContain(ERASE_SCREEN)
-    expect(out).toContain(CURSOR_HOME)
-    expect(out.indexOf(ERASE_SCREEN)).toBeLessThan(out.lastIndexOf('hello'))
+    expectErasedThenRepainted(stdout.chunks.join(''), 'hello')
 
     ink.unmount()
   })
@@ -141,10 +175,7 @@ describe('Ink resize healing', () => {
     ink.onRender()
     await tick()
 
-    const out = stdout.chunks.join('')
-    expect(out).toContain(ERASE_SCREEN)
-    expect(out).toContain(CURSOR_HOME)
-    expect(out.indexOf(ERASE_SCREEN)).toBeLessThan(out.lastIndexOf('hello'))
+    expectErasedThenRepainted(stdout.chunks.join(''), 'hello')
 
     ink.unmount()
   })
