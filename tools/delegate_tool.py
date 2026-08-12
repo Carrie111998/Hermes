@@ -41,6 +41,7 @@ from agent.interrupt_compat import request_hard_interrupt
 # Must match hermes_cli.runtime_provider.RUNTIME_PROVIDER_TYPE_CUSTOM.
 _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
+from tools.credential_files import to_agent_visible_cache_path
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
 
@@ -1951,6 +1952,9 @@ def _trim_summary_with_footer(
         tail = tail[nl + 1:]
 
     spill_path = _spill_summary_to_file(task_index, summary)
+    visible_spill_path = (
+        to_agent_visible_cache_path(spill_path) if spill_path else None
+    )
 
     footer_lines = [
         "",
@@ -1958,12 +1962,14 @@ def _trim_summary_with_footer(
         f"Showing {len(head):,} chars (head) + {len(tail):,} chars (tail) "
         f"of {original_len:,} total — trimmed to protect the parent's context window.",
     ]
-    if spill_path:
+    if visible_spill_path:
         # read_file is 1-indexed; +2 moves past the last head line shown.
         middle_start_line = head.count("\n") + 2
-        footer_lines.append(f"Full subagent output saved to: {spill_path}")
         footer_lines.append(
-            f'To read the omitted middle: read_file path="{spill_path}" '
+            f"Full subagent output saved to: {visible_spill_path}"
+        )
+        footer_lines.append(
+            f'To read the omitted middle: read_file path="{visible_spill_path}" '
             f"offset={middle_start_line} limit=200  (the file is the complete "
             f"summary; raise/lower offset to page through it)."
         )
@@ -3302,6 +3308,9 @@ def delegate_task(
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
         task_list, context
     )
+    agent_live_paths = [
+        to_agent_visible_cache_path(path) for path in live_paths
+    ]
 
     # Capture the ORIGINATING session's wake target BEFORE any child agent is
     # constructed: _build_child_agent() -> AIAgent() -> agent_init calls
@@ -3561,16 +3570,16 @@ def delegate_task(
                     _w.finalize(entry)
                 except Exception:
                     logger.debug("Live transcript finalize failed", exc_info=True)
-                if _idx < len(live_paths):
-                    entry["live_transcript"] = live_paths[_idx]
+                if _idx < len(agent_live_paths):
+                    entry["live_transcript"] = agent_live_paths[_idx]
         update_manifest_statuses(live_deleg_id, results)
 
         combined: Dict[str, Any] = {
             "results": results,
             "total_duration_seconds": total_duration,
         }
-        if live_paths:
-            combined["live_transcripts"] = list(live_paths)
+        if agent_live_paths:
+            combined["live_transcripts"] = list(agent_live_paths)
         return combined
 
     # ----- Background dispatch: run the WHOLE batch as one async unit -----
@@ -3780,8 +3789,8 @@ def delegate_task(
                 "goals": _goals,
                 "note": note,
             }
-            if live_paths:
-                payload["live_transcripts"] = list(live_paths)
+            if agent_live_paths:
+                payload["live_transcripts"] = list(agent_live_paths)
                 payload["live_transcripts_hint"] = (
                     "Each subagent streams a human-readable transcript of its "
                     "operations to the file listed above (append-only, one per "

@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import tools.delegate_tool as dt
 from tools import delegation_live_log as dll
 from tools.delegation_live_log import (
     LiveTranscriptWriter,
@@ -167,6 +168,64 @@ def _fake_run(task_index, goal, child=None, parent_agent=None, **kw):
         "summary": f"done: {goal}", "api_calls": 1,
         "duration_seconds": 0.1, "model": "m", "exit_reason": "completed",
     }
+
+
+def _patch_delegate_runtime(monkeypatch):
+    child = MagicMock()
+    child._delegate_role = "leaf"
+    child._subagent_id = "s1"
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: child)
+    monkeypatch.setattr(dt, "_run_single_child", _fake_run)
+    monkeypatch.setattr(
+        dt, "_resolve_delegation_credentials", lambda *a, **kw: _CREDS
+    )
+
+
+def test_sync_result_publishes_agent_visible_live_transcripts(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    _patch_delegate_runtime(monkeypatch)
+
+    result = json.loads(
+        dt.delegate_task(goal="inspect paths", parent_agent=_make_parent())
+    )
+
+    paths = result["live_transcripts"]
+    assert paths[0].startswith("/root/.hermes/cache/delegation/live/")
+    assert result["results"][0]["live_transcript"] == paths[0]
+    assert str(tmp_path) not in json.dumps(result)
+
+
+def test_background_dispatch_publishes_agent_visible_live_transcripts(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    _patch_delegate_runtime(monkeypatch)
+    monkeypatch.setattr(
+        "gateway.session_context.async_delivery_supported", lambda: True
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.dispatch_async_delegation_batch",
+        lambda **kw: {
+            "status": "dispatched",
+            "delegation_id": kw["delegation_id"],
+        },
+    )
+
+    result = json.loads(
+        dt.delegate_task(
+            goal="inspect paths", background=True, parent_agent=_make_parent()
+        )
+    )
+
+    assert result["status"] == "dispatched"
+    assert result["live_transcripts"][0].startswith(
+        "~/.hermes/cache/delegation/live/"
+    )
+    assert str(tmp_path) not in json.dumps(result)
 
 
 if __name__ == "__main__":

@@ -84,6 +84,7 @@ _async_parallel_client: Optional[Any] = None
 _exa_client: Optional[Any] = None
 
 from tools.debug_helpers import DebugSession
+from tools.credential_files import to_agent_visible_cache_path
 # Imported solely so unit tests can monkeypatch these names on
 # tools.web_tools (the firecrawl plugin reads them via its own import chain).
 from tools.managed_tool_gateway import (  # noqa: F401 — backward-compat names for tests
@@ -545,6 +546,9 @@ def _truncate_with_footer(
 
     total = len(content)
     stored_path = _store_full_text(url, content)
+    visible_stored_path = (
+        to_agent_visible_cache_path(stored_path) if stored_path else None
+    )
 
     footer_lines = [
         "",
@@ -552,15 +556,15 @@ def _truncate_with_footer(
         f"Showing {len(head):,} chars (head) + {len(tail):,} chars (tail) "
         f"of {total:,} total clean characters.",
     ]
-    if stored_path:
+    if visible_stored_path:
         # The omitted middle begins right after the head we're showing. Give
         # the model a concrete starting line (head line count + 1) so its first
         # read_file lands in the gap instead of guessing <line>. read_file is
         # 1-indexed; +1 moves past the last head line we already showed.
         middle_start_line = head.count("\n") + 2
-        footer_lines.append(f"Full text saved to: {stored_path}")
+        footer_lines.append(f"Full text saved to: {visible_stored_path}")
         footer_lines.append(
-            f'To read the omitted middle: read_file path="{stored_path}" '
+            f'To read the omitted middle: read_file path="{visible_stored_path}" '
             f"offset={middle_start_line} limit=200  (the file is the complete page; "
             f"raise/lower offset to page through it)."
         )
