@@ -387,9 +387,14 @@ async function resolveHermesOwnershipPath(ssh, hermesPath) {
     '   elif len(words)==4 and words[0]=="exec" and os.path.basename(words[1]).startswith("python") and words[3]=="$@":target=words[2];delegated=[words[1],words[2]]\n' +
     '   delegated=[os.path.expanduser(x) for x in delegated]\n' +
     '   if target and all(os.path.isabs(x) for x in delegated):\n' +
-    '    stats=[os.stat(x,follow_symlinks=False) for x in delegated]\n' +
-    '    all_safe=all(stat.S_ISREG(x.st_mode) and (not hasattr(os,"getuid") or x.st_uid==os.getuid()) and not (x.st_mode&0o022) for x in stats)\n' +
-    '    if all_safe:process_path=os.path.expanduser(target)\n' +
+    '    checked=[]\n' +
+    '    for i,x in enumerate(delegated):\n' +
+    '     ls=os.stat(x,follow_symlinks=False)\n' +
+    '     resolved=os.path.realpath(x) if i==0 and stat.S_ISLNK(ls.st_mode) else x\n' +
+    '     rs=os.stat(resolved,follow_symlinks=False)\n' +
+    '     writable_mask=0o002 if i==0 else 0o022\n' +
+    '     checked.append(stat.S_ISREG(rs.st_mode) and (not hasattr(os,"getuid") or rs.st_uid==os.getuid()) and not (rs.st_mode&writable_mask))\n' +
+    '    if all(checked):process_path=os.path.expanduser(target)\n' +
     'except (OSError,ValueError):pass\n' +
     'print("PROCESS_PATH="+process_path)'
 

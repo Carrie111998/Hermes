@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFile as execFileCallback, spawn } from 'node:child_process'
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -403,6 +403,58 @@ test.runIf(process.platform !== 'win32')('pidIsOurDashboard does not trust a tex
 
     assert.equal(await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, wrapperPath), false)
   } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test.runIf(process.platform !== 'win32')('pidIsOurDashboard accepts a canonical wrapper using a uv-venv Python symlink', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'hermes-ownership-uv-venv-'))
+  const venvPath = join(directory, '.venv')
+  const pythonPath = join(venvPath, 'bin', 'python')
+  const entrypoint = join(directory, 'hermes-entrypoint')
+  const wrapperPath = join(directory, 'hermes')
+  let child: ReturnType<typeof spawn> | null = null
+
+  try {
+    try {
+      await execFile('uv', ['venv', venvPath, '--no-project'])
+    } catch (error: any) {
+      if (error?.code !== 'ENOENT') {
+        throw error
+      }
+
+      await execFile('python3', ['-m', 'venv', venvPath])
+
+      // Python's venv may copy on some systems; keep the regression shaped like
+      // uv's normal bin/python symlink in that fallback environment.
+      await rm(pythonPath, { force: true })
+      await symlink(process.execPath, pythonPath)
+    }
+
+    await writeFile(entrypoint, 'import time\ntime.sleep(30)\n')
+    await chmod(entrypoint, 0o700)
+    await writeFile(
+      wrapperPath,
+      [
+        '#!/usr/bin/env bash',
+        'unset PYTHONPATH',
+        'unset PYTHONHOME',
+        `exec "${pythonPath}" "${entrypoint}" "$@"`
+      ].join('\n')
+    )
+    await chmod(wrapperPath, 0o700)
+
+    child = spawn(wrapperPath, ['serve', '--isolated', '--ssh-owner-nonce', SPAWN_NONCE])
+
+    const ssh = {
+      async exec(command: string) {
+        return (await execFile('/bin/sh', ['-c', command])).stdout
+      }
+    }
+
+    assert.equal(await pidIsOurDashboard(ssh, child.pid, SPAWN_NONCE, wrapperPath), true)
+  } finally {
+    child?.kill('SIGKILL')
     await rm(directory, { recursive: true, force: true })
   }
 })
