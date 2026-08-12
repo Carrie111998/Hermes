@@ -230,6 +230,147 @@ async def test_active_owner_flow_is_closed_before_replacement(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_failed_owner_cleanup_is_retained_until_explicit_retry(
+    tmp_path, monkeypatch
+):
+    """A failed close poisons the entry and cannot coexist with a replacement."""
+    from tools.mcp_oauth_manager import (
+        MCPAuthFlowLifecycleError,
+        MCPOAuthManager,
+        _ProviderEntry,
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    manager = MCPOAuthManager()
+    close_done = asyncio.Event()
+    attempts = 0
+
+    class FlakyFlow:
+        async def aclose(self):
+            nonlocal attempts
+            attempts += 1
+            close_done.set()
+            if attempts <= 2:
+                raise RuntimeError("cleanup failed")
+
+    old_flow = FlakyFlow()
+    old_provider = SimpleNamespace(
+        _hermes_active_flows={id(old_flow): old_flow},
+        _hermes_loop=asyncio.get_running_loop(),
+        _hermes_generation=0,
+    )
+    entry = _ProviderEntry(
+        server_url="https://old.example/mcp",
+        oauth_config={},
+        provider=old_provider,
+        loop=asyncio.get_running_loop(),
+        oauth_config_fingerprint="old",
+    )
+    manager._entries[manager._key("srv")] = entry
+    replacement = SimpleNamespace()
+    built = 0
+
+    def build(_server_name, _entry):
+        nonlocal built
+        built += 1
+        return replacement
+
+    monkeypatch.setattr(manager, "_build_provider", build)
+    with pytest.raises(MCPAuthFlowLifecycleError):
+        manager.get_or_build_provider("srv", "https://new.example/mcp", {})
+    await close_done.wait()
+
+    assert attempts == 1
+    assert old_provider._hermes_active_flows == {id(old_flow): old_flow}
+    assert built == 0
+
+    assert await manager.retry_active_flow_cleanup("srv") is False
+    assert attempts == 2
+    assert old_provider._hermes_active_flows == {id(old_flow): old_flow}
+    assert await manager.retry_active_flow_cleanup("srv") is True
+    assert attempts == 3
+    assert old_provider._hermes_active_flows == {}
+
+    assert (
+        manager.get_or_build_provider("srv", "https://new.example/mcp", {})
+        is replacement
+    )
+    assert built == 1
+
+
+def test_resolved_callback_identity_is_retained_after_build(tmp_path, monkeypatch):
+    """A resolved callback port participates in the post-build cache identity."""
+    from tools.mcp_oauth_manager import MCPOAuthManager
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    manager = MCPOAuthManager()
+    builds = 0
+
+    def build(_server_name, _entry):
+        nonlocal builds
+        builds += 1
+        return SimpleNamespace(_hermes_resolved_port=43127)
+
+    monkeypatch.setattr(manager, "_build_provider", build)
+    provider = manager.get_or_build_provider(
+        "resolved", "https://example.test/mcp", {"redirect_host": "127.0.0.1"}
+    )
+    entry = manager._entries[manager._key("resolved")]
+    assert provider is not None
+    assert entry.resolved_callback_fingerprint == "127.0.0.1:43127"
+    assert entry.oauth_config_fingerprint != entry.requested_fingerprint
+    assert (
+        manager.get_or_build_provider(
+            "resolved", "https://example.test/mcp", {"redirect_host": "127.0.0.1"}
+        )
+        is provider
+    )
+    assert builds == 1
+
+
+@pytest.mark.asyncio
+async def test_cross_owner_cleanup_failure_is_fenced_until_owner_retry(
+    tmp_path, monkeypatch
+):
+    """A foreign owner failure is retained and later retried on that owner."""
+    from tools.mcp_oauth_manager import MCPOAuthManager, MCPAuthFlowLifecycleError
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    manager = MCPOAuthManager()
+    old_provider = SimpleNamespace(_hermes_active_flows={})
+    monkeypatch.setattr(manager, "_build_provider", lambda *_args: old_provider)
+    manager.get_or_build_provider("cross", "https://old.example/mcp", {})
+    entry = manager._entries[manager._key("cross")]
+    owner = asyncio.new_event_loop()
+    owner_thread = threading.Thread(target=owner.run_forever)
+    owner_thread.start()
+    attempts = 0
+
+    class Flow:
+        async def aclose(self):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("foreign close failed")
+
+    flow = Flow()
+    old_provider._hermes_active_flows[id(flow)] = flow
+    entry.loop = owner
+    old_provider._hermes_loop = owner
+    try:
+        with pytest.raises(MCPAuthFlowLifecycleError):
+            manager.get_or_build_provider("cross", "https://new.example/mcp", {})
+        assert old_provider._hermes_active_flows == {id(flow): flow}
+        assert await manager.retry_active_flow_cleanup("cross") is True
+        assert attempts == 2
+        assert old_provider._hermes_active_flows == {}
+    finally:
+        owner.call_soon_threadsafe(owner.stop)
+        owner_thread.join(timeout=5)
+        owner.close()
+
+
+@pytest.mark.asyncio
 async def test_incompatible_inner_with_aclose_is_closed_before_protocol_error(
     tmp_path, monkeypatch
 ):

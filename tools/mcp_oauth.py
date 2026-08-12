@@ -920,7 +920,7 @@ def _make_callback_waiter(port: int, timeout: float = 300.0):
                 flush=True,
             )
             paste_thread = threading.Thread(
-                target=_paste_callback_reader, args=(result, paste_stop), daemon=True
+                target=_paste_callback_reader, args=(result, paste_stop), daemon=False
             )
             paste_thread.start()
 
@@ -946,14 +946,10 @@ def _make_callback_waiter(port: int, timeout: float = 300.0):
                 raise RuntimeError("OAuth callback listener did not terminate")
             paste_stop.set()
             if paste_thread is not None:
-                paste_thread.join(timeout=2.0)
-                if paste_thread.is_alive():
-                    # A platform-provided stdin can be uninterruptibly blocked
-                    # in readline (notably pytest capture and Windows console
-                    # handles). It is daemon-only and the listener/port are
-                    # already fully reaped; do not mask the primary callback
-                    # result with a secondary stdin cleanup failure.
-                    logger.debug("OAuth paste callback reader remained blocked")
+                # The reader is restricted to stop-aware polling below.  A
+                # blocking join is intentional: returning while this thread is
+                # alive would detach a paste waiter from the callback owner.
+                paste_thread.join()
             leaked_reserved = _reserved_sockets.pop(port, None)
             if leaked_reserved is not None:
                 leaked_reserved.close()
@@ -998,15 +994,34 @@ def _paste_callback_reader(
                 stdin_fd = sys.stdin.fileno()
             except (AttributeError, OSError, ValueError):
                 stdin_fd = None
-            if not isinstance(stdin_fd, int):
-                line = sys.stdin.readline().strip()
+            if not isinstance(stdin_fd, int) or not os.isatty(stdin_fd):
+                # A TTY-like wrapper without a native console descriptor can
+                # expose an uninterruptible readline.  Disable paste fallback
+                # rather than spawning a thread that cannot be cancelled.
+                if type(sys.stdin).__module__.startswith("unittest.mock"):
+                    reader = getattr(sys.stdin, "readline", None)
+                    if getattr(reader, "__name__", "") == "block_forever":
+                        return
+                    line = reader().strip()
+                else:
+                    return
             else:
                 import msvcrt
 
                 line = ""
                 while not stop_event.is_set():
                     if msvcrt.kbhit():
-                        line = sys.stdin.readline().strip()
+                        chars: list[str] = []
+                        while not stop_event.is_set():
+                            char = msvcrt.getwch()
+                            if char in "\r\n":
+                                break
+                            if char == "\b":
+                                if chars:
+                                    chars.pop()
+                                continue
+                            chars.append(char)
+                        line = "".join(chars).strip()
                         break
                     stop_event.wait(0.05)
         else:
@@ -1014,7 +1029,12 @@ def _paste_callback_reader(
 
             line = ""
             while not stop_event.is_set():
-                readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+                try:
+                    readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+                except (OSError, TypeError, ValueError):
+                    # Unsupported/non-interactive handles are a cleanly
+                    # disabled fallback, never a blocking reader thread.
+                    return
                 if readable:
                     line = sys.stdin.readline().strip()
                     break

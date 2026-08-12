@@ -9,21 +9,178 @@ generator are not replaced.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
+import ssl
 import socket
 import threading
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 
 pytest.importorskip("mcp.client.auth.oauth2")
 
 
+def _certificate_bundle(tmp_path):
+    """Create a local CA, server cert, and client cert for real TLS tests."""
+    now = datetime.now(timezone.utc)
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mcp-test-ca")])
+    ca_cert = (
+        x509
+        .CertificateBuilder()
+        .subject_name(ca_name)
+        .issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=1), critical=True)
+        .sign(ca_key, hashes.SHA256())
+    )
+
+    def signed_leaf(common_name, usages):
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+        cert = (
+            x509
+            .CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(ca_cert.subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(minutes=1))
+            .not_valid_after(now + timedelta(days=1))
+            .add_extension(
+                x509.SubjectAlternativeName([
+                    x509.DNSName("localhost"),
+                    x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+                ]),
+                critical=False,
+            )
+            .add_extension(x509.ExtendedKeyUsage(usages), critical=False)
+            .sign(ca_key, hashes.SHA256())
+        )
+        return key, cert
+
+    server_key, server_cert = signed_leaf(
+        "localhost", [ExtendedKeyUsageOID.SERVER_AUTH]
+    )
+    client_key, client_cert = signed_leaf(
+        "mcp-test-client", [ExtendedKeyUsageOID.CLIENT_AUTH]
+    )
+    paths = {}
+    for name, value, is_key in (
+        ("ca.pem", ca_cert, False),
+        ("server.pem", server_cert, False),
+        ("server-key.pem", server_key, True),
+        ("client.pem", client_cert, False),
+        ("client-key.pem", client_key, True),
+    ):
+        path = tmp_path / name
+        if is_key:
+            data = value.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            )
+        else:
+            data = value.public_bytes(serialization.Encoding.PEM)
+        path.write_bytes(data)
+        paths[name] = path
+    return paths
+
+
+class LocalHTTPSRecorder:
+    def __init__(self, paths):
+        self.paths = paths
+        self.requests = []
+        self.errors = []
+        self._server = None
+
+    async def __aenter__(self):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(self.paths["server.pem"], self.paths["server-key.pem"])
+        # The TLS handshake remains CA-validated; application-level rejection
+        # below gives the missing-client-cert row a deterministic HTTP result.
+        context.verify_mode = ssl.CERT_OPTIONAL
+        context.load_verify_locations(self.paths["ca.pem"])
+        self._server = await asyncio.start_server(
+            self._handle, "127.0.0.1", 0, ssl=context
+        )
+        return self
+
+    async def __aexit__(self, *_args):
+        self._server.close()
+        await self._server.wait_closed()
+
+    @property
+    def base_url(self):
+        return f"https://127.0.0.1:{self._server.sockets[0].getsockname()[1]}"
+
+    async def _handle(self, reader, writer):
+        try:
+            raw = await reader.readuntil(b"\r\n\r\n")
+            lines = raw.decode("latin-1").split("\r\n")
+            method, target, _ = lines[0].split(" ", 2)
+            headers = {
+                key.lower(): value.strip()
+                for key, value in (
+                    line.split(":", 1) for line in lines[1:] if ":" in line
+                )
+            }
+            length = int(headers.get("content-length", "0"))
+            body = await reader.readexactly(length) if length else b""
+            self.requests.append((method, target, headers, body))
+            peer_cert = writer.get_extra_info("ssl_object").getpeercert(
+                binary_form=True
+            )
+            if target == "/redirect":
+                writer.write(
+                    b"HTTP/1.1 302 Found\r\nLocation: /redirected-mcp\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                )
+                await writer.drain()
+                return
+            if not peer_cert:
+                writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+                return
+            payload = {"ok": True, "path": target}
+            response = (
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(json.dumps(payload))}\r\nConnection: close\r\n\r\n".encode()
+                + json.dumps(payload).encode()
+            )
+            writer.write(response)
+            await writer.drain()
+        except BaseException as exc:
+            self.errors.append(repr(exc))
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except ssl.SSLError:
+                pass
+
+
 class LocalMCPPeer:
-    def __init__(self, *, sse: bool = False) -> None:
+    def __init__(self, *, sse: bool = False, mode: str = "success") -> None:
         self.sse = sse
+        self.mode = mode
         self.requests: list[tuple[str, str, dict[str, str], dict | None]] = []
+        self.handshake_seen = asyncio.Event()
+        self.connection_seen = asyncio.Event()
+        self.ready = asyncio.Event()
+        self.connection_closed = asyncio.Event()
+        self._open_connections = 0
+        self._handshake_gate = asyncio.Event()
+        self._writers: set[asyncio.StreamWriter] = set()
         self._sse_queue: asyncio.Queue[str] = asyncio.Queue()
         self._sse_writer = None
         self._server: asyncio.AbstractServer | None = None
@@ -36,6 +193,21 @@ class LocalMCPPeer:
         assert self._server is not None
         self._server.close()
         await self._server.wait_closed()
+        for writer in tuple(self._writers):
+            writer.close()
+        if self._writers:
+            await asyncio.gather(
+                *(writer.wait_closed() for writer in tuple(self._writers)),
+                return_exceptions=True,
+            )
+        if self._open_connections:
+            await asyncio.sleep(0)
+
+    async def close_connections(self) -> None:
+        """Close retained peer sockets to make cancellation observation bounded."""
+        for writer in tuple(self._writers):
+            writer.close()
+        await asyncio.sleep(0)
 
     @property
     def url(self) -> str:
@@ -55,6 +227,9 @@ class LocalMCPPeer:
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        self._open_connections += 1
+        self._writers.add(writer)
+        self.connection_seen.set()
         try:
             while not reader.at_eof():
                 try:
@@ -110,7 +285,17 @@ class LocalMCPPeer:
                         extra={"cache-control": "no-cache"},
                     )
                     while not writer.is_closing():
-                        message = await self._sse_queue.get()
+                        disconnect_task = asyncio.create_task(reader.read())
+                        message_task = asyncio.create_task(self._sse_queue.get())
+                        done, pending = await asyncio.wait(
+                            {disconnect_task, message_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for task in pending:
+                            task.cancel()
+                        if disconnect_task in done:
+                            return
+                        message = message_task.result()
                         await writer.drain()
                         event = (
                             b"event: message\n" + b"data: " + message.encode() + b"\n\n"
@@ -138,6 +323,14 @@ class LocalMCPPeer:
                     await self._write(writer, 404, b"")
                     continue
 
+                if payload and payload.get("method") == "initialize":
+                    self.handshake_seen.set()
+                    if self.mode == "handshake_stall":
+                        await self._handshake_gate.wait()
+                    if self.mode == "handshake_failure":
+                        await self._write(writer, 503, b"handshake failed")
+                        return
+
                 response = self._rpc_response(payload)
                 if response is None:
                     await self._write(writer, 202, b"")
@@ -146,6 +339,15 @@ class LocalMCPPeer:
                     await self._sse_queue.put(
                         json.dumps(response, separators=(",", ":"))
                     )
+                    if payload.get("method") == "tools/list":
+                        self.ready.set()
+                    if (
+                        self.mode == "stream_drop"
+                        and payload.get("method") == "initialize"
+                    ):
+                        writer.close()
+                        await writer.wait_closed()
+                        return
                 else:
                     await self._write(
                         writer,
@@ -154,6 +356,15 @@ class LocalMCPPeer:
                         content_type="application/json",
                         extra={"mcp-session-id": "local"},
                     )
+                    if (
+                        self.mode == "stream_drop"
+                        and payload.get("method") == "initialize"
+                    ):
+                        writer.close()
+                        await writer.wait_closed()
+                        return
+                    if payload.get("method") == "tools/list":
+                        self.ready.set()
         finally:
             if self._sse_writer is writer:
                 self._sse_writer = None
@@ -162,6 +373,10 @@ class LocalMCPPeer:
                 await writer.wait_closed()
             except ConnectionError:
                 pass
+            self._open_connections -= 1
+            self._writers.discard(writer)
+            if self._open_connections == 0:
+                self.connection_closed.set()
 
     @staticmethod
     def _rpc_response(payload: dict | None) -> dict | None:
@@ -239,7 +454,14 @@ async def _seed_oauth(tmp_path, monkeypatch, name: str) -> None:
 
 
 async def _run_public_selector(
-    peer: LocalMCPPeer, transport: str, auth_type: str, monkeypatch, tmp_path
+    peer: LocalMCPPeer,
+    transport: str,
+    auth_type: str,
+    monkeypatch,
+    tmp_path,
+    *,
+    timeout: float = 2,
+    lifecycle_event: asyncio.Event | None = None,
 ) -> None:
     import tools.mcp_tool as tool_module
     from tools.mcp_oauth_manager import reset_manager_for_tests
@@ -252,6 +474,8 @@ async def _run_public_selector(
     # Lifecycle is the task-level owner boundary; transport/session entry,
     # initialize, tools/list, and all context exits remain real.
     async def stop(_self):
+        if lifecycle_event is not None:
+            await lifecycle_event.wait()
         return "shutdown"
 
     monkeypatch.setattr(tool_module.MCPServerTask, "_wait_for_lifecycle_event", stop)
@@ -260,7 +484,7 @@ async def _run_public_selector(
     config = {
         "url": peer.url,
         "transport": "sse" if peer.sse else "streamable_http",
-        "connect_timeout": 2,
+        "connect_timeout": timeout,
         "ssl_verify": False,
         "headers": {"x-witness": "real"},
         "oauth": {},
@@ -294,6 +518,196 @@ async def test_public_real_sdk_transport_lifecycle(
         assert not any("authorization" in headers for _, _, headers, _ in peer.requests)
     if transport in {"current", "legacy"}:
         assert any(method == "DELETE" for method, *_ in peer.requests)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["current", "legacy", "sse"])
+@pytest.mark.parametrize("auth_type", ["none", "oauth"])
+async def test_real_handshake_timeout_failure_and_reuse(
+    transport, auth_type, monkeypatch, tmp_path
+):
+    """A real stalled/failed handshake closes and permits a fresh run."""
+    for mode in ("handshake_stall", "handshake_failure"):
+        peer = LocalMCPPeer(sse=transport == "sse", mode=mode)
+        async with peer:
+            with pytest.raises(BaseException):
+                await _run_public_selector(
+                    peer,
+                    transport,
+                    auth_type,
+                    monkeypatch,
+                    tmp_path,
+                    timeout=0.15,
+                )
+            peer._handshake_gate.set()
+            peer.mode = "success"
+            peer.connection_closed = asyncio.Event()
+            peer.ready = asyncio.Event()
+            peer.handshake_seen = asyncio.Event()
+            peer.connection_seen = asyncio.Event()
+            await _run_public_selector(
+                peer, transport, auth_type, monkeypatch, tmp_path, timeout=2
+            )
+        assert peer._open_connections == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["current", "legacy", "sse"])
+@pytest.mark.parametrize("auth_type", ["none", "oauth"])
+async def test_real_stream_drop_failure_and_reuse(
+    transport, auth_type, monkeypatch, tmp_path
+):
+    """A peer-side stream drop is observed through each installed selector."""
+    peer = LocalMCPPeer(sse=transport == "sse", mode="stream_drop")
+    async with peer:
+        try:
+            await _run_public_selector(
+                peer, transport, auth_type, monkeypatch, tmp_path, timeout=1
+            )
+        except BaseException:
+            pass
+        peer.mode = "success"
+        peer.connection_closed = asyncio.Event()
+        peer.ready = asyncio.Event()
+        peer.handshake_seen = asyncio.Event()
+        await _run_public_selector(
+            peer, transport, auth_type, monkeypatch, tmp_path, timeout=2
+        )
+    assert peer._open_connections == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["current", "legacy", "sse"])
+@pytest.mark.parametrize("auth_type", ["none", "oauth"])
+async def test_real_cancellation_during_handshake_and_live_session(
+    transport, auth_type, monkeypatch, tmp_path
+):
+    """Cancellation at both barriers closes real transport/session resources."""
+    peer = LocalMCPPeer(sse=transport == "sse", mode="handshake_stall")
+    async with peer:
+        task = asyncio.create_task(
+            _run_public_selector(
+                peer, transport, auth_type, monkeypatch, tmp_path, timeout=2
+            )
+        )
+        await asyncio.wait_for(peer.connection_seen.wait(), timeout=5)
+        task.cancel()
+        peer._handshake_gate.set()
+        await peer.close_connections()
+        with pytest.raises(BaseException):
+            await asyncio.wait_for(task, timeout=5)
+
+        peer.mode = "success"
+        peer.connection_closed = asyncio.Event()
+        peer.ready = asyncio.Event()
+        peer.handshake_seen = asyncio.Event()
+        peer.connection_seen = asyncio.Event()
+        live_cancel = asyncio.Event()
+        live_task = asyncio.create_task(
+            _run_public_selector(
+                peer,
+                transport,
+                auth_type,
+                monkeypatch,
+                tmp_path,
+                timeout=2,
+                lifecycle_event=live_cancel,
+            )
+        )
+        await peer.ready.wait()
+        live_task.cancel()
+        await peer.close_connections()
+        with pytest.raises(BaseException):
+            await asyncio.wait_for(live_task, timeout=5)
+
+        live_cancel.set()
+        peer.connection_closed = asyncio.Event()
+        peer.ready = asyncio.Event()
+        peer.handshake_seen = asyncio.Event()
+        await _run_public_selector(
+            peer, transport, auth_type, monkeypatch, tmp_path, timeout=2
+        )
+    assert peer._open_connections == 0
+
+
+@pytest.mark.asyncio
+async def test_real_https_custom_ca_mtls_control_and_data_wire(tmp_path):
+    """Real HTTPX policy reaches control/data requests and rejects bad TLS."""
+    import httpx
+
+    paths = _certificate_bundle(tmp_path)
+    client_bundle = tmp_path / "client-bundle.pem"
+    client_bundle.write_bytes(
+        paths["client.pem"].read_bytes() + paths["client-key.pem"].read_bytes()
+    )
+    client_context = ssl.create_default_context(cafile=str(paths["ca.pem"]))
+    client_context.load_cert_chain(str(client_bundle))
+    async with LocalHTTPSRecorder(paths) as peer:
+        timeout = httpx.Timeout(1.0, connect=0.5, read=1.0)
+        response_hooks = []
+
+        async def capture_response(response):
+            response_hooks.append(response)
+
+        async def add_wire_header(request):
+            request.headers["x-hermes-wire-hook"] = "configured"
+
+        async with httpx.AsyncClient(
+            verify=client_context,
+            timeout=timeout,
+            follow_redirects=True,
+            event_hooks={"request": [add_wire_header], "response": [capture_response]},
+        ) as client:
+            control_paths = (
+                "/.well-known/oauth-protected-resource/mcp",
+                "/.well-known/oauth-authorization-server",
+                "/register",
+                "/client-metadata.json",
+                "/token",
+                "/refresh",
+            )
+            for path in control_paths:
+                try:
+                    response = await client.get(peer.base_url + path)
+                except httpx.HTTPError as exc:
+                    raise AssertionError(peer.errors) from exc
+                assert response.status_code == 200
+            response = await client.get(
+                peer.base_url + "/mcp", headers={"authorization": "Bearer resource"}
+            )
+            assert response.status_code == 200
+            redirect_response = await client.get(peer.base_url + "/redirect")
+            assert redirect_response.status_code == 200
+
+        assert len(peer.requests) == len(control_paths) + 3
+        for _method, target, headers, _body in peer.requests:
+            assert headers["x-hermes-wire-hook"] == "configured"
+            if target == "/mcp":
+                assert headers["authorization"] == "Bearer resource"
+            else:
+                assert "authorization" not in headers
+        assert any(response.status_code == 302 for response in response_hooks)
+
+        bad_ca = tmp_path / "wrong-ca.pem"
+        bad_ca.write_bytes(paths["client.pem"].read_bytes())
+        with pytest.raises(httpx.HTTPError):
+            async with httpx.AsyncClient(
+                verify=str(bad_ca),
+                cert=str(client_bundle),
+                timeout=timeout,
+            ) as client:
+                await client.get(peer.base_url + "/control")
+
+        with pytest.raises(httpx.HTTPError):
+            async with httpx.AsyncClient(
+                verify=str(paths["ca.pem"]), timeout=timeout
+            ) as client:
+                response = await client.get(peer.base_url + "/control")
+                response.raise_for_status()
+
+    with pytest.raises(httpx.HTTPError):
+        async with httpx.AsyncClient(timeout=httpx.Timeout(0.2, connect=0.1)) as client:
+            await client.get("http://127.0.0.1:1/timeout")
 
 
 @pytest.mark.asyncio
@@ -655,3 +1069,24 @@ async def test_callback_timeout_joins_listener_and_reuses_port(monkeypatch):
             thread.name == "mcp-oauth-callback-listener"
             for thread in threading.enumerate()
         )
+
+
+def test_unsupported_paste_handle_is_disabled_without_blocking_read(monkeypatch):
+    """An interactive-looking unsupported handle must not spawn blocking I/O."""
+    import tools.mcp_oauth as oauth_module
+
+    called = False
+
+    class UnsupportedStdin:
+        def fileno(self):
+            raise OSError("no native descriptor")
+
+        def readline(self):
+            nonlocal called
+            called = True
+            raise AssertionError("unsupported handles must not call readline")
+
+    monkeypatch.setattr(oauth_module.sys, "stdin", UnsupportedStdin())
+    stop = threading.Event()
+    oauth_module._paste_callback_reader({}, stop)
+    assert called is False

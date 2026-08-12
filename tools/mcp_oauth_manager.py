@@ -205,6 +205,8 @@ class _ProviderEntry:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     loop: Optional[asyncio.AbstractEventLoop] = None
     oauth_config_fingerprint: str = ""
+    requested_fingerprint: str = ""
+    resolved_callback_fingerprint: str = ""
     transport_options: dict[str, Any] = field(default_factory=dict)
     pending_401: dict[str, "asyncio.Future[bool]"] = field(default_factory=dict)
 
@@ -568,7 +570,10 @@ def _make_hermes_provider_class() -> Optional[type]:
         async def _close_flow_on_owner(self, flow_id: int, flow: Any) -> None:
             try:
                 await flow.aclose()
-            finally:
+            except BaseException:
+                self._hermes_cleanup_failed = True
+                raise
+            else:
                 self._hermes_active_flows.pop(flow_id, None)
 
         async def _close_all_flows_on_owner(self, flows: list[tuple[int, Any]]) -> None:
@@ -654,7 +659,10 @@ def _make_hermes_provider_class() -> Optional[type]:
                     return
                 try:
                     await inner.aclose()
-                finally:
+                except BaseException:
+                    self._hermes_cleanup_failed = True
+                    raise
+                else:
                     active_flows.pop(flow_id, None)
 
             try:
@@ -777,7 +785,11 @@ class MCPOAuthManager:
             entry = self._entries.get(key)
             if entry is not None and (
                 entry.server_url != server_url
-                or entry.oauth_config_fingerprint != fingerprint
+                or (
+                    entry.requested_fingerprint
+                    or entry.oauth_config_fingerprint
+                )
+                != fingerprint
             ):
                 if self._entry_has_active_flows(entry):
                     if not self._fence_and_schedule_close(entry):
@@ -810,6 +822,7 @@ class MCPOAuthManager:
                     server_url=server_url,
                     oauth_config=dict(oauth_config or {}),
                     oauth_config_fingerprint=fingerprint,
+                    requested_fingerprint=fingerprint,
                     transport_options=transport_options,
                 )
                 self._entries[key] = entry
@@ -821,6 +834,22 @@ class MCPOAuthManager:
                     entry.loop = _running_loop_or_none()
                     if entry.loop is not None:
                         entry.provider._hermes_loop = entry.loop
+                    resolved = getattr(entry.provider, "_hermes_resolved_port", None)
+                    if resolved:
+                        callback_identity = (
+                            f"{entry.oauth_config.get('redirect_host', '127.0.0.1')}"
+                            f":{int(resolved)}"
+                        )
+                        entry.resolved_callback_fingerprint = callback_identity
+                        entry.oauth_config_fingerprint = _effective_provider_fingerprint(
+                            server_name,
+                            server_url,
+                            entry.oauth_config,
+                            {
+                                **entry.transport_options,
+                                "resolved_callback_identity": callback_identity,
+                            },
+                        )
 
             return entry.provider
 
@@ -829,6 +858,50 @@ class MCPOAuthManager:
         """Return whether replacement would strand a delegated SDK generator."""
         provider = entry.provider
         return bool(provider and getattr(provider, "_hermes_active_flows", None))
+
+    async def retry_active_flow_cleanup(
+        self,
+        server_name: str,
+        *,
+        hermes_home: str | Path | None = None,
+    ) -> bool:
+        """Retry a failed owner-side close and reap only after success."""
+        with self._entries_lock:
+            entry = self._entries.get(self._key(server_name, hermes_home))
+        if entry is None or entry.provider is None:
+            return True
+        provider = entry.provider
+        flows = getattr(provider, "_hermes_active_flows", {})
+        if not flows:
+            provider._hermes_cleanup_failed = False
+            return True
+        owner = entry.loop or getattr(provider, "_hermes_loop", None)
+        if owner is None or owner.is_closed() or not owner.is_running():
+            return False
+
+        async def close_on_owner() -> bool:
+            for flow_id, flow in list(flows.items()):
+                try:
+                    await flow.aclose()
+                except BaseException as exc:
+                    provider._hermes_cleanup_failed = True
+                    logger.warning(
+                        "MCP OAuth '%s': explicit owner-side flow cleanup retry failed: %s",
+                        server_name,
+                        exc,
+                    )
+                    return False
+                else:
+                    if flows.get(flow_id) is flow:
+                        flows.pop(flow_id, None)
+            provider._hermes_cleanup_failed = bool(flows)
+            return not flows
+
+        current = asyncio.get_running_loop()
+        if current is owner:
+            return await close_on_owner()
+        future = asyncio.run_coroutine_threadsafe(close_on_owner(), owner)
+        return await asyncio.wrap_future(future)
 
     def _fence_and_schedule_close(self, entry: _ProviderEntry) -> bool:
         """Fence an entry and schedule all delegated closes on its owner loop."""
@@ -841,13 +914,25 @@ class MCPOAuthManager:
         flows = list(getattr(provider, "_hermes_active_flows", {}).items())
         if not flows:
             return True
+        if getattr(provider, "_hermes_cleanup_failed", False):
+            return False
+        previous_task = getattr(provider, "_hermes_cleanup_task", None)
+        if previous_task is not None and not previous_task.done():
+            return False
         provider._hermes_generation = getattr(provider, "_hermes_generation", 0) + 1
+
         async def close_all() -> None:
             for flow_id, flow in flows:
                 try:
                     await asyncio.wait_for(flow.aclose(), timeout=5.0)
-                finally:
-                    getattr(provider, "_hermes_active_flows", {}).pop(flow_id, None)
+                except BaseException:
+                    provider._hermes_cleanup_failed = True
+                    raise
+                else:
+                    active = getattr(provider, "_hermes_active_flows", {})
+                    if active.get(flow_id) is flow:
+                        active.pop(flow_id, None)
+            provider._hermes_cleanup_failed = False
 
         try:
             current = asyncio.get_running_loop()
@@ -860,6 +945,7 @@ class MCPOAuthManager:
                 # its own running loop. Schedule bounded cleanup, observe its
                 # result, and fail closed without publishing a replacement.
                 task = asyncio.create_task(close_coro)
+                provider._hermes_cleanup_task = task
 
                 def _observe(task: asyncio.Task) -> None:
                     try:
@@ -870,6 +956,8 @@ class MCPOAuthManager:
                             getattr(provider, "_hermes_server_name", ""),
                             exc,
                         )
+                    finally:
+                        provider._hermes_cleanup_task = None
 
                 task.add_done_callback(_observe)
                 return False
@@ -990,6 +1078,11 @@ class MCPOAuthManager:
             timeout=float(cfg.get("timeout", 300)),
         )
         provider._hermes_transport_options = dict(entry.transport_options)
+        provider._hermes_resolved_port = resolved_port
+        provider._hermes_callback_identity = (
+            cfg.get("redirect_uri")
+            or f"{cfg.get('redirect_host', '127.0.0.1')}:{resolved_port}/callback"
+        )
         provider._hermes_control_plane_required = bool(entry.transport_options)
         return provider
 
