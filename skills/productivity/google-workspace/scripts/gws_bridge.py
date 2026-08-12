@@ -16,10 +16,14 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 from _hermes_home import get_hermes_home
+from _google_identities import get_google_credentials, UnknownGoogleIdentityError
 
 
-def get_token_path() -> Path:
-    return get_hermes_home() / "google_token.json"
+def get_token_path(identity: str | None) -> Path:
+    """Resolve the token path for a given identity. FAIL-CLOSED: raises for a
+    missing or unregistered identity — there is no default identity."""
+    token_path, _client_secret_path, _scopes = get_google_credentials(identity)
+    return token_path
 
 
 def _normalize_authorized_user_payload(payload: dict) -> dict:
@@ -29,7 +33,7 @@ def _normalize_authorized_user_payload(payload: dict) -> dict:
     return normalized
 
 
-def refresh_token(token_data: dict) -> dict:
+def refresh_token(token_data: dict, identity: str) -> dict:
     """Refresh the access token using the refresh token."""
     import urllib.error
     import urllib.parse
@@ -68,17 +72,26 @@ def refresh_token(token_data: dict) -> dict:
         tz=timezone.utc,
     ).isoformat()
 
-    get_token_path().write_text(
+    get_token_path(identity).write_text(
         json.dumps(_normalize_authorized_user_payload(token_data), indent=2), encoding="utf-8"
     )
     return token_data
 
 
-def get_valid_token() -> str:
-    """Return a valid access token, refreshing if needed."""
-    token_path = get_token_path()
+def get_valid_token(identity: str) -> str:
+    """Return a valid access token for the given identity, refreshing if needed.
+
+    FAIL-CLOSED: identity must be a registered identity (see
+    _google_identities.py) — there is no default and no fallback to another
+    identity's token.
+    """
+    token_path = get_token_path(identity)
     if not token_path.exists():
-        print("ERROR: No Google token found. Run setup.py --auth-url first.", file=sys.stderr)
+        print(
+            f"ERROR: No Google token found for identity {identity!r} at "
+            f"{token_path}. Run setup.py --identity {identity!r} --auth-url first.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     token_data = json.loads(token_path.read_text(encoding="utf-8"))
@@ -88,22 +101,34 @@ def get_valid_token() -> str:
         exp_dt = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
         now = datetime.now(timezone.utc)
         if now >= exp_dt:
-            token_data = refresh_token(token_data)
+            token_data = refresh_token(token_data, identity)
 
     return token_data["token"]
 
 
 def main():
-    """Refresh token if needed, then exec gws with remaining args."""
-    if len(sys.argv) < 2:
-        print("Usage: gws_bridge.py <gws args...>", file=sys.stderr)
+    """Parse --identity, refresh token if needed, then exec gws with remaining args."""
+    argv = sys.argv[1:]
+    if len(argv) < 3 or argv[0] != "--identity":
+        print(
+            "Usage: gws_bridge.py --identity <name> <gws args...> "
+            "(--identity is required, no default)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    identity = argv[1]
+    gws_args = argv[2:]
+
+    try:
+        access_token = get_valid_token(identity)
+    except UnknownGoogleIdentityError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
 
-    access_token = get_valid_token()
     env = os.environ.copy()
     env["GOOGLE_WORKSPACE_CLI_TOKEN"] = access_token
 
-    result = subprocess.run(["gws"] + sys.argv[1:], env=env)
+    result = subprocess.run(["gws"] + gws_args, env=env)
     sys.exit(result.returncode)
 
 
