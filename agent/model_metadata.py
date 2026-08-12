@@ -3111,6 +3111,14 @@ def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
 # hit the memo even though the outer dicts are fresh objects every turn.
 _MSG_TOKENS_CACHE: Dict[Any, Tuple[list, int]] = {}
 _MSG_TOKENS_CACHE_MAX = 4096
+# The count cap above is not a byte cap: entries pin the message's raw
+# strings (strong references), so large payloads — multimodal base64, big
+# documents — could be retained unboundedly. Track pinned bytes and evict on
+# either axis (#84727). A single entry whose pinned strings exceed the
+# per-entry budget is not cached at all (see _estimate_message_tokens_cached).
+_MSG_TOKENS_CACHE_MAX_BYTES = 64 * 1024 * 1024      # 64 MiB of pinned strings
+_MSG_TOKENS_CACHE_MAX_ENTRY_BYTES = 1 * 1024 * 1024  # skip the memo past 1 MiB
+_msg_tokens_cache_pinned_bytes = 0
 
 
 def _msg_fingerprint(value: Any, pins: list) -> Any:
@@ -3144,6 +3152,17 @@ def _estimate_message_tokens_cached(msg: Any, image_cost: int) -> int:
             _estimate_message_tokens_without_images(msg)
             + _count_image_tokens(msg, image_cost)
         )
+    pinned_bytes = sum(len(s) for s in pins if isinstance(s, str))
+    if pinned_bytes > _MSG_TOKENS_CACHE_MAX_ENTRY_BYTES:
+        # Do not pin giant payloads (multimodal base64, big documents) in a
+        # process-global memo: the entry cap is a count, not bytes, and a few
+        # such entries would retain many MiB of raw content indefinitely.
+        # Fall through to a direct compute so no strong reference is kept.
+        # (#84727)
+        return (
+            _estimate_message_tokens_without_images(msg)
+            + _count_image_tokens(msg, image_cost)
+        )
     cached = _MSG_TOKENS_CACHE.get(key)
     if cached is not None:
         return cached[1]
@@ -3151,10 +3170,18 @@ def _estimate_message_tokens_cached(msg: Any, image_cost: int) -> int:
         _estimate_message_tokens_without_images(msg)
         + _count_image_tokens(msg, image_cost)
     )
+    global _msg_tokens_cache_pinned_bytes
     _MSG_TOKENS_CACHE[key] = (pins, tokens)
-    while len(_MSG_TOKENS_CACHE) > _MSG_TOKENS_CACHE_MAX:
+    _msg_tokens_cache_pinned_bytes += pinned_bytes
+    while (
+        len(_MSG_TOKENS_CACHE) > _MSG_TOKENS_CACHE_MAX
+        or _msg_tokens_cache_pinned_bytes > _MSG_TOKENS_CACHE_MAX_BYTES
+    ):
         try:
-            _MSG_TOKENS_CACHE.pop(next(iter(_MSG_TOKENS_CACHE)))
+            old_pins, _ = _MSG_TOKENS_CACHE.pop(next(iter(_MSG_TOKENS_CACHE)))
+            _msg_tokens_cache_pinned_bytes -= sum(
+                len(s) for s in old_pins if isinstance(s, str)
+            )
         except (StopIteration, KeyError, RuntimeError):
             break
     return tokens

@@ -1389,3 +1389,54 @@ class TestFallbackWarning:
             if r.levelno == logging.WARNING and "falling back" in r.getMessage()
         ]
         assert len(fallback_warnings) == 0
+
+
+# =========================================================================
+# Per-message token memo: byte budget
+# =========================================================================
+
+class TestMessageTokensMemoByteBudget:
+    """Regression for #84727: the memo pinned raw message strings with only a
+    count cap, so giant payloads (multimodal base64, big documents) were
+    retained in a process-global cache without a byte limit."""
+
+    @staticmethod
+    def _reset():
+        import agent.model_metadata as mm
+
+        mm._MSG_TOKENS_CACHE.clear()
+        mm._msg_tokens_cache_pinned_bytes = 0
+
+    def test_giant_payload_is_not_cached(self):
+        import agent.model_metadata as mm
+
+        self._reset()
+        try:
+            payload = "x" * (2 * 1024 * 1024)
+            msg = {"role": "user", "content": f"data:image/png;base64,{payload}"}
+            before = len(mm._MSG_TOKENS_CACHE)
+            first = mm._estimate_message_tokens_cached(msg, 1500)
+            second = mm._estimate_message_tokens_cached(msg, 1500)
+            assert first == second
+            assert len(mm._MSG_TOKENS_CACHE) == before, (
+                "giant message must not enter the memo (no strong pin of raw base64)"
+            )
+            assert mm._msg_tokens_cache_pinned_bytes == 0
+        finally:
+            self._reset()
+
+    def test_byte_budget_evicts_oldest(self, monkeypatch):
+        import agent.model_metadata as mm
+
+        self._reset()
+        monkeypatch.setattr(mm, "_MSG_TOKENS_CACHE_MAX_BYTES", 10_000)
+        monkeypatch.setattr(mm, "_MSG_TOKENS_CACHE_MAX", 100_000)
+        try:
+            for i in range(8):
+                msg = {"role": "user", "content": f"m{i} " + "y" * 3000}
+                mm._estimate_message_tokens_cached(msg, 1500)
+            # ~3KB of pinned strings per entry → only ~3 fit in the 10KB budget.
+            assert mm._msg_tokens_cache_pinned_bytes <= 10_000
+            assert len(mm._MSG_TOKENS_CACHE) <= 5
+        finally:
+            self._reset()
