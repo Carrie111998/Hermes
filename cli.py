@@ -9216,9 +9216,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             # has all API keys in os.environ.
                             from tools.environments.local import _sanitize_subprocess_env
                             sanitized_env = _sanitize_subprocess_env(os.environ.copy())
-                            result = subprocess.run(
-                                exec_cmd, shell=True, capture_output=True,
-                                text=True, timeout=30, env=sanitized_env
+                            # run_text_capture, not subprocess.run: with shell=True
+                            # the real command is always a grandchild of cmd.exe,
+                            # and a grandchild inheriting capture PIPES defeats
+                            # `timeout` outright on Windows. It captures into temp
+                            # files instead, so the 30s bound actually holds.
+                            from hermes_cli._subprocess_compat import run_text_capture
+                            result = run_text_capture(
+                                exec_cmd, shell=True, timeout=30, env=sanitized_env
                             )
                             output = result.stdout.strip() or result.stderr.strip()
                             if output:
