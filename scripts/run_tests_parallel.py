@@ -91,15 +91,43 @@ _SKIP_PARTS = {"integration", "e2e", "docker"}
 # Per-file wall-clock cap. Override
 # via --file-timeout or HERMES_TEST_FILE_TIMEOUT.
 #
-# Set to 300s (5 min) deliberately generous: the per-test subprocess
-# isolation plugin spawns a fresh Python process per test, so a
-# large-collection file pays N × (interpreter startup + import) of
-# overhead before any test logic runs — and that overhead dilates under
-# load on shared CI runners, producing false "no tests ran" timeouts on
-# files that finish in ~100s on a quiet box. The Docker build matrix jobs
-# take 7-10 min anyway, so this headroom costs nothing on total CI wall
-# time while keeping a genuinely hung file bounded.
-_DEFAULT_FILE_TIMEOUT_SECONDS = 300.0
+# Deliberately generous: a large-collection file pays interpreter startup
+# plus a heavy import graph before any test logic runs, and that overhead
+# dilates under load, producing false "no tests ran" timeouts on files that
+# finish comfortably on a quiet box. The Docker build matrix jobs take 7-10
+# min anyway, so this headroom costs nothing on total CI wall time while
+# keeping a genuinely hung file bounded.
+#
+# Raised 300s -> 1800s on 2026-08-12, from measurement. The 300s value was
+# reached by exactly the reasoning above but set below what this hardware
+# actually needs. A full `tests/hermes_cli` run (467 files, ~8770 tests, -j 8
+# on 12 cores) put 28 files in the "no tests ran" bucket. Re-running just
+# those 28 with the cap lifted and retries off gave max 664.3s, p90 557.2s,
+# median 95.4s -- only 4 of 28 over 300s, so most were killed for being slow
+# under sustained load rather than being slow in themselves.
+#
+# Do NOT re-derive this from "observed max x margin": on this box the same
+# file's wall time swings hard with ambient load, and not monotonically with
+# -j. `test_web_server.py` finished inside 664s in a 28-file -j 8 batch and
+# took 1234.3s in a 4-file -j 4 batch. An intermediate 1200s trial still
+# killed it. Treat any single number as a lower bound on what a legitimate
+# file can take here.
+#
+# 1800s is therefore chosen as "well past any plausible legitimate run" rather
+# than as a tight fit. That is the right bias, because the two failure modes
+# are wildly asymmetric:
+#
+#   too tight -> SIGKILL the tree, report "no tests ran", and silently discard
+#                every real result in the file. Measured cost of the 300s cap:
+#                `test_commands.py` reported nothing while actually passing
+#                175/175 (647.1s), and `test_config.py` reported nothing while
+#                actually surfacing 11 genuine failures (1090.2s). A green-
+#                looking run was hiding real red.
+#   too loose -> one worker of 8 idles until a genuinely hung file is killed.
+#
+# The cap's job is bounding a hang, not policing slowness. Prefer masking
+# nothing.
+_DEFAULT_FILE_TIMEOUT_SECONDS = 1800.0
 
 # One-shot retry of failing test FILES. A file that exits non-zero is re-run
 # once in a fresh subprocess; if the re-run passes, the file counts as passed
