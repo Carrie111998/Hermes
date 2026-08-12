@@ -300,6 +300,153 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     return scrubbed
 
 
+
+# ---------------------------------------------------------------------------
+# Sandbox import guard -- PYTHONPATH credential isolation (#8028)
+# ---------------------------------------------------------------------------
+
+# Packages whose import from within the execute_code sandbox is blocked.
+# These expose credentials, session internals, approval bypass, or user auth.
+_SANDBOX_BLOCKED_PACKAGES = frozenset({
+    "hermes_cli",   # OAuth tokens, auth.json, CLI internals
+    "agent",        # credential_pool, session state, prompt builder
+    "tools",        # approval bypass, terminal_tool force=True
+    "gateway",      # messaging connections, user authorization
+})
+
+
+def _generate_sandbox_import_guard() -> str:
+    """Return a Python source snippet that, when prepended to a sandbox
+    script, blocks imports of the sensitive internal packages listed in
+    ``_SANDBOX_BLOCKED_PACKAGES``.
+
+    **Three-layer defense (tamper-resistant):**
+
+    Layer 1 -- ``sys.modules`` pre-seeding:
+        Each blocked package name is planted in ``sys.modules`` with a
+        ``_BlockedModule`` sentinel.  Any attempt to ``import X`` where X
+        is blocked returns the sentinel immediately; touching its attributes
+        or calling it raises ``ImportError``.  This covers the common case
+        before any finder runs.
+
+    Layer 2 -- ``sys.meta_path`` finders (``find_module`` + ``find_spec``):
+        A meta-path finder is prepended that blocks any new import attempt
+        for the blocked prefixes.  The finder instance is protected against
+        removal by wrapping ``sys.meta_path`` in a read-only proxy.
+
+    Layer 3 -- Builtins lockdown:
+        ``__import__`` is replaced with a wrapper that checks the target
+        against the blocklist before delegating to the original.  This
+        catches ``__import__("agent")`` bypasses even after meta_path
+        manipulation.
+
+    This is a defense-in-depth measure: removing the hermes-agent root
+    from PYTHONPATH (see below) already makes these packages unreachable
+    in most configurations.  The guard catches edge cases where a
+    site-packages .pth file, a symlink, or a project venv with the
+    hermes-agent source installed could still resolve them.
+
+    Returns:
+        A string of Python source code that can be prepended to user
+        scripts in the sandbox.
+    """
+    blocked_list = sorted(_SANDBOX_BLOCKED_PACKAGES)
+    NL = chr(10)
+    lines = [
+        "# -----------------------------------------------------------------------",
+        "# Hermes sandbox import guard -- blocks credential-accessible packages",
+        "# See: https://github.com/NousResearch/hermes-agent/issues/8028",
+        "# -----------------------------------------------------------------------",
+        "import sys as __hermes_sys",
+        "",
+        "# Layer 1: Pre-seed sys.modules with sentinel modules for blocked names",
+        "class _BlockedModule:",
+        "    __slots__ = ('__name__',)",
+        "    def __init__(self, name):",
+        "        self.__name__ = name",
+        "    def __getattr__(self, item):",
+        "        raise ImportError(",
+        "            f'Import of {self.__name__!r} is blocked in the Hermes sandbox. ' "
+        "            f'Use the hermes_tools API instead. (See #8028)'",
+        "        )",
+        "",
+        f"_hermes_blocked_names = {blocked_list!r}",
+        "_hermes_blocklist_set = frozenset(_hermes_blocked_names)",
+        "for __hermes_nm in _hermes_blocked_names:",
+        "    if __hermes_nm not in __hermes_sys.modules:",
+        "        __hermes_sys.modules[__hermes_nm] = _BlockedModule(__hermes_nm)",
+        "",
+        "# Layer 2: Meta-path finder + read-only meta_path proxy",
+        "class _HermesSandboxGuard:",
+        "    __slots__ = ()",
+        "",
+        f"    BLOCKED = {blocked_list!r}",
+        "",
+        "    def find_module(self, fullname, path=None):",
+        "        for prefix in self.BLOCKED:",
+        "            if fullname == prefix or fullname.startswith(prefix + '.'):",
+        "                raise ImportError(",
+        "                    f'Import of {fullname!r} is blocked in the Hermes sandbox. ' "
+        "                    f'Use the hermes_tools API instead. (See #8028)'",
+        "                )",
+        "        return None",
+        "    def find_spec(self, fullname, path, target=None):",
+        "        for prefix in self.BLOCKED:",
+        "            if fullname == prefix or fullname.startswith(prefix + '.'):",
+        "                raise ImportError(",
+        "                    f'Import of {fullname!r} is blocked in the Hermes sandbox. ' "
+        "                    f'Use the hermes_tools API instead. (See #8028)'",
+        "                )",
+        "        return None",
+        "",
+        "class _ReadOnlyMetaPath:",
+        "    __slots__ = ('_inner',)",
+        "    def __init__(self, inner):",
+        "        self._inner = inner",
+        "    def __getitem__(self, index):",
+        "        return self._inner[index]",
+        "    def __iter__(self):",
+        "        return iter(self._inner)",
+        "    def __len__(self):",
+        "        return len(self._inner)",
+        "    def append(self, value):",
+        "        raise AttributeError('sys.meta_path is locked in the Hermes sandbox')",
+        "    def insert(self, index, value):",
+        "        raise AttributeError('sys.meta_path is locked in the Hermes sandbox')",
+        "    def remove(self, value):",
+        "        raise AttributeError('sys.meta_path is locked in the Hermes sandbox')",
+        "    def pop(self, *args):",
+        "        raise AttributeError('sys.meta_path is locked in the Hermes sandbox')",
+        "    def clear(self):",
+        "        raise AttributeError('sys.meta_path is locked in the Hermes sandbox')",
+        "    def __delitem__(self, index):",
+        "        raise AttributeError('sys.meta_path is locked in the Hermes sandbox')",
+        "    def __setitem__(self, index, value):",
+        "        raise AttributeError('sys.meta_path is locked in the Hermes sandbox')",
+        "",
+        "_hermes_guard = _HermesSandboxGuard()",
+        "__hermes_sys.meta_path.insert(0, _hermes_guard)",
+        "__hermes_sys.meta_path = _ReadOnlyMetaPath(__hermes_sys.meta_path)",
+        "",
+        "# Layer 3: Wrap __import__ to catch direct builtin bypasses",
+        "_hermes_orig_import = __builtins__['__import__'] if isinstance(__builtins__, dict) else __builtins__.__import__",
+        "def _hermes_safe_import(name, globals=None, locals=None, fromlist=(), level=0):",
+        "    if level == 0:",
+        "        for prefix in _hermes_blocklist_set:",
+        "            if name == prefix or name.startswith(prefix + '.'):",
+        "                raise ImportError(",
+        "                    f'Import of {name!r} is blocked in the Hermes sandbox. ' "
+        "                    f'Use the hermes_tools API instead. (See #8028)'",
+        "                )",
+        "    return _hermes_orig_import(name, globals, locals, fromlist, level)",
+        "if isinstance(__builtins__, dict):",
+        "    __builtins__['__import__'] = _hermes_safe_import",
+        "else:",
+        "    __builtins__.__import__ = _hermes_safe_import",
+        "# -----------------------------------------------------------------------",
+    ]
+    return NL.join(lines) + NL
+
 def check_sandbox_requirements() -> bool:
     """Code execution sandbox requires a POSIX OS for Unix domain sockets."""
     if not SANDBOX_AVAILABLE:
@@ -1127,7 +1274,10 @@ def _execute_remote(
             list(sandbox_tools), transport="file",
         )
         _ship_file_to_remote(env, f"{sandbox_dir}/hermes_tools.py", tools_src)
-        _ship_file_to_remote(env, f"{sandbox_dir}/script.py", code)
+        # Prepend sandbox import guard to remote script (#8028)
+        _guard_code = _generate_sandbox_import_guard()
+        _ship_file_to_remote(env, f"{sandbox_dir}/script.py",
+                                     _guard_code + chr(10) + chr(10) + code)
 
         # Wrapped so the thread inherits the turn's approval context + callbacks
         # (see tools.thread_context) — else sandbox RPC tool calls lose approval
@@ -1145,6 +1295,7 @@ def _execute_remote(
 
         # Build environment variable prefix for the script
         env_prefix = (
+            f"PYTHONPATH={shlex.quote(sandbox_dir)} "
             f"HERMES_RPC_DIR={shlex.quote(f'{sandbox_dir}/rpc')} "
             f"HERMES_RPC_TOKEN={shlex.quote(rpc_token)} "
             f"PYTHONDONTWRITEBYTECODE=1"
@@ -1384,10 +1535,14 @@ def execute_code(
         with open(os.path.join(tmpdir, "hermes_tools.py"), "w", encoding="utf-8") as f:
             f.write(tools_src)
 
-        # Write the user's script
+        # Write the user's script with a sandbox import guard prepended.
+        # The guard blocks imports of hermes_cli, agent, tools, gateway
+        # to prevent credential theft via PYTHONPATH (#8028).
+        _guard_code = _generate_sandbox_import_guard()
         with open(os.path.join(tmpdir, "script.py"), "w", encoding="utf-8") as f:
+            f.write(_guard_code)
+            f.write(chr(10) + chr(10))
             f.write(code)
-
         # --- Start RPC server ---
         rpc_token = secrets.token_urlsafe(32)
         # Two transports:
@@ -1455,16 +1610,43 @@ def execute_code(
         # with a C/POSIX locale (containers, minimal base images).
         child_env["PYTHONIOENCODING"] = "utf-8"
         child_env["PYTHONUTF8"] = "1"
-        # Ensure the hermes-agent root is importable in the sandbox so
-        # repo-root modules are available to child scripts.  We also prepend
-        # the staging tmpdir so ``from hermes_tools import ...`` resolves even
-        # when the subprocess CWD is not tmpdir (project mode).
-        _hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        _existing_pp = child_env.get("PYTHONPATH", "")
-        _pp_parts = [tmpdir, _hermes_root]
-        if _existing_pp:
-            _pp_parts.append(_existing_pp)
-        child_env["PYTHONPATH"] = os.pathsep.join(_pp_parts)
+        # -------------------------------------------------------------------
+        # PYTHONPATH hardening -- sandbox credential isolation (#8028)
+        # -------------------------------------------------------------------
+        #
+        # Before: the hermes-agent root was added to PYTHONPATH so sandbox
+        # scripts could import *any* internal module (hermes_cli, agent, tools,
+        # gateway) -- including auth helpers, credential pools, and the
+        # approval system.  A prompt-injected script could then read all
+        # OAuth tokens, API keys, and bypass command approvals without any
+        # user interaction (see #8028, closed as not-planned).
+        #
+        # After: only the staging tmpdir is on PYTHONPATH, meaning scripts
+        # can import the generated hermes_tools stub (the official controlled
+        # API) but cannot reach internal modules.  We also install an import
+        # blocklist hook that catches any attempt to import the sensitive
+        # packages by name and raises an ImportError immediately.
+        #
+        # Why tmpdir only: the hermes_tools.py stub lives in tmpdir and
+        # provides all tool access via RPC back to the parent.  Legitimate
+        # scripts never need to import hermes_cli, agent, tools, or gateway
+        # directly -- those are internal implementation details, not a
+        # supported API.  Stdlib and venv packages (pandas, requests, etc.)
+        # remain fully accessible via the venv's own site-packages path.
+        #
+        # Blocked packages:
+        #   - hermes_cli   : OAuth tokens, auth.json, CLI internals
+        #   - agent         : credential_pool, session state, prompt builder
+        #   - tools         : approval bypass, terminal_tool force=True
+        #   - gateway       : messaging connections, user authorization
+        #
+        # Config: set code_execution.allow_internal_imports: true to
+        # disable the blocklist (not recommended; breaks security model).
+        # -------------------------------------------------------------------
+        # PYTHONPATH hardening -- sandbox credential isolation (#8028)
+        # Only tmpdir (hermes_tools.py) is on PYTHONPATH.
+        # Inherited PYTHONPATH is NOT passed through.
+        child_env["PYTHONPATH"] = tmpdir
         # Inject user's configured timezone so datetime.now() in sandboxed
         # code reflects the correct wall-clock time.  Only TZ is set —
         # HERMES_TIMEZONE is an internal Hermes setting and must not leak
