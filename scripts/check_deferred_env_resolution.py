@@ -110,6 +110,7 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -297,18 +298,28 @@ def _module_name(rel: Path) -> str:
 
 
 def _iter_py_files(root: Path) -> Iterator[Path]:
-    for path in root.rglob("*.py"):
-        try:
-            rel = path.relative_to(root)
-        except ValueError:  # pragma: no cover — rglob guarantees containment
-            continue
-        # Relative-path filtering: see SKIP_DIR_NAMES.
-        if any(part in SKIP_DIR_NAMES for part in rel.parts[:-1]):
-            continue
-        name = rel.name
-        if name == "conftest.py" or name.startswith("test_") or name.endswith("_test.py"):
-            continue
-        yield path
+    # ``os.walk`` with in-place pruning, NOT ``root.rglob("*.py")``.  rglob
+    # descends the whole tree and only then lets the caller filter, so on a
+    # checkout that carries git worktrees under ``.claude/worktrees/`` it walked
+    # every one of them (40+ full copies of this repo here) and then threw the
+    # results away.  Worse, it made the scan RACY: a concurrent session removing
+    # a worktree mid-walk crashed the whole run with
+    # ``FileNotFoundError: [WinError 3]`` from ``os.scandir`` deep inside
+    # pathlib's recursive selector.  Pruning ``dirnames`` in place keeps
+    # SKIP_DIR_NAMES authoritative *during* the walk, and ``onerror`` swallows a
+    # directory that disappears under us instead of aborting the scan.
+    #
+    # The skip test stays RELATIVE to ``root`` (root's own name is never
+    # examined), so a checkout that itself lives under ``.claude/worktrees/``
+    # still scans normally — see SKIP_DIR_NAMES.
+    for dirpath, dirnames, filenames in os.walk(root, onerror=lambda _err: None):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIR_NAMES)
+        for name in sorted(filenames):
+            if not name.endswith(".py"):
+                continue
+            if name == "conftest.py" or name.startswith("test_") or name.endswith("_test.py"):
+                continue
+            yield Path(dirpath) / name
 
 
 # Anything that could possibly host a deferred registration. Deliberately
