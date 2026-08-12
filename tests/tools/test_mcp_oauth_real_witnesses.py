@@ -502,8 +502,7 @@ async def _run_public_selector(
     assert peer.response_hook_seen
     assert peer.requests
     assert all(
-        headers.get("x-composed-hook") == "yes"
-        for _, _, headers, _ in peer.requests
+        headers.get("x-composed-hook") == "yes" for _, _, headers, _ in peer.requests
     )
 
 
@@ -1108,3 +1107,425 @@ def test_unsupported_paste_handle_is_disabled_without_blocking_read(monkeypatch)
     stop = threading.Event()
     oauth_module._paste_callback_reader({}, stop)
     assert called is False
+
+
+class LocalTLSOAuthPeer:
+    """Real HTTPS OAuth/MCP peer used by the public composition witnesses."""
+
+    def __init__(self, paths, *, cimd=False, step_up=False):
+        self.paths = paths
+        self.cimd = cimd
+        self.step_up = step_up
+        self.requests = []
+        self.response_statuses = []
+        self.tokens_issued = []
+        self._server = None
+        self._writers = set()
+        self._mcp_calls = 0
+
+    async def __aenter__(self):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(self.paths["server.pem"], self.paths["server-key.pem"])
+        context.verify_mode = ssl.CERT_OPTIONAL
+        context.load_verify_locations(self.paths["ca.pem"])
+        self._server = await asyncio.start_server(
+            self._handle, "127.0.0.1", 0, ssl=context
+        )
+        return self
+
+    async def __aexit__(self, *_args):
+        self._server.close()
+        await self._server.wait_closed()
+        for writer in tuple(self._writers):
+            writer.close()
+        await asyncio.gather(
+            *(writer.wait_closed() for writer in tuple(self._writers)),
+            return_exceptions=True,
+        )
+
+    @property
+    def base_url(self):
+        port = self._server.sockets[0].getsockname()[1]
+        return f"https://127.0.0.1:{port}"
+
+    @property
+    def url(self):
+        return self.base_url + "/mcp"
+
+    async def _handle(self, reader, writer):
+        self._writers.add(writer)
+        try:
+            while not reader.at_eof():
+                raw = await reader.readuntil(b"\r\n\r\n")
+                lines = raw.decode("latin-1").split("\r\n")
+                method, target, _ = lines[0].split(" ", 2)
+                headers = {
+                    key.lower(): value.strip()
+                    for key, value in (
+                        line.split(":", 1) for line in lines[1:] if ":" in line
+                    )
+                }
+                length = int(headers.get("content-length", "0"))
+                body = await reader.readexactly(length) if length else b""
+                payload = (
+                    json.loads(body)
+                    if body and "application/json" in headers.get("content-type", "")
+                    else None
+                )
+                if method == "POST" and target == "/register" and payload is None:
+                    payload = {}
+                self.requests.append((method, target, headers, payload))
+                status, response_body, content_type, extra = await self._response(
+                    method, target, headers, payload
+                )
+                self.response_statuses.append((target, status))
+                await self._write(
+                    writer,
+                    status,
+                    response_body,
+                    content_type=content_type,
+                    extra=extra,
+                )
+                if target == "/sse" and status == 200:
+                    await reader.read()
+                    return
+                if method == "DELETE":
+                    return
+        except BaseException as exc:
+            self.requests.append(("ERROR", repr(exc), {}, None))
+            return
+        finally:
+            self._writers.discard(writer)
+            writer.close()
+            await writer.wait_closed()
+
+    async def _response(self, method, target, headers, payload):
+        if method == "GET" and "oauth-protected-resource" in target:
+            return (
+                200,
+                json.dumps({
+                    "resource": self.url,
+                    "authorization_servers": [self.base_url],
+                }).encode(),
+                "application/json",
+                {},
+            )
+        if method == "GET" and "oauth-authorization-server" in target:
+            metadata = {
+                "issuer": self.base_url,
+                "authorization_endpoint": self.base_url + "/authorize",
+                "token_endpoint": self.base_url + "/token",
+                "code_challenge_methods_supported": ["S256"],
+            }
+            if not self.cimd:
+                metadata["registration_endpoint"] = self.base_url + "/register"
+            else:
+                metadata["client_id_metadata_document_supported"] = True
+            return 200, json.dumps(metadata).encode(), "application/json", {}
+        if method == "GET" and target == "/cimd.json":
+            return (
+                200,
+                json.dumps({"client_name": "Hermes", "redirect_uris": []}).encode(),
+                "application/json",
+                {},
+            )
+        if method == "POST" and target == "/register":
+            return (
+                201,
+                json.dumps({
+                    "client_id": "tls-dcr-client",
+                    "redirect_uris": ["http://127.0.0.1:9/callback"],
+                    "grant_types": ["authorization_code", "refresh_token"],
+                    "response_types": ["code"],
+                    "token_endpoint_auth_method": "none",
+                }).encode(),
+                "application/json",
+                {},
+            )
+        if method == "GET" and target.startswith("/authorize"):
+            return 302, b"", None, {"Location": "/callback?code=tls-code"}
+        if method == "POST" and target == "/token":
+            self.tokens_issued.append(len(self.tokens_issued) + 1)
+            token = f"tls-access-{len(self.tokens_issued)}"
+            return (
+                200,
+                json.dumps({
+                    "access_token": token,
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                    "refresh_token": f"tls-refresh-{len(self.tokens_issued)}",
+                }).encode(),
+                "application/json",
+                {},
+            )
+        if method == "GET" and target == "/callback":
+            return 200, b"callback", "text/plain", {}
+        if method == "DELETE":
+            return 204, b"", None, {}
+        if method == "GET" and target in {"/mcp", "/sse"}:
+            return 200, b"", "text/event-stream", {"cache-control": "no-cache"}
+        if method == "POST" and target in {"/mcp", "/messages"}:
+            if not headers.get("authorization"):
+                return (
+                    401,
+                    b"",
+                    None,
+                    {
+                        "WWW-Authenticate": f'Bearer resource_metadata="{self.base_url}/.well-known/oauth-protected-resource/mcp"'
+                    },
+                )
+            if not payload or "id" not in payload:
+                return 202, b"", None, {}
+            self._mcp_calls += 1
+            if self.step_up and self._mcp_calls == 1:
+                return (
+                    403,
+                    b"",
+                    None,
+                    {
+                        "WWW-Authenticate": 'Bearer error="insufficient_scope", scope="elevated"'
+                    },
+                )
+            method_name = (payload or {}).get("method")
+            if method_name == "initialize":
+                result = {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "tls-peer", "version": "1"},
+                }
+            elif method_name == "tools/list":
+                result = {"tools": []}
+            else:
+                result = {}
+            return (
+                200,
+                json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": result,
+                }).encode(),
+                "application/json",
+                {"mcp-session-id": "tls"},
+            )
+        return 404, b"", None, {}
+
+    @staticmethod
+    async def _write(writer, status, body, *, content_type=None, extra=None):
+        reason = {
+            200: "OK",
+            201: "Created",
+            204: "No Content",
+            302: "Found",
+            401: "Unauthorized",
+            403: "Forbidden",
+            404: "Not Found",
+        }.get(status, "Error")
+        headers = {"Connection": "keep-alive", "Content-Length": str(len(body))}
+        if content_type:
+            headers["Content-Type"] = content_type
+        headers.update(extra or {})
+        wire = (
+            f"HTTP/1.1 {status} {reason}\r\n"
+            + "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+            + "\r\n"
+        )
+        writer.write(wire.encode() + body)
+        await writer.drain()
+
+
+async def _run_composed_tls_public(
+    peer, transport, monkeypatch, tmp_path, *, cimd=False, step_up=False, expired=False
+):
+    import tools.mcp_tool as tool_module
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import reset_manager_for_tests
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    storage = HermesTokenStorage("tls-peer")
+    assert await storage.get_tokens() is None
+    assert await storage.get_client_info() is None
+    assert storage.load_oauth_metadata() is None
+    if expired:
+        from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+        from pydantic import AnyUrl
+
+        await storage.set_tokens(
+            OAuthToken(
+                access_token="expired",
+                token_type="Bearer",
+                expires_in=0,
+                refresh_token="old",
+            )
+        )
+        await storage.set_client_info(
+            OAuthClientInformationFull(
+                client_id="old-client",
+                redirect_uris=[AnyUrl("http://127.0.0.1:9/callback")],
+                grant_types=["authorization_code", "refresh_token"],
+                response_types=["code"],
+                token_endpoint_auth_method="none",
+            )
+        )
+    reset_manager_for_tests()
+    monkeypatch.setattr(tool_module, "_MCP_NEW_HTTP", transport == "current")
+    callback_state = None
+    callback_ready = asyncio.Event()
+
+    async def redirect_handler(url):
+        nonlocal callback_state
+        callback_state = parse_qs(urlsplit(url).query)["state"][0]
+        callback_ready.set()
+
+    async def callback_handler():
+        await callback_ready.wait()
+        return "tls-code", callback_state
+
+    async def request_hook(request):
+        request.headers["x-composed-hook"] = "yes"
+
+    async def response_hook(response):
+        response.extensions["composed_response_hook"] = True
+
+    async def stop(_self):
+        return "shutdown"
+
+    monkeypatch.setattr(tool_module.MCPServerTask, "_wait_for_lifecycle_event", stop)
+    task = tool_module.MCPServerTask("tls-peer")
+    task._auth_type = "oauth"
+    config = {
+        "url": peer.url,
+        "transport": "sse" if transport == "sse" else "streamable_http",
+        "connect_timeout": 2,
+        "ssl_verify": str(peer.paths["ca.pem"]),
+        "client_cert": str(peer.paths["client.pem"]),
+        "client_key": str(peer.paths["client-key.pem"]),
+        "headers": {"x-witness": "real"},
+        "request_hooks": [request_hook],
+        "response_hooks": [response_hook],
+        "oauth": {"client_metadata_url": peer.base_url + "/cimd.json"}
+        if cimd
+        else {
+            "redirect_handler": redirect_handler,
+            "callback_handler": callback_handler,
+        },
+    }
+    if cimd:
+        config["oauth"].update({
+            "redirect_handler": redirect_handler,
+            "callback_handler": callback_handler,
+        })
+    await task._run_http(config)
+    return storage
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["current", "legacy"])
+@pytest.mark.parametrize("cimd", [False, True])
+async def test_composed_cold_public_real_https_oauth_control_plane(
+    transport, cimd, monkeypatch, tmp_path
+):
+    """Cold DCR/CIMD and token exchange use public _run_http over mTLS."""
+    paths = _certificate_bundle(tmp_path)
+    async with LocalTLSOAuthPeer(paths, cimd=cimd) as peer:
+        storage = await _run_composed_tls_public(
+            peer, transport, monkeypatch, tmp_path, cimd=cimd
+        )
+    assert peer.tokens_issued
+    assert any("oauth-protected-resource" in target for _, target, *_ in peer.requests)
+    assert any(target.endswith("/token") for _, target, *_ in peer.requests)
+    if cimd:
+        assert not any(target == "/register" for _, target, *_ in peer.requests)
+    else:
+        assert any(target == "/register" for _, target, *_ in peer.requests)
+    for _method, target, headers, _payload in peer.requests:
+        if target not in {"/mcp", "/messages", "/callback"}:
+            assert "authorization" not in headers
+        if target not in {"/mcp", "/messages", "/callback"} and headers:
+            assert headers.get("x-composed-hook") == "yes"
+    assert await storage.get_tokens() is not None
+
+
+@pytest.mark.asyncio
+async def test_composed_cold_public_real_https_oauth_refresh_and_step_up(
+    monkeypatch, tmp_path
+):
+    """A public TLS run refreshes persisted tokens and handles 403 step-up."""
+    paths = _certificate_bundle(tmp_path)
+    async with LocalTLSOAuthPeer(paths, step_up=True) as peer:
+        storage = await _run_composed_tls_public(
+            peer, "current", monkeypatch, tmp_path, step_up=True, expired=True
+        )
+    saved = await storage.get_tokens()
+    assert saved is not None and saved.access_token.startswith("tls-access-")
+    assert saved.refresh_token.startswith("tls-refresh-")
+    assert sum(target == "/token" for _, target, *_ in peer.requests) >= 1
+    assert any(status == 403 for _, status in peer.response_statuses)
+
+
+@pytest.mark.asyncio
+async def test_composed_cold_public_real_https_oauth_wrong_ca_and_missing_cert(
+    monkeypatch, tmp_path
+):
+    """Public _run_http fails closed for wrong CA and missing client cert."""
+    import tools.mcp_tool as tool_module
+
+    paths = _certificate_bundle(tmp_path)
+    wrong_ca = tmp_path / "wrong-ca.pem"
+    wrong_ca.write_bytes(paths["client.pem"].read_bytes())
+    async with LocalTLSOAuthPeer(paths) as peer:
+        for config_change in (
+            {"ssl_verify": str(wrong_ca)},
+            {"client_cert": None, "client_key": None},
+        ):
+            task = tool_module.MCPServerTask("tls-failure")
+            task._auth_type = "oauth"
+            config = {
+                "url": peer.url,
+                "transport": "streamable_http",
+                "connect_timeout": 0.2,
+                "ssl_verify": str(paths["ca.pem"]),
+                "client_cert": str(paths["client.pem"]),
+                "client_key": str(paths["client-key.pem"]),
+                "oauth": {
+                    "redirect_handler": lambda _url: None,
+                    "callback_handler": lambda: ("unused", "unused"),
+                },
+            }
+            config.update(config_change)
+            with pytest.raises(BaseException):
+                await task._run_http(config)
+
+
+@pytest.mark.asyncio
+async def test_composed_cold_public_real_https_oauth_sse_typed_redirect_refusal(
+    monkeypatch, tmp_path
+):
+    """SSE rejects strict redirect policy through the public task seam."""
+    import tools.mcp_tool as tool_module
+
+    paths = _certificate_bundle(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    task = tool_module.MCPServerTask("tls-sse-refusal")
+    task._auth_type = "oauth"
+
+    async def redirect_handler(_url):
+        return None
+
+    async def callback_handler():
+        return "unused", "unused"
+
+    config = {
+        "url": "https://127.0.0.1:1/mcp",
+        "transport": "sse",
+        "connect_timeout": 0.2,
+        "ssl_verify": str(paths["ca.pem"]),
+        "client_cert": str(paths["client.pem"]),
+        "client_key": str(paths["client-key.pem"]),
+        "strict_redirect_headers": True,
+        "oauth": {
+            "redirect_handler": redirect_handler,
+            "callback_handler": callback_handler,
+        },
+    }
+    with pytest.raises(ValueError, match="strict_redirect_headers"):
+        await task._run_http(config)

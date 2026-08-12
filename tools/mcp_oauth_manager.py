@@ -1104,6 +1104,10 @@ class MCPOAuthManager:
             get_dashboard_oauth_flow() is None
             and not _is_interactive()
             and not storage.has_cached_tokens()
+            and not (
+                callable(cfg.get("redirect_handler"))
+                and callable(cfg.get("callback_handler"))
+            )
         ):
             raise OAuthNonInteractiveError(
                 "MCP OAuth for "
@@ -1118,12 +1122,16 @@ class MCPOAuthManager:
         _maybe_preregister_client(storage, cfg, client_metadata)
 
         resolved_port = cfg.get("_resolved_port", 0)
-        redirect_handler = _make_redirect_handler(
-            resolved_port, redirect_uri=cfg.get("redirect_uri")
-        )
-        callback_handler = _make_callback_waiter(
-            resolved_port, timeout=float(cfg.get("timeout", 300))
-        )
+        redirect_handler = cfg.get("redirect_handler")
+        if not callable(redirect_handler):
+            redirect_handler = _make_redirect_handler(
+                resolved_port, redirect_uri=cfg.get("redirect_uri")
+            )
+        callback_handler = cfg.get("callback_handler")
+        if not callable(callback_handler):
+            callback_handler = _make_callback_waiter(
+                resolved_port, timeout=float(cfg.get("timeout", 300))
+            )
 
         provider = _HERMES_PROVIDER_CLS(
             server_name=server_name,
@@ -1134,6 +1142,7 @@ class MCPOAuthManager:
             redirect_handler=redirect_handler,
             callback_handler=callback_handler,
             timeout=float(cfg.get("timeout", 300)),
+            client_metadata_url=cfg.get("client_metadata_url"),
         )
         provider._hermes_transport_options = dict(entry.transport_options)
         provider._hermes_resolved_port = resolved_port
