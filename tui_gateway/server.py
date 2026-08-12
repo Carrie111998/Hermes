@@ -9253,6 +9253,16 @@ def _notification_poller_loop(
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     _last_kanban_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
+        # A live TUI/desktop poller is a consumer half of async-delegation
+        # delivery: keep the delivery sweeper running here so a completion
+        # stranded by a producer-side process death is re-enqueued into a
+        # process that can deliver it.
+        try:
+            from tools.async_delegation import _ensure_delivery_sweeper
+
+            _ensure_delivery_sweeper()
+        except Exception:
+            pass
         _now = time.monotonic()
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
             _last_kanban_poll = _now
