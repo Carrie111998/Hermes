@@ -2986,6 +2986,118 @@ WantedBy=default.target
 def _normalize_service_definition(text: str) -> str:
     return "\n".join(line.rstrip() for line in text.strip().splitlines())
 
+# ── Custom directive detection & drop-in migration ────────────────────────
+
+# Keys that generate_systemd_unit() always emits in [Service].  Any
+# Environment= key *value* not in this set, or any other [Service]
+# directive not in this set, is treated as a user customization.
+_GENERATED_ENV_KEYS: frozenset[str] = frozenset({
+    "PATH", "VIRTUAL_ENV", "HERMES_HOME",
+    # System-scope extras (present only when --system is used)
+    "HOME", "USER", "LOGNAME",
+})
+
+_GENERATED_SERVICE_DIRECTIVES: frozenset[str] = frozenset({
+    "Type", "ExecStart", "WorkingDirectory", "Restart", "RestartSec",
+    "RestartForceExitStatus", "KillMode", "KillSignal", "ExecReload",
+    "TimeoutStopSec", "StandardOutput", "StandardError",
+    # System-scope extras
+    "User", "Group",
+})
+
+
+def _parse_env_key(directive: str) -> str | None:
+    """Extract the variable name from ``Environment="KEY=VALUE"``."""
+    import re
+    # Handle both quoted and unquoted forms:
+    #   Environment="KEY=VALUE"
+    #   Environment=KEY=VALUE
+    #   Environment = "KEY=VALUE"
+    m = re.match(r'^Environment\s*=\s*"?([^"=\s]+)=', directive.strip())
+    return m.group(1) if m else None
+
+
+def _detect_custom_directives(existing_unit: str) -> list[str]:
+    """Return [Service] directives in *existing_unit* not in the generated set.
+
+    Scans for:
+    - ``Environment="KEY=VALUE"`` where KEY is not in ``_GENERATED_ENV_KEYS``
+    - Other ``Key=Value`` lines where Key is not in ``_GENERATED_SERVICE_DIRECTIVES``
+
+    Comments and blank lines are ignored.  Only lines inside the [Service]
+    section are considered (the [Unit] and [Install] sections are fully
+    managed by Hermes).
+    """
+    custom: list[str] = []
+    in_service = False
+    for raw_line in existing_unit.splitlines():
+        line = raw_line.strip()
+        if line.startswith("["):
+            in_service = line == "[Service]"
+            continue
+        if not in_service or not line or line.startswith("#"):
+            continue
+        # Normalize: strip whitespace around the directive name for matching
+        eq_pos = line.find("=")
+        if eq_pos < 0:
+            continue
+        directive_name = line[:eq_pos].strip()
+        if directive_name == "Environment":
+            key = _parse_env_key(line)
+            if key and key not in _GENERATED_ENV_KEYS:
+                custom.append(raw_line.strip())
+        elif directive_name not in _GENERATED_SERVICE_DIRECTIVES:
+            custom.append(raw_line.strip())
+    return custom
+
+
+def _drop_in_dir(system: bool = False) -> Path:
+    """Return the drop-in override directory for the gateway service."""
+    unit_path = get_systemd_unit_path(system=system)
+    return unit_path.parent / f"{unit_path.stem}.service.d"
+
+
+def _migrate_custom_to_drop_in(
+    custom_lines: list[str],
+    system: bool = False,
+) -> Path:
+    """Write *custom_lines* into a drop-in override file and return its path.
+
+    Creates the drop-in directory if it does not exist.
+    If ``custom.conf`` already exists, appends only lines not already present.
+    """
+    drop_in = _drop_in_dir(system=system)
+    drop_in.mkdir(parents=True, exist_ok=True)
+    target = drop_in / "custom.conf"
+
+    existing_content = ""
+    existing_lines: set[str] = set()
+    if target.exists():
+        existing_content = target.read_text(encoding="utf-8")
+        existing_lines = {l.strip() for l in existing_content.splitlines() if l.strip()}
+
+    # Filter out lines already present in the existing drop-in
+    new_lines = [l for l in custom_lines if l.strip() not in existing_lines]
+    if not new_lines:
+        return target
+
+    if existing_content:
+        # Append to existing file
+        sep = "\n" if existing_content.endswith("\n") else "\n\n"
+        target.write_text(
+            existing_content + sep + "\n".join(new_lines) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        header = (
+            "# Auto-migrated by `hermes gateway install` — custom directives\n"
+            "# that were previously in the main service file.\n"
+            "# See https://www.freedesktop.org/software/systemd/man/systemd.service.html\n\n"
+            "[Service]\n"
+        )
+        target.write_text(header + "\n".join(new_lines) + "\n", encoding="utf-8")
+
+    return target
 
 # Directives that older systemd versions silently ignore/strip.  Normalize
 # them out of stale-check comparisons so a unit that differs only by these
@@ -3126,6 +3238,59 @@ def _refuse_temp_home_service_write(definition: str, kind: str) -> bool:
     return True
 
 
+def _warn_and_migrate_custom_directives(
+    custom_lines: list[str],
+    system: bool = False,
+) -> None:
+    """Warn about custom directives and offer automatic migration to a drop-in.
+
+    When the existing service file contains [Service] directives that are not
+    part of the generated set (e.g. custom ``Environment=`` variables, custom
+    ``LimitNOFILE=``), the user has edited the main unit file directly.
+    These will be overwritten by the refresh.  This function warns and offers
+    to migrate them to a systemd drop-in override file so they survive future
+    updates.
+    """
+    scope = _service_scope_label(system)
+    print()
+    print("⚠ Custom service directives detected in the main unit file:")
+    for line in custom_lines:
+        print(f"    {line}")
+    print()
+    print(
+        "  Direct edits to the main service file will be overwritten by"
+        " updates."
+    )
+    print("  These directives should be placed in a systemd drop-in override")
+    drop_in = _drop_in_dir(system=system)
+    print(f"  directory instead: {drop_in}/")
+    print()
+
+    if not sys.stdin.isatty():
+        # Non-interactive (CI, piped install): auto-migrate silently.
+        target = _migrate_custom_to_drop_in(custom_lines, system=system)
+        print(f"  → Auto-migrated custom directives to: {target}")
+        print()
+        return
+
+    if prompt_yes_no(
+        "  Migrate these custom directives to a drop-in override now?", True
+    ):
+        target = _migrate_custom_to_drop_in(custom_lines, system=system)
+        print(f"  ✓ Migrated to: {target}")
+        print(
+            "    Run `systemctl --user daemon-reload` after installation"
+            " completes."
+        )
+    else:
+        print(
+            "  Skipped. To migrate manually, create a file at:"
+        )
+        print(f"    {drop_in}/custom.conf")
+        print("  with the directives listed above under a [Service] section.")
+    print()
+
+
 def refresh_systemd_unit_if_needed(system: bool = False) -> bool:
     """Rewrite the installed systemd unit when the generated definition has changed."""
     unit_path = get_systemd_unit_path(system=system)
@@ -3168,6 +3333,18 @@ def refresh_systemd_unit_if_needed(system: bool = False) -> bool:
     # don't carry the pytest markers above but poison the unit identically).
     if _refuse_temp_home_service_write(new_unit, "systemd unit"):
         return False
+
+    # ── Detect and migrate custom directives before overwriting ─────────
+    # Users sometimes add custom Environment= lines or other [Service]
+    # directives directly to the main service file.  Detect these before
+    # overwriting and offer to migrate them to a systemd drop-in override.
+    existing_custom = _detect_custom_directives(
+        unit_path.read_text(encoding="utf-8")
+    )
+    if existing_custom:
+        _warn_and_migrate_custom_directives(
+            existing_custom, system=system,
+        )
 
     unit_path.write_text(new_unit, encoding="utf-8")
     _run_systemctl(["daemon-reload"], system=system, check=True, timeout=30)
@@ -3370,6 +3547,19 @@ def systemd_install(
     new_unit = generate_systemd_unit(system=system, run_as_user=run_as_user)
     if _refuse_temp_home_service_write(new_unit, "systemd unit"):
         return
+
+    # ── Detect and migrate custom directives before overwriting ─────────
+    # On --force or fresh install, also check for customizations if the
+    # unit already exists (e.g. the user ran install --force to update).
+    if unit_path.exists():
+        existing_custom = _detect_custom_directives(
+            unit_path.read_text(encoding="utf-8")
+        )
+        if existing_custom:
+            _warn_and_migrate_custom_directives(
+                existing_custom, system=system,
+            )
+
     print(f"Installing {_service_scope_label(system)} systemd service to: {unit_path}")
     unit_path.write_text(new_unit, encoding="utf-8")
 

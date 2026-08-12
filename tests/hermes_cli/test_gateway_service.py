@@ -2035,3 +2035,179 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
         assert ok is False
         assert list_calls["n"] >= 1
 
+class TestCustomDirectiveDetection:
+    """Tests for _detect_custom_directives and drop-in migration."""
+
+    def test_detects_custom_environment_variable(self):
+        unit = (
+            '[Service]\n'
+            'Type=simple\n'
+            'Environment="PATH=/usr/bin"\n'
+            'Environment="VIRTUAL_ENV=/home/user/.venv"\n'
+            'Environment="HERMES_HOME=/home/user/.hermes"\n'
+            'Environment="MY_CUSTOM_VAR=hello"\n'
+            'Restart=always\n'
+        )
+        custom = gateway_cli._detect_custom_directives(unit)
+        assert custom == ['Environment="MY_CUSTOM_VAR=hello"']
+
+    def test_ignores_generated_environment_keys(self):
+        unit = (
+            '[Service]\n'
+            'Environment="PATH=/usr/bin"\n'
+            'Environment="VIRTUAL_ENV=/home/user/.venv"\n'
+            'Environment="HERMES_HOME=/home/user/.hermes"\n'
+            'Environment="HOME=/home/user"\n'
+            'Environment="USER=user"\n'
+            'Environment="LOGNAME=user"\n'
+        )
+        custom = gateway_cli._detect_custom_directives(unit)
+        assert custom == []
+
+    def test_detects_custom_service_directives(self):
+        unit = (
+            '[Service]\n'
+            'Type=simple\n'
+            'LimitNOFILE=65536\n'
+            'MemoryMax=2G\n'
+            'Restart=always\n'
+        )
+        custom = gateway_cli._detect_custom_directives(unit)
+        assert "LimitNOFILE=65536" in custom
+        assert "MemoryMax=2G" in custom
+
+    def test_ignores_comments_and_blank_lines(self):
+        unit = (
+            '[Service]\n'
+            '# This is a comment\n'
+            '\n'
+            'Type=simple\n'
+        )
+        custom = gateway_cli._detect_custom_directives(unit)
+        assert custom == []
+
+    def test_ignores_unit_and_install_sections(self):
+        unit = (
+            '[Unit]\n'
+            'Description=Custom thing\n'
+            '\n'
+            '[Service]\n'
+            'Type=simple\n'
+            '\n'
+            '[Install]\n'
+            'WantedBy=custom.target\n'
+        )
+        custom = gateway_cli._detect_custom_directives(unit)
+        assert custom == []
+
+    def test_empty_unit_returns_empty(self):
+        assert gateway_cli._detect_custom_directives("") == []
+
+    def test_multiple_custom_directives(self):
+        unit = (
+            '[Service]\n'
+            'Type=simple\n'
+            'Environment="HTTP_PROXY=http://proxy:8080"\n'
+            'Environment="NO_PROXY=localhost"\n'
+            'LimitNOFILE=4096\n'
+            'Restart=always\n'
+        )
+        custom = gateway_cli._detect_custom_directives(unit)
+        assert len(custom) == 3
+        assert 'Environment="HTTP_PROXY=http://proxy:8080"' in custom
+        assert 'Environment="NO_PROXY=localhost"' in custom
+        assert "LimitNOFILE=4096" in custom
+
+    def test_detects_unquoted_environment_variable(self):
+        """Unquoted Environment=KEY=VALUE is valid systemd syntax."""
+        unit = (
+            '[Service]\n'
+            'Type=simple\n'
+            'Environment=MY_CUSTOM_VAR=hello\n'
+            'Restart=always\n'
+        )
+        custom = gateway_cli._detect_custom_directives(unit)
+        assert custom == ["Environment=MY_CUSTOM_VAR=hello"]
+
+    def test_detects_environment_with_spaces_around_equals(self):
+        unit = (
+            '[Service]\n'
+            'Environment = "MY_VAR=hello"\n'
+            'Restart=always\n'
+        )
+        custom = gateway_cli._detect_custom_directives(unit)
+        assert len(custom) == 1
+        assert "MY_VAR" in custom[0]
+
+    def test_detects_directive_with_space_before_equals(self):
+        unit = (
+            '[Service]\n'
+            'LimitNOFILE = 65536\n'
+            'Restart=always\n'
+        )
+        custom = gateway_cli._detect_custom_directives(unit)
+        assert len(custom) == 1
+        assert "LimitNOFILE" in custom[0]
+
+
+class TestDropInMigration:
+    """Tests for _migrate_custom_to_drop_in."""
+
+    def test_creates_drop_in_file(self, tmp_path, monkeypatch):
+        unit_path = tmp_path / "hermes-gateway.service"
+        unit_path.write_text("[Service]\nType=simple\n", encoding="utf-8")
+        monkeypatch.setattr(
+            gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path
+        )
+
+        custom = ['Environment="MY_VAR=test"', "LimitNOFILE=65536"]
+        target = gateway_cli._migrate_custom_to_drop_in(custom, system=False)
+
+        assert target.exists()
+        assert target.name == "custom.conf"
+        content = target.read_text(encoding="utf-8")
+        assert "[Service]" in content
+        assert 'Environment="MY_VAR=test"' in content
+        assert "LimitNOFILE=65536" in content
+        assert "Auto-migrated" in content
+
+    def test_creates_drop_in_directory(self, tmp_path, monkeypatch):
+        unit_path = tmp_path / "hermes-gateway.service"
+        unit_path.write_text("[Service]\n", encoding="utf-8")
+        monkeypatch.setattr(
+            gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path
+        )
+
+        drop_in_dir = tmp_path / "hermes-gateway.service.d"
+        assert not drop_in_dir.exists()
+
+        gateway_cli._migrate_custom_to_drop_in(["LimitNOFILE=65536"], system=False)
+        assert drop_in_dir.exists()
+        assert (drop_in_dir / "custom.conf").exists()
+
+    def test_overwrites_existing_custom_conf(self, tmp_path, monkeypatch):
+        """When custom.conf exists, new lines are appended, not overwritten."""
+        unit_path = tmp_path / "hermes-gateway.service"
+        unit_path.write_text("[Service]\n", encoding="utf-8")
+        monkeypatch.setattr(
+            gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path
+        )
+
+        drop_in_dir = tmp_path / "hermes-gateway.service.d"
+        drop_in_dir.mkdir()
+        existing = drop_in_dir / "custom.conf"
+        existing.write_text(
+            "# Previous migration\n[Service]\nEnvironment=\"OLD_VAR=old\"\n",
+            encoding="utf-8",
+        )
+
+        target = gateway_cli._migrate_custom_to_drop_in(
+            ['Environment="OLD_VAR=old"', 'Environment="NEW_VAR=new"'],
+            system=False,
+        )
+        content = target.read_text(encoding="utf-8")
+        # Existing content preserved
+        assert "# Previous migration" in content
+        assert 'Environment="OLD_VAR=old"' in content
+        # New line appended (deduped)
+        assert 'Environment="NEW_VAR=new"' in content
