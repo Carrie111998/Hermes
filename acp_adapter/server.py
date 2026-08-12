@@ -821,31 +821,28 @@ class HermesACPAgent(acp.Agent):
         )
 
     @staticmethod
-    def _resolve_model_selection(raw_model: str, current_provider: str) -> tuple[str, str]:
+    def _resolve_model_selection(
+        raw_model: str,
+        current_provider: str,
+    ) -> tuple[str, str]:
         """Resolve ``provider:model`` input into the provider and normalized model id."""
         target_provider = current_provider
         new_model = raw_model.strip()
 
         try:
             from hermes_cli.models import (
-                _KNOWN_PROVIDER_NAMES,
                 detect_provider_for_model,
+                is_known_provider_name,
                 normalize_provider,
-                parse_model_input,
+                parse_model_input_details,
             )
 
             stripped_model = new_model.strip()
-            explicit_provider = False
+            target_provider, new_model, explicit_provider = parse_model_input_details(
+                stripped_model,
+                current_provider,
+            )
 
-            colon = stripped_model.find(":")
-            if colon > 0:
-                provider_part = stripped_model[:colon].strip().lower()
-                model_part = stripped_model[colon + 1 :].strip()
-                explicit_provider = bool(
-                    provider_part and model_part and provider_part in _KNOWN_PROVIDER_NAMES
-                )
-
-            slash_handled = False
             slash = stripped_model.find("/")
             if not explicit_provider and slash > 0:
                 provider_part = stripped_model[:slash].strip().lower()
@@ -853,18 +850,15 @@ class HermesACPAgent(acp.Agent):
                 if (
                     provider_part
                     and model_part
-                    and provider_part in _KNOWN_PROVIDER_NAMES
-                    and normalize_provider(provider_part) == normalize_provider(current_provider)
+                    and is_known_provider_name(provider_part)
+                    and normalize_provider(provider_part)
+                    == normalize_provider(current_provider)
                 ):
                     target_provider = normalize_provider(provider_part)
                     new_model = model_part
                     explicit_provider = True
-                    slash_handled = True
 
-            if not slash_handled:
-                target_provider, new_model = parse_model_input(new_model, current_provider)
-
-            if not explicit_provider and target_provider == current_provider:
+            if not explicit_provider:
                 detected = detect_provider_for_model(new_model, current_provider)
                 if detected:
                     target_provider, new_model = detected
