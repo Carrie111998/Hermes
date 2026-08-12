@@ -98,9 +98,26 @@ _COMPRESSION_CHILD_SQL = (
 )
 
 
-# Rows that surface in pickers: roots + branch children (subagent runs and
-# compression continuations stay hidden).
-_LISTABLE_CHILD_SQL = f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')})"
+# A child created by an explicit user reset (/new, /reset) is a new thread the
+# user opened on purpose, so it must surface in pickers like any other root.
+# Gateway session_reset chains link every /new to the previous session via
+# parent_session_id; hiding those made every gateway-platform conversation
+# (weixin, telegram, ...) invisible to ``hermes sessions list`` and the desktop
+# sidebar messaging sections even though they are ordinary user threads.
+_USER_RESET_CHILD_SQL = (
+    "EXISTS (SELECT 1 FROM sessions p"
+    "        WHERE p.id = {a}.parent_session_id"
+    "        AND p.end_reason IN ('session_reset', 'new_session'))"
+)
+
+
+# Rows that surface in pickers: roots + branch children + explicit user-reset
+# continuations (subagent runs and compression continuations stay hidden).
+_LISTABLE_CHILD_SQL = (
+    f"(s.parent_session_id IS NULL"
+    f" OR {_BRANCH_CHILD_SQL.format(a='s')}"
+    f" OR {_USER_RESET_CHILD_SQL.format(a='s')})"
+)
 
 
 def _ephemeral_child_sql(alias: str = "s") -> str:

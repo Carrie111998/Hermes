@@ -1920,6 +1920,31 @@ class TestListSessionsRich:
         assert "delegate" not in ids, "Delegate sub-agent should not appear in default list"
         assert "root" in ids
 
+    def test_user_reset_child_visible(self, db):
+        """Gateway /new chains (parent ended with 'session_reset') surface in
+        pickers — they are ordinary user threads, not hidden subagent runs."""
+        db.create_session("gw-root", "weixin")
+        db.create_session("reset-child", "weixin", parent_session_id="gw-root")
+        db.end_session("gw-root", "session_reset")
+
+        sessions = db.list_sessions_rich()
+        ids = [s["id"] for s in sessions]
+        assert "reset-child" in ids, "User /new child should appear in default list"
+        assert "gw-root" in ids
+
+    def test_compression_child_still_hidden_with_reset_fix(self, db):
+        """Compression chains still follow the tip-projection rule with the
+        user-reset visibility fix: the live tip surfaces, the dead compressed
+        root stays hidden."""
+        db.create_session("comp-root", "cli")
+        db.create_session("comp-child", "cli", parent_session_id="comp-root")
+        db.end_session("comp-root", "compression")
+
+        sessions = db.list_sessions_rich()
+        ids = [s["id"] for s in sessions]
+        assert "comp-child" in ids, "Compression tip should surface in default list"
+        assert "comp-root" not in ids, "Compressed root should stay hidden"
+
 
 
 class TestCompressionChainProjection:
