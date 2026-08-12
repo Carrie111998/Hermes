@@ -106,4 +106,191 @@ describe('resolveStoredSession profile ownership', () => {
 
     await expect(resolveSessionProfile('s1')).resolves.toBe('default')
   })
+
+  it('skips an owning empty unknown shadow when another profile owns a materialized twin', async () => {
+    // Legacy damage: active profile (meta/production) holds a titled empty
+    // source=unknown shadow for the same id that default owns as a real desktop row.
+    const emptyShadow = session({
+      id: 's1',
+      message_count: 0,
+      profile: 'meta',
+      source: 'unknown',
+      title: 'Real conversation'
+    })
+
+    const materialized = session({
+      id: 's1',
+      message_count: 4,
+      profile: 'default',
+      source: 'desktop',
+      title: 'Real conversation'
+    })
+
+    $sessions.set([emptyShadow])
+    mockGetSession.mockResolvedValueOnce(emptyShadow)
+    mockGetSession.mockResolvedValueOnce(materialized)
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved?.profile).toBe('default')
+    expect(resolved?.message_count).toBe(4)
+    expect(resolved?.source).toBe('desktop')
+    expect($sessions.get().find(s => s.id === 's1')?.profile).toBe('default')
+    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1')
+    expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'default')
+  })
+
+  it('keeps probing past an earlier zero-message known-source for a transcript-bearing twin', async () => {
+    // Profile order meta → other → default: remember the first known-source
+    // (desktop/0) compression-root candidate, but keep probing so a later
+    // transcript-bearing twin still wins immediately.
+    $profiles.set(profiles('meta', 'other', 'default'))
+    $activeGatewayProfile.set('meta')
+
+    const emptyShadow = session({
+      id: 's1',
+      message_count: 0,
+      profile: 'meta',
+      source: 'unknown',
+      title: 'Real conversation'
+    })
+
+    const zeroMessageOther = session({
+      id: 's1',
+      message_count: 0,
+      profile: 'other',
+      source: 'desktop',
+      title: 'Real conversation'
+    })
+
+    const materialized = session({
+      id: 's1',
+      message_count: 4,
+      profile: 'default',
+      source: 'desktop',
+      title: 'Real conversation'
+    })
+
+    $sessions.set([emptyShadow])
+    mockGetSession.mockResolvedValueOnce(emptyShadow)
+    mockGetSession.mockResolvedValueOnce(zeroMessageOther)
+    mockGetSession.mockResolvedValueOnce(materialized)
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved?.profile).toBe('default')
+    expect(resolved?.message_count).toBe(4)
+    expect(resolved?.source).toBe('desktop')
+    expect($sessions.get().find(s => s.id === 's1')?.profile).toBe('default')
+    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1')
+    expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'other')
+    expect(mockGetSession).toHaveBeenNthCalledWith(3, 's1', 'default')
+  })
+
+  it('falls back to the first known-source zero-message twin when no transcript candidate exists', async () => {
+    // Raw REST getSession returns the exact row and does not walk the
+    // compression chain — a legitimate compression root can be desktop/0.
+    // Prefer that known-source candidate over the deferred legacy shadow.
+    $profiles.set(profiles('meta', 'other', 'default'))
+    $activeGatewayProfile.set('meta')
+
+    const emptyShadow = session({
+      id: 's1',
+      message_count: 0,
+      profile: 'meta',
+      source: 'unknown',
+      title: 'Untitled draft'
+    })
+
+    const zeroMessageOther = session({
+      id: 's1',
+      message_count: 0,
+      profile: 'other',
+      source: 'desktop',
+      title: 'Untitled draft'
+    })
+
+    $sessions.set([emptyShadow])
+    mockGetSession.mockResolvedValueOnce(emptyShadow)
+    mockGetSession.mockResolvedValueOnce(zeroMessageOther)
+    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved?.profile).toBe('other')
+    expect(resolved?.message_count).toBe(0)
+    expect(resolved?.source).toBe('desktop')
+    expect(resolved?.title).toBe('Untitled draft')
+    expect($sessions.get().find(s => s.id === 's1')?.profile).toBe('other')
+    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1')
+    expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'other')
+    expect(mockGetSession).toHaveBeenNthCalledWith(3, 's1', 'default')
+  })
+
+  it('keeps a titled empty unknown row when no other profile owns a materialized twin', async () => {
+    const emptyDraft = session({
+      id: 's1',
+      message_count: 0,
+      profile: 'meta',
+      source: 'unknown',
+      title: 'Untitled draft'
+    })
+
+    $sessions.set([emptyDraft])
+    mockGetSession.mockResolvedValueOnce(emptyDraft)
+    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved?.profile).toBe('meta')
+    expect(resolved?.message_count).toBe(0)
+    expect(resolved?.source).toBe('unknown')
+    expect(resolved?.title).toBe('Untitled draft')
+    expect($sessions.get().find(s => s.id === 's1')?.profile).toBe('meta')
+    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1')
+    expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'default')
+  })
+
+  it('returns a single-profile empty unknown draft from cache without probing', async () => {
+    // No cross-profile twin can exist, so the exact legacy shadow shape must
+    // not force a getSession round-trip.
+    $profiles.set(profiles('default'))
+    $activeGatewayProfile.set('default')
+    $sessions.set([
+      session({
+        id: 's1',
+        message_count: 0,
+        profile: 'default',
+        source: 'unknown',
+        title: 'Untitled draft'
+      })
+    ])
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved?.id).toBe('s1')
+    expect(resolved?.source).toBe('unknown')
+    expect(resolved?.message_count).toBe(0)
+    expect(resolved?.title).toBe('Untitled draft')
+    expect(mockGetSession).not.toHaveBeenCalled()
+  })
+
+  it('does not treat omitted message_count as the legacy empty shadow', async () => {
+    // Only message_count === 0 is the damaged shape; undefined must keep the
+    // direct cache short-circuit even under multi-profile.
+    const ambiguous = session({
+      id: 's1',
+      profile: 'meta',
+      source: 'unknown',
+      title: 'Maybe a draft'
+    })
+
+    $sessions.set([ambiguous])
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved).toBe(ambiguous)
+    expect(resolved?.message_count).toBeUndefined()
+    expect(mockGetSession).not.toHaveBeenCalled()
+  })
 })

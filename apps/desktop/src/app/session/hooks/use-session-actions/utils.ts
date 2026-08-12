@@ -842,6 +842,55 @@ function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
   ])
 }
 
+/**
+ * Legacy cross-profile damage can leave the same session id on the active
+ * profile as `source=unknown` with `message_count=0` (often still titled)
+ * while another profile owns the real message-bearing desktop row. Treat only
+ * that exact shape as a deferred fallback so resume can keep probing for a
+ * materialized twin; omitted/undefined counts are not the legacy shadow.
+ */
+function isLegacyEmptyUnknownShadow(session: SessionInfo): boolean {
+  return session.source === 'unknown' && session.message_count === 0
+}
+
+/**
+ * A real session source (desktop/cli/tui/…) as opposed to the legacy
+ * `unknown` shadow or an omitted stamp. Compression roots can legitimately
+ * report `message_count=0` while a descendant owns the messages; raw REST
+ * `getSession` returns that exact row and does not resolve the chain, so a
+ * known-source zero-message hit is a safer resume target than the shadow.
+ */
+function isKnownSourceCandidate(session: SessionInfo): boolean {
+  const source = session.source?.trim()
+
+  return Boolean(source) && source !== 'unknown'
+}
+
+/**
+ * After a legacy empty-unknown shadow is deferred: transcript candidates win
+ * immediately; the first known-source candidate is remembered while probing
+ * continues; unknown/undefined rows must not displace the shadow.
+ */
+function considerDeferredCandidate(
+  session: SessionInfo,
+  deferredEmptyUnknown: SessionInfo | undefined,
+  knownSourceFallback: SessionInfo | undefined
+): { done: true; session: SessionInfo } | { done: false; knownSourceFallback: SessionInfo | undefined } {
+  if (!deferredEmptyUnknown) {
+    return { done: true, session }
+  }
+
+  if (sessionShouldHaveTranscript(session)) {
+    return { done: true, session }
+  }
+
+  if (isKnownSourceCandidate(session)) {
+    return { done: false, knownSourceFallback: knownSourceFallback ?? session }
+  }
+
+  return { done: false, knownSourceFallback }
+}
+
 export async function resolveStoredSession(storedSessionId: string): Promise<SessionInfo | undefined> {
   const cached = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
 
@@ -850,9 +899,17 @@ export async function resolveStoredSession(storedSessionId: string): Promise<Ses
   // active (#67603 family, cross-profile open asymmetry). Treat such a hit as
   // unresolved and fall through to the by-id lookups, which stamp ownership.
   const multiProfile = $profiles.get().length > 1
+  let deferredEmptyUnknown: SessionInfo | undefined
+  let knownSourceFallback: SessionInfo | undefined
 
   if (cached && (cached.profile?.trim() || !multiProfile)) {
-    return cached
+    // Defer only under multi-profile — that's the only case a twin on another
+    // profile could exist. Single-profile empty unknowns return immediately.
+    if (multiProfile && isLegacyEmptyUnknownShadow(cached)) {
+      deferredEmptyUnknown = cached
+    } else {
+      return cached
+    }
   }
 
   // Direct by-id on the live backend — one row lookup, no list scan. Covers
@@ -867,9 +924,19 @@ export async function resolveStoredSession(storedSessionId: string): Promise<Ses
     // can legitimately carry another profile's row (see the branch tests).
     session.profile ||= normalizeProfileKey($activeGatewayProfile.get())
 
-    upsertResolvedSession(session, storedSessionId)
+    if (multiProfile && isLegacyEmptyUnknownShadow(session)) {
+      deferredEmptyUnknown ??= session
+    } else {
+      const considered = considerDeferredCandidate(session, deferredEmptyUnknown, knownSourceFallback)
 
-    return session
+      if (considered.done) {
+        upsertResolvedSession(considered.session, storedSessionId)
+
+        return considered.session
+      }
+
+      knownSourceFallback = considered.knownSourceFallback
+    }
   } catch {
     // Not on the active profile — fall through to the cross-profile probe.
   }
@@ -894,12 +961,30 @@ export async function resolveStoredSession(storedSessionId: string): Promise<Ses
       // forwarding, so that backend answers as its own "default").
       session.profile = profile
 
-      upsertResolvedSession(session, storedSessionId)
+      if (multiProfile && isLegacyEmptyUnknownShadow(session)) {
+        deferredEmptyUnknown ??= session
+      } else {
+        const considered = considerDeferredCandidate(session, deferredEmptyUnknown, knownSourceFallback)
 
-      return session
+        if (considered.done) {
+          upsertResolvedSession(considered.session, storedSessionId)
+
+          return considered.session
+        }
+
+        knownSourceFallback = considered.knownSourceFallback
+      }
     } catch {
       // Not on this profile; try the next.
     }
+  }
+
+  const fallback = knownSourceFallback ?? deferredEmptyUnknown
+
+  if (fallback) {
+    upsertResolvedSession(fallback, storedSessionId)
+
+    return fallback
   }
 
   return undefined
