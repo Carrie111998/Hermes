@@ -444,6 +444,45 @@ async function reviewRevParse(repoPath, ref, gitBin) {
   }
 }
 
+// The remote a push of `branch` should target, or null when it is ambiguous.
+// Deliberately does NOT fall back to `origin`: in a fork checkout `origin` is
+// often the UPSTREAM project (~/.hermes/agent-src is exactly that), so guessing
+// it publishes private work to a public repo and pins the branch's tracking
+// there. Follows git's own precedence, then accepts a lone remote as
+// unambiguous; anything else is the user's decision, not ours.
+async function resolvePushRemote(git, branch) {
+  for (const key of [`branch.${branch}.pushRemote`, 'remote.pushDefault']) {
+    try {
+      const configured = (await git.raw(['config', '--get', key])).trim()
+
+      if (configured) {
+        return configured
+      }
+    } catch {
+      // An unset key exits 1; try the next candidate.
+    }
+  }
+
+  const remotes = (await git.raw(['remote'])).split(/\s+/).filter(Boolean)
+
+  return remotes.length === 1 ? remotes[0] : null
+}
+
+// First push of a branch that has no upstream yet.
+async function pushSettingUpstream(git, branch) {
+  const remote = await resolvePushRemote(git, branch)
+
+  if (!remote) {
+    throw new Error(
+      `'${branch}' has no upstream and no push remote is configured. Refusing to guess ` +
+        "'origin' -- in a fork checkout that is often the upstream project. Set " +
+        'branch.<name>.pushRemote or remote.pushDefault, or push manually.'
+    )
+  }
+
+  await git.raw(['push', '-u', remote, branch])
+}
+
 // Commit the working tree. Mirrors VS Code: if nothing is staged, stage
 // everything first ("commit all"), then commit. Optionally push afterward,
 // setting upstream on the first push.
@@ -464,7 +503,7 @@ async function reviewCommit(repoPath, message, push, gitBin) {
     if (fresh.tracking) {
       await git.push()
     } else if (fresh.current) {
-      await git.raw(['push', '-u', 'origin', fresh.current])
+      await pushSettingUpstream(git, fresh.current)
     }
   }
 
@@ -530,7 +569,7 @@ async function reviewPush(repoPath, gitBin) {
   if (status.tracking) {
     await git.push()
   } else if (status.current) {
-    await git.raw(['push', '-u', 'origin', status.current])
+    await pushSettingUpstream(git, status.current)
   }
 
   return { ok: true }

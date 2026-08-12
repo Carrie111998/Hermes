@@ -6,7 +6,7 @@ import path from 'node:path'
 
 import { afterEach, test } from 'vitest'
 
-import { gitFor, repoStatus, resolveRenamePath } from './git-review-ops'
+import { gitFor, repoStatus, resolveRenamePath, reviewPush } from './git-review-ops'
 
 const tempDirs: string[] = []
 
@@ -87,3 +87,104 @@ test('repoStatus reports an untracked directory without recursively listing its 
     ['generated/']
   )
 })
+
+// --- push remote resolution -------------------------------------------------
+// In a fork checkout `origin` is frequently the UPSTREAM project rather than the
+// user's own repo (~/.hermes/agent-src is exactly that). Pushing to a hardcoded
+// `origin` therefore publishes private work to a public upstream and pins the
+// branch's tracking there. These use real bare repos so each asserts *which*
+// remote received the branch.
+
+function makeBare(name: string) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `hermes-desktop-git-${name}-`))
+
+  tempDirs.push(dir)
+  execFileSync('git', ['init', '-q', '--bare'], { cwd: dir })
+
+  return dir
+}
+
+function makeBranchRepo() {
+  const dir = makeRepo()
+
+  execFileSync('git', ['checkout', '-q', '-b', 'feature/x'], { cwd: dir })
+
+  return dir
+}
+
+function hasBranch(bare: string, branch: string) {
+  return execFileSync('git', ['branch', '--list', branch], { cwd: bare, encoding: 'utf8' }).includes(
+    branch
+  )
+}
+
+test('reviewPush refuses to guess origin when several remotes and no push default', async () => {
+  const upstream = makeBare('upstream')
+  const fork = makeBare('fork')
+  const dir = makeBranchRepo()
+
+  execFileSync('git', ['remote', 'add', 'origin', upstream], { cwd: dir })
+  execFileSync('git', ['remote', 'add', 'fork', fork], { cwd: dir })
+
+  await assert.rejects(() => reviewPush(dir, 'git'))
+  assert.equal(hasBranch(upstream, 'feature/x'), false, 'published to the upstream remote')
+  assert.equal(hasBranch(fork, 'feature/x'), false)
+}, 120_000)
+
+test('reviewPush uses the sole remote even when it is not named origin', async () => {
+  const fork = makeBare('fork')
+  const dir = makeBranchRepo()
+
+  execFileSync('git', ['remote', 'add', 'daragao3', fork], { cwd: dir })
+
+  await reviewPush(dir, 'git')
+
+  assert.equal(hasBranch(fork, 'feature/x'), true)
+}, 120_000)
+
+test('reviewPush honours branch pushRemote over origin', async () => {
+  const upstream = makeBare('upstream')
+  const fork = makeBare('fork')
+  const dir = makeBranchRepo()
+
+  execFileSync('git', ['remote', 'add', 'origin', upstream], { cwd: dir })
+  execFileSync('git', ['remote', 'add', 'fork', fork], { cwd: dir })
+  execFileSync('git', ['config', 'branch.feature/x.pushRemote', 'fork'], { cwd: dir })
+
+  await reviewPush(dir, 'git')
+
+  assert.equal(hasBranch(fork, 'feature/x'), true)
+  assert.equal(hasBranch(upstream, 'feature/x'), false)
+}, 120_000)
+
+test('reviewPush honours remote.pushDefault over origin', async () => {
+  const upstream = makeBare('upstream')
+  const fork = makeBare('fork')
+  const dir = makeBranchRepo()
+
+  execFileSync('git', ['remote', 'add', 'origin', upstream], { cwd: dir })
+  execFileSync('git', ['remote', 'add', 'fork', fork], { cwd: dir })
+  execFileSync('git', ['config', 'remote.pushDefault', 'fork'], { cwd: dir })
+
+  await reviewPush(dir, 'git')
+
+  assert.equal(hasBranch(fork, 'feature/x'), true)
+  assert.equal(hasBranch(upstream, 'feature/x'), false)
+}, 120_000)
+
+test('reviewPush with an upstream still pushes to that upstream', async () => {
+  const fork = makeBare('fork')
+  const dir = makeBranchRepo()
+
+  execFileSync('git', ['remote', 'add', 'fork', fork], { cwd: dir })
+  execFileSync('git', ['push', '-q', '-u', 'fork', 'feature/x'], { cwd: dir })
+  fs.writeFileSync(path.join(dir, 'tracked.txt'), 'changed\n')
+  execFileSync('git', ['commit', '-qam', 'second'], { cwd: dir })
+
+  await reviewPush(dir, 'git')
+
+  assert.equal(
+    execFileSync('git', ['rev-parse', 'feature/x'], { cwd: fork, encoding: 'utf8' }).trim(),
+    execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim()
+  )
+}, 120_000)
