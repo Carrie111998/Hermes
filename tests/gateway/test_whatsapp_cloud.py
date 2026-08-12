@@ -878,39 +878,114 @@ class TestInboundMediaDispatch:
 # Group-shaped message guard
 # ---------------------------------------------------------------------------
 
-class TestGroupMessageGuard:
-    """Cloud API group support is deferred to v2 (Meta capability-tier
-    gated, different payload shape than DMs). If Meta delivers a
-    group-shaped message — identifiable by a populated ``chat`` field
-    on the message object — the adapter should refuse cleanly rather
-    than silently treating the sender's wa_id as the chat_id (which
-    would route the bot's reply back to the sender as a DM, not the
-    group)."""
+GROUP_JID = "120363012345678901@g.us"
+
+
+def _group_raw(**overrides):
+    raw = {
+        "from": "15551234567",
+        "id": "wamid.group1",
+        "timestamp": "0",
+        "type": "text",
+        "text": {"body": "hi from a group"},
+        "chat": GROUP_JID,  # presence of `chat` = group
+    }
+    raw.update(overrides)
+    return raw
+
+
+class TestGroupMessageGating:
+    """Group-shaped Cloud payloads route through the shared mixin gate.
+
+    Meta's Groups API is open to Official Business Accounts, so a
+    group-shaped message — identifiable by a populated ``chat`` field on the
+    message object — is no longer refused unconditionally. It goes through
+    the same ``group_policy`` / allowlist / mention gate the Baileys adapter
+    uses (#80054), and the reply addresses the group rather than the
+    individual sender.
+    """
 
     @pytest.mark.asyncio
-    async def test_group_shaped_message_dropped_with_warning(self, caplog):
+    async def test_default_policy_still_admits_no_group(self):
+        """Unconfigured WABAs must not start accepting group traffic.
+
+        The production default is "pairing", which admits no group chat, so
+        behavior is unchanged from the previous hard drop — the difference is
+        that it is now a visible policy decision rather than a refusal.
+        """
         adapter = _make_adapter()
+        adapter._group_policy = "pairing"
         adapter.handle_message = AsyncMock()
-        raw = {
-            "from": "15551234567",
-            "id": "wamid.group1",
-            "timestamp": "0",
-            "type": "text",
-            "text": {"body": "hi from a group"},
-            "chat": "120363012345678901@g.us",  # presence of `chat` = group
-        }
-        with caplog.at_level("WARNING"):
-            event = await adapter._build_message_event_from_cloud(
-                raw, {"15551234567": "Alice"}, {}
-            )
-        assert event is None
-        # Warning surfaced so the operator knows group messages are being dropped
-        assert any(
-            "group-shaped" in rec.message
-            for rec in caplog.records
+
+        event = await adapter._build_message_event_from_cloud(
+            _group_raw(), {"15551234567": "Alice"}, {}
         )
-        # Defensive: handler not invoked
+
+        assert event is None
         adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_open_policy_routes_group_and_addresses_the_group(self):
+        """chat_id must be the group JID, never the sender's wa_id.
+
+        Using the sender would send the reply back as a DM instead of into
+        the group the question was asked in.
+        """
+        adapter = _make_adapter()
+        adapter._group_policy = "open"
+
+        event = await adapter._build_message_event_from_cloud(
+            _group_raw(), {"15551234567": "Alice"}, {}
+        )
+
+        assert event is not None
+        assert event.source.chat_id == GROUP_JID
+        assert event.source.chat_id != "15551234567"
+
+    @pytest.mark.asyncio
+    async def test_allowlist_policy_admits_only_listed_groups(self):
+        adapter = _make_adapter()
+        adapter._group_policy = "allowlist"
+        adapter._group_allow_from = {GROUP_JID}
+
+        admitted = await adapter._build_message_event_from_cloud(
+            _group_raw(), {"15551234567": "Alice"}, {}
+        )
+        assert admitted is not None
+
+        adapter._group_allow_from = {"120363999999999999@g.us"}
+        refused = await adapter._build_message_event_from_cloud(
+            _group_raw(), {"15551234567": "Alice"}, {}
+        )
+        assert refused is None
+
+    @pytest.mark.asyncio
+    async def test_object_shaped_chat_field_is_understood(self):
+        """Meta has shipped both a bare JID string and an object carrying it."""
+        adapter = _make_adapter()
+        adapter._group_policy = "open"
+
+        event = await adapter._build_message_event_from_cloud(
+            _group_raw(chat={"id": GROUP_JID}), {"15551234567": "Alice"}, {}
+        )
+
+        assert event is not None
+        assert event.source.chat_id == GROUP_JID
+
+    @pytest.mark.asyncio
+    async def test_dm_path_is_unaffected(self):
+        """No ``chat`` field means DM: chat_id stays the sender's wa_id."""
+        adapter = _make_adapter()
+        adapter._dm_policy = "open"
+        raw = _group_raw()
+        raw.pop("chat")
+
+        event = await adapter._build_message_event_from_cloud(
+            raw, {"15551234567": "Alice"}, {}
+        )
+
+        assert event is not None
+        assert event.source.chat_id == "15551234567"
 
 
 # =========================================================================

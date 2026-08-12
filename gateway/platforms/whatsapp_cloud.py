@@ -294,11 +294,17 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             or _get_wsecret("WHATSAPP_DM_POLICY")
             or _default_dm_policy
         ).strip().lower()
+        # Default "pairing" (admits no group chat), matching the Baileys
+        # adapter. Inbound group payloads used to be hard-dropped before any
+        # gating ran, so this value was dead for groups; now that they are
+        # routed through _should_process_message (#80054) the default decides
+        # real access, and an unconfigured WABA must not start accepting group
+        # traffic on upgrade. Operators opt in with "allowlist" or "open".
         self._group_policy: str = str(
             extra.get("group_policy")
             or _get_wsecret("WHATSAPP_CLOUD_GROUP_POLICY")
-            or _get_wsecret("WHATSAPP_GROUP_POLICY", default="open")
-            or "open"
+            or _get_wsecret("WHATSAPP_GROUP_POLICY", default="pairing")
+            or "pairing"
         ).strip().lower()
         self._group_allow_from: set[str] = self._normalize_allow_ids(
             self._coerce_allow_list(
@@ -1955,31 +1961,37 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         sender_name = contacts_by_waid.get(sender_id, "")
 
         # Cloud API doesn't have a separate "chat" entity for DMs — chat_id
-        # equals the sender's wa_id. Group support is deferred to v2.
+        # equals the sender's wa_id. Group messages carry a ``chat`` field on
+        # the message object identifying the group JID; its absence signals a
+        # DM.
         #
-        # Defensive guard: if Meta ever delivers a group-shaped payload
-        # (group support is capability-tier gated by Meta; some WABAs
-        # have it enabled), refuse rather than silently treating it as
-        # a DM. Group messages carry a ``chat`` field on the message
-        # object identifying the group JID — its absence signals DM.
+        # Group-shaped payloads used to be hard-dropped here. Meta's Groups
+        # API is now open to Official Business Accounts, so they are instead
+        # routed through the same mixin gate the Baileys adapter uses --
+        # group_policy, group allowlist and mention gating (#80054). The
+        # default policy admits no group chat, so an unconfigured WABA behaves
+        # exactly as before; the difference is that the drop is now a policy
+        # decision the operator can see and change, rather than an
+        # unconditional refusal.
         chat_field = raw_message.get("chat")
-        if chat_field:
-            logger.warning(
-                "[whatsapp_cloud] received group-shaped message (chat=%s, "
-                "wamid=%s) — group support is not yet implemented; dropping. "
-                "Use the Baileys whatsapp adapter for group chats.",
-                chat_field, raw_message.get("id"),
-            )
-            return None
+        group_id = ""
+        if isinstance(chat_field, dict):
+            # Be liberal about the envelope shape: Meta has shipped both a
+            # bare JID string and an object carrying it.
+            group_id = str(chat_field.get("id") or chat_field.get("wa_id") or "").strip()
+        elif chat_field:
+            group_id = str(chat_field).strip()
+        is_group = bool(group_id)
 
-        chat_id = sender_id
+        # Replies must address the group, never the individual sender.
+        chat_id = group_id if is_group else sender_id
 
         # Build the data dict the mixin's _should_process_message expects.
         # Cloud API uses different field names from Baileys, so we adapt.
         gating_data = {
             "chatId": chat_id,
             "senderId": sender_id,
-            "isGroup": False,  # Phase 3 = DM only
+            "isGroup": is_group,
             "body": body,
         }
         if not self._should_process_message(gating_data):
