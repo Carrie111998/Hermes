@@ -1,0 +1,8 @@
+name: fleet-pulse
+version: 1.0.0
+description: "Fleet activity monitoring — tracks session lifecycle and tool usage across all Hermes profiles. Exposes /fleet-pulse slash command for real-time fleet status."
+author: "SMF Works — Team Norddal (Lofoten Challenge)"
+hooks:
+  - on_session_start
+  - on_session_end
+  - post_tool_call

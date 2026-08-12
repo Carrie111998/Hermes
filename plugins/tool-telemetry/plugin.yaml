@@ -1,0 +1,17 @@
+name: tool-telemetry
+version: "1.0.0"
+description: >-
+  Passive tool call telemetry for Hermes agents. Collects structured
+  observations on every tool invocation — name, toolset, duration, success,
+  redacted arguments — into a local SQLite database. Exposes telemetry_summary,
+  telemetry_failures, and telemetry_export tools for agent self-diagnosis.
+  Observes lifecycle hooks; never blocks or transforms tool calls.
+author: "SMF Works — Team Maelstrom"
+hooks:
+  - pre_tool_call
+  - post_tool_call
+  - on_session_start
+provides_tools:
+  - telemetry_summary
+  - telemetry_failures
+  - telemetry_export
