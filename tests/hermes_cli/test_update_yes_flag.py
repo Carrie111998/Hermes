@@ -187,7 +187,11 @@ class TestUnicodeDecodeErrorInUpdatePrompts:
         ), patch.object(_sys.stdin, "isatty", return_value=True), patch.object(
             _sys.stdout, "isatty", return_value=True
         ):
-            cmd_update(args)  # must not raise
+            # Bypass the update-approval staging gate (this fork's own
+            # feature, absent upstream where this test originates) -- same
+            # as the sibling tests above, this exercises the config-migration
+            # prompt's UnicodeDecodeError handling, not the approval gate.
+            cmd_update(args, approved=True)  # must not raise
 
         out = capsys.readouterr().out
         assert "hermes config migrate" in out
