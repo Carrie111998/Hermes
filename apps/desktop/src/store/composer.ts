@@ -112,6 +112,24 @@ export function createComposerAttachmentScope($attachments = atom<ComposerAttach
  *  `$composerAttachments` reader/writer IS this scope. */
 export const mainComposerScope = createComposerAttachmentScope($composerAttachments)
 
+// ---------------------------------------------------------------------------
+// Main composer draft-scope registry — which session key the MAIN composer's
+// draft stash is (or was last) keyed on. Mirrors focus.ts's markActiveComposer
+// pattern: the mounted main composer publishes its scope from the same layout
+// effect that swaps its stash key; it deliberately does NOT clear on unmount,
+// because "hand this artifact to the chat" from another page (Media Studio,
+// a plugin pane) should target the session the user just left. Null means a
+// fresh draft (the `__new__` stash key).
+// ---------------------------------------------------------------------------
+
+let mainComposerDraftScope: string | null = null
+
+export const markMainComposerDraftScope = (scope: string | null): void => {
+  mainComposerDraftScope = scope
+}
+
+export const getMainComposerDraftScope = (): string | null => mainComposerDraftScope
+
 // Per-thread draft stash for the decoupled composer. Session lifecycle never
 // touches this — only ChatBar's scope swap reads/writes it. Text mirrors to
 // localStorage; attachments are memory-only (blobs, upload state).
@@ -218,8 +236,16 @@ export function reloadPersistedDrafts(): void {
   }
 
   // A key that vanished from storage was cleared (sent) in the other window.
+  // Only text ever reaches storage, though — an attachment-bearing local
+  // entry (chips staged while the composer is unmounted, or with no text
+  // yet) was never persisted, so its absence from storage proves nothing;
+  // deleting it here would eat the chips.
   for (const key of [...draftsBySession.keys()]) {
     if (!incoming.has(key)) {
+      if (draftsBySession.get(key)?.attachments.length) {
+        continue
+      }
+
       draftsBySession.delete(key)
       publishDraftTitle(key, '')
     }
@@ -498,7 +524,7 @@ export function clearComposerTerminalSelections() {
   $composerTerminalSelections.set({})
 }
 
-function upsertAttachment(attachments: ComposerAttachment[], attachment: ComposerAttachment) {
+export function upsertAttachment(attachments: ComposerAttachment[], attachment: ComposerAttachment) {
   const index = attachments.findIndex(item => item.id === attachment.id)
 
   if (index < 0) {

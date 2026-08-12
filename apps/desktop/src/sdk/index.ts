@@ -108,6 +108,20 @@ export const host = {
     }
 
     return gateway.request<T>(method, params)
+  },
+
+  /** Stage a LOCAL FILE onto the main chat composer (image => inline image
+   *  attachment with preview; anything else => file attachment). The narrow
+   *  "hand my artifact to the conversation" door — the send itself stays with
+   *  the user. Returns false when no path was given. */
+  attachFileToComposer: async (filePath: string): Promise<boolean> => {
+    if (!filePath) {
+      return false
+    }
+
+    const { attachComposerFile } = await import('@/app/chat/hooks/composer-attach')
+
+    return attachComposerFile(filePath)
   }
 }
 
