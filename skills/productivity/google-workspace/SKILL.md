@@ -202,11 +202,24 @@ $GAPI gmail modify MESSAGE_ID --remove-labels UNREAD
 ### Calendar
 
 ```bash
-# List events (defaults to next 7 days)
+# List events (defaults to next 7 days, and to EVERY calendar the identity
+# can see — primary plus any owned/shared sub-calendars like Family,
+# Birthdays, Holidays, or a person's own named working calendar. This is
+# deliberate: a Google account's real schedule is very often NOT on
+# "primary" at all (confirmed 2026-08-12 — a person's actual day-to-day
+# calendar lived entirely on a differently-named sub-calendar, and the old
+# primary-only default made it look like they had no calendar at all).
 $GAPI calendar list
 $GAPI calendar list --start 2026-03-01T00:00:00Z --end 2026-03-07T23:59:59Z
 
-# Create event (ISO 8601 with timezone required)
+# Narrow to one specific calendar (skips the "check every calendar" step)
+$GAPI calendar list --calendar primary
+$GAPI calendar list --calendar "family123@group.calendar.google.com"
+
+# Create event (ISO 8601 with timezone required) — always targets ONE
+# specific calendar, defaults to "primary". Creating doesn't aggregate the
+# way listing does; pick the right --calendar if the event doesn't belong
+# on the default one.
 $GAPI calendar create --summary "Team Standup" --start 2026-03-01T10:00:00-06:00 --end 2026-03-01T10:30:00-06:00
 $GAPI calendar create --summary "Lunch" --start 2026-03-01T12:00:00Z --end 2026-03-01T13:00:00Z --location "Cafe"
 $GAPI calendar create --summary "Review" --start 2026-03-01T14:00:00Z --end 2026-03-01T15:00:00Z --attendees "alice@co.com,bob@co.com"
@@ -214,6 +227,8 @@ $GAPI calendar create --summary "Review" --start 2026-03-01T14:00:00Z --end 2026
 # Delete event
 $GAPI calendar delete EVENT_ID
 ```
+
+Each listed event is tagged with `calendar` (which calendar it came from) and `calendarId` — surface this when it's not obvious from context (e.g. summarizing "what's on my calendar" across several sub-calendars), so the person can tell a Family-calendar item from a personal one.
 
 ### Drive
 

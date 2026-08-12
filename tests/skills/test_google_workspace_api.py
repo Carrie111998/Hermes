@@ -165,6 +165,119 @@ def test_api_calendar_list_uses_events_list(api_module):
 
 
 
+def test_calendar_default_is_all(api_module):
+    """--calendar defaults to 'all', not a single calendar — the 2026-08-12
+    incident was caused by the old 'primary'-only default silently missing
+    every sub-calendar (Family, Birthdays, a person's own named calendar)."""
+    captured_args = {}
+
+    def fake_calendar_list(args):
+        captured_args["calendar"] = args.calendar
+
+    api_module.calendar_list = fake_calendar_list
+    with patch.object(sys, "argv", ["google_api.py", "--identity", "jid", "calendar", "list"]):
+        api_module.main()
+    assert captured_args["calendar"] == "all"
+
+
+def test_calendar_list_all_aggregates_across_calendars(api_module):
+    """calendar list --calendar all merges events from every calendar, tagged
+    with which calendar each event came from, sorted by start time."""
+    args = api_module.argparse.Namespace(
+        start="", end="", max=25, calendar="all", func=api_module.calendar_list,
+    )
+
+    def fake_all_calendar_ids():
+        return [("primary", "primary"), ("family123@group.calendar.google.com", "Family")]
+
+    def fake_events_for_calendar(calendar_id, time_min, time_max, max_results):
+        if calendar_id == "primary":
+            return [{
+                "id": "ev1", "summary": "Primary event",
+                "start": {"dateTime": "2026-08-13T10:00:00-04:00"},
+                "end": {"dateTime": "2026-08-13T11:00:00-04:00"},
+            }]
+        return [{
+            "id": "ev2", "summary": "Family event",
+            "start": {"dateTime": "2026-08-13T08:00:00-04:00"},
+            "end": {"dateTime": "2026-08-13T09:00:00-04:00"},
+        }]
+
+    api_module._all_calendar_ids = fake_all_calendar_ids
+    api_module._events_for_calendar = fake_events_for_calendar
+
+    captured = {}
+    def fake_print(s):
+        captured["out"] = s
+    with patch.object(api_module, "print", fake_print, create=True):
+        api_module.calendar_list(args)
+
+    events = json.loads(captured["out"])
+    assert len(events) == 2
+    # Family event (08:00) sorts before Primary event (10:00).
+    assert events[0]["summary"] == "Family event"
+    assert events[0]["calendar"] == "Family"
+    assert events[1]["summary"] == "Primary event"
+    assert events[1]["calendar"] == "primary"
+
+
+def test_calendar_list_all_survives_one_broken_calendar(api_module):
+    """A broken/inaccessible calendar must not blank out every other one."""
+    args = api_module.argparse.Namespace(
+        start="", end="", max=25, calendar="all", func=api_module.calendar_list,
+    )
+
+    def fake_all_calendar_ids():
+        return [("bad-cal", "Broken"), ("primary", "primary")]
+
+    def fake_events_for_calendar(calendar_id, time_min, time_max, max_results):
+        if calendar_id == "bad-cal":
+            raise RuntimeError("404 not found")
+        return [{
+            "id": "ev1", "summary": "Still works",
+            "start": {"dateTime": "2026-08-13T10:00:00-04:00"},
+            "end": {"dateTime": "2026-08-13T11:00:00-04:00"},
+        }]
+
+    api_module._all_calendar_ids = fake_all_calendar_ids
+    api_module._events_for_calendar = fake_events_for_calendar
+
+    captured = {}
+    def fake_print(s, **kwargs):
+        if "file" not in kwargs:
+            captured["out"] = s
+    with patch.object(api_module, "print", fake_print, create=True):
+        api_module.calendar_list(args)
+
+    events = json.loads(captured["out"])
+    assert len(events) == 1
+    assert events[0]["summary"] == "Still works"
+
+
+def test_calendar_list_specific_calendar_still_works(api_module):
+    """Passing an explicit --calendar value (not 'all') still narrows to just
+    that one calendar — this is a real narrowing option, not removed."""
+    args = api_module.argparse.Namespace(
+        start="", end="", max=25, calendar="primary", func=api_module.calendar_list,
+    )
+
+    calls = []
+    def fake_events_for_calendar(calendar_id, time_min, time_max, max_results):
+        calls.append(calendar_id)
+        return []
+
+    api_module._events_for_calendar = fake_events_for_calendar
+    # _all_calendar_ids must NOT be called when a specific calendar is given.
+    def fail_if_called():
+        raise AssertionError("_all_calendar_ids should not be called for a specific --calendar value")
+    api_module._all_calendar_ids = fail_if_called
+
+    with patch.object(api_module, "print", lambda s: None, create=True):
+        api_module.calendar_list(args)
+
+    assert calls == ["primary"]
+
+
 def test_api_get_credentials_refresh_persists_authorized_user_type(api_module, monkeypatch):
     token_path = api_module.TOKEN_PATH
     _write_token(token_path, token="ya29.old")

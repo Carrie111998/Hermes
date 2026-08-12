@@ -506,46 +506,93 @@ def gmail_modify(args):
 # =========================================================================
 
 
+def _all_calendar_ids():
+    """Return [(calendarId, summary), ...] for every calendar this identity can see.
+
+    A Google account's "calendar" is really a set of separate calendar
+    resources (primary + any owned/shared sub-calendars — Family, Birthdays,
+    Holidays, a person's own named working calendar, etc.). Querying only
+    "primary" silently misses all of those — confirmed 2026-08-12 as the
+    actual cause of an apparently-empty calendar for an identity whose real
+    schedule lived entirely on a non-primary calendar.
+    """
+    if _gws_binary():
+        # Mirrors this file's existing REST-path-as-CLI-segments convention
+        # (see e.g. "people","people","connections","list" for contacts_list).
+        # Not independently verified against a live gws binary — none is
+        # installed in this environment — but follows the same pattern every
+        # other _run_gws call in this file already uses successfully.
+        results = _run_gws(["calendar", "calendarList", "list"])
+        return [(c["id"], c.get("summary", c["id"])) for c in results.get("items", [])]
+
+    service = build_service("calendar", "v3")
+    results = service.calendarList().list().execute()
+    return [(c["id"], c.get("summary", c["id"])) for c in results.get("items", [])]
+
+
+def _events_for_calendar(calendar_id, time_min, time_max, max_results):
+    if _gws_binary():
+        results = _run_gws(
+            ["calendar", "events", "list"],
+            params={
+                "calendarId": calendar_id,
+                "timeMin": time_min,
+                "timeMax": time_max,
+                "maxResults": max_results,
+                "singleEvents": True,
+                "orderBy": "startTime",
+            },
+        )
+        return results.get("items", [])
+
+    service = build_service("calendar", "v3")
+    results = service.events().list(
+        calendarId=calendar_id, timeMin=time_min, timeMax=time_max,
+        maxResults=max_results, singleEvents=True, orderBy="startTime",
+    ).execute()
+    return results.get("items", [])
+
+
+def _event_sort_key(event: dict):
+    """Sortable datetime for an event's start — all-day events sort at midnight."""
+    start = event.get("start", {})
+    raw = start.get("dateTime") or start.get("date") or ""
+    try:
+        if "T" in raw:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return datetime.fromisoformat(raw + "T00:00:00+00:00")
+    except (ValueError, TypeError):
+        return datetime.max.replace(tzinfo=timezone.utc)
+
+
 def calendar_list(args):
     now = datetime.now(timezone.utc)
     time_min = _datetime_with_timezone(args.start or now.isoformat())
     time_max = _datetime_with_timezone(args.end or (now + timedelta(days=7)).isoformat())
 
-    if _gws_binary():
-        results = _run_gws(
-            ["calendar", "events", "list"],
-            params={
-                "calendarId": args.calendar,
-                "timeMin": time_min,
-                "timeMax": time_max,
-                "maxResults": args.max,
-                "singleEvents": True,
-                "orderBy": "startTime",
-            },
-        )
-        events = []
-        for e in results.get("items", []):
-            events.append({
-                "id": e["id"],
-                "summary": e.get("summary", "(no title)"),
-                "start": e.get("start", {}).get("dateTime", e.get("start", {}).get("date", "")),
-                "end": e.get("end", {}).get("dateTime", e.get("end", {}).get("date", "")),
-                "location": e.get("location", ""),
-                "description": e.get("description", ""),
-                "status": e.get("status", ""),
-                "htmlLink": e.get("htmlLink", ""),
-            })
-        print(json.dumps(events, indent=2, ensure_ascii=False))
-        return
+    if args.calendar == "all":
+        calendars = _all_calendar_ids()
+    else:
+        calendars = [(args.calendar, args.calendar)]
 
-    service = build_service("calendar", "v3")
-    results = service.events().list(
-        calendarId=args.calendar, timeMin=time_min, timeMax=time_max,
-        maxResults=args.max, singleEvents=True, orderBy="startTime",
-    ).execute()
+    tagged = []  # (raw_event, calendar_summary, calendar_id)
+    for calendar_id, calendar_summary in calendars:
+        try:
+            raw_events = _events_for_calendar(calendar_id, time_min, time_max, args.max)
+        except Exception as e:
+            # One broken/inaccessible calendar (e.g. a stale shared calendar
+            # the account no longer has real access to) must not blank out
+            # every other calendar's results.
+            print(f"WARNING: could not read calendar '{calendar_summary}' ({calendar_id}): {e}", file=sys.stderr)
+            continue
+        for e in raw_events:
+            tagged.append((e, calendar_summary, calendar_id))
+
+    tagged.sort(key=lambda t: _event_sort_key(t[0]))
+    tagged = tagged[: args.max]
 
     events = []
-    for e in results.get("items", []):
+    for e, calendar_summary, calendar_id in tagged:
         events.append({
             "id": e["id"],
             "summary": e.get("summary", "(no title)"),
@@ -555,6 +602,8 @@ def calendar_list(args):
             "description": e.get("description", ""),
             "status": e.get("status", ""),
             "htmlLink": e.get("htmlLink", ""),
+            "calendar": calendar_summary,
+            "calendarId": calendar_id,
         })
     print(json.dumps(events, indent=2, ensure_ascii=False))
 
@@ -1266,8 +1315,8 @@ def main():
     p = cal_sub.add_parser("list")
     p.add_argument("--start", default="", help="Start time (ISO 8601)")
     p.add_argument("--end", default="", help="End time (ISO 8601)")
-    p.add_argument("--max", type=int, default=25)
-    p.add_argument("--calendar", default="primary")
+    p.add_argument("--max", type=int, default=25, help="Max events total, across all calendars when --calendar all")
+    p.add_argument("--calendar", default="all", help="'all' (default) merges every calendar this identity can see; pass a specific calendar ID (e.g. 'primary') to narrow to just one")
     p.set_defaults(func=calendar_list)
 
     p = cal_sub.add_parser("create")
