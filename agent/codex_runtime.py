@@ -806,14 +806,16 @@ def run_codex_app_server_turn(
         # users see no live tool-progress or interim commentary while
         # codex_app_server is running — only the final answer (#33200).
         # Supersedes the narrower item/started-only bridge from #38835.
-        (
-            dynamic_tools,
-            dynamic_tool_targets,
-            restrict_native_tools,
-            origin_session_targets,
-        ) = (
-            _configured_mcp_dynamic_tools(agent)
-        )
+        restricted = getattr(agent, "enabled_toolsets", None) == []
+        if restricted:
+            (
+                dynamic_tools,
+                dynamic_tool_targets,
+                _restrict_native_tools,
+                origin_session_targets,
+            ) = _configured_mcp_dynamic_tools(agent)
+        else:
+            dynamic_tools, dynamic_tool_targets, origin_session_targets = [], {}, frozenset()
         allowed_dynamic_tools = frozenset(dynamic_tool_targets.values())
 
         def dispatch_dynamic_tool(
@@ -845,12 +847,8 @@ def run_codex_app_server_turn(
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
             )
 
-        agent._codex_session = CodexAppServerSession(
+        session_kwargs = dict(
             cwd=cwd,
-            developer_instructions=getattr(agent, "_cached_system_prompt", None),
-            dynamic_tools=dynamic_tools,
-            dynamic_tool_handler=dispatch_dynamic_tool,
-            restrict_native_tools=restrict_native_tools,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -858,6 +856,14 @@ def run_codex_app_server_turn(
             ),
             on_event=make_codex_app_server_event_bridge(agent),
         )
+        if restricted:
+            session_kwargs.update(
+                developer_instructions=getattr(agent, "_cached_system_prompt", None),
+                dynamic_tools=dynamic_tools,
+                dynamic_tool_handler=dispatch_dynamic_tool,
+                restrict_native_tools=True,
+            )
+        agent._codex_session = CodexAppServerSession(**session_kwargs)
 
     # NOTE: the user message is ALREADY appended to messages by the
     # standard run_conversation() flow (line ~11823) before the early

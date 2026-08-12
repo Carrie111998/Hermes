@@ -140,6 +140,35 @@ class TestConfiguredMcpDynamicTools:
         assert origins == frozenset({name})
 
 
+def test_unrelated_profile_keeps_legacy_codex_session_constructor(monkeypatch):
+    from agent import codex_runtime
+
+    captured = {}
+
+    class StopAfterConstruction:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            raise RuntimeError("stop")
+
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        StopAfterConstruction,
+    )
+    agent = SimpleNamespace(enabled_toolsets=["other"], _codex_session=None)
+    with pytest.raises(RuntimeError, match="stop"):
+        codex_runtime.run_codex_app_server_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[],
+            effective_task_id="task",
+        )
+    assert "developer_instructions" not in captured
+    assert "dynamic_tools" not in captured
+    assert "dynamic_tool_handler" not in captured
+    assert "restrict_native_tools" not in captured
+
+
 
 
 class TestSpawnEnvIsolation:
