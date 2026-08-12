@@ -65,7 +65,7 @@ export function applyZoomLevel(webContents, level) {
 export const ZOOM_RESIZE_REASSERT_DELAY_MS = 100
 
 export function zoomReassertWindowEvents(platform = process.platform) {
-  return platform === 'linux' ? ['show', 'restore', 'resize', 'move', 'focus'] : ['show', 'restore', 'resized', 'moved', 'focus']
+  return platform === 'linux' ? ['show', 'restore', 'resize', 'move', 'focus', 'blur'] : ['show', 'restore', 'resized', 'moved', 'focus', 'blur']
 }
 
 export function installZoomReassertOnWindowEvents(win, reassert, platform = process.platform) {
