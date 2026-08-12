@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+import agent.redact as redact_module
+import hermes_cli.profiles as profiles_module
 from hermes_cli.profiles import (
     export_profile,
     _DEFAULT_EXPORT_EXCLUDE_ROOT,
@@ -102,6 +104,7 @@ class TestIsSensitiveExportName:
             # credential-/token-looking containers
             "credentials.json",
             "credentials.json.bak",
+            "credentials",
             "client_secret.json",
             "access_token.txt",
             "refresh-tokens.yaml",
@@ -350,6 +353,7 @@ class TestCredentialExclusion:
             / "pairing.backup-20260101"
             / "README.md",
             profile_dir / "workspace" / "project" / "mcp-tokens" / "README.md",
+            profile_dir / "workspace" / "project" / "credentials" / "README.md",
             profile_dir
             / "workspace"
             / "project"
@@ -1020,10 +1024,10 @@ class TestExportSecretScrub:
         assert _LEAKED_KEY in skill.read_text()
         assert _LEAKED_KEY in memory.read_text()
 
-    def test_export_redacts_through_symlink_without_touching_source(
+    def test_export_rejects_symlink_without_touching_source(
         self, tmp_path, monkeypatch
     ):
-        """Symlinked skill text is redacted in the archive, source file stays put."""
+        """Symlinked skill text refuses export without touching its target."""
         profiles_root = tmp_path / "profiles"
         profile_dir = profiles_root / "linkme"
         profile_dir.mkdir(parents=True)
@@ -1039,13 +1043,904 @@ class TestExportSecretScrub:
         (profile_dir / "config.yaml").write_text("model: gpt-4\n")
         _patch_named_profile(monkeypatch, profiles_root, profile_dir)
 
-        result = export_profile("linkme", str(tmp_path / "linkme.tar.gz"))
+        output = tmp_path / "linkme.tar.gz"
+        with pytest.raises(ValueError, match=r"skills/linked/SKILL\.md"):
+            export_profile("linkme", str(output))
 
-        with tarfile.open(result, "r:gz") as tf:
-            skill_members = [n for n in tf.getnames() if n.endswith("SKILL.md")]
-            assert skill_members
-            archived = tf.extractfile(skill_members[0]).read().decode("utf-8")
-
-        assert _LEAKED_KEY not in archived
+        assert not output.exists()
         assert _LEAKED_KEY in outside.read_text()
         assert link.is_symlink()
+
+
+class TestExportSQLiteSecretInspection:
+    @pytest.mark.parametrize(
+        "fragment",
+        [
+            "password=",
+            "API_KEY=",
+            "postgresql://user:",
+            '"apiKey": "',
+            "-----BEGIN PRIVATE KEY-----",
+        ],
+    )
+    def test_incomplete_secret_fragments_remain_exportable(
+        self, tmp_path, monkeypatch, fragment
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "fragment"
+        profile_dir.mkdir(parents=True)
+        database = profile_dir / "state.db"
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE values_table (value TEXT)")
+            connection.execute("INSERT INTO values_table VALUES (?)", (fragment,))
+        before = database.read_bytes()
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        result = export_profile("fragment", str(tmp_path / "fragment.tar.gz"))
+        archived = tmp_path / "fragment-archived.db"
+        with tarfile.open(result, "r:gz") as tf:
+            archived.write_bytes(tf.extractfile("fragment/state.db").read())
+
+        with sqlite3.connect(archived) as connection:
+            assert connection.execute(
+                "SELECT value FROM values_table"
+            ).fetchone() == (fragment,)
+        assert database.read_bytes() == before
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "task-" + "A" * 20,
+            "mask-" + "B" * 20,
+            "ask-" + "C" * 20,
+            "xkey=value",
+        ],
+    )
+    def test_framing_lookalikes_remain_exportable(
+        self, tmp_path, monkeypatch, value
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "lookalike"
+        profile_dir.mkdir(parents=True)
+        database = profile_dir / "state.db"
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE values_table (value TEXT)")
+            connection.execute("INSERT INTO values_table VALUES (?)", (value,))
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        result = export_profile("lookalike", str(tmp_path / "lookalike.tar.gz"))
+        archived = tmp_path / "lookalike-archived.db"
+        with tarfile.open(result, "r:gz") as tf:
+            archived.write_bytes(tf.extractfile("lookalike/state.db").read())
+        with sqlite3.connect(archived) as connection:
+            assert connection.execute(
+                "SELECT value FROM values_table"
+            ).fetchone() == (value,)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "password=actual-value-123",
+            "API_KEY=actual-value-123",
+            "postgresql://user:actual-value-123@host",
+            '"apiKey": "actual-value-123"',
+            "-----BEGIN PRIVATE KEY-----\nactual\n-----END PRIVATE KEY-----",
+        ],
+    )
+    def test_complete_secret_evidence_refuses_export(
+        self, tmp_path, monkeypatch, value
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "complete"
+        profile_dir.mkdir(parents=True)
+        database = profile_dir / "state.db"
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE values_table (value TEXT)")
+            connection.execute("INSERT INTO values_table VALUES (?)", (value,))
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        output = tmp_path / "complete.tar.gz"
+        with pytest.raises(ValueError, match=r"secret-shaped content: state\.db"):
+            export_profile("complete", str(output))
+        assert not output.exists()
+
+    @pytest.mark.parametrize(
+        "schema_sql",
+        [
+            f"CREATE TABLE configured (value TEXT DEFAULT '{_LEAKED_KEY}')",
+            f"CREATE INDEX configured_index ON items(value) WHERE value = '{_LEAKED_KEY}'",
+            f"CREATE VIEW configured_view AS SELECT '{_LEAKED_KEY}' AS value",
+            (
+                "CREATE TRIGGER configured_trigger AFTER INSERT ON items BEGIN "
+                f"INSERT INTO log VALUES ('{_LEAKED_KEY}'); END"
+            ),
+        ],
+    )
+    def test_secret_shaped_sqlite_schema_refuses_export(
+        self, tmp_path, monkeypatch, schema_sql
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "schema"
+        profile_dir.mkdir(parents=True)
+        database = profile_dir / "state.db"
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE items (value TEXT)")
+            connection.execute("CREATE TABLE log (value TEXT)")
+            connection.execute(schema_sql)
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        output = tmp_path / "schema.tar.gz"
+        with pytest.raises(ValueError, match=r"secret-shaped content: state\.db"):
+            export_profile("schema", str(output))
+        assert not output.exists()
+
+    def test_clean_table_index_view_and_trigger_schema_remains_exportable(
+        self, tmp_path, monkeypatch
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "schema"
+        profile_dir.mkdir(parents=True)
+        database = profile_dir / "state.db"
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE items (value TEXT DEFAULT 'safe')")
+            connection.execute("CREATE TABLE log (value TEXT)")
+            connection.execute("CREATE INDEX items_value ON items(value)")
+            connection.execute("CREATE VIEW item_values AS SELECT value FROM items")
+            connection.execute(
+                "CREATE TRIGGER copy_item AFTER INSERT ON items BEGIN "
+                "INSERT INTO log VALUES (NEW.value); END"
+            )
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        result = export_profile("schema", str(tmp_path / "clean-schema.tar.gz"))
+        archived = tmp_path / "clean-schema.db"
+        with tarfile.open(result, "r:gz") as tf:
+            archived.write_bytes(tf.extractfile("schema/state.db").read())
+        with sqlite3.connect(archived) as connection:
+            assert connection.execute(
+                "SELECT type FROM sqlite_schema "
+                "WHERE name IN ('items', 'items_value', 'item_values', 'copy_item') "
+                "ORDER BY type"
+            ).fetchall() == [("index",), ("table",), ("trigger",), ("view",)]
+
+    @pytest.mark.parametrize("storage", ["text", "blob"])
+    def test_secret_shaped_sqlite_value_refuses_export_without_mutating_source(
+        self, tmp_path, monkeypatch, storage
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "database"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("model: test\n")
+        database = profile_dir / "state.db"
+        value = _LEAKED_KEY if storage == "text" else sqlite3.Binary(
+            _LEAKED_KEY.encode()
+        )
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE values_table (value)")
+            connection.execute("INSERT INTO values_table VALUES (?)", (value,))
+        before = database.read_bytes()
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        output = tmp_path / f"{storage}.tar.gz"
+        with pytest.raises(ValueError, match=r"secret-shaped content: state\.db"):
+            export_profile("database", str(output))
+
+        assert not output.exists()
+        assert database.read_bytes() == before
+        with sqlite3.connect(database) as connection:
+            stored = connection.execute("SELECT value FROM values_table").fetchone()[0]
+        expected = _LEAKED_KEY if storage == "text" else _LEAKED_KEY.encode()
+        assert stored == expected
+
+    def test_undecodable_sqlite_blob_remains_exportable_and_unchanged(
+        self, tmp_path, monkeypatch
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "database"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("model: test\n")
+        database = profile_dir / "state.db"
+        binary = b"\xff\xfe\x00synthetic-binary\x80"
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE values_table (value BLOB)")
+            connection.execute(
+                "INSERT INTO values_table VALUES (?)", (sqlite3.Binary(binary),)
+            )
+        before = database.read_bytes()
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        result = export_profile("database", str(tmp_path / "blob.tar.gz"))
+        archived = tmp_path / "archived.db"
+        with tarfile.open(result, "r:gz") as tf:
+            archived.write_bytes(tf.extractfile("database/state.db").read())
+
+        with sqlite3.connect(archived) as connection:
+            assert connection.execute(
+                "SELECT value FROM values_table"
+            ).fetchone()[0] == binary
+        assert database.read_bytes() == before
+
+    @pytest.mark.parametrize(
+        "blob",
+        [
+            b"\xff\xfe" + _LEAKED_KEY.encode(),
+            _LEAKED_KEY.encode() + b"\xff\xfe",
+        ],
+    )
+    def test_secret_in_arbitrary_sqlite_blob_refuses_export(
+        self, tmp_path, monkeypatch, blob
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "database"
+        profile_dir.mkdir(parents=True)
+        database = profile_dir / "state.db"
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE values_table (value BLOB)")
+            connection.execute(
+                "INSERT INTO values_table VALUES (?)", (sqlite3.Binary(blob),)
+            )
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        output = tmp_path / "arbitrary-blob.tar.gz"
+        with pytest.raises(ValueError, match=r"secret-shaped content: state\.db"):
+            export_profile("database", str(output))
+        assert not output.exists()
+        with sqlite3.connect(database) as connection:
+            assert connection.execute(
+                "SELECT value FROM values_table"
+            ).fetchone()[0] == blob
+
+    def test_clean_utf8_sqlite_blob_remains_exportable(self, tmp_path, monkeypatch):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "database"
+        profile_dir.mkdir(parents=True)
+        database = profile_dir / "state.db"
+        blob = "plain UTF-8 café".encode()
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE values_table (value BLOB)")
+            connection.execute(
+                "INSERT INTO values_table VALUES (?)", (sqlite3.Binary(blob),)
+            )
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        result = export_profile("database", str(tmp_path / "utf8-blob.tar.gz"))
+        archived = tmp_path / "utf8-blob.db"
+        with tarfile.open(result, "r:gz") as tf:
+            archived.write_bytes(tf.extractfile("database/state.db").read())
+        with sqlite3.connect(archived) as connection:
+            assert connection.execute(
+                "SELECT value FROM values_table"
+            ).fetchone()[0] == blob
+
+    @pytest.mark.parametrize("storage", ["text", "blob"])
+    def test_deleted_sqlite_secret_refuses_export_without_mutating_source(
+        self, tmp_path, monkeypatch, storage
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "deleted"
+        profile_dir.mkdir(parents=True)
+        database = profile_dir / "state.db"
+        value = _LEAKED_KEY if storage == "text" else sqlite3.Binary(
+            _LEAKED_KEY.encode()
+        )
+        with sqlite3.connect(database) as connection:
+            connection.execute("PRAGMA secure_delete=OFF")
+            connection.execute("CREATE TABLE values_table (value)")
+            connection.execute("INSERT INTO values_table VALUES (?)", (value,))
+            connection.commit()
+            connection.execute("DELETE FROM values_table")
+            connection.commit()
+            assert connection.execute(
+                "SELECT COUNT(*) FROM values_table"
+            ).fetchone()[0] == 0
+        before = database.read_bytes()
+        assert _LEAKED_KEY.encode() in before
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        output = tmp_path / f"deleted-{storage}.tar.gz"
+        with pytest.raises(ValueError, match=r"secret-shaped content: state\.db"):
+            export_profile("deleted", str(output))
+
+        assert not output.exists()
+        assert database.read_bytes() == before
+        with sqlite3.connect(database) as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM values_table"
+            ).fetchone()[0] == 0
+
+    @pytest.mark.parametrize("storage", ["text", "blob"])
+    def test_deleted_long_prefix_secret_with_varint_framing_refuses_export(
+        self, tmp_path, monkeypatch, storage
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "deleted-long"
+        profile_dir.mkdir(parents=True)
+        database = profile_dir / "state.db"
+        token = "sk-" + "A" * 80
+        value = token if storage == "text" else sqlite3.Binary(token.encode())
+        with sqlite3.connect(database) as connection:
+            connection.execute("PRAGMA secure_delete=OFF")
+            connection.execute("CREATE TABLE values_table (value)")
+            connection.execute("INSERT INTO values_table VALUES (?)", (value,))
+            connection.commit()
+            connection.execute("DELETE FROM values_table WHERE rowid = 1")
+            connection.commit()
+        before = database.read_bytes()
+        marker_offset = before.index(token.encode())
+        assert before[marker_offset - 2] & 0x80
+        assert chr(before[marker_offset - 1]).isalnum()
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        output = tmp_path / f"deleted-long-{storage}.tar.gz"
+        with pytest.raises(ValueError, match=r"secret-shaped content: state\.db"):
+            export_profile("deleted-long", str(output))
+
+        assert not output.exists()
+        assert database.read_bytes() == before
+
+    @pytest.mark.parametrize("codec", ["utf-16-le", "utf-16-be"])
+    def test_utf16_encoded_sqlite_blob_refuses_export(
+        self, tmp_path, monkeypatch, codec
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "utf16-blob"
+        profile_dir.mkdir(parents=True)
+        database = profile_dir / "state.db"
+        blob = "password=DefinitelySecret123".encode(codec)
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE values_table (value BLOB)")
+            connection.execute(
+                "INSERT INTO values_table VALUES (?)", (sqlite3.Binary(blob),)
+            )
+        before = database.read_bytes()
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        output = tmp_path / f"utf16-blob-{codec}.tar.gz"
+        with pytest.raises(ValueError, match=r"secret-shaped content: state\.db"):
+            export_profile("utf16-blob", str(output))
+
+        assert not output.exists()
+        assert database.read_bytes() == before
+
+    @pytest.mark.parametrize("codec", ["utf-16-le", "utf-16-be"])
+    def test_deleted_utf16_encoded_sqlite_blob_refuses_export(
+        self, tmp_path, monkeypatch, codec
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "deleted-utf16-blob"
+        profile_dir.mkdir(parents=True)
+        database = profile_dir / "state.db"
+        blob = "password=DefinitelySecret123".encode(codec)
+        with sqlite3.connect(database) as connection:
+            connection.execute("PRAGMA secure_delete=OFF")
+            connection.execute("CREATE TABLE values_table (value BLOB)")
+            connection.execute(
+                "INSERT INTO values_table VALUES (?)", (sqlite3.Binary(blob),)
+            )
+            connection.commit()
+            connection.execute("DELETE FROM values_table WHERE rowid = 1")
+            connection.commit()
+        before = database.read_bytes()
+        assert blob in before
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        output = tmp_path / f"deleted-utf16-blob-{codec}.tar.gz"
+        with pytest.raises(ValueError, match=r"secret-shaped content: state\.db"):
+            export_profile("deleted-utf16-blob", str(output))
+
+        assert not output.exists()
+        assert database.read_bytes() == before
+
+    @pytest.mark.parametrize(
+        ("pragma_encoding", "codec"),
+        [("UTF-16le", "utf-16-le"), ("UTF-16be", "utf-16-be")],
+    )
+    def test_deleted_utf16_sqlite_secret_refuses_export(
+        self, tmp_path, monkeypatch, pragma_encoding, codec
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "deleted-utf16"
+        profile_dir.mkdir(parents=True)
+        database = profile_dir / "state.db"
+        with sqlite3.connect(database) as connection:
+            connection.execute(f"PRAGMA encoding='{pragma_encoding}'")
+            connection.execute("PRAGMA secure_delete=OFF")
+            connection.execute("CREATE TABLE values_table (value TEXT)")
+            connection.execute("INSERT INTO values_table VALUES (?)", (_LEAKED_KEY,))
+            connection.commit()
+            connection.execute("DELETE FROM values_table")
+            connection.commit()
+            assert connection.execute(
+                "SELECT COUNT(*) FROM values_table"
+            ).fetchone()[0] == 0
+        before = database.read_bytes()
+        assert _LEAKED_KEY.encode(codec) in before
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        output = tmp_path / f"deleted-{pragma_encoding}.tar.gz"
+        with pytest.raises(ValueError, match=r"state\.db"):
+            export_profile("deleted-utf16", str(output))
+        assert not output.exists()
+        assert database.read_bytes() == before
+
+    def test_deleted_secret_spanning_raw_scan_boundary_is_detected(
+        self, tmp_path, monkeypatch
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "boundary"
+        profile_dir.mkdir(parents=True)
+        database = profile_dir / "state.db"
+        with sqlite3.connect(database) as connection:
+            connection.execute("PRAGMA secure_delete=OFF")
+            connection.execute("CREATE TABLE values_table (value TEXT)")
+            connection.execute("INSERT INTO values_table VALUES (?)", (_LEAKED_KEY,))
+            connection.commit()
+            connection.execute("DELETE FROM values_table")
+            connection.commit()
+        raw = database.read_bytes()
+        marker = _LEAKED_KEY.encode()
+        marker_offset = raw.index(marker)
+        chunk_bytes = marker_offset + len(b"sk-") + 5
+        assert marker_offset < chunk_bytes < marker_offset + len(marker)
+        monkeypatch.setattr(
+            profiles_module, "_SQLITE_RAW_SCAN_CHUNK_BYTES", chunk_bytes
+        )
+        monkeypatch.setattr(
+            profiles_module, "_SQLITE_RAW_SCAN_OVERLAP_BYTES", len(marker)
+        )
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        output = tmp_path / "boundary.tar.gz"
+        with pytest.raises(ValueError, match=r"state\.db"):
+            export_profile("boundary", str(output))
+        assert not output.exists()
+
+    def test_sqlite_framing_cannot_hide_deleted_prefix_secret(
+        self, tmp_path, monkeypatch
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "framed"
+        profile_dir.mkdir(parents=True)
+        database = profile_dir / "state.db"
+        marker = "sk-" + "A" * 33
+        with sqlite3.connect(database) as connection:
+            connection.execute("PRAGMA secure_delete=OFF")
+            connection.execute("CREATE TABLE values_table (value TEXT)")
+            connection.execute("INSERT INTO values_table VALUES (?)", (marker,))
+            connection.commit()
+            connection.execute("DELETE FROM values_table")
+            connection.commit()
+        raw = database.read_bytes()
+        marker_offset = raw.index(marker.encode())
+        assert chr(raw[marker_offset - 1]).isalnum()
+        decoded = raw.decode("utf-8", errors="surrogateescape")
+        assert redact_module.redact_sensitive_text(decoded, force=True) == decoded
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        output = tmp_path / "framed.tar.gz"
+        with pytest.raises(ValueError, match=r"secret-shaped content: state\.db"):
+            export_profile("framed", str(output))
+        assert not output.exists()
+
+    def test_sqlite_framing_cannot_hide_deleted_assignment_secret(
+        self, tmp_path, monkeypatch
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "framed-assignment"
+        profile_dir.mkdir(parents=True)
+        database = profile_dir / "state.db"
+        marker = "password=" + "A" * 17
+        with sqlite3.connect(database) as connection:
+            connection.execute("PRAGMA secure_delete=OFF")
+            connection.execute("CREATE TABLE values_table (value TEXT)")
+            connection.execute("INSERT INTO values_table VALUES (?)", (marker,))
+            connection.commit()
+            connection.execute("DELETE FROM values_table")
+            connection.commit()
+        raw = database.read_bytes()
+        marker_offset = raw.index(marker.encode())
+        assert chr(raw[marker_offset - 1]).isalnum()
+        decoded = raw.decode("utf-8", errors="surrogateescape")
+        assert redact_module.redact_sensitive_text(decoded, force=True) == decoded
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        output = tmp_path / "framed-assignment.tar.gz"
+        with pytest.raises(ValueError, match=r"secret-shaped content: state\.db"):
+            export_profile("framed-assignment", str(output))
+        assert not output.exists()
+
+    def test_deleted_nonsecret_sqlite_content_remains_exportable(
+        self, tmp_path, monkeypatch
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "deleted-clean"
+        profile_dir.mkdir(parents=True)
+        database = profile_dir / "state.db"
+        deleted = "ordinary deleted content"
+        with sqlite3.connect(database) as connection:
+            connection.execute("PRAGMA secure_delete=OFF")
+            connection.execute("CREATE TABLE values_table (value TEXT)")
+            connection.execute("INSERT INTO values_table VALUES (?)", (deleted,))
+            connection.commit()
+            connection.execute("DELETE FROM values_table")
+            connection.commit()
+        before = database.read_bytes()
+        assert deleted.encode() in before
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        result = export_profile(
+            "deleted-clean", str(tmp_path / "deleted-clean.tar.gz")
+        )
+        archived = tmp_path / "deleted-clean-archived.db"
+        with tarfile.open(result, "r:gz") as tf:
+            archived.write_bytes(tf.extractfile("deleted-clean/state.db").read())
+        with sqlite3.connect(archived) as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM values_table"
+            ).fetchone()[0] == 0
+        assert database.read_bytes() == before
+
+    @pytest.mark.parametrize(
+        "blob",
+        [
+            b"\xff\xfe" + _LEAKED_KEY.encode(),
+            _LEAKED_KEY.encode() + b"\xff\xfe",
+        ],
+    )
+    def test_deleted_secret_in_arbitrary_blob_refuses_export(
+        self, tmp_path, monkeypatch, blob
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "deleted-blob"
+        profile_dir.mkdir(parents=True)
+        database = profile_dir / "state.db"
+        with sqlite3.connect(database) as connection:
+            connection.execute("PRAGMA secure_delete=OFF")
+            connection.execute("CREATE TABLE values_table (value BLOB)")
+            connection.execute(
+                "INSERT INTO values_table VALUES (?)", (sqlite3.Binary(blob),)
+            )
+            connection.commit()
+            connection.execute("DELETE FROM values_table")
+            connection.commit()
+        before = database.read_bytes()
+        assert _LEAKED_KEY.encode() in before
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        output = tmp_path / "deleted-arbitrary-blob.tar.gz"
+        with pytest.raises(ValueError, match=r"secret-shaped content: state\.db"):
+            export_profile("deleted-blob", str(output))
+        assert not output.exists()
+        assert database.read_bytes() == before
+
+    def test_hint_dense_raw_scan_detector_calls_are_bounded_by_chunks(
+        self, tmp_path, monkeypatch
+    ):
+        def make_database(name, value):
+            database = tmp_path / name
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE values_table (value TEXT)")
+                connection.execute("INSERT INTO values_table VALUES (?)", (value,))
+            return database
+
+        sparse = make_database("sparse.db", "safe-data" * 4_000)
+        dense = make_database("dense.db", "key-safe-" * 4_000)
+        assert sparse.stat().st_size == dense.stat().st_size
+
+        original_redactor = redact_module.redact_sensitive_text
+        calls = 0
+
+        def counting_redactor(text, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original_redactor(text, **kwargs)
+
+        monkeypatch.setattr(redact_module, "redact_sensitive_text", counting_redactor)
+
+        assert not profiles_module._sqlite_raw_snapshot_contains_secret(sparse)
+        sparse_calls = calls
+        calls = 0
+        assert not profiles_module._sqlite_raw_snapshot_contains_secret(dense)
+        dense_calls = calls
+
+        chunks = (
+            dense.stat().st_size + profiles_module._SQLITE_RAW_SCAN_CHUNK_BYTES - 1
+        ) // profiles_module._SQLITE_RAW_SCAN_CHUNK_BYTES
+        text_views_per_chunk = 5  # UTF-8 plus two alignments for each UTF-16 order.
+        assert sparse_calls == dense_calls == chunks * text_views_per_chunk
+
+    def test_hint_dense_clean_sqlite_database_remains_exportable(
+        self, tmp_path, monkeypatch
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "hint-dense"
+        profile_dir.mkdir(parents=True)
+        database = profile_dir / "state.db"
+        value = "key-safe-" * 4_000
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE values_table (value TEXT)")
+            connection.execute("INSERT INTO values_table VALUES (?)", (value,))
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        result = export_profile("hint-dense", str(tmp_path / "hint-dense.tar.gz"))
+        archived = tmp_path / "hint-dense-archived.db"
+        with tarfile.open(result, "r:gz") as tf:
+            archived.write_bytes(tf.extractfile("hint-dense/state.db").read())
+        with sqlite3.connect(archived) as connection:
+            assert connection.execute(
+                "SELECT value FROM values_table"
+            ).fetchone() == (value,)
+
+    def test_secret_committed_only_to_wal_refuses_export_without_mutation(
+        self, tmp_path, monkeypatch
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "database"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("model: test\n")
+        database = profile_dir / "state.db"
+        writer = sqlite3.connect(database)
+        try:
+            assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+            writer.execute("CREATE TABLE values_table (value TEXT)")
+            writer.execute("INSERT INTO values_table VALUES ('safe')")
+            writer.commit()
+            writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            writer.execute("INSERT INTO values_table VALUES (?)", (_LEAKED_KEY,))
+            writer.commit()
+            wal = Path(f"{database}-wal")
+            main_before = database.read_bytes()
+            wal_before = wal.read_bytes()
+            _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+            output = tmp_path / "wal.tar.gz"
+            with pytest.raises(ValueError, match=r"state\.db"):
+                export_profile("database", str(output))
+
+            assert not output.exists()
+            assert database.read_bytes() == main_before
+            assert wal.read_bytes() == wal_before
+            assert writer.execute(
+                "SELECT value FROM values_table ORDER BY rowid"
+            ).fetchall() == [("safe",), (_LEAKED_KEY,)]
+        finally:
+            writer.close()
+
+    def test_malformed_recognized_sqlite_file_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "database"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("model: test\n")
+        database = profile_dir / "broken.db"
+        database.write_bytes(b"SQLite format 3\x00" + b"broken")
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        output = tmp_path / "broken.tar.gz"
+        with pytest.raises(RuntimeError, match=r"broken\.db"):
+            export_profile("database", str(output))
+        assert not output.exists()
+        assert database.read_bytes() == b"SQLite format 3\x00" + b"broken"
+
+
+class TestExtensionIndependentExportScrub:
+    @pytest.mark.parametrize("name", ["payload.data", "events.log", "notes"])
+    def test_utf8_secret_is_redacted_independent_of_suffix(
+        self, tmp_path, monkeypatch, name
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "text"
+        profile_dir.mkdir(parents=True)
+        source = profile_dir / name
+        source.write_text(f"before {_LEAKED_KEY} after\n")
+        source.chmod(0o640)
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        result = export_profile("text", str(tmp_path / f"{name}.tar.gz"))
+        with tarfile.open(result, "r:gz") as tf:
+            member = tf.getmember(f"text/{name}")
+            archived = tf.extractfile(member).read().decode()
+
+        assert _LEAKED_KEY not in archived
+        assert "before " in archived and " after" in archived
+        assert member.mode & 0o777 == 0o640
+        assert _LEAKED_KEY in source.read_text()
+
+    def test_extra_files_are_redacted_independent_of_suffix(
+        self, tmp_path, monkeypatch
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "extras"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("model: test\n")
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+        extras = {
+            name: f"before {_LEAKED_KEY} after\n"
+            for name in ("payload.data", "events.log", "notes")
+        }
+
+        result = export_profile(
+            "extras", str(tmp_path / "extras.tar.gz"), extra_files=extras
+        )
+        with tarfile.open(result, "r:gz") as tf:
+            for name in extras:
+                archived = tf.extractfile(f"extras/{name}").read().decode()
+                assert _LEAKED_KEY not in archived
+                assert "before " in archived and " after" in archived
+
+    def test_safe_utf8_and_binary_files_remain_byte_identical(
+        self, tmp_path, monkeypatch
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "content"
+        profile_dir.mkdir(parents=True)
+        safe = profile_dir / "safe.data"
+        binary = profile_dir / "binary.log"
+        safe_bytes = "plain unicode text: café\r\n".encode()
+        binary_bytes = b"\x00\xffsynthetic\r\n"
+        safe.write_bytes(safe_bytes)
+        binary.write_bytes(binary_bytes)
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        result = export_profile("content", str(tmp_path / "content.tar.gz"))
+        with tarfile.open(result, "r:gz") as tf:
+            assert tf.extractfile("content/safe.data").read() == safe_bytes
+            assert tf.extractfile("content/binary.log").read() == binary_bytes
+        assert safe.read_bytes() == safe_bytes
+        assert binary.read_bytes() == binary_bytes
+
+    def test_secret_late_in_large_utf8_file_is_redacted(self, tmp_path, monkeypatch):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "large"
+        profile_dir.mkdir(parents=True)
+        source = profile_dir / "events.log"
+        source.write_text("safe\n" * 400_000 + f"key={_LEAKED_KEY}\n")
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        result = export_profile("large", str(tmp_path / "large.tar.gz"))
+        with tarfile.open(result, "r:gz") as tf:
+            archived = tf.extractfile("large/events.log").read().decode()
+        assert _LEAKED_KEY not in archived
+        assert archived.startswith("safe\n")
+        assert _LEAKED_KEY in source.read_text()
+
+
+class TestAtomicArchivePublication:
+    def _profile(self, tmp_path, monkeypatch):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "atomic"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("model: test\n")
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+    def test_output_symlink_is_replaced_without_touching_target(
+        self, tmp_path, monkeypatch
+    ):
+        self._profile(tmp_path, monkeypatch)
+        external = tmp_path / "external.txt"
+        external.write_text("do not alter")
+        output = tmp_path / "atomic.tar.gz"
+        try:
+            output.symlink_to(external)
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable on this platform: {exc}")
+
+        result = export_profile("atomic", str(output))
+
+        assert external.read_text() == "do not alter"
+        assert result == output
+        assert result.is_file() and not result.is_symlink()
+        with tarfile.open(result, "r:gz") as tf:
+            assert "atomic/config.yaml" in tf.getnames()
+
+    def test_existing_regular_output_is_atomically_replaced(
+        self, tmp_path, monkeypatch
+    ):
+        self._profile(tmp_path, monkeypatch)
+        output = tmp_path / "atomic.tar.gz"
+        output.write_bytes(b"old archive")
+
+        result = export_profile("atomic", str(output))
+
+        assert result == output and result.is_file()
+        with tarfile.open(result, "r:gz") as tf:
+            assert "atomic/config.yaml" in tf.getnames()
+
+    def test_directory_output_fails_clearly(self, tmp_path, monkeypatch):
+        self._profile(tmp_path, monkeypatch)
+        output = tmp_path / "atomic.tar.gz"
+        output.mkdir()
+
+        with pytest.raises(IsADirectoryError, match="output is a directory"):
+            export_profile("atomic", str(output))
+        assert output.is_dir()
+
+    def test_archive_creation_failure_is_not_published(
+        self, tmp_path, monkeypatch
+    ):
+        self._profile(tmp_path, monkeypatch)
+        output = tmp_path / "atomic.tar.gz"
+
+        def fail_add(*args, **kwargs):
+            raise RuntimeError("synthetic archive failure")
+
+        monkeypatch.setattr(tarfile.TarFile, "add", fail_add)
+        with pytest.raises(RuntimeError, match="synthetic archive failure"):
+            export_profile("atomic", str(output))
+
+        assert not output.exists()
+        assert not list(tmp_path.glob(".atomic.tar.gz.*.tmp"))
+
+
+class TestProfileExportSymlinkPolicy:
+    @pytest.mark.parametrize("kind", ["absolute", "relative", "dangling"])
+    def test_profile_symlink_refuses_export(self, tmp_path, monkeypatch, kind):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "links"
+        profile_dir.mkdir(parents=True)
+        link = profile_dir / "workspace" / "link"
+        link.parent.mkdir()
+        target = profile_dir / "workspace" / "target.txt"
+        if kind == "absolute":
+            target = tmp_path / "absolute-target.txt"
+            target.write_text("synthetic")
+            link.symlink_to(target)
+        elif kind == "relative":
+            target.write_text("synthetic")
+            link.symlink_to("target.txt")
+        else:
+            link.symlink_to("missing.txt")
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        output = tmp_path / f"{kind}.tar.gz"
+        with pytest.raises(ValueError) as exc_info:
+            export_profile("links", str(output))
+
+        assert "workspace/link" in str(exc_info.value)
+        assert str(target) not in str(exc_info.value)
+        assert not output.exists()
+
+    def test_symlink_in_excluded_credential_tree_does_not_block_export(
+        self, tmp_path, monkeypatch
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "links"
+        profile_dir.mkdir(parents=True)
+        outside = tmp_path / "outside-token-store"
+        outside.write_text("DO_NOT_ARCHIVE_SYMLINK_TARGET")
+        link = profile_dir / "mcp-tokens" / "server"
+        link.parent.mkdir()
+        link.symlink_to(outside)
+        (profile_dir / "config.yaml").write_text("model: test\n")
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        result = export_profile("links", str(tmp_path / "filtered-link.tar.gz"))
+        with tarfile.open(result, "r:gz") as tf:
+            names = set(tf.getnames())
+            content = b"\n".join(
+                tf.extractfile(member).read()
+                for member in tf.getmembers()
+                if member.isfile()
+            )
+
+        assert not any("mcp-tokens" in name for name in names)
+        assert b"DO_NOT_ARCHIVE_SYMLINK_TARGET" not in content
+        assert link.is_symlink()
+
+    def test_profile_root_symlink_refuses_export(self, tmp_path, monkeypatch):
+        profiles_root = tmp_path / "profiles"
+        target = tmp_path / "real-profile"
+        target.mkdir()
+        (target / "config.yaml").write_text("model: test\n")
+        profile_dir = profiles_root / "linked-root"
+        profiles_root.mkdir()
+        profile_dir.symlink_to(target, target_is_directory=True)
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        output = tmp_path / "linked-root.tar.gz"
+        with pytest.raises(ValueError, match=r"profile export symlink: \.") as exc_info:
+            export_profile("linked-root", str(output))
+
+        assert str(target) not in str(exc_info.value)
+        assert not output.exists()

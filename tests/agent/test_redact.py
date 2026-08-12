@@ -4,7 +4,13 @@ import logging
 
 import pytest
 
-from agent.redact import mask_secret, redact_cdp_url, redact_sensitive_text, RedactingFormatter
+from agent.redact import (
+    RedactingFormatter,
+    contains_framing_tolerant_secret,
+    mask_secret,
+    redact_cdp_url,
+    redact_sensitive_text,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -83,6 +89,40 @@ class TestKnownPrefixes:
     def test_short_fireworks_like_words_unchanged(self):
         text = "fw-tooshort fw_tooshort fpk_tooshort"
         assert redact_sensitive_text(text) == text
+
+
+class TestFramingTolerantSecretDetection:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "task-" + "A" * 20,
+            "mask-" + "B" * 20,
+            "ask-" + "C" * 20,
+            "\udc813task-" + "D" * 20,
+            "xkey=value",
+            "\x01xkey=value",
+            "\udc813xkey=value",
+            "monkey=value",
+            "password=",
+            "API_KEY=",
+            "postgresql://user:",
+        ],
+    )
+    def test_benign_complete_strings_are_not_secret_witnesses(self, text):
+        assert redact_sensitive_text(text, force=True) == text
+        assert not contains_framing_tolerant_secret(text)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "sk-" + "A" * 20,
+            "\x01x" + "sk-" + "A" * 20,
+            "\udc813" + "sk-" + "A" * 20,
+            "\x01xpassword=" + "A" * 17,
+        ],
+    )
+    def test_real_and_framed_secret_witnesses_are_detected(self, text):
+        assert contains_framing_tolerant_secret(text)
 
 
 

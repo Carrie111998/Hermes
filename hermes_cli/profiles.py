@@ -31,7 +31,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
 
@@ -2222,9 +2222,6 @@ def _is_sensitive_export_entry(
     trees are matched relative to ``profile_root`` so ordinary same-named
     project directories remain portable.
     """
-    if _is_sensitive_export_name(name):
-        return True
-
     if _is_sensitive_profile_credential_tree_entry(
         directory, name, profile_root
     ):
@@ -2233,11 +2230,14 @@ def _is_sensitive_export_entry(
     if _is_sensitive_profile_home_entry(directory, name, profile_root):
         return True
 
+    path = Path(directory) / name
+    if not path.is_dir() and _is_sensitive_export_name(name):
+        return True
+
     underlying_name = _strip_export_backup_suffixes(name)
     if not underlying_name.endswith(".pem"):
         return False
 
-    path = Path(directory) / name
     try:
         if path.is_symlink() or not path.is_file():
             return False
@@ -2254,6 +2254,19 @@ def _is_sensitive_export_entry(
         # not turn an ordinary I/O error into a silent exclusion.
         return False
     return False
+
+
+def _reject_profile_export_symlinks(root: Path) -> None:
+    """Fail before export can preserve or dereference a profile symlink."""
+    if root.is_symlink():
+        raise ValueError("Refusing profile export symlink: .")
+
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        for name in (*dirnames, *filenames):
+            path = Path(directory) / name
+            if path.is_symlink():
+                relative = path.relative_to(root).as_posix()
+                raise ValueError(f"Refusing profile export symlink: {relative}")
 
 
 def _default_export_ignore(root_dir: Path):
@@ -2303,7 +2316,7 @@ def _default_export_ignore(root_dir: Path):
 
 
 def _make_profile_archive(base: str, root_dir: str, base_dir: str) -> str:
-    """Create ``<base>.tar.gz`` of ``root_dir/base_dir`` — GNU tar format.
+    """Atomically create ``<base>.tar.gz`` — GNU tar format.
 
     Not :func:`shutil.make_archive`: that writes PAX (Python's tarfile default
     since 3.8), whose fractional-mtime records macOS Archive Utility rejects —
@@ -2312,37 +2325,36 @@ def _make_profile_archive(base: str, root_dir: str, base_dir: str) -> str:
     mtime, so Finder, bsdtar, and gnutar all extract it.
     """
     import tarfile
+    import tempfile
 
-    archive_path = f"{base}.tar.gz"
-    with tarfile.open(archive_path, "w:gz", format=tarfile.GNU_FORMAT) as tf:
-        tf.add(str(Path(root_dir) / base_dir), arcname=base_dir)
-    return archive_path
+    archive_path = Path(f"{base}.tar.gz")
+    if not archive_path.is_symlink() and archive_path.is_dir():
+        raise IsADirectoryError(f"Profile export output is a directory: {archive_path}")
 
-
-# Text / config suffixes walked during export secret scrubbing. Binary DBs,
-# images, and other non-text artifacts are left alone (they may still leave
-# via named-profile export — scrubbing those is a separate concern).
-_EXPORT_REDACT_SUFFIXES = frozenset({
-    ".md", ".txt", ".yaml", ".yml", ".json", ".jsonl",
-    ".toml", ".ini", ".cfg", ".conf", ".py", ".sh",
-    ".bash", ".zsh", ".js", ".ts", ".tsx", ".jsx",
-    ".css", ".html", ".xml", ".csv",
-})
-# pathlib.Path(".cursorrules").suffix is "" — name-match these.
-# ``*.env.example`` uses endswith (suffix would be ``.example``).
-_EXPORT_REDACT_NAMES = frozenset({
-    ".cursorrules",
-})
-
-
-def _should_redact_export_file(path: Path) -> bool:
-    """True when *path* is a text-ish file we should secret-scrub on export."""
-    name = path.name
-    if name in _EXPORT_REDACT_NAMES:
-        return True
-    if name.lower() in _EXPORT_ENV_TEMPLATE_NAMES:
-        return True
-    return path.suffix.lower() in _EXPORT_REDACT_SUFFIXES
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w+b",
+            prefix=f".{archive_path.name}.",
+            suffix=".tmp",
+            dir=archive_path.parent,
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            with tarfile.open(
+                fileobj=handle,
+                mode="w:gz",
+                format=tarfile.GNU_FORMAT,
+            ) as tf:
+                tf.add(str(Path(root_dir) / base_dir), arcname=base_dir)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, archive_path)
+        temporary_path = None
+        return str(archive_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def _safe_copy_export_sqlite_database(source: Path, destination: Path) -> None:
@@ -2375,6 +2387,135 @@ def _safe_copy_export_sqlite_database(source: Path, destination: Path) -> None:
         raise RuntimeError(
             f"Could not create a consistent SQLite export snapshot: {source.name}"
         ) from snapshot_error
+
+
+_SQLITE_RAW_SCAN_CHUNK_BYTES = 64 * 1024
+# Retain a full chunk: before bytes are discarded they are rescanned beside
+# the next chunk, so a boundary-spanning detector witness shorter than one
+# chunk is presented contiguously. UTF-16 needs twice the bytes per character,
+# hence an overlap measured in raw bytes rather than decoded characters.
+_SQLITE_RAW_SCAN_OVERLAP_BYTES = _SQLITE_RAW_SCAN_CHUNK_BYTES
+
+
+def _iter_sqlite_secret_text_views(data: bytes) -> Iterator[str]:
+    """Yield bounded text views that can expose ASCII or UTF-16 secrets."""
+    yield data.decode("utf-8", errors="surrogateescape")
+    for codec in ("utf-16-le", "utf-16-be"):
+        for offset in (0, 1):
+            encoded = data[offset:]
+            encoded = encoded[: len(encoded) - (len(encoded) % 2)]
+            if encoded:
+                yield encoded.decode(codec, errors="surrogatepass")
+
+
+def _sqlite_raw_snapshot_contains_secret(snapshot: Path) -> bool:
+    """Stream-scan live and deleted page bytes without rewriting the snapshot."""
+    from agent.redact import contains_framing_tolerant_secret, redact_sensitive_text
+
+    def _contains_secret(text: str) -> bool:
+        # One forced-redactor pass covers assignments, headers, complete
+        # private-key blocks, connection strings, JWTs, and other contextual
+        # patterns using only bytes present in this view. Known vendor prefixes
+        # get one additional regex pass without textual boundary assumptions:
+        # a SQLite record header may itself decode to an ASCII token character.
+        # Both passes are bounded per chunk/view, independent of hint density.
+        return (
+            redact_sensitive_text(text, force=True) != text
+            or contains_framing_tolerant_secret(text)
+        )
+
+    with snapshot.open("rb") as handle:
+        header = handle.read(100)
+        if len(header) < 60 or not header.startswith(b"SQLite format 3\x00"):
+            raise OSError("invalid SQLite snapshot header")
+        encoding_id = int.from_bytes(header[56:60], "big")
+        if encoding_id not in {0, 1, 2, 3}:
+            raise OSError(f"unsupported SQLite text encoding: {encoding_id}")
+        handle.seek(0)
+
+        overlap = b""
+        while chunk := handle.read(_SQLITE_RAW_SCAN_CHUNK_BYTES):
+            window = overlap + chunk
+            for text in _iter_sqlite_secret_text_views(window):
+                if _contains_secret(text):
+                    return True
+
+            overlap = window[-_SQLITE_RAW_SCAN_OVERLAP_BYTES:]
+    return False
+
+
+def _sqlite_snapshot_contains_secret(snapshot: Path, relative: Path) -> bool:
+    """Inspect logical content and raw page residue without mutating a database."""
+    import sqlite3
+
+    from agent.redact import redact_sensitive_text
+
+    connection = None
+    try:
+        uri = f"{snapshot.resolve().as_uri()}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True)
+        connection.execute("PRAGMA query_only = ON")
+
+        check_cursor = connection.execute("PRAGMA quick_check")
+        try:
+            for result in check_cursor:
+                if result != ("ok",):
+                    raise sqlite3.DatabaseError("SQLite quick_check failed")
+        finally:
+            check_cursor.close()
+
+        schema_cursor = connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_schema "
+            "WHERE type IN ('table', 'index', 'view', 'trigger') "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        )
+        try:
+            while schema_rows := schema_cursor.fetchmany(128):
+                for schema_row in schema_rows:
+                    for value in schema_row:
+                        if (
+                            isinstance(value, str)
+                            and redact_sensitive_text(value, force=True) != value
+                        ):
+                            return True
+        finally:
+            schema_cursor.close()
+
+        table_cursor = connection.execute(
+            "SELECT name FROM sqlite_schema "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )
+        try:
+            while tables := table_cursor.fetchmany(128):
+                for (table_name,) in tables:
+                    identifier = '"' + table_name.replace('"', '""') + '"'
+                    row_cursor = connection.execute(f"SELECT * FROM {identifier}")
+                    try:
+                        while rows := row_cursor.fetchmany(128):
+                            for row in rows:
+                                for value in row:
+                                    if isinstance(value, str):
+                                        text = value
+                                    elif isinstance(value, (bytes, bytearray, memoryview)):
+                                        text = bytes(value).decode(
+                                            "utf-8", errors="surrogateescape"
+                                        )
+                                    else:
+                                        continue
+                                    if redact_sensitive_text(text, force=True) != text:
+                                        return True
+                    finally:
+                        row_cursor.close()
+        finally:
+            table_cursor.close()
+        return _sqlite_raw_snapshot_contains_secret(snapshot)
+    except (sqlite3.Error, OSError, UnicodeError) as exc:
+        raise RuntimeError(
+            f"Could not safely inspect SQLite database during profile export: {relative}"
+        ) from exc
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 def _snapshot_export_sqlite_databases(source_root: Path, staged_root: Path) -> None:
@@ -2423,7 +2564,18 @@ def _snapshot_export_sqlite_databases(source_root: Path, staged_root: Path) -> N
         ) as handle:
             snapshot = Path(handle.name)
         try:
-            _safe_copy_export_sqlite_database(source_db, snapshot)
+            try:
+                _safe_copy_export_sqlite_database(source_db, snapshot)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "Could not safely inspect SQLite database during profile export: "
+                    f"{relative}"
+                ) from exc
+            if _sqlite_snapshot_contains_secret(snapshot, relative):
+                raise ValueError(
+                    "Refusing profile export because SQLite database contains "
+                    f"secret-shaped content: {relative}"
+                )
             snapshot.chmod(original_mode)
             snapshot.replace(staged_db)
         finally:
@@ -2439,42 +2591,41 @@ def _scrub_export_secrets(staged: Path) -> None:
     ``security.redact_secrets`` / ``HERMES_REDACT_SECRETS`` — share archives
     must not emit raw keys even when the user has disabled live redaction.
 
-    Symlinks to text files are materialized into regular files when their
-    content changes, so redaction never follows a link back into the source
-    profile (``copytree(..., symlinks=True)``).
+    Every valid UTF-8 regular file is inspected regardless of filename. Files
+    containing NUL bytes or invalid UTF-8 are treated as binary and left byte-
+    identical. Profile symlinks are rejected before this function runs.
     """
     from agent.redact import redact_sensitive_text
 
     for path in staged.rglob("*"):
-        try:
-            is_link = path.is_symlink()
-        except OSError:
-            continue
-        if is_link:
-            # Skip broken links and symlinked directories.
-            try:
-                if not path.exists() or path.is_dir():
-                    continue
-            except OSError:
-                continue
-        elif not path.is_file():
-            continue
-
-        if not _should_redact_export_file(path):
+        if path.is_symlink():
+            relative = path.relative_to(staged).as_posix()
+            raise ValueError(f"Refusing profile export symlink: {relative}")
+        if not path.is_file():
             continue
 
         try:
-            text = path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                text = handle.read()
+        except UnicodeDecodeError:
+            continue
+        except OSError as exc:
+            relative = path.relative_to(staged).as_posix()
+            raise RuntimeError(f"Could not inspect profile export file: {relative}") from exc
+
+        if "\x00" in text:
             continue
 
         redacted = redact_sensitive_text(text, force=True)
         if redacted == text:
             continue
 
-        if is_link:
-            path.unlink()
-        path.write_text(redacted, encoding="utf-8")
+        try:
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                handle.write(redacted)
+        except OSError as exc:
+            relative = path.relative_to(staged).as_posix()
+            raise RuntimeError(f"Could not scrub profile export file: {relative}") from exc
 
 
 def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, str]] = None) -> Path:
@@ -2501,13 +2652,15 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
     base = str(output).removesuffix(".tar.gz").removesuffix(".tgz")
 
     def _stage_extras(staged: Path) -> None:
+        from agent.redact import redact_sensitive_text
+
         for rel, content in (extra_files or {}).items():
             parts = _normalize_profile_archive_parts(rel)
             target = staged.joinpath(*parts)
 
             if (
                 any(_is_transient_export_name(part) for part in parts)
-                or any(_is_sensitive_export_name(part) for part in parts)
+                or _is_sensitive_export_name(target.name)
                 or _is_sensitive_profile_credential_tree_entry(
                     str(target.parent), target.name, staged
                 )
@@ -2532,7 +2685,13 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
                 parent.mkdir(exist_ok=True)
             if target.is_symlink():
                 raise ValueError(f"Refusing symlinked profile export extra: {rel}")
-            target.write_text(content, encoding="utf-8")
+            target.write_text(
+                redact_sensitive_text(content, force=True),
+                encoding="utf-8",
+            )
+
+    if profile_dir.is_symlink():
+        raise ValueError("Refusing profile export symlink: .")
 
     if canon == "default":
         # The default profile IS ~/.hermes itself — its parent is ~/ and its
@@ -2546,6 +2705,7 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
                 symlinks=True,
                 ignore=_default_export_ignore(profile_dir),
             )
+            _reject_profile_export_symlinks(staged)
             _snapshot_export_sqlite_databases(profile_dir, staged)
             _stage_extras(staged)
             _scrub_export_secrets(staged)
@@ -2574,6 +2734,7 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
             symlinks=True,
             ignore=_named_ignore,
         )
+        _reject_profile_export_symlinks(staged)
         _snapshot_export_sqlite_databases(profile_dir, staged)
         _stage_extras(staged)
         _scrub_export_secrets(staged)

@@ -484,6 +484,70 @@ _TOKEN_BODY_CHARS = frozenset(
 _PREFIX_RE = re.compile(
     r"(?<![A-Za-z0-9_-])(" + "|".join(_PREFIX_PATTERNS) + r")(?![A-Za-z0-9_-])"
 )
+# Binary-container framing can sit directly beside a credential and defeat the
+# display redactor's word-boundary guards. This variant recognizes only the
+# real, minimum token witnesses encoded by _PREFIX_PATTERNS; it does not add
+# boundaries, suffixes, or other bytes that are absent from the input.
+_PREFIX_ANYWHERE_RE = re.compile(r"(?:" + "|".join(_PREFIX_PATTERNS) + r")")
+_RAW_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?P<key>api[ _.\-]?key|token|secret|passwd|password|pass|pw|credential|auth|key)"
+    r"\s*=\s*['\"]?[A-Za-z0-9_./:+@%~!#$^*?\-]",
+    re.IGNORECASE,
+)
+# These short words commonly appear as suffixes in ordinary identifiers
+# (``xkey``, ``oauth``). Require their normal boundary even in framed data.
+_RAW_AMBIGUOUS_ASSIGNMENT_KEYS = frozenset({"auth", "key", "pass", "pw"})
+
+
+def contains_framing_tolerant_secret(text: str) -> bool:
+    """Return whether binary-framed text contains a complete secret witness.
+
+    Known prefixes must satisfy a full pattern from ``_PREFIX_PATTERNS``,
+    including its real minimum body length. Assignments must contain a real
+    secret-key word, ``=``, and at least one real printable value character.
+    A single adjacent identifier character is tolerated only when it is itself
+    preceded by a control byte or a surrogate-preserved binary byte, matching
+    SQLite record headers without treating words such as ``monkey=`` or
+    ``task-...`` as credentials. No boundaries, values, terminators, or other
+    bytes are added to the input.
+    """
+    if not text:
+        return False
+
+    def is_identifier_char(char: str) -> bool:
+        return char.isascii() and (char.isalnum() or char in "_-")
+
+    def is_framing_char(char: str) -> bool:
+        return (
+            _CONTROL_CHARS_RE.fullmatch(char) is not None
+            or 0xDC80 <= ord(char) <= 0xDCFF
+        )
+
+    def has_plain_start(start: int) -> bool:
+        if start == 0 or not is_identifier_char(text[start - 1]):
+            return True
+        return False
+
+    def has_single_framing_char(start: int) -> bool:
+        return (
+            start >= 2
+            and is_identifier_char(text[start - 1])
+            and is_framing_char(text[start - 2])
+        )
+
+    for match in _PREFIX_ANYWHERE_RE.finditer(text):
+        if has_plain_start(match.start()) or has_single_framing_char(match.start()):
+            return True
+    for match in _RAW_SECRET_ASSIGNMENT_RE.finditer(text):
+        start = match.start()
+        if has_plain_start(start):
+            return True
+        if (
+            match.group("key").casefold() not in _RAW_AMBIGUOUS_ASSIGNMENT_KEYS
+            and has_single_framing_char(start)
+        ):
+            return True
+    return False
 
 
 def _mask_control_split_tokens(text: str, mask_fn) -> str:
