@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+from dataclasses import replace
 import json
 import os
 import sqlite3
@@ -18,7 +19,12 @@ import pytest
 
 import hermes_state
 from hermes_cli import kanban_db as kb
-from hermes_cli.kanban_repository import VerificationCommand
+from hermes_cli.kanban_repository import (
+    VerificationCommand,
+    VerificationProfile,
+    run_verification,
+    verification_receipt_from_payload,
+)
 
 
 @pytest.fixture

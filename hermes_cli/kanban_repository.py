@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ from typing import Any, Literal
 
 
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
+FULL_DIGEST = re.compile(r"[0-9a-f]{64}")
 
 _REPOSITORY_KEYS = frozenset(
     {
@@ -70,6 +72,25 @@ class VerificationProfile:
 
 
 @dataclass(frozen=True)
+class VerificationReceiptKey:
+    candidate_sha: str
+    contract_digest: str
+    command_set_digest: str
+    runtime_toolchain_digest: str
+    generated_policy_digest: str
+    gate_kind: str
+    executor_policy: str
+    digest: str
+
+
+@dataclass(frozen=True)
+class VerificationReceipt:
+    key: VerificationReceiptKey
+    result_digest: str
+    created_at: int
+
+
+@dataclass(frozen=True)
 class VerificationStepResult:
     """Bounded evidence for one configured verification command."""
 
@@ -105,7 +126,9 @@ class VerificationResult:
     contract_digest: str
     profile: str
     steps: tuple[VerificationStepResult, ...]
+    key: VerificationReceiptKey
     error: str | None = None
+    reused: bool = False
 
 
 _VERIFICATION_OUTPUT_TAIL_CHARS = 4096
@@ -145,6 +168,7 @@ def _verification_result(
     contract_digest: str,
     profile: str,
     steps: list[VerificationStepResult],
+    key: VerificationReceiptKey,
     error: str | None = None,
 ) -> VerificationResult:
     return VerificationResult(
@@ -155,6 +179,7 @@ def _verification_result(
         profile=profile,
         steps=tuple(steps),
         error=error,
+        key=key,
     )
 
 
@@ -215,6 +240,266 @@ def _verification_environment(
     return {key: values[key] for key in _VERIFICATION_ENV_KEYS}
 
 
+def _canonical_digest(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _verification_runtime_toolchain(
+    profile: VerificationProfile | None, candidate_root: Path
+) -> dict[str, object]:
+    path_value = os.environ.get("PATH") or os.defpath
+    executables: list[dict[str, str]] = []
+    commands = profile.commands if isinstance(profile, VerificationProfile) else ()
+    for command in commands:
+        argv0 = command.argv[0] if isinstance(command, VerificationCommand) and command.argv else ""
+        workdir = (
+            _verification_workdir(candidate_root, command.workdir)
+            if isinstance(command, VerificationCommand)
+            else None
+        )
+        executable = (
+            _verification_executable(
+                argv0,
+                candidate_root=candidate_root,
+                workdir=workdir,
+                path_value=path_value,
+            )
+            if workdir is not None
+            else None
+        )
+        if executable is None:
+            executables.append(
+                {"path": f"missing:{argv0}", "sha256": f"missing:{argv0}"}
+            )
+            continue
+        try:
+            executable_digest = hashlib.sha256(Path(executable).read_bytes()).hexdigest()
+        except OSError:
+            executable_digest = f"missing:{argv0}"
+        executables.append(
+            {
+                "path": str(Path(executable).resolve(strict=False)),
+                "sha256": executable_digest,
+            }
+        )
+    return {
+        "python_implementation": platform.python_implementation(),
+        "python_version": platform.python_version(),
+        "platform_system": platform.system(),
+        "platform_release": platform.release(),
+        "platform_machine": platform.machine(),
+        "executables": executables,
+    }
+def build_verification_receipt_key(
+    profile: VerificationProfile | None,
+    candidate_root: Path,
+    *,
+    candidate_sha: str,
+    contract_digest: str,
+    generated_policy_digest: str,
+    gate_kind: str,
+    profile_name: str,
+) -> VerificationReceiptKey:
+    """Build the canonical meaning key for one configured verification run."""
+
+    commands: list[dict[str, object]] = []
+    if isinstance(profile, VerificationProfile):
+        for command in profile.commands:
+            if isinstance(command, VerificationCommand):
+                commands.append(
+                    {
+                        "argv": list(command.argv),
+                        "workdir": command.workdir.as_posix(),
+                        "timeout_seconds": int(command.timeout_seconds),
+                    }
+                )
+            else:
+                commands.append({"invalid": str(command)})
+    command_set_digest = _canonical_digest(commands)
+    runtime_toolchain_digest = _canonical_digest(
+        _verification_runtime_toolchain(
+            profile, Path(candidate_root).expanduser().resolve(strict=False)
+        )
+    )
+    executor_policy = f"hermes_repository_verifier:v1:{profile_name}"
+    fields = {
+        "candidate_sha": candidate_sha,
+        "contract_digest": contract_digest,
+        "command_set_digest": command_set_digest,
+        "runtime_toolchain_digest": runtime_toolchain_digest,
+        "generated_policy_digest": generated_policy_digest,
+        "gate_kind": gate_kind,
+        "executor_policy": executor_policy,
+    }
+    return VerificationReceiptKey(**fields, digest=_canonical_digest(fields))
+def _verification_result_envelope(
+    result: VerificationResult, *, subject_id: str | None = None
+) -> dict[str, object]:
+    return {
+        "status": result.status,
+        "source_sha": result.source_sha,
+        "candidate_sha": result.candidate_sha,
+        "contract_digest": result.contract_digest,
+        "profile": result.profile,
+        "subject_id": result.subject_id if subject_id is None else subject_id,
+        "error": result.error,
+        "steps": [
+            {
+                "argv": list(step.argv),
+                "workdir": step.workdir.as_posix(),
+                "status": step.status,
+                "returncode": step.returncode,
+                "duration_seconds": step.duration_seconds,
+                "stdout_tail": step.stdout_tail,
+                "stderr_tail": step.stderr_tail,
+                "error": step.error,
+            }
+            for step in result.steps
+        ],
+    }
+def build_verification_receipt(
+    result: VerificationResult, *, subject_id: str, created_at: int
+) -> VerificationReceipt:
+    if result.status != "passed":
+        raise ValueError("verification receipt requires a passed result")
+    if not isinstance(result.key, VerificationReceiptKey):
+        raise ValueError("verification result key is missing")
+    return VerificationReceipt(
+        key=result.key,
+        result_digest=_canonical_digest(
+            _verification_result_envelope(result, subject_id=subject_id)
+        ),
+        created_at=int(created_at),
+    )
+def verification_receipt_from_payload(
+    payload: Mapping[str, object],
+) -> VerificationReceipt | None:
+    try:
+        if not isinstance(payload, Mapping) or payload.get("status") != "passed":
+            return None
+        if set(payload) != {
+            "scope", "subject_id", "status", "source_sha", "candidate_sha",
+            "contract_digest", "profile", "error", "rework_eligible", "steps", "receipt"
+        }:
+            return None
+        receipt_payload = payload.get("receipt")
+        key_payload = receipt_payload.get("key") if isinstance(receipt_payload, Mapping) else None
+        if not isinstance(receipt_payload, Mapping) or not isinstance(key_payload, Mapping):
+            return None
+        if set(receipt_payload) != {"key", "result_digest", "created_at"} or set(key_payload) != {
+            "candidate_sha", "contract_digest", "command_set_digest",
+            "runtime_toolchain_digest", "generated_policy_digest", "gate_kind",
+            "executor_policy", "digest"
+        }:
+            return None
+        if (not isinstance(payload["scope"], str)
+            or not isinstance(payload["subject_id"], str)
+            or not isinstance(payload["source_sha"], str)
+            or not isinstance(payload["candidate_sha"], str)
+            or not isinstance(payload["contract_digest"], str)
+            or not isinstance(payload["profile"], str)
+            or (payload["error"] is not None and not isinstance(payload["error"], str))
+            or not isinstance(payload["rework_eligible"], bool)):
+            return None
+        fields = {
+            name: key_payload.get(name)
+            for name in (
+                "candidate_sha",
+                "contract_digest",
+                "command_set_digest",
+                "runtime_toolchain_digest",
+                "generated_policy_digest",
+                "gate_kind",
+                "executor_policy",
+            )
+        }
+        if (
+            not isinstance(fields["candidate_sha"], str)
+            or not FULL_SHA.fullmatch(fields["candidate_sha"])
+            or any(
+                not isinstance(fields[name], str)
+                or not FULL_DIGEST.fullmatch(fields[name])
+                for name in (
+                    "contract_digest",
+                    "command_set_digest",
+                    "runtime_toolchain_digest",
+                    "generated_policy_digest",
+                )
+            )
+            or not isinstance(fields["gate_kind"], str)
+            or not isinstance(fields["executor_policy"], str)
+            or not isinstance(key_payload.get("digest"), str)
+            or key_payload["digest"] != _canonical_digest(fields)
+            or fields["candidate_sha"] != payload.get("candidate_sha")
+            or fields["contract_digest"] != payload.get("contract_digest")
+            or fields["gate_kind"] != payload.get("scope")
+            or fields["executor_policy"]
+            != f"hermes_repository_verifier:v1:{payload.get('profile')}"
+        ):
+            return None
+        steps = payload.get("steps")
+        if not isinstance(steps, list):
+            return None
+        step_keys = {"argv", "workdir", "status", "returncode", "duration_seconds", "stdout_tail", "stderr_tail", "error"}
+        if any(not isinstance(step, Mapping)
+            or set(step) != step_keys
+            or not isinstance(step["argv"], list)
+            or not all(isinstance(arg, str) for arg in step["argv"])
+            or not isinstance(step["workdir"], str)
+            or not isinstance(step["status"], str)
+            or step["status"] not in {"passed", "failed", "configuration_error", "infrastructure_error"}
+            or (step["returncode"] is not None and (isinstance(step["returncode"], bool) or not isinstance(step["returncode"], int)))
+            or isinstance(step["duration_seconds"], bool)
+            or not isinstance(step["duration_seconds"], (int, float))
+            or not isinstance(step["stdout_tail"], str)
+            or not isinstance(step["stderr_tail"], str)
+            or (step["error"] is not None and not isinstance(step["error"], str))
+            for step in steps):
+            return None
+        result = VerificationResult(
+            status="passed",
+            source_sha=payload["source_sha"],
+            candidate_sha=payload["candidate_sha"],
+            contract_digest=payload["contract_digest"],
+            profile=payload["profile"],
+            steps=tuple(
+                VerificationStepResult(
+                    argv=tuple(step["argv"]),
+                    workdir=PurePosixPath(step["workdir"]),
+                    status=step["status"],
+                    returncode=step["returncode"],
+                    duration_seconds=step["duration_seconds"],
+                    stdout_tail=step["stdout_tail"],
+                    stderr_tail=step["stderr_tail"],
+                    error=step["error"],
+                )
+                for step in steps
+                if isinstance(step, Mapping)
+            ),
+            key=VerificationReceiptKey(**fields, digest=key_payload["digest"]),
+            error=payload["error"],
+        )
+        result_digest = receipt_payload.get("result_digest")
+        created_at = receipt_payload.get("created_at")
+        if (
+            not isinstance(result_digest, str)
+            or not FULL_DIGEST.fullmatch(result_digest)
+            or isinstance(created_at, bool)
+            or not isinstance(created_at, int)
+            or result_digest != _canonical_digest(
+                _verification_result_envelope(result, subject_id=payload["subject_id"])
+            )
+        ):
+            return None
+        return VerificationReceipt(result.key, result_digest, created_at)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def run_verification(
     profile: VerificationProfile | None,
     candidate_path: Path,
@@ -225,6 +510,7 @@ def run_verification(
     scope: str,
     subject_id: str,
     profile_name: str | None = None,
+    generated_policy_digest: str = "",
 ) -> VerificationResult:
     """Run an operator-configured profile in a bounded isolated candidate.
 
@@ -235,9 +521,17 @@ def run_verification(
     and process/timeout errors stay distinct.
     """
 
-    del subject_id  # identity is persisted by the caller alongside the result
     result_profile = profile_name or scope
     candidate_root = Path(candidate_path).expanduser().resolve(strict=False)
+    key = build_verification_receipt_key(
+        profile,
+        candidate_root,
+        candidate_sha=candidate_sha,
+        contract_digest=contract_digest,
+        generated_policy_digest=generated_policy_digest,
+        gate_kind=scope,
+        profile_name=result_profile,
+    )
     if profile is None:
         return _verification_result(
             status="configuration_error",
@@ -245,6 +539,7 @@ def run_verification(
             candidate_sha=candidate_sha,
             contract_digest=contract_digest,
             profile=result_profile,
+            key=key,
             steps=[],
             error="missing_profile",
         )
@@ -255,6 +550,7 @@ def run_verification(
             candidate_sha=candidate_sha,
             contract_digest=contract_digest,
             profile=result_profile,
+            key=key,
             steps=[],
             error="invalid_profile_or_candidate",
         )
@@ -265,6 +561,7 @@ def run_verification(
             candidate_sha=candidate_sha,
             contract_digest=contract_digest,
             profile=result_profile,
+            key=key,
             steps=[],
             error="empty_profile",
         )
@@ -283,6 +580,7 @@ def run_verification(
                 candidate_sha=candidate_sha,
                 contract_digest=contract_digest,
                 profile=result_profile,
+                key=key,
                 steps=steps,
                 error="invalid_command",
             )
@@ -294,6 +592,7 @@ def run_verification(
                 candidate_sha=candidate_sha,
                 contract_digest=contract_digest,
                 profile=result_profile,
+                key=key,
                 steps=steps,
                 error="invalid_workdir",
             )
@@ -310,6 +609,7 @@ def run_verification(
                 candidate_sha=candidate_sha,
                 contract_digest=contract_digest,
                 profile=result_profile,
+                key=key,
                 steps=steps,
                 error=f"missing_executable:{command.argv[0]}",
             )
@@ -345,6 +645,7 @@ def run_verification(
                 candidate_sha=candidate_sha,
                 contract_digest=contract_digest,
                 profile=result_profile,
+                key=key,
                 steps=steps,
                 error="timeout",
             )
@@ -365,6 +666,7 @@ def run_verification(
                 candidate_sha=candidate_sha,
                 contract_digest=contract_digest,
                 profile=result_profile,
+                key=key,
                 steps=steps,
                 error="process_error",
             )
@@ -389,6 +691,7 @@ def run_verification(
                 candidate_sha=candidate_sha,
                 contract_digest=contract_digest,
                 profile=result_profile,
+                key=key,
                 steps=steps,
                 error="nonzero_exit",
             )
@@ -399,6 +702,7 @@ def run_verification(
         candidate_sha=candidate_sha,
         contract_digest=contract_digest,
         profile=result_profile,
+        key=key,
         steps=steps,
     )
 
@@ -410,6 +714,7 @@ class RepositoryContract:
     target_branch: str
     verification: Mapping[str, VerificationProfile]
     generated_paths: tuple[PurePosixPath, ...]
+    generated_policy_digest: str
     ci_workflows: tuple[str, ...]
     digest: str
 
@@ -981,6 +1286,9 @@ def load_repository_contract(
             ensure_ascii=False,
         ).encode("utf-8")
     ).hexdigest()
+    generated_policy_digest = _canonical_digest(
+        [path.as_posix() for path in normalized_generated_paths]
+    )
 
     return RepositoryContract(
         repo_root=root,
@@ -988,6 +1296,7 @@ def load_repository_contract(
         target_branch=target_branch,
         verification=MappingProxyType(verification),
         generated_paths=normalized_generated_paths,
+        generated_policy_digest=generated_policy_digest,
         ci_workflows=ci_workflows,
         digest=digest,
     )

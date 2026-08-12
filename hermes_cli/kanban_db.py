@@ -100,12 +100,14 @@ from hermes_cli.kanban_repository import (
     RefreshResult,
     VerificationProfile,
     VerificationResult,
+    build_verification_receipt,
     inspect_evidence_workspace,
     load_repository_contract,
     refresh_story_branch,
     resolve_commit,
     restore_generated_paths,
     run_verification,
+    verification_receipt_from_payload,
 )
 from hermes_cli.kanban_product_outcomes import (
     ApprovedCandidate,
@@ -13644,8 +13646,7 @@ def _verification_result_payload(
     result: VerificationResult, *, scope: str, subject_id: str
 ) -> dict[str, Any]:
     """Serialize bounded repository verification evidence for a task event."""
-
-    return {
+    payload: dict[str, Any] = {
         "scope": scope,
         "subject_id": subject_id,
         "status": result.status,
@@ -13669,6 +13670,29 @@ def _verification_result_payload(
             for step in result.steps
         ],
     }
+    if result.status == "passed":
+        try:
+            receipt = build_verification_receipt(
+                result, subject_id=subject_id, created_at=int(time.time())
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("passed verification result cannot produce receipt") from exc
+        else:
+            payload["receipt"] = {
+                "key": {
+                    "candidate_sha": receipt.key.candidate_sha,
+                    "contract_digest": receipt.key.contract_digest,
+                    "command_set_digest": receipt.key.command_set_digest,
+                    "runtime_toolchain_digest": receipt.key.runtime_toolchain_digest,
+                    "generated_policy_digest": receipt.key.generated_policy_digest,
+                    "gate_kind": receipt.key.gate_kind,
+                    "executor_policy": receipt.key.executor_policy,
+                    "digest": receipt.key.digest,
+                },
+                "result_digest": receipt.result_digest,
+                "created_at": receipt.created_at,
+            }
+    return payload
 
 
 def _verification_needs_attention(result: Optional[VerificationResult]) -> bool:
@@ -13741,6 +13765,7 @@ def _build_verified_merge_candidate(
     verification_scope: str = "story_integration",
     verification_subject_id: str = "",
     verification_profile_name: Optional[str] = None,
+    verification_generated_policy_digest: str = "",
 ) -> IntegrationCandidate:
     repo_root = repo_root.resolve()
     target_worktree = _checked_out_branch_worktree(repo_root, target_branch)
@@ -13822,6 +13847,7 @@ def _build_verified_merge_candidate(
             scope=verification_scope,
             subject_id=verification_subject_id,
             profile_name=verification_profile_name,
+            generated_policy_digest=verification_generated_policy_digest,
         )
         verification_result = configured_result
         verified = configured_result.status == "passed"
@@ -14183,6 +14209,9 @@ def merge_epic_to_main(
             verification_scope="epic_release",
             verification_subject_id=epic_id,
             verification_profile_name="epic_release",
+            verification_generated_policy_digest=(
+                contract.generated_policy_digest if contract is not None else ""
+            ),
         )
         if before_apply_fn is not None and not before_apply_fn():
             return "ownership_conflict"
@@ -14565,6 +14594,9 @@ def integrate_story_to_epic(
                         verification_scope="story_integration",
                         verification_subject_id=story_id,
                         verification_profile_name="story_integration",
+                        verification_generated_policy_digest=(
+                            contract.generated_policy_digest if contract is not None else ""
+                        ),
                     )
                 finally:
                     if reviewed_source_ref is not None:
@@ -14875,6 +14907,9 @@ def _merge_standalone_story_to_main(
             verification_scope="story_integration",
             verification_subject_id=story_id,
             verification_profile_name="story_integration",
+            verification_generated_policy_digest=(
+                contract.generated_policy_digest if contract is not None else ""
+            ),
         )
         if before_apply_fn is not None and not before_apply_fn():
             return "ownership_conflict"

@@ -15,12 +15,15 @@ from hermes_cli.kanban_repository import (
     RefreshRequest,
     VerificationCommand,
     VerificationProfile,
+    build_verification_receipt,
+    build_verification_receipt_key,
     inspect_evidence_workspace,
     load_repository_contract,
     refresh_story_branch,
     resolve_commit,
     restore_generated_paths,
     run_verification,
+    verification_receipt_from_payload,
 )
 
 
@@ -665,6 +668,118 @@ def test_run_verification_missing_profile_is_configuration_error(tmp_path: Path)
 
     assert result.status == "configuration_error"
     assert result.steps == ()
+
+
+def test_verification_receipt_key_changes_for_each_meaningful_input(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+):
+    runner = repository / "scripts" / "run_tests.sh"
+    runner.chmod(0o755)
+    profile = VerificationProfile(
+        (VerificationCommand(("scripts/run_tests.sh",), PurePosixPath("."), 60),)
+    )
+    values = {
+        "candidate_sha": "a" * 40,
+        "contract_digest": "b" * 64,
+        "generated_policy_digest": "c" * 64,
+        "gate_kind": "story_integration",
+        "profile_name": "story_integration",
+    }
+
+    def make_key(current_profile=profile, **updates):
+        return build_verification_receipt_key(
+            current_profile, repository, **{**values, **updates}
+        )
+
+    base = make_key()
+    assert len(base.digest) == 64
+    assert base.executor_policy == "hermes_repository_verifier:v1:story_integration"
+
+    changed = [
+        make_key(candidate_sha="d" * 40),
+        make_key(
+            current_profile=VerificationProfile(
+                (VerificationCommand(("scripts/run_tests.sh", "--changed"), PurePosixPath("."), 60),)
+            )
+        ),
+        make_key(
+            current_profile=VerificationProfile(
+                (
+                    VerificationCommand(("scripts/run_tests.sh",), PurePosixPath("."), 60),
+                    VerificationCommand(("scripts/run_tests.sh", "--second"), PurePosixPath("."), 60),
+                )
+            )
+        ),
+        make_key(
+            current_profile=VerificationProfile(
+                (
+                    VerificationCommand(("scripts/run_tests.sh", "--second"), PurePosixPath("."), 60),
+                    VerificationCommand(("scripts/run_tests.sh",), PurePosixPath("."), 60),
+                )
+            )
+        ),
+        make_key(
+            current_profile=VerificationProfile(
+                (VerificationCommand(("run_tests.sh",), PurePosixPath("scripts"), 60),)
+            )
+        ),
+        make_key(
+            current_profile=VerificationProfile(
+                (VerificationCommand(("scripts/run_tests.sh",), PurePosixPath("."), 61),)
+            )
+        ),
+        make_key(contract_digest="d" * 64),
+        make_key(generated_policy_digest="d" * 64),
+        make_key(gate_kind="epic_release"),
+        make_key(profile_name="epic_release"),
+    ]
+    assert all(key.digest != base.digest for key in changed)
+
+    runner.write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
+    assert make_key().digest != base.digest
+
+    monkeypatch.setattr(repository_module.platform, "system", lambda: "ChangedOS")
+    assert make_key().digest != base.digest
+
+
+def test_verification_receipt_key_is_stable_for_equivalent_profiles(repository: Path):
+    first = VerificationProfile(
+        (VerificationCommand(("scripts/run_tests.sh",), PurePosixPath("."), 60),)
+    )
+    second = VerificationProfile(
+        (VerificationCommand(("scripts/run_tests.sh",), PurePosixPath("."), 60),)
+    )
+    values = {
+        "candidate_sha": "a" * 40,
+        "contract_digest": "b" * 64,
+        "generated_policy_digest": "c" * 64,
+        "gate_kind": "story_integration",
+        "profile_name": "story_integration",
+    }
+
+    assert build_verification_receipt_key(first, repository, **values) == build_verification_receipt_key(
+        second, repository, **values
+    )
+
+
+def test_build_verification_receipt_rejects_nonpassing_result(tmp_path: Path):
+    result = run_verification(
+        None,
+        tmp_path,
+        source_sha="a" * 40,
+        candidate_sha="b" * 40,
+        contract_digest="c" * 64,
+        scope="story_integration",
+        subject_id="story-1",
+        generated_policy_digest="d" * 64,
+    )
+
+    with pytest.raises(ValueError, match="passed"):
+        build_verification_receipt(result, subject_id="story-1", created_at=123)
+
+
+def test_verification_receipt_from_payload_rejects_malformed_receipt():
+    assert verification_receipt_from_payload({}) is None
 
 
 def test_run_verification_missing_executable_is_configuration_error(tmp_path: Path):
