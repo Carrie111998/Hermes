@@ -1457,6 +1457,13 @@ def _resolve_hermes_home() -> Path:
 # User-managed env files should override stale shell exports on restart.
 from dotenv import load_dotenv  # noqa: F401  # backward-compat for tests that monkeypatch this symbol
 from hermes_cli.env_loader import load_hermes_dotenv
+# Import-scoped and vestigial: nothing in this module READS ``_env_path``, so it
+# cannot leak a stale home. The name is kept because seven tests
+# (test_discord_channel_prompts, test_fast_command, test_reasoning_command)
+# ``monkeypatch.setattr`` it, and monkeypatch raises when the attribute is
+# absent. Do NOT introduce a runtime read of it — that would make it a second
+# import-time snapshot, which is the whole defect this seam removes.
+_env_path = _resolve_hermes_home() / '.env'
 load_hermes_dotenv(hermes_home=_resolve_hermes_home(), project_env=Path(__file__).resolve().parents[1] / '.env')
 
 
