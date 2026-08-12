@@ -21,7 +21,6 @@ MOVED_NAMES = (
     "_ensure_whatsapp_bridge_dependencies",
     "_spawn_whatsapp_pairing_process",
     "_watch_whatsapp_pairing",
-    "_write_platform_enabled",
     "apply_whatsapp_onboarding",
     "cancel_whatsapp_onboarding",
     "get_whatsapp_onboarding_status",
