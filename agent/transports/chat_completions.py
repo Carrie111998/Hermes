@@ -396,6 +396,9 @@ class ChatCompletionsTransport(ProviderTransport):
             # Temperature
             fixed_temperature: Any — from _fixed_temperature_for_model()
             omit_temperature: bool
+            # top_p (used on BOTH profile and legacy paths)
+            fixed_top_p: float | None — from _fixed_top_p_for_model(); never
+                clobbers an existing/overridden top_p
             # Reasoning
             supports_reasoning: bool
             github_reasoning_extra: dict | None
@@ -580,6 +583,14 @@ class ChatCompletionsTransport(ProviderTransport):
         if extra_body:
             api_kwargs["extra_body"] = extra_body
 
+        # top_p: per-model contract override (Ollama-cloud Kimi requires
+        # exactly 0.95 — omitting the param 400s on the server-side default).
+        # Never clobbers an existing top_p, and request_overrides below can
+        # still replace it — an intentional override always wins.
+        _fixed_top_p = params.get("fixed_top_p")
+        if _fixed_top_p is not None and "top_p" not in api_kwargs:
+            api_kwargs["top_p"] = _fixed_top_p
+
         # Request overrides last (service_tier etc.)
         overrides = params.get("request_overrides")
         if overrides:
@@ -633,6 +644,14 @@ class ChatCompletionsTransport(ProviderTransport):
             temp = params.get("temperature")
             if temp is not None:
                 api_kwargs["temperature"] = temp
+
+        # top_p: per-model contract override (Ollama-cloud Kimi requires
+        # exactly 0.95 — omitting the param 400s on the server-side default).
+        # request_overrides applied below can still replace it — an
+        # intentional caller override always wins.
+        _fixed_top_p = params.get("fixed_top_p")
+        if _fixed_top_p is not None and "top_p" not in api_kwargs:
+            api_kwargs["top_p"] = _fixed_top_p
 
         # Timeout
         timeout = params.get("timeout")
