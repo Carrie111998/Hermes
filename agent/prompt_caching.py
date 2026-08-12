@@ -120,6 +120,29 @@ def _build_marker(ttl: str) -> Dict[str, str]:
     return marker
 
 
+# Alibaba/Qwen document explicit context-cache TTLs of five minutes
+# (renewed on hit); an explicit '1h' marker is ignored/rejected on that wire,
+# so a config requesting 1h would silently get zero cache hits. Clamp to the
+# supported TTL rather than emitting a marker the provider ignores. (#84733)
+_QWEN_CACHE_SHORT_TTL_PREFIXES = ("qwen",)
+
+
+def effective_cache_ttl(cache_ttl: str, *, model: str = "") -> str:
+    """Resolve the TTL actually supported for the resolved model/route.
+
+    Returns ``cache_ttl`` unchanged except for the documented Qwen clamp:
+    ``1h`` → ``5m`` for Qwen-family models. The capability comes from the
+    resolved model (and, in future, the route matrix), never from a bare
+    config value.
+    """
+    if cache_ttl != "1h":
+        return cache_ttl
+    model_lower = (model or "").strip().lower()
+    if model_lower.startswith(_QWEN_CACHE_SHORT_TTL_PREFIXES):
+        return "5m"
+    return cache_ttl
+
+
 def _apply_system_cache_markers(
     message: dict,
     cache_marker: dict,
@@ -343,11 +366,13 @@ def build_prompt_cache_plan(
     native_anthropic: bool = False,
     static_system_prefix: str | None = None,
     direct_native_tool_cache: bool = False,
+    model: str = "",
 ) -> PromptCachePlan:
     """Build isolated cache sections for one resolved request destination."""
     messages = copy.deepcopy(api_messages or [])
     strip_anthropic_cache_control(messages)
     planned_tools = strip_anthropic_tool_cache_control(tools)
+    cache_ttl = effective_cache_ttl(cache_ttl, model=model)
 
     if not direct_native_tool_cache or not planned_tools:
         planned_messages = apply_anthropic_cache_control(
@@ -389,8 +414,12 @@ def apply_anthropic_cache_control(
     cache_ttl: str = "5m",
     native_anthropic: bool = False,
     static_system_prefix: str | None = None,
+    model: str = "",
 ) -> List[Dict[str, Any]]:
     """Apply Anthropic cache-control markers to API messages.
+
+    ``model`` participates in the effective-TTL resolution
+    (:func:`effective_cache_ttl`), e.g. the Qwen 1h→5m clamp.
 
     When ``static_system_prefix`` exactly matches the beginning of a string
     system prompt, it receives an early marker and the full system prompt gets
@@ -405,6 +434,7 @@ def apply_anthropic_cache_control(
         return api_messages
 
     messages = list(api_messages)
+    cache_ttl = effective_cache_ttl(cache_ttl, model=model)
     marker = _build_marker(cache_ttl)
 
     breakpoints_used = 0

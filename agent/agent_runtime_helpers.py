@@ -2062,6 +2062,7 @@ def plan_cache_sections_for_destination(
             api_mode=api_mode,
             model=model,
         ),
+        model=model,
     )
     return plan.messages, plan.tools
 
