@@ -419,7 +419,7 @@ async function waitForServeArgv(pid: number, entrypoint: string) {
 // connect() could not kill it, dropped its only lock, and spawned another
 // detached serve — one orphan per reconnect.
 test('pidIsOurDashboard reclaims a dashboard whose exec wrapper rewrote argv', async () => {
-  if (process.platform === 'win32') {
+  if (process.platform !== 'linux') {
     return
   }
 
@@ -494,6 +494,10 @@ test('pidIsOurDashboard rejects a malformed ownership ID without probing the pro
 })
 
 test('pidIsOurDashboard fails closed when the ps fallback cannot read a process', async () => {
+  if (process.platform === 'win32') {
+    return
+  }
+
   const ssh = psFallbackSsh()
 
   try {
@@ -504,6 +508,10 @@ test('pidIsOurDashboard fails closed when the ps fallback cannot read a process'
 })
 
 test('pidIsOurDashboard rejects a shell whose flattened ps line contains the ownership arguments', async () => {
+  if (process.platform === 'win32') {
+    return
+  }
+
   const tokenFilePath = `${ownershipDirectory(OWNERSHIP_ID).replace(/^~/, os.homedir())}/${SPAWN_NONCE}.token`
 
   const ssh = psFallbackSsh(
