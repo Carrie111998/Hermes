@@ -152,6 +152,36 @@ DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+# How much of a tool's output rides the chat-completions SSE channel. The
+# result shares that stream with the reply text, so an unbounded one would
+# stall the prose queued behind it. Clients needing the whole thing still
+# read it from the stored transcript.
+TOOL_RESULT_STREAM_CHARS = 4_000
+# Cap for the one-line summary a client shows on the collapsed step.
+TOOL_LABEL_STREAM_CHARS = 120
+# Queue markers the chat-completions SSE writer turns into named events
+# rather than assistant text. Keyed by the marker the producer enqueues.
+_CUSTOM_SSE_EVENTS = {
+    "__tool_progress__": "hermes.tool.progress",
+    "__reasoning__": "hermes.reasoning.delta",
+    "__approval__": "hermes.approval.request",
+}
+
+
+def _approval_timeout_seconds() -> int:
+    """How long a pending approval waits before it is treated as a refusal.
+
+    Sent with the request so a client can show the deadline it is actually
+    working against rather than inventing one — silence here is a denial, not
+    a pause, so a UI that lets it lapse unannounced misleads the user.
+    """
+    try:
+        from tools.approval import _get_approval_config
+
+        raw = (_get_approval_config() or {}).get("timeout", 60)
+        return max(1, int(raw))
+    except Exception:
+        return 60
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
@@ -2091,6 +2121,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
+            ("POST", "/v1/approvals/{session_key}/decision", self._handle_session_approval),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
         ]
         if _CRON_AVAILABLE:
@@ -3170,6 +3201,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
+                "approval_decision": {"method": "POST", "path": "/v1/approvals/{session_key}/decision"},
             },
         })
 
@@ -4223,29 +4255,128 @@ class APIServerAdapter(BasePlatformAdapter):
                 }))
 
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
-                """Emit the matching ``status: completed`` event.
+                """Emit the matching ``completed``/``failed`` lifecycle event.
 
                 Dropped if the start was filtered (internal tool, missing
                 id, or never seen) so clients never get an orphaned
                 ``completed`` they can't correlate to a prior ``running``.
+
+                Carries the tool's output and its success/failure verdict.
+                Without them a client can only turn its spinner into an
+                unconditional green check: the output arrives when the
+                turn's transcript is re-read — minutes later, at the end of
+                the turn — and until then a tool that actually failed is
+                indistinguishable from one that succeeded.
+
+                Failure is derived from the result here rather than taken
+                from ``tool_progress_callback``. That callback does carry an
+                ``is_error`` flag, but no ``tool_call_id`` to correlate it
+                by, and wiring it for tool events would duplicate every chip
+                on this channel (see the callback wiring below).
                 """
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
+                from agent.display import _detect_tool_failure
+                from agent.tool_dispatch_helpers import _multimodal_text_summary
+                # A projection for display only: never let a malformed result
+                # take down the turn that produced it.
+                try:
+                    result_text = _multimodal_text_summary(function_result) or ""
+                except Exception:
+                    result_text = ""
+                try:
+                    is_error, failure_suffix = _detect_tool_failure(
+                        function_name, function_result
+                    )
+                except Exception:
+                    is_error, failure_suffix = False, ""
+                # On failure the detector's own tag (``[exit 1]``, a trimmed
+                # error message) is the most informative one line available.
+                # On success the opening line of the output is.
+                if is_error and failure_suffix:
+                    label = failure_suffix.strip().strip("[]")
+                else:
+                    label = next(
+                        (ln for ln in result_text.splitlines() if ln.strip()), ""
+                    ).strip()
                 _stream_q.put_threadsafe(("__tool_progress__", {
                     "tool": function_name,
                     "toolCallId": tool_call_id,
-                    "status": "completed",
+                    "status": "failed" if is_error else "completed",
+                    "label": label[:TOOL_LABEL_STREAM_CHARS],
+                    "result": result_text[:TOOL_RESULT_STREAM_CHARS],
+                    "resultTruncated": len(result_text) > TOOL_RESULT_STREAM_CHARS,
                 }))
+
+            def _on_agent_progress(event_type, tool_name=None, preview=None, args=None, **kwargs):
+                """Forward reasoning, and nothing else.
+
+                ``run_agent`` fires this callback side-by-side with the
+                structured tool callbacks, so anything tool-shaped forwarded
+                here would double every chip on the wire — which is why this
+                callback used to be left unwired entirely. Reasoning is the
+                one thing with no structured equivalent: ``_on_tool_start``
+                filters ``_``-prefixed internal tools, and ``_thinking`` is
+                exactly such a tool, so this is the only channel on which a
+                reasoning trace can arrive while the turn is still running
+                rather than after the transcript is re-read.
+                """
+                if event_type != "reasoning.available":
+                    return
+                text = preview or ""
+                if not text:
+                    return
+                _stream_q.put_threadsafe(("__reasoning__", {"delta": text}))
+
+            # The key the approval is registered under, and the one
+            # /v1/approvals/{key}/decision resolves against. Falls back to the
+            # completion id so a turn with neither a session key nor a session
+            # id still gets a unique one rather than colliding with every other
+            # anonymous turn on the shared "" key.
+            approval_session_key = (
+                gateway_session_key or session_id or f"chatcmpl:{completion_id}"
+            )
+
+            def _on_approval_request(approval_data):
+                """Put a pending approval on the stream for the client to answer.
+
+                Runs on the agent thread, which is blocked inside the tool
+                waiting for the decision — so this only hands the request to
+                the SSE writer and returns. The writer is still pumping (its
+                queue wait times out every 0.5s and keeps sending keepalives),
+                so the frame goes out while the tool is parked.
+                """
+                payload = dict(approval_data or {})
+                # Same egress rule as the /v1/runs notifier: the raw command
+                # can carry credentials, and this one is rendered straight
+                # into a browser.
+                if "command" in payload:
+                    from gateway.run import _redact_approval_command
+
+                    payload["command"] = _redact_approval_command(
+                        payload.get("command")
+                    )
+                payload.update({
+                    "sessionKey": approval_session_key,
+                    "choices": _approval_event_choices(
+                        smart_denied=bool(payload.get("smart_denied")),
+                        allow_permanent=payload.get("allow_permanent") is not False,
+                    ),
+                    "timeoutSeconds": _approval_timeout_seconds(),
+                })
+                _stream_q.put_threadsafe(("__approval__", payload))
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
             #
-            # ``tool_progress_callback`` is intentionally not wired here:
-            # it would duplicate every emit because ``run_agent`` fires it
+            # ``tool_progress_callback`` is wired only for reasoning — see
+            # ``_on_agent_progress``. Forwarding its tool events too would
+            # duplicate every emit, because ``run_agent`` fires it
             # side-by-side with ``tool_start_callback``/``tool_complete_callback``.
             # The structured callbacks are strictly richer (they carry
-            # the tool_call id), so they own the chat-completions SSE channel.
+            # the tool_call id), so they still own the tool lifecycle on the
+            # chat-completions SSE channel.
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
@@ -4253,8 +4384,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
+                tool_progress_callback=_on_agent_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
+                approval_notify_callback=_on_approval_request,
+                approval_session_key=approval_session_key,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
@@ -4432,14 +4566,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 """Write a single queue item to the SSE stream.
 
                 Plain strings are sent as normal ``delta.content`` chunks.
-                Tagged tuples ``("__tool_progress__", payload)`` are sent
-                as a custom ``event: hermes.tool.progress`` SSE event so
-                frontends can display them without storing the markers in
-                conversation history.  See #6972 for the original event,
-                #16588 for the ``toolCallId``/``status`` lifecycle fields.
+                Tagged tuples ``(marker, payload)`` are sent as the custom
+                SSE event that marker names, so frontends can display them
+                without storing the markers in conversation history.  See
+                #6972 for the original tool event, #16588 for the
+                ``toolCallId``/``status`` lifecycle fields.
+
+                Both custom events are additive: a client that only knows
+                about ``delta.content`` ignores them, exactly as before.
                 """
-                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
-                    await response.write(_sse_frame(item[1], event="hermes.tool.progress"))
+                if isinstance(item, tuple) and len(item) == 2 and item[0] in _CUSTOM_SSE_EVENTS:
+                    await response.write(
+                        _sse_frame(item[1], event=_CUSTOM_SSE_EVENTS[item[0]])
+                    )
                 else:
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
@@ -6145,6 +6284,8 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        approval_notify_callback=None,
+        approval_session_key: str = "",
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6170,6 +6311,21 @@ class APIServerAdapter(BasePlatformAdapter):
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
         callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
         another thread to stop in-progress LLM calls.
+
+        *approval_notify_callback* is how a caller offers the user a way to
+        answer a dangerous-command approval. Without one, ``tools.approval``
+        finds no notifier for the session, files the request into an
+        in-process dict nothing reads, and returns ``pending_approval``
+        immediately — which the agent sees as a flat refusal. Every
+        approval-gated tool call therefore fails on any route that does not
+        pass this. The callback runs on the agent thread and must not block;
+        it is expected to hand the request to whatever transport can reach
+        the user (for the SSE routes, the stream itself).
+
+        *approval_session_key* is the key that callback is registered under,
+        and the one a decision endpoint must resolve against. It is bound
+        explicitly rather than inferred so the registration and the lookup
+        ``tools.approval`` performs cannot drift apart.
         """
         loop = asyncio.get_running_loop()
         # Capture before hopping to the executor — ContextVars do not follow
@@ -6186,6 +6342,21 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
                 )
+                # Contextvars do not follow the executor hop, so the approval
+                # key is bound here, inside the thread that will actually run
+                # the tools — the same reason the profile scope is re-entered
+                # above.
+                approval_token = None
+                if approval_notify_callback is not None and approval_session_key:
+                    from tools.approval import (
+                        register_gateway_notify,
+                        set_current_session_key,
+                    )
+
+                    approval_token = set_current_session_key(approval_session_key)
+                    register_gateway_notify(
+                        approval_session_key, approval_notify_callback
+                    )
                 agent = None
                 try:
                     agent = self._create_agent(
@@ -6353,6 +6524,23 @@ class APIServerAdapter(BasePlatformAdapter):
                         # shutdown.  pop() is a no-op when _create_agent
                         # succeeded but the turn never reached registration.
                         self._shutdown_interruptible_agents.pop(id(agent), None)
+                    # Unregistering also releases any thread still blocked on
+                    # an approval nobody is going to answer, so a turn that
+                    # crashed mid-prompt cannot leave one parked for the whole
+                    # approval timeout.
+                    if approval_token is not None:
+                        from tools.approval import (
+                            reset_current_session_key,
+                            unregister_gateway_notify,
+                        )
+
+                        try:
+                            unregister_gateway_notify(approval_session_key)
+                        finally:
+                            try:
+                                reset_current_session_key(approval_token)
+                            except Exception:
+                                pass
                     clear_session_vars(tokens)
 
         self._activate_admitted_request()
@@ -7036,6 +7224,83 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response({
             "object": "hermes.run.approval_response",
             "run_id": run_id,
+            "choice": choice,
+            "resolved": resolved,
+        })
+
+    async def _handle_session_approval(self, request: "web.Request") -> "web.Response":
+        """POST /v1/approvals/{session_key}/decision — answer a pending approval.
+
+        The run-scoped endpoint above only reaches turns started via /v1/runs,
+        which is not the route the SSE chat surfaces use. This one resolves by
+        the session key carried on the ``hermes.approval.request`` event, so
+        any caller streaming a turn can answer the approval that turn is
+        parked on.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_key = request.match_info["session_key"]
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        raw_choice = str(body.get("choice", "")).strip().lower()
+        aliases = {"approve": "once", "approved": "once", "allow": "once"}
+        choice = aliases.get(raw_choice, raw_choice)
+        allowed = {"once", "session", "always", "deny"}
+        if choice not in allowed:
+            return web.json_response(
+                _openai_error(
+                    "Invalid approval choice; expected one of: once, session, always, deny",
+                    code="invalid_approval_choice",
+                ),
+                status=400,
+            )
+
+        reason = body.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            return web.json_response(
+                _openai_error("reason must be a string", code="invalid_approval_reason"),
+                status=400,
+            )
+
+        resolve_all = (
+            _coerce_request_bool(body.get("all"), default=False)
+            or _coerce_request_bool(body.get("resolve_all"), default=False)
+        )
+        try:
+            from tools.approval import resolve_gateway_approval
+
+            resolved = resolve_gateway_approval(
+                session_key,
+                choice,
+                resolve_all=resolve_all,
+                reason=reason or None,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[api_server] approval resolution failed for session %s", session_key
+            )
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        if resolved <= 0:
+            # Nothing waiting: the turn already moved on, most likely because
+            # the approval timed out. Distinguished from a bad key on purpose —
+            # both are 409, but the message says which is worth checking.
+            return web.json_response(
+                _openai_error(
+                    "No approval is pending for this session; it may have timed out.",
+                    code="approval_not_pending",
+                ),
+                status=409,
+            )
+
+        return web.json_response({
+            "object": "hermes.approval_response",
+            "session_key": session_key,
             "choice": choice,
             "resolved": resolved,
         })

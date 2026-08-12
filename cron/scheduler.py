@@ -259,6 +259,10 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
     "qqbot", "yuanbao",
+    # Deliverable since cron learned to reach non-push adapters by starting a
+    # turn (see _deliver_via_wake) rather than by pushing to a socket the HTTP
+    # request/response cycle does not keep open.
+    "api_server",
 })
 
 # Platforms that support a configured cron/notification home target, mapped to
@@ -1653,6 +1657,90 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+# How long to wait for a wake turn to confirm before assuming it is in flight.
+# gateway.wake allows the turn itself up to WAKE_TURN_TIMEOUT_SECONDS (600s),
+# but blocking a scheduler thread that long would stall every other job's
+# delivery. Wait a bounded slice and then apply the same in-flight reasoning the
+# adapter path uses for a slow confirmation (#38922).
+_WAKE_CONFIRM_TIMEOUT_SECONDS = 120
+
+
+def _deliver_via_wake(
+    runtime_adapter,
+    text: str,
+    chat_id,
+    loop,
+    job: dict,
+    platform_name: str,
+    target_errors: list,
+) -> tuple[bool, bool]:
+    """Deliver to a non-push adapter by starting a turn on its session.
+
+    An adapter that cannot be pushed to can still be *woken*: gateway.wake
+    self-posts the text to the in-pod API server as an ordinary session turn,
+    which lands in the same message store the dashboard reads its history from.
+    This is the mechanism the kanban notifier already uses to reach exactly
+    these sessions, so cron is adopting a proven path, not inventing one.
+
+    Returns ``(adapter_ok, timed_out)`` matching the live-adapter branch's
+    contract, so the caller's downstream logic is unchanged.
+    """
+    from agent.async_utils import safe_schedule_threadsafe
+    from gateway.wake import deliver_wake
+
+    # For a non-push adapter the chat_id IS the raw session id — the same
+    # X-Hermes-Session-Id the client sent and state.db keys messages by.
+    session_id = str(chat_id)
+    if loop is None or not getattr(loop, "is_running", lambda: False)():
+        target_errors.append(
+            f"wake delivery to {platform_name}:{chat_id} needs a running "
+            f"gateway loop; none available"
+        )
+        return False, False
+
+    future = safe_schedule_threadsafe(
+        deliver_wake(runtime_adapter, text=text, session_id=session_id),
+        loop,
+    )
+    if future is None:
+        target_errors.append("wake delivery event loop scheduling failed")
+        return False, False
+
+    try:
+        future.result(timeout=_WAKE_CONFIRM_TIMEOUT_SECONDS)
+    except TimeoutError:
+        # Same split as the adapter path: cancel() == False means the turn was
+        # already running and cannot be un-started, so re-sending would produce
+        # a duplicate turn on the user's session. cancel() == True means it
+        # never started, and nothing was delivered.
+        if future.cancel():
+            msg = (
+                f"wake delivery to {platform_name}:{chat_id} timed out before "
+                f"the turn was dispatched"
+            )
+            logger.warning("Job '%s': %s", job["id"], msg)
+            target_errors.append(msg)
+            return False, False
+        logger.warning(
+            "Job '%s': wake turn for %s:%s still running after %ss; already "
+            "dispatched, assuming delivered",
+            job["id"], platform_name, chat_id, _WAKE_CONFIRM_TIMEOUT_SECONDS,
+        )
+        return True, True
+    except Exception as ex:
+        # deliver_wake raises on exhausted retries / HTTP error, deliberately,
+        # so a failure is never mistaken for a delivery.
+        msg = f"wake delivery to {platform_name}:{chat_id} failed: {ex}"
+        logger.warning("Job '%s': %s", job["id"], msg)
+        target_errors.append(msg)
+        return False, False
+
+    logger.info(
+        "Job '%s': delivered to %s:%s via wake turn", job["id"], platform_name, chat_id
+    )
+    return True, False
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -1827,6 +1915,24 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         delivered = False
         target_errors = []
 
+        # Some adapters have no channel to push into after a turn ends — the
+        # api_server adapter behind the dashboard is the live example: its
+        # send() is a deliberate stub, because an HTTP request/response cycle
+        # holds no socket to write to later. Calling send() on one is
+        # guaranteed to fail, and so is the standalone retry, which resolves
+        # the very same adapter; that double failure is how a cron job could
+        # report last_status: ok next to a permanent delivery error. Such
+        # sessions are reachable — just by starting a turn rather than by
+        # pushing to one (gateway.wake) — so route them there instead.
+        push_capable = True
+        if runtime_adapter is not None:
+            try:
+                from gateway.wake import adapter_supports_push
+
+                push_capable = adapter_supports_push(runtime_adapter)
+            except Exception:  # pragma: no cover - import guard
+                push_capable = True
+
         # Continuable cron surface (D1/D2/D6): resolve the delivery surface for
         # this platform generically from its config ``extra``. Default "thread"
         # (today's behaviour, byte-identical). "in_channel" delivers the brief
@@ -2000,7 +2106,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 text_to_send = cleaned_delivery_content.strip()
                 adapter_ok = True
                 timed_out = False
-                if text_to_send:
+                if text_to_send and not push_capable:
+                    adapter_ok, timed_out = _deliver_via_wake(
+                        runtime_adapter,
+                        text_to_send,
+                        chat_id,
+                        loop,
+                        job,
+                        platform_name,
+                        target_errors,
+                    )
+                elif text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
                     router = DeliveryRouter(config, adapters)
@@ -2146,7 +2262,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # payload is already assumed delivered (#38922).  Record the
                 # skipped attachments so the drop is visible rather than silently
                 # lost.
-                if adapter_ok and not timed_out and media_files:
+                if media_files and not push_capable:
+                    # Media goes out through the adapter's native attachment
+                    # send, which is the same stubbed surface the wake path
+                    # exists to avoid; a wake turn carries text only. Record the
+                    # drop rather than attempting a send that cannot work.
+                    msg = (
+                        f"{len(media_files)} media attachment(s) not delivered to "
+                        f"{platform_name}:{chat_id} — this adapter has no push "
+                        f"channel, and a wake turn delivers text only"
+                    )
+                    logger.warning("Job '%s': %s", job["id"], msg)
+                    delivery_errors.append(msg)
+                elif adapter_ok and not timed_out and media_files:
                     routed_media_metadata = dict(media_metadata or {})
                     if transport is not None and transport.is_relay:
                         routed_media_metadata["_relay_logical_platform"] = platform.value
@@ -2221,6 +2349,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if not target_errors:
                     target_errors.append(
                         f"relay delivery to {platform_name}:{chat_id} failed"
+                    )
+                delivery_errors.extend(target_errors)
+                continue
+            if not push_capable:
+                # The standalone path re-resolves this same non-push adapter and
+                # fails on the same stubbed send(). Retrying it only appends a
+                # second copy of the identical error, which is exactly the
+                # doubled "not send()" message operators had to decode. The wake
+                # path above was the real attempt; stop here.
+                if not target_errors:
+                    target_errors.append(
+                        f"wake delivery to {platform_name}:{chat_id} failed"
                     )
                 delivery_errors.extend(target_errors)
                 continue

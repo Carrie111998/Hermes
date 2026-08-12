@@ -315,6 +315,9 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+    app.router.add_post(
+        "/v1/approvals/{session_key}/decision", adapter._handle_session_approval
+    )
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
@@ -1189,9 +1192,10 @@ class TestChatCompletionsEndpoint:
                 cb = kwargs.get("stream_delta_callback")
                 ts_cb = kwargs.get("tool_start_callback")
                 tc_cb = kwargs.get("tool_complete_callback")
-                # The structured callbacks own the chat-completions SSE
-                # channel now; ``tool_progress_callback`` is intentionally
-                # not wired so each tool start emits exactly one event.
+                # The structured callbacks own the tool lifecycle on the
+                # chat-completions SSE channel; ``tool_progress_callback``
+                # is wired only for reasoning, so each tool start still
+                # emits exactly one event.
                 if ts_cb:
                     ts_cb("call_terminal_1", "terminal", {"command": "ls -la"})
                 if tc_cb:
@@ -1290,6 +1294,398 @@ class TestChatCompletionsEndpoint:
             assert "call_orphan_1" not in body
             assert '"status": "running"' not in body
             assert '"status": "completed"' not in body
+
+    @staticmethod
+    def _tool_progress_payloads(body: str) -> list:
+        """Every ``hermes.tool.progress`` payload in an SSE body, in order."""
+        import json as _json
+
+        out = []
+        lines = body.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip() != "event: hermes.tool.progress":
+                continue
+            for follow in lines[i + 1: i + 4]:
+                if follow.startswith("data: "):
+                    try:
+                        out.append(_json.loads(follow[len("data: "):]))
+                    except _json.JSONDecodeError:
+                        pass
+                    break
+        return out
+
+    @pytest.mark.asyncio
+    async def test_stream_tool_completion_carries_result_and_failure(self, adapter):
+        """A settled tool must carry its output and its verdict live.
+
+        The lifecycle event used to be a bare ``status: completed`` with no
+        output attached, so a client could only render the spinner turning
+        into an unconditional green check. The output arrived when the
+        turn's transcript was re-read at the end of the turn, which meant a
+        tool that had actually failed was indistinguishable from one that
+        succeeded for as long as the turn kept running.
+        """
+        import asyncio
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                ts_cb = kwargs.get("tool_start_callback")
+                tc_cb = kwargs.get("tool_complete_callback")
+                if ts_cb:
+                    ts_cb("call_ok_1", "terminal", {"command": "true"})
+                    ts_cb("call_bad_1", "terminal", {"command": "false"})
+                if tc_cb:
+                    tc_cb(
+                        "call_ok_1", "terminal", {"command": "true"},
+                        '{"exit_code": 0, "output": "all good"}',
+                    )
+                    # A non-zero exit is the canonical terminal failure.
+                    tc_cb(
+                        "call_bad_1", "terminal", {"command": "false"},
+                        '{"exit_code": 1, "error": "boom"}',
+                    )
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("done.")
+                return (
+                    {"final_response": "done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "run"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        settled = [
+            p for p in self._tool_progress_payloads(body)
+            if p.get("status") in ("completed", "failed")
+        ]
+        assert len(settled) == 2, settled
+
+        ok = next(p for p in settled if p["toolCallId"] == "call_ok_1")
+        assert ok["status"] == "completed"
+        # The output rides the event, so an expanded step has something to
+        # show before the transcript is ever re-read.
+        assert "all good" in ok["result"]
+        assert ok["resultTruncated"] is False
+
+        bad = next(p for p in settled if p["toolCallId"] == "call_bad_1")
+        assert bad["status"] == "failed"
+        assert "boom" in bad["result"]
+        # The one-line summary a collapsed step shows comes from the
+        # failure detector rather than the head of the raw JSON.
+        assert "boom" in bad["label"]
+
+    @pytest.mark.asyncio
+    async def test_stream_tool_result_is_truncated(self, adapter):
+        """Tool output shares the stream with the reply, so it is capped."""
+        import asyncio
+
+        from gateway.platforms.api_server import TOOL_RESULT_STREAM_CHARS
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                ts_cb = kwargs.get("tool_start_callback")
+                tc_cb = kwargs.get("tool_complete_callback")
+                if ts_cb:
+                    ts_cb("call_big_1", "read_file", {"path": "big.txt"})
+                if tc_cb:
+                    tc_cb(
+                        "call_big_1", "read_file", {"path": "big.txt"},
+                        "x" * (TOOL_RESULT_STREAM_CHARS * 3),
+                    )
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("done.")
+                return (
+                    {"final_response": "done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "read"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        settled = [
+            p for p in self._tool_progress_payloads(body)
+            if p.get("status") in ("completed", "failed")
+        ]
+        assert len(settled) == 1, settled
+        assert len(settled[0]["result"]) == TOOL_RESULT_STREAM_CHARS
+        assert settled[0]["resultTruncated"] is True
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_reasoning_events(self, adapter):
+        """Reasoning must reach the client while the turn is still running.
+
+        ``_thinking`` is an underscore-prefixed internal tool, so the
+        structured tool callbacks filter it off this channel by design.
+        ``tool_progress_callback`` is therefore wired for reasoning alone —
+        and must stay filtered to it, or every tool chip would be emitted
+        twice (once structured, once via progress).
+        """
+        import asyncio
+        import json as _json
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                tp_cb = kwargs.get("tool_progress_callback")
+                ts_cb = kwargs.get("tool_start_callback")
+                tc_cb = kwargs.get("tool_complete_callback")
+                assert tp_cb is not None, "reasoning channel must be wired"
+                tp_cb("reasoning.available", "_thinking", "**Plan**\nfirst step", None)
+                # run_agent fires the progress callback side-by-side with the
+                # structured ones; these must not produce a second chip.
+                tp_cb("tool.started", "terminal", "ls -la", None)
+                if ts_cb:
+                    ts_cb("call_t_1", "terminal", {"command": "ls -la"})
+                tp_cb("tool.completed", "terminal", None, None)
+                if tc_cb:
+                    tc_cb("call_t_1", "terminal", {"command": "ls -la"}, "ok")
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("done.")
+                return (
+                    {"final_response": "done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "think"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        reasoning = []
+        lines = body.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip() != "event: hermes.reasoning.delta":
+                continue
+            for follow in lines[i + 1: i + 4]:
+                if follow.startswith("data: "):
+                    reasoning.append(_json.loads(follow[len("data: "):]))
+                    break
+
+        assert len(reasoning) == 1, reasoning
+        assert "first step" in reasoning[0]["delta"]
+
+        # The tool lifecycle stays single-emit: forwarding the progress
+        # callback's tool events too would double every chip.
+        pairs = [
+            (p.get("status"), p.get("toolCallId"))
+            for p in self._tool_progress_payloads(body)
+        ]
+        assert pairs == [("running", "call_t_1"), ("completed", "call_t_1")], pairs
+
+        # Reasoning must never leak into assistant text — the model would
+        # learn to imitate it instead of actually reasoning.
+        for line in lines:
+            if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+                continue
+            try:
+                chunk = _json.loads(line[len("data: "):])
+            except _json.JSONDecodeError:
+                continue
+            if chunk.get("object") == "chat.completion.chunk":
+                for choice in chunk.get("choices", []):
+                    assert "first step" not in (choice.get("delta", {}).get("content") or "")
+
+    @pytest.mark.asyncio
+    async def test_stream_registers_an_approval_notifier(self, adapter):
+        """A streamed turn must give the user a way to answer an approval.
+
+        Without a registered notifier ``tools.approval`` files the request
+        into an in-process dict nothing reads and returns immediately, so
+        every approval-gated tool call fails on this route no matter what the
+        user would have said. The run-scoped notifier does not cover it: that
+        one is registered by /v1/runs, which the SSE chat surfaces don't use.
+        """
+        import asyncio
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            seen = {}
+
+            async def _mock_run_agent(**kwargs):
+                seen["cb"] = kwargs.get("approval_notify_callback")
+                seen["key"] = kwargs.get("approval_session_key")
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("done.")
+                return (
+                    {"final_response": "done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                await resp.text()
+
+        assert callable(seen.get("cb")), "no approval notifier was wired"
+        # The key must be non-empty, or concurrent anonymous turns would all
+        # register under "" and resolve each other's approvals.
+        assert seen.get("key")
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_approval_request(self, adapter):
+        """The pending approval must reach the client as its own event."""
+        import asyncio
+        import json as _json
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                approve_cb = kwargs.get("approval_notify_callback")
+                cb = kwargs.get("stream_delta_callback")
+                if approve_cb:
+                    approve_cb({
+                        "command": "rm -rf /tmp/x",
+                        "description": "terminal command",
+                        "pattern_key": "terminal:rm",
+                        "pattern_keys": ["terminal:rm"],
+                        "allow_permanent": True,
+                    })
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("done.")
+                return (
+                    {"final_response": "done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "delete it"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        payloads = []
+        lines = body.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip() != "event: hermes.approval.request":
+                continue
+            for follow in lines[i + 1: i + 4]:
+                if follow.startswith("data: "):
+                    payloads.append(_json.loads(follow[len("data: "):]))
+                    break
+
+        assert len(payloads) == 1, payloads
+        req = payloads[0]
+        assert req["description"] == "terminal command"
+        # The key the client has to send back to answer it.
+        assert req["sessionKey"]
+        # Choices drive the buttons; silence is a denial, so the deadline
+        # travels with the request rather than being guessed client-side.
+        assert "deny" in req["choices"] and "once" in req["choices"]
+        assert isinstance(req["timeoutSeconds"], int) and req["timeoutSeconds"] > 0
+
+    @pytest.mark.asyncio
+    async def test_approval_decision_endpoint(self, adapter):
+        """The decision endpoint resolves by session key, not run id."""
+        import tools.approval as A
+
+        app = _create_app(adapter)
+        session_key = "sess_decision_test"
+
+        async with TestClient(TestServer(app)) as cli:
+            # Nothing pending yet — must not report success.
+            resp = await cli.post(
+                f"/v1/approvals/{session_key}/decision",
+                json={"choice": "once"},
+            )
+            assert resp.status == 409
+            assert (await resp.json())["error"]["code"] == "approval_not_pending"
+
+            # A bad choice is rejected before anything is resolved.
+            resp = await cli.post(
+                f"/v1/approvals/{session_key}/decision",
+                json={"choice": "maybe"},
+            )
+            assert resp.status == 400
+
+            # Park a real entry the way a blocked tool would, then answer it.
+            entry = A._ApprovalEntry({"command": "rm -rf /tmp/x"})
+            with A._lock:
+                A._gateway_queues[session_key] = [entry]
+            try:
+                resp = await cli.post(
+                    f"/v1/approvals/{session_key}/decision",
+                    json={"choice": "approve"},  # alias for "once"
+                )
+                assert resp.status == 200
+                assert (await resp.json())["choice"] == "once"
+                # The blocked thread is released with the decision attached.
+                assert entry.event.is_set()
+                assert entry.result == "once"
+            finally:
+                with A._lock:
+                    A._gateway_queues.pop(session_key, None)
+
+    @pytest.mark.asyncio
+    async def test_approval_decision_relays_deny_reason(self, adapter):
+        """A denial with a reason lets the agent adapt instead of just retrying."""
+        import tools.approval as A
+
+        app = _create_app(adapter)
+        session_key = "sess_deny_reason"
+        entry = A._ApprovalEntry({"command": "rm -rf /"})
+        with A._lock:
+            A._gateway_queues[session_key] = [entry]
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    f"/v1/approvals/{session_key}/decision",
+                    json={"choice": "deny", "reason": "wrong directory"},
+                )
+                assert resp.status == 200
+            assert entry.result == "deny"
+            assert entry.reason == "wrong directory"
+        finally:
+            with A._lock:
+                A._gateway_queues.pop(session_key, None)
 
 
 # ---------------------------------------------------------------------------

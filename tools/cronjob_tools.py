@@ -5,8 +5,10 @@ Expose a single compressed action-oriented tool to avoid schema/context bloat.
 Compatibility wrappers remain for direct Python callers and legacy tests.
 """
 
+import contextlib
 import json
 import logging
+import os
 import re
 import sys
 import threading
@@ -376,6 +378,162 @@ def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> 
     )
 
 
+# Actions a caller may perform on ANOTHER profile's cron store. Deliberately
+# limited to inspecting and firing: those are what a profile fixing someone
+# else's automation needs in order to verify its own fix. Creating, editing or
+# deleting jobs in another profile's store is not verification — it is writing
+# unattended schedules into a profile whose owner never asked for them, and the
+# per-profile split (#4707) exists to prevent exactly that.
+_CROSS_PROFILE_ACTIONS = frozenset({"list", "run"})
+
+
+class _CrossProfileDenied(Exception):
+    """A cross-profile request that must be reported rather than performed."""
+
+
+def _resolve_cross_profile_home(profile: str, action: str):
+    """Resolve ``profile`` to a HERMES_HOME, or raise ``_CrossProfileDenied``.
+
+    Returns ``None`` when the request is a no-op (the caller named its own
+    profile), so the caller can take the ordinary path.
+    """
+    from hermes_constants import get_default_hermes_root, get_hermes_home
+
+    name = (profile or "").strip()
+    if not name:
+        return None
+    # A profile name is a single directory component. Anything with a separator
+    # is either a mistake or an attempt to point the cron store at an arbitrary
+    # directory, and neither should be honoured.
+    if "/" in name or "\\" in name or name in {".", ".."}:
+        raise _CrossProfileDenied(
+            f"profile {name!r} is not a valid profile name (expected a bare "
+            f"name like 'default' or 'dev')."
+        )
+    if action not in _CROSS_PROFILE_ACTIONS:
+        raise _CrossProfileDenied(
+            f"action {action!r} is not allowed across profiles. Cron stores are "
+            f"per-profile; another profile's schedule may be inspected and fired "
+            f"({', '.join(sorted(_CROSS_PROFILE_ACTIONS))}) so a fix can be "
+            f"verified, but not created, edited or removed from here."
+        )
+
+    root = get_default_hermes_root()
+    target = root if name == "default" else root / "profiles" / name
+    if not target.is_dir():
+        raise _CrossProfileDenied(
+            f"profile {name!r} not found (looked for {target}). Use the profile "
+            f"directory name, or 'default' for the root profile."
+        )
+    if target.resolve() == get_hermes_home().resolve():
+        return None  # Naming your own profile is just the ordinary path.
+    return target
+
+
+@contextlib.contextmanager
+def _cron_profile_context(profile: Optional[str], action: str):
+    """Point cron storage and script resolution at another profile, temporarily.
+
+    Cron is per-profile by design, which is right for isolation and wrong for
+    repair: a profile handed a broken automation to fix could install the fix
+    but could not run the job to prove it worked, because the job genuinely
+    does not exist in its own store. The work would come back unverified,
+    which defeats the point of routing it there.
+
+    Both the cron store and HERMES_HOME are redirected, because a job's script
+    resolves under HERMES_HOME/scripts — redirecting only the store would find
+    the job and then look for its script in the wrong profile's directory.
+
+    Every crossing is logged: the isolation is intentional, so stepping over it
+    should leave a trace rather than being indistinguishable from ordinary use.
+    """
+    target = None
+    if profile:
+        target = _resolve_cross_profile_home(profile, action)
+    if target is None:
+        yield None
+        return
+
+    from cron.jobs import use_cron_store
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    caller = (os.environ.get("HERMES_PROFILE") or "default").strip() or "default"
+    logger.warning(
+        "cronjob: profile %r performing cross-profile action %r against profile "
+        "%r (%s)", caller, action, profile, target,
+    )
+    token = set_hermes_home_override(str(target))
+    try:
+        with use_cron_store(target):
+            yield target
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _smoke_run_new_script_job(
+    job: Dict[str, Any], no_agent: bool
+) -> Optional[Dict[str, Any]]:
+    """Run a newly created ``no_agent`` script job once, and report what happened.
+
+    A schedule receipt is not evidence that an automation works. Creation used
+    to return ``success: true`` for a job whose script had never been executed,
+    so the first proof of life was the first scheduled fire — a month away for a
+    monthly job, by which time the agent that created it had long since told the
+    user it was done. Everything needed to run it is available here, so run it
+    here and return the real outcome.
+
+    A failing smoke run does NOT roll the job back. The job is a valid,
+    correctly-registered schedule; what failed is the script. Deleting it would
+    throw away the user's intent along with the diagnosis, and leave nothing on
+    the board to fix. Report and keep.
+
+    Returns ``None`` when there is nothing to smoke-run (agent-mode jobs, or no
+    script), so the caller can omit the field entirely.
+    """
+    if not no_agent:
+        return None  # Agent-mode jobs need a live model turn; not a smoke test.
+    script = (job.get("script") or "").strip()
+    if not script:
+        return None
+
+    try:
+        from cron.scheduler import _run_job_script
+
+        ok, output = _run_job_script(script, workdir=job.get("workdir") or None)
+    except Exception as exc:  # never let verification break creation
+        logger.warning("cron smoke run failed to execute for %s: %s", job.get("id"), exc)
+        return {
+            "ran": False,
+            "ok": False,
+            "message": (
+                f"Could not smoke-run the script ({exc}); the job is scheduled "
+                f"but unverified."
+            ),
+        }
+
+    text = (output or "").strip()
+    truncated = text if len(text) <= 2000 else text[:2000] + "… (truncated)"
+    if ok:
+        return {
+            "ran": True,
+            "ok": True,
+            "output": truncated,
+            "message": f"Smoke run succeeded; output: {truncated!r}",
+        }
+    return {
+        "ran": True,
+        "ok": False,
+        "error": truncated,
+        "message": (
+            f"WARNING: the job is scheduled but its first run FAILED: {truncated}. "
+            f"Fix this before reporting the automation as working."
+        ),
+    }
+
+
 def _repeat_display(job: Dict[str, Any]) -> str:
     times = (job.get("repeat") or {}).get("times")
     completed = (job.get("repeat") or {}).get("completed", 0)
@@ -530,13 +688,23 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
 
     raw = script.strip()
 
-    # Reject absolute paths and ~ expansion at the API boundary.
-    # Only relative paths within ~/.hermes/scripts/ are allowed.
+    # Reject absolute paths and ~ expansion at the API boundary; only relative
+    # paths inside this profile's scripts dir are allowed.
+    #
+    # The scripts dir is per-profile, so the old hardcoded "~/.hermes/scripts"
+    # named the wrong directory for every profile but default. Report the real
+    # one — and report it as an absolute path, not via display_hermes_home():
+    # that helper renders "~/."
+    # when HERMES_HOME *is* the home directory — the containerised layout —
+    # which turned this hint into the actively unhelpful "~/./scripts/". These
+    # messages exist to answer "which directory?", and only an absolute path
+    # answers that in every layout and every profile.
+    scripts_display = f"{get_hermes_home()}/scripts/"
     if raw.startswith(("/", "~")) or (len(raw) >= 2 and raw[1] == ":"):
         return (
-            f"Script path must be relative to ~/.hermes/scripts/. "
+            f"Script path must be relative to {scripts_display}. "
             f"Got absolute or home-relative path: {raw!r}. "
-            f"Place scripts in ~/.hermes/scripts/ and use just the filename."
+            f"Place scripts in {scripts_display} and use just the filename."
         )
 
     # Validate containment after resolution
@@ -548,6 +716,24 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     if containment_error:
         return (
             f"Script path escapes the scripts directory via traversal: {raw!r}"
+        )
+
+    # The script must exist NOW, not at first fire. Shape validation alone let a
+    # job be created against a missing file and still return success: true — the
+    # scheduler only discovers the truth when it runs ("Script not found: ..."),
+    # so a monthly job sat broken for a month while its author reported it done.
+    # Whether the file is there is knowable at this point, so decide here.
+    resolved = scripts_dir / raw
+    if not resolved.is_file():
+        profile = (os.environ.get("HERMES_PROFILE") or "default").strip() or "default"
+        return (
+            f"Script not found: {resolved}. Cron resolves `script` under "
+            f"HERMES_HOME/scripts for the profile that owns the job (profile "
+            f"{profile!r}, {scripts_display}), and that is the only directory it "
+            f"will look in — there is no search path and no fallback. Write the "
+            f"script to that exact path first, then create the job. If this "
+            f"profile cannot write there, hand the work to one that can rather "
+            f"than scheduling a job that cannot run."
         )
 
     return None
@@ -1054,12 +1240,25 @@ def cronjob(
     monitor_url: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
+    profile: Optional[str] = None,
 ) -> str:
     """Unified cron job management tool."""
     del task_id  # unused but kept for handler signature compatibility
 
+    normalized = (action or "").strip().lower()
+    # Enter the (usually inert) profile redirection via an ExitStack so the
+    # large action body below keeps its existing shape; the finally-close is
+    # what guarantees the override is unwound on every return path.
+    _profile_stack = contextlib.ExitStack()
     try:
-        normalized = (action or "").strip().lower()
+        _cross_profile_home = _profile_stack.enter_context(
+            _cron_profile_context(profile, normalized)
+        )
+    except _CrossProfileDenied as denial:
+        _profile_stack.close()
+        return tool_error(str(denial), success=False)
+
+    try:
 
         if normalized == "create":
             if not schedule:
@@ -1148,22 +1347,25 @@ def cronjob(
             _local_notice = _local_delivery_notice(job, _normalize_deliver_param(deliver))
             if _local_notice:
                 _create_message = f"{_create_message} {_local_notice}"
-            return json.dumps(
-                {
-                    "success": True,
-                    "job_id": job["id"],
-                    "name": job["name"],
-                    "skill": job.get("skill"),
-                    "skills": job.get("skills", []),
-                    "schedule": job["schedule_display"],
-                    "repeat": _repeat_display(job),
-                    "deliver": job.get("deliver", "local"),
-                    "next_run_at": job["next_run_at"],
-                    "job": _format_job(job),
-                    "message": _create_message,
-                },
-                indent=2,
-            )
+            _smoke = _smoke_run_new_script_job(job, _no_agent)
+            if _smoke is not None:
+                _create_message = f"{_create_message} {_smoke['message']}"
+            _payload = {
+                "success": True,
+                "job_id": job["id"],
+                "name": job["name"],
+                "skill": job.get("skill"),
+                "skills": job.get("skills", []),
+                "schedule": job["schedule_display"],
+                "repeat": _repeat_display(job),
+                "deliver": job.get("deliver", "local"),
+                "next_run_at": job["next_run_at"],
+                "job": _format_job(job),
+                "message": _create_message,
+            }
+            if _smoke is not None:
+                _payload["smoke_run"] = _smoke
+            return json.dumps(_payload, indent=2)
 
         if normalized == "list":
             jobs = [_format_job(job) for job in list_jobs(include_disabled=include_disabled)]
@@ -1252,9 +1454,19 @@ def cronjob(
             # batches of manual runs (#80xxx — the "stuck Telegram session"
             # incident). Falls back to inline execution when the session
             # runtime can't receive detached completions.
-            bg = _try_dispatch_background_run(
-                job, session_id=session_id, extra_prompt=extra_prompt
-            )
+            if _cross_profile_home is not None:
+                # The profile redirection is a ContextVar, and a detached
+                # background run does not inherit it. Dispatching there would
+                # resolve the job against the CALLER's store — finding nothing,
+                # or worse, a different job that happens to share the id. A
+                # cross-profile run is a verification step, so run it inline
+                # where the redirection still holds and the caller gets the
+                # actual outcome rather than a handle.
+                bg = None
+            else:
+                bg = _try_dispatch_background_run(
+                    job, session_id=session_id, extra_prompt=extra_prompt
+                )
             if bg is not None and bg.get("dispatched"):
                 _notify_provider_jobs_changed_safe()
                 result = _format_job(get_job(job_id) or {"id": job_id})
@@ -1436,6 +1648,11 @@ def cronjob(
 
     except Exception as e:
         return tool_error(str(e), success=False)
+    finally:
+        # Unwind any cross-profile redirection on every path, including the
+        # early returns above — a leaked override would silently point the rest
+        # of this context's cron work at the wrong profile's store.
+        _profile_stack.close()
 
 
 
@@ -1450,6 +1667,10 @@ Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing
 action='run' fires the job immediately in the BACKGROUND (like delegate_task): the call returns at once with a handle and the job's outcome re-enters the conversation as a new message when it finishes. Do not wait or poll after triggering a run — just continue. Optionally pass 'prompt' with action='run' to inject transient per-run context (appended to the job's stored prompt for that single fire only, never persisted).
 
 To stop a job the user no longer wants: first action='list' to find the job_id, then action='remove' with that job_id. Never guess job IDs — always list first.
+
+Cron stores are PER-PROFILE: action='list' shows only jobs created by your own profile, so a job you were asked to fix or verify may be invisible here and its job_id will not resolve. That means the job is missing, not the id — pass 'profile' with the owning profile's name (e.g. profile='default') to list and run it.
+
+A job's `script` must already exist under this profile's scripts directory before you can schedule it; creation refuses a script it cannot find, and a no_agent job is run once at creation so you get its real output instead of just a schedule.
 
 Jobs run in a fresh session with no current-chat context, so prompts must be self-contained.
 If skills are provided on create, the future cron run loads those skills in order, then follows the prompt as the task instruction.
@@ -1470,6 +1691,10 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             "job_id": {
                 "type": "string",
                 "description": "Required for update/pause/resume/remove/run"
+            },
+            "profile": {
+                "type": "string",
+                "description": "Optional. Cron stores are per-profile, so a job created by another profile is invisible here by default. Set this to that profile's name (e.g. 'default') to inspect or fire ITS jobs — use it when you have been asked to fix or verify an automation you did not create and action='list' shows nothing. Only 'list' and 'run' are permitted across profiles; creating, editing or removing another profile's jobs is refused. Omit for your own jobs."
             },
             "prompt": {
                 "type": "string",
@@ -1613,6 +1838,7 @@ registry.register(
         monitor_url=args.get("monitor_url"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
+        profile=args.get("profile"),
     ),
     check_fn=check_cronjob_requirements,
     emoji="⏰",

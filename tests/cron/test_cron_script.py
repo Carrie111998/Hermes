@@ -287,6 +287,89 @@ class TestBuildJobPromptWithScript:
         assert "Simple job." in prompt
 
 
+class TestCreateTimeScriptVerification:
+    """A job must not be schedulable against a script that isn't there.
+
+    Shape validation alone (relative, no traversal) let a job be created
+    against a missing file and still return ``success: true``. The scheduler
+    only found out at fire time, so a monthly job could sit broken for a month
+    while the agent that made it reported the automation as working.
+    """
+
+    def test_create_rejects_missing_script(self, cron_env, monkeypatch):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        from tools.cronjob_tools import cronjob
+
+        result = json.loads(cronjob(
+            action="create",
+            schedule="0 9 1 * *",
+            script="never_written.py",
+            no_agent=True,
+        ))
+        assert result["success"] is False
+        # The message must name the resolved path, since "which directory?" is
+        # the actual question the caller has to answer.
+        assert "never_written.py" in result["error"]
+        assert str(cron_env / "scripts") in result["error"]
+
+        # ...and nothing may be left on the schedule.
+        listing = json.loads(cronjob(action="list"))
+        assert listing["jobs"] == []
+
+    def test_create_smoke_runs_the_script(self, cron_env, monkeypatch):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        from tools.cronjob_tools import cronjob
+
+        (cron_env / "scripts" / "works.py").write_text(
+            "print('sum is 42')\n"
+        )
+        result = json.loads(cronjob(
+            action="create",
+            schedule="0 9 1 * *",
+            script="works.py",
+            no_agent=True,
+        ))
+        assert result["success"] is True
+        # Real output, not just a schedule receipt.
+        assert result["smoke_run"]["ok"] is True
+        assert "sum is 42" in result["smoke_run"]["output"]
+
+    def test_failing_smoke_run_is_reported_but_keeps_the_job(
+        self, cron_env, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        from tools.cronjob_tools import cronjob
+
+        (cron_env / "scripts" / "broken.py").write_text(
+            "raise SystemExit('boom')\n"
+        )
+        result = json.loads(cronjob(
+            action="create",
+            schedule="0 9 1 * *",
+            script="broken.py",
+            no_agent=True,
+        ))
+        # The schedule itself is valid — it is the script that is broken, so the
+        # job survives to be fixed rather than vanishing with the diagnosis.
+        assert result["success"] is True
+        assert result["smoke_run"]["ok"] is False
+        assert "FAILED" in result["message"]
+        listing = json.loads(cronjob(action="list"))
+        assert len(listing["jobs"]) == 1
+
+    def test_agent_mode_job_is_not_smoke_run(self, cron_env, monkeypatch):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        from tools.cronjob_tools import cronjob
+
+        result = json.loads(cronjob(
+            action="create",
+            schedule="every 1h",
+            prompt="Summarize the news",
+        ))
+        assert result["success"] is True
+        assert "smoke_run" not in result
+
+
 class TestCronjobToolScript:
     """Test the cronjob tool's script parameter."""
 
@@ -294,6 +377,10 @@ class TestCronjobToolScript:
     def test_clear_script(self, cron_env, monkeypatch):
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         from tools.cronjob_tools import cronjob
+
+        # The tool refuses to schedule a script it cannot find, so the file has
+        # to exist before the job referencing it can be created.
+        (cron_env / "scripts" / "some_script.py").write_text("print('ok')\n")
 
         create_result = json.loads(cronjob(
             action="create",
@@ -314,6 +401,8 @@ class TestCronjobToolScript:
     def test_list_shows_script(self, cron_env, monkeypatch):
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         from tools.cronjob_tools import cronjob
+
+        (cron_env / "scripts" / "data_collector.py").write_text("print('ok')\n")
 
         cronjob(
             action="create",
