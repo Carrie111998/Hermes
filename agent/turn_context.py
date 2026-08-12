@@ -1153,6 +1153,20 @@ def build_turn_context(
     plugin_user_context = ""
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+        _snapshot_todos = getattr(agent._todo_store, "snapshot", None)
+        if callable(_snapshot_todos):
+            _snapshot_value = _snapshot_todos()
+            _todo_snapshot = (
+                _snapshot_value
+                if isinstance(_snapshot_value, dict)
+                else {"todos": [], "timing": None}
+            )
+        else:
+            _read_todos = getattr(agent._todo_store, "read", None)
+            _todo_snapshot = {
+                "todos": _read_todos() if callable(_read_todos) else [],
+                "timing": None,
+            }
         _pre_results = _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
@@ -1160,6 +1174,8 @@ def build_turn_context(
             turn_id=turn_id,
             user_message=original_user_message,
             conversation_history=list(messages),
+            todos=_todo_snapshot["todos"],
+            todo_snapshot=_todo_snapshot,
             is_first_turn=(not bool(conversation_history)),
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",

@@ -26,6 +26,12 @@ import pytest
 
 from agent.context_compressor import ContextCompressor
 from hermes_state import SessionDB
+from tools.todo_tool import (
+    MAX_TODO_CONTENT_CHARS,
+    MAX_TODO_ITEMS,
+    MAX_TODO_RESULT_CHARS,
+    TodoStore,
+)
 
 
 def _build_agent_with_db(db: SessionDB, session_id: str, platform: str = "telegram"):
@@ -66,6 +72,22 @@ def _build_agent_with_db(db: SessionDB, session_id: str, platform: str = "telegr
 
 def _msgs(n=20):
     return [{"role": "user", "content": f"m{i}"} for i in range(n)]
+
+
+class _FakeClock:
+    def __init__(self, value: float):
+        self.value = value
+
+    def __call__(self) -> float:
+        return self.value
+
+
+def _durable_todo_pair_count(messages: list[dict]) -> int:
+    return sum(
+        message.get("role") == "tool"
+        and message.get("tool_call_id") == "hermes_durable_todo_snapshot_v1"
+        for message in messages
+    )
 
 
 def _bound_context_compressor(db: SessionDB, session_id: str) -> ContextCompressor:
@@ -508,6 +530,132 @@ class TestCooldownPersistFailureIsNotAClearedRow:
         assert compressor._ineffective_compression_count == 0
 
 
+class TestDurableTodoTimingCompression:
+    def test_store_without_durable_capability_is_ignored(self):
+        from agent.conversation_compression import _append_durable_todo_snapshot
+
+        agent = MagicMock()
+        agent._todo_store = object()
+        messages = []
+
+        _append_durable_todo_snapshot(agent, messages)
+
+        assert messages == []
+
+    def test_maximum_valid_store_keeps_durable_pair(self):
+        from agent.conversation_compression import _append_durable_todo_snapshot
+
+        agent = MagicMock()
+        agent.session_id = "TODO_TIMING_MAXIMUM"
+        agent._todo_store = TodoStore(clock=lambda: 100.0)
+        agent._todo_store.write([
+            {
+                "id": f"{index}:" + "\\" * 400,
+                "content": "\\" * MAX_TODO_CONTENT_CHARS,
+                "status": "pending",
+            }
+            for index in range(MAX_TODO_ITEMS)
+        ])
+        messages = []
+
+        _append_durable_todo_snapshot(agent, messages)
+
+        assert _durable_todo_pair_count(messages) == 1
+        assert len(messages[-1]["content"]) <= MAX_TODO_RESULT_CHARS
+
+    def test_in_place_compression_restart_and_repeated_compression(self, tmp_path: Path):
+        from agent.conversation_compression import compress_context
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "TODO_TIMING_COMPRESSION"
+        db.create_session(session_id, source="cli")
+        agent = _build_agent_with_db(db, session_id, platform="cli")
+        agent.compression_in_place = True
+        clock = _FakeClock(100)
+        agent._todo_store = TodoStore(clock=clock)
+        agent._todo_store.write([
+            {"id": "task", "content": "durable work", "status": "pending"}
+        ])
+        clock.value = 120
+        agent._todo_store.write([
+            {"id": "task", "content": "durable work", "status": "in_progress"}
+        ])
+
+        clock.value = 150
+        compressed, _ = compress_context(
+            agent, _msgs(), "sys", approx_tokens=120_000
+        )
+        active = db.get_messages_as_conversation(session_id)
+        assert _durable_todo_pair_count(active) == 1
+
+        restarted = _build_agent_with_db(db, session_id, platform="cli")
+        restarted._todo_store = TodoStore(clock=_FakeClock(200))
+        restarted._hydrate_todo_store(active)
+        restored = restarted._todo_store.snapshot()
+        assert restored["todos"][0]["status"] == "in_progress"
+        assert restored["timing"]["cycle"]["id"] == 1
+        assert restored["timing"]["cycle"]["elapsed_seconds"] == 100
+        assert restored["timing"]["items"]["task"]["active_seconds"] == 80
+
+        clock.value = 160
+        agent.context_compressor.compress.return_value = [
+            {"role": "user", "content": "[CONTEXT COMPACTION] latest"},
+            {"role": "user", "content": "tail"},
+        ]
+        compress_context(agent, compressed, "sys", approx_tokens=120_000)
+        latest = db.get_messages_as_conversation(session_id)
+        assert _durable_todo_pair_count(latest) == 1
+
+        restarted_again = _build_agent_with_db(db, session_id, platform="cli")
+        restarted_again._todo_store = TodoStore(clock=_FakeClock(200))
+        restarted_again._hydrate_todo_store(latest)
+        restored_again = restarted_again._todo_store.snapshot()
+        assert restored_again["timing"]["items"]["task"]["active_seconds"] == 80
+        db.close()
+
+    def test_clear_compression_restart_advances_cycle(self, tmp_path: Path):
+        from agent.conversation_compression import compress_context
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "TODO_TIMING_CLEAR_COMPRESSION"
+        db.create_session(session_id, source="cli")
+        agent = _build_agent_with_db(db, session_id, platform="cli")
+        agent.compression_in_place = True
+        clock = _FakeClock(100)
+        agent._todo_store = TodoStore(clock=clock)
+        agent._todo_store.write([
+            {"id": "old", "content": "old work", "status": "in_progress"}
+        ])
+        clock.value = 120
+        agent._todo_store.write([
+            {"id": "old", "content": "old work", "status": "completed"}
+        ])
+        clock.value = 130
+        agent._todo_store.write([])
+        assert not agent._todo_store.has_items()
+        assert agent._todo_store.has_durable_state()
+
+        compress_context(agent, _msgs(), "sys", approx_tokens=120_000)
+        active = db.get_messages_as_conversation(session_id)
+        assert _durable_todo_pair_count(active) == 1
+
+        restarted = _build_agent_with_db(db, session_id, platform="cli")
+        restarted._todo_store = TodoStore(clock=_FakeClock(200))
+        restarted._hydrate_todo_store(active)
+        restored = restarted._todo_store.snapshot()
+        assert restored["todos"] == []
+        assert restored["timing"]["cycle"]["id"] == 1
+        assert restored["timing"]["cycle"]["finished_at"] == 120
+
+        restarted._todo_store.write([
+            {"id": "new", "content": "new work", "status": "pending"}
+        ])
+        next_cycle = restarted._todo_store.snapshot()
+        assert next_cycle["timing"]["cycle"]["id"] == 2
+        assert next_cycle["timing"]["cycle"]["started_at"] == 200
+        db.close()
+
+
 class TestTodoSnapshotMergedNotDuplicated:
     """Todo snapshots preserve tail content without duplicate user turns."""
 
@@ -644,18 +792,19 @@ class TestTodoSnapshotScaffoldingTails:
             _msgs(), "sys", approx_tokens=120_000
         )
 
-        tail = compressed[-1]
+        tail = compressed[-3]
         assert tail["role"] == "user"
         assert "please fix the login bug" in tail["content"]
         assert "task A" in tail["content"]
         assert "old finished task" not in tail["content"]
         assert tail["content"].count(TODO_INJECTION_HEADER) == 1
+        assert _durable_todo_pair_count(compressed) == 1
         assert not any(
             previous.get("role") == current.get("role") == "user"
             for previous, current in zip(compressed, compressed[1:])
         )
 
-    def test_empty_todo_store_injects_nothing(self, tmp_path: Path):
+    def test_terminal_todo_has_no_user_snapshot_but_keeps_durable_pair(self, tmp_path: Path):
         from tools.todo_tool import TODO_INJECTION_HEADER
 
         db = SessionDB(db_path=tmp_path / "state.db")
@@ -678,7 +827,8 @@ class TestTodoSnapshotScaffoldingTails:
             _msgs(), "sys", approx_tokens=120_000
         )
 
-        assert compressed == expected
+        assert compressed[:3] == expected
+        assert _durable_todo_pair_count(compressed) == 1
         assert not any(
             TODO_INJECTION_HEADER in str(message.get("content") or "")
             for message in compressed

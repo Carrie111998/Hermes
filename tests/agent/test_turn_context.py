@@ -23,6 +23,15 @@ class _FakeTodoStore:
     def has_items(self):
         return True
 
+    def read(self):
+        return [{"id": "task", "content": "work", "status": "in_progress"}]
+
+    def snapshot(self):
+        return {
+            "todos": self.read(),
+            "timing": {"schema_version": 1, "cycle": {"id": 3}, "items": {}},
+        }
+
     def _hydrate(self, *_a, **_k):
         pass
 
@@ -206,6 +215,16 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.messages[-1] == {"role": "user", "content": "hello"}
     assert ctx.current_turn_user_idx == len(ctx.messages) - 1
     assert ctx.active_system_prompt == "SYSTEM"
+
+
+def test_pre_llm_hook_receives_atomic_todo_snapshot() -> None:
+    agent = _FakeAgent()
+    with patch("hermes_cli.lifecycle.invoke_hook", return_value=[]) as invoke:
+        _build(agent)
+
+    pre_llm = next(call for call in invoke.call_args_list if call.args == ("pre_llm_call",))
+    assert pre_llm.kwargs["todos"] == agent._todo_store.read()
+    assert pre_llm.kwargs["todo_snapshot"] == agent._todo_store.snapshot()
 
 
 # ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────

@@ -1988,6 +1988,114 @@ def _strip_stale_todo_snapshot(content: Any) -> Any:
     return content
 
 
+_DURABLE_TODO_SNAPSHOT_CALL_ID = "hermes_durable_todo_snapshot_v1"
+_DURABLE_TODO_SNAPSHOT_FLAG = "_durable_todo_snapshot"
+
+
+def _todo_call_id(tool_call: Any) -> Optional[str]:
+    if not isinstance(tool_call, dict):
+        return None
+    function = tool_call.get("function")
+    if not isinstance(function, dict) or function.get("name") != "todo":
+        return None
+    call_id = tool_call.get("id")
+    return str(call_id) if call_id else None
+
+
+def _strip_todo_tool_pairs(messages: list) -> None:
+    """Remove Todo call/result pairs before inserting one current snapshot."""
+    todo_call_ids = {
+        call_id
+        for message in messages
+        if isinstance(message, dict) and message.get("role") == "assistant"
+        for call_id in [
+            _todo_call_id(tool_call)
+            for tool_call in (message.get("tool_calls") or [])
+        ]
+        if call_id
+    }
+    normalized = []
+    for message in messages:
+        if not isinstance(message, dict):
+            normalized.append(message)
+            continue
+        if message.get(_DURABLE_TODO_SNAPSHOT_FLAG):
+            continue
+        if (
+            message.get("role") == "tool"
+            and message.get("tool_call_id") in todo_call_ids
+        ):
+            continue
+        if message.get("role") != "assistant" or not isinstance(
+            message.get("tool_calls"), list
+        ):
+            normalized.append(message)
+            continue
+        retained_calls = [
+            call
+            for call in message["tool_calls"]
+            if _todo_call_id(call) is None
+        ]
+        if len(retained_calls) == len(message["tool_calls"]):
+            normalized.append(message)
+            continue
+        retained = dict(message)
+        if retained_calls:
+            retained["tool_calls"] = retained_calls
+        else:
+            retained.pop("tool_calls", None)
+        if retained_calls or _message_text(retained).strip():
+            normalized.append(retained)
+    messages[:] = normalized
+
+
+def _append_durable_todo_snapshot(agent: Any, messages: list) -> None:
+    """Persist one bounded TodoStore snapshot as a valid tool-call pair."""
+    _strip_todo_tool_pairs(messages)
+    store = getattr(agent, "_todo_store", None)
+    if store is None:
+        return
+    has_durable_state = getattr(store, "has_durable_state", None)
+    if callable(has_durable_state):
+        should_preserve = bool(has_durable_state())
+    else:
+        has_items = getattr(store, "has_items", None)
+        should_preserve = bool(has_items()) if callable(has_items) else False
+    if not should_preserve:
+        return
+
+    from tools.todo_tool import MAX_TODO_RESULT_CHARS, todo_tool
+
+    result = todo_tool(store=store)
+    if not isinstance(result, str) or len(result) > MAX_TODO_RESULT_CHARS:
+        logger.warning(
+            "Skipping oversized durable todo snapshot during compression: "
+            "session=%s chars=%d",
+            getattr(agent, "session_id", None) or "none",
+            len(result) if isinstance(result, str) else -1,
+        )
+        return
+    messages.extend([
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": _DURABLE_TODO_SNAPSHOT_CALL_ID,
+                "type": "function",
+                "function": {"name": "todo", "arguments": "{}"},
+            }],
+            _DURABLE_TODO_SNAPSHOT_FLAG: True,
+        },
+        {
+            "role": "tool",
+            "tool_call_id": _DURABLE_TODO_SNAPSHOT_CALL_ID,
+            "name": "todo",
+            "content": result,
+            _DURABLE_TODO_SNAPSHOT_FLAG: True,
+        },
+    ])
+
+
 def _merge_anchor_into_user_message(target: dict, anchor: dict) -> None:
     """Fold the human anchor into an existing user-role scaffolding turn.
 
@@ -3154,6 +3262,7 @@ def compress_context(
                         "check auxiliary.compression.model in config.yaml."
                     )
 
+        _strip_todo_tool_pairs(compressed)
         todo_snapshot = agent._todo_store.format_for_injection()
         if todo_snapshot:
             # Fold the snapshot into a trailing REAL user message so
@@ -3205,6 +3314,7 @@ def compress_context(
                     "_todo_snapshot_synthetic": True,
                 })
         _ensure_compressed_has_user_turn(messages, compressed)
+        _append_durable_todo_snapshot(agent, compressed)
 
         cached_system_prompt = agent._cached_system_prompt
         agent._invalidate_system_prompt()
