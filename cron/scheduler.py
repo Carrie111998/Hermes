@@ -1165,6 +1165,24 @@ def _is_known_delivery_platform(platform_name: str) -> bool:
     return bool(_plugin_cron_env_var(name))
 
 
+# Structural delivery failures that will never succeed on retry. Matched as
+# substrings against adapter / standalone error text. When a live send reports
+# one of these, the scheduler must NOT fall through to the standalone path
+# (which produces the same permanent error a second time and ERROR-spams every
+# cron tick for interval jobs). See #83484 (api_server origin).
+_PERMANENT_DELIVERY_ERROR_MARKERS = (
+    "API server uses HTTP request/response, not send()",
+)
+
+
+def _is_permanent_delivery_failure(error: object) -> bool:
+    """True when ``error`` is a structural non-retryable delivery failure."""
+    text = str(error or "")
+    if not text:
+        return False
+    return any(marker in text for marker in _PERMANENT_DELIVERY_ERROR_MARKERS)
+
+
 def _resolve_home_env_var(platform_name: str) -> str:
     """Return the env var name for a platform's cron home channel.
 
@@ -1337,12 +1355,43 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
 
     if deliver_value == "origin":
         if origin:
-            return {
-                "platform": origin["platform"],
-                "chat_id": str(origin["chat_id"]),
-                "thread_id": origin.get("thread_id"),
-            }
-        # Origin missing (e.g. job created via API/script) — try each
+            origin_platform = str(origin.get("platform") or "").strip()
+            origin_chat_id = origin.get("chat_id")
+            # Only resolve origin when the platform can actually receive a push
+            # delivery. Stateless platforms (api_server, webhook, …) are not in
+            # ``_KNOWN_DELIVERY_PLATFORMS`` and their adapter ``send()`` is a
+            # permanent structural failure — resolving them as targets made
+            # every fire ERROR-spam and re-arm interval jobs forever (#83484).
+            # Fall through to home-channel fallback (same as missing origin)
+            # rather than inventing a never-deliverable target.
+            if (
+                origin_platform
+                and origin_chat_id is not None
+                and str(origin_chat_id) != ""
+                and _is_known_delivery_platform(origin_platform)
+            ):
+                return {
+                    "platform": origin_platform,
+                    "chat_id": str(origin_chat_id),
+                    "thread_id": origin.get("thread_id"),
+                }
+            if origin_platform and not _is_known_delivery_platform(origin_platform):
+                # Non-push origin (api_server, …): do NOT fall through to a
+                # home channel. Diverting API-session output into the
+                # operator's TELEGRAM_HOME (etc.) is a silent cross-channel
+                # leak and suppresses the create-time notice that would tell
+                # the agent delivery cannot return to this session (#83484).
+                # Treat as local-only — same soft outcome as CLI with no origin
+                # and no home channels.
+                logger.info(
+                    "Job '%s' has deliver=origin but origin platform '%s' "
+                    "cannot receive push delivery — treating as local-only "
+                    "(output saved in last_output)",
+                    job.get("name", job.get("id", "?")),
+                    origin_platform,
+                )
+                return None
+        # Origin missing (e.g. job created via API/script / CLI) — try each
         # platform's home channel as a fallback instead of silently dropping.
         for platform_name in _iter_home_target_platforms():
             chat_id = _get_home_target_chat_id(platform_name)
@@ -1362,6 +1411,17 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
     if ":" in deliver_value:
         platform_name, rest = deliver_value.split(":", 1)
         platform_key = platform_name.lower()
+
+        # Explicit ``platform:chat_id`` must still be a push-capable target.
+        # ``api_server:sess-…`` is a permanent structural miss (#83484).
+        if not _is_known_delivery_platform(platform_key):
+            logger.info(
+                "Job '%s': deliver target platform '%s' cannot receive push "
+                "delivery — skipping",
+                job.get("name", job.get("id", "?")),
+                platform_key,
+            )
+            return None
 
         from tools.send_message_tool import _parse_target_ref
 
@@ -1403,7 +1463,19 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
         }
 
     platform_name = deliver_value
-    if origin and origin.get("platform") == platform_name:
+    # Bare platform token (e.g. ``telegram`` or ``api_server``). Non-push
+    # platforms must be rejected before the origin-match branch — otherwise
+    # ``deliver=api_server`` + matching origin still invents a never-deliverable
+    # target and re-arms permanent failures every tick (#83484).
+    if not _is_known_delivery_platform(platform_name):
+        logger.info(
+            "Job '%s': deliver platform '%s' cannot receive push delivery — skipping",
+            job.get("name", job.get("id", "?")),
+            platform_name,
+        )
+        return None
+
+    if origin and str(origin.get("platform") or "").lower() == platform_name.lower():
         chat_id = _get_home_target_chat_id(platform_name)
         if chat_id:
             return {
@@ -1417,8 +1489,6 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
             "thread_id": origin.get("thread_id"),
         }
 
-    if not _is_known_delivery_platform(platform_name):
-        return None
     chat_id = _get_home_target_chat_id(platform_name)
     if not chat_id:
         return None
@@ -1682,6 +1752,23 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 job.get("name", job.get("id", "?")),
             )
             return None
+        # Rejected non-push platforms (``api_server``, ``api_server:sess``, …)
+        # also resolve to zero targets. Treat them as local-only so interval
+        # jobs do not stamp last_delivery_error forever (#83484). Unknown but
+        # push-shaped delivers (typo home channel, etc.) still warn.
+        raw_parts = [p.strip() for p in deliver_value.split(",") if p.strip()]
+        if raw_parts and all(
+            not _is_known_delivery_platform(p.split(":", 1)[0])
+            and p.lower() not in _ROUTING_TOKENS
+            for p in raw_parts
+        ):
+            logger.info(
+                "Job '%s': deliver=%s cannot receive push delivery — "
+                "skipping (output saved in last_output)",
+                job.get("name", job.get("id", "?")),
+                deliver_value,
+            )
+            return None
         msg = f"no delivery target resolved for deliver={deliver_value}"
         logger.warning("Job '%s': %s", job["id"], msg)
         return msg
@@ -1826,6 +1913,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         )
         delivered = False
         target_errors = []
+        # When a live send reports a structural permanent failure (e.g. the
+        # api_server adapter's "HTTP request/response, not send()" contract),
+        # skip the standalone fallback — it cannot succeed either and only
+        # duplicates the ERROR log every tick (#83484).
+        skip_standalone_for_permanent = False
 
         # Continuable cron surface (D1/D2/D6): resolve the delivery surface for
         # this platform generically from its config ``extra``. Default "thread"
@@ -2115,15 +2207,33 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                     f"live adapter send to {platform_name}:{chat_id} "
                                     f"returned unconfirmed result ({shape}, error={err})"
                                 )
-                                if transport is not None and transport.is_relay:
+                                if _is_permanent_delivery_failure(err):
+                                    # Structural non-retryable failure (api_server
+                                    # push contract, etc.) — standalone cannot
+                                    # succeed either. Record once and skip the
+                                    # second attempt so interval jobs do not
+                                    # ERROR-spam every tick (#83484).
+                                    # adapter_ok must be False so the success
+                                    # branch below does not mark delivered=True.
+                                    logger.warning(
+                                        "Job '%s': permanent delivery failure to "
+                                        "%s:%s — %s (skipping standalone retry)",
+                                        job["id"], platform_name, chat_id, err,
+                                    )
+                                    target_errors.append(msg)
+                                    adapter_ok = False
+                                    skip_standalone_for_permanent = True
+                                elif transport is not None and transport.is_relay:
                                     logger.warning("Job '%s': %s", job["id"], msg)
+                                    target_errors.append(msg)
+                                    adapter_ok = False  # fall through to standalone path
                                 else:
                                     logger.warning(
                                         "Job '%s': %s, falling back to standalone",
                                         job["id"], msg,
                                     )
-                                target_errors.append(msg)
-                                adapter_ok = False  # fall through to standalone path
+                                    target_errors.append(msg)
+                                    adapter_ok = False  # fall through to standalone path
                             elif (
                                 send_raw_response
                                 and thread_id
@@ -2224,6 +2334,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     )
                 delivery_errors.extend(target_errors)
                 continue
+            if skip_standalone_for_permanent:
+                # Permanent structural failure already logged at WARNING.
+                # Do NOT stamp a sticky delivery_error: interval jobs would
+                # re-arm with last_delivery_error forever even though no
+                # amount of retry can succeed (#83484). Local semantics.
+                continue
             # If the interpreter is finalizing (gateway SIGTERM / restart /
             # OOM), scheduling any new delivery is futile — asyncio.run and a
             # fresh ThreadPoolExecutor both raise "cannot schedule new futures
@@ -2297,6 +2413,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # Not inside an except block — the error comes from the send
                 # result dict, so there is no traceback to attach.
                 msg = f"delivery error: {result['error']} (target {platform_name}:{chat_id})"
+                if _is_permanent_delivery_failure(result.get("error")):
+                    # Standalone hit the same structural non-push contract
+                    # (api_server). Log once at WARNING; no sticky error (#83484).
+                    logger.warning(
+                        "Job '%s': permanent delivery failure to %s:%s — %s "
+                        "(no retry)",
+                        job["id"], platform_name, chat_id, result.get("error"),
+                    )
+                    continue
                 logger.error("Job '%s': %s", job["id"], msg)
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
