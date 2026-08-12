@@ -882,11 +882,19 @@ class ShellFileOperations(FileOperations):
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
     
-    def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
+    def _is_likely_binary(self, path: str, content_sample: str = None,
+                          sample_truncated: bool = False) -> bool:
         """
         Check if a file is likely binary.
         
         Uses extension check (fast) + content analysis (fallback).
+        
+        ``sample_truncated`` must be True when ``content_sample`` came from a
+        byte-capped read (e.g. ``head -c 1000``) of a larger file: the cap can
+        split a UTF-8 multi-byte char in half, and the terminal env's
+        errors="replace" decode turns that single truncated sequence into one
+        trailing U+FFFD. That artifact is not mojibake and must not flip a
+        legitimate text file to binary.
         """
         ext = os.path.splitext(path)[1].lower()
         if ext in BINARY_EXTENSIONS:
@@ -903,9 +911,18 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            sample = content_sample[:1000]
+            if sample_truncated:
+                # A byte-capped sample can end with exactly one U+FFFD that is
+                # a truncation artifact: `head -c 1000` split a multi-byte
+                # UTF-8 char, and errors="replace" emitted a replacement char
+                # for the incomplete sequence. Real mojibake U+FFFDs are
+                # decoded per invalid byte, so they can trail in runs — strip
+                # only the single artifact, never genuine replacement chars.
+                sample = sample[:-1] if sample.endswith("\ufffd") else sample
+            if "\ufffd" in sample:
                 return True
-            non_printable = sum(1 for c in content_sample[:1000]
+            non_printable = sum(1 for c in sample
                                if ord(c) < 32 and c not in '\n\r\t')
             return non_printable / min(len(content_sample), 1000) > 0.30
         
@@ -1193,7 +1210,7 @@ class ShellFileOperations(FileOperations):
         sample_result = self._exec(sample_cmd)
         sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
         
-        if self._is_likely_binary(path, sample_output):
+        if self._is_likely_binary(path, sample_output, sample_truncated=file_size > 1000):
             return ReadResult(
                 is_binary=True,
                 file_size=file_size,
@@ -1309,7 +1326,7 @@ class ShellFileOperations(FileOperations):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
         sample_result = self._exec(f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null")
         sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
-        if self._is_likely_binary(path, sample_output):
+        if self._is_likely_binary(path, sample_output, sample_truncated=file_size > 1000):
             return ReadResult(
                 is_binary=True, file_size=file_size,
                 error="Binary file — cannot display as text."

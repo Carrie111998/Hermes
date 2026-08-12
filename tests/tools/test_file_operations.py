@@ -255,10 +255,15 @@ def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMoc
     env.cwd = cwd
 
     def execute(command, **kwargs):
+        # Mirror the production local env: stdout is decoded as UTF-8 with
+        # errors="replace", so byte-capped reads (head -c 1000) that split a
+        # multi-byte char surface a trailing U+FFFD instead of crashing.
         completed = subprocess.run(
             command,
             shell=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             input=kwargs.get("stdin_data"),
         )
@@ -673,3 +678,49 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+    def test_trailing_single_replacement_char_from_byte_cap_is_artifact(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # Regression: read_file samples with `head -c 1000`; for a >1KB UTF-8
+        # file the cap can split a multi-byte char, and the env's
+        # errors="replace" decode turns that incomplete sequence into one
+        # trailing U+FFFD. That artifact is not mojibake — the file is valid
+        # UTF-8 text and must not flip to binary.
+        sample = "中文行内容测试0\n" * 43 + "中文" + "\ufffd"
+        assert ops._is_likely_binary("notes.md", sample, sample_truncated=True) is False
+        # The identical sample from an uncapped read is genuine mojibake.
+        assert ops._is_likely_binary("notes.md", sample, sample_truncated=False) is True
+
+    def test_trailing_run_of_replacement_chars_still_binary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # Real mojibake decodes per invalid byte, so U+FFFD trails in runs;
+        # only a *single* trailing replacement char is attributable to a
+        # byte-capped truncation artifact. A run must stay binary.
+        mojibake = "plain text\n" + "\ufffd" * 5
+        assert ops._is_likely_binary("notes.txt", mojibake, sample_truncated=True) is True
+
+    def test_long_utf8_chinese_file_reads_as_text(self, tmp_path):
+        """Regression: >1KB UTF-8 Chinese text was misflagged binary because
+        head -c 1000 split a multi-byte char, leaving a U+FFFD artifact."""
+        path = tmp_path / "chinese.md"
+        path.write_bytes(("中文行内容测试0\n" * 45).encode("utf-8"))
+        assert path.stat().st_size > 1000
+
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        result = ops.read_file(str(path))
+
+        assert result.is_binary is False
+        assert result.error is None
+        assert "中文行内容测试0" in result.content
+
+    def test_long_latin1_file_still_flagged_binary(self, tmp_path):
+        """True mojibake (non-UTF-8 bytes) must still be flagged binary."""
+        path = tmp_path / "latin1.txt"
+        path.write_bytes(("café résumé\n" * 100).encode("latin-1"))
+        assert path.stat().st_size > 1000
+
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        result = ops.read_file(str(path))
+
+        assert result.is_binary is True
+        assert result.error is not None
