@@ -844,6 +844,16 @@ skills:
   #   - ~/.agents/skills
   #   - /home/shared/team-skills
 
+  # Optional self-hosted SkillHub registry. When configured, SkillHub appears
+  # as a first-class source for `hermes skills search/inspect/install/check/update`.
+  # The token must remain in the profile secret environment (`SKILLHUB_TOKEN`);
+  # do not put credentials in config.yaml. Background skill reviews refresh
+  # already-installed SkillHub skills through the normal scanner by default.
+  # skillhub:
+  #   registry: "https://skillhub.example.internal"
+  #   namespace: "company-common"   # optional; filters search and bare names
+  #   auto_update: true              # default true when registry is configured
+
 # =============================================================================
 # Agent Behavior
 # =============================================================================

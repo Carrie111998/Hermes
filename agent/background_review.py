@@ -655,6 +655,7 @@ def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
     prompt: str,
+    review_skills: bool = False,
 ) -> None:
     """Worker function executed in the background-review daemon thread.
 
@@ -684,6 +685,7 @@ def _run_review_in_thread(
 
     review_agent = None
     review_messages: List[Dict] = []
+    skillhub_refresh_changed = False
 
     def _unregister_review_agent(agent_ref) -> None:
         """Idempotent: clears the review fork from both tracking slots.
@@ -720,6 +722,29 @@ def _run_review_in_thread(
         # thread's writes to devnull and leaves all other threads on the real
         # streams.
         with thread_scoped_silence():
+            # SkillHub is an opt-in source. Refresh only when this review has
+            # the skills curator enabled, and use the same quarantine/scanner
+            # path as `hermes skills update`. The current live turn is never
+            # rebuilt mid-turn; after a successful refresh the parent's cache
+            # is invalidated so its next turn sees the new skill content.
+            if review_skills:
+                try:
+                    from tools.skills_hub import refresh_skillhub_installed_skills
+
+                    refresh_results = refresh_skillhub_installed_skills()
+                    skillhub_refresh_changed = any(
+                        item.get("status") == "updated"
+                        for item in refresh_results
+                        if isinstance(item, dict)
+                    )
+                    if skillhub_refresh_changed:
+                        # Do not rebuild the parent prompt from this worker.
+                        # Mark it stale for the next foreground turn instead.
+                        setattr(agent, "_cached_system_prompt", None)
+                        logger.info("Background review refreshed installed SkillHub skills")
+                except Exception as exc:
+                    logger.warning("Background SkillHub refresh failed: %s", exc)
+
             # Inherit the parent agent's live runtime (provider, model,
             # base_url, api_key, api_mode) so the fork uses the exact
             # same credentials the main turn is using.  Without this,
@@ -876,7 +901,7 @@ def _run_review_in_thread(
             # runs on the SAME model (not routed). When routed to a different
             # model the parent's cached prompt is for the wrong model/cache key
             # and would miss anyway, so let the routed fork build its own.
-            if not _routed:
+            if not _routed and not skillhub_refresh_changed:
                 review_agent._cached_system_prompt = agent._cached_system_prompt
                 # Defensive: pin session_start + session_id to the
                 # parent's so any code path that re-renders parts of
@@ -886,6 +911,11 @@ def _run_review_in_thread(
                 # rebuild path, but these pins guarantee parity even
                 # if a future code path bypasses the cache.
                 review_agent.session_start = agent.session_start
+            else:
+                # A provider refresh changed the skill documents that belong
+                # in the fork prompt. Rebuild this fork's prompt rather than
+                # copying the parent's stale cached prefix.
+                setattr(review_agent, "_cached_system_prompt", None)
             review_agent.session_id = agent.session_id
             # The fork shares the parent's live session_id (pinned above for
             # prefix-cache parity). It is single-lifecycle and calls close()
@@ -1129,7 +1159,7 @@ def spawn_background_review_thread(
         )
 
     def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+        _run_review_in_thread(agent, messages_snapshot, prompt, review_skills)
 
     return _target, prompt
 

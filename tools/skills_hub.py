@@ -132,7 +132,7 @@ class SkillMeta:
     """Minimal metadata returned by search results."""
     name: str
     description: str
-    source: str           # "official", "github", "clawhub", "lobehub"
+    source: str           # "official", "github", "clawhub", "lobehub", "skillhub"
     identifier: str       # source-specific ID (e.g. "openai/skills/skill-creator")
     trust_level: str      # "builtin" | "trusted" | "community"
     repo: Optional[str] = None
@@ -505,6 +505,373 @@ class SkillSource(ABC):
     def trust_level_for(self, identifier: str) -> str:
         """Determine trust level for a skill from this source."""
         return "community"
+
+
+# ---------------------------------------------------------------------------
+# SkillHub source adapter
+# ---------------------------------------------------------------------------
+
+_SKILLHUB_PART_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _skillhub_settings() -> Optional[Dict[str, Any]]:
+    """Return configured SkillHub connection settings, or ``None``.
+
+    The registry URL and namespace are ordinary profile configuration. The
+    bearer token is deliberately secret-only: it is never read from the YAML
+    config or included in logs. Environment variables are supported for
+    headless deployments and take precedence over the YAML URL/namespace.
+    """
+    config: Dict[str, Any] = {}
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        loaded = load_config_readonly()
+        if isinstance(loaded, dict):
+            config = loaded
+    except Exception:
+        logger.debug("Unable to load SkillHub config", exc_info=True)
+
+    skills_config = config.get("skills", {})
+    skillhub_config = (
+        skills_config.get("skillhub", {})
+        if isinstance(skills_config, dict)
+        else {}
+    )
+    if not isinstance(skillhub_config, dict):
+        skillhub_config = {}
+
+    registry = (
+        os.environ.get("HERMES_SKILLHUB_REGISTRY")
+        or os.environ.get("SKILLHUB_REGISTRY")
+        or skillhub_config.get("registry")
+    )
+    if not isinstance(registry, str) or not registry.strip():
+        return None
+
+    namespace = (
+        os.environ.get("HERMES_SKILLHUB_NAMESPACE")
+        or os.environ.get("SKILLHUB_NAMESPACE")
+        or skillhub_config.get("namespace")
+        or ""
+    )
+    if not isinstance(namespace, str):
+        namespace = ""
+
+    auto_update = skillhub_config.get("auto_update", True)
+    if isinstance(auto_update, str):
+        auto_update = auto_update.strip().lower() in {"1", "true", "yes", "on"}
+
+    try:
+        from agent.secret_scope import get_secret
+
+        token = get_secret("HERMES_SKILLHUB_TOKEN") or get_secret("SKILLHUB_TOKEN")
+    except Exception:
+        token = os.environ.get("HERMES_SKILLHUB_TOKEN") or os.environ.get("SKILLHUB_TOKEN")
+
+    return {
+        "registry": registry.strip().rstrip("/"),
+        "namespace": namespace.strip(),
+        "token": token,
+        "auto_update": bool(auto_update),
+    }
+
+
+class SkillHubSource(SkillSource):
+    """Read-only SkillHub REST adapter.
+
+    SkillHub's CLI API is used directly so Hermes does not need the SkillHub
+    CLI installed. Identifiers are explicit and provenance-safe:
+    ``skillhub://<namespace>/<slug>``. The registry URL is configuration, not
+    skill metadata, so a fetched bundle cannot redirect Hermes to another
+    registry during resolution.
+    """
+
+    API_PREFIX = "/api/cli/v1"
+
+    def __init__(
+        self,
+        registry: str,
+        *,
+        namespace: str = "",
+        token: Optional[str] = None,
+    ):
+        parsed = urlparse(registry.strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("SkillHub registry must be an absolute HTTP(S) URL")
+        if parsed.username or parsed.password:
+            raise ValueError("SkillHub registry must not contain credentials")
+        self.registry = registry.strip().rstrip("/")
+        self.namespace = self._validate_part(namespace, "namespace") if namespace else ""
+        self.token = token
+
+    @classmethod
+    def from_config(cls) -> Optional["SkillHubSource"]:
+        settings = _skillhub_settings()
+        if not settings:
+            return None
+        try:
+            return cls(
+                settings["registry"],
+                namespace=settings.get("namespace", ""),
+                token=settings.get("token"),
+            )
+        except ValueError as exc:
+            logger.warning("Ignoring invalid SkillHub configuration: %s", exc)
+            return None
+
+    @staticmethod
+    def _validate_part(value: str, label: str) -> str:
+        if not isinstance(value, str) or not _SKILLHUB_PART_RE.fullmatch(value):
+            raise ValueError(f"SkillHub {label} is invalid")
+        return value
+
+    def source_id(self) -> str:
+        return "skillhub"
+
+    def trust_level_for(self, identifier: str) -> str:
+        # Registry provenance is useful, but all remote content still goes
+        # through the normal Hermes scanner and install policy.
+        return "community"
+
+    def _headers(self) -> Dict[str, str]:
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        return headers
+
+    def _url(self, path: str) -> str:
+        return f"{self.registry}{self.API_PREFIX}{path}"
+
+    def _request_json(self, path: str, params: Optional[Dict[str, str]] = None) -> Optional[Any]:
+        url = self._url(path)
+        try:
+            response = httpx.get(
+                url,
+                params=params or {},
+                headers=self._headers(),
+                timeout=20,
+                follow_redirects=True,
+            )
+        except httpx.HTTPError as exc:
+            logger.debug("SkillHub request failed for %s: %s", url, exc)
+            return None
+        if response.status_code != 200:
+            logger.debug("SkillHub request for %s returned %s", url, response.status_code)
+            return None
+        try:
+            envelope = response.json()
+        except (ValueError, json.JSONDecodeError):
+            logger.debug("SkillHub returned invalid JSON for %s", url)
+            return None
+        if not isinstance(envelope, dict):
+            return None
+        code = envelope.get("code")
+        if code not in (None, 0, "0"):
+            logger.debug("SkillHub rejected %s: %s", url, envelope.get("msg", code))
+            return None
+        return envelope.get("data")
+
+    def _parse_identifier(self, identifier: str) -> Optional[Tuple[str, str]]:
+        raw = identifier.strip()
+        if raw.startswith("skillhub://"):
+            parsed = urlsplit(raw)
+            namespace, slug = parsed.netloc, parsed.path.strip("/")
+        else:
+            if raw.startswith("skillhub/"):
+                raw = raw[len("skillhub/"):]
+            parts = raw.strip("/").split("/", 1)
+            if len(parts) == 2:
+                namespace, slug = parts
+            elif len(parts) == 1 and self.namespace:
+                namespace, slug = self.namespace, parts[0]
+            else:
+                return None
+        if not namespace or not slug or "/" in slug:
+            return None
+        try:
+            return self._validate_part(namespace, "namespace"), self._validate_part(slug, "slug")
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _identifier(namespace: str, slug: str) -> str:
+        return f"skillhub://{namespace}/{slug}"
+
+    def search(self, query: str, limit: int = 10) -> List[SkillMeta]:
+        data = self._request_json(
+            "/skills/search",
+            params={
+                "q": query or "",
+                "limit": str(100 if limit <= 0 else min(limit, 100)),
+            },
+        )
+        if not isinstance(data, dict):
+            return []
+        items = data.get("items")
+        if not isinstance(items, list):
+            return []
+        results: List[SkillMeta] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            namespace = item.get("namespace")
+            slug = item.get("slug")
+            if not isinstance(namespace, str) or not isinstance(slug, str):
+                continue
+            if self.namespace and namespace != self.namespace:
+                continue
+            try:
+                namespace = self._validate_part(namespace, "namespace")
+                slug = self._validate_part(slug, "slug")
+            except ValueError:
+                continue
+            results.append(SkillMeta(
+                name=slug,
+                description=str(item.get("summary") or "SkillHub skill"),
+                source=self.source_id(),
+                identifier=self._identifier(namespace, slug),
+                trust_level=self.trust_level_for(slug),
+                path=slug,
+                extra={
+                    "registry": self.registry,
+                    "namespace": namespace,
+                    "latest_version": item.get("latestVersion"),
+                },
+            ))
+        return results[:limit] if limit > 0 else results
+
+    def _resolve(self, identifier: str) -> Optional[Dict[str, Any]]:
+        parsed = self._parse_identifier(identifier)
+        if not parsed:
+            return None
+        namespace, slug = parsed
+        data = self._request_json(f"/skills/{namespace}/{slug}/resolve")
+        return data if isinstance(data, dict) else None
+
+    def inspect(self, identifier: str) -> Optional[SkillMeta]:
+        data = self._resolve(identifier)
+        parsed = self._parse_identifier(identifier)
+        if not data or not parsed:
+            return None
+        namespace, slug = parsed
+        version = data.get("version")
+        return SkillMeta(
+            name=slug,
+            description=f"SkillHub skill in namespace {namespace}",
+            source=self.source_id(),
+            identifier=self._identifier(namespace, slug),
+            trust_level=self.trust_level_for(identifier),
+            path=slug,
+            extra={
+                "registry": self.registry,
+                "namespace": namespace,
+                "version": version,
+                "fingerprint": data.get("fingerprint"),
+                "source_url": self._url(f"/skills/{namespace}/{slug}/resolve"),
+            },
+        )
+
+    def _download(self, namespace: str, slug: str, version: Optional[str]) -> Optional[bytes]:
+        self._validate_part(namespace, "namespace")
+        self._validate_part(slug, "slug")
+        if version:
+            self._validate_part(str(version), "version")
+            path = f"/skills/{namespace}/{slug}/versions/{version}/download"
+        else:
+            path = f"/skills/{namespace}/{slug}/download"
+        current_url = self._url(path)
+        from tools.url_safety import SSRFConnectionBlocked, create_ssrf_safe_client
+
+        for _ in range(_MAX_SKILL_FETCH_REDIRECTS + 1):
+            if not is_safe_url(current_url) or check_website_access(current_url):
+                logger.warning("Blocked unsafe SkillHub download URL: %s", current_url)
+                return None
+            headers = self._headers() if urlparse(current_url).netloc == urlparse(self.registry).netloc else {}
+            try:
+                with create_ssrf_safe_client(timeout=30, follow_redirects=False) as client:
+                    response = client.get(current_url, headers=headers)
+            except (SSRFConnectionBlocked, httpx.HTTPError) as exc:
+                logger.debug("SkillHub download failed for %s: %s", current_url, exc)
+                return None
+            if response.status_code in _REDIRECT_STATUS_CODES:
+                location = response.headers.get("location")
+                if not location:
+                    return None
+                current_url = urljoin(current_url, location)
+                continue
+            if response.status_code != 200:
+                logger.debug("SkillHub download returned %s for %s", response.status_code, current_url)
+                return None
+            return response.content
+        logger.warning("SkillHub download exceeded redirect limit for %s", current_url)
+        return None
+
+    @staticmethod
+    def _extract_zip(content: bytes) -> Dict[str, Union[str, bytes]]:
+        import io
+        import zipfile
+
+        files: Dict[str, Union[str, bytes]] = {}
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                for info in archive.infolist():
+                    if info.is_dir() or info.file_size > 500_000:
+                        continue
+                    try:
+                        name = _validate_bundle_rel_path(info.filename)
+                    except ValueError:
+                        logger.debug("Skipping unsafe SkillHub ZIP member: %s", info.filename)
+                        continue
+                    try:
+                        raw = archive.read(info.filename)
+                        files[name] = raw.decode("utf-8")
+                    except (UnicodeDecodeError, KeyError):
+                        logger.debug("Skipping non-text SkillHub ZIP member: %s", name)
+        except zipfile.BadZipFile:
+            logger.warning("SkillHub returned an invalid ZIP bundle")
+            return {}
+        return files
+
+    def fetch(self, identifier: str) -> Optional[SkillBundle]:
+        parsed = self._parse_identifier(identifier)
+        resolved = self._resolve(identifier)
+        if not parsed or not resolved:
+            return None
+        namespace, slug = parsed
+        version = resolved.get("version")
+        content = self._download(namespace, slug, str(version) if version else None)
+        if content is None:
+            return None
+        files = self._extract_zip(content)
+        if "SKILL.md" not in files:
+            logger.warning("SkillHub bundle %s/%s has no root SKILL.md", namespace, slug)
+            return None
+        name = slug
+        skill_md = files.get("SKILL.md")
+        if isinstance(skill_md, str) and skill_md.startswith("---"):
+            try:
+                frontmatter = yaml.safe_load(skill_md.split("---", 2)[1]) or {}
+                candidate = frontmatter.get("name") if isinstance(frontmatter, dict) else None
+                if isinstance(candidate, str) and _SKILLHUB_PART_RE.fullmatch(candidate):
+                    name = candidate
+            except yaml.YAMLError:
+                pass
+        return SkillBundle(
+            name=name,
+            files=files,
+            source=self.source_id(),
+            identifier=self._identifier(namespace, slug),
+            trust_level=self.trust_level_for(identifier),
+            metadata={
+                "registry": self.registry,
+                "namespace": namespace,
+                "slug": slug,
+                "version": version,
+                "fingerprint": resolved.get("fingerprint"),
+                "source_url": self._url(f"/skills/{namespace}/{slug}/resolve"),
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3998,7 +4365,7 @@ def install_from_quarantine(
         trust_level=bundle.trust_level,
         scan_verdict=scan_result.verdict,
         skill_hash=content_hash(install_dir),
-        install_path=str(install_dir.relative_to(_skills_dir())),
+        install_path=str(install_dir.relative_to(_skills_dir().resolve())),
         files=list(bundle.files.keys()),
         metadata=bundle.metadata,
         scan_provenance=scan_provenance or getattr(scan_result, "scan_provenance", None),
@@ -4160,6 +4527,121 @@ def check_for_skill_updates(
         })
 
     return results
+
+
+def refresh_skillhub_installed_skills(
+    *,
+    lock: Optional[HubLockFile] = None,
+    sources: Optional[List[SkillSource]] = None,
+) -> List[dict]:
+    """Refresh configured SkillHub installs through the normal install gate.
+
+    This is intentionally a non-UI helper for background review and other
+    autonomous callers. It only considers lock entries whose source is exactly
+    ``skillhub`` and only runs when a SkillHub registry is configured with
+    ``skills.skillhub.auto_update`` enabled. Every update is fetched,
+    quarantined, scanned, and installed using the same path as the interactive
+    ``hermes skills update`` command.
+
+    Returns compact per-skill results. A failed or blocked update is reported
+    in the result and never aborts the remaining refreshes.
+    """
+    settings = _skillhub_settings()
+    if not settings or not settings.get("auto_update", True):
+        return []
+
+    lock = lock or HubLockFile()
+    if sources is None:
+        source = SkillHubSource.from_config()
+        sources = [source] if source is not None else []
+    skillhub_sources = [src for src in sources if _source_matches(src, "skillhub")]
+    if not skillhub_sources:
+        return []
+
+    installed = [
+        entry for entry in lock.list_installed()
+        if entry.get("source") == "skillhub"
+    ]
+    refreshed: List[dict] = []
+
+    for entry in installed:
+        name = str(entry.get("name", ""))
+        try:
+            results = check_for_skill_updates(
+                name=name,
+                lock=lock,
+                sources=skillhub_sources,
+            )
+            result = results[0] if results else {"status": "unavailable"}
+            if result.get("status") != "update_available":
+                refreshed.append({"name": name, "status": result.get("status", "unavailable")})
+                continue
+
+            bundle = result.get("bundle")
+            if not isinstance(bundle, SkillBundle):
+                refreshed.append({"name": name, "status": "unavailable"})
+                continue
+            # The installed name is the lockfile identity. Preserve it even
+            # if a remote frontmatter edit changes its display name.
+            bundle.name = name
+            install_path = str(entry.get("install_path", ""))
+            path_parts = PurePosixPath(install_path).parts
+            if not path_parts or path_parts[-1] != name:
+                refreshed.append({"name": name, "status": "blocked", "reason": "invalid install path"})
+                continue
+            category = "/".join(path_parts[:-1])
+
+            q_path = quarantine_bundle(bundle)
+            try:
+                from tools.skills_guard import scan_skill_cached, should_allow_install
+
+                scan_result, scan_provenance = scan_skill_cached(
+                    q_path,
+                    source=bundle.identifier,
+                    source_url=source_url_for_bundle(bundle),
+                    cache_dir=_hub_dir() / "scan-cache",
+                )
+                allowed, reason = should_allow_install(scan_result, force=True)
+                if not allowed:
+                    shutil.rmtree(q_path, ignore_errors=True)
+                    append_audit_log(
+                        "BLOCKED", name, bundle.source, bundle.trust_level,
+                        scan_result.verdict, str(reason),
+                    )
+                    refreshed.append({"name": name, "status": "blocked", "reason": reason})
+                    continue
+                install_from_quarantine(
+                    q_path,
+                    name,
+                    category,
+                    bundle,
+                    scan_result,
+                    scan_provenance,
+                )
+                refreshed.append({
+                    "name": name,
+                    "status": "updated",
+                    "latest_hash": result.get("latest_hash", ""),
+                })
+            except Exception as exc:
+                shutil.rmtree(q_path, ignore_errors=True)
+                logger.warning("SkillHub background refresh failed for %s: %s", name, exc)
+                refreshed.append({"name": name, "status": "failed", "reason": str(exc)})
+        except Exception as exc:
+            logger.warning("SkillHub background refresh failed for %s: %s", name, exc)
+            refreshed.append({"name": name, "status": "failed", "reason": str(exc)})
+
+    if any(item.get("status") == "updated" for item in refreshed):
+        # The current turn's prompt is not rebuilt here. Clear the shared
+        # skills snapshot so the next turn sees the newly installed content.
+        try:
+            from agent.prompt_builder import clear_skills_system_prompt_cache
+
+            clear_skills_system_prompt_cache(clear_snapshot=True)
+        except Exception:
+            logger.debug("Unable to clear the skills prompt cache after SkillHub refresh", exc_info=True)
+
+    return refreshed
 
 
 # ---------------------------------------------------------------------------
@@ -4464,12 +4946,23 @@ def create_source_router(auth: Optional[GitHubAuth] = None) -> List[SkillSource]
         HermesIndexSource(auth=auth), # Centralized index (search + resolved install paths)
         SkillsShSource(auth=auth),
         WellKnownSkillSource(),
+    ]
+
+    # SkillHub is deliberately opt-in. A normal Hermes installation must not
+    # add a new network source unless a registry is configured for the active
+    # profile. The provider is still a first-class source once enabled, so
+    # search, inspect, install, check, and update all use the same router.
+    skillhub = SkillHubSource.from_config()
+    if skillhub is not None:
+        sources.append(skillhub)
+
+    sources.extend([
         UrlSource(),                  # Direct HTTP(S) URL to a SKILL.md file
         GitHubSource(auth=auth, extra_taps=extra_taps),
         ClawHubSource(),
         LobeHubSource(),
         BrowseShSource(),   # browse.sh: 169+ site-specific browser automation skills
-    ]
+    ])
 
     return sources
 
