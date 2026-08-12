@@ -10385,6 +10385,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.undo_last(_undo_n)
         elif canonical == "branch":
             self._handle_branch_command(cmd_original)
+        elif canonical == "merge":
+            self._handle_merge_command(cmd_original)
         elif canonical == "save":
             self.save_conversation()
         elif canonical == "cron":

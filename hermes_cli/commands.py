@@ -127,6 +127,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="<platform>", cli_only=True),
     CommandDef("branch", "Branch the current session (explore a different path)", "Session",
                aliases=("fork",), args_hint="[name]"),
+    CommandDef("merge", "Merge two or more sessions into one combined thread", "Session",
+               args_hint="<session_id_1> <session_id_2> [...] [--mode interleave|append] [--title ...]"),
     CommandDef("compress", "Compress conversation context (add 'here [N]' to keep recent N turns; --preview shows what would happen)", "Session",
                aliases=("compact",), args_hint="[here [N] | focus topic | --preview|--dry-run]"),
     CommandDef("rollback", "List or restore filesystem checkpoints", "Session",

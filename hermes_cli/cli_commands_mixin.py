@@ -1333,6 +1333,47 @@ class CLICommandsMixin:
         _cprint(f"  Original session: {parent_session_id}")
         _cprint(f"  Branch session:   {new_session_id}")
 
+    def _handle_merge_command(self, cmd_original: str) -> None:
+        """Handle /merge <session_id_1> <session_id_2> [...] — merge sessions.
+
+        Delegates to ~/.hermes/scripts/merge-sessions.py which reads from
+        state.db, interleaves (or appends) messages, and registers a new
+        merged session.
+        """
+        from cli import _cprint
+
+        parts = cmd_original.split(None, 1)
+        args = parts[1].strip() if len(parts) > 1 else ""
+
+        if not args:
+            _cprint("  Usage: /merge <session_id_1> <session_id_2> [...]")
+            _cprint("         /merge <id1> <id2> --mode append")
+            _cprint("         /merge <id1> <id2> --dry-run")
+            _cprint("")
+            _cprint("  Tip: use /sessions to browse session IDs.")
+            return
+
+        script = os.path.expanduser("~/.hermes/scripts/merge-sessions.py")
+        if not os.path.isfile(script):
+            _cprint(f"  (x_x) Merge script not found at {script}")
+            return
+
+        import subprocess
+        _cprint(f"  🔀 Merging sessions...")
+        try:
+            result = subprocess.run(
+                [sys.executable, script] + args.split(),
+                capture_output=True, text=True, timeout=30,
+            )
+            for line in result.stdout.splitlines():
+                _cprint(f"  {line}")
+            if result.stderr.strip():
+                _cprint(f"  {result.stderr.strip()}")
+        except subprocess.TimeoutExpired:
+            _cprint("  (x_x) Merge timed out.")
+        except Exception as e:
+            _cprint(f"  (x_x) Merge failed: {e}")
+
     def _handle_personality_command(self, cmd: str):
         """Handle the /personality command to set predefined personalities.
 
