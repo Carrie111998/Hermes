@@ -730,6 +730,9 @@ def test_doctor_section_lines_remediation_is_a_short_one_liner_when_stale(tmp_pa
 
 def test_doctor_section_lines_remediation_is_a_short_one_liner_when_not_stale(tmp_path):
     """Finding C, mirrored for the not-stale remedy."""
+    import re
+    import sys
+
     from hermes_cli.install_doctor import InstallRoot, doctor_section_lines
 
     root_dir = tmp_path / "agent-src"
@@ -748,10 +751,12 @@ def test_doctor_section_lines_remediation_is_a_short_one_liner_when_not_stale(tm
     rows, remediation = doctor_section_lines(probe_fn=fake_probe, root=root)
 
     assert remediation is not None
-    # Bound is generous because this wording names sys.executable, which on
-    # a WindowsApps install can itself run ~150+ chars; the wording around
-    # it stays a concise one-liner, not a reproduction of the full block.
-    assert len(remediation) < 350
+    # Same normalisation as the stale branch above: this wording names
+    # sys.executable, which on a WindowsApps install can itself run ~150+
+    # chars. Measure the prose rather than loosening the bound until the
+    # interpreter path fits under it, so both branches hold one budget.
+    prose = re.sub(r"`[^`]*`", "``", remediation).replace(sys.executable, "")
+    assert len(prose) < 250, remediation
     assert "install_doctor" in remediation
 
 

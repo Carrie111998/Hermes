@@ -23,9 +23,43 @@ def test_observability_source_supports_bundled_and_sibling_layouts(tmp_path):
     assert _observability_source(shared_test) == shared_script
 
 
+def test_observability_source_resolves_from_a_nested_worktree(tmp_path):
+    """A git worktree sits deeper than the two layouts above.
+
+    Checkouts under `<hermes>/agent-src/.claude/worktrees/<name>` put the
+    script five hops up, not three or four, so a fixed-hop lookup raises
+    FileNotFoundError and takes all 22 tests in this file down with it —
+    which reads as a regression when it is only a verification location.
+    """
+    hermes_root = tmp_path / ".hermes"
+    worktree_test = (
+        hermes_root
+        / "agent-src"
+        / ".claude"
+        / "worktrees"
+        / "some-worktree"
+        / "tests"
+        / "devflow_delegation"
+        / "test_observability.py"
+    )
+    script = hermes_root / "profiles" / "main" / "scripts" / "devflow_observability.py"
+    script.parent.mkdir(parents=True)
+    script.touch()
+
+    assert _observability_source(worktree_test) == script
+
+
 def _observability_source(test_file: Path) -> Path:
+    """Locate the deployed observability script above *test_file*.
+
+    Anchored on the marker path rather than a fixed number of parent hops:
+    the bundled layout puts it 3 hops up and the `<hermes>/agent-src` sibling
+    layout 4, but a git worktree is deeper still. Walking the ancestors
+    covers all three and any future checkout depth. Compare the same fix in
+    01cf92357 (Hermes-root paths) and 3b9612474 (SOUL/SKILL paths).
+    """
     relative = Path("profiles") / "main" / "scripts" / "devflow_observability.py"
-    for root in (test_file.parents[2], test_file.parents[3]):
+    for root in test_file.parents:
         source = root / relative
         if source.is_file():
             return source
