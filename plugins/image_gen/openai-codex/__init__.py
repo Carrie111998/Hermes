@@ -104,7 +104,7 @@ _SIZES = {
 
 _CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
-_MAX_REFERENCE_IMAGES = 5
+_MAX_INPUT_IMAGES = 5
 _MAX_INPUT_IMAGE_BYTES = 25 * 1024 * 1024
 # gpt-image-2's Images edit endpoint accepts raster formats only. The
 # shared magic-byte sniffer also recognizes SVG/TIFF/ICO, which the API
@@ -267,7 +267,8 @@ def _normalize_input_images(
         values.append(image_url.strip())
     for ref in normalize_reference_images(reference_image_urls) or []:
         values.append(ref)
-    values = values[:_MAX_REFERENCE_IMAGES]
+    if len(values) > _MAX_INPUT_IMAGES:
+        raise ValueError("Codex image edits accept at most 5 total images")
     return [_to_input_image_part(value) for value in values]
 
 
@@ -405,7 +406,10 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
         # preserving edits instead of unrelated text-to-image redraws.
         return {
             "modalities": ["text", "image"],
-            "max_reference_images": _MAX_REFERENCE_IMAGES,
+            # The tool schema has no separate total-input capability. Reserve
+            # one slot for the primary ``image_url``; calls without a primary
+            # image can still pass five items, enforced below at runtime.
+            "max_reference_images": _MAX_INPUT_IMAGES - 1,
         }
 
     def generate(

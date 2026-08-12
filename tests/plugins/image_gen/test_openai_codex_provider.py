@@ -155,7 +155,8 @@ class TestGenerate:
     def test_capabilities_advertise_image_inputs(self, provider):
         caps = provider.capabilities()
         assert caps["modalities"] == ["text", "image"]
-        assert caps["max_reference_images"] == 5
+        # A primary image consumes one of Codex's five total edit-image slots.
+        assert caps["max_reference_images"] == 4
 
     def test_rejects_non_image_local_source(self, provider, monkeypatch, tmp_path):
         monkeypatch.setattr(
@@ -265,6 +266,9 @@ class TestRequestShape:
         def _handler(request):
             captured["path"] = request.url.path
             captured["accept"] = request.headers["Accept"]
+            captured["authorization"] = request.headers["Authorization"]
+            captured["content_type"] = request.headers["Content-Type"]
+            captured["originator"] = request.headers["originator"]
             captured["turn_id"] = request.headers["x-codex-image-turn-id"]
             captured["payload"] = json.loads(request.content)
             return httpx.Response(
@@ -289,6 +293,9 @@ class TestRequestShape:
         )
         assert captured["path"].endswith("/codex/images/generations")
         assert captured["accept"] == "application/json"
+        assert captured["authorization"] == "Bearer codex-token"
+        assert captured["content_type"] == "application/json"
+        assert captured["originator"] == "codex_cli_rs"
         assert captured["turn_id"]
         assert captured["payload"]["prompt"] == "a cat"
 
@@ -299,6 +306,10 @@ class TestRequestShape:
 
         def _handler(request):
             captured["path"] = request.url.path
+            captured["authorization"] = request.headers["Authorization"]
+            captured["content_type"] = request.headers["Content-Type"]
+            captured["originator"] = request.headers["originator"]
+            captured["turn_id"] = request.headers["x-codex-image-turn-id"]
             captured["payload"] = json.loads(request.content)
             return httpx.Response(
                 200, json={"data": [{"b64_json": _b64_png()}]}, request=request
@@ -326,6 +337,10 @@ class TestRequestShape:
             == _b64_png()
         )
         assert captured["path"].endswith("/codex/images/edits")
+        assert captured["authorization"] == "Bearer codex-token"
+        assert captured["content_type"] == "application/json"
+        assert captured["originator"] == "codex_cli_rs"
+        assert captured["turn_id"]
         assert captured["payload"]["images"] == [{"image_url": image["image_url"]}]
 
     def test_http_error_body_is_truncated_but_preserved(self, monkeypatch):
@@ -385,9 +400,9 @@ class TestRequestShape:
                 "codex-token", prompt="a cat", size="1024x1024", quality="low"
             )
 
-    def test_reference_inputs_are_capped_at_five(self, tmp_path):
+    def test_five_total_input_images_are_accepted(self, tmp_path):
         paths = []
-        for index in range(7):
+        for index in range(5):
             path = tmp_path / f"image-{index}.png"
             path.write_bytes(bytes.fromhex(_PNG_HEX))
             paths.append(str(path))
@@ -398,6 +413,38 @@ class TestRequestShape:
         assert all(
             part["image_url"].startswith("data:image/png;base64,") for part in images
         )
+
+    def test_more_than_five_total_input_images_are_rejected(self, tmp_path):
+        paths = []
+        for index in range(6):
+            path = tmp_path / f"image-{index}.png"
+            path.write_bytes(bytes.fromhex(_PNG_HEX))
+            paths.append(str(path))
+
+        with pytest.raises(ValueError, match="at most 5 total images"):
+            codex_plugin._normalize_input_images(paths[0], paths[1:])
+
+    def test_primary_plus_five_references_returns_invalid_input(
+        self, provider, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(
+            codex_plugin, "_read_codex_access_token", lambda: "codex-token"
+        )
+        paths = []
+        for index in range(6):
+            path = tmp_path / f"image-{index}.png"
+            path.write_bytes(bytes.fromhex(_PNG_HEX))
+            paths.append(str(path))
+
+        result = provider.generate(
+            "edit these",
+            image_url=paths[0],
+            reference_image_urls=paths[1:],
+        )
+
+        assert result["success"] is False
+        assert result["error_type"] == "invalid_image_input"
+        assert "at most 5 total images" in result["error"]
 
 
 # ── Plugin entry point ──────────────────────────────────────────────────────
