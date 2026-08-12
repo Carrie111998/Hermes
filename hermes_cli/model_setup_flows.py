@@ -1522,9 +1522,17 @@ def _model_flow_named_custom(config, provider_info):
     saved_model = provider_info.get("model", "")
     provider_key = (provider_info.get("provider_key") or "").strip()
 
-    # Resolve key from env var if api_key not set directly
+    from hermes_cli.config import get_env_value
+
+    # Resolve key from env var if api_key not set directly. Route the read
+    # through ``get_env_value`` so it honours the per-profile secret scope:
+    # a raw ``os.environ`` read hands this profile whatever key the process
+    # environment holds — another profile's, under the multiplexed gateway —
+    # and the resolved value is then sent as the bearer token to *this*
+    # provider's ``base_url``. Matches the four sibling ``key_env`` reads in
+    # this module and the picker read in ``model_switch``.
     if not api_key and key_env:
-        api_key = os.environ.get(key_env, "")
+        api_key = get_env_value(key_env) or ""
     config_api_key = _custom_provider_api_key_config_value(provider_info, api_key)
 
     # Honor ``discover_models: false`` (default True) — when discovery is
