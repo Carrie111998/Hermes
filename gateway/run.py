@@ -21491,7 +21491,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # path before a draft could be sent; the handler suppresses the
             # non-streaming final at its normal delivery boundary.
             _suppress_public_delivery = bool(
-                getattr(source, "internal_session_id", "").startswith("agent-mail:")
+                (getattr(source, "internal_session_id", "") or "").startswith("agent-mail:")
             )
             _streaming_enabled = (
                 (
