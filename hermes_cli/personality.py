@@ -154,16 +154,19 @@ def personality_selection_mode(cfg: Optional[Dict[str, Any]]) -> str:
 
 
 def resolve_ephemeral_system_prompt(cfg: Optional[Dict[str, Any]]) -> str:
-    """Resolve the session overlay from config.
+    """Resolve the producer-owned baseline loaded for a session.
 
-    ``display.personality`` wins when it names a known personality; otherwise
-    the user-owned ``agent.system_prompt`` applies. Callers should still
-    prefer ``HERMES_EPHEMERAL_SYSTEM_PROMPT`` when that env var is set.
+    In historical ``replace`` mode, a selected personality owns the active
+    system prompt. In ``overlay`` mode, ``agent.system_prompt`` remains the
+    baseline and the selected personality is appended later by a pre-LLM hook.
     """
+    baseline = prompt_text(_get(cfg, "agent", "system_prompt", default=""))
+    if personality_selection_mode(cfg) == "overlay":
+        return baseline
     name = active_personality_name(cfg)
     if name:
         return render_personality_prompt(available_personalities(cfg)[name])
-    return prompt_text(_get(cfg, "agent", "system_prompt", default=""))
+    return baseline
 
 
 def persist_personality(value: Any) -> bool:

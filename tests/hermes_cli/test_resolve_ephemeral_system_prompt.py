@@ -17,6 +17,32 @@ def test_resolve_uses_named_personality_when_set():
     assert resolve_ephemeral_system_prompt_from_config(cfg) == "You are helpful."
 
 
+def test_overlay_mode_preserves_manual_baseline_when_personality_is_selected():
+    cfg = {
+        "display": {"personality": "helpful"},
+        "agent": {
+            "personality_selection_mode": " OvErLaY ",
+            "system_prompt": "<live-card0>\nbaseline truth\n</live-card0>",
+            "personalities": {"helpful": "You are helpful."},
+        },
+    }
+    assert resolve_ephemeral_system_prompt_from_config(cfg) == (
+        "<live-card0>\nbaseline truth\n</live-card0>"
+    )
+
+
+def test_invalid_selection_mode_preserves_replace_behavior():
+    cfg = {
+        "display": {"personality": "helpful"},
+        "agent": {
+            "personality_selection_mode": "unknown",
+            "system_prompt": "manual forever",
+            "personalities": {"helpful": "You are helpful."},
+        },
+    }
+    assert resolve_ephemeral_system_prompt_from_config(cfg) == "You are helpful."
+
+
 def test_resolve_falls_back_to_manual_system_prompt():
     cfg = {
         "display": {"personality": "none"},

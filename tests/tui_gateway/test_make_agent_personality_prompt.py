@@ -61,6 +61,21 @@ def test_make_agent_uses_display_personality_when_set():
     assert kwargs["ephemeral_system_prompt"] == "You are helpful."
 
 
+def test_make_agent_overlay_mode_preserves_producer_owned_baseline():
+    cfg = {
+        "display": {"personality": "helpful"},
+        "agent": {
+            "personality_selection_mode": "overlay",
+            "system_prompt": "<live-card0>\nbaseline truth\n</live-card0>",
+            "personalities": {"helpful": "You are helpful."},
+        },
+    }
+    kwargs = _call_make_agent(cfg)
+    assert kwargs["ephemeral_system_prompt"] == (
+        "<live-card0>\nbaseline truth\n</live-card0>"
+    )
+
+
 def test_make_agent_preserves_manual_prompt_without_personality():
     cfg = {
         "display": {"personality": "none"},
