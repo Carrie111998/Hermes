@@ -9347,7 +9347,7 @@ def _termux_post_pull_wheelhouse_gate(
                 print(f"  Recover manually: git reset --hard {pre_pull_sha}")
         raise SystemExit(1)
 
-    uv_bin = shutil.which("uv")
+    uv_bin = _ensure_uv_for_termux([sys.executable, "-m", "pip"])
     if not uv_bin:
         reject("Termux uv is unavailable; reinstall the Termux uv package")
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, readFileSync } from 'node:fs'
+import { closeSync, existsSync, openSync, readFileSync, readSync } from 'node:fs'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
@@ -87,7 +87,9 @@ if (typeof metadata.bin === 'string') {
 }
 
 if (!binRelative) {
-  console.error(`run-node-package-bin: ${packageName} has no ${binName ? JSON.stringify(binName) : 'unambiguous'} executable in package.json`)
+  console.error(
+    `run-node-package-bin: ${packageName} has no ${binName ? JSON.stringify(binName) : 'unambiguous'} executable in package.json`
+  )
   process.exit(127)
 }
 
@@ -99,10 +101,43 @@ if (rel.startsWith(`..${sep}`) || rel === '..' || isAbsolute(rel) || !existsSync
   process.exit(127)
 }
 
-const result = spawnSync(process.execPath, [executable, ...childArgs], {
+function isNativeExecutable(path) {
+  const header = Buffer.alloc(4)
+  let fd
+  try {
+    fd = openSync(path, 'r')
+    const bytes = readSync(fd, header, 0, header.length, 0)
+    if (bytes < 2) return false
+  } catch {
+    return false
+  } finally {
+    if (fd !== undefined) closeSync(fd)
+  }
+
+  if (header[0] === 0x7f && header.subarray(1, 4).toString('ascii') === 'ELF') return true
+  if (header[0] === 0x4d && header[1] === 0x5a) return true // PE/COFF (MZ)
+
+  const magic = header.toString('hex')
+  return new Set([
+    'feedface', // Mach-O 32-bit
+    'cefaedfe', // Mach-O 32-bit reversed
+    'feedfacf', // Mach-O 64-bit
+    'cffaedfe', // Mach-O 64-bit reversed
+    'cafebabe', // universal/fat Mach-O
+    'bebafeca' // universal/fat Mach-O reversed
+  ]).has(magic)
+}
+
+// Most npm bins are JavaScript files and need the current Node runtime. A few
+// packages (notably esbuild after its postinstall) replace that bin with a
+// platform-native executable. Feeding an ELF/PE/Mach-O binary to Node fails
+// with SyntaxError, so execute native bins directly while keeping JS bins on
+// the exact Node process that invoked this resolver.
+const native = isNativeExecutable(executable)
+const result = spawnSync(native ? executable : process.execPath, native ? childArgs : [executable, ...childArgs], {
   cwd,
   env: process.env,
-  stdio: 'inherit',
+  stdio: 'inherit'
 })
 if (result.error) {
   console.error(`run-node-package-bin: failed to launch ${packageName}: ${result.error.message}`)

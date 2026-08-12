@@ -62,6 +62,49 @@ def test_resolves_hoisted_package_bin_from_nested_workspace(tmp_path: Path) -> N
     assert payload["args"] == ["alpha", "beta"]
 
 
+def test_executes_native_package_bin_directly(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    nested = root / "ui-tui"
+    package = root / "node_modules" / "native-tool"
+    nested.mkdir(parents=True)
+    package.mkdir(parents=True)
+
+    node = Path(_node())
+    suffix = node.suffix if node.suffix else ""
+    bin_relative = f"bin/native{suffix}"
+    native = package / bin_relative
+    native.parent.mkdir()
+    shutil.copy2(node, native)
+    (package / "package.json").write_text(
+        json.dumps({"name": "native-tool", "bin": {"native": bin_relative}}),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            _node(),
+            str(RUNNER),
+            "native-tool",
+            "--bin",
+            "native",
+            "--cwd",
+            str(nested),
+            "--",
+            "-e",
+            "process.stdout.write('native-ok')",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "native-ok"
+
+
 def test_missing_package_fails_without_using_path_shims(tmp_path: Path) -> None:
     result = subprocess.run(
         [_node(), str(RUNNER), "definitely-not-installed", "--cwd", str(tmp_path)],
