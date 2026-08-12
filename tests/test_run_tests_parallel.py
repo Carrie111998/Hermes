@@ -30,6 +30,7 @@ from pathlib import Path
 
 import pytest
 
+from hermes_cli._subprocess_compat import run_text_capture
 from scripts import run_tests_parallel
 
 
@@ -241,18 +242,36 @@ def _make_probe_dir(tmp_path: Path) -> Path:
     return probe_dir
 
 
+def _merged(r: subprocess.CompletedProcess) -> subprocess.CompletedProcess:
+    """Re-merge stderr into stdout, the way ``stderr=subprocess.STDOUT`` did.
+
+    ``run_text_capture`` captures the two streams into separate temp files, so
+    callers asserting on a combined transcript get it back here rather than at
+    every assertion site.
+    """
+    return subprocess.CompletedProcess(
+        r.args, r.returncode, (r.stdout or "") + (r.stderr or ""), "",
+    )
+
+
 def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
     repo_root = Path(__file__).resolve().parent.parent
     runner = repo_root / "scripts" / "run_tests_parallel.py"
-    return subprocess.run(
+    # run_text_capture, not stdout=PIPE: the runner spawns a pytest worker per
+    # file, so every worker is a grandchild of this call and inherits the
+    # capture pipe handles. A worker that outlives the runner holds the write
+    # end open, the pipe never reaches EOF, and the timeout below stops
+    # bounding anything — subprocess.run kills only the runner and then blocks
+    # re-draining. That this runner leaks grandchildren is not hypothetical:
+    # test_grandchild_leak_is_killed_by_runner exists to assert it reaps them,
+    # and that test is POSIX-only because the reaping is killpg-based — so
+    # Windows has no such guarantee and is exactly where the hang lands.
+    return _merged(run_text_capture(
         [sys.executable, str(runner), "--paths", str(probe_dir),
          "-j", "1", "--file-timeout", "30", *extra],
         cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
         timeout=60,
-    )
+    ))
 
 
 def test_bare_q_flag_passes_through(tmp_path: Path) -> None:
@@ -297,12 +316,12 @@ def test_positional_path_not_treated_as_flag(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parent.parent
     runner = repo_root / "scripts" / "run_tests_parallel.py"
     # Pass the probe dir positionally (no --paths), plus a bare -q.
-    proc = subprocess.run(
+    # run_text_capture: pytest workers are grandchildren here — see _run_runner.
+    proc = _merged(run_text_capture(
         [sys.executable, str(runner), str(probe_dir), "-j", "1",
          "--file-timeout", "30", "-q"],
-        cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, timeout=60,
-    )
+        cwd=repo_root, timeout=60,
+    ))
     assert proc.returncode == 0, proc.stdout
     # Discovery found the probe file (2 tests), proving the positional path
     # was consumed as a root, not forwarded to pytest as a bad flag.
@@ -415,7 +434,9 @@ def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    proc = subprocess.run(
+    # run_text_capture: pytest workers are grandchildren here, and the retry
+    # path runs more than one generation of them — see _run_runner.
+    proc = _merged(run_text_capture(
         [
             sys.executable,
             str(runner),
@@ -428,11 +449,8 @@ def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:
             "-q",
         ],
         cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
         timeout=60,
-    )
+    ))
 
     assert proc.returncode == 0, proc.stdout
     assert "FLAKY file" in proc.stdout
@@ -451,7 +469,9 @@ def test_file_retry_does_not_launder_deterministic_failure(tmp_path: Path) -> No
         encoding="utf-8",
     )
 
-    proc = subprocess.run(
+    # run_text_capture: pytest workers are grandchildren here, and the retry
+    # path runs more than one generation of them — see _run_runner.
+    proc = _merged(run_text_capture(
         [
             sys.executable,
             str(runner),
@@ -464,11 +484,8 @@ def test_file_retry_does_not_launder_deterministic_failure(tmp_path: Path) -> No
             "-q",
         ],
         cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
         timeout=60,
-    )
+    ))
 
     assert proc.returncode == 1, proc.stdout
     assert "deterministic regression" in proc.stdout

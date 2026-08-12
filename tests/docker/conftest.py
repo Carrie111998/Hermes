@@ -60,9 +60,22 @@ def built_image() -> str:
     repo_root = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", ".."),
     )
-    result = subprocess.run(
+    # run_text_capture, not capture_output=True: `docker build` is the one
+    # docker subcommand here that is NOT a leaf. It routes through the buildx
+    # CLI plugin, which docker.exe execs as a separate binary
+    # (~/.docker/cli-plugins/docker-buildx.exe) — so buildx is a grandchild of
+    # this call and inherits the capture pipe handles, holding the write end
+    # open. The pipe never reaches EOF, subprocess.run kills only docker.exe at
+    # 1200s and then blocks re-draining. This is a SESSION-scoped fixture, so
+    # that hang takes the entire tests/docker suite with it rather than one
+    # test. The run/exec/logs/rm calls elsewhere in this directory stay on
+    # pipes: container processes are children of the DAEMON, not of docker.exe,
+    # so nothing inherits these handles.
+    from hermes_cli._subprocess_compat import run_text_capture
+
+    result = run_text_capture(
         ["docker", "build", "-t", IMAGE_TAG, repo_root],
-        capture_output=True, text=True, timeout=1200,
+        timeout=1200,
     )
     assert result.returncode == 0, (
         f"docker build failed:\n{result.stderr[-2000:]}"
