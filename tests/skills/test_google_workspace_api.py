@@ -71,11 +71,23 @@ def _write_token(path: Path, *, token="ya29.test", expiry=None, **extra):
 def test_bridge_returns_valid_token(bridge_module, tmp_path):
     """Non-expired token is returned without refresh."""
     future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-    token_path = bridge_module.get_token_path()
+    token_path = bridge_module.get_token_path("jid")
     _write_token(token_path, token="ya29.valid", expiry=future)
 
-    result = bridge_module.get_valid_token()
+    result = bridge_module.get_valid_token("jid")
     assert result == "ya29.valid"
+
+
+def test_bridge_get_token_path_fails_closed_on_unknown_identity(bridge_module):
+    """An unregistered identity must raise, never fall back to jid's path."""
+    with pytest.raises(bridge_module.UnknownGoogleIdentityError):
+        bridge_module.get_token_path("someone-not-registered")
+
+
+def test_bridge_get_token_path_fails_closed_on_missing_identity(bridge_module):
+    """No identity at all must raise, never default to jid."""
+    with pytest.raises(bridge_module.UnknownGoogleIdentityError):
+        bridge_module.get_token_path(None)
 
 
 
@@ -89,7 +101,7 @@ def test_bridge_returns_valid_token(bridge_module, tmp_path):
 def test_bridge_main_injects_token_env(bridge_module, tmp_path):
     """main() sets GOOGLE_WORKSPACE_CLI_TOKEN in subprocess env."""
     future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-    token_path = bridge_module.get_token_path()
+    token_path = bridge_module.get_token_path("jid")
     _write_token(token_path, token="ya29.injected", expiry=future)
 
     captured = {}
@@ -99,13 +111,20 @@ def test_bridge_main_injects_token_env(bridge_module, tmp_path):
         captured["env"] = kwargs.get("env", {})
         return MagicMock(returncode=0)
 
-    with patch.object(sys, "argv", ["gws_bridge.py", "gmail", "+triage"]):
+    with patch.object(sys, "argv", ["gws_bridge.py", "--identity", "jid", "gmail", "+triage"]):
         with patch.object(subprocess, "run", side_effect=capture_run):
             with pytest.raises(SystemExit):
                 bridge_module.main()
 
     assert captured["env"]["GOOGLE_WORKSPACE_CLI_TOKEN"] == "ya29.injected"
     assert captured["cmd"] == ["gws", "gmail", "+triage"]
+
+
+def test_bridge_main_requires_identity_flag(bridge_module):
+    """Omitting --identity must fail closed, not default to any identity."""
+    with patch.object(sys, "argv", ["gws_bridge.py", "gmail", "+triage"]):
+        with pytest.raises(SystemExit):
+            bridge_module.main()
 
 
 def test_api_calendar_list_uses_events_list(api_module):

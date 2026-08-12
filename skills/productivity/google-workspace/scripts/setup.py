@@ -4,21 +4,29 @@
 Fully non-interactive — designed to be driven by the agent via terminal commands.
 The agent mediates between this script and the user (works on CLI, Telegram, Discord, etc.)
 
-Commands:
-  setup.py --check                          # Is auth valid? Exit 0 = yes, 1 = no
-  setup.py --client-secret /path/to.json    # Store OAuth client credentials
-  setup.py --auth-url                       # Print the OAuth URL for user to visit
-  setup.py --auth-code CODE                 # Exchange auth code for token
-  setup.py --revoke                         # Revoke and delete stored token
-  setup.py --install-deps                   # Install Python dependencies only
+--identity is required on every invocation (e.g. 'jid', 'zarkash') — there
+is no default identity, and each identity's credentials are fully isolated
+from every other's (see _google_identities.py).
 
-Agent workflow:
-  1. Run --check. If exit 0, auth is good — skip setup.
-  2. Ask user for client_secret.json path. Run --client-secret PATH.
-  3. Run --auth-url. Send the printed URL to the user.
-  4. User opens URL, authorizes, gets redirected to a page with a code.
-  5. User pastes the code. Agent runs --auth-code CODE.
-  6. Run --check to verify. Done.
+Commands:
+  setup.py --identity jid --check                       # Is auth valid?
+  setup.py --identity jid --client-secret /path/to.json  # Store OAuth client credentials
+  setup.py --identity jid --auth-url                     # Print the OAuth URL for user to visit
+  setup.py --identity jid --auth-code CODE               # Exchange auth code for token
+  setup.py --identity jid --revoke                       # Revoke and delete stored token
+  setup.py --install-deps                                # Install Python dependencies only (identity-agnostic)
+
+Agent workflow (repeat per identity — swap --identity for a different person):
+  1. Run --identity <name> --check. If exit 0, auth is good — skip setup.
+  2. Ask that person for their client_secret.json path. Run --identity <name> --client-secret PATH.
+  3. Run --identity <name> --auth-url. Send the printed URL to them.
+  4. They open the URL, authorize, get redirected to a page with a code. If
+     this is a new identity sharing a device/browser with an existing
+     Google-authenticated identity, remind them to sign out of any other
+     active Google sessions first, so the consent screen can't accidentally
+     authorize the wrong account.
+  5. They paste the code. Agent runs --identity <name> --auth-code CODE.
+  6. Run --identity <name> --check to verify. Done.
 """
 
 from __future__ import annotations  # allow PEP 604 `X | None` on Python 3.9+
@@ -38,22 +46,30 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 from _hermes_home import display_hermes_home, get_hermes_home
+from _google_identities import get_google_credentials, UnknownGoogleIdentityError
 
 HERMES_HOME = get_hermes_home()
-TOKEN_PATH = HERMES_HOME / "google_token.json"
-CLIENT_SECRET_PATH = HERMES_HOME / "google_client_secret.json"
-PENDING_AUTH_PATH = HERMES_HOME / "google_oauth_pending.json"
 
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/contacts.readonly",
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/documents",
-]
+# Resolved per-identity at CLI dispatch time (see _resolve_identity / main()).
+# Defaulted to identity="jid" so a direct module import (as tests do) behaves
+# exactly as it always has. Real CLI usage always goes through main(), where
+# --identity is a required argparse argument with no default.
+TOKEN_PATH, CLIENT_SECRET_PATH, SCOPES = get_google_credentials("jid")
+PENDING_AUTH_PATH = TOKEN_PATH.parent / "google_oauth_pending.json"
+
+
+def _resolve_identity(identity: str | None) -> None:
+    """Re-point TOKEN_PATH/CLIENT_SECRET_PATH/SCOPES/PENDING_AUTH_PATH at the
+    given identity. FAIL-CLOSED: raises for a missing/unregistered identity.
+    """
+    global TOKEN_PATH, CLIENT_SECRET_PATH, SCOPES, PENDING_AUTH_PATH
+    TOKEN_PATH, CLIENT_SECRET_PATH, SCOPES = get_google_credentials(identity)
+    PENDING_AUTH_PATH = TOKEN_PATH.parent / "google_oauth_pending.json"
+    TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        TOKEN_PATH.parent.chmod(0o700)
+    except OSError:
+        pass
 
 # Exact pins: keep in sync with pyproject.toml [project.optional-dependencies].google
 # and tools/lazy_deps.py LAZY_DEPS['skill.google_workspace'].
@@ -83,7 +99,7 @@ def _normalize_authorized_user_payload(payload: dict) -> dict:
     return normalized
 
 
-def _load_token_payload(path: Path = TOKEN_PATH) -> dict:
+def _load_token_payload(path: Path) -> dict:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
@@ -304,6 +320,10 @@ def store_client_secret(path: str):
         sys.exit(1)
 
     CLIENT_SECRET_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    try:
+        CLIENT_SECRET_PATH.chmod(0o600)
+    except OSError:
+        pass
     print(f"OK: Client secret saved to {CLIENT_SECRET_PATH}")
 
 
@@ -444,9 +464,12 @@ def exchange_auth_code(code: str):
         print("Some services may not be available.")
 
     TOKEN_PATH.write_text(json.dumps(token_payload, indent=2), encoding="utf-8")
+    try:
+        TOKEN_PATH.chmod(0o600)
+    except OSError:
+        pass
     PENDING_AUTH_PATH.unlink(missing_ok=True)
     print(f"OK: Authenticated. Token saved to {TOKEN_PATH}")
-    print(f"Profile-scoped token location: {display_hermes_home()}/google_token.json")
 
 
 def revoke():
@@ -484,6 +507,14 @@ def revoke():
 
 def main():
     parser = argparse.ArgumentParser(description="Google Workspace OAuth setup for Hermes")
+    parser.add_argument(
+        "--identity",
+        required=True,
+        help=(
+            "Which person this setup is for (e.g. 'jid', 'zarkash'). "
+            "Required — there is no default identity."
+        ),
+    )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--check", action="store_true", help="Check if auth is valid (exit 0=yes, 1=no)")
     group.add_argument("--check-live", action="store_true", help="Check auth with a real API call (detects disabled_client)")
@@ -493,6 +524,11 @@ def main():
     group.add_argument("--revoke", action="store_true", help="Revoke and delete stored token")
     group.add_argument("--install-deps", action="store_true", help="Install Python dependencies")
     args = parser.parse_args()
+    try:
+        _resolve_identity(args.identity)
+    except UnknownGoogleIdentityError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
 
     if args.check:
         sys.exit(0 if check_auth() else 1)

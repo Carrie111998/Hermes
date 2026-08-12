@@ -5,8 +5,8 @@ Uses the Google Workspace CLI (`gws`) when available, but preserves the
 existing Hermes-facing JSON contract and falls back to the Python client
 libraries if `gws` is not installed.
 
-Usage:
-  python google_api.py gmail search "is:unread" [--max 10]
+Usage (--identity is required — no default, fail-closed):
+  python google_api.py --identity jid gmail search "is:unread" [--max 10]
   python google_api.py gmail get MESSAGE_ID
   python google_api.py gmail send --to user@example.com --subject "Hi" --body "Hello"
   python google_api.py gmail reply MESSAGE_ID --body "Thanks"
@@ -37,21 +37,29 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 from _hermes_home import get_hermes_home
+from _google_identities import get_google_credentials, UnknownGoogleIdentityError
 
 HERMES_HOME = get_hermes_home()
-TOKEN_PATH = HERMES_HOME / "google_token.json"
-CLIENT_SECRET_PATH = HERMES_HOME / "google_client_secret.json"
 
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/contacts.readonly",
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/documents",
-]
+# Resolved per-identity at CLI dispatch time (see _resolve_identity / main()).
+# Defaulted here to identity="jid" so a direct module import (as unit tests do)
+# behaves exactly as it always has — TOKEN_PATH/CLIENT_SECRET_PATH/SCOPES only
+# change when a caller runs main() with a DIFFERENT --identity. Real CLI usage
+# always goes through main(), where --identity is a required argparse argument
+# with no default, so there is no unattended path that silently stays on JID's
+# credentials for someone else's turn.
+TOKEN_PATH, CLIENT_SECRET_PATH, SCOPES = get_google_credentials("jid")
+
+
+def _resolve_identity(identity: str | None) -> None:
+    """Re-point TOKEN_PATH/CLIENT_SECRET_PATH/SCOPES at the given identity.
+
+    FAIL-CLOSED: raises UnknownGoogleIdentityError for a missing or
+    unregistered identity rather than leaving the previous (possibly wrong)
+    identity's paths in place.
+    """
+    global TOKEN_PATH, CLIENT_SECRET_PATH, SCOPES
+    TOKEN_PATH, CLIENT_SECRET_PATH, SCOPES = get_google_credentials(identity)
 
 
 def _normalize_authorized_user_payload(payload: dict) -> dict:
@@ -418,6 +426,43 @@ def gmail_reply(args):
 
     result = service.users().messages().send(userId="me", body=body).execute()
     print(json.dumps({"status": "sent", "id": result["id"], "threadId": result.get("threadId", "")}, indent=2))
+
+
+
+def gmail_draft_create(args):
+    message = MIMEText(args.body, "html" if args.html else "plain")
+    message["To"] = args.to
+    message["Subject"] = args.subject
+    if args.cc:
+        message["Cc"] = args.cc
+    if args.from_header:
+        message["From"] = args.from_header
+
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+    body = {"message": {"raw": raw}}
+    if args.thread_id:
+        body["message"]["threadId"] = args.thread_id
+
+    if _gws_binary():
+        result = _run_gws(
+            ["gmail", "users", "drafts", "create"],
+            params={"userId": "me"},
+            body=body,
+        )
+        print(json.dumps({
+            "status": "draft_created",
+            "id": result["id"],
+            "messageId": result.get("message", {}).get("id", ""),
+        }, indent=2))
+        return
+
+    service = build_service("gmail", "v1")
+    result = service.users().drafts().create(userId="me", body=body).execute()
+    print(json.dumps({
+        "status": "draft_created",
+        "id": result["id"],
+        "messageId": result.get("message", {}).get("id", ""),
+    }, indent=2))
 
 
 
@@ -845,6 +890,31 @@ def contacts_list(args):
     print(json.dumps(contacts, indent=2, ensure_ascii=False))
 
 
+def contacts_create(args):
+    person = {}
+    if args.name:
+        person["names"] = [{"givenName": args.name}]
+    if args.email:
+        person["emailAddresses"] = [{"value": args.email}]
+    if args.phone:
+        person["phoneNumbers"] = [{"value": args.phone}]
+
+    if _gws_binary():
+        result = _run_gws(["people", "people", "createContact"], body=person)
+        print(json.dumps({
+            "status": "created",
+            "resourceName": result.get("resourceName", ""),
+        }, indent=2))
+        return
+
+    service = build_service("people", "v1")
+    result = service.people().createContact(body=person).execute()
+    print(json.dumps({
+        "status": "created",
+        "resourceName": result.get("resourceName", ""),
+    }, indent=2))
+
+
 # =========================================================================
 # Sheets
 # =========================================================================
@@ -1053,6 +1123,16 @@ def _docs_insert_text(doc_id: str, text: str, index: int) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Google Workspace API for Hermes Agent")
+    parser.add_argument(
+        "--identity",
+        required=True,
+        help=(
+            "Which person's Google account this call is for (e.g. 'jid', "
+            "'zarkash'). Required — there is no default. The caller must "
+            "already know this from resolving whose turn it is (same "
+            "resolution used for Family Rules/Actions routing)."
+        ),
+    )
     sub = parser.add_subparsers(dest="service", required=True)
 
     # --- Gmail ---
@@ -1083,6 +1163,16 @@ def main():
     p.add_argument("--body", required=True)
     p.add_argument("--from", dest="from_header", default="", help="Custom From header (e.g. '\"Agent Name\" <user@example.com>')")
     p.set_defaults(func=gmail_reply)
+
+    p = gmail_sub.add_parser("draft-create")
+    p.add_argument("--to", required=True)
+    p.add_argument("--subject", required=True)
+    p.add_argument("--body", required=True)
+    p.add_argument("--cc", default="")
+    p.add_argument("--from", dest="from_header", default="", help="Custom From header (e.g. '\"Agent Name\" <user@example.com>')")
+    p.add_argument("--html", action="store_true", help="Draft body as HTML")
+    p.add_argument("--thread-id", default="", help="Thread ID for threading")
+    p.set_defaults(func=gmail_draft_create)
 
     p = gmail_sub.add_parser("labels")
     p.set_defaults(func=gmail_labels)
@@ -1173,6 +1263,12 @@ def main():
     p.add_argument("--max", type=int, default=50)
     p.set_defaults(func=contacts_list)
 
+    p = con_sub.add_parser("create")
+    p.add_argument("--name", default="")
+    p.add_argument("--email", default="")
+    p.add_argument("--phone", default="")
+    p.set_defaults(func=contacts_create)
+
     # --- Sheets ---
     sh = sub.add_parser("sheets")
     sh_sub = sh.add_subparsers(dest="action", required=True)
@@ -1218,6 +1314,11 @@ def main():
     p.set_defaults(func=docs_append)
 
     args = parser.parse_args()
+    try:
+        _resolve_identity(args.identity)
+    except UnknownGoogleIdentityError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
     args.func(args)
 
 
