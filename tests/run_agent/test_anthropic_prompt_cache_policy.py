@@ -312,6 +312,73 @@ class TestOpenAIWireFormatOnCustomProvider:
         assert agent._anthropic_prompt_cache_policy() == (False, False)
 
 
+class TestLiteLLMOpenAIWire:
+    """LiteLLM proxies exposing the OpenAI-compatible surface get cache_control.
+
+    A LiteLLM deployment that serves Claude over /v1/chat/completions
+    (``provider: custom:litellm``; /v1/messages returns 404) honours
+    Anthropic-style ``cache_control`` markers on the OpenAI wire. Before
+    this fix the policy matched no grant branch for this route and fell
+    through to (False, False) — zero cache hits, the full prompt re-billed
+    on every turn, with no error or warning. Envelope layout (native=False)
+    because the wire format is OpenAI chat.completions, like OpenRouter.
+    """
+
+    def test_named_litellm_custom_provider_caches_with_envelope_layout(self):
+        agent = _make_agent(
+            provider="custom:litellm",
+            base_url="https://litellm.example.com/v1",
+            api_mode="chat_completions",
+            model="claude-opus-5",
+        )
+        should, native = agent._anthropic_prompt_cache_policy()
+        assert should is True, "LiteLLM OpenAI-wire Claude must cache"
+        assert native is False, "LiteLLM OpenAI wire uses the envelope layout"
+
+    def test_bare_litellm_provider_caches(self):
+        agent = _make_agent(
+            provider="litellm",
+            base_url="https://litellm.example.com/v1",
+            api_mode="chat_completions",
+            model="claude-sonnet-4-6",
+        )
+        assert agent._anthropic_prompt_cache_policy() == (True, False)
+
+    def test_custom_provider_pointed_at_litellm_host_caches(self):
+        # A bare custom provider registered at a LiteLLM host — host match
+        # alone is sufficient, mirroring the MiniMax provider-or-host branch.
+        agent = _make_agent(
+            provider="custom",
+            base_url="https://litellm.example.com/v1",
+            api_mode="chat_completions",
+            model="claude-sonnet-4-6",
+        )
+        assert agent._anthropic_prompt_cache_policy() == (True, False)
+
+    def test_litellm_anthropic_wire_keeps_native_layout(self):
+        # LiteLLM's Anthropic-native route (/v1/messages) is covered by the
+        # third-party-gateway branch: native layout, not envelope.
+        agent = _make_agent(
+            provider="custom:litellm",
+            base_url="https://litellm.example.com/v1",
+            api_mode="anthropic_messages",
+            model="claude-opus-5",
+        )
+        assert agent._anthropic_prompt_cache_policy() == (True, True)
+
+    def test_non_claude_on_litellm_does_not_cache(self):
+        # LiteLLM serving a non-Claude model stays off: we only grant
+        # cache_control when the served model family is documented to
+        # honour the markers.
+        agent = _make_agent(
+            provider="custom:litellm",
+            base_url="https://litellm.example.com/v1",
+            api_mode="chat_completions",
+            model="openai/gpt-5.4",
+        )
+        assert agent._anthropic_prompt_cache_policy() == (False, False)
+
+
 class TestQwenAlibabaFamily:
     """Qwen on OpenCode/OpenCode-Go/Alibaba — needs cache_control even on OpenAI-wire.
 
