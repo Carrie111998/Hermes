@@ -66,6 +66,19 @@ def _watcher_dict(session_id="proc_test", thread_id=""):
     return d
 
 
+def test_parse_collision_safe_session_key_decodes_components():
+    parsed = _parse_session_key(
+        "agent-v2:main:telegram:thread:chat%3Awith%3Acolons:topic%3A42"
+    )
+
+    assert parsed == {
+        "platform": "telegram",
+        "chat_type": "thread",
+        "chat_id": "chat:with:colons",
+        "thread_id": "topic:42",
+    }
+
+
 # ---------------------------------------------------------------------------
 # _load_background_notifications_mode unit tests
 # ---------------------------------------------------------------------------

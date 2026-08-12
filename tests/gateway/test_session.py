@@ -15,6 +15,7 @@ from gateway.session import (
     build_session_context,
     build_session_context_prompt,
     build_session_key,
+    _legacy_session_key,
     canonical_whatsapp_identifier,
     neutralize_untrusted_inline_text,
 )
@@ -705,6 +706,80 @@ class TestWhatsAppSessionKeyConsistency:
         assert build_session_key(first) == "agent:main:telegram:dm:99"
         assert build_session_key(second) == "agent:main:telegram:dm:100"
         assert build_session_key(first) != build_session_key(second)
+
+    def test_colon_bearing_components_do_not_collide(self):
+        first = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="a:b",
+            chat_type="group",
+            thread_id="c",
+        )
+        second = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="a",
+            chat_type="group",
+            thread_id="b:c",
+        )
+
+        assert _legacy_session_key(first) == _legacy_session_key(second)
+        assert build_session_key(first) != build_session_key(second)
+        assert build_session_key(first).startswith("agent-v2:main:")
+
+    def test_legacy_binding_migrates_to_collision_safe_key(self, store):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="a:b",
+            chat_type="group",
+            thread_id="c",
+        )
+        legacy_key = _legacy_session_key(source)
+        existing = SessionEntry(
+            session_key=legacy_key,
+            session_id="existing-session",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=source.platform,
+            chat_type=source.chat_type,
+        )
+        store._entries[legacy_key] = existing
+
+        migrated = store.get_or_create_session(source)
+
+        assert migrated is existing
+        assert migrated.session_id == "existing-session"
+        assert migrated.session_key == build_session_key(source)
+        assert legacy_key not in store._entries
+
+    def test_ambiguous_legacy_binding_is_not_adopted_by_other_source(self, store):
+        first = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="a:b",
+            chat_type="group",
+            thread_id="c",
+        )
+        second = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="a",
+            chat_type="group",
+            thread_id="b:c",
+        )
+        legacy_key = _legacy_session_key(first)
+        store._entries[legacy_key] = SessionEntry(
+            session_key=legacy_key,
+            session_id="first-session",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=first,
+            platform=first.platform,
+            chat_type=first.chat_type,
+        )
+
+        routed = store.get_or_create_session(second)
+
+        assert routed.session_id != "first-session"
+        assert routed.session_key == build_session_key(second)
+        assert store._entries[legacy_key].session_id == "first-session"
 
 
     def test_dm_without_chat_id_distinct_users_do_not_collide(self):

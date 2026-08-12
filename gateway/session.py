@@ -15,6 +15,7 @@ import os
 import json
 import threading
 import uuid
+from urllib.parse import quote
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
@@ -1125,6 +1126,27 @@ def build_session_key(
         shared session per chat.
       - Without identifiers, messages fall back to one session per platform/chat_type.
     """
+    parts = _session_key_parts(
+        source,
+        group_sessions_per_user=group_sessions_per_user,
+        thread_sessions_per_user=thread_sessions_per_user,
+        profile=profile,
+    )
+    legacy_key = ":".join(parts)
+    if not any(":" in part for part in parts[1:]):
+        return legacy_key
+    versioned_namespace = parts[0].replace("agent:", "agent-v2:", 1)
+    encoded = [versioned_namespace, *(quote(part, safe="") for part in parts[1:])]
+    return ":".join(encoded)
+
+
+def _session_key_parts(
+    source: SessionSource,
+    group_sessions_per_user: bool = True,
+    thread_sessions_per_user: bool = False,
+    profile: Optional[str] = None,
+) -> List[str]:
+    """Return the ordered components used to identify a gateway session."""
     ns = _session_key_namespace(profile)
     platform = source.platform.value
     slack_scope_id = (
@@ -1144,7 +1166,7 @@ def build_session_key(
             dm_parts.append(dm_chat_id)
             if source.thread_id:
                 dm_parts.append(source.thread_id)
-            return ":".join(str(part) for part in dm_parts)
+            return [str(part) for part in dm_parts]
         # No chat_id — fall back to the sender's own identifier before the
         # bare per-platform sink.  Without this, every DM from every user that
         # arrives without a chat_id (non-standard adapters / synthetic sources)
@@ -1161,10 +1183,10 @@ def build_session_key(
             dm_parts.append(str(dm_participant_id))
             if source.thread_id:
                 dm_parts.append(source.thread_id)
-            return ":".join(str(part) for part in dm_parts)
+            return [str(part) for part in dm_parts]
         if source.thread_id:
             dm_parts.append(source.thread_id)
-        return ":".join(str(part) for part in dm_parts)
+        return [str(part) for part in dm_parts]
 
     participant_id = source.user_id_alt or source.user_id
     if participant_id and source.platform == Platform.WHATSAPP:
@@ -1208,7 +1230,24 @@ def build_session_key(
     if isolate_user and participant_id:
         key_parts.append(str(participant_id))
 
-    return ":".join(str(part) for part in key_parts)
+    return [str(part) for part in key_parts]
+
+
+def _legacy_session_key(
+    source: SessionSource,
+    group_sessions_per_user: bool = True,
+    thread_sessions_per_user: bool = False,
+    profile: Optional[str] = None,
+) -> str:
+    """Build the pre-v2 delimiter-only key for migration lookups."""
+    return ":".join(
+        _session_key_parts(
+            source,
+            group_sessions_per_user=group_sessions_per_user,
+            thread_sessions_per_user=thread_sessions_per_user,
+            profile=profile,
+        )
+    )
 
 
 class _SessionFlight:
@@ -1786,7 +1825,7 @@ class SessionStore:
         if not session_key:
             return None
         parts = str(session_key).split(":")
-        if len(parts) < 2 or parts[0] != "agent":
+        if len(parts) < 2 or parts[0] not in {"agent", "agent-v2"}:
             return None
         namespace = parts[1] or "main"
         return "default" if namespace == "main" else namespace
@@ -1826,6 +1865,38 @@ class SessionStore:
             group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
             profile=self._resolve_profile_for_key(source),
+        )
+
+    def _pre_v2_session_key(self, source: SessionSource) -> str:
+        """Return the delimiter-only key emitted before collision-safe v2 keys."""
+        return _legacy_session_key(
+            source,
+            group_sessions_per_user=getattr(
+                self.config, "group_sessions_per_user", True
+            ),
+            thread_sessions_per_user=getattr(
+                self.config, "thread_sessions_per_user", False
+            ),
+            profile=self._resolve_profile_for_key(source),
+        )
+
+    def _legacy_origin_matches_source(
+        self, origin: Optional[SessionSource], source: SessionSource
+    ) -> bool:
+        """Return whether an ambiguous v1 binding belongs to this source."""
+        if origin is None:
+            return False
+        key_options = {
+            "group_sessions_per_user": getattr(
+                self.config, "group_sessions_per_user", True
+            ),
+            "thread_sessions_per_user": getattr(
+                self.config, "thread_sessions_per_user", False
+            ),
+            "profile": self._resolve_profile_for_key(source),
+        }
+        return _session_key_parts(origin, **key_options) == _session_key_parts(
+            source, **key_options
         )
 
     def _legacy_slack_session_key(self, source: SessionSource) -> Optional[str]:
@@ -2484,6 +2555,33 @@ class SessionStore:
         """
         session_key = self._generate_session_key(source)
         now = _now()
+
+        # Keys only change when an identity component contains the legacy
+        # delimiter. Move an existing routing binding to the v2 key so an
+        # upgraded gateway preserves the transcript instead of starting over.
+        migrated_v1_entry: Optional[SessionEntry] = None
+        v1_key = self._pre_v2_session_key(source)
+        if v1_key != session_key and not force_new:
+            with self._lock:
+                self._ensure_loaded_locked()
+                legacy_entry = self._entries.get(v1_key)
+                if (
+                    session_key not in self._entries
+                    and legacy_entry is not None
+                    and self._legacy_origin_matches_source(legacy_entry.origin, source)
+                ):
+                    migrated_v1_entry = self._entries.pop(v1_key)
+                    migrated_v1_entry.session_key = session_key
+                    migrated_v1_entry.origin = source
+                    self._entries[session_key] = migrated_v1_entry
+            if migrated_v1_entry is not None:
+                self._save_entries()
+                self._record_gateway_session_peer(
+                    migrated_v1_entry.session_id,
+                    session_key,
+                    source,
+                    display_name=migrated_v1_entry.display_name,
+                )
 
         # One-time routing-index migration for Slack sessions created before
         # workspace scope was part of the key. Move (rather than copy) the
