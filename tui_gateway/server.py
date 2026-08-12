@@ -10022,6 +10022,75 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
+def _drain_post_turn_notifications(
+    rid, sid: str, session: dict, *, db_path: Optional[Path] = None
+) -> None:
+    """Drain completion notifications that arrived during a turn.
+
+    The background poller handles between-turn delivery; this is the safety
+    net for events that arrived mid-turn.
+
+    Ownership filter (#42674, #35652): a turn finishing in session B must not
+    consume an event that belongs to session A. The registry requeues every
+    addressed event this session cannot positively claim; the poller then
+    delivers it to a live owner or drops an orphan.
+
+    ``db_path`` is the delegation db captured at the top of the turn thread.
+    This runs on a daemon thread whose lifetime is bounded by the turn, and
+    the delivery calls below CREATE ``<home>/state.db``; resolving ``_db_path()``
+    here would follow a ``HERMES_HOME`` that moved since the turn started.
+    None means "resolve live", which is correct for direct callers.
+
+    Module-level on purpose: a closure inside ``_run_prompt_submit`` cannot be
+    bound or regression-tested.
+    """
+    try:
+        from tools.process_registry import process_registry
+
+        # Positive-proof ownership (compression-chain aware) — the same
+        # fail-closed gate the poller uses, so the post-turn drain can't
+        # adopt another session's addressed notification while a
+        # post-compression session still claims its own pre-compression
+        # dispatches (#55578).
+        drained = process_registry.drain_notifications(
+            session_key=session.get("session_key", ""),
+            owns_event=lambda e: _session_owns_notification_event(sid, session, e),
+            skip_poll_observed=False,
+        )
+        for index, (_evt, synth) in enumerate(drained):
+            with session["history_lock"]:
+                if session.get("running"):
+                    for pending_evt, _pending_synth in drained[index:]:
+                        process_registry.completion_queue.put(pending_evt)
+                    break
+                session["running"] = True
+            from tools.async_delegation import (
+                claim_event_delivery, complete_event_delivery, release_event_delivery,
+            )
+            _claim = claim_event_delivery(_evt, "tui-post-turn", db_path=db_path)
+            if _claim is None:
+                continue
+            try:
+                _emit("message.start", sid)
+                _run_prompt_submit(rid, sid, session, synth)
+                complete_event_delivery(_evt, _claim, db_path=db_path)
+            except Exception as _n_exc:
+                release_event_delivery(_evt, _claim, db_path=db_path)
+                print(
+                    f"[tui_gateway] completion notification dispatch failed: "
+                    f"{type(_n_exc).__name__}: {_n_exc}",
+                    file=sys.stderr,
+                )
+                with session["history_lock"]:
+                    session["running"] = False
+    except Exception as _drain_exc:
+        print(
+            f"[tui_gateway] completion queue drain failed: "
+            f"{type(_drain_exc).__name__}: {_drain_exc}",
+            file=sys.stderr,
+        )
+
+
 def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
     with session["history_lock"]:
         history = list(session["history"])
@@ -10044,6 +10113,21 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
         one_turn_restore = session.pop("one_turn_model_restore", None)
+        # Bind the delegation db for the post-turn drain HERE — top of the turn
+        # thread, BEFORE the per-turn override below. The drain runs after that
+        # override is reset, so this is the home it resolves today; capturing
+        # after the override would bind a resumed remote profile's home instead
+        # and disagree with the home this session's notification poller
+        # captured, which shares a cross-consumer delivery claim with it.
+        # Threads do not inherit contextvars, so the caller's scope is
+        # irrelevant here. Resolving only — never creating, never raising.
+        # See GBrain concepts/import-time-hermes-home-snapshot-bug.
+        try:
+            from tools.async_delegation import _db_path as _delegation_db_path
+
+            _turn_db_path = _delegation_db_path()
+        except Exception:
+            _turn_db_path = None
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -10547,59 +10631,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 with session["history_lock"]:
                     session["running"] = False
 
-        # Drain completion notifications that arrived during this turn.
-        # The background poller handles between-turn delivery; this is
-        # the safety net for events that arrived mid-turn.
-        #
-        # Ownership filter (#42674, #35652): a turn finishing in session B
-        # must not consume an event that belongs to session A. The registry
-        # requeues every addressed event this session cannot positively claim;
-        # the poller then delivers it to a live owner or drops an orphan.
-        try:
-            from tools.process_registry import process_registry
-
-            # Positive-proof ownership (compression-chain aware) — the same
-            # fail-closed gate the poller uses, so the post-turn drain can't
-            # adopt another session's addressed notification while a
-            # post-compression session still claims its own pre-compression
-            # dispatches (#55578).
-            drained = process_registry.drain_notifications(
-                session_key=session.get("session_key", ""),
-                owns_event=lambda e: _session_owns_notification_event(sid, session, e),
-                skip_poll_observed=False,
-            )
-            for index, (_evt, synth) in enumerate(drained):
-                with session["history_lock"]:
-                    if session.get("running"):
-                        for pending_evt, _pending_synth in drained[index:]:
-                            process_registry.completion_queue.put(pending_evt)
-                        break
-                    session["running"] = True
-                from tools.async_delegation import (
-                    claim_event_delivery, complete_event_delivery, release_event_delivery,
-                )
-                _claim = claim_event_delivery(_evt, "tui-post-turn")
-                if _claim is None:
-                    continue
-                try:
-                    _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
-                    complete_event_delivery(_evt, _claim)
-                except Exception as _n_exc:
-                    release_event_delivery(_evt, _claim)
-                    print(
-                        f"[tui_gateway] completion notification dispatch failed: "
-                        f"{type(_n_exc).__name__}: {_n_exc}",
-                        file=sys.stderr,
-                    )
-                    with session["history_lock"]:
-                        session["running"] = False
-        except Exception as _drain_exc:
-            print(
-                f"[tui_gateway] completion queue drain failed: "
-                f"{type(_drain_exc).__name__}: {_drain_exc}",
-                file=sys.stderr,
-            )
+        _drain_post_turn_notifications(rid, sid, session, db_path=_turn_db_path)
 
     run_thread = threading.Thread(target=run, daemon=True)
     session["_run_thread"] = run_thread
