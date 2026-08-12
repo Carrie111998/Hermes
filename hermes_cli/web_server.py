@@ -41,7 +41,12 @@ import urllib.error
 import urllib.parse
 import zipfile
 
-from hermes_cli._subprocess_compat import windows_detach_flags, windows_hide_flags
+from hermes_cli._subprocess_compat import (
+    IS_WINDOWS,
+    run_text_capture,
+    windows_detach_flags,
+    windows_hide_flags,
+)
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -5452,15 +5457,22 @@ def _run_setup_command(
     shell: bool = False,
     timeout: int = 180,
 ) -> subprocess.CompletedProcess:
-    return subprocess.run(
+    # run_text_capture, not subprocess.run: these are dependency install/check
+    # commands (`uv pip install`, provider-supplied shell snippets) that spawn
+    # deep process trees, and a grandchild inheriting the capture PIPES holds
+    # their write end open so `timeout` never fires on Windows. With shell=True
+    # that is guaranteed rather than merely likely — cmd.exe is the direct child
+    # and the real command is always a grandchild. run_text_capture captures
+    # into temp files, so the bound holds regardless of what the tree does.
+    #
+    # executable is POSIX-only: on Windows, Popen uses it INSTEAD of cmd.exe,
+    # so passing a /bin/bash path there fails to spawn at all.
+    return run_text_capture(
         command,
         shell=shell,
-        executable="/bin/bash" if shell else None,
+        executable="/bin/bash" if shell and not IS_WINDOWS else None,
         env=_memory_provider_setup_env(),
-        capture_output=True,
-        text=True,
         timeout=timeout,
-        check=False,
     )
 
 

@@ -335,12 +335,14 @@ def windows_hide_flags() -> int:
 
 
 def run_text_capture(
-    argv: Sequence[str],
+    argv: Sequence[str] | str,
     *,
     timeout: float,
     cwd: str | os.PathLike | None = None,
     env: Mapping[str, str] | None = None,
     stdin: int | None = subprocess.DEVNULL,
+    shell: bool = False,
+    executable: str | os.PathLike | None = None,
 ) -> subprocess.CompletedProcess:
     """``subprocess.run(argv, capture_output=True, text=True, timeout=timeout)``
     that reliably honours ``timeout`` on Windows.
@@ -389,6 +391,19 @@ def run_text_capture(
     daemon there is no terminal behind it at all. Every caller of this helper
     wants a non-interactive probe, so closing stdin is the right default; pass
     ``stdin=None`` to opt back into inheritance.
+
+    ``shell=True`` runs ``argv`` (then a command *string*, not a list) through
+    the platform shell, and is the case that needs this helper most: with a
+    shell the real command is ALWAYS a grandchild — ``cmd.exe`` / ``/bin/sh``
+    is the direct child — so the grandchild-holds-the-pipe hang above is not a
+    risk but a guarantee, and ``subprocess.run(shell=True, capture_output=True,
+    timeout=N)`` has no bound at all on Windows. File-backed capture removes
+    the pipe the shell's children would otherwise inherit.
+
+    ``executable`` is passed through to :class:`subprocess.Popen`; with
+    ``shell=True`` it selects the shell binary (POSIX only — on Windows Popen
+    uses it *instead of* ``cmd.exe``, so a POSIX shell path there fails to
+    spawn). Callers wanting bash must gate on :data:`IS_WINDOWS` themselves.
     """
     if IS_WINDOWS:
         popen_kwargs: dict = {"creationflags": _CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW}
@@ -401,12 +416,16 @@ def run_text_capture(
     # replacement, \r\n normalized) instead of locale-dependent.
     with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
         proc = subprocess.Popen(
-            list(argv),
+            # With shell=True the command is a string Popen hands to the shell
+            # verbatim; list() would shred it into one argument per character.
+            argv if shell else list(argv),
             stdout=out_f,
             stderr=err_f,
             stdin=stdin,
             cwd=cwd,
             env=dict(env) if env is not None else None,
+            shell=shell,
+            executable=executable,
             **popen_kwargs,
         )
         try:
