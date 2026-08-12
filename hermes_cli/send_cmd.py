@@ -333,6 +333,11 @@ def cmd_send(args: argparse.Namespace) -> None:
     # the channel directory) can see platform credentials and home channels.
     _load_hermes_env()
 
+    # --edit short-circuits the usual "no message" checks below only in that
+    # it changes which tool action is invoked; target/message resolution is
+    # otherwise identical to a normal send.
+    edit_message_id = getattr(args, "edit", None)
+
     # --list short-circuits everything else.
     if getattr(args, "list_targets", False):
         # When `--list telegram` is used, argparse stores "telegram" in the
@@ -348,7 +353,8 @@ def cmd_send(args: argparse.Namespace) -> None:
             "Examples:\n"
             "  hermes send --to telegram \"hello\"\n"
             "  hermes send --to discord:#ops --file report.md\n"
-            "  hermes send --list      # list available targets",
+            "  hermes send --list      # list available targets\n"
+            "  hermes send --to telegram:-1001234567890 --edit 42 \"updated text\"",
             file=sys.stderr,
         )
         sys.exit(_USAGE_EXIT)
@@ -380,11 +386,23 @@ def cmd_send(args: argparse.Namespace) -> None:
     # Signal/SMS/WhatsApp; live-adapter path for plugin platforms).
     #
     # It expects the standard tool-call dict and returns a JSON string.
-    tool_args = {
-        "action": "send",
-        "target": target,
-        "message": message,
-    }
+    # action='edit' is intentionally not part of the model-facing tool
+    # schema (SEND_MESSAGE_SCHEMA) — this CLI calls send_message_tool()
+    # directly with a raw dict, bypassing the schema entirely, so the
+    # dispatcher's support for 'edit' doesn't expand what the model can do.
+    if edit_message_id:
+        tool_args = {
+            "action": "edit",
+            "target": target,
+            "message_id": edit_message_id,
+            "message": message,
+        }
+    else:
+        tool_args = {
+            "action": "send",
+            "target": target,
+            "message": message,
+        }
 
     result = send_message_tool(tool_args)
     exit_code = _emit_result(
@@ -421,6 +439,8 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
             "  hermes send --to telegram \"MEDIA:/tmp/chart.png\"   # send a media attachment\n"
             "  hermes send --list                  # all platforms\n"
             "  hermes send --list telegram         # filter by platform\n"
+            "  hermes send --to telegram:-1001234567890 --edit 42 \"updated text\"\n"
+            "  hermes send --to telegram:-100123 --edit 42 --json --file report.md\n"
             "\n"
             "Exit codes: 0 ok, 1 delivery/backend error, 2 usage error."
         ),
@@ -468,6 +488,18 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
         metavar="LINE",
         default=None,
         help="Prepend a subject/header line before the message body.",
+    )
+
+    parser.add_argument(
+        "--edit",
+        metavar="MESSAGE_ID",
+        default=None,
+        help=(
+            "Edit an existing message instead of sending a new one. Requires "
+            "--to and the new text (positional, --file, or stdin). Fails "
+            "closed with a clear error on platforms without edit support -- "
+            "never falls back to sending a new message."
+        ),
     )
 
     parser.add_argument(

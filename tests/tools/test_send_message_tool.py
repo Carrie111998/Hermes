@@ -1700,6 +1700,207 @@ class TestSendViaAdapterStandaloneFallback:
 
         assert result == {"error": "Plugin standalone send failed: boom!"}
 
+
+    @pytest.mark.asyncio
+    async def test_standalone_sender_fn_return_shape_passed_through(self, monkeypatch):
+        """Hook returns success dict: passed through unchanged."""
+        from tools.send_message_tool import _send_via_adapter
+        from gateway.platform_registry import platform_registry
+
+        async def fake_send(pconfig, chat_id, message, **kwargs):
+            return {"success": True, "message_id": "abc-123", "extra_field": "preserved"}
+
+        platform_registry.register(self._make_entry(fake_send))
+        try:
+            monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+
+            result = await _send_via_adapter(
+                _FakePlatform("fakeplatform"),
+                SimpleNamespace(extra={}),
+                "chat-1",
+                "hi",
+            )
+        finally:
+            platform_registry.unregister("fakeplatform")
+
+        assert result["success"] is True
+        assert result["message_id"] == "abc-123"
+        assert result["extra_field"] == "preserved"
+
+
+# ── _edit_via_platform standalone fallback ───────────────────────────────
+
+
+class TestEditViaPlatformStandaloneFallback:
+    """Coverage for the out-of-process plugin-platform edit path (#edit-fn).
+
+    Mirrors ``TestSendViaAdapterStandaloneFallback`` but for
+    ``_edit_via_platform``. Unlike sending, editing has no generic
+    "just send something" fallback: a platform without a registered
+    ``standalone_editor_fn`` (and no live adapter) must fail closed.
+    """
+
+    @staticmethod
+    def _make_entry(editor_fn):
+        from gateway.platform_registry import PlatformEntry
+
+        return PlatformEntry(
+            name="fakeplatform",
+            label="Fake",
+            adapter_factory=lambda cfg: None,
+            check_fn=lambda: True,
+            standalone_editor_fn=editor_fn,
+        )
+
+    @pytest.mark.asyncio
+    async def test_standalone_editor_fn_called_when_no_adapter(self, monkeypatch):
+        """Registry has the editor hook, runner ref returns None: the hook
+        is awaited and its result passed through."""
+        from tools.send_message_tool import _edit_via_platform
+        from gateway.platform_registry import platform_registry
+
+        recorded = {}
+
+        async def fake_edit(pconfig, chat_id, message_id, message, **kwargs):
+            recorded["pconfig"] = pconfig
+            recorded["chat_id"] = chat_id
+            recorded["message_id"] = message_id
+            recorded["message"] = message
+            recorded["kwargs"] = kwargs
+            return {"success": True, "message_id": message_id}
+
+        platform_registry.register(self._make_entry(fake_edit))
+        try:
+            monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+
+            pconfig = SimpleNamespace(extra={})
+            result = await _edit_via_platform(
+                _FakePlatform("fakeplatform"),
+                pconfig,
+                "room/123",
+                "42",
+                "updated text",
+            )
+        finally:
+            platform_registry.unregister("fakeplatform")
+
+        assert result == {"success": True, "message_id": "42"}
+        assert recorded["pconfig"] is pconfig
+        assert recorded["chat_id"] == "room/123"
+        assert recorded["message_id"] == "42"
+        assert recorded["message"] == "updated text"
+
+    @pytest.mark.asyncio
+    async def test_platform_without_editor_fails_closed(self, monkeypatch):
+        """No standalone_editor_fn and no live adapter: a stable error is
+        returned. Critically, nothing resembling a 'send' path is invoked --
+        editing must never silently degrade into posting a new message."""
+        from tools.send_message_tool import _edit_via_platform
+        from gateway.platform_registry import platform_registry
+
+        platform_registry.register(self._make_entry(None))
+        try:
+            monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+
+            with patch(
+                "tools.send_message_tool._send_via_adapter",
+                side_effect=AssertionError("must not fall back to sending"),
+            ):
+                result = await _edit_via_platform(
+                    _FakePlatform("fakeplatform"),
+                    SimpleNamespace(extra={}),
+                    "chat-1",
+                    "42",
+                    "won't apply",
+                )
+        finally:
+            platform_registry.unregister("fakeplatform")
+
+        assert "error" in result
+        assert "success" not in result
+        assert "fakeplatform" in result["error"]
+        assert "standalone_editor_fn" in result["error"]
+
+
+# ── Telegram _standalone_edit ────────────────────────────────────────────
+
+
+class TestTelegramStandaloneEdit:
+    """Coverage for ``plugins.platforms.telegram.adapter._standalone_edit``,
+    the ``standalone_editor_fn`` implementation Telegram registers on its
+    ``PlatformEntry``."""
+
+    def _make_bot(self):
+        bot = MagicMock()
+        bot.edit_message_text = AsyncMock(return_value=SimpleNamespace(message_id=42))
+        return bot
+
+    @pytest.mark.asyncio
+    async def test_edit_calls_edit_message_text_and_returns_same_message_id(self, monkeypatch):
+        from plugins.platforms.telegram.adapter import _standalone_edit
+
+        bot = self._make_bot()
+        _install_telegram_mock(monkeypatch, bot)
+
+        pconfig = SimpleNamespace(token="tok", extra={})
+        result = await _standalone_edit(pconfig, "123", "42", "updated text")
+
+        bot.edit_message_text.assert_awaited_once()
+        kwargs = bot.edit_message_text.await_args.kwargs
+        assert kwargs["chat_id"] == 123
+        assert kwargs["message_id"] == 42
+        assert kwargs["text"] == "updated text"
+
+        assert result["success"] is True
+        assert result["message_id"] == "42"
+
+    @pytest.mark.asyncio
+    async def test_parse_failure_retries_as_plain_text(self, monkeypatch):
+        """A parse-mode rejection from Telegram falls back to a second
+        edit_message_text call with parse_mode=None, mirroring the send
+        path's plain-text fallback."""
+        from plugins.platforms.telegram.adapter import _standalone_edit
+
+        bot = self._make_bot()
+        bot.edit_message_text = AsyncMock(
+            side_effect=[
+                Exception("Bad Request: can't parse entities: unsupported html tag"),
+                SimpleNamespace(message_id=42),
+            ]
+        )
+        _install_telegram_mock(monkeypatch, bot)
+
+        pconfig = SimpleNamespace(token="tok", extra={})
+        result = await _standalone_edit(pconfig, "123", "42", "<invalid>broken</invalid>")
+
+        assert result["success"] is True
+        assert bot.edit_message_text.await_count == 2
+        second_call = bot.edit_message_text.await_args_list[1].kwargs
+        assert second_call["parse_mode"] is None
+
+    @pytest.mark.asyncio
+    async def test_non_parse_error_never_sends_a_new_message(self, monkeypatch):
+        """A non-parse error (e.g. message-not-found) must surface as an
+        error dict, not silently fall back to posting a fresh message. The
+        mock bot only exposes edit_message_text -- if the implementation
+        ever tried to call send_message as a fallback, this would raise
+        AttributeError instead of a clean error result."""
+        from plugins.platforms.telegram.adapter import _standalone_edit
+
+        bot = MagicMock(spec=["edit_message_text"])
+        bot.edit_message_text = AsyncMock(
+            side_effect=Exception("message to edit not found")
+        )
+        _install_telegram_mock(monkeypatch, bot)
+
+        pconfig = SimpleNamespace(token="tok", extra={})
+        result = await _standalone_edit(pconfig, "123", "42", "updated text")
+
+        assert "error" in result
+        assert "success" not in result
+        bot.edit_message_text.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # _check_send_message — availability gating
 # ---------------------------------------------------------------------------

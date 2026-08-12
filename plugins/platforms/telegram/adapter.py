@@ -10107,6 +10107,128 @@ async def _standalone_send(
     )
 
 
+async def _standalone_edit(
+    pconfig,
+    chat_id,
+    message_id,
+    message,
+    *,
+    thread_id=None,
+):
+    """Out-of-process Telegram message edit via the Bot API.
+
+    Implements the ``standalone_editor_fn`` contract (see
+    ``gateway.platform_registry.PlatformEntry``) so external callers such as
+    ``hermes send --edit`` can update an existing message without a live
+    gateway adapter. Mirrors ``_standalone_send``'s
+    connection/parse-mode/fallback handling (proxy honouring, MarkdownV2 with
+    HTML auto-detection, plain-text fallback on parse failure) but calls
+    ``editMessageText`` instead of ``sendMessage``.
+
+    ``thread_id`` is accepted for signature parity with
+    ``standalone_sender_fn`` but is unused — Telegram's ``editMessageText``
+    addresses a message purely by ``chat_id`` + ``message_id`` and has no
+    topic/thread parameter.
+    """
+    token = getattr(pconfig, "token", None) or os.getenv("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        return {"error": "Telegram bot token not configured."}
+
+    try:
+        int_message_id = int(message_id)
+    except (TypeError, ValueError):
+        return {"error": f"Invalid Telegram message_id: {message_id!r}"}
+
+    try:
+        from telegram import Bot
+        from telegram.constants import ParseMode
+
+        _has_html = bool(re.search(r'<[a-zA-Z/][^>]*>', message))
+        if _has_html:
+            formatted = message
+            send_parse_mode = ParseMode.HTML
+        else:
+            try:
+                _adapter = TelegramAdapter.__new__(TelegramAdapter)
+                formatted = _adapter.format_message(message)
+            except Exception:
+                formatted = message
+            send_parse_mode = ParseMode.MARKDOWN_V2
+
+        # Honour a configured proxy — same reasoning as _send_telegram: the
+        # standalone path bypasses the live adapter's connection, so without
+        # this a proxied deployment's edits would time out even though sends
+        # succeed.
+        try:
+            from gateway.platforms.base import resolve_proxy_url
+            _tg_proxy = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=["api.telegram.org"])
+        except Exception:
+            _tg_proxy = None
+        if _tg_proxy:
+            try:
+                from telegram.request import HTTPXRequest
+                logger.info("send_message: standalone Telegram edit routed through proxy %s", _tg_proxy)
+                bot = Bot(
+                    token=token,
+                    request=HTTPXRequest(proxy=_tg_proxy),
+                    get_updates_request=HTTPXRequest(proxy=_tg_proxy),
+                )
+            except Exception as _proxy_err:
+                logger.warning(
+                    "send_message: failed to attach Telegram proxy for edit (%s), falling back to direct connection",
+                    _redact_telegram_error_text(_proxy_err),
+                )
+                bot = Bot(token=token)
+        else:
+            bot = Bot(token=token)
+
+        from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
+        int_chat_id = normalize_telegram_chat_id(chat_id)
+
+        try:
+            await bot.edit_message_text(
+                chat_id=int_chat_id,
+                message_id=int_message_id,
+                text=formatted,
+                parse_mode=send_parse_mode,
+            )
+        except Exception as edit_err:
+            err_str = str(edit_err).lower()
+            if "not modified" in err_str:
+                return {
+                    "success": True,
+                    "platform": "telegram",
+                    "chat_id": chat_id,
+                    "message_id": str(int_message_id),
+                }
+            if "parse" in err_str or "markdown" in err_str or "html" in err_str:
+                logger.warning(
+                    "Parse mode %s failed in Telegram standalone edit, falling back to plain text: %s",
+                    send_parse_mode,
+                    _redact_telegram_error_text(edit_err),
+                )
+                plain = message if _has_html else _strip_mdv2(message)
+                await bot.edit_message_text(
+                    chat_id=int_chat_id,
+                    message_id=int_message_id,
+                    text=plain,
+                    parse_mode=None,
+                )
+            else:
+                raise
+
+        return {
+            "success": True,
+            "platform": "telegram",
+            "chat_id": chat_id,
+            "message_id": str(int_message_id),
+        }
+    except ImportError:
+        return {"error": "python-telegram-bot not installed. Run: pip install python-telegram-bot"}
+    except Exception as e:
+        return {"error": f"Telegram edit failed: {_redact_telegram_error_text(e)}"}
+
+
 def interactive_setup() -> None:
     """Configure Telegram bot credentials and allowlist.
 
@@ -10265,6 +10387,7 @@ def register(ctx) -> None:
         allow_all_env="TELEGRAM_ALLOW_ALL_USERS",
         cron_deliver_env_var="TELEGRAM_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
+        standalone_editor_fn=_standalone_edit,
         max_message_length=4096,
         emoji="✈️",
         allow_update_command=True,

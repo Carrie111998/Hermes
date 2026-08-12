@@ -179,6 +179,25 @@ class PlatformEntry:
     # targets when the gateway is not co-resident with the cron process.
     standalone_sender_fn: Optional[Callable[..., Awaitable[dict]]] = None
 
+    # ── Standalone (out-of-process) editing ──
+    # Optional: async coroutine that edits a previously sent message without
+    # a live gateway adapter.  Called by
+    # ``tools/send_message_tool._edit_via_platform`` when no in-process
+    # adapter is available (standalone CLI, cron, or any external caller
+    # that only has bot-token credentials).
+    #
+    # Signature:
+    #     async (pconfig, chat_id, message_id, message, *, thread_id=None) -> dict
+    #
+    # Returns ``{"success": True, "message_id": ...}`` on success or
+    # ``{"error": str}`` on failure.  There is no generic fallback to
+    # "send a new message" when this hook is absent or fails — editing must
+    # fail closed so callers never mistake a fresh duplicate message for an
+    # in-place update.  Plugin authors implement this the same way as
+    # ``standalone_sender_fn``: open an ephemeral connection, edit, and
+    # (if applicable) close.
+    standalone_editor_fn: Optional[Callable[..., Awaitable[dict]]] = None
+
 
 class PlatformRegistry:
     """Central registry of platform adapters.

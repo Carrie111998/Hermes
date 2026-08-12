@@ -73,6 +73,107 @@ def fake_tool(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# --edit
+# ---------------------------------------------------------------------------
+
+
+def test_edit_dispatches_edit_action_with_message_id(fake_tool, capsys):
+    args = _parse(["--to", "telegram:-1001234567890:17585", "--edit", "42", "updated text"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+    assert exc.value.code == 0
+    # action='edit' (never 'send') and the target/topic string is preserved
+    # verbatim for the tool layer to resolve chat_id/thread_id from.
+    assert fake_tool.calls == [
+        {
+            "action": "edit",
+            "target": "telegram:-1001234567890:17585",
+            "message_id": "42",
+            "message": "updated text",
+        }
+    ]
+
+
+def test_edit_json_mode_returns_message_id(fake_tool, capsys):
+    args = _parse(["--to", "telegram", "--edit", "42", "--json", "updated"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+    assert exc.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload.get("success") is True
+    assert payload.get("message_id") == "m123"
+
+
+def test_edit_reads_replacement_body_from_file(fake_tool, tmp_path):
+    body = tmp_path / "new.txt"
+    body.write_text("replacement from file\n")
+    args = _parse(["--to", "telegram", "--edit", "99", "--file", str(body)])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+    assert exc.value.code == 0
+    assert fake_tool.calls[0] == {
+        "action": "edit",
+        "target": "telegram",
+        "message_id": "99",
+        "message": "replacement from file\n",
+    }
+
+
+def test_edit_missing_target_is_usage_error(fake_tool, capsys, monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    args = _parse(["--edit", "42", "hello"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--to" in err
+
+
+def test_edit_missing_message_is_usage_error(fake_tool, capsys, monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    args = _parse(["--to", "telegram", "--edit", "42"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "no message" in err.lower()
+
+
+def test_edit_does_not_fall_back_to_send_on_platform_error(monkeypatch, capsys):
+    """When the underlying tool fails closed (no editor for the platform),
+    the CLI surfaces that as a failure -- it never retries as a plain send."""
+    import sys as _sys
+    import types as _types
+
+    calls = []
+
+    def _tool(args, **_kw):
+        calls.append(dict(args))
+        return json.dumps({
+            "error": "No message editor available for platform 'discord'. "
+            "Neither a live adapter nor a standalone_editor_fn is registered."
+        })
+
+    fake_mod = _types.ModuleType("tools.send_message_tool")
+    fake_mod.send_message_tool = _tool
+    monkeypatch.setitem(_sys.modules, "tools.send_message_tool", fake_mod)
+
+    args = _parse(["--to", "discord:#ops", "--edit", "7", "won't apply"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "no message editor available" in err.lower()
+    # Exactly one dispatch -- action='edit', no follow-up 'send' call.
+    assert calls == [{
+        "action": "edit",
+        "target": "discord:#ops",
+        "message_id": "7",
+        "message": "won't apply",
+    }]
+
+
+# ---------------------------------------------------------------------------
 # Error paths
 # ---------------------------------------------------------------------------
 

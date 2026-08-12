@@ -247,6 +247,34 @@ class TestPlatformEntryExtendedFields:
         assert entry.allow_update_command is True
 
 
+class TestPlatformEntryStandaloneEditorFn:
+    """PlatformEntry must accept an optional standalone_editor_fn hook,
+    the out-of-process editing counterpart to standalone_sender_fn."""
+
+    def test_defaults_to_none(self):
+        entry = PlatformEntry(
+            name="test",
+            label="Test",
+            adapter_factory=lambda cfg: None,
+            check_fn=lambda: True,
+        )
+        assert entry.standalone_editor_fn is None
+
+    def test_accepts_callable(self):
+        async def editor(pconfig, chat_id, message_id, message, *, thread_id=None):
+            return {"success": True, "message_id": message_id}
+
+        entry = PlatformEntry(
+            name="test",
+            label="Test",
+            adapter_factory=lambda cfg: None,
+            check_fn=lambda: True,
+            standalone_editor_fn=editor,
+        )
+        assert entry.standalone_editor_fn is editor
+        assert callable(entry.standalone_editor_fn)
+
+
 # ── Cron platform resolution ─────────────────────────────────────────
 
 
