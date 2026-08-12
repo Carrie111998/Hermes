@@ -1,6 +1,6 @@
 import { createElement } from 'react'
 
-import { registerPaneCloser, removeTreePane, revealTreePane } from '@/components/pane-shell/tree/store'
+import { registerPaneCloser, removeTreePane, revealTreePane, setPaneCollapsed } from '@/components/pane-shell/tree/store'
 import { registry } from '@/contrib/registry'
 import { Codecs, persistentAtom } from '@/lib/persisted'
 
@@ -28,7 +28,13 @@ const drawingName = (path: string): string => path.split('/').filter(Boolean).at
 type DrawingControllerHandle = Pick<DrawingController, 'canCloseCleanly' | 'reconcileExternalChange' | 'waitForSave'>
 
 const controllers = new Map<string, DrawingControllerHandle>()
-const registered = new Map<string, () => void>()
+
+interface RegisteredDrawingPane {
+  dispose: () => void
+  paneId: string
+}
+
+const registered = new Map<string, RegisteredDrawingPane>()
 
 const sanitizeDocuments = (value: unknown): ExcalidrawDocument[] => {
   if (!Array.isArray(value)) {return []}
@@ -65,25 +71,21 @@ function registerDrawingPane(identity: ExcalidrawDocumentIdentity) {
   if (registered.has(key)) {return}
 
   const paneId = excalidrawPaneId(identity)
-  registered.set(
-    key,
-    registry.register({
-      area: PANES_AREA,
-      data: { placement: 'right' },
-      id: paneId,
-      render: () => createElement(ExcalidrawPane, { identity }),
-      title: drawingName(identity.path)
-    })
-  )
-  registerPaneCloser(paneId, () => {
-    if (!controllers.has(key)) {
-      closeDrawing(identity)
-
-      return
-    }
-
-    void requestDrawingClose(identity, () => window.confirm(`Discard unsaved changes to ${drawingName(identity.path)}?`))
+  const anchorPaneId = registered.values().next().value?.paneId
+  const dispose = registry.register({
+    area: PANES_AREA,
+    data: {
+      dock: anchorPaneId
+        ? { pane: anchorPaneId, pos: 'center' as const }
+        : { pane: 'workspace', pos: 'right' as const },
+      placement: 'right'
+    },
+    id: paneId,
+    render: () => createElement(ExcalidrawPane, { identity }),
+    title: drawingName(identity.path)
   })
+  registered.set(key, { dispose, paneId })
+  registerPaneCloser(paneId, () => setPaneCollapsed(paneId, true))
 }
 
 export function openDrawing(identity: ExcalidrawDocumentIdentity, fingerprint: string): void {
@@ -124,7 +126,7 @@ export function closeDrawing(identity: ExcalidrawDocumentIdentity): void {
   const key = excalidrawDocumentKey(identity)
   const paneId = excalidrawPaneId(identity)
   controllers.delete(key)
-  registered.get(key)?.()
+  registered.get(key)?.dispose()
   registered.delete(key)
   registerPaneCloser(paneId)
   removeTreePane(paneId)
@@ -144,7 +146,7 @@ export function restoreExcalidrawDocuments(availableRuntimes: readonly string[])
 }
 
 export function resetExcalidrawDocumentsForTest(restored?: RestoredExcalidrawDocuments): void {
-  registered.forEach(dispose => dispose())
+  registered.forEach(({ dispose }) => dispose())
   controllers.clear()
   registered.clear()
   $excalidrawDocuments.set(restored ? [...restored.documents] : [])
