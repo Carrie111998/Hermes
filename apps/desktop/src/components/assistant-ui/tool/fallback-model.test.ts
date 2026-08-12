@@ -90,6 +90,22 @@ describe('buildToolView terminal exit-code status', () => {
     expect(view.terminalCommand).toBe('npm run check --workspace=apps/desktop')
     expect(view.terminalExitCode).toBe(0)
   })
+
+  it('prefers the model-provided title over the raw command in the header', () => {
+    const view = buildToolView(
+      part({
+        args: {
+          command: 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\owner\\probe.ps1',
+          title: 'List Hermes processes'
+        },
+        result: undefined,
+        toolName: 'terminal'
+      }),
+      ''
+    )
+
+    expect(view.title).toBe('Running List Hermes processes')
+  })
 })
 
 describe('buildToolView web-search query', () => {
@@ -296,11 +312,11 @@ describe('buildToolView title actions', () => {
       ],
       [
         'which node pnpm corepack; node -v; echo "---"; corepack --version 2>&1; echo "---pnpm via corepack---"; pnpm --version 2>&1 | tail -5',
-        'Ran which node pnpm corepack + 3 commands'
+        'Ran which node · node -v · corepack --version + 1 more'
       ],
       [
         'echo "--- proto pnpm direct ---"; ~/.proto/tools/node/24.11.0/bin/pnpm --version 2>&1 | tail -3; echo "--- proto node ---"; ls ~/.proto/tools/node/ 2>&1; echo "--- corepack cache ---"; ls ~/.cache/node/corepack/v1/pnpm/ 2>&1',
-        'Ran ~/.proto/tools/node/24.11.0/bin/pnpm --version + 2 commands'
+        'Ran pnpm --version · ls ~/.proto/tools/node/ · ls ~/.cache/node/corepac...'
       ],
       [
         'cd /Users/brooklyn/www/bb-rainbows && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack pnpm@10.20.0 --version 2>&1 | tail -3',
@@ -357,7 +373,7 @@ describe('buildToolView title actions', () => {
       ''
     )
 
-    expect(view.title).toBe('Ran sleep 70 + 2 commands')
+    expect(view.title).toBe('Ran sleep 70 · echo "a" · echo "b"')
     expect(view.terminalCommand).toBe(command)
     expect(view.detail).toBe('')
   })

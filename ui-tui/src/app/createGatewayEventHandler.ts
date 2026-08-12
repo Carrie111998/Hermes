@@ -1116,7 +1116,9 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         turnController.recordToolStart(
           ev.payload.tool_id,
           ev.payload.name ?? 'tool',
-          ev.payload.context ?? '',
+          // The model can name its own command run (`title` arg) — show that
+          // instead of the raw command preview when it bothered.
+          ev.payload.title ?? ev.payload.context ?? '',
           ev.payload.args_text ? stripAnsi(String(ev.payload.args_text)) : undefined
         )
 

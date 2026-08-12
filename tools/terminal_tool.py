@@ -3740,6 +3740,10 @@ TERMINAL_SCHEMA = {
                 "type": "string",
                 "description": "The command to execute on the VM"
             },
+            "title": {
+                "type": "string",
+                "description": "Short human-readable label for the command (3-8 words, under 80 characters, e.g. \"List Hermes processes\"). Surfaces show it while the command runs and on approval prompts instead of the raw command line. Provide it whenever the command is long, wrapped, or hard to read at a glance."
+            },
             "background": {
                 "type": "boolean",
                 "description": "Run in the background, returning a session_id. Pair with notify_on_complete=true for anything with a defined end (tests, builds, deploys) — without it the process runs silently. Only servers/watchers/daemons that never exit should stay silent. Short commands: prefer foreground with a generous timeout.",

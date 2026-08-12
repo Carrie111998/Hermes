@@ -34,6 +34,22 @@ describe('summarizeToolRun', () => {
     )
   })
 
+  it('keeps a settled command named when the model titled it', () => {
+    expect(settled([tool('terminal', { command: 'git status', title: 'Check working tree' }, { exit_code: 0 })])).toBe(
+      'Ran Check working tree'
+    )
+    // Untitled commands still collapse to a count.
+    expect(settled([ran('git status')])).toBe('Ran 1 command')
+  })
+
+  it('caps a rambling model title so it cannot flood the group line', () => {
+    const longTitle = 'x'.repeat(200)
+
+    expect(settled([tool('terminal', { command: 'git status', title: longTitle }, { exit_code: 0 })])).toBe(
+      `Ran ${'x'.repeat(79)}…`
+    )
+  })
+
   it('puts the running category in the present tense and leaves the rest past', () => {
     expect(running([read('a.ts'), tool('read_file', { path: 'b.ts' }), ran('x'), ran('y')])).toBe(
       'Exploring 2 files, ran 2 commands'
@@ -42,6 +58,17 @@ describe('summarizeToolRun', () => {
 
   it('names the command that is still running', () => {
     expect(running([tool('terminal', { command: 'npm run typecheck' })])).toMatch(/^Running /)
+  })
+
+  it('prefers the model-provided title over the command summary', () => {
+    expect(
+      running([
+        tool('terminal', {
+          command: 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\owner\\probe.ps1',
+          title: 'List Hermes processes'
+        })
+      ])
+    ).toBe('Running List Hermes processes')
   })
 
   // Sequential calls leave a gap where the run is still going but nothing is

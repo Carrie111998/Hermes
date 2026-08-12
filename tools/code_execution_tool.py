@@ -367,9 +367,9 @@ _TOOL_STUBS = {
     ),
     "terminal": (
         "terminal",
-        "command: str, timeout: int = None, workdir: str = None",
-        '"""Run a shell command (foreground only). Returns dict with "output" and "exit_code"."""',
-        '{"command": command, "timeout": timeout, "workdir": workdir}',
+        "command: str, timeout: int = None, workdir: str = None, title: str = None",
+        '"""Run a shell command (foreground only). Returns dict with "output" and "exit_code". title: optional short human-readable label shown in the UI while the command runs."""',
+        '{"command": command, "timeout": timeout, "workdir": workdir, "title": title}',
     ),
 }
 
@@ -2047,6 +2047,16 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
                         "Python code to execute. Import tools with "
                         f"`from hermes_tools import {import_str}` "
                         "and print your final result to stdout."
+                    ),
+                },
+                "title": {
+                    "type": "string",
+                    "description": (
+                        "Short human-readable label for the script (3-8 words, "
+                        "under 80 characters, "
+                        "e.g. \"Summarize CSV sales by region\"). Surfaces show it "
+                        "while the script runs and on approval prompts instead of "
+                        "the raw code."
                     ),
                 },
             },

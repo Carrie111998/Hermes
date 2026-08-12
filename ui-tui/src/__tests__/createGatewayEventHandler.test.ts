@@ -274,6 +274,22 @@ describe('createGatewayEventHandler', () => {
     expect(getTurnState().todos).toEqual([])
   })
 
+  it('shows the model-provided title instead of the command preview on tool.start', () => {
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    onEvent({
+      payload: {
+        context: 'powershell -NoProfile -ExecutionPolicy Bypass -File probe.ps1',
+        name: 'terminal',
+        title: 'List Hermes processes',
+        tool_id: 'tool-t1'
+      },
+      type: 'tool.start'
+    } as any)
+
+    expect(turnController.activeTools[0]?.context).toBe('List Hermes processes')
+  })
+
   it('persists completed tool rows when message.complete lands immediately after tool.complete', () => {
     const appended: Msg[] = []
 

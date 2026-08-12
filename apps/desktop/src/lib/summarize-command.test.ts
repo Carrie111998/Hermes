@@ -25,9 +25,9 @@ describe('summarizeShellCommand', () => {
     )
   })
 
-  it('compacts a genuine multi-command compound without listing every command', () => {
+  it('names every command in a two-command compound', () => {
     const compound = 'git add -A && git commit -m "wip"'
-    expect(summarizeShellCommand(compound)).toBe('git add -A + 1 command')
+    expect(summarizeShellCommand(compound)).toBe('git add · git commit')
   })
 
   it('leaves a single bare command untouched', () => {
@@ -71,25 +71,29 @@ describe('summarizeShellCommand', () => {
     )
   })
 
-  it('compacts a genuine multi-command probe from session 20260624_231846_bdbd1e', () => {
+  it('names each segment of a multi-command probe from session 20260624_231846_bdbd1e', () => {
     const probe = 'which node pnpm corepack; node -v; corepack --version 2>&1'
-    expect(summarizeShellCommand(probe)).toBe('which node pnpm corepack + 2 commands')
+    expect(summarizeShellCommand(probe)).toBe('which node · node -v · corepack --version')
   })
 
-  it('compacts the corepack diagnostic command from session 20260624_231846_bdbd1e', () => {
+  it('labels an env-assignment-only segment instead of leaving an empty slot', () => {
+    expect(summarizeShellCommand('FOO=1 && npm test')).toBe('FOO=1 · npm test')
+  })
+
+  it('names the first three and counts the rest for long compounds', () => {
     expect(
       summarizeShellCommand(
         'which node pnpm corepack; node -v; echo "---"; corepack --version 2>&1; echo "---pnpm via corepack---"; pnpm --version 2>&1 | tail -5'
       )
-    ).toBe('which node pnpm corepack + 3 commands')
+    ).toBe('which node · node -v · corepack --version + 1 more')
   })
 
-  it('compacts the proto/cache probe from session 20260624_231846_bdbd1e', () => {
+  it('names each surviving segment of the proto/cache probe from session 20260624_231846_bdbd1e', () => {
     expect(
       summarizeShellCommand(
         'echo "--- proto pnpm direct ---"; ~/.proto/tools/node/24.11.0/bin/pnpm --version 2>&1 | tail -3; echo "--- proto node ---"; ls ~/.proto/tools/node/ 2>&1; echo "--- corepack cache ---"; ls ~/.cache/node/corepack/v1/pnpm/ 2>&1'
       )
-    ).toBe('~/.proto/tools/node/24.11.0/bin/pnpm --version + 2 commands')
+    ).toBe('pnpm --version · ls ~/.proto/tools/node/ · ls ~/.cache/node/corepac...')
   })
 
   it('summarizes the successful lint command from session 20260624_231846_bdbd1e', () => {
