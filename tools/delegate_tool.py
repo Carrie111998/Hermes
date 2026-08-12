@@ -328,6 +328,7 @@ def _extract_output_tail(
     *,
     max_entries: int = 12,
     max_chars: int = 8000,
+    fail_closed: bool = False,
 ) -> List[Dict[str, Any]]:
     """Pull the last N tool-call results from a child's conversation.
 
@@ -335,6 +336,17 @@ def _extract_output_tail(
     We reuse the same messages list the trajectory saver walks, taking
     only the tail to keep event payloads small.  Each entry is
     ``{tool, preview, is_error}``.
+
+    Tool output is redacted BEFORE truncation so a credential cannot be
+    split at the ``max_chars`` boundary into an unrecognisable — and
+    therefore unredacted — fragment.
+
+    ``fail_closed`` controls what happens if the redactor itself raises.
+    The default (False) is best-effort: that single tool result is skipped
+    and the rest of the tail still renders, so a redactor hiccup cannot
+    blank the whole ordinary Output overlay.  Callers surfacing evidence
+    from a *failed* child — where the entry is a security boundary rather
+    than a display nicety — pass True to drop the entire tail instead.
     """
     messages = result.get("messages") if isinstance(result, dict) else None
     if not isinstance(messages, list):
@@ -368,10 +380,35 @@ def _extract_output_tail(
         content = _stringify_tool_content(msg.get("content") or "")
         is_error = _looks_like_error_output(content)
         tool_name = pending_call_by_id.get(msg.get("tool_call_id") or "", "tool")
+        # Redact the complete tool output before truncating it. Truncating first
+        # could split a credential at the boundary and leave an unrecognisable
+        # (therefore unredacted) secret fragment in the preview.
+        try:
+            from agent.redact import redact_sensitive_text
+
+            safe_content = redact_sensitive_text(content, force=True)
+        except Exception:
+            if fail_closed:
+                # Security-boundary caller (timeout evidence): never emit a
+                # possibly-unredacted preview, drop the whole tail.
+                logger.warning(
+                    "Failed to redact delegated tool output; dropping output tail",
+                    exc_info=True,
+                )
+                return []
+            # Display caller (ordinary Output overlay): skip only this entry.
+            # Blanking the entire section because one result could not be
+            # redacted would turn a redactor hiccup into a total loss of a
+            # working feature, which upstream never did.
+            logger.warning(
+                "Failed to redact delegated tool output; skipping this entry",
+                exc_info=True,
+            )
+            continue
         # Preserve line structure so the overlay's wrapped scroll region can
         # show real output rather than a whitespace-collapsed blob. We still
         # cap the payload size to keep events bounded.
-        preview = content[:max_chars]
+        preview = safe_content[:max_chars]
         tail.append({"tool": tool_name, "preview": preview, "is_error": is_error})
 
     tail.reverse()  # restore chronological order for display
@@ -2399,19 +2436,56 @@ def _run_single_child(
                         diagnostic_path,
                     )
 
+            # A timed-out child may already have completed useful tool calls.
+            # Snapshot its live in-memory transcript, then reuse the normal
+            # bounded/redacted overlay extractor. Never expose this evidence for
+            # ordinary exceptions: those retain the existing error schema.
+            partial_output_tail: List[Dict[str, Any]] = []
+            if is_timeout:
+                try:
+                    session_messages = getattr(child, "_session_messages", None)
+                    if isinstance(session_messages, list):
+                        partial_output_tail = [
+                            item
+                            for item in _extract_output_tail(
+                                {"messages": list(session_messages)},
+                                max_entries=8,
+                                max_chars=600,
+                                # Evidence from a FAILED child is a security
+                                # boundary, not a display nicety: if redaction
+                                # cannot be guaranteed, emit nothing at all.
+                                fail_closed=True,
+                            )
+                            if isinstance(item, dict)
+                            and isinstance(item.get("preview"), str)
+                            and item["preview"].strip()
+                        ]
+                except Exception:
+                    # This path is handling an existing timeout and must never
+                    # turn observability damage into a new error or expose an
+                    # unredacted transcript. Preserve the legacy timeout schema.
+                    logger.warning(
+                        "Failed to extract redacted delegated timeout output; "
+                        "dropping output tail",
+                        exc_info=True,
+                    )
+                    partial_output_tail = []
+
             if child_progress_cb:
                 try:
-                    child_progress_cb(
-                        "subagent.complete",
-                        preview=(
+                    complete_kwargs: Dict[str, Any] = {
+                        "preview": (
                             f"Timed out after {duration}s"
                             if is_timeout
                             else str(_timeout_exc)
                         ),
-                        status="timeout" if is_timeout else "error",
-                        duration_seconds=duration,
-                        summary="",
-                    )
+                        "status": "timeout" if is_timeout else "error",
+                        "duration_seconds": duration,
+                        "summary": "",
+                    }
+                    if partial_output_tail:
+                        complete_kwargs["output_tail"] = partial_output_tail
+                    child_progress_cb("subagent.complete", **complete_kwargs)
                 except Exception:
                     pass
 
@@ -2437,7 +2511,7 @@ def _run_single_child(
             else:
                 _err = str(_timeout_exc)
 
-            _error_entry = {
+            _error_entry: Dict[str, Any] = {
                 "task_index": task_index,
                 "status": "timeout" if is_timeout else "error",
                 "summary": None,
@@ -2461,6 +2535,9 @@ def _run_single_child(
                     " [steer did not land before the subagent stopped: "
                     f"{_late_pending_steer}]"
                 )
+            if partial_output_tail:
+                _error_entry["partial"] = True
+                _error_entry["partial_output_tail"] = partial_output_tail
             return _error_entry
         finally:
             # Shut down executor without waiting — if the child thread
