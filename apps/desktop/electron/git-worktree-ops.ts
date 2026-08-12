@@ -75,8 +75,14 @@ async function listWorktrees(repoPath, gitBin) {
   try {
     const out = await runGit(gitBin, ['worktree', 'list', '--porcelain'], resolved)
 
+    // `git worktree list --porcelain` prints FORWARD-slash absolute paths even on
+    // Windows (`C:/Users/…`), while every path recorded elsewhere (session cwds,
+    // the backend project tree) uses the native separator. Normalize so the
+    // renderer's lanes reconcile against one spelling — matching what the Python
+    // REST side does in `hermes_cli/web_git.py`. (The renderer folds separators
+    // itself too, since it also consumes a remote gateway's worktree list.)
     return parseWorktrees(out).map((tree, index) => ({
-      path: tree.path,
+      path: tree.path ? path.normalize(tree.path) : tree.path,
       branch: tree.branch,
       isMain: index === 0,
       detached: tree.detached,
