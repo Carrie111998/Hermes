@@ -2291,6 +2291,11 @@ DEFAULT_CONFIG = {
         # Wrap delivered cron responses with a header (task name) and footer
         # ("The agent cannot see this message").  Set to false for clean output.
         "wrap_response": True,
+        # Delivery policy for failed LLM-driven jobs. "notify" sends the
+        # compact scheduler-authored failure summary (backward-compatible);
+        # "local" records the force-redacted diagnostic without messaging it.
+        # Script-only no_agent watchdog failures always notify as before.
+        "model_failure_delivery": "notify",
         # Make cron deliveries CONTINUABLE: a user can reply to a cron brief
         # and the agent has it in context (no "what is Task #2?" amnesia).
         # Default False preserves the historical isolation guarantee (cron

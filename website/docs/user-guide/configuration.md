@@ -132,6 +132,17 @@ For git installs, Hermes auto-stashes dirty tracked files and untracked files be
 
 Before that stash step, Hermes also restores tracked `package-lock.json` diffs left by npm install/build churn. Commit or manually stash intentional lockfile edits before updating.
 
+## Cron Failure Delivery
+
+`cron.model_failure_delivery` controls whether failed LLM-driven scheduled jobs send a compact scheduler-authored failure notice to their configured chat target:
+
+| Value | Behavior |
+|---|---|
+| `notify` | Send a compact failure summary and persist the force-redacted full diagnostic. This is the default. |
+| `local` | Persist the force-redacted full diagnostic and mark the job failed without calling outbound delivery. |
+
+Set local-only failure handling with `hermes config set cron.model_failure_delivery local`. No gateway restart is required: `run_one_job` calls `load_config()` before each failed-model delivery decision, and `load_config()` invalidates its cache when the config file changes. Restore the default with `hermes config set cron.model_failure_delivery notify`. Unknown values preserve `notify` behavior. This setting does not suppress successful responses, change `[SILENT]` monitoring behavior, or affect `no_agent` watchdog failure alerts.
+
 ## Terminal Backend Configuration
 
 Hermes supports seven terminal backends. Each determines where the agent's shell commands actually execute — your local machine, a Docker container, a remote server via SSH, a Modal cloud sandbox (direct or via the Nous-managed gateway), a Daytona workspace, a Vercel Sandbox, or a Singularity/Apptainer container.
