@@ -24,6 +24,7 @@ import {
   groupLeafIds,
   type GroupNode,
   insertAtGroup,
+  insertAtRootEdge,
   isLayoutNode,
   type LayoutNode,
   mergeZonesWithPane as mergeZonesWithPaneOp,
@@ -37,6 +38,7 @@ import {
   setGroupHeaderHidden as setGroupHeaderHiddenOp,
   setGroupMinimized,
   setSplitWeights as setSplitWeightsOp,
+  type RootEdge,
   type SplitNode
 } from './model'
 import { FLOATING_PLACEMENT } from './renderer/floating-rect'
@@ -1087,12 +1089,12 @@ export function declareDefaultTree(tree: LayoutNode) {
 /**
  * LIVE pane adoption — a `panes` contribution that isn't in the tree yet
  * (a plugin registered after boot, incl. runtime-loaded ones) joins the
- * tree via the SAME primitive a human drag/drop commits with
- * (`insertAtGroup`: anchor group + side). The pane's data supplies the
- * gesture:
+ * tree through the same primitives a human drag/drop commits with. The pane's
+ * data supplies the gesture:
  *
  *  - `dock: { pane, pos }` — "drop me on that edge of that pane". Any pane,
  *    any side, exactly what the drop chips do.
+ *  - `dock: { root }` — create an equal split at the layout's outer edge.
  *  - otherwise the semantic `placement` role infers the anchor: stack with
  *    a settled pane of the same placement, main zone as last resort.
  *
@@ -1100,12 +1102,18 @@ export function declareDefaultTree(tree: LayoutNode) {
  * boots), so user rearrangement wins from then on and plugin reloads keep
  * the pane where the user left it.
  */
-interface PaneDockHint {
+interface PaneGroupDockHint {
   pane: string
   pos: DropPosition
   /** Center docks: stack BEFORE this pane id (the strip divider's slot). */
   before?: null | string
 }
+
+interface RootEdgeDockHint {
+  root: RootEdge
+}
+
+type PaneDockHint = PaneGroupDockHint | RootEdgeDockHint
 
 function adoptContributedPanes(): void {
   const tree = $layoutTree.get()
@@ -1141,6 +1149,11 @@ function adoptContributedPanes(): void {
 
   for (const pane of missing) {
     const dock = dataOf(pane.id)?.dock
+
+    if (dock && 'root' in dock) {
+      next = insertAtRootEdge(next, pane.id, dock.root)
+      continue
+    }
     const placement = placementOf(pane.id) ?? 'right'
 
     const anchor =

@@ -1,6 +1,6 @@
 import { createElement } from 'react'
 
-import { registerPaneCloser, removeTreePane, revealTreePane, setPaneCollapsed } from '@/components/pane-shell/tree/store'
+import { collapseTreePane, registerPaneCloser, removeTreePane, revealTreePane } from '@/components/pane-shell/tree/store'
 import { registry } from '@/contrib/registry'
 import { Codecs, persistentAtom } from '@/lib/persisted'
 
@@ -77,7 +77,7 @@ function registerDrawingPane(identity: ExcalidrawDocumentIdentity) {
     data: {
       dock: anchorPaneId
         ? { pane: anchorPaneId, pos: 'center' as const }
-        : { pane: 'workspace', pos: 'right' as const },
+        : { root: 'right' as const },
       placement: 'right'
     },
     id: paneId,
@@ -85,7 +85,7 @@ function registerDrawingPane(identity: ExcalidrawDocumentIdentity) {
     title: drawingName(identity.path)
   })
   registered.set(key, { dispose, paneId })
-  registerPaneCloser(paneId, () => setPaneCollapsed(paneId, true))
+  registerPaneCloser(paneId, () => collapseTreePane(paneId))
 }
 
 export function openDrawing(identity: ExcalidrawDocumentIdentity, fingerprint: string): void {
