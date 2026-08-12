@@ -2752,8 +2752,22 @@ def _build_job_prompt(
         has_injected_data = True
 
     # Always prepend cron execution guidance so the agent knows how
-    # delivery works and can suppress delivery when appropriate.
-    cron_hint = (
+    # delivery works. Report-style jobs opt out of silence suppression so a
+    # deliberate zero-item report still reaches the configured channel.
+    always_deliver = bool(job.get("always_deliver"))
+    if always_deliver:
+        cron_hint = (
+            "[IMPORTANT: You are running as a scheduled cron job. "
+            "DELIVERY: Your final response will be automatically delivered "
+            "to the user — do NOT use send_message or try to deliver "
+            "the output yourself. Just produce your report/output as your "
+            "final response and the system handles the rest. "
+            "This job must always produce its configured human-readable "
+            "report, including when there are zero items. Never output "
+            "[SILENT] or suppress the report.]\n\n"
+        )
+    else:
+        cron_hint = (
         "[IMPORTANT: You are running as a scheduled cron job. "
         "DELIVERY: Your final response will be automatically delivered "
         "to the user — do NOT use send_message or try to deliver "
@@ -2763,7 +2777,7 @@ def _build_job_prompt(
         "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
         "Never combine [SILENT] with content — either report your "
         "findings normally, or say [SILENT] and nothing more.]\n\n"
-    )
+        )
     prompt = cron_hint + prompt
     if skills is None:
         legacy = job.get("skill")
@@ -4713,7 +4727,12 @@ def run_one_job(
             # a real report that merely quoted "[SILENT]" mid-sentence (#51438,
             # #46917).  Keeps the intentional bracketed-prefix / trailing-line
             # tolerance the cron contract relies on.
-            if should_deliver and success and _is_cron_silence_response(deliver_content):
+            if (
+                should_deliver
+                and success
+                and not job.get("always_deliver")
+                and _is_cron_silence_response(deliver_content)
+            ):
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                 should_deliver = False
 
