@@ -46,7 +46,11 @@ from typing import Any, Dict, List
 
 from agent.secret_scope import get_secret
 
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import (
+    MemoryProvider,
+    RecallItem,
+    RecallTrust,
+)
 from hermes_constants import get_hermes_home
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
@@ -719,6 +723,13 @@ class HindsightMemoryProvider(MemoryProvider):
         self._timeout = _DEFAULT_TIMEOUT
         self._idle_timeout = _DEFAULT_IDLE_TIMEOUT
         self._prefetch_result = ""
+        # Structured (tier B, #84251) counterpart to _prefetch_result: the same
+        # warmed recall, kept as provenance-bearing RecallItems for
+        # prefetch_items(). Populated together with _prefetch_result under
+        # _prefetch_lock so both consumers observe the same warmed turn.
+        # ``None`` means "nothing warmed"; a list (possibly empty) means the
+        # background recall ran.
+        self._prefetch_items_cache: List[RecallItem] | None = None
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
         # Single-writer model for retain. sync_turn() enqueues; the writer
@@ -1731,6 +1742,74 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return f"{header}\n\n{result}"
 
+    def _recall_result_to_item(self, result: Any) -> RecallItem:
+        """Map one Hindsight ``RecallResult`` to a provenance-bearing ``RecallItem``.
+
+        Only NON-authoritative provenance is carried across: the record id, when
+        the memory occurred, an optional ``source`` from the result metadata, and
+        a few diagnostic bits (type/document_id/chunk_id/tags). ``provider`` and
+        ``trust`` are set here but the host re-stamps them regardless; ``verified``
+        is always ``False`` — Hindsight recall is not a verification signal.
+        """
+        text = getattr(result, "text", "") or ""
+        record_id = getattr(result, "id", None)
+        occurred_at = (
+            getattr(result, "occurred_start", None)
+            or getattr(result, "mentioned_at", None)
+        )
+        raw_meta = getattr(result, "metadata", None)
+        if not isinstance(raw_meta, dict):
+            raw_meta = {}
+        source = raw_meta.get("source")
+
+        diagnostic: Dict[str, str] = {}
+        for key in ("type", "document_id", "chunk_id", "tags"):
+            value = getattr(result, key, None)
+            if value is None:
+                value = raw_meta.get(key)
+            if value is not None:
+                diagnostic[key] = str(value)
+
+        return RecallItem(
+            text=text,
+            provider="hindsight",
+            trust=RecallTrust.UNTRUSTED,
+            source=str(source) if source else None,
+            verified=False,
+            record_id=str(record_id) if record_id else None,
+            occurred_at=str(occurred_at) if occurred_at else None,
+            metadata=diagnostic,
+        )
+
+    def prefetch_items(self, query: str, *, session_id: str = "") -> List[RecallItem]:
+        """Structured (tier B, #84251) recall — provenance-bearing items.
+
+        Consumes the same warmed recall as :meth:`prefetch`, but as
+        ``RecallItem``s (one per recalled memory; a single item for a
+        reflect-mode synthesis). Returns an EMPTY list — never ``None`` — when
+        nothing is warmed, because Hindsight fully implements the structured
+        hook and must not silently fall back to the legacy string path.
+
+        Preserves the existing warm-prefetch caching semantics: it drains the
+        in-flight background recall the same way ``prefetch`` does and consumes
+        the cached result exactly once (clearing both the structured and legacy
+        caches) so a stale warmed turn can never be re-served.
+        """
+        if self._prefetch_thread and self._prefetch_thread.is_alive():
+            logger.debug("Prefetch(items): waiting for background thread to complete")
+            self._prefetch_thread.join(timeout=3.0)
+        with self._prefetch_lock:
+            items = self._prefetch_items_cache
+            # Consume once across BOTH consumers: clear the legacy string too so
+            # a following prefetch() can't re-serve the same warmed turn.
+            self._prefetch_items_cache = None
+            self._prefetch_result = ""
+        if not items:
+            logger.debug("Prefetch(items): no results available")
+            return []
+        logger.debug("Prefetch(items): returning %d recall item(s)", len(items))
+        return list(items)
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if self._memory_mode == "tools":
             logger.debug("Prefetch: skipped (tools-only mode)")
@@ -1756,10 +1835,22 @@ class HindsightMemoryProvider(MemoryProvider):
             if self._prefetch_waits_for_retain:
                 self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
             try:
+                items: List[RecallItem] = []
                 if self._prefetch_method == "reflect":
                     logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
                     resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
                     text = resp.text or ""
+                    if text:
+                        # Reflect synthesizes ACROSS memories — there is no
+                        # single source record, so it becomes one untrusted item
+                        # with no item-level provenance (record_id/source/etc).
+                        items = [
+                            RecallItem(
+                                text=text,
+                                provider="hindsight",
+                                trust=RecallTrust.UNTRUSTED,
+                            )
+                        ]
                 else:
                     recall_kwargs: dict = {
                         "bank_id": self._bank_id, "query": query,
@@ -1776,9 +1867,16 @@ class HindsightMemoryProvider(MemoryProvider):
                     num_results = len(resp.results) if resp.results else 0
                     logger.debug("Prefetch: recall returned %d results", num_results)
                     text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
-                if text:
+                    if resp.results:
+                        items = [
+                            self._recall_result_to_item(r)
+                            for r in resp.results
+                            if getattr(r, "text", "")
+                        ]
+                if text or items:
                     with self._prefetch_lock:
                         self._prefetch_result = text
+                        self._prefetch_items_cache = items
             except Exception as e:
                 logger.debug("Hindsight prefetch failed: %s", e, exc_info=True)
 
@@ -2150,6 +2248,9 @@ class HindsightMemoryProvider(MemoryProvider):
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
             self._prefetch_result = ""
+            # Drop the structured cache too so the new session never sees a
+            # prior session's warmed recall items (reject cross-session reuse).
+            self._prefetch_items_cache = None
 
         # 3. Now rotate to the new session.
         if parent_session_id:

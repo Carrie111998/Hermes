@@ -543,6 +543,104 @@ class TestPrefetch:
         assert p._prefetch_waits_for_retain is False
 
 
+class TestPrefetchItems:
+    """Structured recall-provenance hook (tier B of #84251)."""
+
+    def _warm_and_get_items(self, provider):
+        provider.queue_prefetch("what does the user like?")
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+        return provider.prefetch_items("what does the user like?")
+
+    def test_prefetch_items_maps_recall_result_fields(self, provider):
+        from agent.memory_provider import RecallTrust
+
+        r1 = SimpleNamespace(
+            text="User prefers tea",
+            id="rec-a",
+            occurred_start="2026-01-01T00:00:00Z",
+            mentioned_at=None,
+            metadata={"source": "chat-log", "irrelevant": "x"},
+            type="observation",
+            document_id="doc-1",
+            chunk_id="chunk-1",
+            tags=["pref"],
+        )
+        r2 = SimpleNamespace(
+            text="User lives in Toronto",
+            id="rec-b",
+            occurred_start=None,
+            mentioned_at="2026-02-02",
+            metadata={},
+            type="world",
+            document_id="doc-2",
+            chunk_id=None,
+            tags=None,
+        )
+        provider._client.arecall = AsyncMock(
+            return_value=SimpleNamespace(results=[r1, r2])
+        )
+
+        items = self._warm_and_get_items(provider)
+        assert [i.text for i in items] == [
+            "User prefers tea",
+            "User lives in Toronto",
+        ]
+
+        first = items[0]
+        assert first.provider == "hindsight"
+        assert first.trust is RecallTrust.UNTRUSTED
+        assert first.verified is False
+        assert first.record_id == "rec-a"
+        assert first.occurred_at == "2026-01-01T00:00:00Z"
+        assert first.source == "chat-log"
+        # metadata is diagnostic only: type/document_id/chunk_id/tags, never the
+        # authoritative 'source' or unrelated keys.
+        assert first.metadata["type"] == "observation"
+        assert first.metadata["document_id"] == "doc-1"
+        assert first.metadata["chunk_id"] == "chunk-1"
+        assert "source" not in first.metadata
+        assert "irrelevant" not in first.metadata
+
+        # occurred_at falls back to mentioned_at when occurred_start is absent.
+        assert items[1].occurred_at == "2026-02-02"
+        assert items[1].source is None
+
+    def test_prefetch_items_reflect_is_single_untrusted_item(self, provider_with_config):
+        from agent.memory_provider import RecallTrust
+
+        p = provider_with_config(recall_prefetch_method="reflect")
+        p._client = _make_mock_client()  # areflect -> text="Synthesized answer"
+
+        p.queue_prefetch("summarize what you know")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=5.0)
+        items = p.prefetch_items("summarize what you know")
+
+        assert len(items) == 1
+        item = items[0]
+        assert item.text == "Synthesized answer"
+        assert item.provider == "hindsight"
+        assert item.trust is RecallTrust.UNTRUSTED
+        # Reflect synthesizes across memories: no single-record provenance.
+        assert item.record_id is None
+        assert item.source is None
+        assert item.occurred_at is None
+        assert dict(item.metadata) == {}
+
+    def test_prefetch_items_empty_list_when_nothing_warmed(self, provider):
+        # Never returns None (Hindsight fully implements the structured hook),
+        # so the manager won't fall back to the legacy string path.
+        assert provider.prefetch_items("test") == []
+
+    def test_prefetch_items_consumes_once(self, provider):
+        items = self._warm_and_get_items(provider)
+        assert items  # first read sees the warmed recall
+        # Second read is empty, and the legacy string cache was cleared too.
+        assert provider.prefetch_items("again") == []
+        assert provider.prefetch("again") == ""
+
+
 class TestPrefetchServerRetainVisibility:
     """PR #62871 review follow-up: draining the local writer queue is not a
     read-after-write signal for async retains. With ``retain_async=True`` the
