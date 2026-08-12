@@ -67,8 +67,10 @@ import {
   friendlyRemoteAttachError,
   type GatewayRequest,
   inlineErrorMessage,
+  markSessionRecentlyInterrupted,
   readFileDataUrlForAttach,
   readImageForRemoteAttach,
+  shouldInterruptBeforeRewind,
   type SubmitTextOptions,
   withSessionNotFoundResume
 } from './utils'
@@ -644,6 +646,10 @@ export function usePromptActions({
       return
     }
 
+    // Frontend busy clears immediately; gateway wind-down can lag. Mark so a
+    // fast edit/resend still interrupt-first instead of racing 4009 (#83855).
+    markSessionRecentlyInterrupted(sessionId)
+
     updateSessionState(sessionId, state => {
       const streamId = state.streamId
       const messages = finalizeInterruptedMessages(state.messages, streamId)
@@ -866,6 +872,13 @@ export function usePromptActions({
       resetSessionBackground(sessionId)
       clearPreviewArtifacts(sessionId)
 
+      // Capture before optimistic busy=true — otherwise interruptFirst is always
+      // true and idle restores wrongly interrupt (and Stop→edit misses cooldown).
+      const interruptFirst = shouldInterruptBeforeRewind({
+        busy: busyRef.current || $busy.get(),
+        sessionId
+      })
+
       clearNotifications()
       setMutableRef(busyRef, true)
       setBusy(true)
@@ -873,7 +886,7 @@ export function usePromptActions({
       updateSessionState(sessionId, state => applyRewindOptimistic(state, plan.sourceIndex))
 
       try {
-        await submitRewindPrompt(sessionId, plan.text, plan.truncateOrdinal, busyRef.current || $busy.get())
+        await submitRewindPrompt(sessionId, plan.text, plan.truncateOrdinal, interruptFirst)
       } catch (err) {
         // The rewind never landed (e.g. the gateway stayed busy past the retry
         // deadline). Roll the optimistic truncation back to the full original
@@ -914,6 +927,12 @@ export function usePromptActions({
       resetSessionBackground(sessionId)
       clearPreviewArtifacts(sessionId)
 
+      // Before optimistic busy=true — see restoreToMessage (#83855).
+      const interruptFirst = shouldInterruptBeforeRewind({
+        busy: busyRef.current || $busy.get(),
+        sessionId
+      })
+
       clearNotifications()
       setMutableRef(busyRef, true)
       setBusy(true)
@@ -924,7 +943,7 @@ export function usePromptActions({
         /no longer in session history|not in session history/i.test(err instanceof Error ? err.message : String(err))
 
       try {
-        await submitRewindPrompt(sessionId, plan.text, plan.truncateOrdinal, busyRef.current || $busy.get())
+        await submitRewindPrompt(sessionId, plan.text, plan.truncateOrdinal, interruptFirst)
       } catch (err) {
         let surfaced = err
 
