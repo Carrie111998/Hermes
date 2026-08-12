@@ -192,11 +192,23 @@ export function pollUpdateForAggregation({
 //   @whiskeysockets/baileys  — only inherits the above; not a second defect
 //
 // Both report `fixAvailable: false`, and that is correct rather than a stale
-// database: EVERY published link-preview-js is <=4.0.0, the whole affected
-// range, and Baileys pins it at `^3.0.0`. There is no version to bump to, so
-// `npm audit fix` here is a no-op — it cannot move either advisory. (Doctor
-// knows this as of 2026-08-12 and prints "no upstream fix available" instead
-// of a command that does nothing; see hermes_cli/doctor.py `_audit_npm_target`.)
+// database — but NOT because no patched release exists. 4.0.1 / 4.0.3 / 4.0.4
+// and 5.0.0 are all published and all outside the advisory's `<=4.0.0` range.
+// The blocker is the PEER RANGE: Baileys declares link-preview-js `^3.0.0`
+// (optional peer, verified on disk), the newest 3.x is 3.2.0, and every 3.x is
+// affected. So every safe version violates the peer constraint and npm has no
+// in-range fix to offer. `npm audit fix` here is a no-op. (Doctor knows this as
+// of 2026-08-12 and prints "no upstream fix available" instead of a command
+// that does nothing; see hermes_cli/doctor.py `_audit_npm_target`.)
+//
+// And do not "solve" it with an `overrides` bump to 4.x: that was analysed on
+// 2026-07-20 and rejected as AUDIT-COSMETIC for this deployment. In 4.0.4 the
+// loopback guard `throwOnLoopback` only runs when `options.resolveDNSHost` is
+// passed (build/index.js ~461 and ~501 for redirects); without it the library
+// logs a warning and fetches anyway. Baileys' call site passes only
+// {followRedirects, handleRedirects, headers, timeout} — never resolveDNSHost.
+// A 4.x override would therefore turn `npm audit` green while delivering
+// essentially zero real protection, and break the optional peer besides.
 //
 // It is accepted BECAUSE of the mitigation below, not in spite of it: the sink
 // is unreachable, because the only thing that reaches link-preview-js is
@@ -208,8 +220,9 @@ export function pollUpdateForAggregation({
 // stop being accepted risk the moment that line goes. If you are here to
 // "clean up" that field, you are removing the reason the audit warning is
 // tolerable. Re-evaluate for real when Baileys widens its optional-peer range
-// or link-preview-js ships a fixed release above 4.0.0; until then the expected
-// steady state of this directory is exactly 2 high, and 0 would be the surprise.
+// to admit 4.x/5.x AND its call site passes `resolveDNSHost` — the first alone
+// only buys a green audit. Until then the expected steady state of this
+// directory is exactly 2 high, and 0 would be the surprise.
 export function buildTextSendPayload(text, { replyTo, messageStore } = {}) {
   // linkPreview: null disables Baileys' server-side link-preview generation.
   // When it is left undefined, Baileys fetches any URL in the text via
