@@ -143,11 +143,10 @@ dependencies = [
   # `@file:` context references — routes through it, so it belongs in core
   # rather than an extra: a lazy install mid-upload would either block the
   # request or silently degrade the document to an un-inlinable binary.
-  # Ranged rather than exact-pinned (the only such core dep) because it ships
-  # per-platform abi3 wheels and the <0.3 ceiling is the API contract boundary;
-  # the resolved version is still frozen in uv.lock, so an install only moves
-  # when the lockfile is regenerated on purpose.
-  "firecrawl-anydoc>=0.1.8,<0.3",
+  # Exact-pinned like every other core dep: this one parses untrusted uploaded
+  # bytes in-process through a Rust extension, so it is the last place to accept
+  # "whatever PyPI ships today". Bump deliberately and regenerate uv.lock.
+  "firecrawl-anydoc==0.1.8",
 ]
 
 [project.optional-dependencies]

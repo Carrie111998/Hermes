@@ -27,8 +27,19 @@ __all__ = ["ArtifactRecord", "AttemptRecord", "DocumentArtifactRepository"]
 # Statuses a customer may see. Anything else is an internal detail.
 PUBLIC_STATUSES = ("uploaded", "processing", "ready", "needs_attention", "failed")
 
+# Insert order. `content` is the only heavy column, and the only one
+# ArtifactRecord does not carry.
 _ARTIFACT_COLUMNS = (
     "id, document_id, company_id, role, filename, content_type, content, "
+    "checksum, size_bytes, local_path, attempt_id, metadata, created_at"
+)
+# What every metadata read selects. Reading metadata used to pull each
+# artifact's full bytes out of SQLite and discard them — ~5ms per 5MB original,
+# scaling linearly with document size, on paths that run for every upload,
+# every processing attempt, and every admin page. Only materialize() selects
+# `content`, because only it needs the bytes.
+_ARTIFACT_META_COLUMNS = (
+    "id, document_id, company_id, role, filename, content_type, "
     "checksum, size_bytes, local_path, attempt_id, metadata, created_at"
 )
 _ATTEMPT_COLUMNS = (
@@ -154,14 +165,14 @@ class DocumentArtifactRepository:
 
     def get_artifact(self, company_id: str, artifact_id: str) -> ArtifactRecord | None:
         row = self.db.one(
-            f"SELECT {_ARTIFACT_COLUMNS} FROM document_artifacts WHERE id=? AND company_id=?",
+            f"SELECT {_ARTIFACT_META_COLUMNS} FROM document_artifacts WHERE id=? AND company_id=?",
             (artifact_id, company_id),
         )
         return _artifact(row) if row else None
 
     def get_original(self, company_id: str, document_id: str) -> ArtifactRecord | None:
         row = self.db.one(
-            f"SELECT {_ARTIFACT_COLUMNS} FROM document_artifacts"
+            f"SELECT {_ARTIFACT_META_COLUMNS} FROM document_artifacts"
             " WHERE company_id=? AND document_id=? AND role='original'"
             " ORDER BY created_at DESC LIMIT 1",
             (company_id, document_id),
@@ -192,7 +203,7 @@ class DocumentArtifactRepository:
         return [
             _artifact(row)
             for row in self.db.all(
-                f"SELECT {_ARTIFACT_COLUMNS} FROM document_artifacts"
+                f"SELECT {_ARTIFACT_META_COLUMNS} FROM document_artifacts"
                 " WHERE company_id=? AND document_id=? ORDER BY created_at",
                 (company_id, document_id),
             )
@@ -221,7 +232,7 @@ class DocumentArtifactRepository:
         """Persist the uploaded bytes. Idempotent per (document, checksum)."""
         checksum = _checksum(content)
         existing = self.db.one(
-            f"SELECT {_ARTIFACT_COLUMNS} FROM document_artifacts"
+            f"SELECT {_ARTIFACT_META_COLUMNS} FROM document_artifacts"
             " WHERE company_id=? AND document_id=? AND role='original' AND checksum=?",
             (company_id, document_id, checksum),
         )
