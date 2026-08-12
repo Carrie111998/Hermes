@@ -30,9 +30,11 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib.util
 import json
 import os
 import re
+import shutil
 import site
 import subprocess
 import sys
@@ -439,6 +441,78 @@ def analyze(
     )
 
 
+def _pip_is_importable() -> bool:
+    """Whether the interpreter running this check can run ``-m pip``.
+
+    Split out as a named function so tests can stub it — importing pip for
+    real would bind the assertion to whatever created the developer's venv.
+    ``find_spec`` rather than ``import pip`` keeps this cheap and avoids
+    executing pip's package body just to answer a yes/no.
+    """
+    try:
+        return importlib.util.find_spec("pip") is not None
+    except Exception:
+        # A broken/partial pip (ImportError from a mangled .pth, ValueError
+        # from a namespace shim) means "cannot run -m pip", not a crash of
+        # the whole doctor section.
+        return False
+
+
+def _quote(value: str) -> str:
+    """Quote a path only when it needs it, so the command stays copy-pasteable."""
+    return f'"{value}"' if " " in value else value
+
+
+def reinstall_command(python: str | None = None) -> str:
+    """The editable-reinstall command that will actually RUN here.
+
+    Neither form is universally right, so this detects rather than
+    hardcodes:
+
+    * ``python -m pip install -e . --no-deps`` when the interpreter that
+      owns the install has pip.
+    * ``uv pip install -e . --no-deps --python <interpreter>`` when it does
+      not. uv does not install pip into the environments it creates, so on
+      a uv-made ``.venv`` the pip form fails immediately with "No module
+      named pip" — observed 2026-08-12 on a uv-created agent-src ``.venv``,
+      where doctor's hardcoded pip text was unrunnable as printed.
+
+    ``--python`` is not decoration: without it uv resolves an environment
+    from the cwd, which need not be the one that owns this install. A bare
+    ``pip`` from PATH is never emitted as a fallback — on Windows that
+    resolves to the scoop/MSIX Python and would install into an entirely
+    different interpreter.
+    """
+    python = python or sys.executable
+    if _pip_is_importable():
+        return f"{_quote(python)} -m pip install -e . --no-deps"
+    uv = shutil.which("uv") or "uv"
+    return f"{_quote(uv)} pip install -e . --no-deps --python {_quote(python)}"
+
+
+def _reinstall_notes(python: str | None = None) -> list[str]:
+    """The traps that go with whichever form ``reinstall_command`` picked."""
+    if _pip_is_importable():
+        return []
+    notes = [
+        "This interpreter has no pip — uv does not install one into the",
+        "environments it creates — so the uv form above is the one that runs.",
+        "`--python` is NOT optional: without it uv resolves an environment",
+        "from the cwd, which need not be the one that owns this install.",
+        "Do NOT substitute a bare `pip` from PATH: that belongs to a",
+        "different interpreter (scoop/MSIX Python on Windows) and would",
+        "install into the wrong environment entirely.",
+    ]
+    if shutil.which("uv") is None:
+        notes.extend([
+            "",
+            "uv is not on PATH here. Install it (https://astral.sh/uv), or",
+            f"bootstrap pip into this interpreter with `{_quote(python or sys.executable)}"
+            " -m ensurepip` and use the pip form instead.",
+        ])
+    return notes
+
+
 def remedy_lines(install_root: InstallRoot, finder_is_stale: bool | None = True) -> list[str]:
     """The fix, the interpreter that must apply it, and the trap that blocks it.
 
@@ -477,22 +551,28 @@ def remedy_lines(install_root: InstallRoot, finder_is_stale: bool | None = True)
             "interpreter above, and whether its site-packages actually loads",
             "user site (site.ENABLE_USER_SITE).",
         ]
-    return [
+    lines = [
         "Remedy — regenerate the finder by reinstalling the editable package:",
         "",
         f"    cd {where}",
-        "    pip install -e . --no-deps",
+        f"    {reinstall_command()}",
         "",
         "Use the interpreter that OWNS the install (the one this ran under):",
         f"    {sys.executable}",
+    ]
+    notes = _reinstall_notes()
+    if notes:
+        lines.extend(["", *notes])
+    lines.extend([
         "",
-        "If pip fails with WinError 32 (file in use): a console-script wrapper",
+        "If the install fails with WinError 32 (file in use): a console-script wrapper",
         "stays resident as the PARENT of its python process, so a gateway",
         "started via hermes.exe holds the install open. Stop it and relaunch",
         "as a module instead, which avoids the wrapper entirely:",
         "",
         "    python -m hermes_cli.main gateway",
-    ]
+    ])
+    return lines
 
 
 def render(findings: Findings, install_root: InstallRoot, probe_result: dict) -> list[str]:
@@ -610,7 +690,7 @@ def _remediation_one_liner(install_root: InstallRoot, finder_is_stale: bool | No
         )
     where = str(install_root.path) if install_root.path else "the agent-src checkout"
     return (
-        f"Editable install has drifted: run `pip install -e . --no-deps` from "
+        f"Editable install has drifted: run `{reinstall_command()}` from "
         f"{where}. Full remedy: python -m hermes_cli.install_doctor"
     )
 

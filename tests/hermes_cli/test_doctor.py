@@ -9,6 +9,7 @@ import contextlib
 import subprocess
 import time
 from argparse import Namespace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -119,6 +120,60 @@ class TestDoctorPlatformHints:
         assert doctor._is_termux() is False
         assert doctor._python_install_cmd() == "uv pip install"
         assert doctor._system_package_install_cmd("ripgrep") == "sudo apt install ripgrep"
+
+
+class TestInstallIntegrityRemediationIsRunnable:
+    """The Install Integrity remediation doctor prints must be executable here.
+
+    Regression for 2026-08-12: on a uv-created ``.venv`` (uv installs no pip
+    into the environments it builds) doctor printed
+    ``run `pip install -e . --no-deps` `` — which died on "No module named
+    pip" the moment anyone pasted it. The command form is now detected from
+    the environment in ``install_doctor.reinstall_command``; this pins that
+    the detected form is what reaches doctor's summary block, since doctor
+    is the surface a user actually reads.
+    """
+
+    def _drifted_section(self, monkeypatch, *, has_pip):
+        from hermes_cli import install_doctor
+
+        monkeypatch.setattr(install_doctor, "_pip_is_importable", lambda: has_pip)
+        monkeypatch.setattr(install_doctor.shutil, "which", lambda name: "/usr/bin/uv")
+        monkeypatch.setattr(install_doctor.sys, "executable", "/agent-src/.venv/bin/python")
+
+        root = install_doctor.InstallRoot(
+            path=Path("/agent-src"), provenance="test", mapping={"events": "x"}
+        )
+        probe_result = {
+            "executable": "/agent-src/.venv/bin/python",
+            "resolved": {
+                "events": {"ok": True, "origin": "/agent-src/events", "error": None},
+                "jobflow_dispatch": {"ok": False, "origin": None, "error": "not found"},
+            },
+            "imports": {},
+        }
+        findings = install_doctor.analyze(
+            {"events", "jobflow_dispatch"}, probe_result, root
+        )
+        assert findings.ok is False  # the branch under test only runs on drift
+        return install_doctor._remediation_one_liner(root, findings.finder_is_stale)
+
+    def test_uv_environment_gets_the_uv_form_with_an_explicit_python(self, monkeypatch):
+        remediation = self._drifted_section(monkeypatch, has_pip=False)
+
+        assert (
+            "uv pip install -e . --no-deps --python /agent-src/.venv/bin/python"
+            in remediation
+        )
+        # The old, unrunnable text: a bare pip invocation with no interpreter.
+        assert "run `pip install -e . --no-deps`" not in remediation
+
+    def test_pip_environment_still_gets_the_pip_form(self, monkeypatch):
+        """Hardcoding uv would be the same bug mirrored onto a pip venv."""
+        remediation = self._drifted_section(monkeypatch, has_pip=True)
+
+        assert "/agent-src/.venv/bin/python -m pip install -e . --no-deps" in remediation
+        assert "uv pip install" not in remediation
 
 
 class TestProviderEnvDetection:
