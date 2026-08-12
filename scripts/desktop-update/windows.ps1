@@ -299,7 +299,26 @@ function Show-ProgressWindow {
         $form.Controls.Add($bar)
         $form.Controls.Add($title)
         $form.Controls.Add($sub)
+        # Tuck the console away while MainWindowHandle still refers to it:
+        # it is unambiguous only while this process owns just its console,
+        # and once the card exists it may resolve to the card instead. The
+        # card is the visible progress surface; the bare console is just
+        # the detached `start /min` host.
+        try {
+            if ($script:Win32) {
+                $consoleHwnd = (Get-Process -Id $PID).MainWindowHandle
+                if ($consoleHwnd -ne [System.IntPtr]::Zero) {
+                    [HermesHandoff.Win32]::ShowWindow($consoleHwnd, 6) | Out-Null  # SW_MINIMIZE
+                }
+            }
+        } catch {}
         $form.Show()
+        # `cmd start /min` seeds our STARTUPINFO with SW_SHOWMINIMIZED and
+        # Form.Show() inherits that initial show state, so the card would be
+        # born iconic (minimized and invisible). Force it back to NORMAL.
+        try {
+            if ($script:Win32) { [HermesHandoff.Win32]::ShowWindow($form.Handle, 9) | Out-Null }  # SW_RESTORE
+        } catch {}
         # `cmd start /min` spawned us backgrounded, so the card comes up
         # behind everything without one explicit activation. Claim it ONCE
         # (so the user knows the update started), then never again — the
