@@ -1,5 +1,7 @@
 """Gateway noise/secret filtering across chat surfaces (Telegram + siblings)."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from agent.conversation_compression import (
@@ -8,6 +10,7 @@ from agent.conversation_compression import (
 )
 from gateway.config import Platform
 from gateway.run import (
+    TurnRunner,
     _prepare_gateway_status_message,
     _sanitize_gateway_final_response,
 )
@@ -343,3 +346,77 @@ def test_chat_gateways_redact_all_issue_23810_credential_shapes(platform, shape_
     # Prose around the secret is preserved — redaction is surgical.
     assert "here is the token you asked me to echo" in sanitized
     assert sanitized.endswith("done.")
+
+
+def _turn_for_admin_target(platform, employee_chat="D_EMPLOYEE"):
+    class Config:
+        def get_home_channel(self, requested_platform):
+            assert requested_platform == platform
+            return SimpleNamespace(chat_id="C_ADMIN", thread_id=None)
+
+    ctx = SimpleNamespace(
+        source=SimpleNamespace(platform=platform),
+        _status_chat_id=employee_chat,
+        _status_thread_metadata={"thread_ts": "employee-thread"},
+        _status_adapter=object(),
+    )
+    runner = SimpleNamespace(
+        config=Config(),
+        _thread_metadata_for_target=lambda *args, **kwargs: {"admin": True},
+    )
+    turn = TurnRunner.__new__(TurnRunner)
+    object.__setattr__(turn, "_ctx", ctx)
+    object.__setattr__(turn, "_runner", runner)
+    return turn
+
+
+def test_slack_operational_prompts_route_to_home_admin():
+    turn = _turn_for_admin_target(Platform.SLACK)
+
+    chat_id, metadata, rerouted = turn._operational_admin_target()
+
+    assert chat_id == "C_ADMIN"
+    assert metadata == {"admin": True}
+    assert rerouted is True
+
+
+def test_non_slack_operational_prompts_stay_in_origin():
+    turn = _turn_for_admin_target(Platform.TELEGRAM)
+
+    chat_id, metadata, rerouted = turn._operational_admin_target()
+
+    assert chat_id == "D_EMPLOYEE"
+    assert metadata == {"thread_ts": "employee-thread"}
+    assert rerouted is False
+
+
+def test_slack_provider_status_is_sent_to_home_admin(monkeypatch):
+    turn = _turn_for_admin_target(Platform.SLACK)
+    turn._ctx._run_still_current = lambda: True
+    turn._ctx._loop_for_step = object()
+    turn._ctx._cleanup_progress = False
+    captured = {}
+
+    async def fake_status_send(adapter, chat_id, event_type, message, metadata):
+        captured.update(
+            chat_id=chat_id,
+            event_type=event_type,
+            message=message,
+            metadata=metadata,
+        )
+        return SimpleNamespace(success=True, message_id="m1")
+
+    def fake_schedule(coro, *args, **kwargs):
+        import asyncio
+
+        asyncio.run(coro)
+        return SimpleNamespace(add_done_callback=lambda callback: None)
+
+    monkeypatch.setattr("gateway.run._send_or_update_status_coro", fake_status_send)
+    monkeypatch.setattr("gateway.run.safe_schedule_threadsafe", fake_schedule)
+
+    turn._status_callback_sync("provider.error", "HTTP 401 Incorrect API key")
+
+    assert captured["chat_id"] == "C_ADMIN"
+    assert captured["metadata"] == {"admin": True}
+    assert "authentication failed" in captured["message"].lower()

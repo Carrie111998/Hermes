@@ -54,4 +54,41 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
         # Should have been called at least twice (primary + fallback)
         assert call_count["n"] >= 2
 
+    def test_non_auth_resolution_error_tries_fallback(self, tmp_path, monkeypatch):
+        """Credential-pool/plugin errors must not bypass the fallback chain."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "model:\n  provider: openai-codex\n"
+            "fallback_model:\n  provider: nous\n  model: z-ai/glm-5.2\n"
+        )
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        call_count = {"n": 0}
+
+        def _mock_resolve(**kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("credential pool exhausted")
+            return {
+                "api_key": "fallback-key",
+                "base_url": "https://inference-api.nousresearch.com/v1",
+                "provider": "nous",
+                "api_mode": "chat_completions",
+                "command": None,
+                "args": None,
+                "credential_pool": None,
+            }
+
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=_mock_resolve,
+        ):
+            from gateway.run import _resolve_runtime_agent_kwargs
+
+            result = _resolve_runtime_agent_kwargs()
+
+        assert result["provider"] == "nous"
+        assert result["api_key"] == "fallback-key"
+        assert result["model"] == "z-ai/glm-5.2"
+        assert call_count["n"] >= 2
+
 

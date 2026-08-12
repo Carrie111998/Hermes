@@ -2689,6 +2689,17 @@ def _resolve_runtime_agent_kwargs() -> dict:
             return fb_config
         raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
     except Exception as exc:
+        # Credential-pool exhaustion and provider-plugin failures are not
+        # always surfaced as AuthError. They are still primary-resolution
+        # failures and must be eligible for the configured fallback chain.
+        logger.warning(
+            "Primary provider resolution failed: %s — trying fallback",
+            exc,
+            exc_info=True,
+        )
+        fb_config = _try_resolve_fallback_provider()
+        if fb_config is not None:
+            return fb_config
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
     model_cfg = _get_model_config()
@@ -5138,6 +5149,31 @@ class TurnRunner:
         except Exception:
             logger.debug("Failed to attach session title callback", exc_info=True)
 
+    def _operational_admin_target(self):
+        """Route Slack infrastructure prompts away from employee conversations."""
+        ctx = self._ctx
+        origin = (ctx._status_chat_id, ctx._status_thread_metadata, False)
+        if ctx.source.platform != Platform.SLACK:
+            return origin
+        try:
+            home = self._runner.config.get_home_channel(ctx.source.platform)
+        except Exception:
+            home = None
+        if not home or not getattr(home, "chat_id", None):
+            return origin
+        if str(home.chat_id) == str(ctx._status_chat_id):
+            return origin
+        try:
+            metadata = self._runner._thread_metadata_for_target(
+                ctx.source.platform,
+                str(home.chat_id),
+                getattr(home, "thread_id", None),
+                adapter=ctx._status_adapter,
+            )
+        except Exception:
+            metadata = None
+        return str(home.chat_id), metadata, True
+
     def _status_callback_sync(self, event_type: str, message: str) -> None:
         ctx = self._ctx
         if not ctx._status_adapter or not ctx._run_still_current():
@@ -5155,8 +5191,26 @@ class TurnRunner:
                 _redact_gateway_user_facing_secrets(str(message or ""))[:160],
             )
             return
+        target_chat_id = ctx._status_chat_id
+        target_metadata = ctx._status_thread_metadata
+        if _looks_like_gateway_provider_error(
+            _redact_gateway_user_facing_secrets(str(message or ""))
+        ):
+            target_chat_id, target_metadata, rerouted = self._operational_admin_target()
+            if rerouted:
+                logger.warning(
+                    "Routed provider status alert away from Slack employee chat %s to %s",
+                    ctx._status_chat_id,
+                    target_chat_id,
+                )
         _fut = safe_schedule_threadsafe(
-            _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared_message, ctx._status_thread_metadata),
+            _send_or_update_status_coro(
+                ctx._status_adapter,
+                target_chat_id,
+                event_type,
+                prepared_message,
+                target_metadata,
+            ),
             ctx._loop_for_step,
             logger=logger,
             log_message=f"status_callback ({event_type}) scheduling error",
@@ -5978,6 +6032,15 @@ class TurnRunner:
             # (send_exec_approval) and plain-text fallback paths below use
             # the redacted value.
             cmd = _redact_approval_command(cmd)
+            approval_chat_id, approval_metadata, approval_rerouted = (
+                self._operational_admin_target()
+            )
+            if approval_rerouted:
+                logger.warning(
+                    "Routed command approval away from Slack employee chat %s to %s",
+                    ctx._status_chat_id,
+                    approval_chat_id,
+                )
 
             # Prefer button-based approval when the adapter supports it.
             # Check the *class* for the method, not the instance — avoids
@@ -5986,11 +6049,11 @@ class TurnRunner:
                 try:
                     _approval_fut = safe_schedule_threadsafe(
                         ctx._status_adapter.send_exec_approval(
-                            chat_id=ctx._status_chat_id,
+                            chat_id=approval_chat_id,
                             command=cmd,
                             session_key=_approval_session_key,
                             description=desc,
-                            metadata=ctx._status_thread_metadata,
+                            metadata=approval_metadata,
                             allow_permanent=approval_data.get("allow_permanent", True),
                             allow_session=approval_data.get("allow_session", True),
                             smart_denied=approval_data.get("smart_denied", False),
@@ -6029,9 +6092,9 @@ class TurnRunner:
             try:
                 _approval_send_fut = safe_schedule_threadsafe(
                     ctx._status_adapter.send(
-                        ctx._status_chat_id,
+                        approval_chat_id,
                         msg,
-                        metadata=ctx._status_thread_metadata,
+                        metadata=approval_metadata,
                     ),
                     ctx._loop_for_step,
                     logger=logger,
