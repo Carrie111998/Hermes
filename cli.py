@@ -10472,6 +10472,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._manual_compress(cmd_original)
         elif canonical == "usage":
             self._handle_usage_command(cmd_original)
+        elif canonical == "quota":
+            self._handle_quota_command(cmd_original)
         elif canonical == "subscription":
             self._show_subscription()
         elif canonical == "topup":
@@ -11614,6 +11616,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return
         self._show_usage()
 
+    def _handle_quota_command(self, cmd_original: str):
+        """Dispatch `/quota` — show subscription quota status and warnings.
+
+        Mirrors ``/usage``'s arg parsing shape but takes no subcommands: any
+        stray args are ignored and full quota data is always rendered (never
+        gated by ``quota.suppress_warnings`` — issue #6567).
+        """
+        parts = cmd_original.split()
+        args = [p.lower() for p in parts[1:]]
+        if args:
+            # /quota takes no subcommands; ignore unknown args gracefully and
+            # always show the full quota status.
+            pass
+        self._show_quota()
+
     def _usage_reset(self, force: bool = False):
         """`/usage reset [--force]` — redeem one banked Codex reset credit."""
         provider = (
@@ -11801,6 +11818,82 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # into stream-retry events, credential rotations, etc.
             # Console quietness is enforced by hermes_logging not
             # installing a console StreamHandler in non-verbose mode.
+
+    def _show_quota(self):
+        """`/quota` — subscription quota status and warnings.
+
+        ALWAYS renders full data: the account-usage block is shown regardless
+        of provider availability (fail-open), and warning lines come from
+        ``startup_warning_lines`` which ignores ``quota.suppress_warnings`` so
+        the user is never blinded by an explicit ``/quota`` invocation (issue
+        #6567 acceptance criterion).
+        """
+        agent = self.agent
+        provider = getattr(agent, "provider", None) or getattr(self, "provider", None)
+        base_url = getattr(agent, "base_url", None) or getattr(self, "base_url", None)
+        api_key = getattr(agent, "api_key", None) or getattr(self, "api_key", None)
+        # Lazy import — pulls the account_usage → auth chain, only needed here.
+        from agent.quota_warnings import (
+            fetch_quota_snapshot,
+            startup_warning_lines,
+        )
+        from agent.account_usage import render_account_usage_lines
+
+        snapshot = None
+        if provider:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
+                try:
+                    snapshot = _pool.submit(
+                        fetch_quota_snapshot, provider,
+                        base_url=base_url, api_key=api_key,
+                    ).result(timeout=10.0)
+                except (concurrent.futures.TimeoutError, Exception):
+                    snapshot = None
+
+        if not provider or snapshot is None:
+            print("  No quota data for the current provider — /usage shows session usage and rate limits.")
+            return
+
+        account_lines = [f"  {line}" for line in render_account_usage_lines(snapshot)]
+        if account_lines:
+            print()
+            for line in account_lines:
+                print(line)
+
+        for line in startup_warning_lines(snapshot, CLI_CONFIG):
+            print(line)
+
+    def _maybe_emit_pre_turn_quota_warning(self):
+        """Pre-turn quota probe — prints above the prompt on the main thread.
+
+        Honors ``quota.suppress_warnings``: when set, emits nothing.  The probe
+        is fail-open (never breaks a turn) and TTL-cached via the engine, so a
+        slow/unreachable provider can't hang the prompt.
+        """
+        try:
+            agent = self.agent
+            provider = getattr(agent, "provider", None) or getattr(self, "provider", None)
+            if not provider:
+                return
+            base_url = getattr(agent, "base_url", None) or getattr(self, "base_url", None)
+            api_key = getattr(agent, "api_key", None) or getattr(self, "api_key", None)
+            from agent.quota_warnings import (
+                fetch_quota_snapshot,
+                quota_warning_lines,
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
+                try:
+                    snapshot = _pool.submit(
+                        fetch_quota_snapshot, provider,
+                        base_url=base_url, api_key=api_key,
+                    ).result(timeout=10.0)
+                except (concurrent.futures.TimeoutError, Exception):
+                    snapshot = None
+            for line in quota_warning_lines(snapshot, CLI_CONFIG):
+                print(line)
+        except Exception:
+            # Fail-open: a quota probe must never break a turn.
+            pass
 
     def _show_insights(self, command: str = "/insights"):
         """Show usage insights and analytics from session history."""
@@ -14448,6 +14541,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # finishes; reset on the next turn.
             self._prompt_start_time = time.time()
             self._prompt_duration = 0.0
+            # Emit any quota warning for the upcoming turn on the main thread so
+            # it paints cleanly above the prompt (honors suppress_warnings).
+            self._maybe_emit_pre_turn_quota_warning()
             agent_thread = threading.Thread(target=run_agent, daemon=True)
             agent_thread.start()
 
