@@ -8,14 +8,18 @@ this file says where it goes and what the inline marker looks like.
 Inline `[n]` immediately after the sentence. Block at the end:
 
 ```
-## Sources
+## Fuentes <!-- hermes-sources -->
 
-[1] https://example.com/a — Page title
-[2] https://example.com/b
+[1] [Resumen de resultados](https://example.com/a) — Cifras y conclusiones citadas en la respuesta.
+[2] [example.com / b](https://example.com/b)
 ```
 
-`--style plain` gives a bare `Sources:` header for chat replies where a
-markdown heading would be noise.
+`chat` is the default style. Populate localized labels/descriptions with
+`annotate`, and localize the heading with `--heading`; the hidden
+`hermes-sources` marker lets `verify` recognize any language. Missing metadata
+falls back to a readable host/path label with no description. Use
+`--style markdown` for the legacy raw URL list, or `--style plain` for a bare
+technical `Sources:` block.
 
 ## PDF via LaTeX (`latex-pdf-report` skill)
 

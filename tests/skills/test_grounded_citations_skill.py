@@ -150,6 +150,60 @@ def test_render_markdown_lists_ids_and_urls(sources_mod, ledger: Path) -> None:
     assert "[2] https://b.example" in block
 
 
+def test_render_chat_uses_localized_labeled_links(sources_mod) -> None:
+    sources = [
+        {
+            "id": 1,
+            "url": "https://jetson.com/jetson-one",
+            "label": "Jetson ONE: характеристики персонального eVTOL",
+            "description": "Официальная страница с ключевыми характеристиками.",
+        }
+    ]
+
+    block = sources_mod.render_sources(sources, style="chat", heading="Источники")
+
+    assert block == (
+        "## Источники <!-- hermes-sources -->\n\n"
+        "[1] [Jetson ONE: характеристики персонального eVTOL]"
+        "(https://jetson.com/jetson-one) — "
+        "Официальная страница с ключевыми характеристиками."
+    )
+
+
+def test_annotate_source_persists_localized_chat_metadata(sources_mod, ledger: Path) -> None:
+    sources_mod.add_sources(ledger, ["https://example.com/report"], title="Original page title")
+
+    entry = sources_mod.annotate_source(
+        ledger,
+        1,
+        label="Résumé localisé du rapport",
+        description="Synthèse des résultats cités dans la réponse.",
+    )
+
+    assert entry["title"] == "Original page title"
+    assert entry["label"] == "Résumé localisé du rapport"
+    assert entry["description"] == "Synthèse des résultats cités dans la réponse."
+    persisted = json.loads(ledger.read_text(encoding="utf-8"))["sources"][0]
+    assert persisted == entry
+
+
+def test_render_chat_falls_back_to_readable_host_path_without_description(sources_mod) -> None:
+    sources = [
+        {
+            "id": 2,
+            "url": "https://www.example.com/reports/annual%20review?utm=chat",
+            "title": "Untrusted HTML title",
+        }
+    ]
+
+    block = sources_mod.render_sources(sources, style="chat")
+
+    assert "[2] [example.com / reports / annual review]" in block
+    assert "(https://www.example.com/reports/annual%20review?utm=chat)" in block
+    assert "Untrusted HTML title" not in block
+    assert " — " not in block
+
+
 def test_render_only_subset_and_ordering(sources_mod, ledger: Path) -> None:
     block = sources_mod.render_sources(_seed(sources_mod, ledger), style="plain", only={3, 1})
     lines = [ln for ln in block.splitlines() if ln.startswith("[")]
@@ -240,6 +294,43 @@ def test_markdown_links_are_not_citations(sources_mod, ledger: Path, tmp_path: P
     assert (code, errors) == (0, [])
 
 
+def test_localized_chat_sources_block_verifies_against_ledger(
+    sources_mod, ledger: Path, tmp_path: Path
+) -> None:
+    sources_mod.add_sources(ledger, ["https://a.example/report"])
+    sources_mod.annotate_source(ledger, 1, label="Rapport localisé")
+    sources = json.loads(ledger.read_text(encoding="utf-8"))["sources"]
+    block = sources_mod.render_sources(sources, style="chat", heading="Sources consultées")
+
+    code, errors, _ = _verify(
+        sources_mod,
+        ledger,
+        tmp_path,
+        "La réponse contient une affirmation vérifiable.[1]\n\n" + block + "\n",
+    )
+
+    assert (code, errors) == (0, [])
+
+
+def test_chat_renderer_escapes_labels_and_verifies_parenthesized_urls(
+    sources_mod, ledger: Path, tmp_path: Path
+) -> None:
+    url = "https://en.wikipedia.org/wiki/Source_(journal)"
+    sources_mod.add_sources(ledger, [url])
+    sources_mod.annotate_source(ledger, 1, label="Source [journal]")
+    sources = json.loads(ledger.read_text(encoding="utf-8"))["sources"]
+    block = sources_mod.render_sources(sources, style="chat")
+
+    assert r"[Source \[journal\]](<https://en.wikipedia.org/wiki/Source_(journal)>)" in block
+    code, errors, _ = _verify(
+        sources_mod,
+        ledger,
+        tmp_path,
+        "This sentence cites a parenthesized URL safely.[1]\n\n" + block + "\n",
+    )
+    assert (code, errors) == (0, [])
+
+
 def test_min_coverage_gate(sources_mod, ledger: Path, tmp_path: Path) -> None:
     _seed(sources_mod, ledger)
     text = (
@@ -290,10 +381,43 @@ def test_cli_add_render_verify_roundtrip(sources_mod, tmp_path: Path, capsys) ->
 
     draft = tmp_path / "d.md"
     draft.write_text("Only the first source is used here.[1]\n", encoding="utf-8")
-    assert sources_mod.main(args + ["render", "--cited-in", str(draft)]) == 0
+    assert sources_mod.main(args + ["render", "--style", "markdown", "--cited-in", str(draft)]) == 0
     block = capsys.readouterr().out
     assert "[1] https://a.example" in block and "[2]" not in block
 
+    with draft.open("a", encoding="utf-8") as fh:
+        fh.write("\n" + block)
+    assert sources_mod.main(args + ["verify", str(draft)]) == 0
+
+
+def test_cli_defaults_to_localized_chat_rendering(sources_mod, tmp_path: Path, capsys) -> None:
+    ledger = tmp_path / "chat.json"
+    args = ["--ledger", str(ledger)]
+    assert sources_mod.main(args + ["add", "https://example.com/report"]) == 0
+    capsys.readouterr()
+    assert (
+        sources_mod.main(
+            args
+            + [
+                "annotate",
+                "1",
+                "--label",
+                "Informe de resultados",
+                "--description",
+                "Resumen de las cifras citadas.",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    draft = tmp_path / "chat.md"
+    draft.write_text("La respuesta presenta una cifra comprobable.[1]\n", encoding="utf-8")
+    assert sources_mod.main(args + ["render", "--heading", "Fuentes", "--cited-in", str(draft)]) == 0
+    block = capsys.readouterr().out
+
+    assert "## Fuentes <!-- hermes-sources -->" in block
+    assert "[1] [Informe de resultados](https://example.com/report)" in block
     with draft.open("a", encoding="utf-8") as fh:
         fh.write("\n" + block)
     assert sources_mod.main(args + ["verify", str(draft)]) == 0
@@ -565,8 +689,61 @@ def test_render_replace_in_appends_when_no_block_exists(sources_mod, tmp_path: P
     assert sources_mod.main(args + ["render", "--replace-in", str(draft)]) == 0
     body = draft.read_text(encoding="utf-8")
     assert body.startswith("A claim resting on the first source.[1]")
-    assert "## Sources" in body and "[1] https://a.example" in body
+    assert "## Sources <!-- hermes-sources -->" in body
+    assert "[1] [a.example](https://a.example)" in body
     capsys.readouterr()
+    assert sources_mod.main(args + ["verify", str(draft)]) == 0
+    capsys.readouterr()
+
+
+def test_render_replace_in_ignores_localized_marker_inside_fence(
+    sources_mod, tmp_path: Path, capsys
+) -> None:
+    ledger = tmp_path / "fenced.json"
+    args = ["--ledger", str(ledger)]
+    sources_mod.main(args + ["add", "https://a.example"])
+    capsys.readouterr()
+    draft = tmp_path / "d.md"
+    draft.write_text(
+        "Example output:\n\n"
+        "```md\n## Fuentes <!-- hermes-sources -->\n"
+        "[1] [example](https://example.invalid)\n```\n\n"
+        "A real claim after the example cites the ledger.[1]\n",
+        encoding="utf-8",
+    )
+
+    assert sources_mod.main(args + ["render", "--replace-in", str(draft)]) == 0
+    rendered = draft.read_text(encoding="utf-8")
+
+    assert "example.invalid" in rendered
+    assert "A real claim after the example cites the ledger.[1]" in rendered
+    assert rendered.endswith(
+        "## Sources <!-- hermes-sources -->\n\n[1] [a.example](https://a.example)\n"
+    )
+
+
+def test_render_replace_in_normalizes_multiline_heading_idempotently(
+    sources_mod, tmp_path: Path, capsys
+) -> None:
+    ledger = tmp_path / "heading.json"
+    args = ["--ledger", str(ledger)]
+    sources_mod.main(args + ["add", "https://a.example"])
+    capsys.readouterr()
+    draft = tmp_path / "d.md"
+    draft.write_text("A claim resting on the first source.[1]\n", encoding="utf-8")
+    command = args + [
+        "render",
+        "--heading",
+        "Fuentes\nconsultadas",
+        "--replace-in",
+        str(draft),
+    ]
+
+    assert sources_mod.main(command) == 0
+    first = draft.read_text(encoding="utf-8")
+    assert "## Fuentes consultadas <!-- hermes-sources -->" in first
+    assert sources_mod.main(command) == 0
+    assert draft.read_text(encoding="utf-8") == first
 
 
 # ---------------------------------------------------------------------------

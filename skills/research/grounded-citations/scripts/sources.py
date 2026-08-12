@@ -11,9 +11,10 @@ Subcommands
   reset                            start a clean ledger
   add URL [URL ...]                register source(s), print their ids
   ingest FILE|-                    register every url found in JSON tool output
+  annotate ID --label L [...]      attach localized chat metadata
   quote ID --text T --from FILE|-  attach verbatim supporting evidence to a source
   list                             show the ledger
-  render                           render a Sources block
+  render                           render a labeled chat Sources block
   verify DRAFT                     check a draft's citations against the ledger
 
 Fact-checking is evidence-backed citation: ``quote`` only accepts text that
@@ -39,6 +40,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import unquote, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _hermes_home import get_hermes_home  # noqa: E402
@@ -49,9 +51,14 @@ SCHEMA_VERSION = 1
 # reference-style labels are excluded by requiring digits only and no
 # following "(" or ":".
 _CITE_RE = re.compile(r"\[(\d{1,4})\](?![(:])")
-_SOURCES_HEADER_RE = re.compile(r"^\s*(?:#{1,6}\s*)?(?:\*\*)?sources:?(?:\*\*)?\s*$", re.IGNORECASE)
+_SOURCES_HEADER_RE = re.compile(
+    r"^(?:\s*(?:#{1,6}\s*)?(?:\*\*)?sources:?(?:\*\*)?\s*|"
+    r".*<!--\s*hermes-sources\s*-->.*)$",
+    re.IGNORECASE,
+)
 _SOURCE_LINE_RE = re.compile(r"^\s*\[(\d{1,4})\]\s*[-–:]?\s*(\S+)")
 _URL_IN_TEXT_RE = re.compile(r"https?://[^\s\"'<>)\]}]+")
+_URL_IN_ANGLE_TARGET_RE = re.compile(r"\]\(<(https?://[^>]+)>\)")
 _FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
 # Explicit declaration that a claim comes from model knowledge, not a source.
 _UNVERIFIED_RE = re.compile(r"\[unverified\]", re.IGNORECASE)
@@ -196,6 +203,48 @@ def add_sources(
     return out
 
 
+def annotate_source(
+    path: Path,
+    source_id: int,
+    label: str,
+    description: str | None = None,
+) -> dict[str, Any]:
+    """Attach human-facing chat metadata to an existing ledger source."""
+    with _LedgerLock(path):
+        data = load_ledger(path)
+        entry = next((s for s in data["sources"] if s["id"] == source_id), None)
+        if entry is None:
+            raise SystemExit(f"error: no source [{source_id}] in the ledger")
+        entry["label"] = " ".join(label.split())
+        entry["description"] = " ".join((description or "").split())
+        save_ledger(path, data)
+    return entry
+
+
+def _fallback_label(url: str) -> str:
+    """Build a conservative human-readable label from URL components."""
+    parsed = urlsplit(url)
+    host = (parsed.hostname or parsed.netloc or url).removeprefix("www.")
+    segments = [unquote(segment).replace("-", " ") for segment in parsed.path.split("/") if segment]
+    return " / ".join([host, *segments])
+
+
+def _markdown_label(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+def _markdown_target(url: str) -> str:
+    return f"<{url}>" if any(char in url for char in "() ") else url
+
+
+def _source_url_from_line(line: str) -> str | None:
+    angle_target = _URL_IN_ANGLE_TARGET_RE.search(line)
+    if angle_target:
+        return angle_target.group(1)
+    url = _URL_IN_TEXT_RE.search(line)
+    return url.group(0) if url else None
+
+
 def urls_from_json(payload: Any) -> list[tuple[str, str]]:
     """Walk arbitrary JSON tool output collecting (url, title) pairs.
 
@@ -293,6 +342,7 @@ def render_sources(
     sources: list[dict[str, Any]],
     style: str = "markdown",
     only: set[int] | None = None,
+    heading: str = "Sources",
 ) -> str:
     picked = [s for s in sources if only is None or s["id"] in only]
     picked.sort(key=lambda s: s["id"])
@@ -314,6 +364,17 @@ def render_sources(
             suffix = f" — {title}" if title else ""
             lines.append(f"[^{s['id']}]: {s['url']}{suffix}")
         return "\n".join(lines)
+    if style == "chat":
+        normalized_heading = " ".join(heading.split()) or "Sources"
+        lines.append(f"## {normalized_heading} <!-- hermes-sources -->")
+        lines.append("")
+        for s in picked:
+            label = _markdown_label(s.get("label") or _fallback_label(s["url"]))
+            target = _markdown_target(s["url"])
+            lines.append(f"[{s['id']}] [{label}]({target})")
+            if s.get("description"):
+                lines[-1] += f" — {_markdown_label(s['description'])}"
+        return "\n".join(lines)
     header = "Sources:" if style == "plain" else "## Sources"
     lines.append(header)
     if style != "plain":
@@ -333,6 +394,19 @@ def render_sources(
 # ---------------------------------------------------------------------------
 
 
+def _sources_header_index(lines: list[str]) -> int:
+    """Return the last Sources header outside fenced code, or -1."""
+    header_idx = -1
+    in_fence = False
+    for i, line in enumerate(lines):
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if not in_fence and _SOURCES_HEADER_RE.match(line):
+            header_idx = i
+    return header_idx
+
+
 def _split_draft(text: str) -> tuple[str, dict[int, str]]:
     """Split a draft into (prose, sources_block_map).
 
@@ -341,17 +415,13 @@ def _split_draft(text: str) -> tuple[str, dict[int, str]]:
     Fenced code blocks are dropped from prose.
     """
     lines = text.splitlines()
-    header_idx = -1
-    for i, line in enumerate(lines):
-        if _SOURCES_HEADER_RE.match(line):
-            header_idx = i
+    header_idx = _sources_header_index(lines)
     listed: dict[int, str] = {}
     if header_idx >= 0:
         for line in lines[header_idx + 1:]:
             m = _SOURCE_LINE_RE.match(line)
             if m:
-                url_match = _URL_IN_TEXT_RE.search(line)
-                listed[int(m.group(1))] = url_match.group(0) if url_match else m.group(2)
+                listed[int(m.group(1))] = _source_url_from_line(line) or m.group(2)
         body_lines = lines[:header_idx]
     else:
         body_lines = lines
@@ -374,10 +444,7 @@ def _strip_sources_block(text: str) -> str:
     idempotent instead of stacking duplicate blocks.
     """
     lines = text.splitlines()
-    header_idx = -1
-    for i, line in enumerate(lines):
-        if _SOURCES_HEADER_RE.match(line):
-            header_idx = i
+    header_idx = _sources_header_index(lines)
     if header_idx < 0:
         return text
     return "\n".join(lines[:header_idx])
@@ -535,6 +602,11 @@ def main(argv: list[str] | None = None) -> int:
     p_ing = sub.add_parser("ingest", help="register every url in JSON tool output")
     p_ing.add_argument("file", help="JSON file, or - for stdin")
 
+    p_ann = sub.add_parser("annotate", help="attach localized chat label and description")
+    p_ann.add_argument("id", type=int, help="ledger id of the source to annotate")
+    p_ann.add_argument("--label", required=True, help="localized visible link label")
+    p_ann.add_argument("--description", help="optional localized one-line description")
+
     p_q = sub.add_parser("quote", help="attach verbatim supporting evidence to a source")
     p_q.add_argument("id", type=int, help="ledger id of the source the quote supports")
     p_q.add_argument("--text", required=True, help="the exact quote, copied from the page")
@@ -550,8 +622,11 @@ def main(argv: list[str] | None = None) -> int:
 
     p_render = sub.add_parser("render", help="render a Sources block")
     p_render.add_argument(
-        "--style", default="markdown", choices=["markdown", "plain", "footnotes", "bibtex", "evidence"]
+        "--style",
+        default="chat",
+        choices=["chat", "markdown", "plain", "footnotes", "bibtex", "evidence"],
     )
+    p_render.add_argument("--heading", default="Sources", help="localized heading for chat style")
     p_render.add_argument("--only", help="ids to include, e.g. 1,3,5-7")
     p_render.add_argument("--cited-in", help="include only ids cited in this draft file")
     p_render.add_argument(
@@ -604,6 +679,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[{entry['id']}] {entry['url']}")
         return 0
 
+    if args.cmd == "annotate":
+        entry = annotate_source(path, args.id, args.label, args.description)
+        print(f"[{entry['id']}] chat metadata attached")
+        return 0
+
     if args.cmd == "quote":
         raw = (
             sys.stdin.read()
@@ -638,7 +718,7 @@ def main(argv: list[str] | None = None) -> int:
             prose, _ = _split_draft(draft)
             cited = {int(m) for m in _CITE_RE.findall(prose)}
             only = cited if only is None else (only & cited)
-        block = render_sources(sources, style=args.style, only=only)
+        block = render_sources(sources, style=args.style, only=only, heading=args.heading)
         if not block:
             print("no sources to render", file=sys.stderr)
             return 1
