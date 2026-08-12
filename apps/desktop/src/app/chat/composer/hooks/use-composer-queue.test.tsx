@@ -73,7 +73,7 @@ describe('useComposerQueue park integration', () => {
     expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
   })
 
-  it('reuses one delivery id when a queued send loses its client promise across remount', async () => {
+  it('holds an ambiguous delivery across remount until the user retries it', async () => {
     let settleFirst: (accepted: boolean) => void = () => undefined
     const firstResult = new Promise<boolean>(resolve => {
       settleFirst = resolve
@@ -112,13 +112,21 @@ describe('useComposerQueue park integration', () => {
       await Promise.resolve()
     })
 
-    await waitFor(() => expect(second.onSubmit).toHaveBeenCalledTimes(1))
+    expect(second.onSubmit).not.toHaveBeenCalled()
     expect(onSubmit.mock.calls[0]?.[1]).toMatchObject({
       queueDeliveryId: expect.any(String)
     })
-    expect(second.onSubmit.mock.calls[0]?.[1]).toMatchObject({
-      queueDeliveryId: onSubmit.mock.calls[0]?.[1]?.queueDeliveryId
+    expect(getQueuedPrompts(SESSION_KEY)).toMatchObject([
+      { deliveryStarted: true, text: 'run this exactly once' }
+    ])
+
+    const entryId = getQueuedPrompts(SESSION_KEY)[0]!.id
+    await act(async () => {
+      await second.hook.result.current.sendQueuedNow(entryId)
     })
+
+    expect(second.onSubmit).toHaveBeenCalledTimes(1)
+    expect(second.onSubmit.mock.calls[0]?.[1]).toMatchObject({ queueDeliveryId: entryId })
     expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
 
     settleFirst(true)

@@ -11,6 +11,9 @@ export interface QueuedPromptEntry {
   displayText?: string
   attachments: ComposerAttachment[]
   queuedAt: number
+  /** Persisted before dispatch. A remount must not auto-replay an entry whose
+   * RPC outcome is unknown; the user can still retry it explicitly. */
+  deliveryStarted?: true
 }
 
 type QueueState = Record<string, QueuedPromptEntry[]>
@@ -174,6 +177,60 @@ export const removeQueuedPrompt = (key: string | null | undefined, id: string): 
   writeSession(sid, next)
 
   return true
+}
+
+export const claimQueuedPrompt = (
+  key: string | null | undefined,
+  id: string,
+  retry = false
+): null | QueuedPromptEntry => {
+  const sid = sidOf(key)
+
+  if (!sid) {
+    return null
+  }
+
+  const queue = queueFor(sid)
+  const entry = queue.find(candidate => candidate.id === id)
+
+  if (!entry || (entry.deliveryStarted && !retry)) {
+    return null
+  }
+
+  const claimed: QueuedPromptEntry = { ...entry, deliveryStarted: true }
+  writeSession(
+    sid,
+    queue.map(candidate => (candidate.id === id ? claimed : candidate))
+  )
+
+  return claimed
+}
+
+/** Restore only a definitively rejected delivery. A thrown/lost RPC remains
+ * claimed because the gateway may already have accepted it. */
+export const releaseQueuedPromptClaim = (key: string | null | undefined, id: string): boolean => {
+  const sid = sidOf(key)
+
+  if (!sid) {
+    return false
+  }
+
+  const queue = queueFor(sid)
+  let changed = false
+  const next = queue.map(entry => {
+    if (entry.id !== id || !entry.deliveryStarted) {
+      return entry
+    }
+    const { deliveryStarted: _deliveryStarted, ...pending } = entry
+    changed = true
+    return pending
+  })
+
+  if (changed) {
+    writeSession(sid, next)
+  }
+
+  return changed
 }
 
 export const promoteQueuedPrompt = (key: string | null | undefined, id: string): boolean => {

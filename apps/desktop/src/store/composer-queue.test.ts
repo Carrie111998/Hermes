@@ -4,6 +4,7 @@ import type { ComposerAttachment } from './composer'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
+  claimQueuedPrompt,
   clearQueuedPrompts,
   dequeueQueuedPrompt,
   enqueueQueuedPrompt,
@@ -12,6 +13,7 @@ import {
   migrateQueuedPrompts,
   parkQueuedPrompts,
   promoteQueuedPrompt,
+  releaseQueuedPromptClaim,
   removeQueuedPrompt,
   shouldAutoDrain,
   unparkQueuedPrompts,
@@ -119,6 +121,19 @@ describe('composer queue store', () => {
 
     const parsed = JSON.parse(String(raw)) as Record<string, { text: string }[]>
     expect(parsed[SESSION_KEY]?.[0]?.text).toBe('persist me')
+  })
+
+  it('persists a delivery claim and restores only an explicit rejection', () => {
+    const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'once' })!
+
+    expect(claimQueuedPrompt(SESSION_KEY, entry.id)).toMatchObject({ deliveryStarted: true })
+    expect(claimQueuedPrompt(SESSION_KEY, entry.id)).toBeNull()
+    expect(JSON.parse(String(window.localStorage.getItem(QUEUE_STORAGE_KEY)))[SESSION_KEY][0]).toMatchObject({
+      deliveryStarted: true
+    })
+
+    expect(releaseQueuedPromptClaim(SESSION_KEY, entry.id)).toBe(true)
+    expect(getQueuedPrompts(SESSION_KEY)[0]?.deliveryStarted).toBeUndefined()
   })
 })
 

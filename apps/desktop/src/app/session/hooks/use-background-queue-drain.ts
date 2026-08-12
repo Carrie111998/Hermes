@@ -6,9 +6,10 @@ import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
-  getQueuedPrompts,
+  claimQueuedPrompt,
   MAX_AUTO_DRAIN_ATTEMPTS,
   type QueuedPromptEntry,
+  releaseQueuedPromptClaim,
   removeQueuedPrompt,
   shouldAutoDrain
 } from '@/store/composer-queue'
@@ -110,7 +111,7 @@ export function useBackgroundQueueDrain({
 
       void Promise.resolve()
         .then(async () => {
-          const liveEntry = getQueuedPrompts(sessionKey).find(candidate => candidate.id === entry.id)
+          const liveEntry = claimQueuedPrompt(sessionKey, entry.id)
 
           if (!liveEntry) {
             return true
@@ -129,6 +130,7 @@ export function useBackgroundQueueDrain({
           )
 
           if (accepted === false) {
+            releaseQueuedPromptClaim(sessionKey, liveEntry.id)
             return false
           }
 
@@ -182,7 +184,11 @@ export function useBackgroundQueueDrain({
 
       const entry = entries[0]
 
-      if (!entry || (drainFailuresRef.current.get(entry.id) ?? 0) >= MAX_AUTO_DRAIN_ATTEMPTS) {
+      if (
+        !entry ||
+        entry.deliveryStarted ||
+        (drainFailuresRef.current.get(entry.id) ?? 0) >= MAX_AUTO_DRAIN_ATTEMPTS
+      ) {
         continue
       }
 

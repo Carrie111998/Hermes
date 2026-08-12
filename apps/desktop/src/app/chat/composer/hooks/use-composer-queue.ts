@@ -9,12 +9,14 @@ import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
+  claimQueuedPrompt,
   enqueueQueuedPrompt,
   getQueuedPrompts,
   MAX_AUTO_DRAIN_ATTEMPTS,
   migrateQueuedPrompts,
   promoteQueuedPrompt,
   type QueuedPromptEntry,
+  releaseQueuedPromptClaim,
   removeQueuedPrompt,
   shouldAutoDrain,
   unparkQueuedPrompts,
@@ -196,14 +198,18 @@ export function useComposerQueue({
   // All queue drain paths share one lock + send-then-remove sequence.
   // `pickEntry` lets each caller choose head, by-id, or skip-edited.
   const runDrain = useCallback(
-    async (pickEntry: (entries: QueuedPromptEntry[]) => QueuedPromptEntry | undefined): Promise<boolean> => {
+    async (
+      pickEntry: (entries: QueuedPromptEntry[]) => QueuedPromptEntry | undefined,
+      retryClaim = false
+    ): Promise<boolean> => {
       if (drainingQueueRef.current || !activeQueueSessionKey) {
         return false
       }
 
       const drainQueueSessionKey = activeQueueSessionKey
       const drainRuntimeSessionId = sessionId ?? null
-      const entry = pickEntry(getQueuedPrompts(drainQueueSessionKey))
+      const picked = pickEntry(getQueuedPrompts(drainQueueSessionKey))
+      const entry = picked ? claimQueuedPrompt(drainQueueSessionKey, picked.id, retryClaim) : null
 
       if (!entry) {
         return false
@@ -224,6 +230,7 @@ export function useComposerQueue({
         )
 
         if (accepted === false) {
+          releaseQueuedPromptClaim(drainQueueSessionKey, entry.id)
           return false
         }
 
@@ -279,7 +286,7 @@ export function useComposerQueue({
       // taps gets a fresh attempt (and re-enables auto-retry on success).
       drainFailuresRef.current.delete(id)
 
-      return runDrain(entries => entries.find(e => e.id === id))
+      return runDrain(entries => entries.find(e => e.id === id), true)
     },
     [activeQueueSessionKey, busy, onCancel, queueEdit, runDrain]
   )
@@ -295,7 +302,11 @@ export function useComposerQueue({
 
     const entry = pickDrainHead(queuedPrompts)
 
-    if (!entry || (drainFailuresRef.current.get(entry.id) ?? 0) >= MAX_AUTO_DRAIN_ATTEMPTS) {
+    if (
+      !entry ||
+      entry.deliveryStarted ||
+      (drainFailuresRef.current.get(entry.id) ?? 0) >= MAX_AUTO_DRAIN_ATTEMPTS
+    ) {
       return
     }
 
