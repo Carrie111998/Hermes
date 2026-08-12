@@ -299,8 +299,14 @@ browser.stderr?.on('data', chunk => {
 })
 const stderrTail = () => Buffer.concat(stderrChunks).toString('utf8').slice(-24_000)
 
+let browserControl = null
+
 try {
-  await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, browser, stderrTail)
+  const browserVersion = await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, browser, stderrTail)
+  if (browserVersion?.webSocketDebuggerUrl) {
+    browserControl = new CdpClient(browserVersion.webSocketDebuggerUrl)
+    await browserControl.connect()
+  }
 
   for (const viewport of [
     { width: 390, height: 844 },
@@ -389,8 +395,34 @@ try {
     }
   }
 } finally {
-  if (browser.exitCode === null) browser.kill('SIGTERM')
-  await Promise.race([new Promise(resolve => browser.once('exit', resolve)), delay(3_000)])
-  if (browser.exitCode === null) browser.kill('SIGKILL')
-  rmSync(profile, { recursive: true, force: true })
+  // Ask Chromium to shut down through its own browser-level CDP endpoint first.
+  // This lets profile writers and helper processes flush before we remove the
+  // temporary user-data-dir. Native Termux exposed a real ENOTEMPTY race when
+  // the smoke killed Chromium and immediately called rmSync despite all UX
+  // assertions already passing.
+  if (browserControl) {
+    try {
+      await browserControl.send('Browser.close')
+    } catch {
+      /* Chromium may close the control socket before acknowledging Browser.close */
+    }
+    browserControl.close()
+  }
+
+  const hasExited = () => browser.exitCode !== null || browser.signalCode !== null
+  const waitForExit = async timeoutMs => {
+    if (hasExited()) return true
+    await Promise.race([new Promise(resolve => browser.once('exit', resolve)), delay(timeoutMs)])
+    return hasExited()
+  }
+
+  if (!(await waitForExit(3_000))) {
+    browser.kill('SIGTERM')
+    if (!(await waitForExit(3_000))) {
+      browser.kill('SIGKILL')
+      await waitForExit(3_000)
+    }
+  }
+
+  rmSync(profile, { recursive: true, force: true, maxRetries: 12, retryDelay: 125 })
 }
