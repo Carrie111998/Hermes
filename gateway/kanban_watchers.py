@@ -530,6 +530,7 @@ class GatewayKanbanWatchersMixin:
                             if isinstance(delivery_metadata, dict)
                             else {}
                         )
+                        deliver_artifacts = metadata.pop("deliver_artifacts", True) is not False
                         if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
                         # Adapters with no push channel (the API server —
@@ -588,7 +589,7 @@ class GatewayKanbanWatchersMixin:
                             # ``send_document`` / ``send_image_file`` uploads
                             # them. Only fires on the ``completed`` event so
                             # we never spam attachments on retries.
-                            if kind == "completed":
+                            if kind == "completed" and deliver_artifacts:
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,
