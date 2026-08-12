@@ -2101,8 +2101,10 @@ DEFAULT_CONFIG = {
     },
 
     # Approval mode for dangerous commands:
-    #   manual — always prompt the user
-    #   smart  — use auxiliary LLM to auto-approve low-risk commands (default)
+    #   manual — always prompt the user (DEFAULT: fail closed — an absent
+    #     approvals.mode key must never silently resolve to LLM-adjudicated
+    #     approvals; see issue #84547)
+    #   smart  — use auxiliary LLM to auto-approve low-risk commands (opt-in)
     #   off    — skip all approval prompts (equivalent to --yolo)
     #
     # cron_mode — what to do when a cron job hits a dangerous command:
@@ -2115,7 +2117,7 @@ DEFAULT_CONFIG = {
     # immediately — 60s proved too tight on Telegram/Discord (the prompt
     # expired before the user reached their phone), so the default is 300.
     "approvals": {
-        "mode": "smart",
+        "mode": "manual",
         "timeout": 300,
         "cron_mode": "deny",
         # Operator-customizable policy text for smart approvals. When
