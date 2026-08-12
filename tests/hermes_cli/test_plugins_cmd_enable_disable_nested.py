@@ -91,7 +91,7 @@ class TestEnableDisableNested:
     ):
         from types import SimpleNamespace
 
-        from hermes_cli.plugins_cmd import _get_plugin_toolset_key
+        from hermes_cli.plugins_cmd import _get_plugin_toolset_keys
 
         loaded = SimpleNamespace(
             manifest=SimpleNamespace(name="associative-memory"),
@@ -99,7 +99,7 @@ class TestEnableDisableNested:
         )
         mock_manager.return_value._plugins = {"associative-memory": loaded}
 
-        assert _get_plugin_toolset_key("associative-memory") is None
+        assert _get_plugin_toolset_keys("associative-memory") == []
         mock_discover.assert_called_once_with(force=True)
 
     @patch("hermes_cli.plugins_cmd._toggle_plugin_toolset")
@@ -154,8 +154,8 @@ class TestEnableDisableNested:
     @patch("hermes_cli.config.save_config")
     @patch("hermes_cli.config.load_config")
     @patch(
-        "hermes_cli.plugins_cmd._get_plugin_toolset_key",
-        return_value="associative-memory",
+        "hermes_cli.plugins_cmd._get_plugin_toolset_keys",
+        return_value=["associative-memory"],
     )
     def test_existing_toolset_still_persists_plugin_mapping(
         self, mock_key, mock_load, mock_save,
@@ -174,6 +174,53 @@ class TestEnableDisableNested:
         assert config["plugins"]["entries"]["associative-memory"]["toolsets"] == [
             "associative-memory"
         ]
+
+    @patch("hermes_cli.config.save_config")
+    @patch("hermes_cli.config.load_config")
+    @patch(
+        "hermes_cli.plugins_cmd._get_plugin_toolset_keys",
+        return_value=["demo-admin", "demo-read"],
+    )
+    def test_toggle_synchronizes_every_plugin_toolset(
+        self, mock_keys, mock_load, mock_save,
+    ):
+        from hermes_cli.plugins_cmd import _toggle_plugin_toolset
+
+        config = {
+            "plugins": {"entries": {}},
+            "platform_toolsets": {
+                "cli": ["web", "demo-read"],
+                "telegram": ["web"],
+            },
+        }
+        mock_load.return_value = config
+
+        _toggle_plugin_toolset("demo", enable=True)
+
+        assert config["plugins"]["entries"]["demo"]["toolsets"] == [
+            "demo-admin",
+            "demo-read",
+        ]
+        assert config["platform_toolsets"]["cli"] == [
+            "web",
+            "demo-read",
+            "demo-admin",
+        ]
+        assert config["platform_toolsets"]["telegram"] == [
+            "web",
+            "demo-admin",
+            "demo-read",
+        ]
+        mock_save.assert_called_once_with(config)
+
+        mock_save.reset_mock()
+        mock_keys.return_value = []
+        config["platform_toolsets"]["cli"].append("demo-read")
+        _toggle_plugin_toolset("demo", enable=False)
+
+        assert config["platform_toolsets"]["cli"] == ["web"]
+        assert config["platform_toolsets"]["telegram"] == ["web"]
+        mock_save.assert_called_once_with(config)
 
     @patch("hermes_cli.plugins_cmd._resolve_tool_override_grant")
     @patch("hermes_cli.plugins_cmd._toggle_plugin_toolset")

@@ -1919,17 +1919,19 @@ def dashboard_install_plugin(
     }
 
 
-def _get_plugin_toolset_key(name: str) -> Optional[str]:
-    """Return the toolset key a plugin registers its tools under, or None.
+def _get_plugin_toolset_keys(name: str) -> list[str]:
+    """Return every toolset key a plugin registers its tools under.
 
     Queries the live tool registry — the plugin must already be loaded.
     Falls back to reading ``provides_tools`` from plugin.yaml and looking
-    up the toolset from the registry for the first tool name found.
+    up each tool's toolset in the registry.
     """
     try:
         from tools.registry import registry
     except Exception:
-        return None
+        return []
+
+    toolset_keys: set[str] = set()
 
     # Check the plugin manager for tools this plugin registered
     try:
@@ -1946,7 +1948,7 @@ def _get_plugin_toolset_key(name: str) -> Optional[str]:
                 for tool_name in loaded.tools_registered:
                     entry = registry.get_entry(tool_name)
                     if entry and entry.toolset:
-                        return entry.toolset
+                        toolset_keys.add(entry.toolset)
                 break
     except Exception:
         pass
@@ -1963,11 +1965,11 @@ def _get_plugin_toolset_key(name: str) -> Optional[str]:
                 for tool_name in manifest.get("provides_tools") or []:
                     entry = registry.get_entry(tool_name)
                     if entry and entry.toolset:
-                        return entry.toolset
+                        toolset_keys.add(entry.toolset)
     except Exception:
         pass
 
-    return None
+    return sorted(toolset_keys)
 
 
 def _toggle_plugin_toolset(name: str, *, enable: bool) -> None:
@@ -1983,18 +1985,21 @@ def _toggle_plugin_toolset(name: str, *, enable: bool) -> None:
     entry = entries.setdefault(name, {}) if isinstance(entries, dict) else {}
 
     mapping_changed = False
-    toolset_key = _get_plugin_toolset_key(name)
-    if toolset_key and isinstance(entry, dict):
-        # Preserve the plugin→toolset mapping for future disable/repair calls,
+    toolset_keys = _get_plugin_toolset_keys(name)
+    if toolset_keys and isinstance(entry, dict):
+        # Preserve the plugin→toolsets mapping for future disable/repair calls,
         # when disabled plugin code is deliberately not imported.
-        remembered_value = [toolset_key]
-        if entry.get("toolsets") != remembered_value:
-            entry["toolsets"] = remembered_value
+        if entry.get("toolsets") != toolset_keys:
+            entry["toolsets"] = toolset_keys
             mapping_changed = True
     elif not enable and isinstance(entry, dict):
         remembered = entry.get("toolsets")
-        toolset_key = remembered[0] if isinstance(remembered, list) and remembered else None
-    if not toolset_key:
+        toolset_keys = (
+            sorted({key for key in remembered if isinstance(key, str) and key})
+            if isinstance(remembered, list)
+            else []
+        )
+    if not toolset_keys:
         return
 
     platform_toolsets = config.get("platform_toolsets")
@@ -2007,16 +2012,19 @@ def _toggle_plugin_toolset(name: str, *, enable: bool) -> None:
         if not isinstance(ts_list, list):
             continue
         if enable:
-            if toolset_key not in ts_list:
-                ts_list.append(toolset_key)
+            for toolset_key in toolset_keys:
+                if toolset_key not in ts_list:
+                    ts_list.append(toolset_key)
+                    changed = True
+        else:
+            filtered = [key for key in ts_list if key not in toolset_keys]
+            if filtered != ts_list:
+                ts_list[:] = filtered
                 changed = True
-        elif toolset_key in ts_list:
-            ts_list.remove(toolset_key)
-            changed = True
 
     # If enabling and no platforms have toolset lists yet, add to "cli" at minimum
     if enable and not changed and not platform_toolsets:
-        platform_toolsets["cli"] = [toolset_key]
+        platform_toolsets["cli"] = list(toolset_keys)
         changed = True
 
     if changed or mapping_changed:
