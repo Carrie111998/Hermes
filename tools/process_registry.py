@@ -66,6 +66,21 @@ def _checkpoint_path() -> Path:
         return CHECKPOINT_PATH
     return get_hermes_home() / "processes.json"
 
+
+def _capture_checkpoint_path() -> Optional[Path]:
+    """Bind the checkpoint file to the home a session is being spawned under.
+
+    Resolving only — never creating, and never raising: a spawn must not fail
+    because the home could not be resolved (get_hermes_home() falls back to
+    Path.home(), which raises when the environment has no home at all). None
+    means "no binding", and the reader thread falls back to resolving live —
+    the pre-existing behaviour.
+    """
+    try:
+        return _checkpoint_path()
+    except Exception:
+        return None
+
 # Limits
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
 FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
@@ -149,6 +164,12 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
+    # Checkpoint file this session belongs to, captured at spawn. The reader
+    # thread outlives the scope that started it — its lifetime is bounded by
+    # the child process — so re-resolving get_hermes_home() when the child
+    # exits writes into whatever HERMES_HOME has been restored to by then.
+    # See _write_checkpoint() and GBrain concepts/import-time-hermes-home-snapshot-bug.
+    checkpoint_path: Optional[Path] = field(default=None, repr=False)
 
 
 class ProcessRegistry:
@@ -747,7 +768,10 @@ class ProcessRegistry:
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
 
-                # PTY reader thread
+                # PTY reader thread. Bind the checkpoint to the home we are
+                # spawning under: this thread finishes whenever the child
+                # does, by which point HERMES_HOME may have moved.
+                session.checkpoint_path = _capture_checkpoint_path()
                 reader = threading.Thread(
                     target=self._pty_reader_loop,
                     args=(session,),
@@ -799,7 +823,9 @@ class ProcessRegistry:
         session.host_start_time = self._safe_host_start_time(session.pid)
 
         try:
-            # Start output reader thread
+            # Start output reader thread (see the PTY branch above for why the
+            # checkpoint path is captured here rather than resolved on exit).
+            session.checkpoint_path = _capture_checkpoint_path()
             reader = threading.Thread(
                 target=self._reader_loop,
                 args=(session,),
@@ -917,7 +943,10 @@ class ProcessRegistry:
             session.output_buffer = f"Failed to start: {e}"
 
         if not session.exited:
-            # Start a poller thread that periodically reads the log file
+            # Start a poller thread that periodically reads the log file. Same
+            # binding as spawn_local: capture the checkpoint path now, because
+            # this thread only stops when the sandbox child does.
+            session.checkpoint_path = _capture_checkpoint_path()
             reader = threading.Thread(
                 target=self._env_poller_loop,
                 args=(session, env, log_path, pid_path, exit_path),
@@ -988,7 +1017,7 @@ class ProcessRegistry:
             if session.completion_reason != "killed":
                 session.exit_code = session.process.returncode
                 session.completion_reason = "exited"
-            self._move_to_finished(session)
+            self._move_to_finished(session, checkpoint_path=session.checkpoint_path)
 
     def _env_poller_loop(
         self, session: ProcessSession, env: Any, log_path: str, pid_path: str, exit_path: str
@@ -1036,7 +1065,9 @@ class ProcessRegistry:
                     session.exited = True
                     if session.completion_reason != "killed":
                         session.completion_reason = "exited"
-                    self._move_to_finished(session)
+                    self._move_to_finished(
+                        session, checkpoint_path=session.checkpoint_path
+                    )
                     return
 
             except Exception:
@@ -1045,7 +1076,9 @@ class ProcessRegistry:
                 session.exit_code = -1
                 session.completion_reason = "lost"
                 session.termination_source = "backend_lost"
-                self._move_to_finished(session)
+                self._move_to_finished(
+                    session, checkpoint_path=session.checkpoint_path
+                )
                 return
 
     def _pty_reader_loop(self, session: ProcessSession):
@@ -1080,20 +1113,26 @@ class ProcessRegistry:
         if session.completion_reason != "killed":
             session.exit_code = pty.exitstatus if hasattr(pty, 'exitstatus') else -1
             session.completion_reason = "exited"
-        self._move_to_finished(session)
+        self._move_to_finished(session, checkpoint_path=session.checkpoint_path)
 
-    def _move_to_finished(self, session: ProcessSession):
+    def _move_to_finished(
+        self, session: ProcessSession, *, checkpoint_path: Optional[Path] = None
+    ):
         """Move a session from running to finished.
 
         Idempotent: if the session was already moved (e.g. kill_process raced
         with the reader thread), the second call is a no-op — no duplicate
         completion notification is enqueued.
+
+        ``checkpoint_path`` is forwarded to _write_checkpoint(); the reader
+        threads pass the path captured at spawn so the exit write cannot
+        follow a HERMES_HOME that moved underneath them.
         """
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
         session._completion_event.set()
-        self._write_checkpoint()
+        self._write_checkpoint(checkpoint_path=checkpoint_path)
 
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
@@ -1904,8 +1943,20 @@ class ProcessRegistry:
 
     # ----- Checkpoint (crash recovery) -----
 
-    def _write_checkpoint(self):
-        """Write running process metadata to checkpoint file atomically."""
+    def _write_checkpoint(self, *, checkpoint_path: Optional[Path] = None):
+        """Write running process metadata to checkpoint file atomically.
+
+        ``checkpoint_path`` is the path captured when the session was spawned.
+        Callers on the spawning thread pass nothing and resolve live, which is
+        correct — the process still holds the home it was launched with. The
+        reader/poller threads pass ``session.checkpoint_path``, because they
+        finish whenever the *child* does, long after the scope that started
+        them is gone (under pytest, after monkeypatch has restored the env).
+        """
+        if checkpoint_path is not None and not checkpoint_path.parent.is_dir():
+            # The captured home was deleted (a torn-down tmp_path). Recreating
+            # it would leave litter; there is nothing left to checkpoint for.
+            return
         try:
             with self._lock:
                 entries = []
@@ -1939,7 +1990,7 @@ class ProcessRegistry:
             
             # Atomic write to avoid corruption on crash
             from utils import atomic_json_write
-            atomic_json_write(_checkpoint_path(), entries)
+            atomic_json_write(checkpoint_path or _checkpoint_path(), entries)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 

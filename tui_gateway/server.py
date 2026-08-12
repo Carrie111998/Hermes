@@ -9765,7 +9765,10 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 
 
 def _notification_poller_loop(
-    stop_event: threading.Event, sid: str, session: dict
+    stop_event: threading.Event,
+    sid: str,
+    session: dict,
+    db_path: Optional[Path] = None,
 ) -> None:
     """Poll completion_queue and dispatch notifications autonomously.
 
@@ -9776,6 +9779,13 @@ def _notification_poller_loop(
     The completion_queue is process-global. In multi-session Desktop each
     poller requeues events owned by another live session and drops addressed
     events whose owner is gone; ownerless legacy notifications remain global.
+
+    ``db_path`` is the delegation db captured at session start and carried
+    into every delivery call. This thread's lifetime is bounded by the
+    session, so re-resolving ``_db_path()`` per tick would CREATE a state.db
+    under whatever ``HERMES_HOME`` has been restored to — see GBrain
+    ``concepts/import-time-hermes-home-snapshot-bug``. None means "resolve
+    live", which is correct for direct callers.
     """
     from tools.process_registry import process_registry, format_process_notification
 
@@ -9853,15 +9863,15 @@ def _notification_poller_loop(
         from tools.async_delegation import (
             claim_event_delivery, complete_event_delivery, release_event_delivery,
         )
-        _claim = claim_event_delivery(evt, "tui-poller")
+        _claim = claim_event_delivery(evt, "tui-poller", db_path=db_path)
         if _claim is None:
             continue
         try:
             _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
+            complete_event_delivery(evt, _claim, db_path=db_path)
         except Exception as exc:
-            release_event_delivery(evt, _claim)
+            release_event_delivery(evt, _claim, db_path=db_path)
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
                 f"{type(exc).__name__}: {exc}",
@@ -9921,15 +9931,15 @@ def _notification_poller_loop(
         from tools.async_delegation import (
             claim_event_delivery, complete_event_delivery, release_event_delivery,
         )
-        _claim = claim_event_delivery(evt, "tui-poller")
+        _claim = claim_event_delivery(evt, "tui-poller", db_path=db_path)
         if _claim is None:
             continue
         try:
             _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
+            complete_event_delivery(evt, _claim, db_path=db_path)
         except Exception as exc:
-            release_event_delivery(evt, _claim)
+            release_event_delivery(evt, _claim, db_path=db_path)
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
                 f"{type(exc).__name__}: {exc}",
@@ -9992,9 +10002,20 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     """Start the background notification poller for a TUI session."""
     _wire_agent_terminal_output()
     stop = threading.Event()
+    # Bind the delegation db to the home this session starts in. The poller
+    # runs for the life of the session; resolving _db_path() on a later tick
+    # would follow a HERMES_HOME that moved and CREATE a state.db there.
+    # Resolving only — never creating, and never raising: a session must not
+    # fail to start because the home could not be resolved.
+    try:
+        from tools.async_delegation import _db_path as _delegation_db_path
+
+        db_path = _delegation_db_path()
+    except Exception:
+        db_path = None
     t = threading.Thread(
         target=_notification_poller_loop,
-        args=(stop, sid, session),
+        args=(stop, sid, session, db_path),
         daemon=True,
     )
     t.start()
