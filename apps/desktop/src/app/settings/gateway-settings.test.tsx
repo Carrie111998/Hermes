@@ -8,7 +8,8 @@ const saveConnectionConfig = vi.fn()
 
 // Keep the component import static so the suite's import phase, not a timed hook,
 // owns module loading under full-suite contention. Vitest hoists this isolated
-// profile-store mock before evaluating the component import.
+// profile-store mock before evaluating the component import, keeping import
+// scheduling outside the behavioral assertion timeout.
 vi.mock('@/store/profile', async () => {
   const { atom } = await import('nanostores')
 
