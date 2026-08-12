@@ -5231,6 +5231,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Battery read-out in the status bar (toggled via /battery, off by
         # default). Persisted to display.battery so it survives restarts.
         self._battery_visible = bool(CLI_CONFIG["display"].get("battery", False))
+        # Cached provider-plan usage for the status bar. Refresh asynchronously;
+        # quota requests must never block prompt_toolkit repaints.
+        self._status_usage_snapshot = None
+        self._status_usage_checked_at = 0.0
+        self._status_usage_refreshing = False
+        self._status_usage_lock = threading.Lock()
         # When True, the input separator rules and the dynamic status bar are
         # hidden until the next user input. Set by _recover_after_resize() so a
         # SIGWINCH cannot stamp a freshly-drawn status bar on top of one that
@@ -5942,6 +5948,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         }
 
         try:
+            self._maybe_refresh_status_usage()
+            usage = getattr(self, "_status_usage_snapshot", None)
+            if usage is not None:
+                labels = []
+                for window in tuple(getattr(usage, "windows", ()) or ()):
+                    used = getattr(window, "used_percent", None)
+                    if used is None:
+                        continue
+                    remaining = max(0, min(100, round(100 - float(used))))
+                    short = "S" if getattr(window, "label", "") == "Session" else "W"
+                    labels.append(f"{short} {remaining}%")
+                snapshot["plan_usage_label"] = "plan " + " · ".join(labels) if labels else ""
+        except Exception:
+            pass
+
+        try:
             from hermes_cli.focus_view import focus_statusbar_segment
 
             snapshot["focus_label"] = focus_statusbar_segment(
@@ -6045,6 +6067,45 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
 
         return snapshot
+
+    def _maybe_refresh_status_usage(self) -> None:
+        """Start a throttled, non-blocking provider plan-usage refresh."""
+        lock = getattr(self, "_status_usage_lock", None)
+        if lock is None:
+            return
+        now = time.monotonic()
+        with lock:
+            if getattr(self, "_status_usage_refreshing", False):
+                return
+            if now - float(getattr(self, "_status_usage_checked_at", 0.0) or 0.0) < 60:
+                return
+            self._status_usage_checked_at = now
+            self._status_usage_refreshing = True
+
+        def refresh() -> None:
+            try:
+                agent = getattr(self, "agent", None)
+                provider = getattr(agent, "provider", None) or getattr(self, "provider", None)
+                if not provider:
+                    return
+                from agent.account_usage import fetch_account_usage
+                usage = fetch_account_usage(
+                    provider,
+                    base_url=getattr(agent, "base_url", None) or getattr(self, "base_url", None),
+                    api_key=getattr(agent, "api_key", None) or getattr(self, "api_key", None),
+                )
+                with lock:
+                    self._status_usage_snapshot = usage
+                app = getattr(self, "_app", None)
+                if app is not None:
+                    app.invalidate()
+            except Exception:
+                pass
+            finally:
+                with lock:
+                    self._status_usage_refreshing = False
+
+        threading.Thread(target=refresh, name="hermes-status-usage", daemon=True).start()
 
     def _get_status_bar_session_title(self) -> str:
         """Return the current title without polling state.db on every repaint."""
@@ -6661,6 +6722,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             battery_label = snapshot.get("battery_label") or ""
             battery_prefix = f"{battery_label} │ " if battery_label else ""
             focus_label = snapshot.get("focus_label") or ""
+            plan_usage_label = snapshot.get("plan_usage_label") or ""
             session_title = snapshot.get("session_title") or ""
 
             yolo_active = self._is_session_yolo_active()
@@ -6671,6 +6733,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     text += f" · {goal_segment}"
                 if focus_label:
                     text += f" · {focus_label}"
+                if plan_usage_label:
+                    text += f" · {plan_usage_label}"
                 if yolo_active:
                     text += " · ⚠ YOLO"
                 return self._right_align_status_title(text, session_title, width)
@@ -6695,6 +6759,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 parts.append(duration_label)
                 if focus_label:
                     parts.append(focus_label)
+                if plan_usage_label:
+                    parts.append(plan_usage_label)
                 if yolo_active:
                     parts.append("⚠ YOLO")
                 return self._right_align_status_title(" · ".join(parts), session_title, width)
@@ -6732,6 +6798,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 parts.append(idle_since)
             if focus_label:
                 parts.append(focus_label)
+            if plan_usage_label:
+                parts.append(plan_usage_label)
             if yolo_active:
                 parts.append("⚠ YOLO")
             return self._right_align_status_title(" │ ".join(parts), session_title, width)
@@ -6755,6 +6823,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             battery_label = snapshot.get("battery_label") or ""
             battery_style = self._battery_status_style(snapshot.get("battery_category", "dim"))
             focus_label = snapshot.get("focus_label") or ""
+            plan_usage_label = snapshot.get("plan_usage_label") or ""
             session_title = snapshot.get("session_title") or ""
 
             if width < 52:
@@ -6770,6 +6839,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if focus_label:
                     frags.append(("class:status-bar-dim", " · "))
                     frags.append(("class:status-bar-strong", focus_label))
+                if plan_usage_label:
+                    frags.append(("class:status-bar-dim", " · "))
+                    frags.append(("class:status-bar-strong", plan_usage_label))
                 if yolo_active:
                     frags.append(("class:status-bar-dim", " · "))
                     frags.append(("class:status-bar-yolo", "⚠ YOLO"))
@@ -6810,6 +6882,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if focus_label:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-strong", focus_label))
+                    if plan_usage_label:
+                        frags.append(("class:status-bar-dim", " · "))
+                        frags.append(("class:status-bar-strong", plan_usage_label))
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
@@ -6871,6 +6946,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if focus_label:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-strong", focus_label))
+                    if plan_usage_label:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-strong", plan_usage_label))
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
