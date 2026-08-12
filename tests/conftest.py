@@ -904,46 +904,6 @@ def _live_system_guard(request, monkeypatch):
         except Exception:
             return False
 
-    def _is_package_install(cmd) -> bool:
-        """True if *cmd* would install/remove packages in the LIVE venv.
-
-        A test run must never mutate the developer's / gateway's venv. The
-        live offender was ``tools/lazy_deps.py::_venv_pip_install``: any
-        test that enables a platform (e.g. by setting ``FEISHU_APP_ID``)
-        reaches ``gateway/config.py::_apply_env_overrides`` ->
-        ``entry.check_fn()``, which — per its own comment there — "lazy-
-        INSTALLS the platform SDK (pip) as a side effect". One
-        ``pytest tests/gateway`` run installed lark_oapi 1.6.8 (101 MB,
-        21,169 files) into ``~/.hermes/agent-src/.venv`` and timed out
-        mid-install.
-
-        Installs redirected somewhere disposable are still allowed: a
-        ``--target``/``--prefix``/``--root``/``--python`` install, or one
-        run against a different interpreter (a throwaway venv built by the
-        test), cannot touch the running environment.
-        """
-        cmd_str = _cmd_to_string(cmd)
-        try:
-            tokens = _shlex.split(cmd_str)
-        except ValueError:
-            tokens = cmd_str.split()
-        if not tokens:
-            return False
-
-        heads = [_exe_head(t) for t in tokens]
-        # ``ensurepip`` bootstraps pip INTO the venv — a mutation with no
-        # "install" verb of its own.
-        if "ensurepip" not in heads:
-            if not any(_PIP_HEAD.match(h) for h in heads):
-                return False
-            if not any(t in _INSTALL_VERBS for t in tokens):
-                return False
-
-        for tok in tokens:
-            if tok.split("=", 1)[0] in _INSTALL_REDIRECT_FLAGS:
-                return False
-        return not _is_foreign_interpreter(tokens[0])
-
     def _cmd_tokens(cmd) -> list:
         """Tokenise *cmd* without destroying Windows paths.
 
@@ -962,6 +922,54 @@ def _live_system_guard(request, monkeypatch):
             return _shlex.split(cmd_str)
         except ValueError:
             return cmd_str.split()
+
+    def _is_package_install(cmd) -> bool:
+        """True if *cmd* would install/remove packages in the LIVE venv.
+
+        A test run must never mutate the developer's / gateway's venv. The
+        live offender was ``tools/lazy_deps.py::_venv_pip_install``: any
+        test that enables a platform (e.g. by setting ``FEISHU_APP_ID``)
+        reaches ``gateway/config.py::_apply_env_overrides`` ->
+        ``entry.check_fn()``, which — per its own comment there — "lazy-
+        INSTALLS the platform SDK (pip) as a side effect". One
+        ``pytest tests/gateway`` run installed lark_oapi 1.6.8 (101 MB,
+        21,169 files) into ``~/.hermes/agent-src/.venv`` and timed out
+        mid-install.
+
+        Installs redirected somewhere disposable are still allowed: a
+        ``--target``/``--prefix``/``--root``/``--python`` install, or one
+        run against a different interpreter (a throwaway venv built by the
+        test), cannot touch the running environment.
+
+        Tokenisation goes through ``_cmd_tokens``, NOT a join + posix
+        ``shlex.split``: the latter eats the backslashes in a Windows argv, so
+        ``[r"C:\\…\\venv\\Scripts\\python.exe", "-m", "ensurepip", …]``
+        collapsed to a single ``C:…venvScriptspython.exe`` token whose
+        basename no longer starts with ``python``. ``_is_foreign_interpreter``
+        then answered False and the throwaway-venv exemption — the one this
+        docstring and the RuntimeError both advertise — never fired. That is
+        why ``venv.create(tmp_path / "venv", with_pip=True)`` (CPython shells
+        out to ``<newvenv>/Scripts/python.exe -m ensurepip``) was blocked on
+        Windows while the identical call was correctly allowed on POSIX. Same
+        defect class ``_cmd_tokens`` was introduced for in the Node guard.
+        """
+        tokens = _cmd_tokens(cmd)
+        if not tokens:
+            return False
+
+        heads = [_exe_head(t) for t in tokens]
+        # ``ensurepip`` bootstraps pip INTO the venv — a mutation with no
+        # "install" verb of its own.
+        if "ensurepip" not in heads:
+            if not any(_PIP_HEAD.match(h) for h in heads):
+                return False
+            if not any(t in _INSTALL_VERBS for t in tokens):
+                return False
+
+        for tok in tokens:
+            if tok.split("=", 1)[0] in _INSTALL_REDIRECT_FLAGS:
+                return False
+        return not _is_foreign_interpreter(tokens[0])
 
     def _is_node_package_install(cmd) -> bool:
         """True if *cmd* would really run a Node package manager.

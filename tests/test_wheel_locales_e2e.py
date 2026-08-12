@@ -104,7 +104,15 @@ def test_installed_wheel_renders_i18n_strings(tmp_path):
     #    same-version no-op.
     venv_dir = tmp_path / "venv"
     venv.create(venv_dir, with_pip=True)
-    vpy = venv_dir / "bin" / "python"
+    # venv puts its interpreter and console scripts under ``Scripts/`` with an
+    # ``.exe`` suffix on Windows and ``bin/`` elsewhere. Hardcoding
+    # ``bin/python`` made this test POSIX-only by construction: on Windows the
+    # very first subprocess below died with FileNotFoundError (WinError 2)
+    # before it could assert anything about the wheel — so the packaging
+    # regression this file exists to catch went unwatched on the platform the
+    # developer actually runs.
+    bindir = venv_dir / ("Scripts" if os.name == "nt" else "bin")
+    vpy = bindir / ("python.exe" if os.name == "nt" else "python")
     subprocess.run(
         [str(vpy), "-m", "pip", "install", "-q", "pyyaml"],
         check=True, timeout=_PIP_TIMEOUT,
@@ -127,7 +135,9 @@ def test_installed_wheel_renders_i18n_strings(tmp_path):
         "and s != 'gateway.status.header') else 1)"
     )
     env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "HERMES_BUNDLED_LOCALES")}
-    env["PATH"] = f"{venv_dir / 'bin'}:{env['PATH']}"
+    # os.pathsep, not a literal ":" — on Windows the separator is ";" and a
+    # ":"-joined value silently collapses the whole PATH into one bogus entry.
+    env["PATH"] = os.pathsep.join([str(bindir), env["PATH"]])
     env["VIRTUAL_ENV"] = str(venv_dir)
     run = subprocess.run(
         [str(vpy), "-c", probe],

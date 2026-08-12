@@ -459,6 +459,54 @@ def test_pip_install_into_other_interpreter_passes_through():
         )
 
 
+# The three tests below are the Windows half of the exemption above.  The
+# POSIX-path test could never have caught the defect they cover: the guard
+# tokenised a list argv by joining it and re-splitting with posix
+# ``shlex.split``, which eats backslashes.  A Windows argv
+# ``[r"C:\…\venv\Scripts\python.exe", "-m", "ensurepip", …]`` collapsed into
+# one ``C:…venvScriptspython.exe`` token whose basename no longer starts with
+# ``python``, so ``_is_foreign_interpreter`` said False and the
+# throwaway-venv exemption never fired.  A POSIX path has no backslashes to
+# eat, so it sailed through either way.
+#
+# These use literal backslash paths rather than ``tmp_path`` so they exercise
+# the Windows shape on EVERY platform — a native-separator test would silently
+# stop covering the regression whenever the suite runs on Linux CI.
+
+
+def test_windows_venv_ensurepip_passes_through():
+    """``venv.create(tmp, with_pip=True)`` on Windows — the reported failure.
+
+    CPython's venv module shells out to
+    ``<newvenv>/Scripts/python.exe -m ensurepip --upgrade --default-pip``.
+    That interpreter is the throwaway venv's, not ours, so it must pass
+    through.  It was blocked, which made ``venv.create`` unusable in tests on
+    Windows while working fine on POSIX.
+    """
+    fake = r"C:\Users\dev\AppData\Local\Temp\pytest-1\t0\venv\Scripts\python.exe"
+    with pytest.raises(FileNotFoundError):
+        subprocess.check_output([fake, "-m", "ensurepip", "--upgrade", "--default-pip"])
+
+
+def test_windows_venv_pip_install_passes_through():
+    """The pip installs that follow ``venv.create`` are the same shape."""
+    fake = r"C:\Users\dev\AppData\Local\Temp\pytest-1\t0\venv\Scripts\python.exe"
+    with pytest.raises(FileNotFoundError):
+        subprocess.run([fake, "-m", "pip", "install", "-q", "pyyaml"])
+
+
+def test_windows_live_interpreter_pip_install_still_blocked():
+    """The widened tokeniser must not blunt the guard on Windows.
+
+    ``sys.executable`` spelt with native separators is still OUR interpreter,
+    so an install through it still mutates the live venv and must be blocked.
+    Without this, a fix for the two tests above could pass by exempting every
+    backslash-bearing path.
+    """
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run([os.path.normpath(sys.executable), "-m", "pip", "install", "pyyaml"])
+
+
 def test_npm_install_passes_through():
     """The guard protects the Python venv; ``npm install`` is unrelated."""
     with pytest.raises(FileNotFoundError):
