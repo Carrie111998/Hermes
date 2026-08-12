@@ -16,9 +16,10 @@ check verifies the metadata of whatever is actually installed.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
-from hermes_cli.doctor import _scan_installed_distributions
+from hermes_cli.doctor import _UNNAMED_DIST, _scan_installed_distributions
 
 
 def _make_dist(site: Path, name: str, version: str = "1.0.0") -> Path:
@@ -82,6 +83,27 @@ def test_metadata_without_name_is_flagged(tmp_path: Path) -> None:
     assert "Name" in broken[0][1]
 
 
+def test_unnamed_distribution_never_reports_a_path_as_its_name(tmp_path: Path) -> None:
+    """The name is interpolated into a pip command -- it must stay a name.
+
+    A path in the name slot yields `pip --force-reinstall C:\\...\\foo.dist-info`,
+    which cannot be run. The path belongs in the reason instead.
+    """
+    site = tmp_path / "site-packages"
+    site.mkdir()
+    dist_info = _make_dist(site, "delta")
+    (dist_info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nVersion: 1.0.0\n", encoding="utf-8"
+    )
+
+    broken, _ = _scan_installed_distributions([str(site)])
+
+    name, reason = broken[0]
+    assert name == _UNNAMED_DIST
+    assert os.sep not in name and "/" not in name, f"path leaked into name: {name!r}"
+    assert "delta" in reason, f"the path should be surfaced in the reason: {reason!r}"
+
+
 def test_egg_info_without_record_is_not_flagged(tmp_path: Path) -> None:
     """Legacy/editable installs legitimately have no RECORD -- no false alarm."""
     site = tmp_path / "site-packages"
@@ -106,8 +128,25 @@ def test_scan_never_raises_on_a_broken_path(tmp_path: Path) -> None:
     assert total == 0
 
 
-def test_scans_the_real_environment_without_error() -> None:
-    """Smoke test against the live interpreter: fast and non-throwing."""
-    broken, total = _scan_installed_distributions()
-    assert total > 0, "expected to find installed distributions"
+def test_returns_the_documented_shape(tmp_path: Path) -> None:
+    """Contract check, kept hermetic.
+
+    Deliberately not run against the live interpreter: that would make the
+    suite depend on whatever happens to be installed on the runner, and it
+    would fail on exactly the corrupted environment this check exists to
+    diagnose.
+    """
+    site = tmp_path / "site-packages"
+    site.mkdir()
+    _make_dist(site, "epsilon")
+
+    result = _scan_installed_distributions([str(site)])
+
+    assert isinstance(result, tuple) and len(result) == 2
+    broken, total = result
     assert isinstance(broken, list)
+    assert isinstance(total, int)
+    assert all(
+        isinstance(item, tuple) and len(item) == 2 and all(isinstance(s, str) for s in item)
+        for item in broken
+    )
