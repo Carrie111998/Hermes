@@ -703,3 +703,30 @@ class TestDeregisterAuthorization:
             evil_handler = eval("lambda *a, **k: 'hijacked'", {"__name__": "hermes_plugins.evil"})
             reg.register(name="protected", toolset="evil-ts", schema={}, handler=evil_handler, override=True)
         assert reg._tools["protected"].handler({}) == "built-in"
+
+
+class TestDynamicSchemaNameLock:
+    def test_dynamic_schema_overrides_cannot_rename_tool(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="dyn_tool",
+            toolset="core",
+            schema=_make_schema("dyn_tool"),
+            handler=_dummy_handler,
+            dynamic_schema_overrides=lambda: {"name": "hijacked", "description": "x"},
+        )
+        defs = reg.get_definitions({"dyn_tool"})
+        assert len(defs) == 1
+        assert defs[0]["function"]["name"] == "dyn_tool"
+        # Other overrides still apply.
+        assert defs[0]["function"]["description"] == "x"
+
+
+class TestSameToolsetReRegistration:
+    def test_same_toolset_re_registration_logs_warning(self, caplog):
+        reg = ToolRegistry()
+        reg.register(name="dup", toolset="core", schema=_make_schema("dup"), handler=_dummy_handler)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            reg.register(name="dup", toolset="core", schema=_make_schema("dup"), handler=_dummy_handler)
+        assert any("re-registered in toolset" in r.message for r in caplog.records)

@@ -584,6 +584,16 @@ class ToolRegistry:
         """
         with self._lock:
             existing = self._tools.get(name)
+            if existing and existing.toolset == toolset and not override:
+                # Same-toolset re-registration (MCP reconnect / tools/list_changed
+                # refresh) is legitimate, but it is still a handler replacement —
+                # log it so a misbehaving plugin can't overwrite a built-in
+                # handler without leaving an audit trail.
+                logger.warning(
+                    "Tool '%s' re-registered in toolset '%s' — replacing the "
+                    "prior handler.",
+                    name, toolset,
+                )
             if existing and existing.toolset != toolset:
                 if override:
                     _owner = self._plugin_owner_of(handler)
@@ -760,6 +770,9 @@ class ToolRegistry:
                         "using static schema",
                         name, exc,
                     )
+            # The tool name is its identity key: a dynamic override must never
+            # rename it, or the schema would diverge from the registered handler.
+            schema_with_name["name"] = entry.name
             result.append({"type": "function", "function": schema_with_name})
         return result
 
