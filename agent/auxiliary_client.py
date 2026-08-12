@@ -8881,6 +8881,7 @@ def call_llm(
     api_mode: str = None,
     stream: bool = False,
     stream_options: dict = None,
+    fallback_policy: str = "host",
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
     semaphore = _acquire_sync_aux_semaphore(task)
@@ -8905,6 +8906,7 @@ def call_llm(
             api_mode=api_mode,
             stream=stream,
             stream_options=stream_options,
+            fallback_policy=fallback_policy,
         )
         if stream and semaphore is not None:
             stream_semaphore = semaphore
@@ -8950,6 +8952,7 @@ def _call_llm_impl(
     api_mode: str = None,
     stream: bool = False,
     stream_options: dict = None,
+    fallback_policy: str = "host",
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -8993,6 +8996,10 @@ def _call_llm_impl(
     # and fallbacks. Reading ambient state independently in each phase lets a
     # concurrent /model switch produce a key for one runtime and a client for
     # another.
+    fallback_policy = str(fallback_policy or "host").strip().lower()
+    if fallback_policy not in {"host", "same_provider_only"}:
+        raise ValueError("fallback_policy must be 'host' or 'same_provider_only'")
+    same_provider_only = fallback_policy == "same_provider_only"
     main_runtime = _normalize_main_runtime(main_runtime)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
@@ -9012,6 +9019,10 @@ def _call_llm_impl(
             main_runtime=main_runtime,
         )
         if client is None and resolved_provider != "auto" and not resolved_base_url:
+            if same_provider_only:
+                raise RuntimeError(
+                    f"No LLM provider configured for task={task} provider={resolved_provider}"
+                )
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -9550,6 +9561,8 @@ def _call_llm_impl(
             or _is_invalid_aux_response_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
+            if same_provider_only:
+                raise first_err
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
@@ -9725,6 +9738,7 @@ async def async_call_llm(
     timeout: float = None,
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
+    fallback_policy: str = "host",
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
     semaphore = _acquire_async_aux_semaphore(task)
@@ -9745,6 +9759,7 @@ async def async_call_llm(
             timeout=timeout,
             extra_body=extra_body,
             reasoning_config=reasoning_config,
+            fallback_policy=fallback_policy,
         )
     finally:
         if semaphore is not None:
@@ -9766,6 +9781,7 @@ async def _async_call_llm_impl(
     timeout: float = None,
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
+    fallback_policy: str = "host",
 ) -> Any:
     """Centralized asynchronous LLM call.
 
@@ -9773,6 +9789,10 @@ async def _async_call_llm_impl(
     """
     # Keep every async phase on the same runtime identity, even if another
     # session switches models while this task is awaiting network I/O.
+    fallback_policy = str(fallback_policy or "host").strip().lower()
+    if fallback_policy not in {"host", "same_provider_only"}:
+        raise ValueError("fallback_policy must be 'host' or 'same_provider_only'")
+    same_provider_only = fallback_policy == "same_provider_only"
     main_runtime = _normalize_main_runtime(main_runtime)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
@@ -9790,6 +9810,10 @@ async def _async_call_llm_impl(
             main_runtime=main_runtime,
         )
         if client is None and resolved_provider != "auto" and not resolved_base_url:
+            if same_provider_only:
+                raise RuntimeError(
+                    f"No LLM provider configured for task={task} provider={resolved_provider}"
+                )
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -10206,6 +10230,8 @@ async def _async_call_llm_impl(
             or _is_invalid_aux_response_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
+            if same_provider_only:
+                raise first_err
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):

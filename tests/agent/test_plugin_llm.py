@@ -271,6 +271,50 @@ class TestJsonParsing:
 
 
 class TestPluginLlmFacade:
+    def test_complete_forwards_same_provider_only_policy(self):
+        seen = {}
+
+        def caller(**kwargs):
+            seen.update(kwargs)
+            return "openrouter", "deepseek/deepseek-v4-flash", _fake_response("ok")
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="obsidian_duo",
+            policy=_TrustPolicy(plugin_id="obsidian_duo"),
+            sync_caller=caller,
+        )
+
+        result = llm.complete(
+            [{"role": "user", "content": "classify"}],
+            fallback_policy="same_provider_only",
+        )
+
+        assert result.text == "ok"
+        assert seen["fallback_policy"] == "same_provider_only"
+
+    def test_complete_structured_forwards_same_provider_only_policy(self):
+        seen = {}
+
+        def caller(**kwargs):
+            seen.update(kwargs)
+            return "openrouter", "deepseek/deepseek-v4-flash", _fake_response('{"ok": true}')
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="obsidian_duo",
+            policy=_TrustPolicy(plugin_id="obsidian_duo"),
+            sync_caller=caller,
+        )
+
+        result = llm.complete_structured(
+            instructions="classify",
+            input=[PluginLlmTextInput(text="data")],
+            json_mode=True,
+            fallback_policy="same_provider_only",
+        )
+
+        assert result.parsed == {"ok": True}
+        assert seen["fallback_policy"] == "same_provider_only"
+
     def test_complete_uses_active_model_by_default(self):
         captured: dict = {}
 
@@ -388,6 +432,56 @@ class TestPluginLlmFacade:
 
 
 class TestAsyncSurface:
+    def test_acomplete_forwards_same_provider_only_policy(self):
+        seen = {}
+
+        async def caller(**kwargs):
+            seen.update(kwargs)
+            return "openrouter", "deepseek/deepseek-v4-flash", _fake_response("ok")
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="obsidian_duo",
+            policy=_TrustPolicy(plugin_id="obsidian_duo"),
+            async_caller=caller,
+        )
+
+        async def _run():
+            return await llm.acomplete(
+                [{"role": "user", "content": "classify"}],
+                fallback_policy="same_provider_only",
+            )
+
+        result = asyncio.run(_run())
+
+        assert result.text == "ok"
+        assert seen["fallback_policy"] == "same_provider_only"
+
+    def test_acomplete_structured_forwards_same_provider_only_policy(self):
+        seen = {}
+
+        async def caller(**kwargs):
+            seen.update(kwargs)
+            return "openrouter", "deepseek/deepseek-v4-flash", _fake_response('{"ok": true}')
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="obsidian_duo",
+            policy=_TrustPolicy(plugin_id="obsidian_duo"),
+            async_caller=caller,
+        )
+
+        async def _run():
+            return await llm.acomplete_structured(
+                instructions="classify",
+                input=[PluginLlmTextInput(text="data")],
+                json_mode=True,
+                fallback_policy="same_provider_only",
+            )
+
+        result = asyncio.run(_run())
+
+        assert result.parsed == {"ok": True}
+        assert seen["fallback_policy"] == "same_provider_only"
+
     def test_acomplete_uses_async_caller(self):
         async def fake_async(**_kwargs):
             return "openai", "gpt-4o", _fake_response("async hello")

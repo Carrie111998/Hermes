@@ -633,11 +633,23 @@ def build_memory_write_metadata(
     tool_call_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build provenance metadata for external memory-provider mirrors."""
+    from agent.memory_provenance import is_host_confirmed_user_memory
+
+    resolved_origin = write_origin or getattr(agent, "_memory_write_origin", "assistant_tool")
+    resolved_context = execution_context or getattr(agent, "_memory_write_context", "foreground")
+    resolved_intent = str(getattr(agent, "_memory_user_intent", "none") or "none")
+    synthetic = bool(getattr(agent, "_memory_user_turn_synthetic", False))
     metadata: Dict[str, Any] = {
-        "write_origin": write_origin or getattr(agent, "_memory_write_origin", "assistant_tool"),
+        "write_origin": resolved_origin,
         "execution_context": (
-            execution_context
-            or getattr(agent, "_memory_write_context", "foreground")
+            resolved_context
+        ),
+        "user_memory_intent": resolved_intent,
+        "host_confirmed_user_memory": is_host_confirmed_user_memory(
+            resolved_intent,
+            write_origin=resolved_origin,
+            execution_context=resolved_context,
+            synthetic=synthetic,
         ),
         "session_id": agent.session_id or "",
         "parent_session_id": agent._parent_session_id or "",

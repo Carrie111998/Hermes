@@ -305,7 +305,7 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
 
     # Try register(ctx) pattern first (how our plugins are written)
     if hasattr(mod, "register"):
-        collector = _ProviderCollector()
+        collector = _ProviderCollector(plugin_id=name)
         try:
             mod.register(collector)
             if collector.provider:
@@ -330,8 +330,11 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
 class _ProviderCollector:
     """Fake plugin context that captures register_memory_provider calls."""
 
-    def __init__(self):
+    def __init__(self, plugin_id: str):
+        from agent.plugin_llm import PluginLlm
+
         self.provider = None
+        self.llm = PluginLlm(plugin_id=plugin_id)
 
     def register_memory_provider(self, provider):
         self.provider = provider

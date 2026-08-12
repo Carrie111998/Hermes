@@ -25,6 +25,7 @@ Usage in run_agent.py:
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import re
@@ -697,6 +698,9 @@ class MemoryManager:
 
     def _submit_background(self, fn, *, kind: str = "write") -> None:
         """Queue ``fn`` on the serialized worker and track its durability class."""
+        submission_context = contextvars.copy_context()
+        original_fn = fn
+        fn = lambda: submission_context.run(original_fn)  # preserve originating runtime context
         executor = self._get_sync_executor()
         if executor is None:
             if self._shutting_down:

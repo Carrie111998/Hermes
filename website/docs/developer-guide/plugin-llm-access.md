@@ -206,6 +206,15 @@ in the same repo.
 Everything else — provider selection, model resolution, auth, fallback,
 timeout, vision routing — is the same across all four.
 
+### Restricting fallback for cost-sensitive work
+
+Plugin calls use the host's normal fallback behavior by default. A
+cost-sensitive plugin can pass `fallback_policy="same_provider_only"` to any
+of the four methods. Hermes may retry or refresh credentials for the active
+provider, but it will not select a different provider or model after that
+route fails. This is useful for memory and other background work where a free
+or explicitly selected route must not silently become a paid fallback.
+
 ## API surface
 
 `ctx.llm` is an instance of `agent.plugin_llm.PluginLlm`.
@@ -223,6 +232,7 @@ result = ctx.llm.complete(
     agent_id=None,         # optional, gated
     profile=None,          # optional, gated — explicit auth-profile name
     purpose="optional-audit-string",
+    fallback_policy="host",  # or "same_provider_only"
 )
 # → PluginLlmCompleteResult(text, provider, model, agent_id, usage, audit)
 ```

@@ -1946,6 +1946,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         # turn_context.py binds this onto the write-origin ContextVar at turn
         # start (see agent/turn_context.py).
         review_agent._memory_write_origin = "background_review"
+        review_agent._memory_write_context = "background_review"
 
         # Redirect the forked agent's stdout/stderr to /dev/null while it
         # runs so its tool-call chatter doesn't pollute the foreground
