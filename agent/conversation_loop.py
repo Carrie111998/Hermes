@@ -188,6 +188,8 @@ _API_CALL_MODULES = frozenset({
 })
 
 
+
+
 def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str) -> None:
     """Append a provider-safe checkpoint and correction to the live turn.
 
