@@ -48,6 +48,7 @@ from tools.managed_tool_gateway import resolve_managed_tool_gateway
 from tools.tool_backend_helpers import (
     managed_nous_tools_enabled,
     nous_tool_gateway_unavailable_message,
+    prefers_gateway,
     resolve_openai_audio_api_key,
 )
 
@@ -2951,25 +2952,39 @@ def transcribe_audio_local_fallback(
 
 
 def _resolve_openai_audio_client_config() -> tuple[str, str]:
-    """Return direct OpenAI audio config or a managed gateway fallback."""
+    """Return OpenAI audio config, honoring an explicit gateway preference.
+
+    When ``stt.use_gateway`` is set, managed audio is selected before every
+    direct credential source, matching the other gateway-enabled media tools.
+    """
     stt_config = _load_stt_config()
     openai_cfg = stt_config.get("openai") or {}
     cfg_api_key = openai_cfg.get("api_key", "")
     cfg_base_url = openai_cfg.get("base_url", "")
-    if cfg_api_key:
+    prefer_managed = prefers_gateway("stt")
+    if cfg_api_key and not prefer_managed:
         return cfg_api_key, (cfg_base_url or OPENAI_BASE_URL)
 
     # A local OpenAI-compatible server needs no key — send a placeholder so
     # the SDK doesn't refuse to construct a client (#25193, credit @nnnet).
-    if cfg_base_url and _is_local_or_private_url(cfg_base_url):
+    if cfg_base_url and _is_local_or_private_url(cfg_base_url) and not prefer_managed:
         return "not-needed", cfg_base_url
 
-    direct_api_key = resolve_openai_audio_api_key()
-    if direct_api_key:
-        return direct_api_key, OPENAI_BASE_URL
+    if not prefer_managed:
+        direct_api_key = resolve_openai_audio_api_key()
+        if direct_api_key:
+            return direct_api_key, OPENAI_BASE_URL
 
     managed_gateway = resolve_managed_tool_gateway("openai-audio")
     if managed_gateway is None:
+        if prefer_managed:
+            raise ValueError(
+                "stt.use_gateway is enabled, so direct credentials were skipped. "
+                + nous_tool_gateway_unavailable_message(
+                    "managed OpenAI audio for transcription",
+                )
+            )
+
         message = "Neither stt.openai.api_key in config nor VOICE_TOOLS_OPENAI_KEY/OPENAI_API_KEY is set"
         if managed_nous_tools_enabled():
             message += (
