@@ -79,6 +79,7 @@ class TestSkillPrunedMarkerEmit:
         assert summary.startswith("[skill_view] name=docker-management (6,000 chars)")
         assert _skill_pruned_marker("docker-management") in summary
         assert "reload with skill_view(name='docker-management')" in summary
+        assert "before any further action" in summary
 
     def test_small_skill_view_summary_not_marked(self):
         summary = _summarize_tool_result(
@@ -290,6 +291,7 @@ class TestSkillsGuidanceSafetyRule:
         assert "## Skill Safety Rule" in SKILLS_GUIDANCE
         assert "[SKILL_PRUNED]" in SKILLS_GUIDANCE
         assert "skill_view(name='...')" in SKILLS_GUIDANCE
+        assert "next action" in SKILLS_GUIDANCE
         # The rule list must use REAL newlines — the original PR hunk risked
         # literal backslash-n escape text rendering into the system prompt.
         assert "\\n" not in SKILLS_GUIDANCE
