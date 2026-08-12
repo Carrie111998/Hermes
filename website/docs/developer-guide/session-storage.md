@@ -13,7 +13,8 @@ Source file: `hermes_state.py`
 ~/.hermes/state.db (SQLite, WAL mode)
 ├── sessions              — Session metadata, token counts, billing
 ├── messages              — Full message history per session
-├── messages_fts          — FTS5 virtual table (content + tool_name + tool_calls)
+├── messages_fts          — FTS5 external-content index over messages_fts_source
+├── messages_fts_source   — View: content + tool_name + tool_calls per message
 ├── messages_fts_trigram  — FTS5 virtual table with trigram tokenizer (CJK / substring search)
 ├── state_meta            — Key/value metadata table
 └── schema_version        — Single-row table tracking migration state
@@ -102,33 +103,83 @@ Notes:
 
 ### FTS5 Full-Text Search
 
+`messages_fts` is an **external-content** index: it stores the search index but
+no copy of the indexed text, reading that back from `messages` on demand. The
+indexed string spans three columns, so the `content=` option points at a view
+rather than at `messages` directly:
+
 ```sql
+CREATE VIEW IF NOT EXISTS messages_fts_source AS
+SELECT
+    id AS id,
+    COALESCE(content, '') || ' ' || COALESCE(tool_name, '') || ' ' || COALESCE(tool_calls, '') AS content
+FROM messages;
+
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content,
-    content=messages,
-    content_rowid=id
+    content='messages_fts_source',
+    content_rowid='id'
 );
 ```
 
-The FTS5 table is kept in sync via three triggers that fire on INSERT, UPDATE,
-and DELETE of the `messages` table:
+Not storing a second copy of the message text is worth roughly a quarter of the
+database file — on a 5.1 GB production `state.db` the duplicate copy was 1.3 GB.
+The cost is that `snippet()` re-reads the row through the view; in practice that
+is around 0.1% of query time, because callers already join `messages` for the
+full content.
+
+Two consequences are easy to miss:
+
+- **`SELECT COUNT(*) FROM messages_fts` counts messages, not indexed rows.** A
+  full scan of an external-content table reads the view, so this returns the
+  same number whether the index is complete or empty. Use
+  `... WHERE messages_fts MATCH ?` to assert anything about the index itself.
+- **Verify with the strong integrity check.**
+  `INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)`
+  re-derives terms from the content table and so detects both orphaned index
+  rowids and stale text. The default `rank=0` form detects neither.
+
+The index is kept in sync via three triggers on `messages`. Removing an entry
+means handing FTS5 the **old** text through the `'delete'` command so it knows
+which terms to retract — a plain `DELETE FROM messages_fts` is rejected:
 
 ```sql
 CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
-    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+    INSERT INTO messages_fts(rowid, content) VALUES (
+        new.id,
+        COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+    );
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, content)
-        VALUES('delete', old.id, old.content);
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES (
+        'delete',
+        old.id,
+        COALESCE(old.content, '') || ' ' || COALESCE(old.tool_name, '') || ' ' || COALESCE(old.tool_calls, '')
+    );
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, content)
-        VALUES('delete', old.id, old.content);
-    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES (
+        'delete',
+        old.id,
+        COALESCE(old.content, '') || ' ' || COALESCE(old.tool_name, '') || ' ' || COALESCE(old.tool_calls, '')
+    );
+    INSERT INTO messages_fts(rowid, content) VALUES (
+        new.id,
+        COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+    );
 END;
 ```
+
+Recovery from a corrupt or incomplete index is
+`INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`, exposed as
+`SessionDB.rebuild_fts()`. Because it regenerates the index from the view, it
+also picks up any message that was never indexed — which a rebuild of an
+inline index cannot do, since that reads from the index's own stored copy.
+
+`messages_fts_trigram` is a separate, **inline** index; it is created lazily and
+can be disabled with `HERMES_DISABLE_MESSAGE_TRIGRAM`.
 
 
 ## Schema Version and Migrations
@@ -153,6 +204,7 @@ The `schema_version` table stores a single integer. Simple column additions are 
 | 16 | Tag delegate subagent rows in `model_config` (`$._delegate_from`) so session pickers stay clean after parent deletes orphan them |
 | 18 | Gateway metadata consolidation — backfill `display_name` / `origin_json` / `expiry_finalized` from `sessions.json` |
 | 20 | Per-model usage attribution — seed `session_model_usage` rows from historical per-session aggregate totals |
+| 32 | Convert `messages_fts` back to external-content mode over the new `messages_fts_source` view, dropping the duplicate `messages_fts_content` shadow table (~1.3 GB on a 5.1 GB DB); rewrite the triggers to the `'delete'` command form and `'rebuild'` the index. **This migration re-indexes every message and holds the write lock for tens of minutes on a large DB** — deploy it with writers stopped, not on a routine restart |
 
 Versions not listed above were declarative column additions handled by `_reconcile_columns()` (version bump only, no data migration).
 
