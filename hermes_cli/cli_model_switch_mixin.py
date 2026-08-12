@@ -73,6 +73,8 @@ class CLIModelSwitchMixin:
     def _confirm_and_apply_model_switch_result(
         self, result, persist_global: bool, custom_providers=None
     ) -> None:
+        from cli import _cprint
+
         try:
             if result.success and not self._confirm_expensive_model_switch(result):
                 _cprint("  Model switch cancelled.")
@@ -107,6 +109,8 @@ class CLIModelSwitchMixin:
 
     def _restore_model_runtime_snapshot(self, snapshot: dict | None) -> None:
         """Restore a model runtime captured before a one-turn override."""
+        from cli import logger
+
         if not snapshot:
             return
         for key in (
@@ -179,6 +183,8 @@ class CLIModelSwitchMixin:
 
     def _clear_persisted_context_for_model_switch(self, result) -> None:
         """Drop a global context pin when its configured owner changes."""
+        from cli import save_config_value
+
         try:
             from hermes_cli.config import load_config_readonly
             from hermes_cli.route_identity import should_clear_context_pin
@@ -202,6 +208,14 @@ class CLIModelSwitchMixin:
     def _apply_model_switch_result(
         self, result, persist_global: bool, custom_providers=None
     ) -> None:
+        from cli import (
+            HermesCLI,
+            _cprint,
+            base_url_host_matches,
+            logger,
+            save_config_value,
+        )
+
         if not result.success:
             _cprint(f"  ✗ {result.error_message}")
             return
@@ -220,7 +234,7 @@ class CLIModelSwitchMixin:
                 merge_preflight_compression_warning(
                     result,
                     agent=self.agent,
-                    messages=list(self.conversation_history or []),
+                    messages=list(getattr(self, "conversation_history", None) or []),
                     custom_providers=_cp,
                     config_context_length=getattr(self.agent, "_config_context_length", None),
                 )
@@ -432,6 +446,13 @@ class CLIModelSwitchMixin:
         config.yaml, default False — switches are session-scoped). Use
         ``--global`` to persist, or ``--once`` for the next turn only.
         """
+        from cli import (
+            HermesCLI,
+            _cprint,
+            base_url_host_matches,
+            logger,
+            save_config_value,
+        )
         from hermes_cli.model_switch import (
             switch_model,
             parse_model_switch_args,
@@ -555,7 +576,7 @@ class CLIModelSwitchMixin:
                 merge_preflight_compression_warning(
                     result,
                     agent=self.agent,
-                    messages=list(self.conversation_history or []),
+                    messages=list(getattr(self, "conversation_history", None) or []),
                     # Same fresh inventory list passed to switch_model above.
                     custom_providers=custom_provs
                     if custom_provs is not None
@@ -692,25 +713,3 @@ class CLIModelSwitchMixin:
             _cprint("    (next turn only — restores after one response)")
         else:
             _cprint("    (session only — add --global to persist)")
-
-
-
-def __getattr__(name):
-    """PEP 562 lazy bridge for cli.py-internal symbols.
-
-    The moved methods reference ``_cprint``, ``save_config_value``,
-    ``base_url_host_matches``, ``logger``, and the ``HermesCLI`` class by
-    bare name (verbatim bodies).  Resolving them lazily at first attribute
-    access keeps this module free of a top-level ``import cli`` (which would
-    cycle) while preserving byte-identical method bodies.
-    """
-    if name in ("_cprint", "save_config_value", "base_url_host_matches", "logger", "HermesCLI"):
-        from cli import (  # noqa: F401
-            HermesCLI,
-            _cprint,
-            base_url_host_matches,
-            logger,
-            save_config_value,
-        )
-        return locals()[name]
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
