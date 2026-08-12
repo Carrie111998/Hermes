@@ -67,6 +67,7 @@ import {
   type TileDock
 } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
+import { clearSessionTodos } from '@/store/todos'
 import { isWatchWindow } from '@/store/windows'
 import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
 
@@ -1400,6 +1401,7 @@ export function useSessionActions({
 
         if (closingRuntimeId) {
           clearQueuedPrompts(closingRuntimeId)
+          clearSessionTodos(closingRuntimeId)
         }
 
         // A tiled copy of this session must not outlive it: collapse the pane
@@ -1409,6 +1411,7 @@ export function useSessionActions({
         closeSessionTile(storedSessionId)
 
         if (tiledRuntimeId) {
+          clearSessionTodos(tiledRuntimeId)
           runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
           sessionStateByRuntimeIdRef.current.delete(tiledRuntimeId)
           dropSessionState(tiledRuntimeId)
