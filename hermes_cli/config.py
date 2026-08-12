@@ -3560,22 +3560,9 @@ def save_config(
         if is_managed():
             managed_error("save configuration")
             return
-        # Managed scope: strip any leaf the managed layer pins, so a bulk write
-        # (wizard / programmatic save) never persists a user value that would
-        # silently lose to managed on the next load. Single-key `config set`
-        # hard-rejects (see set_config_value); this is the mechanical safety net
-        # for bulk writes so the unmanaged remainder still lands.
         from hermes_cli import managed_scope
 
         managed_keys = managed_scope.managed_config_keys()
-        if managed_keys:
-            config, _stripped = _strip_dotted_keys(copy.deepcopy(config), managed_keys)
-            if _stripped:
-                print(
-                    f"Note: {len(_stripped)} managed setting(s) were not saved "
-                    f"(managed by your administrator): {', '.join(sorted(_stripped))}",
-                    file=sys.stderr,
-                )
         from utils import atomic_yaml_write
 
         ensure_hermes_home()
@@ -3591,6 +3578,17 @@ def save_config(
         )
         if merge_existing and _raw_for_paths:
             config = _merge_partial_save(_raw_for_paths, config)
+        # Strip managed leaves after merging the existing document. Otherwise
+        # merge_existing can restore stale user values that the managed layer
+        # pins and make them active if that policy is later removed.
+        if managed_keys:
+            config, _stripped = _strip_dotted_keys(copy.deepcopy(config), managed_keys)
+            if _stripped:
+                print(
+                    f"Note: {len(_stripped)} managed setting(s) were not saved "
+                    f"(managed by your administrator): {', '.join(sorted(_stripped))}",
+                    file=sys.stderr,
+                )
         # ----------------------------------------------------------------
 
         current_normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
