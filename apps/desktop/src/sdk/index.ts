@@ -20,6 +20,7 @@
 
 import { atom, type ReadableAtom } from 'nanostores'
 
+import { type ComposerInsertMode, type ComposerTarget, requestComposerInsert } from '@/app/chat/composer/focus'
 import { $narrowViewport } from '@/components/pane-shell/tree/store'
 import { onGatewayEvent } from '@/contrib/events'
 import { getLogs, getStatus } from '@/hermes'
@@ -74,6 +75,18 @@ export const host = {
   /** Toast into the app's notification stack. */
   notify,
   notifyError,
+
+  /** Act on the real, currently active chat composer. Unlike dispatching a
+   *  DOM event from a runtime plugin, this crosses the curated SDK boundary
+   *  and resolves the app's live composer target before inserting. */
+  composer: {
+    insert: async (
+      text: string,
+      { mode = 'block', target = 'active' }: { mode?: ComposerInsertMode; target?: ComposerTarget | 'active' } = {}
+    ): Promise<void> => {
+      requestComposerInsert(text, { mode, target })
+    }
+  },
 
   // NOTE: every host door is async-safe — wrapped so a sync throw from an
   // internal helper (e.g. no desktop bridge in a plain browser) becomes a
