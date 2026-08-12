@@ -1982,6 +1982,19 @@ def prompt_caching_disabled_from_config() -> bool:
     return cache_ttl_means_disabled(ttl)
 
 
+def prompt_cache_ttl_from_config() -> Optional[str]:
+    """Return the configured TTL for agent-less auxiliary request paths."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        value = (load_config_readonly().get("prompt_caching", {}) or {}).get(
+            "cache_ttl", "5m"
+        )
+    except Exception:
+        return "5m"
+    return value if value in {"5m", "1h"} else "5m"
+
+
 def blank_cache_policy_stub(cache_disabled: Optional[bool] = None):
     """Build the destination-identity-blank stub for ``anthropic_prompt_cache_policy``.
 
@@ -2015,6 +2028,8 @@ def plan_cache_sections_for_destination(
     api_mode: str,
     model: str,
     cache_disabled: Optional[bool] = None,
+    cache_ttl: Optional[str] = None,
+    static_system_prefix: Optional[str] = None,
 ) -> Tuple[list, list]:
     """Plan request-local cache sections for one resolved destination.
 
@@ -2032,9 +2047,18 @@ def plan_cache_sections_for_destination(
     disable into the blank policy stub. When omitted, the live config is
     consulted so MoA/auxiliary paths cannot re-enable markers after the
     user turned caching off (#76085).
+
+    ``cache_ttl`` threads the operator's configured tier (default ``5m``)
+    into the destination plan so MoA/auxiliary requests stop regressing to
+    the 5m default while the main loop honors ``1h`` (#84733); it is
+    clamped per-destination by :func:`effective_cache_ttl` (Qwen → 5m).
+    ``static_system_prefix`` threads the builder-declared stable prefix so
+    the destination system prompt receives the same early breakpoint the
+    main loop applies instead of marking the whole prompt as a breakpoint.
     """
     from agent.prompt_caching import (
         build_prompt_cache_plan,
+        effective_cache_ttl,
         strip_anthropic_cache_control,
         strip_anthropic_tool_cache_control,
     )
@@ -2054,7 +2078,15 @@ def plan_cache_sections_for_destination(
     plan = build_prompt_cache_plan(
         messages,
         tools,
+        cache_ttl=effective_cache_ttl(
+            cache_ttl or prompt_cache_ttl_from_config() or "5m",
+            provider=provider,
+            model=model,
+        ),
         native_anthropic=native_layout,
+        static_system_prefix=(
+            static_system_prefix if isinstance(static_system_prefix, str) else None
+        ),
         direct_native_tool_cache=_direct_native_anthropic_tool_cache_capability(
             stub,
             provider=provider,

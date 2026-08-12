@@ -120,27 +120,30 @@ def _build_marker(ttl: str) -> Dict[str, str]:
     return marker
 
 
-# Alibaba/Qwen document explicit context-cache TTLs of five minutes
-# (renewed on hit); an explicit '1h' marker is ignored/rejected on that wire,
-# so a config requesting 1h would silently get zero cache hits. Clamp to the
-# supported TTL rather than emitting a marker the provider ignores. (#84733)
-_QWEN_CACHE_SHORT_TTL_PREFIXES = ("qwen",)
+# Routes whose context cache documents a five-minute window (renewed on
+# hit) and rejects the Anthropic 1h tier.
+_QWEN_1H_UNSUPPORTED_PROVIDERS = frozenset({
+    "opencode",
+    "opencode-zen",
+    "opencode-go",
+    "alibaba",
+})
 
 
-def effective_cache_ttl(cache_ttl: str, *, model: str = "") -> str:
-    """Resolve the TTL actually supported for the resolved model/route.
-
-    Returns ``cache_ttl`` unchanged except for the documented Qwen clamp:
-    ``1h`` → ``5m`` for Qwen-family models. The capability comes from the
-    resolved model (and, in future, the route matrix), never from a bare
-    config value.
-    """
-    if cache_ttl != "1h":
-        return cache_ttl
-    model_lower = (model or "").strip().lower()
-    if model_lower.startswith(_QWEN_CACHE_SHORT_TTL_PREFIXES):
+def effective_cache_ttl(
+    ttl: str | None,
+    *,
+    model: str = "",
+    provider: str = "",
+) -> str:
+    """Clamp a requested cache TTL to the resolved route capabilities."""
+    if ttl != "1h":
+        return ttl or "5m"
+    if "qwen" in (model or "").lower():
         return "5m"
-    return cache_ttl
+    if (provider or "").lower() in _QWEN_1H_UNSUPPORTED_PROVIDERS:
+        return "5m"
+    return "1h"
 
 
 def _apply_system_cache_markers(
