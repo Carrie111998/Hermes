@@ -260,7 +260,10 @@ export function useComposerQueue({
     [queueEditRef] // reads the edit id off a ref so the lock-holder always sees the latest
   )
 
-  const drainNextQueued = useCallback(() => runDrain(pickDrainHead), [pickDrainHead, runDrain])
+  // Enter on an empty composer is an explicit retry gesture. It may reclaim a
+  // persisted ambiguous claim; the stable delivery id lets the gateway answer
+  // `duplicate` without starting the turn twice.
+  const drainNextQueued = useCallback(() => runDrain(pickDrainHead, true), [pickDrainHead, runDrain])
 
   const sendQueuedNow = useCallback(
     (id: string) => {

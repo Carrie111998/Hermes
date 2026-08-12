@@ -135,6 +135,18 @@ describe('composer queue store', () => {
     expect(releaseQueuedPromptClaim(SESSION_KEY, entry.id)).toBe(true)
     expect(getQueuedPrompts(SESSION_KEY)[0]?.deliveryStarted).toBeUndefined()
   })
+
+  it('assigns fresh delivery identity when an ambiguous entry is edited', () => {
+    const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'original' })!
+    claimQueuedPrompt(SESSION_KEY, entry.id)
+
+    expect(updateQueuedPromptText(SESSION_KEY, entry.id, 'edited')).toBe(true)
+
+    const edited = getQueuedPrompts(SESSION_KEY)[0]!
+    expect(edited.id).not.toBe(entry.id)
+    expect(edited.text).toBe('edited')
+    expect(edited.deliveryStarted).toBeUndefined()
+  })
 })
 
 describe('migrateQueuedPrompts', () => {

@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
+  claimQueuedPrompt,
   enqueueQueuedPrompt,
   getQueuedPrompts,
   isQueueParked,
@@ -130,6 +131,23 @@ describe('useComposerQueue park integration', () => {
     expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
 
     settleFirst(true)
+  })
+
+  it('retries an ambiguous head when the user drains with Enter', async () => {
+    const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'retry with enter' })!
+    expect(claimQueuedPrompt(SESSION_KEY, entry.id)).toMatchObject({ deliveryStarted: true })
+    const second = renderQueueHook()
+
+    await act(async () => {
+      await second.hook.result.current.drainNextQueued()
+    })
+
+    expect(second.onSubmit).toHaveBeenCalledTimes(1)
+    expect(second.onSubmit).toHaveBeenCalledWith(
+      'retry with enter',
+      expect.objectContaining({ queueDeliveryId: entry.id })
+    )
+    expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
   })
 
   it('holds a parked queue at the idle settle (the Stop edge)', async () => {

@@ -283,9 +283,17 @@ export const updateQueuedPrompt = (
     // The user rewrote the text, so any display projection it carried (a
     // `/skill` invocation standing in for the expanded body) no longer
     // describes it — what they typed is now what sends.
-    const { displayText: _dropped, ...rest } = entry
+    const { deliveryStarted: _deliveryStarted, displayText: _dropped, ...rest } = entry
 
-    return { ...rest, text: update.text, attachments }
+    // Editing an ambiguously delivered entry is fresh intent. Give it a new
+    // delivery identity: the gateway may already remember the old id and would
+    // otherwise acknowledge the edited prompt as a duplicate without running it.
+    return {
+      ...rest,
+      ...(entry.deliveryStarted ? { id: nextId() } : {}),
+      text: update.text,
+      attachments
+    }
   })
 
   if (!changed) {
