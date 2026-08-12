@@ -10026,7 +10026,7 @@ def _run_prompt_submit(
                     _title_model = getattr(agent, "model", None)
                     _title_provider = getattr(agent, "provider", None)
                     maybe_auto_title(
-                        _get_db(),
+                        getattr(agent, "_session_db", None),
                         _title_key,
                         text,
                         raw,

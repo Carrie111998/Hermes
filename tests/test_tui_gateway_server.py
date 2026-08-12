@@ -14,6 +14,7 @@ import pytest
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli.active_sessions import active_session_registry_snapshot
 from hermes_cli.browser_connect import ChromeDebugLaunch
+from hermes_state import SessionDB
 from tools import async_delegation as ad
 from tui_gateway import server
 
@@ -11945,8 +11946,16 @@ class _ImmediateThread:
         self._target()
 
 
-def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
-    """maybe_auto_title is called after a successful (complete) prompt."""
+def test_prompt_submit_auto_title_accounts_in_profile_store(monkeypatch, tmp_path):
+    """The titler uses the session profile DB, never the process-home store."""
+
+    profile_home = tmp_path / "profiles" / "customer"
+    process_home = tmp_path / "process"
+    profile_home.mkdir(parents=True)
+    process_home.mkdir()
+    profile_db = SessionDB(profile_home / "state.db")
+    process_db = SessionDB(process_home / "state.db")
+    profile_db.create_session("session-key", source="tui")
 
     class _Agent:
         model = "gpt-5.6-sol"
@@ -11954,6 +11963,7 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
         base_url = "https://chatgpt.example.test/backend-api/codex"
         api_key = object()
         api_mode = "codex_responses"
+        _session_db = profile_db
 
         def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             return {
@@ -11964,34 +11974,70 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
                 ],
             }
 
-    server._sessions["sid"] = _session(agent=_Agent())
+    server._sessions["sid"] = _session(
+        agent=_Agent(),
+        profile_home=str(profile_home),
+    )
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
-    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_get_db", lambda: process_db)
 
-    with patch("agent.title_generator.maybe_auto_title") as mock_title:
-        server.handle_request(
-            {
-                "id": "1",
-                "method": "prompt.submit",
-                "params": {"session_id": "sid", "text": "Tell me about Rome"},
-            }
+    def _title_and_account(db, session_id, *_args, **_kwargs):
+        db.record_auxiliary_usage(
+            session_id,
+            "title_generation",
+            model="gpt-5.6-sol",
+            billing_provider="openai-codex",
+            input_tokens=12,
+            output_tokens=3,
         )
+        assert db.set_auto_title_if_empty(session_id, "Ancient Rome")
 
-    mock_title.assert_called_once()
-    args = mock_title.call_args.args
-    assert args[1] == "session-key"
-    assert args[2] == "Tell me about Rome"
-    assert args[3] == "Rome was founded in 753 BC."
-    assert mock_title.call_args.kwargs["main_runtime"] == {
-        "model": "gpt-5.6-sol",
-        "provider": "openai-codex",
-        "base_url": "https://chatgpt.example.test/backend-api/codex",
-        "api_key": _Agent.api_key,
-        "api_mode": "codex_responses",
-    }
+    try:
+        with patch(
+            "agent.title_generator.maybe_auto_title",
+            side_effect=_title_and_account,
+        ) as mock_title:
+            server.handle_request(
+                {
+                    "id": "1",
+                    "method": "prompt.submit",
+                    "params": {"session_id": "sid", "text": "Tell me about Rome"},
+                }
+            )
+
+        mock_title.assert_called_once()
+        args = mock_title.call_args.args
+        assert args[0] is profile_db
+        assert args[1:4] == (
+            "session-key",
+            "Tell me about Rome",
+            "Rome was founded in 753 BC.",
+        )
+        assert mock_title.call_args.kwargs["main_runtime"] == {
+            "model": "gpt-5.6-sol",
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.example.test/backend-api/codex",
+            "api_key": _Agent.api_key,
+            "api_mode": "codex_responses",
+        }
+        assert profile_db.get_session_title("session-key") == "Ancient Rome"
+        usage = profile_db._conn.execute(
+            """
+            SELECT input_tokens, output_tokens
+            FROM session_model_usage
+            WHERE session_id = ? AND task = 'title_generation'
+            """,
+            ("session-key",),
+        ).fetchone()
+        assert tuple(usage) == (12, 3)
+        assert process_db.get_session("session-key") is None
+    finally:
+        server._sessions.pop("sid", None)
+        profile_db.close()
+        process_db.close()
 
 
 def test_prompt_submit_skips_auto_title_when_interrupted(monkeypatch):
