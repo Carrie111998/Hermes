@@ -349,7 +349,7 @@ def run_text_capture(
     join because the pipe never reaches EOF. A wedged CLI therefore hangs the
     caller indefinitely instead of timing out at ``timeout`` seconds.
 
-    The fix: launch the child in its own process group, and on timeout
+    The mitigation: launch the child in its own process group, and on timeout
     tree-kill the whole group (``taskkill /T /F`` on Windows, ``killpg`` on
     POSIX) so EVERY write end of the pipe closes before we drain. Returns a
     :class:`subprocess.CompletedProcess`; raises
@@ -357,6 +357,36 @@ def run_text_capture(
     so existing ``except (OSError, subprocess.TimeoutExpired)`` handlers keep
     working. May raise ``OSError`` / ``FileNotFoundError`` at spawn, also like
     ``subprocess.run``.
+
+    **This does NOT bound the call at ``timeout``.** Read the timeout path as
+    four serial costs, only the first of which is ``timeout``:
+
+    1. ``communicate(timeout=timeout)`` — the budget itself.
+    2. ``_tree_kill`` — SYNCHRONOUS, and on Windows shells out to ``taskkill``
+       under its own ``timeout=10``. Measured 8-11s against a live tree.
+    3. the second drain, ``communicate(timeout=10)`` — free if the kill landed,
+       otherwise the full 10s, because the pipe still has no EOF.
+    4. ``Popen.__exit__`` when the ``with`` block unwinds — it closes both
+       pipes (which blocks while a reader thread is parked in a read the
+       grandchild keeps alive) and then calls ``self.wait()`` with NO timeout.
+
+    Step 4 has no cap, so when the tree outlives the kill this helper has no
+    upper bound at all: it degrades to "wait out the whole process tree".
+    Measured on this box against a 3s budget and a tree sleeping 25s — 36.9s
+    with a real kill (``taskkill`` abandoned at its 10s cap, grandchild still
+    alive) and 37.8s with the kill neutered outright; decomposed, that is 3.3s
+    budget + 10.2s dead drain + 18.5s inside ``__exit__``. A prior measurement
+    against a wedged ``npm audit`` saw 75s against a nominal 30s budget. When
+    the kill DOES land inside its cap the tail collapses — one staged probe
+    with a 5s budget recorded taskkill 8.47s, drain 0.00s, closes 0.00s, total
+    13.91s — so the overshoot is bimodal, not proportional to the budget.
+
+    Callers must therefore treat ``timeout`` as a floor, not a bound. The real
+    remedy is to stop capturing through pipes at all: with file-backed stdio
+    there are no reader threads, nothing to drain, and closing a file handle
+    cannot block, which makes the bound independent of the kill landing. That
+    rework exists on the Windows capture-pipe branches and supersedes this
+    implementation; until it lands, steps 2-4 above are live cost.
     """
     if IS_WINDOWS:
         popen_kwargs: dict = {"creationflags": _CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW}
@@ -375,10 +405,15 @@ def run_text_capture(
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             _tree_kill(proc)
-            # The whole tree is now dead, so every pipe write end is closed and
-            # this drain reaches EOF promptly instead of blocking. Bounded by a
-            # second timeout regardless, so a stubborn descendant can never make
-            # this hang — we drop the output and re-raise instead.
+            # IF the kill landed, every pipe write end is now closed and this
+            # drain reaches EOF at once. If it did NOT — taskkill abandoned at
+            # its own 10s cap with a grandchild still alive — this burns the
+            # full 10s below and reaches EOF never; we then drop the output and
+            # re-raise. Note the 10s caps THIS drain only. It does not bound
+            # the function: `Popen.__exit__` still has to close both pipes and
+            # then `self.wait()`s on the child with no timeout, which is where
+            # the remaining ~18s of a measured 36.9s-on-a-3s-budget went. See
+            # the bound breakdown in the docstring.
             try:
                 stdout, stderr = proc.communicate(timeout=10)
             except subprocess.TimeoutExpired:
@@ -400,6 +435,17 @@ def _tree_kill(proc: subprocess.Popen) -> None:
     child was started in its own session (``start_new_session=True``). Either
     way the goal is to close EVERY write end of the capture pipe so a blocked
     reader-thread drain can reach EOF.
+
+    This runs SYNCHRONOUSLY inside ``run_text_capture``'s timeout path, so its
+    duration lands on that call's bound. ``taskkill`` on a live tree has been
+    measured at 8.03s, 8.47s, 10.61s, 10.73s and 11.6s on a loaded Windows
+    host — routinely at or past the ``timeout=10`` cap it carries, at which
+    point the tree survives and the caller pays the far larger costs described
+    in ``run_text_capture``'s docstring. Making the kill fire-and-forget would
+    shave this tail, but is not safe as written: detaching it opens a PID-reuse
+    race between spawning ``taskkill`` and this ``Popen`` handle being
+    released, letting ``taskkill /PID`` shoot an unrelated process that
+    inherited the pid.
     """
     if IS_WINDOWS:
         try:
