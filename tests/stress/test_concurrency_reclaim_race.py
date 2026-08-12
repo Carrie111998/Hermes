@@ -28,14 +28,74 @@ import random
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from tests.attempt_fence_helpers import create_bound_attempt, isolated_home
 
 NUM_WORKERS = 5
 NUM_TASKS = 50
 TTL = 1
 WORK_DURATION_S = 2.0  # longer than TTL => reclaimer wins
 WT = str(Path(__file__).resolve().parents[2])
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="libproc fence is macOS-only")
+def test_recovery_and_claim_overlap_never_open_before_group_death(
+    isolated_home,
+    monkeypatch,
+):
+    identity = kb._darwin_process_identity(os.getpgid(0))
+    assert identity is not None
+    with kb.connect() as setup:
+        task_id, _claimed, _raw = create_bound_attempt(
+            setup,
+            leader_identity=identity,
+        )
+        setup.execute(
+            "UPDATE tasks SET claim_expires=0 WHERE id=?",
+            (task_id,),
+        )
+        setup.commit()
+
+    probe_entered = threading.Event()
+    release_probe = threading.Event()
+
+    def delayed_alive(_fence):
+        probe_entered.set()
+        assert release_probe.wait(5)
+        return "alive"
+
+    monkeypatch.setattr(kb, "_fenced_group_state", delayed_alive)
+
+    def release_once():
+        with kb.connect() as conn:
+            return kb.release_stale_claims(conn)
+
+    def claim_once():
+        with kb.connect() as conn:
+            return kb.claim_task(conn, task_id, claimer="fixture:new")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        recovery = pool.submit(release_once)
+        assert probe_entered.wait(5)
+        claim = pool.submit(claim_once)
+        assert claim.result(timeout=5) is None
+        release_probe.set()
+        assert recovery.result(timeout=5) == 0
+
+    with kb.connect() as conn:
+        claimed_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id=? AND kind='claimed'",
+            (task_id,),
+        ).fetchone()[0]
+        assert claimed_events == 1
 
 
 def worker_loop(worker_id: int, hermes_home: str, result_file: str) -> None:

@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import subprocess
-
-
 def _make_task(kb, *, assignee: str):
     return kb.Task(
         id="t_spawn_tools",
@@ -65,22 +62,21 @@ agent:
 
     captured = {}
 
-    class FakeProc:
-        pid = 4242
+    sentinel = object()
 
-    def fake_popen(cmd, *args, **kwargs):
+    def fake_bootstrap(cmd, **kwargs):
         captured["cmd"] = list(cmd)
         captured["env"] = dict(kwargs.get("env") or {})
         captured["cwd"] = kwargs.get("cwd")
-        return FakeProc()
+        return sentinel
 
-    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(kb, "_spawn_behind_bootstrap", fake_bootstrap)
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    pid = kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
+    pending = kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
 
-    assert pid == 4242
+    assert pending is sentinel
     assert captured["env"]["HERMES_HOME"] == str(profile)
     assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
     assert "--toolsets" in captured["cmd"]
@@ -107,20 +103,19 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
     captured = {}
 
-    class FakeProc:
-        pid = 4244
+    sentinel = object()
 
-    def fake_popen(cmd, *args, **kwargs):
+    def fake_bootstrap(cmd, **kwargs):
         captured["cmd"] = list(cmd)
-        return FakeProc()
+        return sentinel
 
-    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(kb, "_spawn_behind_bootstrap", fake_bootstrap)
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     task = _make_task(kb, assignee="elias")
     task.model_override = "gpt-5.6-sol"
-    kb._default_spawn(task, str(workspace))
+    assert kb._default_spawn(task, str(workspace)) is sentinel
 
     parser, _subparsers, _chat_parser = build_top_level_parser()
     # Profile selection is attached by the outer CLI bootstrap rather than

@@ -817,13 +817,14 @@ class TestSharedBoardPaths:
 
         captured = {}
 
-        class _FakePopen:
-            def __init__(self, cmd, **kwargs):
-                captured["cmd"] = cmd
-                captured["env"] = kwargs.get("env", {})
-                self.pid = 4242
+        sentinel = object()
 
-        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+        def _fake_bootstrap(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs.get("env", {})
+            return sentinel
+
+        monkeypatch.setattr(kb, "_spawn_behind_bootstrap", _fake_bootstrap)
 
         task = kb.Task(
             id="t_dispatch_env",
@@ -843,7 +844,7 @@ class TestSharedBoardPaths:
             tenant=None,
             branch_name="wt/t_dispatch_env",
         )
-        kb._default_spawn(task, str(tmp_path / "ws"))
+        assert kb._default_spawn(task, str(tmp_path / "ws")) is sentinel
 
         env = captured["env"]
         assert env["HERMES_KANBAN_DB"] == str(default_home / "kanban.db")

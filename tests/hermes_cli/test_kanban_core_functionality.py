@@ -151,6 +151,7 @@ def test_notify_sub_crud(kanban_home):
         conn.close()
 
 
+
 def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
     conn1 = kb.connect()
     conn2 = kb.connect()
@@ -701,21 +702,19 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     KANBAN_GUIDANCE, so _default_spawn must NOT append a `--skills` flag
     when the task carries no per-task skills.
 
-    We intercept Popen to capture the argv without actually spawning a
-    hermes subprocess (which would hang trying to call an LLM).
+    We intercept the blocked-bootstrap seam to capture the worker argv without
+    executing a Hermes subprocess (which would hang trying to call an LLM).
     """
     captured = {}
 
-    class FakeProc:
-        def __init__(self):
-            self.pid = 99999
+    sentinel = object()
 
-    def fake_popen(cmd, **kwargs):
+    def fake_bootstrap(cmd, **kwargs):
         captured["cmd"] = cmd
         captured["env"] = kwargs.get("env", {})
-        return FakeProc()
+        return sentinel
 
-    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(kb, "_spawn_behind_bootstrap", fake_bootstrap)
 
     conn = kb.connect()
     try:
@@ -723,8 +722,8 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
                              assignee="some-profile")
         task = kb.get_task(conn, tid)
         workspace = kb.resolve_workspace(task)
-        pid = kb._default_spawn(task, str(workspace))
-        assert pid == 99999
+        pending = kb._default_spawn(task, str(workspace))
+        assert pending is sentinel
     finally:
         conn.close()
 
@@ -1406,5 +1405,3 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
-
