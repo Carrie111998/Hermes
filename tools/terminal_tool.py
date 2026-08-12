@@ -1355,11 +1355,17 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     ``_active_environments``.
 
     The top-level agent passes ``task_id=None`` and lands on ``"default"``.
-    ``delegate_task`` children pass their own subagent ID so that
+    Local sessions keep their raw task IDs because each ``LocalEnvironment``
+    owns a persistent shell snapshot. Sharing that snapshot lets one session
+    (notably a ``delegate_task`` child) export variables into another session.
+    Local filesystem and installed-package state is host-global already, so
+    separate shell snapshots do not lose the useful shared state.
+
+    Container-backed ``delegate_task`` children pass their own subagent ID so
     file-state tracking, the active-subagents registry, and TUI events stay
-    distinct per child -- but we deliberately collapse that ID back to
-    ``"default"`` here so subagents share the parent's long-lived container
-    (one bash, one /workspace, one set of installed packages).
+    distinct per child, but deliberately collapse back to ``"default"`` here
+    so they share the parent's long-lived container (one bash, one /workspace,
+    one set of installed packages).
 
     Exception: RL / benchmark environments (TerminalBench2, HermesSweEnv, ...)
     call ``register_task_env_overrides(task_id, {...})`` to request a
@@ -1381,6 +1387,9 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     alias registry (``register_container_alias``).
     """
     if task_id and _has_isolation_overrides(task_id):
+        return task_id
+    _ensure_terminal_env_bridged()
+    if task_id and os.getenv("TERMINAL_ENV", "local") == "local":
         return task_id
     if task_id and _docker_session_isolation_enabled():
         return _resolve_container_alias(task_id)
