@@ -1753,6 +1753,10 @@ export interface Translations {
     previewLabel: (label: string) => string
     couldNotPreview: (label: string) => string
     removeAttachment: (label: string) => string
+    annotateImage: (label: string) => string
+    annotateTitle: string
+    annotateDesc: (label: string) => string
+    annotateSave: string
     dictating: string
     preparingAudio: string
     speakingResponse: string
