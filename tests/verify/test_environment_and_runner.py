@@ -2,6 +2,9 @@
 
 import http.server
 import json
+import socket
+import subprocess
+import sys
 import threading
 import time
 
@@ -120,19 +123,46 @@ class TestRunner:
 
 
 def _free_port() -> int:
-    import socket
-
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
 class TestReadiness:
+    def test_verbose_start_output_does_not_block_readiness_or_teardown(self, tmp_path):
+        port = _free_port()
+        script = tmp_path / "verbose_server.py"
+        script.write_text(
+            "import http.server\n"
+            "print('x' * 1_000_000, flush=True)\n"
+            f"http.server.HTTPServer(('127.0.0.1', {port}), http.server.SimpleHTTPRequestHandler).serve_forever()\n",
+            encoding="utf-8",
+        )
+        command = subprocess.list2cmdline([sys.executable, str(script)])
+        recipe = Recipe(name="verbose", start=command, port=port)
+
+        result = run_verify(tmp_path, recipe, phases=("start",), ready_timeout=15)
+
+        assert result.ok
+        assert result.readiness is not None
+        assert "x" * 1000 in result.readiness.output_tail
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                    time.sleep(0.05)
+            except OSError:
+                break
+        else:
+            raise AssertionError("start process tree still owns the readiness port")
+
     def test_readiness_against_live_server(self, tmp_path):
         port = _free_port()
         recipe = Recipe(
             name="x",
-            start=f"python3 -m http.server {port} --bind 127.0.0.1",
+            start=subprocess.list2cmdline(
+                [sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1"]
+            ),
             port=port,
         )
         result = run_verify(tmp_path, recipe, phases=("start",), ready_timeout=15)

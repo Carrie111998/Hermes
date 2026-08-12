@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -163,9 +164,32 @@ def _terminate_process_group(proc: subprocess.Popen) -> None:
     """Terminate the started app and its whole process group cleanly.
 
     On POSIX the child is spawned with ``start_new_session=True`` so we can
-    signal the whole group; on Windows (no ``os.killpg``) we fall back to
-    terminating just the direct child.
+    signal the whole group.  On Windows, ``shell=True`` commonly adds a shell
+    between us and the service, so taskkill's tree mode is required to reach
+    descendants such as npm-launched Node processes.
     """
+    if os.name == "nt":
+        if proc.poll() is not None:
+            return
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        return
     if proc.poll() is not None:
         return
     killpg = getattr(os, "killpg", None)
@@ -209,26 +233,21 @@ def _run_start_phase(
     port = port_override or recipe.port or 8000
     url = f"http://127.0.0.1:{port}{recipe.readiness_path}"
     started = time.monotonic()
-    proc = subprocess.Popen(
-        recipe.start,
-        shell=True,  # project-authored command; see module docstring
-        cwd=str(root),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,  # own process group for clean teardown
-        text=True,
-        errors="replace",
-    )
-    output = ""
-    try:
-        ready, status, error = _poll_readiness(url, ready_timeout)
-    finally:
-        _terminate_process_group(proc)
+    with tempfile.TemporaryFile() as output_file:
+        proc = subprocess.Popen(
+            recipe.start,
+            shell=True,  # project-authored command; see module docstring
+            cwd=str(root),
+            stdout=output_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,  # own process group for clean teardown
+        )
         try:
-            if proc.stdout is not None:
-                output = proc.stdout.read() or ""
-        except (OSError, ValueError):
-            output = ""
+            ready, status, error = _poll_readiness(url, ready_timeout)
+        finally:
+            _terminate_process_group(proc)
+        output_file.seek(0)
+        output = output_file.read().decode("utf-8", errors="replace")
     return ReadinessResult(
         url=url,
         ready=ready,
