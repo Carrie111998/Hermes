@@ -484,6 +484,57 @@ lost_deals
 other
 ```
 
+### Upload lifecycle
+
+An upload enters **Processing** automatically. The customer never has to ask
+for it and never waits on it: `POST /documents/upload` returns as soon as the
+file itself is durable, and the work continues behind the response.
+
+The document's status is exactly one of `uploaded`, `processing`, `ready`,
+`needs_attention`, `failed` — rendered as Uploaded, Processing, Ready, Needs
+attention, Failed. `status_detail` is a plain sentence telling the customer
+what to do next, never a technical reason. It stays inside this vocabulary in
+every customer surface and in every agent-authored customer response.
+
+Two forms of every document are retained: the original exactly as uploaded, and
+an internal prepared artifact the agent reads instead. Everything runs on the
+machine that holds the file — no uploaded content is sent to any hosted parser.
+
+`POST /documents/:documentId/process` is a *separate* concern: it starts the
+semantic extraction run that turns a Ready document into records. It requires
+`ready` and answers `409` with product-safe copy otherwise. That run's success
+or failure never changes the document's own status — a file that is usable
+stays Ready even if extraction found nothing. Re-running replaces the records
+derived from that document rather than duplicating them.
+
+---
+
+## 7.6a Admin document routes
+
+Admin-only, cross-tenant, and the only place implementation detail is visible.
+
+```text
+GET    /api/v1/admin/documents
+GET    /api/v1/admin/documents/:documentId
+GET    /api/v1/admin/documents/:documentId/artifacts/:role     role = original | processed
+POST   /api/v1/admin/documents/:documentId/retry
+DELETE /api/v1/admin/documents/:documentId
+
+GET    /api/v1/admin/agent-runs/:runId/detail
+```
+
+Administrators can preview and download both stored forms (the sidecar is
+labelled "Processed (.md) artifact"), read every processing attempt with its
+technical reason code, see the extracted records and rejects, and inspect the
+run's final structured output together with the sources it consulted.
+
+Artifact bytes are streamed, never embedded in JSON, and the local mirror is
+checksum-verified and rebuilt from the database on the way out — losing the
+disk costs a re-materialize, not the document.
+
+Agent evidence is redacted before it is stored: credentials, prompt internals,
+and raw tool arguments never reach these responses.
+
 ---
 
 ## 7.7 Product routes

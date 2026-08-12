@@ -75,6 +75,9 @@ def test_all_product_routes_are_exposed():
         "ruleId": "rule_id", "actionId": "action_id", "runId": "run_id",
         "providerMessageId": "provider_message_id", "exportId": "export_id",
         "sourceId": "source_id", "activityId": "activity_id", "snapshotId": "snapshot_id",
+        # Already snake_case in both the doc and the route; listed so the
+        # rewrite still strips the leading colon.
+        "role": "role",
     }
     expected = set()
     for method, path in re.findall(

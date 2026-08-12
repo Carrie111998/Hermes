@@ -864,9 +864,20 @@ def test_admin_documents_ui_is_wired_and_customer_copy_hides_implementation_term
     assert "['/admin/documents', 'Documents']" in admin
     assert "Processed (.md) artifact" in documents
 
-    customer_sources = client.get("/js/pages/setup.js").text + client.get("/js/pages/onboarding.js").text
+    # Every page a customer can reach. Phase 5 folded the onboarding wizard
+    # into setup.js, so that is where the upload copy now lives. Each file is
+    # fetched and asserted 200 first: a typo'd path would otherwise "pass" by
+    # scanning a 404 body.
+    customer_pages = ("setup.js", "today.js", "buyers.js", "approvals.js",
+                      "analytics.js", "_components.js")
+    customer_sources = ""
+    for page in customer_pages:
+        response = client.get(f"/js/pages/{page}")
+        assert response.status_code == 200, page
+        customer_sources += response.text
+
     for forbidden in ("Anydoc", "conversion", "converter", "Markdown generation", "OCR"):
-        assert forbidden.lower() not in customer_sources.lower()
+        assert forbidden.lower() not in customer_sources.lower(), forbidden
 
 
 def test_admin_documents_module_and_routes_resolve():

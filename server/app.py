@@ -59,6 +59,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
+        _resume_document_processing(application)
         if settings.scheduler_enabled:
             digest_scheduler.start()
         yield
@@ -157,6 +158,31 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         _mount_webui(app, webui_dir, settings)
 
     return app
+
+
+def _resume_document_processing(app: FastAPI) -> None:
+    """Give legacy and interrupted documents their processed form.
+
+    Runs on every boot and is cheap when there is nothing to do: both queries
+    are `NOT EXISTS` / `IS NULL` filters that match only unfinished rows, so a
+    fully-migrated database does no work and needs no separate marker. Failures
+    are logged, never fatal — the API must still come up.
+    """
+    try:
+        artifacts = app.state.document_artifacts
+        summary = artifacts.backfill_existing_documents(
+            resolver=getattr(app.state.storage, "resolve", None)
+        )
+        if summary["backfilled"] or summary["missing"]:
+            log(f"document backfill: {summary}")
+
+        pending = artifacts.documents_awaiting_processing()
+        for company_id, document_id in pending:
+            app.state.document_processing.submit(company_id, document_id)
+        if pending:
+            log(f"queued {len(pending)} document(s) for processing at startup")
+    except Exception as exc:  # noqa: BLE001
+        log(f"document backfill skipped: {type(exc).__name__}: {exc}", logging.ERROR)
 
 
 def _warn_on_incomplete_config(settings: Settings) -> None:

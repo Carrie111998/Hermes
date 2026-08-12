@@ -49,3 +49,17 @@ interfaze_server:
 
   max_upload_bytes: 26214400  # 25 MiB
   webui_enabled: true
+
+  # Document processing. Every upload is prepared locally so the agent can read
+  # it — nothing is sent to a hosted parser — and both the original and the
+  # prepared form are stored. These tune that work to the machine.
+  #
+  # document_workers: how many documents are prepared at once. Each one is
+  # CPU-bound, so more than a couple of cores' worth just adds contention.
+  document_workers: 2
+  # Give up on a single document after this long and mark it Failed, rather
+  # than holding a worker on a pathological file forever.
+  document_processing_timeout_seconds: 180
+  # Reject a prepared result larger than this. A spreadsheet that expands into
+  # hundreds of megabytes of text is a problem to surface, not to store.
+  document_output_max_bytes: 52428800  # 50 MiB

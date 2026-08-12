@@ -116,7 +116,7 @@ async def upload_document(
     )
     request.app.state.db.activity(company_id, principal.id, "document_uploaded", "document", document_id)
     # Processing starts immediately and runs behind the response: the customer
-    # sees Uploaded/Processing right away rather than waiting on a conversion.
+    # sees Uploaded/Processing right away rather than waiting on the work.
     request.app.state.document_processing.submit(company_id, document_id)
     return _document(request.app.state.db.one("SELECT * FROM documents WHERE id=?", (document_id,)))
 

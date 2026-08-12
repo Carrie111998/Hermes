@@ -490,6 +490,23 @@ class DocumentArtifactRepository:
             summary["backfilled"] += 1
         return summary
 
+    def documents_awaiting_processing(self) -> list[tuple[str, str]]:
+        """(company_id, document_id) for stored originals that have no sidecar.
+
+        Covers both the legacy rows the backfill just created and any document
+        whose processing was interrupted by a restart.
+        """
+        return [
+            (row["company_id"], row["id"])
+            for row in self.db.all(
+                "SELECT d.id, d.company_id FROM documents d"
+                " WHERE d.active_processed_artifact_id IS NULL"
+                "   AND d.status IN ('uploaded','processing')"
+                "   AND EXISTS (SELECT 1 FROM document_artifacts a"
+                "               WHERE a.document_id=d.id AND a.role='original')"
+            )
+        ]
+
     @staticmethod
     def _legacy_bytes(storage_path: str | None, resolver) -> bytes | None:
         if not storage_path:
