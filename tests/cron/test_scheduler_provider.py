@@ -434,6 +434,49 @@ def test_ticker_survives_baseexception_from_tick():
     assert len(calls) >= 2, "ticker did not keep ticking after the BaseException"
 
 
+def test_ticker_survives_startup_recover_interrupted_failure():
+    """A failure in the pre-loop ``recover_interrupted()`` must NOT kill the
+    ticker thread — it logs and still enters the tick loop.
+
+    Regression for the 2026-08-11 silent 5h scheduler outage: ``start()`` calls
+    ``self.recover_interrupted()`` BEFORE the ``while not stop_event.is_set()``
+    loop, so the ``except BaseException`` guard inside that loop did not cover
+    it. A transiently half-applied checkout raised
+
+        ImportError: cannot import name 'recover_interrupted_execution_records'
+                     from 'cron.executions'
+
+    which killed the daemon thread before its first tick. The gateway parent
+    process kept running with NO cron scheduler at all, and — because line 211
+    logs "In-process cron scheduler started" immediately BEFORE the fatal call
+    — the log read like a clean startup. Zero of 69 jobs fired for 5h08m.
+    """
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    calls = []
+    stop = threading.Event()
+    prov = InProcessCronScheduler()
+
+    def _boom():
+        raise ImportError(
+            "cannot import name 'recover_interrupted_execution_records' "
+            "from 'cron.executions'"
+        )
+
+    with patch.object(InProcessCronScheduler, "recover_interrupted", side_effect=_boom), \
+         patch("cron.scheduler.tick", side_effect=lambda *a, **k: calls.append(1)), \
+         patch("cron.jobs.record_ticker_heartbeat"):
+        t = threading.Thread(target=prov.start, args=(stop,), kwargs={"interval": 0}, daemon=True)
+        t.start()
+        assert _wait_until(lambda: len(calls) >= 1), \
+            "ticker never reached the tick loop after recover_interrupted() raised"
+        stop.set()
+        t.join(timeout=5)
+
+    assert not t.is_alive(), "ticker thread died during startup recovery"
+    assert len(calls) >= 1, "ticker never ticked after a failing recover_interrupted()"
+
+
 def test_ticker_records_heartbeat_each_iteration():
     """The loop records a liveness heartbeat on start and after each tick,
     bumping the success marker only on a clean tick."""

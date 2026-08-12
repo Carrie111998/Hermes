@@ -265,3 +265,99 @@ class TestCronStaleMonitor:
         assert len(stale) == 1
         assert stale[0].payload["job_name"] == job_name
         assert stale[0].payload["threshold_seconds"] == threshold
+
+
+# ---------------------------------------------------------------------------
+# Ticker-heartbeat watchdog
+#
+# Regression cover for the 2026-08-11 silent scheduler outage. The cron-scheduler
+# thread died at startup and the gateway ran 5h08m with NO scheduler. This
+# subscriber could not see it: it alerts only on a job that STARTED and never
+# finished, and a dead scheduler emits zero cron_started — so `_open_jobs` stayed
+# empty and `_check_stale()` had nothing to check. It was a dead-man's-switch
+# driven by the very events that had stopped.
+#
+# `cron.jobs.record_ticker_heartbeat()` already wrote the one signal that proves
+# the outage (the heartbeat file ages without bound once the thread is gone), but
+# nothing polled it in the background — only interactive `hermes cron status`
+# read it. These tests wire that signal into the subscriber that already owns
+# cron-health alerting.
+# ---------------------------------------------------------------------------
+
+def _patch_age(monkeypatch, value):
+    """Force cron.jobs.get_ticker_heartbeat_age() to return ``value``."""
+    import cron.jobs
+    monkeypatch.setattr(cron.jobs, "get_ticker_heartbeat_age", lambda: value)
+
+
+def test_stale_ticker_heartbeat_emits_cron_stale(bus, monkeypatch):
+    """A heartbeat older than the threshold means the ticker thread is gone."""
+    mon = _monitor(bus)
+    _patch_age(monkeypatch, mon.TICKER_STALE_THRESHOLD_SECONDS + 60)
+
+    mon.poll()
+
+    stale = _stale_events(bus)
+    assert len(stale) == 1, "a dead ticker did not raise cron_stale"
+    assert stale[0].payload["scope"] == "ticker", \
+        "ticker alert must be distinguishable from a stuck-job alert"
+    assert stale[0].payload["age_seconds"] >= mon.TICKER_STALE_THRESHOLD_SECONDS
+
+
+def test_fresh_ticker_heartbeat_is_silent(bus, monkeypatch):
+    """A ticker beating normally must never alert."""
+    mon = _monitor(bus)
+    _patch_age(monkeypatch, 5.0)
+
+    mon.poll()
+
+    assert _stale_events(bus) == []
+
+
+def test_unknown_ticker_heartbeat_age_is_silent(bus, monkeypatch):
+    """None = 'cannot determine' (older build / never ran / torn read), not dead.
+
+    get_ticker_heartbeat_age()'s own contract says callers must treat None as
+    unknown. Alerting here would page on every fresh install.
+    """
+    mon = _monitor(bus)
+    _patch_age(monkeypatch, None)
+
+    mon.poll()
+
+    assert _stale_events(bus) == []
+
+
+def test_stale_ticker_alerts_once_then_rearms_after_recovery(bus, monkeypatch):
+    """One alert per outage — but a NEW outage after recovery alerts again."""
+    mon = _monitor(bus)
+
+    _patch_age(monkeypatch, mon.TICKER_STALE_THRESHOLD_SECONDS + 60)
+    mon.poll()
+    mon.poll()
+    assert len(_stale_events(bus)) == 1, "ticker alert spammed while still stale"
+
+    # Ticker recovers — this must re-arm the alert.
+    _patch_age(monkeypatch, 1.0)
+    mon.poll()
+    assert len(_stale_events(bus)) == 1
+
+    # A second, separate outage must alert again.
+    _patch_age(monkeypatch, mon.TICKER_STALE_THRESHOLD_SECONDS + 60)
+    mon.poll()
+    assert len(_stale_events(bus)) == 2, "a new outage after recovery did not alert"
+
+
+def test_ticker_check_failure_does_not_break_job_staleness_check(bus, monkeypatch):
+    """The watchdog must never take down the subscriber it lives in."""
+    import cron.jobs
+
+    def _boom():
+        raise OSError("heartbeat file unreadable")
+
+    mon = _monitor(bus)
+    monkeypatch.setattr(cron.jobs, "get_ticker_heartbeat_age", _boom)
+
+    mon.poll()  # must not raise
+
+    assert _stale_events(bus) == []
