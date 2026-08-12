@@ -98,6 +98,16 @@ def test_termux_regression_rejects_privileged_or_seccomp_disabled_container(lint
     assert {item.name for item in findings} == {"privileged Termux PR regression container"}
 
 
+def test_renderer_invariant_accepts_locked_package_bin_runner(linter, tmp_path, monkeypatch):
+    monkeypatch.setattr(linter, "REPO_ROOT", tmp_path)
+    _write(
+        tmp_path,
+        "apps/desktop/package.json",
+        '{"scripts":{"build:renderer":"node scripts/assert-root-install.mjs && node ../../scripts/run-node-package-bin.mjs vite -- build"}}\n',
+    )
+    assert linter.invariant_findings({"apps/desktop/package.json"}) == []
+
+
 def test_renderer_invariant_rejects_electron_build(linter, tmp_path, monkeypatch):
     monkeypatch.setattr(linter, "REPO_ROOT", tmp_path)
     _write(

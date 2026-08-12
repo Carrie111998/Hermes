@@ -63,15 +63,14 @@ echo "== frontend type/regression tests =="
 cd "$HERMES_INSTALL_DIR"
 npm run build:ink --workspace ui-tui
 npm run typecheck --workspace ui-tui
-npm exec --workspace ui-tui -- vitest run src/__tests__/termuxComposerLayout.test.ts
+npm run test --workspace ui-tui -- src/__tests__/termuxComposerLayout.test.ts
 echo "== real narrow PTY TUI smoke =="
 "$HERMES_INSTALL_DIR/venv/bin/python" scripts/smoke-termux-tui.py --cols 48 --rows 18
 npm run typecheck --workspace apps/desktop
-npm exec --workspace apps/desktop -- vitest run \
+npm run test:ui --workspace apps/desktop -- \
   src/lib/browser-desktop-bridge.test.ts \
   src/lib/local-preview.test.ts \
-  src/lib/desktop-fs.test.ts \
-  --project ui
+  src/lib/desktop-fs.test.ts
 
 echo "== Termux:X11 package availability =="
 pkg install -y x11-repo >/dev/null

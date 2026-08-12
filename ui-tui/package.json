@@ -4,19 +4,19 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "npm run build:ink && tsx --watch src/entry.tsx",
-    "start": "tsx src/entry.tsx",
+    "dev": "npm run build:ink && node ../scripts/run-node-package-bin.mjs tsx -- --watch src/entry.tsx",
+    "start": "node ../scripts/run-node-package-bin.mjs tsx -- src/entry.tsx",
     "build": "node scripts/build.mjs",
     "build:ink": "npm run build --prefix packages/hermes-ink",
     "visual": "node scripts/visual/run.mjs",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "typecheck": "node ../scripts/run-node-package-bin.mjs typescript --bin tsc -- --noEmit -p tsconfig.json",
     "lint": "eslint src/ packages/",
     "lint:fix": "eslint src/ packages/ --fix",
     "fmt": "prettier --write 'src/**/*.{ts,tsx}' 'packages/**/*.{ts,tsx}'",
     "fix": "npm run lint:fix && npm run fmt",
     "check": "npm run build:ink && npm run typecheck && npm run test && npm run lint",
-    "test": "vitest run",
-    "test:watch": "vitest"
+    "test": "node ../scripts/run-node-package-bin.mjs vitest -- run",
+    "test:watch": "node ../scripts/run-node-package-bin.mjs vitest --"
   },
   "dependencies": {
     "@hermes/ink": "file:./packages/hermes-ink",

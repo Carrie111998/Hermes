@@ -254,7 +254,11 @@ def invariant_findings(selected: set[str]) -> list[Finding]:
             command = str(payload.get("scripts", {}).get("build:renderer", ""))
         except (OSError, UnicodeError, json.JSONDecodeError):
             command = ""
-        bad = (not command) or "vite build" not in command or any(
+        renderer_build = (
+            "vite build" in command
+            or "run-node-package-bin.mjs vite -- build" in command
+        )
+        bad = (not command) or not renderer_build or any(
             token in command.lower() for token in ("electron", "node-pty", "stage-native")
         )
         if bad:
@@ -265,7 +269,7 @@ def invariant_findings(selected: set[str]) -> list[Finding]:
                     'scripts["build:renderer"]',
                     "Termux renderer build depends on native Electron work",
                     "Termux must be able to build the latest Desktop renderer without running Electron/native lifecycle tooling.",
-                    "Keep build:renderer limited to renderer prerequisites plus `vite build`.",
+                    "Keep build:renderer limited to renderer prerequisites plus the locked Vite renderer build.",
                 )
             )
 
