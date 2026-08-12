@@ -1719,6 +1719,108 @@ def test_create_rejects_invalid_source_policy(worker_env):
     assert "source_policy" in json.loads(out)["error"]
 
 
+def test_default_source_flow_creates_separate_child_worktree_from_parent_receipt(
+    monkeypatch, tmp_path,
+):
+    from pathlib import Path
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    repo = tmp_path / "source-repo"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo)],
+        check=True, capture_output=True, text=True,
+    )
+    _git(repo, "config", "user.email", "kanban@example.com")
+    _git(repo, "config", "user.name", "Kanban Test")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "base")
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.create_board(
+        "default", name="Default", preset="generic", default_workdir=str(repo),
+    )
+
+    parent = json.loads(kt._handle_create({
+        "title": "source parent",
+        "assignee": "developer",
+        "workspace_kind": "worktree",
+        "workspace_path": str(repo),
+        "source_policy": "required",
+    }))
+    assert parent["ok"] is True
+    parent_id = parent["task_id"]
+
+    child = json.loads(kt._handle_create({
+        "title": "source child",
+        "assignee": "tester",
+        "parents": [parent_id],
+        "workspace_kind": "worktree",
+        "workspace_path": str(repo),
+        "source_policy": "forbidden",
+    }))
+    assert child["ok"] is True
+    child_id = child["task_id"]
+
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent_id,))
+        conn.commit()
+        claimed = kb.claim_task(conn, parent_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        parent_run_id = claimed.current_run_id
+        parent_task = kb.get_task(conn, parent_id)
+        assert parent_task is not None
+        parent_workspace, parent_branch = kb._resolve_worktree_workspace(
+            parent_task, board="default", conn=conn,
+        )
+        kb.set_workspace_path(conn, parent_id, parent_workspace)
+        kb.set_branch_name(conn, parent_id, parent_branch)
+
+    (parent_workspace / "parent.txt").write_text("from parent\n", encoding="utf-8")
+    before = _git(parent_workspace, "rev-list", "--count", "HEAD")
+
+    with kb.connect(board="default") as conn:
+        assert kb.complete_task(
+            conn, parent_id, expected_run_id=parent_run_id, board="default",
+        )
+
+    after = _git(parent_workspace, "rev-list", "--count", "HEAD")
+    assert int(after) == int(before) + 1
+    with kb.connect(board="default") as conn:
+        completed = kb.get_task(conn, parent_id)
+        child_task = kb.get_task(conn, child_id)
+        parent_run = kb.get_run(conn, parent_run_id)
+    assert completed is not None and completed.status == "done"
+    assert child_task is not None and child_task.status == "ready"
+    assert parent_run is not None
+    receipt = parent_run.metadata["source_completion_receipt"]
+    assert receipt["run_id"] == parent_run_id
+    assert completed.workspace_path == str(parent_workspace)
+    assert _git(parent_workspace, "status", "--porcelain") == ""
+
+    with kb.connect(board="default") as conn:
+        child_task = kb.get_task(conn, child_id)
+        assert child_task is not None
+        child_workspace, child_branch = kb._resolve_worktree_workspace(
+            child_task, board="default", conn=conn,
+        )
+        kb.set_workspace_path(conn, child_id, child_workspace)
+        kb.set_branch_name(conn, child_id, child_branch)
+
+    assert child_workspace != parent_workspace
+    assert (child_workspace / "parent.txt").read_text(encoding="utf-8") == "from parent\n"
+    assert _git(child_workspace, "status", "--porcelain") == ""
+
+
 def test_unblock_happy_path(monkeypatch, worker_env):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     from hermes_cli import kanban_db as kb
