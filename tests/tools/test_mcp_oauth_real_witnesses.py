@@ -103,6 +103,7 @@ class LocalHTTPSRecorder:
         self.requests = []
         self.errors = []
         self._server = None
+        self.response_hook_seen = False
 
     async def __aenter__(self):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -471,6 +472,12 @@ async def _run_public_selector(
         await _seed_oauth(tmp_path, monkeypatch, "real-peer")
     monkeypatch.setattr(tool_module, "_MCP_NEW_HTTP", transport == "current")
 
+    async def request_hook(request):
+        request.headers["x-composed-hook"] = "yes"
+
+    async def response_hook(_response):
+        peer.response_hook_seen = True
+
     # Lifecycle is the task-level owner boundary; transport/session entry,
     # initialize, tools/list, and all context exits remain real.
     async def stop(_self):
@@ -487,9 +494,17 @@ async def _run_public_selector(
         "connect_timeout": timeout,
         "ssl_verify": False,
         "headers": {"x-witness": "real"},
+        "request_hooks": [request_hook],
+        "response_hooks": [response_hook],
         "oauth": {},
     }
     await task._run_http(config)
+    assert peer.response_hook_seen
+    assert peer.requests
+    assert all(
+        headers.get("x-composed-hook") == "yes"
+        for _, _, headers, _ in peer.requests
+    )
 
 
 @pytest.mark.asyncio
@@ -514,6 +529,9 @@ async def test_public_real_sdk_transport_lifecycle(
             "bearer real-access" == headers.get("authorization", "").lower()
             for _, _, headers, _ in peer.requests
         )
+        for _method, target, headers, _payload in peer.requests:
+            if "well-known" in target or target in {"/register", "/token"}:
+                assert "authorization" not in headers
     else:
         assert not any("authorization" in headers for _, _, headers, _ in peer.requests)
     if transport in {"current", "legacy"}:

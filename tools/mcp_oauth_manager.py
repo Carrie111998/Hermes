@@ -68,9 +68,22 @@ def _oauth_config_fingerprint(oauth_config: Optional[dict]) -> str:
     """Fingerprint JSON OAuth settings; reject opaque values fail-closed."""
     if oauth_config is not None and not isinstance(oauth_config, dict):
         raise MCPAuthConfigurationError("OAuth configuration must be a JSON object")
+    def _fingerprint_value(value: Any) -> Any:
+        if callable(value):
+            return {
+                "__callable__": f"{getattr(value, '__module__', '')}."
+                f"{getattr(value, '__qualname__', repr(value))}",
+                "identity": id(value),
+            }
+        if isinstance(value, dict):
+            return {str(k): _fingerprint_value(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_fingerprint_value(v) for v in value]
+        return value
+
     try:
         encoded = json.dumps(
-            oauth_config or {},
+            _fingerprint_value(oauth_config or {}),
             sort_keys=True,
             separators=(",", ":"),
             allow_nan=False,
@@ -129,6 +142,8 @@ def _effective_provider_fingerprint(
         "client_cert": None,
         "follow_redirects": True,
         "headers": {},
+        "request_hooks": [],
+        "response_hooks": [],
         "strict_redirect_headers": False,
         **transport_options,
     }
@@ -399,6 +414,15 @@ def _make_hermes_provider_class() -> Optional[type]:
                 "timeout": httpx.Timeout(timeout, read=300.0),
                 "follow_redirects": True,
                 "verify": options.get("ssl_verify", True),
+                "headers": {
+                    key: value
+                    for key, value in (options.get("headers") or {}).items()
+                    if key.lower() != "authorization"
+                },
+                "event_hooks": {
+                    "request": list(options.get("request_hooks") or []),
+                    "response": list(options.get("response_hooks") or []),
+                },
             }
             if options.get("client_cert") is not None:
                 client_kwargs["cert"] = options["client_cert"]

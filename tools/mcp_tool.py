@@ -3051,6 +3051,8 @@ class MCPServerTask:
                         "client_cert": client_cert,
                         "follow_redirects": True,
                         "headers": dict(headers),
+                        "request_hooks": list(config.get("request_hooks") or []),
+                        "response_hooks": list(config.get("response_hooks") or []),
                         "strict_redirect_headers": _strict_cfg_headers,
                     },
                 )
@@ -3120,6 +3122,10 @@ class MCPServerTask:
                     kwargs: dict = {
                         "follow_redirects": True,
                         "verify": _verify_for_factory,
+                        "event_hooks": {
+                            "request": list(config.get("request_hooks") or []),
+                            "response": list(config.get("response_hooks") or []),
+                        },
                     }
                     if timeout is not None:
                         kwargs["timeout"] = timeout
@@ -3184,7 +3190,11 @@ class MCPServerTask:
                 "follow_redirects": True,
                 "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
                 "verify": ssl_verify,
-                "event_hooks": {"response": [_strip_auth_on_cross_origin_redirect]},
+                "event_hooks": {
+                    "request": list(config.get("request_hooks") or []),
+                    "response": list(config.get("response_hooks") or [])
+                    + [_strip_auth_on_cross_origin_redirect],
+                },
             }
             if headers:
                 client_kwargs["headers"] = headers
@@ -3260,6 +3270,10 @@ class MCPServerTask:
                     kwargs: dict[str, Any] = {
                         "follow_redirects": True,
                         "verify": ssl_verify,
+                        "event_hooks": {
+                            "request": list(config.get("request_hooks") or []),
+                            "response": list(config.get("response_hooks") or []),
+                        },
                         "timeout": timeout
                         if timeout is not None
                         else _httpx_mod.Timeout(float(connect_timeout), read=300.0),
