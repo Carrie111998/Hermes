@@ -316,6 +316,47 @@ class TestAsyncWriterThread:
         mgr.shutdown()
         assert mgr._async_thread is None
 
+    def test_concurrent_flushes_do_not_duplicate_messages(self, make_manager):
+        mgr = make_manager(write_frequency="turn")
+        session = _make_session(key="concurrent-flush")
+        session.add_message("user", "only once")
+        mgr._peers_cache[session.user_peer_id] = MagicMock()
+        mgr._peers_cache[session.assistant_peer_id] = MagicMock()
+        honcho_session = MagicMock()
+        mgr._sessions_cache[session.honcho_session_id] = honcho_session
+
+        first_upload_started = threading.Event()
+        second_upload_started = threading.Event()
+        release_upload = threading.Event()
+        upload_count = 0
+        count_lock = threading.Lock()
+
+        def blocking_add_messages(_messages):
+            nonlocal upload_count
+            with count_lock:
+                upload_count += 1
+                if upload_count == 1:
+                    first_upload_started.set()
+                else:
+                    second_upload_started.set()
+            release_upload.wait(timeout=1)
+
+        honcho_session.add_messages.side_effect = blocking_add_messages
+        first = threading.Thread(target=lambda: mgr._flush_session(session), daemon=True)
+        second = threading.Thread(target=lambda: mgr._flush_session(session), daemon=True)
+        first.start()
+        assert first_upload_started.wait(timeout=1)
+        second.start()
+
+        assert not second_upload_started.wait(timeout=0.05)
+        release_upload.set()
+        first.join(timeout=1)
+        second.join(timeout=1)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert honcho_session.add_messages.call_count == 1
+
 
 # ---------------------------------------------------------------------------
 # async retry on failure
