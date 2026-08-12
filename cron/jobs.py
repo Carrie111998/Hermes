@@ -314,10 +314,18 @@ def _prepare_commit_lock_file(handle, owner_source: Optional[os.stat_result]) ->
 
 @contextlib.contextmanager
 def _jobs_commit_lock():
-    """Serialize the final read, reconcile, and publication of jobs.json."""
+    """Serialize the final read, reconcile, and publication of jobs.json.
+
+    Unlike the broad scheduler lock, this short publication lock must never
+    degrade to process-only locking.  The generation check cannot close the
+    check-to-replace window by itself, so publishing without a cross-process
+    backend would reintroduce the lost-update race this lock exists to close.
+    """
     if fcntl is None and msvcrt is None:
-        yield
-        return
+        raise RuntimeError(
+            "Cron jobs commit lock is unavailable; refusing to publish "
+            "without cross-process serialization"
+        )
 
     ensure_dirs()
     lock_path = _jobs_commit_lock_file()
@@ -379,13 +387,10 @@ def _jobs_commit_lock():
                 time.sleep(0.01)
 
         if backend_error is not None:
-            logger.warning(
-                "Cron jobs commit lock is unavailable (%s); proceeding without "
-                "cross-process publication locking",
-                backend_error,
-            )
-            yield
-            return
+            raise RuntimeError(
+                "Cron jobs commit lock is unsupported; refusing to publish "
+                "without cross-process serialization"
+            ) from backend_error
         yield
     finally:
         try:

@@ -183,25 +183,98 @@ def test_windows_commit_lock_seeds_and_locks_byte_zero(jobs_env, monkeypatch):
     assert calls == [(0, fake.LK_NBLCK, 1), (0, fake.LK_UNLCK, 1)]
 
 
-def test_commit_lock_without_backend_uses_historical_fallback(jobs_env, monkeypatch):
+def test_commit_lock_without_backend_fails_closed(jobs_env, monkeypatch):
     jobs = jobs_env
     monkeypatch.setattr(jobs, "fcntl", None)
     monkeypatch.setattr(jobs, "msvcrt", None)
 
-    with jobs._jobs_commit_lock():
-        pass
+    with pytest.raises(RuntimeError, match="unavailable.*refusing to publish"):
+        with jobs._jobs_commit_lock():
+            pass
+
+
+@pytest.mark.parametrize("replace", [False, True])
+def test_missing_commit_lock_backend_never_publishes(
+    jobs_env, monkeypatch, replace
+):
+    jobs = jobs_env
+    seed = _job(jobs, "a")
+    jobs.save_jobs([seed], replace=True)
+    before = jobs._current_cron_store().jobs_file.read_bytes()
+
+    with jobs._jobs_lock():
+        desired = jobs.load_jobs()
+        desired[0]["prompt"] = "must-not-publish"
+        replace_calls = []
+        monkeypatch.setattr(jobs, "fcntl", None)
+        monkeypatch.setattr(jobs, "msvcrt", None)
+        monkeypatch.setattr(
+            jobs,
+            "atomic_replace",
+            lambda *args: replace_calls.append(args),
+        )
+        with pytest.raises(RuntimeError, match="unavailable.*refusing to publish"):
+            jobs._save_jobs_unlocked(desired, replace=replace)
+
+    assert replace_calls == []
+    assert jobs._current_cron_store().jobs_file.read_bytes() == before
+    assert not list(jobs._current_cron_store().cron_dir.glob(".jobs_*.tmp"))
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX flock semantics")
-def test_unsupported_flock_uses_generation_fallback(jobs_env, monkeypatch):
+def test_unsupported_flock_fails_closed(jobs_env, monkeypatch):
     jobs = jobs_env
 
     def unsupported(_fd, _operation):
         raise OSError(errno.ENOTSUP, "unsupported")
 
     monkeypatch.setattr(jobs.fcntl, "flock", unsupported)
-    with jobs._jobs_commit_lock():
-        pass
+    with pytest.raises(RuntimeError, match="unsupported.*refusing to publish"):
+        with jobs._jobs_commit_lock():
+            pass
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX flock semantics")
+@pytest.mark.parametrize("replace", [False, True])
+@pytest.mark.parametrize(
+    "lock_errno_name",
+    [
+        name
+        for name in ("ENOSYS", "ENOTSUP", "EOPNOTSUPP")
+        if getattr(errno, name, None) is not None
+    ],
+)
+def test_unsupported_commit_lock_never_publishes(
+    jobs_env, monkeypatch, replace, lock_errno_name
+):
+    """A generation check alone cannot protect check-to-replace publication."""
+    jobs = jobs_env
+    seed = _job(jobs, "a")
+    jobs.save_jobs([seed], replace=True)
+    before = jobs._current_cron_store().jobs_file.read_bytes()
+
+    def unsupported(_fd, _operation):
+        raise OSError(getattr(errno, lock_errno_name), "unsupported")
+
+    with jobs._jobs_lock():
+        desired = jobs.load_jobs()
+        desired[0]["prompt"] = "must-not-publish"
+        replace_calls = []
+        # Acquire the broad mutation lock first; only the short publication
+        # lock is under test here. Patching flock before _jobs_lock() would
+        # exercise its bounded retry path and obscure the commit invariant.
+        monkeypatch.setattr(jobs.fcntl, "flock", unsupported)
+        monkeypatch.setattr(
+            jobs,
+            "atomic_replace",
+            lambda *args: replace_calls.append(args),
+        )
+        with pytest.raises(RuntimeError, match="unsupported.*refusing to publish"):
+            jobs._save_jobs_unlocked(desired, replace=replace)
+
+    assert replace_calls == []
+    assert jobs._current_cron_store().jobs_file.read_bytes() == before
+    assert not list(jobs._current_cron_store().cron_dir.glob(".jobs_*.tmp"))
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX flock semantics")
