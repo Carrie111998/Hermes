@@ -39,6 +39,15 @@ import pytest
 
 from hermes_state import SessionDB
 
+# Import the agent module at collection rather than on first use inside the
+# helper below — see the identical note in
+# tests/gateway/test_compression_concurrent_sessions.py. run_agent costs ~14s
+# to import and the first AIAgent() another ~12s; deferring both into the first
+# test body put them under pytest's per-test --timeout, whose expiry kills the
+# process and takes every remaining result in the file with it. Collection is
+# untimed. The helper keeps its own import-under-patch, now a sys.modules hit.
+import run_agent  # noqa: F401
+
 
 def _build_agent_with_db(db: SessionDB, session_id: str):
     """Build an AIAgent that's wired to ``db`` and pinned to ``session_id``."""

@@ -27,6 +27,20 @@ import pytest
 
 from hermes_state import SessionDB
 
+# Import the agent module HERE, at collection, not on first use inside
+# _build_agent_with_db. Pulling in run_agent costs ~14s (it transitively loads
+# the whole tool stack), and the helper's deferred import made every second of
+# that land inside the first test's body, where pytest's per-test --timeout
+# applies — on top of the ~12s the first AIAgent() construction spends probing
+# tool requirements. Collection is untimed, so paying it here is the same cost
+# in a place that cannot kill the file. (pytest-timeout's thread method kills
+# the process, so a blown cap took the whole module's results with it.)
+#
+# The helper below still does its own `from run_agent import AIAgent` inside
+# the env patch, deliberately: that call is now a cheap sys.modules hit, and
+# keeping it preserves the original import-under-patch semantics.
+import run_agent  # noqa: F401
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -130,6 +144,7 @@ def test_concurrent_compressions_do_not_alias_sessions(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.timeout(240)
 def test_concurrent_compressions_same_session_serialize(tmp_path: Path) -> None:
     """Two agents sharing a session_id must not both rotate it.
 
@@ -159,7 +174,16 @@ def test_concurrent_compressions_same_session_serialize(tmp_path: Path) -> None:
     # barrier in front of the real acquire guarantees both threads are
     # contending for the lock at the same instant, which is exactly the
     # condition this test means to assert — with zero timing dependency.
-    barrier = threading.Barrier(2, timeout=15)
+    # 120s, not 15s. These bounds are pure deadlock insurance — the barrier
+    # already removes all timing dependency from the condition under test — but
+    # at 15s they became the failure mode instead: under the nightly gate's
+    # concurrent load a compression thread had not returned when join() gave
+    # up, leaving results[key] as None. That is neither "compressed" nor
+    # "unchanged", so the counts read 1/0 and the test reported
+    # "expected exactly one agent to return messages unchanged, got 0" — a lock
+    # bug that had not happened. The log showed the loser correctly skipping.
+    _THREAD_BOUND_S = 120
+    barrier = threading.Barrier(2, timeout=_THREAD_BOUND_S)
     _real_acquire = db.try_acquire_compression_lock
 
     def _barriered_acquire(*args, **kwargs):
@@ -188,14 +212,21 @@ def test_concurrent_compressions_same_session_serialize(tmp_path: Path) -> None:
     t_b = threading.Thread(target=run, args=("b", agent_b), name="review_fork")
     t_a.start()
     t_b.start()
-    t_a.join(timeout=15)
-    t_b.join(timeout=15)
+    t_a.join(timeout=_THREAD_BOUND_S)
+    t_b.join(timeout=_THREAD_BOUND_S)
 
     # Restore the real method so the post-join lock-leak assertion below
     # (and any future call) hits the unwrapped implementation.
     db.try_acquire_compression_lock = _real_acquire
 
     assert not errors, f"Compression raised exceptions: {errors}"
+    # Check liveness explicitly. A thread that outran join() leaves its result
+    # as None, which silently skews BOTH counts below and misreports itself as
+    # a serialization failure; say what actually went wrong instead.
+    assert not t_a.is_alive() and not t_b.is_alive(), (
+        f"Compression thread(s) still running after {_THREAD_BOUND_S}s "
+        f"(main_turn alive={t_a.is_alive()}, review_fork alive={t_b.is_alive()})"
+    )
 
     # Count which agents actually compressed (returned fewer messages than input)
     compressed_count = sum(

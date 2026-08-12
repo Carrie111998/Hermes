@@ -65,8 +65,25 @@ class _LiveBot(FakeBot):
 
 
 class _FakeKeepAlive:
+    """A heartbeat stand-in whose ack age is fixed at ``ack_age``, not frozen.
+
+    ``_last_ack`` is recomputed on every read so the sampled age is always
+    exactly ``ack_age``, however long the probe takes to fire. Pinning it to a
+    single construction-time instant made the age grow with real elapsed time,
+    which silently turned the default ``ack_age=0.0`` into "fresh for the first
+    ``max_ack_age`` seconds only". Under load the liveness loop reached the
+    health check more than a second after the bot was built, so a probe meant
+    to exercise a *later* branch tripped ``ack_stale`` first and reported the
+    wrong reason. The deliberate-staleness callers (``ack_age=3600``) are
+    unaffected: a constant age of an hour is stale under any threshold.
+    """
+
     def __init__(self, *, ack_age: float = 0.0):
-        self._last_ack = time.perf_counter() - ack_age
+        self._ack_age = ack_age
+
+    @property
+    def _last_ack(self) -> float:
+        return time.perf_counter() - self._ack_age
 
 
 class _FakeWebSocket:

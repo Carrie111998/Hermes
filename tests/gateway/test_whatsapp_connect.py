@@ -15,6 +15,7 @@ Regression tests for two bugs in WhatsAppAdapter.connect():
 import asyncio
 import signal
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -527,35 +528,32 @@ class TestWaitForPortRelease:
 # ---------------------------------------------------------------------------
 
 class TestKillPortProcess:
-    """Verify _kill_port_process uses platform-appropriate commands."""
+    """Verify _kill_port_process uses platform-appropriate commands.
 
-    def test_uses_netstat_and_taskkill_on_windows(self):
+    Windows PID lookup no longer parses ``netstat -ano``: that command was
+    measured at 5.3-36.3s on a dev box against the 5s subprocess cap that used
+    to guard it, and the resulting TimeoutExpired was swallowed — so the whole
+    cleanup was a silent no-op on Windows. Both platforms now resolve the
+    target through ``_listener_pids_on_port`` (psutil first), which is also why
+    these tests stub that helper rather than a command's stdout. The
+    behavioural contract is unchanged and is what they still pin: kill the PID
+    LISTENING on the requested port, and nothing else.
+    """
+
+    def test_taskkills_listener_pid_on_windows(self):
         from plugins.platforms.whatsapp.adapter import _kill_port_process
 
-        netstat_output = (
-            "  Proto  Local Address          Foreign Address        State           PID\n"
-            "  TCP    0.0.0.0:3000           0.0.0.0:0              LISTENING       12345\n"
-            "  TCP    0.0.0.0:3001           0.0.0.0:0              LISTENING       99999\n"
-        )
-        mock_netstat = MagicMock(stdout=netstat_output)
-        mock_taskkill = MagicMock()
-
-        def run_side_effect(cmd, **kwargs):
-            if cmd[0] == "netstat":
-                return mock_netstat
-            if cmd[0] == "taskkill":
-                return mock_taskkill
-            return MagicMock()
-
         with patch("plugins.platforms.whatsapp.adapter._IS_WINDOWS", True), \
-             patch("plugins.platforms.whatsapp.adapter.subprocess.run", side_effect=run_side_effect) as mock_run:
+             patch(
+                 "plugins.platforms.whatsapp.adapter._listener_pids_on_port",
+                 return_value=[12345],
+             ) as mock_lookup, \
+             patch("plugins.platforms.whatsapp.adapter.subprocess.run") as mock_run:
             _kill_port_process(3000)
 
-        # netstat called
-        assert any(
-            call.args[0][0] == "netstat" for call in mock_run.call_args_list
-        )
-        # taskkill called with correct PID
+        # The port actually asked about is the one we resolved.
+        assert mock_lookup.call_args.args[0] == 3000
+        # taskkill called with the resolved PID.
         assert any(
             call.args[0] == ["taskkill", "/PID", "12345", "/F"]
             for call in mock_run.call_args_list
@@ -564,20 +562,46 @@ class TestKillPortProcess:
     def test_does_not_kill_wrong_port_on_windows(self):
         from plugins.platforms.whatsapp.adapter import _kill_port_process
 
-        netstat_output = (
-            "  TCP    0.0.0.0:30000          0.0.0.0:0              LISTENING       55555\n"
-        )
-        mock_netstat = MagicMock(stdout=netstat_output)
-
+        # Nothing is LISTENING on the requested port — a process bound to some
+        # other port must never be signalled.
         with patch("plugins.platforms.whatsapp.adapter._IS_WINDOWS", True), \
-             patch("plugins.platforms.whatsapp.adapter.subprocess.run", return_value=mock_netstat) as mock_run:
+             patch(
+                 "plugins.platforms.whatsapp.adapter._listener_pids_on_port",
+                 return_value=[],
+             ), \
+             patch("plugins.platforms.whatsapp.adapter.subprocess.run") as mock_run:
             _kill_port_process(3000)
 
-        # Should NOT call taskkill because port 30000 != 3000
         assert not any(
             call.args[0][0] == "taskkill"
             for call in mock_run.call_args_list
         )
+
+    def test_listener_lookup_filters_by_port_and_listen_state(self):
+        """The psutil path returns only LISTENers on the requested port.
+
+        This is the guarantee that spares clients: a browser tab connected to
+        the bridge's port appears in net_connections as an ESTABLISHED entry
+        whose laddr.port is ephemeral, and must never be returned.
+        """
+        import plugins.platforms.whatsapp.adapter as adapter_mod
+
+        def _conn(status, port, pid):
+            return SimpleNamespace(
+                status=status, pid=pid, laddr=SimpleNamespace(port=port)
+            )
+
+        fake_psutil = MagicMock()
+        fake_psutil.CONN_LISTEN = "LISTEN"
+        fake_psutil.net_connections.return_value = [
+            _conn("LISTEN", 3000, 111),        # target
+            _conn("LISTEN", 3001, 222),        # different port
+            _conn("ESTABLISHED", 3000, 333),   # a client, not a listener
+            _conn("LISTEN", 3000, None),       # no pid attributable
+        ]
+
+        with patch.dict("sys.modules", {"psutil": fake_psutil}):
+            assert adapter_mod._listener_pids_on_port(3000) == [111]
 
     def test_kills_only_listeners_on_linux(self):
         """POSIX path SIGTERMs only LISTENer PIDs (never clients) — the #43846 fix.

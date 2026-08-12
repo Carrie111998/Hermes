@@ -46,14 +46,34 @@ def _runner_with(monkeypatch, *, idle, armed_adapter=True):
     return r, adapter
 
 
+async def _wait_until(predicate, message: str, timeout: float = 5.0) -> None:
+    """Poll until *predicate* holds, or fail with *message*.
+
+    The watcher needs a real iteration of its own loop to reach go_dormant(),
+    and a bare ``await asyncio.sleep(0.1)`` only *usually* leaves room for one:
+    Windows' ~15.6ms timer granularity plus a loaded box can push the whole
+    interval past the sleep, and the test then asserts against a watcher that
+    never ran. Waiting on the observable effect removes the guess.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        if loop.time() >= deadline:
+            pytest.fail(message)
+        await asyncio.sleep(0.01)
+
+
 @pytest.mark.asyncio
 async def test_watcher_goes_dormant_when_idle(monkeypatch):
     r, adapter = _runner_with(monkeypatch, idle=True)
-    # Run one iteration: stop after the first sleep so the loop exits cleanly.
+    # Run one iteration: stop after it lands so the loop exits cleanly.
     task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
-    await asyncio.sleep(0.1)
+    await _wait_until(
+        lambda: adapter.go_dormant_calls >= 1,
+        "watcher never drove the relay adapter dormant while idle+armed",
+    )
     r._running = False
-    await asyncio.wait_for(task, timeout=2)
+    await asyncio.wait_for(task, timeout=5)
     assert adapter.go_dormant_calls >= 1
     # After driving dormant, a re-arm cooldown is set (0.F).
     assert r._scale_to_zero_cooldown_until > time.time()

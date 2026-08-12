@@ -41,7 +41,21 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # marker overrides the global setting. Sized slightly ABOVE _run's timeout so
 # subprocess.TimeoutExpired fires first and reports WHICH command hung,
 # instead of pytest-timeout hard-exiting with a thread dump.
-_SUBPROCESS_TIMEOUT_S = 300
+# 2026-08-11, second sizing: 300 was still not enough. Only ONE of these tests
+# (test_check_feishu_requirements_binds_sdk_on_first_use) actually completes the
+# import — the other two assert lark stays absent and return quickly — and that
+# one blew the 300s cap in the nightly gate's 24-worker run. Direct measurement
+# of a bare `import lark_oapi` on this box: ~130s with the page cache warm,
+# 339.5s cold. 300s was under the cold figure before contention is added at all.
+#
+# 600s is bounded by the harness's own 900s per-file cap: the file's other three
+# tests plus one attempt of this one leave headroom, and --file-timeout applies
+# per attempt so the automatic retry does not stack against it.
+#
+# If this blows again it is a capacity signal about the host (11k modules on an
+# MSIX path), not a lazy-binding regression — the assertion it guards is about
+# WHICH symbols get bound, not how fast.
+_SUBPROCESS_TIMEOUT_S = 600
 slow_subprocess = pytest.mark.timeout(_SUBPROCESS_TIMEOUT_S + 30)
 
 

@@ -222,7 +222,15 @@ class TestCronStaleMonitor:
         assert config["default_seconds"] == 1200
         assert config["per_job"][job_name] == threshold
 
-        within = datetime.now(timezone.utc) - timedelta(seconds=threshold - 1)
+        # ±60s, not ±1s. The backdated timestamp is fixed at emit time but the
+        # monitor samples datetime.now() later, so a 1s margin only holds if
+        # emit + sqlite UPDATE + construction + poll all complete inside one
+        # second — under gate load they do not, and the "within" case tipped to
+        # age_seconds == threshold and alerted. 60s still discriminates: the
+        # per-job thresholds are 1200/1800/2100/2400/3600, so every one of them
+        # stays on the correct side of the 1200s default.
+        margin = 60
+        within = datetime.now(timezone.utc) - timedelta(seconds=threshold - margin)
         _emit_started(bus, job_name, started_at=within)
         mon = CronStaleMonitor(
             bus,
@@ -237,7 +245,7 @@ class TestCronStaleMonitor:
         mon.poll()
         assert _stale_events(bus) == []
 
-        past = datetime.now(timezone.utc) - timedelta(seconds=threshold + 1)
+        past = datetime.now(timezone.utc) - timedelta(seconds=threshold + margin)
         _emit_started(bus, job_name, started_at=past)
         mon.poll()
 

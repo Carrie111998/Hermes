@@ -37,6 +37,15 @@ def _ensure_feishu_mocks():
 
 _ensure_feishu_mocks()
 
+# When the SDK is genuinely installed, _ensure_feishu_mocks() stubs nothing and
+# the real lark_oapi loads lazily inside whichever test first touches it —
+# past the per-test --timeout, which does not cover collection. Warm it here
+# instead. Ordered AFTER the stub helper on purpose: warm_feishu_sdk() no-ops
+# when lark_oapi is already in sys.modules, so it can never clobber the stub.
+from tests.gateway._feishu_sdk_warm import warm_feishu_sdk  # noqa: E402
+
+warm_feishu_sdk()
+
 from gateway.config import PlatformConfig
 import plugins.platforms.feishu.adapter as feishu_module
 from plugins.platforms.feishu.adapter import FeishuAdapter

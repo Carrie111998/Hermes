@@ -146,9 +146,11 @@ class TestSyncMode:
         }
 
         barrier = threading.Barrier(2, timeout=5)
+        finished = threading.Event()
 
         def slow_run(j, *, defer_agent_teardown=None):
             barrier.wait()  # blocks until test thread also waits
+            finished.set()
             return True, "out", "resp", None
 
         monkeypatch.setattr(sched, "get_due_and_skipped_jobs", lambda: ([job], []))
@@ -158,16 +160,21 @@ class TestSyncMode:
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
 
-        start = time.monotonic()
         n = sched.tick(verbose=False, sync=False)  # opt-in: non-blocking
-        elapsed = time.monotonic() - start
 
         assert n == 1  # optimistic count
-        assert elapsed < 1.0  # returned immediately, didn't wait for slow_run
+        # Non-blocking is proven by the barrier, not by a stopwatch: nobody has
+        # released it yet, so slow_run CANNOT have finished. If tick had waited
+        # on the job we would not be executing this line at all — tick would
+        # still be parked until the barrier's own 5s timeout broke it. An
+        # `elapsed < 1.0` bound asserted the same thing far more weakly and
+        # failed on a loaded box (observed 1.27s and 1.70s) purely from
+        # scheduling latency, with the dispatch behaviour perfectly correct.
+        assert not finished.is_set(), "tick(sync=False) blocked on the slow job"
 
         # Let the job finish so cleanup works.
         barrier.wait()
-        time.sleep(0.1)
+        assert finished.wait(timeout=10), "slow_run never completed after release"
         sched._shutdown_parallel_pool()
 
 
@@ -200,9 +207,11 @@ class TestSequentialPool:
         }
 
         barrier = threading.Barrier(2, timeout=5)
+        finished = threading.Event()
 
         def slow_run(j, *, defer_agent_teardown=None):
             barrier.wait()
+            finished.set()
             return True, "out", "resp", None
 
         monkeypatch.setattr(sched, "get_due_and_skipped_jobs", lambda: ([job], []))
@@ -212,15 +221,16 @@ class TestSequentialPool:
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
 
-        start = time.monotonic()
         n = sched.tick(verbose=False, sync=False)
-        elapsed = time.monotonic() - start
 
         assert n == 1  # optimistic count
-        assert elapsed < 1.0  # did NOT block on the slow workdir job
+        # See TestSyncMode.test_sync_false_returns_immediately: the unreleased
+        # barrier — not a wall-clock bound — is what proves the ticker did not
+        # block on the sequential workdir job.
+        assert not finished.is_set(), "tick(sync=False) blocked on the workdir job"
 
         barrier.wait()
-        time.sleep(0.1)
+        assert finished.wait(timeout=10), "slow_run never completed after release"
         sched._shutdown_parallel_pool()
 
     def test_sequential_running_guard_prevents_double_dispatch(self, tmp_path, monkeypatch):
