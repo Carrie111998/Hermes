@@ -25,7 +25,9 @@ from hermes_cli.config import (
     save_env_value,
     save_env_value_secure,
     sanitize_env_file,
+    get_config_value,
     set_config_value,
+    unset_config_value,
     write_platform_config_field,
     _sanitize_env_lines,
 )
@@ -75,6 +77,96 @@ class TestLoadConfigDefaults:
             assert "terminal" in config
             assert config["terminal"]["backend"] == "local"
             assert config["display"]["interim_assistant_messages"] is True
+
+    def test_config_set_preserves_existing_provider_key_with_literal_dot(self, tmp_path):
+        provider = "qwen3.5-397b-wafer-non-zdr"
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "providers": {
+                        provider: {
+                            "api": "https://pass.wafer.ai/v1",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            set_config_value(
+                f"providers.{provider}.extra_headers.Wafer-ZDR",
+                "required",
+            )
+
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert raw["providers"][provider]["extra_headers"] == {
+            "Wafer-ZDR": "required",
+        }
+        assert "qwen3" not in raw["providers"]
+
+    def test_config_set_get_unset_support_quoted_literal_dot_segments(
+        self, tmp_path, capsys
+    ):
+        provider = "qwen3.5-397b-wafer-non-zdr"
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "providers": {
+                        provider: {
+                            "api": "https://pass.wafer.ai/v1",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        key = f'providers."{provider}".extra_headers.Wafer-ZDR'
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            set_config_value(key, "required")
+            capsys.readouterr()
+
+            get_config_value(key)
+            assert capsys.readouterr().out.strip() == "required"
+
+            unset_config_value(key)
+
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert raw["providers"][provider] == {
+            "api": "https://pass.wafer.ai/v1",
+        }
+
+    def test_config_set_json_object_for_provider_extra_headers_is_mapping(
+        self, tmp_path
+    ):
+        provider = "qwen3.5-397b-wafer-non-zdr"
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "providers": {
+                        provider: {
+                            "api": "https://pass.wafer.ai/v1",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            set_config_value(
+                f'providers."{provider}".extra_headers',
+                '{"Wafer-ZDR": "required"}',
+            )
+
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert raw["providers"][provider]["extra_headers"] == {
+            "Wafer-ZDR": "required",
+        }
 
     def test_legacy_root_level_max_turns_migrates_to_agent_config(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
