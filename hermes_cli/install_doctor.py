@@ -463,17 +463,17 @@ def _quote(value: str) -> str:
     return f'"{value}"' if " " in value else value
 
 
-def reinstall_command(python: str | None = None) -> str:
-    """The editable-reinstall command that will actually RUN here.
+def reinstall_command(python: str | None = None, spec: str = "-e . --no-deps") -> str:
+    """The editable-install command that will actually RUN here.
 
     Neither form is universally right, so this detects rather than
     hardcodes:
 
-    * ``python -m pip install -e . --no-deps`` when the interpreter that
-      owns the install has pip.
-    * ``uv pip install -e . --no-deps --python <interpreter>`` when it does
-      not. uv does not install pip into the environments it creates, so on
-      a uv-made ``.venv`` the pip form fails immediately with "No module
+    * ``python -m pip install <spec>`` when the interpreter that owns the
+      install has pip.
+    * ``uv pip install <spec> --python <interpreter>`` when it does not. uv
+      does not install pip into the environments it creates, so on a
+      uv-made ``.venv`` the pip form fails immediately with "No module
       named pip" — observed 2026-08-12 on a uv-created agent-src ``.venv``,
       where doctor's hardcoded pip text was unrunnable as printed.
 
@@ -482,12 +482,17 @@ def reinstall_command(python: str | None = None) -> str:
     ``pip`` from PATH is never emitted as a fallback — on Windows that
     resolves to the scoop/MSIX Python and would install into an entirely
     different interpreter.
+
+    ``spec`` is what to install. It defaults to this module's own case
+    (regenerate the finder without touching resolved dependencies), and
+    doctor's Command Installation check passes ``-e '.[all]'`` — the two
+    checks want different specs but the same pip-or-uv decision.
     """
     python = python or sys.executable
     if _pip_is_importable():
-        return f"{_quote(python)} -m pip install -e . --no-deps"
+        return f"{_quote(python)} -m pip install {spec}"
     uv = shutil.which("uv") or "uv"
-    return f"{_quote(uv)} pip install -e . --no-deps --python {_quote(python)}"
+    return f"{_quote(uv)} pip install {spec} --python {_quote(python)}"
 
 
 def _reinstall_notes(python: str | None = None) -> list[str]:

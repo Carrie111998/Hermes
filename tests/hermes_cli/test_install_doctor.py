@@ -490,6 +490,22 @@ class TestReinstallCommandIsDetectedNotHardcoded:
         # from the cwd, which need not be the one that owns the install.
         assert "--python /agent-src/.venv/bin/python" in cmd
 
+    def test_default_spec_stays_the_finder_regeneration_case(self, monkeypatch):
+        """`spec` exists for doctor's entry-point check, which wants
+        `-e '.[all]'`. The default must keep this module's own case: `--no-deps`,
+        because re-resolving dependencies risks version drift for every agent
+        on the machine when all we need is a regenerated finder.
+        """
+        from hermes_cli import install_doctor
+
+        monkeypatch.setattr(install_doctor, "_pip_is_importable", lambda: True)
+        monkeypatch.setattr(install_doctor.sys, "executable", "/venv/bin/python")
+
+        assert install_doctor.reinstall_command().endswith("-e . --no-deps")
+        assert install_doctor.reinstall_command(spec="-e '.[all]'").endswith(
+            "-e '.[all]'"
+        )
+
     def test_never_falls_back_to_a_bare_pip_on_path(self, monkeypatch):
         """A bare `pip` is the scoop/MSIX interpreter's pip on Windows.
 

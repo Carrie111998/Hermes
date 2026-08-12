@@ -82,6 +82,47 @@ def _run_doctor(fix=False):
     return buf.getvalue()
 
 
+class TestEditableInstallCmd:
+    """``_editable_install_cmd`` — the entry-point remedy's command builder.
+
+    These run on every platform on purpose. The section that uses it is
+    Unix-only, so every ``run_doctor`` test around it is skipped on Windows —
+    which is exactly how a Windows-authored change could regress it unseen.
+    """
+
+    def test_uses_uv_with_an_explicit_python_when_the_venv_has_no_pip(self, monkeypatch):
+        from hermes_cli import install_doctor
+
+        monkeypatch.setattr(install_doctor, "_pip_is_importable", lambda: False)
+        monkeypatch.setattr(install_doctor.shutil, "which", lambda name: "/usr/bin/uv")
+        monkeypatch.setattr(install_doctor.sys, "executable", "/proj/.venv/bin/python")
+
+        assert doctor_mod._editable_install_cmd("-e '.[all]'") == (
+            "/usr/bin/uv pip install -e '.[all]' --python /proj/.venv/bin/python"
+        )
+
+    def test_uses_pip_when_the_interpreter_has_one(self, monkeypatch):
+        from hermes_cli import install_doctor
+
+        monkeypatch.setattr(install_doctor, "_pip_is_importable", lambda: True)
+        monkeypatch.setattr(install_doctor.sys, "executable", "/proj/venv/bin/python")
+
+        assert doctor_mod._editable_install_cmd("-e '.[all]'") == (
+            "/proj/venv/bin/python -m pip install -e '.[all]'"
+        )
+
+    def test_falls_back_to_the_platform_hint_if_install_doctor_is_unimportable(
+        self, monkeypatch
+    ):
+        """A failure in the sibling module must not take down this section."""
+        monkeypatch.setitem(sys.modules, "hermes_cli.install_doctor", None)
+
+        cmd = doctor_mod._editable_install_cmd("-e '.[all]'")
+
+        assert cmd.endswith("-e '.[all]'")
+        assert cmd.startswith(doctor_mod._python_install_cmd())
+
+
 class TestDoctorCommandInstallation:
     """Tests for the ◆ Command Installation section."""
 
@@ -254,6 +295,50 @@ class TestDoctorCommandInstallation:
         out = _run_doctor(fix=False)
         assert "Command Installation" in out
         assert "$PREFIX/bin" in out
+
+    def test_missing_entry_point_remedy_is_runnable_and_drops_the_dead_activate(
+        self, monkeypatch, tmp_path
+    ):
+        """The printed remedy must be a command that can actually run.
+
+        It used to be ``cd <root> && source venv/bin/activate && pip install
+        -e '.[all]'``, which is wrong twice over: the activate script cannot
+        exist (this branch is only reached when neither venv/ nor .venv/ holds
+        an entry point), and a uv-created venv has no pip to run afterwards.
+
+        Deliberately NOT skipped on Windows. The section is Unix-only, so
+        every other test of it skips there — which would leave the branch this
+        pins unexecuted on the machine where the defect was found. It forces
+        ``sys.platform`` instead, mirroring ``test_windows_skips_check``, which
+        already forces the opposite direction. Nothing in this branch touches a
+        POSIX-only primitive: it stats two paths and formats two strings.
+        """
+        monkeypatch.setattr(sys, "platform", "linux")
+        home = tmp_path / ".hermes"
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
+        project = tmp_path / "project"
+        project.mkdir(exist_ok=True)  # no venv/ and no .venv/ inside
+
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+        monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(
+            doctor_mod, "_editable_install_cmd", lambda spec: f"<detected> {spec}"
+        )
+
+        fake_model_tools = types.SimpleNamespace(
+            check_tool_availability=lambda *a, **kw: ([], []),
+            TOOLSET_REQUIREMENTS={},
+        )
+        monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+        out = _run_doctor(fix=False)
+
+        assert "Venv entry point not found" in out
+        assert "<detected> -e '.[all]'" in out
+        assert "source venv/bin/activate" not in out
 
     def test_windows_skips_check(self, monkeypatch, tmp_path):
         """On Windows, the Command Installation section is skipped."""
