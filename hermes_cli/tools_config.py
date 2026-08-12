@@ -1854,6 +1854,11 @@ def _run_post_setup(post_setup_key: str):
             _print_info("    Run manually: uv pip install -U faster-whisper")
 
     elif post_setup_key == "kittentts":
+        # `subprocess` is a local name in this function (other branches
+        # import it locally), so it must be bound here too — otherwise the
+        # first-time install path below raises UnboundLocalError before it
+        # can download or verify the wheel.
+        import subprocess
         try:
             __import__("kittentts")
             _print_success("    kittentts is already installed")
