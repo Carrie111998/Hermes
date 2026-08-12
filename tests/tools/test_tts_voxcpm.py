@@ -69,8 +69,11 @@ class _FakeVoxCPM:
     def generate(self, **kwargs):
         type(self).last_call_kwargs = kwargs
         type(self).last_call_count += 1
-        import numpy as np
-        return np.zeros(self.tts_model.sample_rate, dtype=np.float32)
+        # Pure-stdlib stand-in for a numpy float32 waveform: a list of
+        # float samples. The fake soundfile writer converts it to int16
+        # without numpy, so these unit tests run in CI (where numpy is
+        # NOT installed — it lives in the lazy [voice] extra).
+        return [0.0] * self.tts_model.sample_rate
 
 
 def _patch_voxcpm(monkeypatch):
@@ -97,12 +100,23 @@ def _fake_soundfile(monkeypatch):
     fake_sf = types.ModuleType("soundfile")
 
     def _fake_write(path, audio, sample_rate, subtype="PCM_16", **kwargs):
-        import numpy as np
-        samples = np.asarray(audio)
-        if samples.dtype != np.int16:
-            # Normalize float audio to int16 so `wave` can write it.
-            scaled = np.clip(samples, -1.0, 1.0)
-            samples = (scaled * 32767).astype(np.int16)
+        # Pure-stdlib WAV writer: converts float samples (or int16) to
+        # little-endian int16 PCM without numpy, so the unit tests run in
+        # CI where numpy is not installed ([voice] extra is lazy).
+        import array
+
+        if isinstance(audio, array.array):
+            samples = audio
+        else:
+            try:
+                samples = array.array("h", audio)  # already int16
+            except (TypeError, OverflowError):
+                # Float samples in [-1, 1] → int16.
+                ints = []
+                for s in audio:
+                    v = int(round(max(-1.0, min(1.0, float(s))) * 32767))
+                    ints.append(v)
+                samples = array.array("h", ints)
         with wave.open(str(path), "wb") as wav:
             wav.setnchannels(1)
             wav.setsampwidth(2)
