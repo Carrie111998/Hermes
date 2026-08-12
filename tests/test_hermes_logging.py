@@ -1149,6 +1149,54 @@ class TestInferDaemonRole:
         monkeypatch.setattr(hermes_logging.sys, "argv", ["hermes", "dashboard"])
         assert hermes_logging.infer_daemon_role() == "dashboard"
 
+    def test_short_profile_flag_before_subcommand(self):
+        """`-p default dashboard` is the canonical monitor/laptop-start launch
+        line. The short flag consumes its value, so the subcommand is
+        ``dashboard`` — not ``default``. Before this was handled the role came
+        back None and every monitor-launched dashboard logged to the shared
+        agent.log instead of agent-dashboard.log."""
+        assert hermes_logging.infer_daemon_role(
+            ["hermes", "-p", "default", "dashboard", "--port", "9119"]
+        ) == "dashboard"
+
+    def test_short_valueless_flag_does_not_eat_subcommand(self):
+        """Only value-taking short flags consume the next token. A bare
+        toggle like ``-v`` must not swallow the subcommand."""
+        assert hermes_logging.infer_daemon_role(
+            ["hermes", "-v", "gateway", "run"]
+        ) == "gateway"
+
+    def test_short_profile_flag_with_inline_value(self):
+        assert hermes_logging.infer_daemon_role(
+            ["hermes", "-p=default", "dashboard"]
+        ) == "dashboard"
+
+
+class TestInferLogMode:
+    """infer_log_mode() picks the gui log mode for dashboard-family entrypoints."""
+
+    def test_dashboard_is_gui(self):
+        assert hermes_logging.infer_log_mode(["hermes", "dashboard"]) == "gui"
+
+    def test_short_profile_flag_before_dashboard_is_gui(self):
+        """Same short-flag trap as infer_daemon_role: the canonical
+        `-p default dashboard` launch was resolving to 'cli', so the process
+        never attached a gui.log handler."""
+        assert hermes_logging.infer_log_mode(
+            ["hermes", "-p", "default", "dashboard", "--port", "9119"]
+        ) == "gui"
+
+    def test_serve_is_gui(self):
+        assert hermes_logging.infer_log_mode(
+            ["hermes", "--profile", "main", "serve"]
+        ) == "gui"
+
+    def test_chat_is_cli(self):
+        assert hermes_logging.infer_log_mode(["hermes", "chat"]) == "cli"
+
+    def test_empty_argv_is_cli(self):
+        assert hermes_logging.infer_log_mode([]) == "cli"
+
 
 class TestRoleScopedCatchAll:
     """role= routes the catch-all logs to per-role filenames."""

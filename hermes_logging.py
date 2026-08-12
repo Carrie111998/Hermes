@@ -294,6 +294,46 @@ _DAEMON_SUBCOMMAND_ROLES = {
     "proxy": "proxy",
 }
 
+# Subcommands whose process is a dashboard-family GUI backend and therefore
+# wants ``mode="gui"`` (and its ``gui.log`` handler).
+_GUI_SUBCOMMANDS = frozenset({"dashboard", "serve", "gui", "desktop"})
+
+# SHORT flags that take a value, so the token after them is a value and NOT
+# the subcommand. Mirrors the ``value_flags`` set in ``hermes_cli/main.py``'s
+# profile scanner — the canonical argv walk for this CLI. Without ``-p`` here,
+# the canonical launch line used by laptop-monitor's HermesDashboard-Kick task
+# and laptop-start.ps1 (``hermes -p default dashboard --port 9119 …``)
+# resolved its subcommand to ``default``, so the role came back ``None`` and
+# the mode came back ``"cli"``: every monitor-launched dashboard logged to the
+# shared ``agent.log`` with no ``gui.log`` handler at all, leaving
+# ``agent-dashboard.log`` misleadingly empty during a startup incident.
+_VALUE_TAKING_SHORT_FLAGS = frozenset({"-p", "-m", "-t", "-r", "-s", "-z"})
+
+
+def _first_subcommand_token(argv: Sequence[str]) -> str:
+    """First positional token in ``argv[1:]``, or ``""`` if there is none.
+
+    Skips flag tokens and the value token that follows a long flag
+    (``--profile main``) or a value-taking short flag (``-p main``), so
+    ``hermes -p default dashboard`` resolves to ``dashboard``. Flags carrying
+    an inline value (``--profile=main``, ``-p=main``) consume nothing extra.
+    Short flags outside ``_VALUE_TAKING_SHORT_FLAGS`` are treated as valueless
+    toggles, so ``hermes -v gateway run`` still resolves to ``gateway``.
+    """
+    skip_next = False
+    for tok in argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok.startswith("-"):
+            if "=" not in tok and (
+                tok.startswith("--") or tok in _VALUE_TAKING_SHORT_FLAGS
+            ):
+                skip_next = True
+            continue
+        return tok
+    return ""
+
 
 def infer_daemon_role(argv: Optional[Sequence[str]] = None) -> Optional[str]:
     """Best-effort daemon role from a process's argv, else ``None``.
@@ -308,26 +348,18 @@ def infer_daemon_role(argv: Optional[Sequence[str]] = None) -> Optional[str]:
         prog = os.path.basename(argv[0])
         if prog.startswith("devflow_bridge_runner"):
             return "devflow-bridge"
-    # Walk argv[1:] skipping flag tokens (starting with "-") and the value
-    # token that immediately follows a long flag (e.g. ``--profile main``).
-    # This ensures ``hermes --profile main gateway run`` resolves to "gateway"
-    # rather than "main".
-    # Best-effort: short flags (single dash) are treated as valueless;
-    # only ``--long value`` pairs consume the following token. Real daemon
-    # launch commands put the subcommand first, so this suffices.
-    skip_next = False
-    for tok in argv[1:]:
-        if skip_next:
-            skip_next = False
-            continue
-        if tok.startswith("-"):
-            # Long flag without inline value (``--flag``, not ``--flag=val``)?
-            # If so, the *next* positional is its value — skip it too.
-            if tok.startswith("--") and "=" not in tok:
-                skip_next = True
-            continue
-        return _DAEMON_SUBCOMMAND_ROLES.get(tok)
-    return None
+    return _DAEMON_SUBCOMMAND_ROLES.get(_first_subcommand_token(argv))
+
+
+def infer_log_mode(argv: Optional[Sequence[str]] = None) -> str:
+    """``"gui"`` for dashboard-family entrypoints, else ``"cli"``.
+
+    Pure (argv-only) counterpart to ``infer_daemon_role`` — both share
+    ``_first_subcommand_token`` so a launch line can never resolve to a
+    dashboard *role* while missing the gui *mode*, or vice versa.
+    """
+    argv = list(sys.argv if argv is None else argv)
+    return "gui" if _first_subcommand_token(argv) in _GUI_SUBCOMMANDS else "cli"
 
 
 # ---------------------------------------------------------------------------

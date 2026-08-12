@@ -19632,7 +19632,31 @@ def start_server(
             config.load()
         server.lifespan = config.lifespan_class(config)
         with server.capture_signals():
-            await server.startup()
+            try:
+                await server.startup()
+            except SystemExit:
+                # uvicorn's Server.startup() handles a failed bind by logging
+                # the OSError to its OWN "uvicorn.error" logger and then
+                # calling sys.exit(1). uvicorn configures that logger with
+                # propagate=False, so the message reaches stderr and NO Hermes
+                # log file: during the 2026-08-12 incident, grepping for
+                # "10048|error while attempting to bind" returned 0 hits across
+                # agent.log, gui.log, errors.log, agent-dashboard.log and
+                # errors-dashboard.log while that exact error was plainly on
+                # stderr. Whoever spawned us may also have discarded stderr
+                # entirely (the HermesDashboard-Kick scheduled task appends it
+                # to ~/.claude/logs), so the only durable record is this one.
+                # Re-log on a propagating Hermes logger, then re-raise so the
+                # exit code is unchanged. ASCII only - this must survive a
+                # legacy MBCS console (see hermes_logging._safe_stderr).
+                _log.error(
+                    "Dashboard server could not start on %s:%s - the bind was "
+                    "refused (the port is almost certainly already in use). "
+                    "Exiting.",
+                    host,
+                    port,
+                )
+                raise
             if server.should_exit:
                 return
 

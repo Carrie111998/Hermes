@@ -789,16 +789,12 @@ except Exception:
 try:
     from hermes_logging import setup_logging as _setup_logging
     from hermes_logging import infer_daemon_role as _infer_daemon_role
+    from hermes_logging import infer_log_mode as _infer_log_mode
 
-    _setup_logging(
-        mode=(
-            "gui"
-            if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
-            in {"dashboard", "serve", "gui", "desktop"}
-            else "cli"
-        ),
-        role=_infer_daemon_role(),
-    )
+    # Both derive the subcommand the same way (hermes_logging's shared argv
+    # walk), so a value-taking short flag like `-p default` can never make one
+    # of them see `default` as the subcommand while the other sees `dashboard`.
+    _setup_logging(mode=_infer_log_mode(), role=_infer_daemon_role())
 except Exception:
     pass  # best-effort — don't crash the CLI if logging setup fails
 
@@ -12708,6 +12704,50 @@ def cmd_dashboard(args):
         _setup_logging_gui(mode="gui")
     except Exception:
         pass
+
+    # ── Port preflight ────────────────────────────────────────────────
+    # Fail fast when the port is already served. The actual bind is the LAST
+    # step of startup, so without this a redundant launch first pays for the
+    # fastapi/uvicorn import, the skills sync, plugin discovery, background MCP
+    # discovery and the ~19k-line web_server import — only to have uvicorn die
+    # on WSAEADDRINUSE/EADDRINUSE at the end. On an idle box that wasted ~20s;
+    # during the 2026-08-12 incident the box was under heavy memory pressure and
+    # the doomed process instead ground on for 29 minutes and was killed BEFORE
+    # reaching the bind, so it never emitted the one error that would have
+    # explained it (5.1s CPU / 3 threads / 83MB, vs 6.1s / 6 / 110MB for a
+    # healthy start). Probing first turns that silent 29-minute phantom into an
+    # immediate, logged, non-zero exit.
+    #
+    # Logged via ``logger`` (not just printed) because uvicorn's own bind error
+    # goes to its non-propagating ``uvicorn.error`` logger and reaches NO Hermes
+    # log file — measured 0 hits across agent.log, gui.log, errors.log,
+    # agent-dashboard.log and errors-dashboard.log while the error sat plainly
+    # on stderr.
+    #
+    # port 0 means "let the OS assign a free port", so there is nothing to
+    # conflict with and the probe is skipped.
+    _preflight_host = args.host or "127.0.0.1"
+    if args.port and _dashboard_listening(_preflight_host, args.port):
+        _busy_msg = (
+            f"Refusing to start: {_preflight_host}:{args.port} is already "
+            f"serving a Hermes dashboard."
+        )
+        # ASCII only. This is the diagnostic path, and a legacy MBCS console
+        # (cp1252 et al) raises UnicodeEncodeError on an em-dash or a "✗" —
+        # see the _safe_stderr() note in hermes_logging. A startup abort that
+        # cannot encode its own reason is the bug we are fixing, not a fix.
+        logger.error(
+            "Dashboard startup aborted - %s:%s is already in use.",
+            _preflight_host,
+            args.port,
+        )
+        print(f"x {_busy_msg}", file=sys.stderr)
+        print(
+            "  Use the running one, or pick another port with --port, or stop "
+            "it with:  hermes dashboard --stop",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     try:
         import fastapi  # noqa: F401
