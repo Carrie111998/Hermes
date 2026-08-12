@@ -569,7 +569,7 @@ def _validate_frontmatter(content: str, *, new_skill: bool = False) -> Optional[
     Returns error message or None if valid.
 
     When ``new_skill`` is True (create path only), the description must also
-    fit the 60-char system-prompt budget (SKILL_PROMPT_DESC_LIMIT) so newly
+    fit the system-prompt budget (SKILL_PROMPT_DESC_LIMIT) so newly
     authored skills never lose routing signal to index truncation. Edit and
     patch paths deliberately skip this so existing over-limit skills remain
     maintainable while their descriptions are cleaned up.

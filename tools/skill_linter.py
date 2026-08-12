@@ -155,7 +155,7 @@ def _check_name_format(frontmatter: Dict[str, Any]) -> List[LintFinding]:
 def _check_description(frontmatter: Dict[str, Any]) -> List[LintFinding]:
     findings: List[LintFinding] = []
     # Raw description as authored — extract_skill_description() applies the
-    # 60-char prompt truncation, so it can never exceed the limit; measure the
+    # prompt truncation, so it can never exceed the limit; measure the
     # raw frontmatter value for the length check.
     desc = str(frontmatter.get("description", "")).strip().strip("'\"")
     if not desc:
