@@ -1678,8 +1678,7 @@ export interface MemoryStatus {
 
 export interface MemoryProviderExternalDependency {
   name: string;
-  install: string;
-  check: string;
+  installable: boolean;
 }
 
 export interface MemoryProviderSetupInfo {
