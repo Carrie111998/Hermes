@@ -75,6 +75,18 @@ def test_termux_desktop_rejects_no_sandbox_and_wildcard_bind(linter, tmp_path, m
 
 
 
+
+def test_termux_regression_rejects_fragile_inline_bash_lc(linter, tmp_path, monkeypatch):
+    monkeypatch.setattr(linter, "REPO_ROOT", tmp_path)
+    path = _write(
+        tmp_path,
+        ".github/workflows/termux-regression.yml",
+        "run: docker run image bash -lc 'echo quoted'\n",
+    )
+    findings = linter.scan_file(path)
+    assert {item.name for item in findings} == {"fragile inline quoted Termux regression shell"}
+
+
 def test_termux_regression_rejects_privileged_or_seccomp_disabled_container(linter, tmp_path, monkeypatch):
     monkeypatch.setattr(linter, "REPO_ROOT", tmp_path)
     path = _write(

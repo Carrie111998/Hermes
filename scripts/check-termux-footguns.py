@@ -98,6 +98,16 @@ FOOTGUNS: tuple[Footgun, ...] = (
         fix="Remove --no-sandbox from the Termux Chromium command.",
     ),
     Footgun(
+        name="fragile inline quoted Termux regression shell",
+        paths=(".github/workflows/termux-regression.yml",),
+        pattern=re.compile(r"bash\s+-lc\s+['\"]"),
+        message=(
+            "The native Termux regression body must live in a checked-in shell script, "
+            "not a large bash -lc quoted string whose embedded quotes can escape unexpectedly."
+        ),
+        fix="Execute scripts/run-termux-regression.sh directly inside the Termux container.",
+    ),
+    Footgun(
         name="privileged Termux PR regression container",
         paths=(".github/workflows/termux-regression.yml",),
         pattern=re.compile(r"(?:^|\s)--privileged(?:\s|$)|--security-opt(?:=|\s+)seccomp=unconfined"),
