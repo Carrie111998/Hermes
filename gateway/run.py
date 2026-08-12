@@ -2013,6 +2013,8 @@ if _config_path.exists():
                 os.environ["HERMES_AGENT_NOTIFY_INTERVAL"] = str(_agent_cfg["gateway_notify_interval"])
             if "restart_drain_timeout" in _agent_cfg:
                 os.environ["HERMES_RESTART_DRAIN_TIMEOUT"] = str(_agent_cfg["restart_drain_timeout"])
+            if "cron_shutdown_grace_s" in _agent_cfg:
+                os.environ["HERMES_CRON_SHUTDOWN_GRACE"] = str(_agent_cfg["cron_shutdown_grace_s"])
             if "gateway_auto_continue_freshness" in _agent_cfg:
                 os.environ["HERMES_AUTO_CONTINUE_FRESHNESS"] = str(
                     _agent_cfg["gateway_auto_continue_freshness"]
@@ -5823,6 +5825,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return value
 
     @staticmethod
+    def _load_cron_shutdown_grace() -> float:
+        """Load the bounded cron-shutdown keepalive grace in seconds.
+
+        Window granted to in-flight cron jobs at gateway shutdown BEFORE the
+        global tool-subprocess sweep, so a long-running cron tool subprocess
+        (e.g. a long LLM verdict/analysis run) can finish naturally instead of
+        being amputated by ``process_registry.kill_all()``. 0 disables the
+        grace (immediate sweep, legacy behaviour). See
+        ``agent.cron_shutdown_grace_s`` in config.
+        """
+        raw = os.getenv("HERMES_CRON_SHUTDOWN_GRACE", "").strip()
+        if not raw:
+            cfg = _load_gateway_runtime_config()
+            raw = str(cfg_get(cfg, "agent", "cron_shutdown_grace_s", default="") or "").strip()
+        if not raw:
+            return 0.0
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid cron_shutdown_grace_s '%s', using 0 (no grace)",
+                raw,
+            )
+            return 0.0
+        return max(0.0, value)
+
+    @staticmethod
     def _load_background_notifications_mode() -> str:
         """Load background process notification mode from config or env var.
 
@@ -6696,6 +6725,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         _maybe_update_status(force=True)
         return snapshot, timed_out
+
+    async def _grant_cron_shutdown_grace(self) -> None:
+        """Give in-flight cron jobs a bounded window to finish BEFORE the
+        global tool-subprocess sweep.
+
+        The shutdown path kills tool subprocesses with a global
+        ``process_registry.kill_all()`` (no per-job targeting). With the
+        default ``agent.restart_drain_timeout=0``, ``_drain_active_agents``
+        returns ``timed_out=True`` the instant any cron job is in flight, and
+        the sweep then amputates that job's tool subprocess mid-command — the
+        general failure mode reported for the T24-verdict one-shot (any long
+        LLM verdict/analysis run, not job-specific). ``#60432`` marking only
+        makes the killed run fail HONESTLY; it does not preserve the work.
+
+        This poll waits up to ``agent.cron_shutdown_grace_s`` (default 30s)
+        for in-flight cron jobs to clear, so a job whose tool subprocess is
+        close to finishing survives shutdown intact. The sweep +
+        interrupted-marking still run as a bounded fallback for jobs that do
+        NOT finish within the grace. No-op (returns immediately) when no cron
+        job is in flight or the grace is 0.
+        """
+        try:
+            from cron.scheduler import get_running_job_ids
+        except Exception:
+            return
+        try:
+            grace = self._load_cron_shutdown_grace()
+        except Exception:
+            grace = 0.0
+        if grace <= 0:
+            return
+        if getattr(self, "_cron_grace_granted", False):
+            return
+        if not get_running_job_ids():
+            return
+        self._cron_grace_granted = True
+        logger.info(
+            "Shutdown: granting %.1fs cron-shutdown keepalive grace for "
+            "in-flight cron job(s) before tool-subprocess sweep",
+            grace,
+        )
+        deadline = asyncio.get_running_loop().time() + grace
+        while get_running_job_ids() and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.1)
+        remaining = get_running_job_ids()
+        if remaining:
+            logger.warning(
+                "Shutdown: %d cron job(s) still in flight after %.1fs grace; "
+                "proceeding with tool-subprocess sweep and interrupted-marking "
+                "for the rest",
+                len(remaining), grace,
+            )
+        else:
+            logger.info(
+                "Shutdown: all in-flight cron job(s) finished within the "
+                "keepalive grace"
+            )
 
     def _interrupt_running_agents(self, reason: str) -> None:
         for session_key, agent in list(self._running_agents.items()):
@@ -9951,6 +10037,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # children left behind by an interrupted terminal tool get
                 # killed by systemd instead of us (issue #8202).  The final
                 # catch-all cleanup below still runs for the graceful path.
+                #
+                # Grant a bounded keepalive grace to in-flight cron jobs first
+                # so a long-running cron tool subprocess (long LLM verdict /
+                # analysis run) is not amputated by the global sweep before it
+                # can finish (general shutdown failure mode, not job-specific).
+                await self._grant_cron_shutdown_grace()
                 _kill_tool_subprocesses("post-interrupt")
                 logger.info(
                     "Shutdown phase: post-interrupt tool kill done at +%.2fs",
@@ -10045,6 +10137,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # where drain succeeded without interrupt, and (b) anything
             # that got respawned between the earlier call and adapter
             # disconnect (defense in depth; safe to call repeatedly).
+            #
+            # Grant the bounded cron keepalive grace here too so a long
+            # cron job's tool subprocess still finishing on the graceful
+            # path is not amputated by this final global sweep.
+            await self._grant_cron_shutdown_grace()
             _kill_tool_subprocesses("final-cleanup")
             logger.info(
                 "Shutdown phase: final-cleanup tool kill done at +%.2fs",
