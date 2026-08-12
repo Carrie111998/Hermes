@@ -1840,40 +1840,25 @@ class TestConfigRoundTrip:
         self.client = TestClient(app)
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
-
-    def test_settings_save_preserves_extra_root_keys(self):
-        """A schema-driven save must round-trip the complete root document."""
-        import yaml
-
+    def test_raw_editor_replaces_the_whole_file(self):
         from hermes_cli import config as config_mod
 
         config_path = config_mod.get_config_path()
-        preserved = {
-            "multiplex_profiles": True,
-            "approvals": {"mode": "off", "cron_mode": "approve"},
-            "x_adapter_95_unknown": {"nested": ["keep", {"exact": 7}]},
-        }
         config_path.write_text(
-            yaml.safe_dump({**preserved, "timezone": "UTC"}, sort_keys=False),
+            "multiplex_profiles: true\napprovals:\n  mode: off\ntimezone: UTC\n",
             encoding="utf-8",
         )
+
         response = self.client.put(
-            "/api/config",
-            json={"config": {"timezone": "Asia/Bangkok"}},
+            "/api/config/raw",
+            json={"yaml_text": "timezone: Asia/Bangkok\n"},
         )
 
         assert response.status_code == 200
-        persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        persisted = config_mod.read_raw_config()
         assert persisted["timezone"] == "Asia/Bangkok"
-        preserved_after = {key: persisted[key] for key in preserved}
-        assert yaml.safe_dump(preserved_after, sort_keys=False).encode() == yaml.safe_dump(
-            preserved, sort_keys=False
-        ).encode()
-
-
-
-
-
+        assert "multiplex_profiles" not in persisted
+        assert "approvals" not in persisted
 
     def test_round_trip_preserves_schema_invisible_nested_keys(self):
         """Nested keys that aren't in CONFIG_SCHEMA must also survive a

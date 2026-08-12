@@ -13228,7 +13228,7 @@ async def delete_hook(body: HookDelete):
             del hooks_cfg[event]
         if not hooks_cfg:
             cfg.pop("hooks", None)
-        save_config(cfg)
+        save_config(cfg, removed_root_keys={"hooks"} if not hooks_cfg else None)
 
     # Revoke consent regardless so a re-add re-prompts.
     try:
@@ -13574,7 +13574,7 @@ def _write_profile_mcp_servers(profile_dir: Path, servers: List["MCPServerCreate
             # We created an empty mcp_servers dict but wrote nothing — don't
             # leave a stray empty key in the new profile's config.
             cfg.pop("mcp_servers", None)
-            save_config(cfg)
+            save_config(cfg, removed_root_keys={"mcp_servers"})
     finally:
         reset_hermes_home_override(token)
     return written
@@ -14103,7 +14103,7 @@ async def update_config_raw(body: RawConfigUpdate, profile: Optional[str] = None
         with _profile_scope(body.profile or profile):
             # Full-document replacement: the editor owns the whole file; do not
             # merge omitted sections back from disk (#62723).
-            save_config(parsed, merge_existing=False)
+            save_config(parsed, full_replace=True)
         return {"ok": True}
     except yaml.YAMLError as e:
         raise HTTPException(status_code=400, detail=f"Invalid YAML: {e}")

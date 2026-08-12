@@ -256,7 +256,7 @@ def _restore_model_cfg(model_before: Any) -> None:
         cfg.pop("model", None)
     else:
         cfg["model"] = copy.deepcopy(model_before)
-    save_config(cfg)
+    save_config(cfg, removed_root_keys={"model"} if model_before is None else None)
 
 
 def cmd_fallback_remove(args) -> None:  # noqa: ARG001
