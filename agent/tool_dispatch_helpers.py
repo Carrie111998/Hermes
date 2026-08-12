@@ -591,8 +591,6 @@ _UNTRUSTED_TOOL_PREFIXES = (
     "mcp_",
 )
 
-_UNTRUSTED_WRAP_MIN_CHARS = 32
-
 # Matches the delimiter token in any case so attacker content can't forge or
 # prematurely close the boundary with a differently-cased variant the model
 # would still read as a tag (e.g. ``</UNTRUSTED_TOOL_RESULT>``).
@@ -671,7 +669,11 @@ def _maybe_wrap_untrusted(name: str, content: Any) -> Any:
     Returns ``content`` unchanged when:
     - the tool is not in the high-risk set
     - the content is neither a string nor a list (dict, None, …)
-    - (string) the content is too short to be worth wrapping
+    - (string) the content is empty
+
+    Every non-empty untrusted string is wrapped regardless of length: a short
+    payload can still be a control/special token sequence that must be framed
+    as untrusted data.
 
     Wrapped string content is always neutralized (any embedded delimiter token
     is defanged) and wrapped in exactly one well-formed block. There is no
@@ -682,7 +684,7 @@ def _maybe_wrap_untrusted(name: str, content: Any) -> Any:
     if not _is_untrusted_tool(name):
         return content
     if isinstance(content, str):
-        if len(content) < _UNTRUSTED_WRAP_MIN_CHARS:
+        if not content:
             return content
         safe_content = _neutralize_delimiters(content)
         return (
