@@ -335,8 +335,25 @@ def _audit_npm_target(
         high = vuln_count.get("high", 0)
         moderate = vuln_count.get("moderate", 0)
         total = critical + high + moderate
+        # Does npm believe ANY of these can be fixed by bumping? `fixAvailable`
+        # is False, True, or a {name, version, isSemVerMajor} target. A target
+        # where nothing is fixable must not be handed a fix command: the
+        # WhatsApp bridge's two highs (link-preview-js GHSA-4gp8-rjrq-ch6q and
+        # baileys, which only inherits it) are both `fixAvailable: false`, so
+        # `npm audit fix` there is a no-op that leaves the warning identical.
+        # A partially-fixable set still gets the command — it clears the subset.
+        # No `vulnerabilities` block at all (older npm, trimmed payload) means
+        # we don't know, and we must not assert a fix we cannot evidence.
+        advisories = audit_data.get("vulnerabilities") or {}
+        any_fixable = any(
+            bool(v.get("fixAvailable"))
+            for v in advisories.values()
+            if isinstance(v, dict)
+        )
         # Determine a scoped fix command for the remediation hint.
-        if audit_extra and audit_extra[0] == "--workspace":
+        if not any_fixable:
+            fix_cmd = None
+        elif audit_extra and audit_extra[0] == "--workspace":
             # Detection (`npm audit --workspace <name>`) is read-only and
             # safe, but `npm audit fix --workspace <name>` crashes on
             # current npm with "Cannot read properties of null (reading
@@ -355,6 +372,16 @@ def _audit_npm_target(
             if fix_cmd:
                 vuln_detail = (
                     f"{critical} critical, {high} high, {moderate} moderate — run: {fix_cmd}"
+                )
+            elif not any_fixable:
+                # Say so explicitly. Silence here reads as a missing hint;
+                # "no upstream fix" tells the reader the ball is not in their
+                # court — the advisory stands until the dependency ships one,
+                # so the answer is a mitigation or an accepted risk, not a bump.
+                vuln_detail = (
+                    f"{critical} critical, {high} high, {moderate} moderate — "
+                    "no upstream fix available (npm reports fixAvailable: false); "
+                    "needs a mitigation or an accepted-risk note, not a bump"
                 )
             else:
                 vuln_detail = (

@@ -61,11 +61,11 @@ class TestCLIQuickCommands:
         cli.console.print.assert_called_once()
 
     def test_exec_command_no_output_shows_fallback(self):
-        # `exit 0`, not `true`: quick commands run with shell=True, which is
-        # cmd.exe on Windows, and `true` is not a cmd builtin — the shell's
-        # "'true' is not recognized" on stderr would take the stderr branch
-        # instead of this fallback. `exit 0` is silent and succeeds on both
-        # cmd.exe and POSIX sh.
+        # ``exit 0``, not ``true``: quick commands run under ``shell=True``, so
+        # on Windows the shell is cmd.exe, which has no ``true`` and answers
+        # "'true' is not recognized" on stderr -- the stderr branch fires and
+        # this test never reaches the no-output case it names. ``exit 0`` is
+        # silent and succeeds under both cmd.exe and /bin/sh.
         cli = self._make_cli({"empty": {"type": "exec", "command": "exit 0"}})
         cli.process_command("/empty")
         cli.console.print.assert_called_once()

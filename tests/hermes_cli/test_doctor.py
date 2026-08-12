@@ -1980,6 +1980,101 @@ class TestNpmAuditBudget:
         assert issues == ["WhatsApp bridge has 6 npm vulnerabilities"]
 
 
+class TestNpmAuditFixHintTracksFixAvailable:
+    """The `npm audit fix` hint must reflect whether npm says a fix EXISTS.
+
+    Doctor used to pick the hint purely from which target it was, never from
+    the audit payload. On the WhatsApp bridge that produced a command that
+    cannot work: its two high advisories (link-preview-js GHSA-4gp8-rjrq-ch6q
+    and @whiskeysockets/baileys, which only inherits it) both report
+    `fixAvailable: false` — every published link-preview-js is <=4.0.0, all
+    affected, and Baileys pins ^3.0.0. Running the suggested command is a
+    no-op that leaves the warning byte-identical, so the reader concludes
+    something is broken rather than that there is nothing to bump.
+    """
+
+    @staticmethod
+    def _run(payload: str, capsys, monkeypatch, tmp_path):
+        def _ok(argv, *, cwd, timeout):
+            return subprocess.CompletedProcess(argv, 1, payload, "")
+
+        monkeypatch.setattr(doctor_mod, "_run_npm_audit", _ok)
+        issues: list[str] = []
+        doctor_mod._audit_npm_target("npm", tmp_path, "WhatsApp bridge", [], issues)
+        return capsys.readouterr().out, issues
+
+    def test_unfixable_advisories_do_not_suggest_npm_audit_fix(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        payload = json.dumps(
+            {
+                "metadata": {"vulnerabilities": {"critical": 0, "high": 2, "moderate": 0}},
+                "vulnerabilities": {
+                    "link-preview-js": {"severity": "high", "fixAvailable": False},
+                    "@whiskeysockets/baileys": {"severity": "high", "fixAvailable": False},
+                },
+            }
+        )
+        out, issues = self._run(payload, capsys, monkeypatch, tmp_path)
+
+        assert "0 critical, 2 high, 0 moderate" in out
+        # The whole point: no command that cannot accomplish anything.
+        assert "npm audit fix" not in out
+        # ... and the reader is told WHY, so the absence isn't mistaken for a gap.
+        assert "no upstream fix" in out
+        # Still a real finding — unfixable is not the same as absent.
+        assert issues == ["WhatsApp bridge has 2 npm vulnerabilities"]
+
+    def test_fixable_advisories_still_suggest_npm_audit_fix(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """The hint must survive where it actually works — no over-correction."""
+        payload = json.dumps(
+            {
+                "metadata": {"vulnerabilities": {"critical": 0, "high": 1, "moderate": 0}},
+                "vulnerabilities": {
+                    "body-parser": {"severity": "high", "fixAvailable": True},
+                },
+            }
+        )
+        out, _ = self._run(payload, capsys, monkeypatch, tmp_path)
+        assert "npm audit fix" in out
+
+    def test_partially_fixable_still_suggests_the_fix(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """A mixed set is worth running: the command clears the fixable subset."""
+        payload = json.dumps(
+            {
+                "metadata": {"vulnerabilities": {"critical": 0, "high": 2, "moderate": 0}},
+                "vulnerabilities": {
+                    "link-preview-js": {"severity": "high", "fixAvailable": False},
+                    # npm reports an object, not a bool, when it has a target.
+                    "body-parser": {
+                        "severity": "high",
+                        "fixAvailable": {
+                            "name": "body-parser",
+                            "version": "1.20.6",
+                            "isSemVerMajor": False,
+                        },
+                    },
+                },
+            }
+        )
+        out, _ = self._run(payload, capsys, monkeypatch, tmp_path)
+        assert "npm audit fix" in out
+
+    def test_missing_vulnerabilities_block_does_not_invent_a_fix(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """No per-advisory detail (older npm, trimmed payload) → claim nothing."""
+        payload = json.dumps(
+            {"metadata": {"vulnerabilities": {"critical": 0, "high": 1, "moderate": 0}}}
+        )
+        out, _ = self._run(payload, capsys, monkeypatch, tmp_path)
+        assert "npm audit fix" not in out
+
+
 class TestNpmAuditIsOptIn:
     """The audits cost 40-120s per target and are off unless asked for.
 
