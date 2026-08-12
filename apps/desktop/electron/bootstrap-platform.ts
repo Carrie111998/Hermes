@@ -107,4 +107,22 @@ function detectRemoteDisplay(options: { env?: NodeJS.ProcessEnv; platform?: Node
   return null
 }
 
-export { bundledRuntimeImportCheck, detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment }
+function remoteDisplayGpuSwitches(reason: string | null) {
+  if (!reason) {
+    return []
+  }
+
+  if (reason.startsWith('rdp ')) {
+    return ['disable-gpu', 'disable-gpu-compositing', 'in-process-gpu']
+  }
+
+  return ['disable-gpu-compositing']
+}
+
+export {
+  bundledRuntimeImportCheck,
+  detectRemoteDisplay,
+  isWindowsBinaryPathInWsl,
+  isWslEnvironment,
+  remoteDisplayGpuSwitches
+}

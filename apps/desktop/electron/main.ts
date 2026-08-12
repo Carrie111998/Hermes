@@ -46,7 +46,12 @@ import {
 } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from './backend-start-failure'
-import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
+import {
+  detectRemoteDisplay,
+  isWindowsBinaryPathInWsl,
+  isWslEnvironment,
+  remoteDisplayGpuSwitches
+} from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
@@ -291,9 +296,11 @@ const REMOTE_DISPLAY_REASON = detectRemoteDisplay()
 
 if (REMOTE_DISPLAY_REASON) {
   app.disableHardwareAcceleration()
-  // Belt-and-suspenders for X11/VNC, where the Viz compositor can still glitch
-  // with only --disable-gpu: force compositing onto the CPU too.
-  app.commandLine.appendSwitch('disable-gpu-compositing')
+  // Keep the existing software-compositing fallback for every remote display,
+  // but apply the additional process switches only to Windows RDP.
+  for (const gpuSwitch of remoteDisplayGpuSwitches(REMOTE_DISPLAY_REASON)) {
+    app.commandLine.appendSwitch(gpuSwitch)
+  }
   console.log(
     `[hermes] remote display detected (${REMOTE_DISPLAY_REASON}); disabling GPU hardware acceleration to prevent flicker`
   )
