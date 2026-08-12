@@ -144,4 +144,4 @@ Available in `hybrid` and `tools` memory modes:
 
 ## Client Version
 
-Requires `hindsight-client >= 0.6.1`. The plugin auto-upgrades on session start if an older version is detected.
+Requires exactly `hindsight-client==0.6.1`. The plugin installs the pin on session start when an older version is detected. If a higher-priority installation shadows Hermes' copy, remove or uninstall the distribution at the path reported by the diagnostic before reinstalling the pin; force-reinstalling only the lower-priority environment does not change Python import precedence.

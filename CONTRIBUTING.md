@@ -898,7 +898,7 @@ After the [litellm supply chain compromise](https://github.com/BerriAI/litellm/i
 # ✅ Correct — pre-1.0 (tight minor window)
 "asyncpg>=0.29,<0.32"
 "aiosqlite>=0.20,<0.23"
-"hindsight-client>=0.4.22,<0.5"
+"example-pre1-package>=0.4.22,<0.7"
 
 # ❌ Rejected — no upper bound
 "some-package>=1.2.3"
