@@ -34,6 +34,9 @@ gateway:
         cli_path: ""               # buzz binary (default: PATH, then ~/bin/buzz)
         credentials_file: ""       # JSON file with the nsec (BUZZ_PRIVATE_KEY fallback)
         allowed_users: []          # empty = allow all; hex pubkeys or npubs
+        mention_required_users: [] # selected senders must explicitly mention this agent
+        mention_aliases: {}        # outbound @alias -> pubkey mapping for real p-tags
+        max_agent_hops: 0          # bound consecutive agent replies; 0 = unlimited
 ```
 
 Plus, in `~/.hermes/.env`:
@@ -52,6 +55,9 @@ BUZZ_PRIVATE_KEY=nsec1...
 | `BUZZ_HOME_CHANNEL` | — | Channel UUID for cron / notification delivery (defaults to the first watched channel) |
 | `BUZZ_ALLOWED_USERS` | — | Comma-separated npubs or hex pubkeys allowed to talk to the agent |
 | `BUZZ_ALLOW_ALL_USERS` | — | Allow any community member to talk to the agent |
+| `BUZZ_MENTION_REQUIRED_USERS` | — | Comma-separated senders that must explicitly mention this agent |
+| `BUZZ_MENTION_ALIASES` | — | Comma-separated `Alias=pubkey` mappings used to create outbound p-tags |
+| `BUZZ_MAX_AGENT_HOPS` | — | Maximum consecutive agent-authored reply hops (`0` = unlimited) |
 | `BUZZ_POLL_INTERVAL` | — | Seconds between inbound poll sweeps (default: 4) |
 | `BUZZ_CLI_PATH` | — | Path to the `buzz` binary (default: `buzz` on PATH, then `~/bin/buzz`) |
 | `BUZZ_CREDENTIALS_FILE` | — | JSON credentials file holding the nsec, used when `BUZZ_PRIVATE_KEY` is unset |
@@ -75,7 +81,8 @@ gateway:
         channels:                         # channel UUIDs to watch (empty = all joined)
           - ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
         home_channel: ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
-        poll_interval: 4                  # seconds between inbound poll sweeps (default 4 — balances latency vs. relay load)
+        transport: auto                   # WebSocket first; polling fallback (auto, websocket, or poll)
+        poll_interval: 4                  # seconds between fallback poll sweeps
         cli_path: ""                      # buzz binary (default: PATH, then ~/bin/buzz)
         credentials_file: ""              # JSON file with the nsec (BUZZ_PRIVATE_KEY fallback)
         allowed_users: []                 # empty = allow all if allow_all_users is true; otherwise restrict to listed npubs/hex pubkeys
@@ -98,8 +105,14 @@ gateway:
 ## Mentions, channels, and DMs
 
 - In shared channels the agent only responds when **addressed** — by `@name`, its npub, or its hex pubkey. Everything else is ignored.
-- Direct messages always reach the agent, no mention needed.
+- Direct messages always reach the agent without a mention, except from identities listed in `mention_required_users`; those senders must still use an explicit tagged mention.
 - The agent's own messages are never dispatched back to it (self-echo suppression by pubkey), and every event is de-duplicated by event id against a per-channel high-water mark.
+
+### Bounded agent-to-agent interaction
+
+To preserve ambient human conversation while requiring explicit bot delegation, keep `require_mention: false`, list the bot identities in both `allowed_users` and `mention_required_users`, configure `mention_aliases`, and set a small positive `max_agent_hops` such as `4`. Senders in `mention_required_users` must provide both an exact visible configured `@alias` and a real Nostr `p` tag; display names, npubs, and raw pubkeys do not substitute for that configured alias. Alias tokens inside inline/fenced/indented code, quoted Markdown, HTML comments, declarations and marked sections such as CDATA, raw HTML elements (including elements spanning blank lines), character references, URLs, relative paths, address/query/fragment syntax, autolinks, or hidden link destinations are examples rather than invocations and do not generate outbound `p` tags. Ordinary Markdown emphasis and visible link-label text remain eligible. Ordinary allowed humans can still speak without a mention. Outbound alias mappings add explicit `--mention` pubkeys so model-authored names become real mention tags. Aliases are case-insensitive **ASCII** tokens containing letters, digits, `_`, `.`, or `-`; duplicate case-insensitive aliases, blank or delimiter-only environment overrides, and malformed security settings fail gateway startup closed.
+
+`max_agent_hops` counts consecutive agent-authored events linked by Buzz reply tags. Values must be between `0` and `1000`; mutually interacting deployments should use a small positive value such as `4`. Events beyond the configured limit remain visible in Buzz but are not dispatched into another Hermes turn. Configure the same agent identity set and hop limit on every mutually interacting profile.
 
 ## Access control
 
@@ -117,7 +130,7 @@ Check status with `hermes gateway status` — Buzz connection state is reported 
 
 ## Notes and limitations
 
-- **Inbound is polled, not streamed.** The `buzz` CLI is request/response, so the adapter polls `buzz messages get` per watched channel every `poll_interval` seconds (default 4). Expect up to one interval of latency on inbound messages. A future optimization is a websocket transport (the Buzz repo ships `buzz-ws-client` for true streaming).
+- **Inbound prefers WebSocket streaming.** With `transport: auto` (the default), the adapter uses an authenticated WebSocket subscription and falls back to `buzz messages get` polling when streaming is unavailable. Set `transport: websocket` to require streaming or `transport: poll` to force polling.
 - On (re)connect the adapter seeds its high-water mark from the newest events, so channel history is never replayed into the agent.
 - New DM conversations are discovered automatically (every few poll sweeps).
 - The private key is passed to the CLI via the subprocess environment — it never appears in argv or logs.

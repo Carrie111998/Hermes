@@ -5,10 +5,9 @@ A plugin-based gateway adapter that connects to a Buzz community relay
 (Block's open-source human+agent collaboration platform, built on the
 Nostr protocol) and relays messages to/from the Hermes agent.
 
-The adapter does not speak Nostr itself — it shells out to the ``buzz``
-CLI binary ("JSON in, JSON out") via ``asyncio.create_subprocess_exec``.
-Inbound delivery uses a poll loop (the CLI is request/response); see the
-"Known limitations" note in the platform docs.
+The adapter shells out to the ``buzz`` CLI for request/response operations
+and uses an authenticated Nostr WebSocket subscription for inbound delivery.
+``transport=auto`` falls back to CLI polling when streaming is unavailable.
 
 Configuration in config.yaml::
 
@@ -21,15 +20,20 @@ Configuration in config.yaml::
             channels:                  # channel UUIDs to watch (empty = all joined)
               - ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
             home_channel: ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
-            poll_interval: 4           # seconds between poll sweeps
+            transport: auto            # WebSocket first; polling fallback
+            poll_interval: 4           # seconds between fallback poll sweeps
             cli_path: ""               # path to the buzz binary (default: PATH, then ~/bin/buzz)
             credentials_file: ""       # JSON file holding the nsec (fallback for BUZZ_PRIVATE_KEY)
             allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
+            mention_required_users: [] # senders that must carry a real mention
+            mention_aliases: {}        # outbound @alias -> pubkey mapping
+            max_agent_hops: 0          # consecutive agent reply limit; 0 = unlimited
 
 Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
     BUZZ_CLI_PATH, BUZZ_CREDENTIALS_FILE, BUZZ_ALLOWED_USERS,
-    BUZZ_ALLOW_ALL_USERS
+    BUZZ_ALLOW_ALL_USERS, BUZZ_MENTION_REQUIRED_USERS, BUZZ_MENTION_ALIASES,
+    BUZZ_MAX_AGENT_HOPS
 
 The only secret is BUZZ_PRIVATE_KEY (nsec or hex) — it belongs in
 ``~/.hermes/.env``.  It is passed to the CLI via the subprocess
@@ -43,11 +47,15 @@ import os
 import re
 import shutil
 import time
+import unicodedata
 from collections import OrderedDict
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
+
+from markdown_it import MarkdownIt
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -75,6 +83,111 @@ def _get_scoped_secret(name, default=None):
 
 logger = logging.getLogger(__name__)
 
+_INVOCATION_MARKDOWN = MarkdownIt("commonmark", {"html": True})
+_INVOCATION_URL_RE = re.compile(
+    r"(?i)(?<![@A-Za-z0-9+.-])(?:[A-Za-z][A-Za-z0-9+.-]*:(?://)?|www\.)[^\s<>]+"
+)
+_INVOCATION_HIDDEN_BOUNDARY = "\u200d"
+_INVOCATION_CHARACTER_REFERENCE_RE = re.compile(
+    r"&(?:#[0-9]+|#[xX][0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]*);"
+)
+
+
+class _RawHtmlInvocationTextParser(HTMLParser):
+    """Exclude text enclosed by any raw HTML element from invocations."""
+
+    _VOID_TAGS = {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._stack: List[str] = []
+        self._hidden_depth = 0
+        self._parts: List[str] = []
+
+    def add_text(self, text: str) -> None:
+        if not self._hidden_depth:
+            self._parts.append(text)
+
+    def add_hidden_boundary(self) -> None:
+        if not self._hidden_depth:
+            self._parts.append(_INVOCATION_HIDDEN_BOUNDARY)
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        normalized = tag.lower()
+        if normalized in self._VOID_TAGS:
+            if not self._hidden_depth:
+                self._parts.append(_INVOCATION_HIDDEN_BOUNDARY)
+            return
+        if not self._hidden_depth:
+            self._parts.append(_INVOCATION_HIDDEN_BOUNDARY)
+        self._stack.append(normalized)
+        self._hidden_depth += 1
+
+    def handle_startendtag(
+        self, tag: str, attrs: List[Tuple[str, Optional[str]]]
+    ) -> None:
+        normalized = tag.lower()
+        if normalized in self._VOID_TAGS:
+            self.handle_starttag(normalized, attrs)
+            return
+        # HTML ignores ``/>`` on non-void elements. Keep the context open so
+        # malformed ``<tag/>@Alias`` fails closed.
+        self.handle_starttag(normalized, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized = tag.lower()
+        if not self._stack or self._stack[-1] != normalized:
+            if not self._hidden_depth:
+                self._parts.append(_INVOCATION_HIDDEN_BOUNDARY)
+            return
+        self._stack.pop()
+        self._hidden_depth -= 1
+        if not self._hidden_depth:
+            self._parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        self.add_text(data)
+
+    def handle_comment(self, data: str) -> None:
+        self.add_hidden_boundary()
+
+    def handle_decl(self, decl: str) -> None:
+        self.add_hidden_boundary()
+
+    def unknown_decl(self, data: str) -> None:
+        # ``HTMLParser`` routes CDATA and other marked sections here. Treat
+        # every omitted declaration as a source boundary so it cannot splice
+        # fragments into a configured alias.
+        self.add_hidden_boundary()
+
+    def handle_pi(self, data: str) -> None:
+        self.add_hidden_boundary()
+
+    def handle_entityref(self, name: str) -> None:
+        self.add_hidden_boundary()
+
+    def handle_charref(self, name: str) -> None:
+        self.add_hidden_boundary()
+
+    @property
+    def text(self) -> str:
+        return "".join(self._parts)
+
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
@@ -99,6 +212,7 @@ _DM_DISCOVERY_EVERY = 5
 _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
 _CLI_TIMEOUT = 30.0
+_MAX_AGENT_HOPS = 1000
 
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 # kind 44100 is Buzz's channel-membership event — used for live DM discovery.
@@ -349,7 +463,7 @@ def _parse_json_list(stdout: str) -> List[dict]:
 # ---------------------------------------------------------------------------
 
 class BuzzAdapter(BasePlatformAdapter):
-    """Poll-based Buzz adapter implementing the BasePlatformAdapter interface.
+    """WebSocket-first Buzz adapter with a polling fallback.
 
     Instantiated by the adapter_factory passed to register_platform().
     """
@@ -360,6 +474,7 @@ class BuzzAdapter(BasePlatformAdapter):
 
         extra = getattr(config, "extra", {}) or {}
         self._extra = extra
+        self._config_errors: List[str] = []
 
         # Connection settings (env vars override config.yaml)
         self.relay_url = (os.getenv("BUZZ_RELAY_URL") or extra.get("relay_url", "")).strip()
@@ -411,6 +526,102 @@ class BuzzAdapter(BasePlatformAdapter):
             if isinstance(entry, str) and (normalized := _normalize_user_ref(entry))
         }
 
+        # Selected senders (normally other agent identities) must address this
+        # profile explicitly even when ambient human messages are allowed with
+        # require_mention=false. Entries may be hex pubkeys or npubs.
+        mention_required_env = os.getenv("BUZZ_MENTION_REQUIRED_USERS")
+        raw_mention_required = (
+            mention_required_env
+            if mention_required_env is not None
+            else extra.get("mention_required_users", [])
+        )
+        if isinstance(raw_mention_required, str):
+            raw_mention_required = raw_mention_required.split(",")
+        if not isinstance(raw_mention_required, (list, tuple, set)):
+            self._config_errors.append("mention_required_users must be a list or CSV")
+            raw_mention_required = []
+        self._mention_required_pubkeys: set = set()
+        for entry in raw_mention_required:
+            normalized = _normalize_user_ref(entry) if isinstance(entry, str) else None
+            if not normalized:
+                self._config_errors.append("mention_required_users contains an invalid identity")
+                continue
+            self._mention_required_pubkeys.add(normalized)
+
+        # Outbound aliases ensure model-authored @names become real Nostr
+        # p-tags. Config accepts a mapping or CSV entries like Alias=pubkey.
+        aliases_env = os.getenv("BUZZ_MENTION_ALIASES")
+        aliases_explicit = aliases_env is not None or "mention_aliases" in extra
+        raw_aliases = aliases_env if aliases_env is not None else extra.get("mention_aliases", {})
+        if aliases_explicit and (
+            raw_aliases is None
+            or not isinstance(raw_aliases, (dict, str))
+            or (isinstance(raw_aliases, str) and not raw_aliases.strip())
+        ):
+            self._config_errors.append("mention_aliases must be a non-empty mapping or CSV")
+        if isinstance(raw_aliases, dict):
+            alias_entries = list(raw_aliases.items())
+        else:
+            alias_entries = []
+            saw_alias_csv_item = False
+            for item in str(raw_aliases or "").split(","):
+                if not item.strip():
+                    continue
+                saw_alias_csv_item = True
+                alias, separator, user_ref = item.partition("=")
+                if not separator:
+                    self._config_errors.append("mention_aliases contains an invalid entry")
+                    continue
+                alias_entries.append((alias, user_ref))
+            if isinstance(raw_aliases, str) and not saw_alias_csv_item:
+                self._config_errors.append("mention_aliases contains no alias entries")
+        self._mention_aliases: Dict[str, str] = {}
+        for alias, user_ref in alias_entries:
+            raw_alias = alias.strip() if isinstance(alias, str) else ""
+            if raw_alias.startswith("@"):
+                raw_alias = raw_alias[1:]
+            normalized_alias = raw_alias.lower()
+            normalized_user = _normalize_user_ref(user_ref) if isinstance(user_ref, str) else None
+            if (
+                not raw_alias
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", raw_alias, re.ASCII)
+                or not normalized_user
+            ):
+                self._config_errors.append("mention_aliases contains an invalid alias or identity")
+                continue
+            if normalized_alias in self._mention_aliases:
+                self._config_errors.append("mention_aliases contains duplicate case-insensitive aliases")
+                continue
+            self._mention_aliases[normalized_alias] = normalized_user
+
+        # Bound consecutive agent-authored reply hops. Zero keeps the legacy
+        # unlimited behavior; configured mutual-agent deployments should use a
+        # small positive value.
+        max_hops_env = os.getenv("BUZZ_MAX_AGENT_HOPS")
+        max_hops_explicit = max_hops_env is not None or "max_agent_hops" in extra
+        max_hops_raw = max_hops_env if max_hops_env is not None else extra.get("max_agent_hops", 0)
+        parsed_max_hops = 0
+        max_hops_valid = False
+        if isinstance(max_hops_raw, int) and not isinstance(max_hops_raw, bool):
+            parsed_max_hops = max_hops_raw
+            max_hops_valid = 0 <= parsed_max_hops <= _MAX_AGENT_HOPS
+        elif isinstance(max_hops_raw, str) and re.fullmatch(r"[0-9]+", max_hops_raw.strip()):
+            try:
+                parsed_max_hops = int(max_hops_raw.strip())
+                max_hops_valid = parsed_max_hops <= _MAX_AGENT_HOPS
+            except ValueError:
+                max_hops_valid = False
+        if not max_hops_valid and max_hops_explicit:
+            self._config_errors.append(
+                f"max_agent_hops must be an integer between 0 and {_MAX_AGENT_HOPS}"
+            )
+            parsed_max_hops = 0
+        self.max_agent_hops = parsed_max_hops
+        if self._mention_required_pubkeys and self.max_agent_hops == 0:
+            self._config_errors.append(
+                "max_agent_hops must be positive when mention_required_users is configured"
+            )
+
         # Secret — resolved lazily (never at import/registration time and
         # never logged).  connect() re-resolves it to fail fast with a clear
         # error when it is missing.
@@ -435,6 +646,12 @@ class BuzzAdapter(BasePlatformAdapter):
         # classification (see _may_reclassify_as_dm).
         self._channel_meta: Dict[str, dict] = {}
         self._user_names: Dict[str, str] = {}
+        # event id -> consecutive agent reply hops; bounded like seen ids.
+        self._agent_hops: OrderedDict[str, int] = OrderedDict()
+        # channel id -> (latest accepted agent event id, hop count). This
+        # supplies a conservative reply parent when the gateway loses reply
+        # metadata while queuing concurrent inbound messages.
+        self._active_agent_events: Dict[str, Tuple[str, int]] = {}
         self._poll_count = 0
 
     @property
@@ -457,7 +674,12 @@ class BuzzAdapter(BasePlatformAdapter):
     # ── Connection lifecycle ──────────────────────────────────────────────
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        """Verify relay credentials, seed high-water marks, start polling."""
+        """Verify credentials, seed high-water marks, and start inbound transport."""
+        if self._config_errors:
+            message = "; ".join(dict.fromkeys(self._config_errors))
+            logger.error("Buzz configuration invalid: %s", message)
+            self._set_fatal_error("config_invalid", message, retryable=False)
+            return False
         if not self.relay_url:
             logger.error("Buzz: relay URL must be configured")
             self._set_fatal_error("config_missing", "BUZZ_RELAY_URL must be set", retryable=False)
@@ -595,6 +817,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 pass
         self._poll_task = None
         self._channel_state = {}
+        self._active_agent_events = {}
         self._poll_count = 0
 
     # ── Sending ───────────────────────────────────────────────────────────
@@ -609,7 +832,14 @@ class BuzzAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
-        reply_target = reply_to or (metadata or {}).get("thread_id")
+        mentions = self._explicit_mentions(content)
+        for pubkey in mentions:
+            args += ["--mention", pubkey]
+        reply_target = self._outbound_reply_target(
+            str(chat_id),
+            mentions,
+            reply_to or (metadata or {}).get("thread_id"),
+        )
         if reply_target:
             args += ["--reply-to", str(reply_target)]
         code, out, err = await self._run_cli(args, input_text=content)
@@ -628,6 +858,9 @@ class BuzzAdapter(BasePlatformAdapter):
             # Belt-and-braces echo suppression: the poll loop already skips
             # our own pubkey, but marking the id seen makes de-dupe explicit.
             self._mark_seen(str(chat_id), str(event_id))
+            if self.max_agent_hops:
+                parent_hops = self._outbound_parent_hops(str(chat_id), reply_target)
+                self._remember_agent_hop(str(event_id), parent_hops + 1)
         return SendResult(
             success=bool(data.get("accepted", True)),
             message_id=str(event_id) if event_id else None,
@@ -681,8 +914,16 @@ class BuzzAdapter(BasePlatformAdapter):
                 "--file", str(local),
                 "--content", "-",
             ]
-            if reply_to:
-                args += ["--reply-to", str(reply_to)]
+            mentions = self._explicit_mentions(caption or "")
+            for pubkey in mentions:
+                args += ["--mention", pubkey]
+            reply_target = self._outbound_reply_target(
+                str(chat_id),
+                mentions,
+                reply_to or (metadata or {}).get("thread_id"),
+            )
+            if reply_target:
+                args += ["--reply-to", str(reply_target)]
             code, out, err = await self._run_cli(args, input_text=caption or "")
             if code != 0:
                 return SendResult(success=False, error=_cli_error_message(err, code), retryable=code == 2)
@@ -693,6 +934,9 @@ class BuzzAdapter(BasePlatformAdapter):
             event_id = data.get("event_id")
             if event_id:
                 self._mark_seen(str(chat_id), str(event_id))
+                if self.max_agent_hops:
+                    parent_hops = self._outbound_parent_hops(str(chat_id), reply_target)
+                    self._remember_agent_hop(str(event_id), parent_hops + 1)
             return SendResult(
                 success=bool(data.get("accepted", True)),
                 message_id=str(event_id) if event_id else None,
@@ -888,15 +1132,19 @@ class BuzzAdapter(BasePlatformAdapter):
                                 raise ConnectionError(str(detail))
                             elif message[0] == "NOTICE":
                                 logger.warning("Buzz: relay notice: %s", message[-1])
+                        self._ws_active = False
+                        self._active_agent_events = {}
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
                     self._ws_active = False
+                    self._active_agent_events = {}
                     logger.warning("Buzz: WebSocket disconnected; retrying in %.1fs: %s", backoff, e)
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 30.0)
         finally:
             self._ws_active = False
+            self._active_agent_events = {}
 
     # ── Inbound polling ───────────────────────────────────────────────────
 
@@ -933,11 +1181,13 @@ class BuzzAdapter(BasePlatformAdapter):
             # replay its whole history once it becomes readable.
             state["last_ts"] = int(time.time())
             return
-        for event in _parse_json_list(out):
+        events = self._causal_event_order(_parse_json_list(out))
+        for event in events:
             event_id = event.get("id")
             created_at = int(event.get("created_at") or 0)
             if event_id:
                 state["seen"][str(event_id)] = None
+                self._record_agent_hop(event)
             state["last_ts"] = max(state["last_ts"], created_at)
             # History is never dispatched, but it still classifies: a DM that
             # leaked in via ``channels list`` latches to chat_type="dm" here,
@@ -1001,7 +1251,8 @@ class BuzzAdapter(BasePlatformAdapter):
                 "Buzz: poll of channel %s failed — %s", channel_id, _cli_error_message(err, code)
             )
             return
-        for event in _parse_json_list(out):
+        events = self._causal_event_order(_parse_json_list(out))
+        for event in events:
             await self._handle_event(channel_id, state, event)
         self._trim_seen(state)
 
@@ -1020,6 +1271,7 @@ class BuzzAdapter(BasePlatformAdapter):
         content = event.get("content")
         if not pubkey or not isinstance(content, str) or not content.strip():
             return
+        agent_hops = self._record_agent_hop(event)
 
         # Suppress self-echo: never dispatch our own messages back to the agent.
         if pubkey == self._self_pubkey:
@@ -1030,17 +1282,41 @@ class BuzzAdapter(BasePlatformAdapter):
         self._maybe_latch_dm(channel_id, state, event)
 
         is_dm = state["chat_type"] == "dm"
-        # In shared channels, respond only when addressed — unless
-        # require_mention is disabled, in which case respond to every message.
-        # DMs always dispatch.
-        if not is_dm and self.require_mention and not self._is_mentioned(content):
-            return
 
         # Adapter-level allow-list (the gateway applies BUZZ_ALLOWED_USERS /
         # BUZZ_ALLOW_ALL_USERS centrally as well; empty list = no filter here).
         if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
             logger.debug("Buzz: ignoring message from unauthorized pubkey %s…", pubkey[:8])
             return
+
+        # Per-sender mention policy supports ambient human messages alongside
+        # explicitly directed agent-to-agent work. A real Nostr p-tag and a
+        # visible mention are both required, so presentation-only @text cannot
+        # invoke another agent and structural DM p-tags do not bypass the gate.
+        if pubkey in self._mention_required_pubkeys:
+            if self.max_agent_hops and agent_hops > self.max_agent_hops:
+                logger.warning(
+                    "Buzz: dropping agent reply at hop %s (limit %s)",
+                    agent_hops,
+                    self.max_agent_hops,
+                )
+                return
+            if not self._event_mentions_self(event) or not self._has_visible_self_mention(content):
+                return
+        # In shared channels, respond only when addressed — unless
+        # require_mention is disabled, in which case respond to every message.
+        # DMs from ordinary allowed users always dispatch.
+        elif not is_dm and self.require_mention and not self._is_mentioned(content):
+            return
+
+        if pubkey in self._mention_required_pubkeys:
+            # The most recently accepted agent event is the active response
+            # parent even when it starts a fresh lower-hop chain. Keeping the
+            # previous highest-hop event would misthread the new response.
+            self._active_agent_events[channel_id] = (event_id, agent_hops)
+        else:
+            # A fresh human instruction starts a new interaction root.
+            self._active_agent_events.pop(channel_id, None)
 
         # Strip a leading @mention so slash commands (@Chip /whoami ->
         # /whoami) and clean prompts are recognized. DM messages often still
@@ -1144,10 +1420,259 @@ class BuzzAdapter(BasePlatformAdapter):
         if self._self_npub and self._self_npub in lowered:
             return True
         if self._display_name:
-            pattern = rf"(?<!\w)@?{re.escape(self._display_name.lower())}(?!\w)"
+            pattern = rf"(?<!\w)@?{re.escape(self._display_name.lower())}(?![\w.-])"
+            if re.search(pattern, lowered):
+                return True
+        for alias, pubkey in self._mention_aliases.items():
+            if pubkey != self._self_pubkey:
+                continue
+            pattern = rf"(?<!\w)@?{re.escape(alias)}(?![\w.-])"
             if re.search(pattern, lowered):
                 return True
         return False
+
+    @staticmethod
+    def _is_alias_continuation(char: str) -> bool:
+        """Return whether ``char`` can visually continue an alias token."""
+        if not char:
+            return False
+        category = unicodedata.category(char)
+        return (
+            char in "_.-"
+            or ("a" + char).isidentifier()
+            or category[0] in {"L", "M", "N"}
+            or category in {"Cf", "Pc"}
+        )
+
+    @staticmethod
+    def _is_alias_path_or_address_join(
+        content: str, match: re.Match[str]
+    ) -> bool:
+        """Reject aliases joined directly to URI/path/address syntax."""
+        if match.start() > 0 and content[match.start() - 1] in "/\\+?#=&;%:":
+            return True
+        if match.end() >= len(content):
+            return False
+        following = content[match.end()]
+        if following in "/\\+=&%":
+            return True
+        if following in "?#;:" and match.end() + 1 < len(content):
+            return not content[match.end() + 1].isspace()
+        return False
+
+    @classmethod
+    def _alias_match(
+        cls, content: str, alias: str, *, leading: bool = False
+    ) -> Optional[re.Match[str]]:
+        """Find one exact ASCII alias with Unicode-safe token boundaries."""
+        pattern = re.compile(rf"@{re.escape(alias)}", re.IGNORECASE | re.ASCII)
+        for match in pattern.finditer(content):
+            if leading and match.start() != 0:
+                return None
+            if not leading and match.start() > 0:
+                previous = content[match.start() - 1]
+                if previous == "@" or cls._is_alias_continuation(previous):
+                    continue
+            if match.end() < len(content) and cls._is_alias_continuation(
+                content[match.end()]
+            ):
+                continue
+            if cls._is_alias_path_or_address_join(content, match):
+                continue
+            return match
+        return None
+
+    @staticmethod
+    def _invocation_text(content: str) -> str:
+        """Return visible Markdown prose eligible to contain invocation aliases."""
+        # Character references are decoded into ordinary text by CommonMark.
+        # Replace their source ranges first so they cannot synthesize an alias
+        # such as ``@Se&#108;f`` or ``&#64;Self`` after parsing.
+        source = _INVOCATION_CHARACTER_REFERENCE_RE.sub(
+            _INVOCATION_HIDDEN_BOUNDARY, content
+        )
+        parser = _RawHtmlInvocationTextParser()
+        blockquote_depth = 0
+
+        for token in _INVOCATION_MARKDOWN.parse(source):
+            if token.type == "blockquote_open":
+                blockquote_depth += 1
+                parser.add_hidden_boundary()
+                continue
+            if token.type == "blockquote_close":
+                blockquote_depth = max(0, blockquote_depth - 1)
+                parser.add_text("\n")
+                continue
+            if blockquote_depth:
+                continue
+            if token.type in {"fence", "code_block"}:
+                parser.add_hidden_boundary()
+                parser.add_text("\n")
+                continue
+            if token.type == "html_block":
+                parser.feed(token.content)
+                parser.add_text("\n")
+                continue
+            if token.type != "inline" or not token.children:
+                continue
+
+            autolink_depth = 0
+            for child in token.children:
+                if child.type == "link_open" and child.markup == "autolink":
+                    autolink_depth += 1
+                    parser.add_hidden_boundary()
+                    continue
+                if child.type == "link_close" and child.markup == "autolink":
+                    autolink_depth = max(0, autolink_depth - 1)
+                    parser.add_hidden_boundary()
+                    continue
+                if autolink_depth:
+                    continue
+                if child.type == "text":
+                    parser.add_text(child.content)
+                elif child.type in {"softbreak", "hardbreak"}:
+                    parser.add_text("\n")
+                elif child.type in {"code_inline", "image"}:
+                    parser.add_hidden_boundary()
+                elif child.type == "html_inline":
+                    parser.feed(child.content)
+            parser.add_text("\n")
+
+        parser.close()
+        return _INVOCATION_URL_RE.sub("", parser.text)
+
+    def _has_visible_self_mention(self, content: str) -> bool:
+        """Require an exact configured self @alias outside code and quotes."""
+        invocation_text = self._invocation_text(content)
+        return any(
+            self._alias_match(invocation_text, alias)
+            for alias, pubkey in self._mention_aliases.items()
+            if pubkey == self._self_pubkey
+        )
+
+    def _event_mentions_self(self, event: dict) -> bool:
+        """Return True only when the event carries a Nostr p-tag for us."""
+        if not self._self_pubkey:
+            return False
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return False
+        return any(
+            isinstance(tag, (list, tuple))
+            and len(tag) > 1
+            and tag[0] == "p"
+            and str(tag[1]).lower() == self._self_pubkey
+            for tag in tags
+        )
+
+    def _explicit_mentions(self, content: str) -> List[str]:
+        """Resolve configured @aliases outside code and quotes to pubkeys."""
+        invocation_text = self._invocation_text(content)
+        mentions = []
+        for alias, pubkey in sorted(self._mention_aliases.items(), key=lambda item: -len(item[0])):
+            if self._alias_match(invocation_text, alias) and pubkey not in mentions:
+                mentions.append(pubkey)
+        return mentions
+
+    def _outbound_parent_hops(self, chat_id: str, reply_target: Optional[str]) -> int:
+        """Return known parent hops, including retained active-state metadata."""
+        target = str(reply_target or "")
+        if target in self._agent_hops:
+            return self._agent_hops[target]
+        active = self._active_agent_events.get(chat_id)
+        if active and active[0] == target:
+            return active[1]
+        if target and self.max_agent_hops:
+            return self.max_agent_hops
+        return 0
+
+    def _outbound_reply_target(
+        self,
+        chat_id: str,
+        mentions: List[str],
+        requested: Optional[str],
+    ) -> Optional[str]:
+        """Preserve chain ancestry when queued replies lose gateway metadata.
+
+        A human message clears the active agent chain. Therefore an explicit
+        outbound agent mention with no supplied reply id can safely attach to
+        the latest accepted agent event in the channel instead of resetting
+        the structural hop counter.
+        """
+        if not self.max_agent_hops or not mentions:
+            return str(requested) if requested else None
+        if requested:
+            return str(requested)
+        active = self._active_agent_events.get(chat_id)
+        return active[0] if active else None
+
+    @staticmethod
+    def _reply_parent_id(event: dict) -> str:
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return ""
+        fallback = ""
+        for tag in tags:
+            if not isinstance(tag, (list, tuple)) or len(tag) < 2 or tag[0] != "e":
+                continue
+            event_id = str(tag[1])
+            if len(tag) > 3 and tag[3] == "reply":
+                return event_id
+            fallback = event_id
+        return fallback
+
+    def _causal_event_order(self, events: List[dict]) -> List[dict]:
+        """Order fetched events by time and reply ancestry (parent before child)."""
+        stable = sorted(events, key=lambda event: int(event.get("created_at") or 0))
+        by_id = {str(event.get("id")): event for event in stable if event.get("id")}
+        ordered: List[dict] = []
+        visited: set[str] = set()
+        active: set[str] = set()
+
+        def visit(event: dict) -> None:
+            event_id = str(event.get("id") or "")
+            if event_id and event_id in visited:
+                return
+            if event_id and event_id in active:
+                return
+            if event_id:
+                active.add(event_id)
+            parent = by_id.get(self._reply_parent_id(event))
+            if parent is not None:
+                visit(parent)
+            if event_id:
+                active.discard(event_id)
+                visited.add(event_id)
+            ordered.append(event)
+
+        for event in stable:
+            visit(event)
+        return ordered
+
+    def _remember_agent_hop(self, event_id: str, hops: int) -> int:
+        if event_id:
+            self._agent_hops[event_id] = hops
+            self._agent_hops.move_to_end(event_id)
+            while len(self._agent_hops) > _SEEN_CAP:
+                self._agent_hops.popitem(last=False)
+        return hops
+
+    def _record_agent_hop(self, event: dict) -> int:
+        """Track consecutive agent replies so mutual conversations are bounded."""
+        event_id = str(event.get("id") or "")
+        pubkey = str(event.get("pubkey") or "").lower()
+        is_agent = pubkey in self._mention_required_pubkeys or (
+            bool(self.max_agent_hops) and pubkey == self._self_pubkey
+        )
+        if not is_agent:
+            return self._remember_agent_hop(event_id, 0)
+        parent_id = self._reply_parent_id(event)
+        if parent_id and parent_id not in self._agent_hops:
+            # A pushed/replayed child can arrive before its parent. Never cache
+            # a guessed low value that weakens a configured chain limit.
+            unknown_parent_hops = self.max_agent_hops + 1 if self.max_agent_hops else 1
+            return self._remember_agent_hop(event_id, unknown_parent_hops)
+        return self._remember_agent_hop(event_id, self._agent_hops.get(parent_id, 0) + 1)
 
     def _strip_mention(self, content: str) -> str:
         """Remove a leading @mention of this agent so the remaining text can be
@@ -1161,7 +1686,21 @@ class BuzzAdapter(BasePlatformAdapter):
         are left intact so normal prose is unaffected.
         """
         text = content.strip()
+        self_aliases = []
+        for alias, pubkey in self._mention_aliases.items():
+            if pubkey == self._self_pubkey:
+                self_aliases.append(alias)
+        for alias in sorted(self_aliases, key=len, reverse=True):
+            match = self._alias_match(text, alias, leading=True)
+            if match:
+                return text[match.end() :].lstrip(" \t:,").strip()
+
+        # Preserve the permissive legacy stripping behavior only when no
+        # configured self alias exists. Protected peer dispatch never uses
+        # these alternate identity forms for authorization.
         candidates = []
+        if self_aliases:
+            return text
         if self._display_name:
             candidates.append(re.escape(self._display_name))
         if self._self_npub:
@@ -1171,9 +1710,17 @@ class BuzzAdapter(BasePlatformAdapter):
         if not candidates:
             return text
         # Optional leading '@', one of the identity forms, optional trailing
-        # ':' or ',' and surrounding whitespace.
-        pattern = rf"^@?(?:{'|'.join(candidates)})[\s:,]*"
-        stripped = re.sub(pattern, "", text, count=1, flags=re.IGNORECASE)
+        # ':' or ',' and surrounding whitespace. Prefer longer candidates and
+        # require an alias-token boundary so @bot never strips @bot-2.
+        alternatives = "|".join(sorted(set(candidates), key=len, reverse=True))
+        pattern = rf"^@?(?:{alternatives})(?![\w.-])[\s:,]*"
+        stripped = re.sub(
+            pattern,
+            "",
+            text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
         return stripped.strip()
 
     async def _resolve_user_name(self, pubkey: str) -> str:
@@ -1372,6 +1919,9 @@ async def _standalone_send(
     fail with ``No live adapter for platform 'buzz'``.
     """
     extra = getattr(pconfig, "extra", {}) or {}
+    policy = BuzzAdapter(pconfig)
+    if policy._config_errors:
+        return {"error": f"Buzz standalone send: invalid configuration ({'; '.join(dict.fromkeys(policy._config_errors))})"}
     relay = (os.getenv("BUZZ_RELAY_URL") or extra.get("relay_url", "")).strip()
     private_key = _resolve_private_key(extra)
     cli_path = _resolve_cli_path(
@@ -1386,6 +1936,8 @@ async def _standalone_send(
         return {"error": "Buzz standalone send: no target channel (set BUZZ_HOME_CHANNEL)"}
 
     args = ["messages", "send", "--channel", target, "--content", "-"]
+    for pubkey in policy._explicit_mentions(message):
+        args += ["--mention", pubkey]
     if thread_id:
         args += ["--reply-to", str(thread_id)]
     for path in media_files or []:

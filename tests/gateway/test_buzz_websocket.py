@@ -119,3 +119,31 @@ async def test_websocket_auth_raises_on_rejection():
         await adapter._authenticate_websocket(RejectingWs())
 
 
+@pytest.mark.asyncio
+async def test_automatic_websocket_reconnect_clears_transient_agent_state(monkeypatch):
+    import websockets
+
+    adapter = _make_adapter({"max_agent_hops": 4})
+    adapter._active_agent_events[CHANNEL] = ("stale-before-reconnect", 4)
+
+    class FailingConnection:
+        async def __aenter__(self):
+            raise ConnectionError("transport interrupted")
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setattr(websockets, "connect", lambda *args, **kwargs: FailingConnection())
+
+    async def stop_after_reset(delay):
+        assert adapter._active_agent_events == {}
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", stop_after_reset)
+
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._websocket_loop()
+
+    assert adapter._active_agent_events == {}
+
+
