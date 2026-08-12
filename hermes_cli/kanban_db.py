@@ -3270,6 +3270,24 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                # A task parked in ``blocked`` at creation needs a real
+                # ``blocked`` event too, not just status='blocked' on the
+                # row — that event is the only signal _has_sticky_block()
+                # reads, so without it recompute_ready() would happily
+                # promote a deliberately-parked task back to ready. No
+                # run_id: nothing has run yet, this is creation rather
+                # than a transition out of a run.
+                if task_status == "blocked":
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": "created blocked (parked at creation)",
+                            "kind": None,
+                            "recurrences": 0,
+                        },
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             # Outside the write txn: add_notify_sub opens its own
             # BEGIN IMMEDIATE and write_txn is not reentrant.

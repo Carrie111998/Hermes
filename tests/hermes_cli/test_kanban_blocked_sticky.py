@@ -78,6 +78,39 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
 
 
 
+def test_created_blocked_task_is_sticky(kanban_home: Path) -> None:
+    """A task created with ``initial_status='blocked'`` is just as
+    deliberate a park as an explicit ``kanban_block`` and must be sticky.
+
+    It has no parents, so the parent-gate in ``recompute_ready`` passes
+    vacuously — the *only* thing standing between it and an auto-promote
+    is the sticky-block guard, and that guard reads ``task_events``, not
+    ``tasks.status``.  Before the fix, ``create_task`` wrote a ``created``
+    event but no ``blocked`` event, so ``_has_sticky_block`` returned
+    False and the very next tick promoted the task to ``ready``.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="parked at creation", initial_status="blocked",
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        # A real event row, not just a status column value.
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
+                (tid,),
+            ).fetchall()
+        ]
+        assert "blocked" in kinds, f"no blocked event recorded, got {kinds}"
+        assert kb._has_sticky_block(conn, tid)
+
+        for _ in range(5):
+            promoted = kb.recompute_ready(conn)
+            assert promoted == 0, "created-blocked task must not auto-promote"
+            assert kb.get_task(conn, tid).status == "blocked"
+
+
 # ---------------------------------------------------------------------------
 # Circuit-breaker blocks still auto-recover (preserve #40c1decb3 intent)
 # ---------------------------------------------------------------------------
