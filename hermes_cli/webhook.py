@@ -260,6 +260,9 @@ def _cmd_list(args):
     for name, route in subs.items():
         events = ", ".join(route.get("events", [])) or "(all)"
         deliver = route.get("deliver", "log")
+        invalid_delivery = not _is_known_delivery_target(deliver)
+        if invalid_delivery:
+            deliver = f"{deliver} (INVALID)"
         if route.get("deliver_only"):
             deliver = f"{deliver} (direct — no agent)"
         desc = route.get("description", "")
@@ -269,6 +272,11 @@ def _cmd_list(args):
         print(f"    URL:     {base_url}/webhooks/{name}")
         print(f"    Events:  {events}")
         print(f"    Deliver: {deliver}")
+        if invalid_delivery:
+            print(
+                f"    Fix:     hermes webhook subscribe {name} --deliver telegram "
+                "--deliver-chat-id <CHAT_ID>"
+            )
         if route.get("script"):
             print(f"    Script:  {route['script']}")
         print()

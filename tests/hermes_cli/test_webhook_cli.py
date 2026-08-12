@@ -116,6 +116,23 @@ class TestList:
         assert "a" in out
         assert "b" in out
 
+    def test_marks_persisted_unknown_delivery_target_invalid(self, capsys, monkeypatch):
+        monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+        _save_subscriptions({
+            "broken": {
+                "secret": "dynamic-secret",
+                "prompt": "test",
+                "deliver": "telegram/all",
+            }
+        })
+
+        webhook_command(_make_args(webhook_action="list"))
+
+        out = capsys.readouterr().out
+        assert "Deliver: telegram/all (INVALID)" in out
+        assert "--deliver telegram --deliver-chat-id <CHAT_ID>" in out
+        assert "broken" in _load_subscriptions()
+
 
 class TestRemove:
 

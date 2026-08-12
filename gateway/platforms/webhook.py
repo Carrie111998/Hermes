@@ -523,6 +523,17 @@ class WebhookAdapter(BasePlatformAdapter):
                         self._host,
                     )
                     continue
+                deliver = v.get("deliver", "log")
+                if not is_known_delivery_target(deliver):
+                    logger.warning(
+                        "[webhook] Dynamic route '%s' skipped: unknown delivery "
+                        "target '%s'. Update it with: hermes webhook subscribe %s "
+                        "--deliver telegram --deliver-chat-id <CHAT_ID>",
+                        k,
+                        deliver,
+                        k,
+                    )
+                    continue
                 new_dynamic[k] = v
             self._dynamic_routes = new_dynamic
             self._routes = {**self._dynamic_routes, **self._static_routes}
