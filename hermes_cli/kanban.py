@@ -19,6 +19,7 @@ import contextlib
 import json
 import os
 import shlex
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -220,6 +221,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     """
     kanban_parser = parent_subparsers.add_parser(
         "kanban",
+        allow_abbrev=False,
         help="Multi-profile collaboration board (tasks, links, comments)",
         description=(
             "Durable SQLite-backed task board shared across Hermes profiles. "
@@ -544,6 +546,153 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_diag.add_argument(
         "--json", action="store_true",
         help="Emit JSON (structured) instead of the default human table",
+    )
+
+    # --- exact-head reconciliation/outbox runner ---
+    p_review_runner = sub.add_parser(
+        "review-runner",
+        help=(
+            "Run the bounded script-only reconciliation/outbox boundary "
+            "(dry-run by default)"
+        ),
+    )
+    p_review_runner.add_argument(
+        "runner_action",
+        nargs="?",
+        choices=("run", "health", "staging"),
+        default="run",
+        help="Run one bounded pass, report health, or probe one explicit staging route",
+    )
+    p_review_runner.add_argument(
+        "--mode",
+        choices=("dry-run", "shadow", "live"),
+        default=None,
+        help="Override kanban.review_runner.mode for this invocation",
+    )
+    p_review_runner.add_argument("--timeout-seconds", type=int, default=None)
+    p_review_runner.add_argument("--lease-seconds", type=int, default=None)
+    p_review_runner.add_argument("--max-items", type=int, default=None)
+    p_review_runner.add_argument("--retry-ceiling", type=int, default=None)
+    p_review_runner.add_argument(
+        "--linear-issue-id",
+        action="append",
+        default=[],
+        help="Restrict reconciliation to one Linear issue ID (repeatable)",
+    )
+    p_review_runner.add_argument(
+        "--repository",
+        default=None,
+        help="Exact owner/name repository required by the read-only staging probe",
+    )
+    p_review_runner.add_argument(
+        "--pr-number",
+        type=int,
+        default=None,
+        help="Exact pull request number required by the read-only staging probe",
+    )
+    p_review_runner.add_argument(
+        "--expected-head-sha",
+        default=None,
+        help="Exact 40-character PR head SHA required by the staging probe",
+    )
+    p_review_runner.add_argument(
+        "--channel-id",
+        default=None,
+        help="Exact allowlisted Slack channel ID for the staging probe",
+    )
+    p_review_runner.add_argument(
+        "--thread-ts",
+        default=None,
+        help="Exact Slack thread timestamp for the staging probe",
+    )
+    p_review_runner.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Emit no stdout for disabled/lease-held/no-op runs",
+    )
+    p_review_runner.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit canonical JSON for script/cron consumption",
+    )
+
+    # --- read-only Linear OAuth MCP diagnostic ---
+    p_linear_mcp = sub.add_parser(
+        "linear-mcp",
+        help="Probe the fail-closed read-only Linear OAuth MCP adapter",
+    )
+    p_linear_mcp.add_argument(
+        "linear_mcp_action",
+        nargs="?",
+        choices=("health",),
+        default="health",
+        help="Report configured/connected/discovered/resource authorization gates",
+    )
+    p_linear_mcp.add_argument(
+        "--server",
+        default=None,
+        help="Override kanban.linear_mcp.mcp_server for this read-only probe",
+    )
+    p_linear_mcp.add_argument(
+        "--team",
+        default=None,
+        help="Require one exact team name or key during the authorization probe",
+    )
+    p_linear_mcp.add_argument(
+        "--issue-id",
+        default=None,
+        help="Read one exact Linear issue ID/identifier as the resource probe",
+    )
+    p_linear_mcp.add_argument("--timeout-seconds", type=int, default=None)
+    p_linear_mcp.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit canonical JSON instead of the human-readable health summary",
+    )
+
+    p_migration = sub.add_parser(
+        "review-migration",
+        help="plan/apply exact-head human-review migration (dry-run by default)",
+    )
+    p_migration.add_argument(
+        "migration_action",
+        nargs="?",
+        choices=("plan", "apply", "rollback", "status"),
+        default="plan",
+        help="operation to perform (default: plan, which is read-only)",
+    )
+    p_migration.add_argument(
+        "--linear-issue-id",
+        action="append",
+        default=None,
+        help="limit planning to a Linear issue ID (repeatable)",
+    )
+    p_migration.add_argument(
+        "--plan-id",
+        help="content-addressed plan ID required by apply/rollback",
+    )
+    p_migration.add_argument(
+        "--confirm",
+        help="exact plan-specific APPLY/ROLLBACK confirmation token",
+    )
+    p_migration.add_argument(
+        "--operator",
+        help="durable operator identity recorded with write checkpoints",
+    )
+    p_migration.add_argument(
+        "--max-actions",
+        type=int,
+        help="apply/rollback at most this many actions, then resume later",
+    )
+    p_migration.add_argument(
+        "--report",
+        type=Path,
+        help="write the deterministic dry-run Markdown report to this path",
+    )
+    p_migration.add_argument(
+        "--json",
+        action="store_true",
+        help="print deterministic JSON instead of Markdown/text",
     )
 
     # --- link / unlink ---
@@ -1079,6 +1228,13 @@ def kanban_command(args: argparse.Namespace) -> int:
         # without ever reaching the repair path.
         if action == "repair":
             return _cmd_repair(args)
+        # Dry-run planning clones the board into an in-memory database so it
+        # must run before normal auto-init can mutate an old schema.
+        if action == "review-migration":
+            return _cmd_review_migration(args)
+        # This remote read-only diagnostic must not create or migrate a board.
+        if action == "linear-mcp":
+            return _cmd_linear_mcp(args)
         try:
             kb.init_db()
         except Exception as exc:
@@ -1098,6 +1254,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
             "diag":     _cmd_diagnostics,
+            "review-runner": _cmd_review_runner,
             "link":     _cmd_link,
             "unlink":   _cmd_unlink,
             "claim":    _cmd_claim,
@@ -1167,6 +1324,8 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "assign",
     "reclaim",
     "reassign",
+    "review-runner",
+    "review-migration",
     "link",
     "unlink",
     "claim",
@@ -2044,6 +2203,413 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                     print(f"       → {a.label}")
         print()
     return 0
+
+
+def _cmd_review_runner(args: argparse.Namespace) -> int:
+    """Run or diagnose the provider-disabled script-only review boundary."""
+    from hermes_cli.config import load_config
+    from hermes_cli import kanban_review_runner as runner
+
+    runtime_config = load_config() or {}
+    kanban_config = runtime_config.get("kanban", {})
+    kanban_config = kanban_config if isinstance(kanban_config, dict) else {}
+    review_config = runner.ReviewRunnerConfig.from_mapping(
+        kanban_config.get("review_runner")
+    ).with_overrides(
+        mode=getattr(args, "mode", None),
+        timeout_seconds=getattr(args, "timeout_seconds", None),
+        lease_seconds=getattr(args, "lease_seconds", None),
+        max_items=getattr(args, "max_items", None),
+        retry_ceiling=getattr(args, "retry_ceiling", None),
+    )
+
+    if getattr(args, "runner_action", "run") == "staging":
+        repository = str(getattr(args, "repository", None) or "").strip()
+        pr_number = getattr(args, "pr_number", None)
+        expected_head_sha = str(
+            getattr(args, "expected_head_sha", None) or ""
+        ).strip()
+        required = {
+            "--repository": repository,
+            "--pr-number": pr_number,
+            "--expected-head-sha": expected_head_sha,
+        }
+        missing = [name for name, value in required.items() if value in {None, ""}]
+        if missing:
+            print(
+                "kanban review-runner staging: required arguments: "
+                + ", ".join(missing),
+                file=sys.stderr,
+            )
+            return 2
+        assert pr_number is not None
+        payload: dict[str, Any]
+        try:
+            payload = runner.probe_review_runner_resources(
+                config=review_config,
+                repository=repository,
+                pr_number=int(pr_number),
+                expected_head_sha=expected_head_sha,
+                channel_id=getattr(args, "channel_id", None),
+                thread_ts=getattr(args, "thread_ts", None),
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            failure = runner._redacted_adapter_setup_failure(exc)
+            payload = {
+                "schema_version": 1,
+                "status": "blocked",
+                "mode": "staging",
+                "script_only": True,
+                "external_provider_writes": False,
+                "local_writes": False,
+                "failure": failure,
+            }
+        if getattr(args, "json", False):
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        elif payload["status"] == "ready":
+            github_resource = payload["github"]
+            print(
+                "Review runner staging: ready; "
+                f"repository={github_resource['repository']}; "
+                f"pr={github_resource['pr_number']}; "
+                f"head={github_resource['head_sha']}; writes=False"
+            )
+        else:
+            failure = payload["failure"]
+            print(
+                "Review runner staging: blocked; "
+                f"{failure['type']} ({failure['kind']}); writes=False",
+                file=sys.stderr,
+            )
+        return 0 if payload["status"] == "ready" else 1
+
+    with kb.connect_closing() as conn:
+        if getattr(args, "runner_action", "run") == "health":
+            health_adapters = None
+            adapter_setup_failure = None
+            if review_config.github_provider_enabled or review_config.slack_provider_enabled:
+                try:
+                    health_adapters = runner._build_configured_mcp_adapters(
+                        review_config
+                    )
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception as exc:
+                    # Health diagnostics must not echo provider exception text:
+                    # MCP failures can contain credentials or remote payloads.
+                    adapter_setup_failure = runner._redacted_adapter_setup_failure(exc)
+            payload = runner.diagnose_review_runner(
+                conn,
+                config=review_config,
+                adapters=health_adapters,
+                adapter_setup_failure=adapter_setup_failure,
+            )
+            if getattr(args, "json", False):
+                print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            else:
+                readiness = payload["readiness"]
+                providers = payload["providers"]
+                outbox = payload["outbox"]
+                gateway = payload["gateway"]
+                print(
+                    "Review runner health: "
+                    f"dry-run={'ready' if readiness['dry_run_ready'] else 'blocked'}, "
+                    f"shadow={'ready' if readiness['shadow_ready'] else 'disabled'}, "
+                    f"live={'ready' if readiness['live_ready'] else 'disabled'}, "
+                    f"human_review={'ready' if readiness['human_review_ready'] else 'blocked'}"
+                )
+                print(
+                    "Providers: "
+                    f"github enabled={providers['github']['enabled']} "
+                    f"read_registered={providers['github']['read_registered']} "
+                    f"write_registered={providers['github']['write_registered']}; "
+                    f"slack enabled={providers['slack']['enabled']} "
+                    f"read_registered={providers['slack']['read_registered']} "
+                    f"write_registered={providers['slack']['write_registered']}"
+                )
+                print(
+                    "Outbox: "
+                    f"github_due={outbox['github_due']} "
+                    f"slack_due={outbox['slack_due']} "
+                    f"retry_exhausted="
+                    f"{outbox['github_retry_exhausted'] + outbox['slack_retry_exhausted']}"
+                )
+                print(
+                    "Gateway config reload: "
+                    f"requires_gateway_restart={gateway['requires_gateway_restart']}; "
+                    "code deployment restart command: "
+                    f"{gateway['external_operator_restart_command']}"
+                )
+                if payload["readiness"]["blockers"]:
+                    print(
+                        "Blockers: "
+                        + ", ".join(payload["readiness"]["blockers"])
+                    )
+            return 0 if not payload["readiness"]["blockers"] else 1
+
+        receipt = runner.run_review_runner(
+            conn,
+            config=review_config,
+            linear_issue_ids=(
+                getattr(args, "linear_issue_id", None) or None
+            ),
+        )
+
+    if getattr(args, "quiet", False) and receipt.quiet_noop:
+        return 0
+    if getattr(args, "json", False):
+        print(receipt.to_json())
+    else:
+        payload = receipt.to_dict()
+        print(
+            f"Review runner {receipt.mode}: {receipt.status}; "
+            f"read_only={receipt.read_only}; "
+            f"findings={receipt.finding_count}; "
+            f"candidates={len(receipt.candidates)}; "
+            f"processed={len(receipt.results)}; "
+            f"skipped={len(receipt.skipped)}"
+        )
+        if payload["errors"]:
+            for error in payload["errors"]:
+                print(f"  error: {error}", file=sys.stderr)
+    return 1 if receipt.status in {"failed", "timed_out"} else 0
+
+
+def _cmd_linear_mcp(args: argparse.Namespace) -> int:
+    """Probe the typed Linear MCP boundary without Kanban or remote writes."""
+    from hermes_cli.config import load_config
+    from hermes_cli import kanban_linear_mcp as linear_mcp
+
+    runtime_config = load_config() or {}
+    kanban_config = runtime_config.get("kanban")
+    kanban_config = kanban_config if isinstance(kanban_config, dict) else {}
+    raw_config = kanban_config.get("linear_mcp")
+    raw_config = dict(raw_config) if isinstance(raw_config, dict) else {}
+    if getattr(args, "server", None) is not None:
+        raw_config["mcp_server"] = args.server
+    if getattr(args, "timeout_seconds", None) is not None:
+        raw_config["provider_timeout_seconds"] = args.timeout_seconds
+    mcp_servers = runtime_config.get("mcp_servers")
+    configured_servers = mcp_servers if isinstance(mcp_servers, dict) else {}
+    payload: dict[str, Any]
+    try:
+        config = linear_mcp.LinearMCPConfig.from_mapping(raw_config)
+        payload = linear_mcp.diagnose_linear_mcp(
+            config=config,
+            mcp_servers=configured_servers,
+            team_query=getattr(args, "team", None),
+            issue_id=getattr(args, "issue_id", None),
+        )
+    except linear_mcp.LinearMCPReadError as exc:
+        server_name = str(raw_config.get("mcp_server") or "linear").strip()
+        server = configured_servers.get(server_name)
+        oauth_configured = (
+            isinstance(server, dict)
+            and str(server.get("auth") or "").strip().casefold() == "oauth"
+        )
+        payload = {
+            "schema_version": 1,
+            "status": "blocked",
+            "server_name": server_name,
+            "read_only": True,
+            "allowed_read_tools": sorted(linear_mcp.LINEAR_MCP_READ_TOOLS),
+            "registered_read_tool_count": 0,
+            "stages": {
+                "configured": isinstance(server, dict),
+                "connected": False,
+                "discovered": False,
+                "resource_authorized": False,
+                "write_enabled": False,
+            },
+            "oauth_configured": oauth_configured,
+            "webhooks_implemented": False,
+            "oauth_event_delivery": False,
+            "external_side_effects": "none",
+            "requires_gateway_restart": False,
+            "resource": None,
+            "failure": {
+                "kind": exc.kind,
+                "message": str(exc),
+                "retryable": exc.retryable,
+                "attempts": exc.attempts,
+                "stage": exc.stage,
+            },
+        }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        stages = payload["stages"]
+        print(
+            "Linear MCP health: "
+            f"configured={stages['configured']} "
+            f"connected={stages['connected']} "
+            f"discovered={stages['discovered']} "
+            f"resource_authorized={stages['resource_authorized']} "
+            f"write_enabled={stages['write_enabled']}"
+        )
+        print(
+            "Boundary: read_only=True webhooks_implemented=False "
+            "oauth_event_delivery=False"
+        )
+        resource = payload.get("resource")
+        if resource:
+            print(
+                "Resource: "
+                f"team={resource.get('team_id') or resource.get('team_name')} "
+                f"issue={resource.get('issue_id') or 'not-probed'}"
+            )
+        failure = payload.get("failure")
+        if failure:
+            print(
+                f"Failure: {failure['kind']}: {failure['message']}",
+                file=sys.stderr,
+            )
+    return 0 if payload["status"] == "ready" else 1
+
+
+def _cmd_review_migration(args: argparse.Namespace) -> int:
+    """Plan by default; require exact plan confirmation before local writes."""
+    from hermes_cli import kanban_review_migration as migration
+    from hermes_cli.config import load_config
+
+    action = getattr(args, "migration_action", "plan")
+    db_path = kb.kanban_db_path()
+    try:
+        registered_provider = migration.migration_snapshot_provider()
+        if registered_provider is None and action in {"plan", "apply"}:
+            runtime_config = load_config() or {}
+            kanban_config = runtime_config.get("kanban", {})
+            kanban_config = (
+                kanban_config if isinstance(kanban_config, dict) else {}
+            )
+            registered_provider = migration.build_configured_snapshot_provider(
+                kanban_config.get("review_runner")
+            )
+        provider = registered_provider or migration.UnavailableSnapshotProvider()
+        if action == "plan":
+            with migration.open_read_only_snapshot(db_path) as conn:
+                inputs = migration.collect_migration_inputs(
+                    conn,
+                    snapshot_provider=provider,
+                    linear_issue_ids=getattr(args, "linear_issue_id", None),
+                )
+                plan = migration.build_migration_plan(inputs)
+            report_path = getattr(args, "report", None)
+            if report_path is not None:
+                written = migration.write_plan_report(plan, report_path)
+                print(f"Dry-run report: {written}", file=sys.stderr)
+            if getattr(args, "json", False):
+                print(plan.to_json())
+            else:
+                print(plan.to_markdown(), end="")
+            return 0
+
+        if action == "status":
+            with migration.open_read_only_snapshot(db_path) as conn:
+                rows = migration.migration_status(
+                    conn,
+                    plan_id=getattr(args, "plan_id", None),
+                )
+            if getattr(args, "json", False):
+                print(json.dumps(rows, ensure_ascii=False, sort_keys=True))
+            elif not rows:
+                print("No persisted review migration plans.")
+            else:
+                for row in rows:
+                    print(
+                        f"{row['id']}  {row['status']}  "
+                        f"actions={row['action_count']}  "
+                        f"checkpoints={row['checkpoint_count']}"
+                    )
+            return 0
+
+        plan_id = str(getattr(args, "plan_id", None) or "").strip()
+        confirmation = str(getattr(args, "confirm", None) or "")
+        operator = str(getattr(args, "operator", None) or "").strip()
+        if not plan_id:
+            print(
+                f"kanban review-migration {action}: --plan-id is required",
+                file=sys.stderr,
+            )
+            return 2
+        if not operator:
+            print(
+                f"kanban review-migration {action}: --operator is required",
+                file=sys.stderr,
+            )
+            return 2
+        expected_confirmation = f"{action.upper()} {plan_id}"
+        if confirmation != expected_confirmation:
+            print(
+                f"kanban review-migration {action}: --confirm must equal "
+                f"{expected_confirmation!r}",
+                file=sys.stderr,
+            )
+            return 2
+
+        kb.init_db(db_path)
+        with kb.connect_closing(db_path=db_path) as conn:
+            plan = migration.load_migration_plan(conn, plan_id)
+            if action == "apply":
+                if registered_provider is None:
+                    print(
+                        "kanban review-migration apply: no authoritative read-only "
+                        "snapshot provider is registered; refusing write mode",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if plan is None:
+                    inputs = migration.collect_migration_inputs(
+                        conn,
+                        snapshot_provider=provider,
+                        linear_issue_ids=getattr(args, "linear_issue_id", None),
+                    )
+                    plan = migration.build_migration_plan(inputs)
+                    if plan.plan_id != plan_id:
+                        raise migration.MigrationConflict(
+                            "fresh exact-head plan ID differs from --plan-id; "
+                            "run a new dry-run"
+                        )
+                receipt = migration.apply_migration_plan(
+                    conn,
+                    plan,
+                    snapshot_provider=provider,
+                    confirmation=confirmation,
+                    operator=operator,
+                    max_actions=getattr(args, "max_actions", None),
+                )
+            else:
+                if plan is None:
+                    raise migration.MigrationBoundaryError(
+                        f"persisted migration plan {plan_id!r} does not exist"
+                    )
+                receipt = migration.rollback_migration_plan(
+                    conn,
+                    plan,
+                    confirmation=confirmation,
+                    operator=operator,
+                    max_actions=getattr(args, "max_actions", None),
+                )
+        payload = receipt.to_dict()
+        if getattr(args, "json", False):
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        else:
+            print(
+                f"Review migration {action}: {payload['status']}; "
+                f"plan={payload['plan_id']}; "
+                f"checkpoints={payload['checkpoint_count']}; "
+                "external_side_effects=none"
+            )
+        return 0
+    except (
+        migration.MigrationBoundaryError,
+        sqlite3.Error,
+        OSError,
+    ) as exc:
+        print(f"kanban review-migration {action}: {exc}", file=sys.stderr)
+        return 1
 
 
 def _cmd_link(args: argparse.Namespace) -> int:

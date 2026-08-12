@@ -99,7 +99,10 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {
+    "triage", "todo", "scheduled", "ready", "running", "blocked",
+    "review", "awaiting_human", "done", "archived",
+}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -1364,6 +1367,427 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Typed, exact-head human-review gate. The linked task is intentionally kept
+-- separate from generic ``review`` because review tasks are dispatchable to an
+-- agent while a human gate must never be claimed by the dispatcher.
+CREATE TABLE IF NOT EXISTS human_review_gates (
+    id                              TEXT PRIMARY KEY,
+    task_id                         TEXT NOT NULL UNIQUE,
+    schema_version                  INTEGER NOT NULL,
+    gate_kind                       TEXT NOT NULL,
+    reviewer_principal              TEXT NOT NULL,
+    notification_principal          TEXT,
+    repo                            TEXT NOT NULL,
+    pr_number                       INTEGER NOT NULL,
+    pr_url                          TEXT NOT NULL,
+    linear_issue_id                 TEXT,
+    base_branch                     TEXT NOT NULL,
+    head_branch                     TEXT NOT NULL,
+    approved_head_sha               TEXT NOT NULL,
+    implementation_task_id          TEXT NOT NULL,
+    qa_task_id                      TEXT NOT NULL,
+    qa_run_id                       INTEGER NOT NULL,
+    qa_worker_session_id            TEXT,
+    qa_verdict                      TEXT NOT NULL,
+    qa_attempt_count                INTEGER NOT NULL,
+    coder_correction_attempt_count  INTEGER NOT NULL,
+    qa_approved_at                  INTEGER NOT NULL,
+    approval_packet_json            TEXT NOT NULL,
+    approval_packet_sha256          TEXT NOT NULL,
+    state                           TEXT NOT NULL,
+    superseded_by_gate_id           TEXT,
+    created_at                      INTEGER NOT NULL,
+    updated_at                      INTEGER NOT NULL
+);
+
+-- One independently retryable row per external destination. This table holds
+-- no credentials and grants no merge or branch-write capability.
+CREATE TABLE IF NOT EXISTS review_gate_deliveries (
+    gate_id          TEXT NOT NULL,
+    channel          TEXT NOT NULL,
+    destination      TEXT NOT NULL,
+    state            TEXT NOT NULL,
+    attempt_count    INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at  INTEGER,
+    external_id      TEXT,
+    dedupe_marker    TEXT NOT NULL,
+    last_error       TEXT,
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL
+);
+
+-- Linear is an intent/readback source, not the workflow authority.  These
+-- rows live in the Kanban DB so one stable issue coordinator can fan out to
+-- many repository/PR aggregates without creating a card for every webhook.
+CREATE TABLE IF NOT EXISTS linear_issue_coordinators (
+    linear_issue_id     TEXT PRIMARY KEY,
+    linear_identifier   TEXT NOT NULL UNIQUE,
+    title               TEXT NOT NULL,
+    issue_url           TEXT NOT NULL,
+    source_revision     INTEGER NOT NULL,
+    snapshot_sha256     TEXT NOT NULL,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL
+);
+
+-- Signed, normalized Linear wakeups land here before any provider readback or
+-- workflow transition.  Provider event IDs suppress literal retries, while
+-- source_key + source_revision suppress semantically identical replays that
+-- arrive under a different delivery ID.
+CREATE TABLE IF NOT EXISTS linear_event_inbox (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider            TEXT NOT NULL,
+    event_id            TEXT NOT NULL,
+    event_kind          TEXT NOT NULL,
+    linear_issue_id     TEXT NOT NULL,
+    source_key          TEXT NOT NULL,
+    source_revision     INTEGER NOT NULL,
+    payload_sha256      TEXT NOT NULL,
+    status              TEXT NOT NULL,
+    read_attempt_count  INTEGER NOT NULL DEFAULT 0,
+    last_error          TEXT,
+    received_at         INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL,
+    processed_at        INTEGER
+);
+
+-- Issue-to-PR links are historical one-to-many associations observed through
+-- Linear.  They deliberately contain no PR state or head; those facts only
+-- enter through the trusted read-only PR snapshot provider below.
+CREATE TABLE IF NOT EXISTS linear_issue_pr_links (
+    linear_issue_id       TEXT NOT NULL,
+    repository            TEXT NOT NULL,
+    pr_number              INTEGER NOT NULL,
+    first_seen_revision    INTEGER NOT NULL,
+    last_seen_revision     INTEGER NOT NULL,
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL,
+    PRIMARY KEY (linear_issue_id, repository, pr_number)
+);
+
+-- Current PR aggregate state is provider readback only.  Repository names are
+-- stored in canonical case-folded form by hermes_cli.kanban_linear.
+CREATE TABLE IF NOT EXISTS linear_pr_aggregates (
+    repository            TEXT NOT NULL,
+    pr_number              INTEGER NOT NULL,
+    pr_url                 TEXT NOT NULL,
+    state                  TEXT NOT NULL,
+    is_draft               INTEGER NOT NULL,
+    base_branch            TEXT NOT NULL,
+    head_branch            TEXT NOT NULL,
+    current_head_sha       TEXT NOT NULL,
+    provider_revision      INTEGER NOT NULL,
+    snapshot_sha256        TEXT NOT NULL,
+    observed_at            INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL,
+    PRIMARY KEY (repository, pr_number)
+);
+
+-- Immutable PR head generations preserve exact-head identity independently
+-- from the mutable aggregate pointer.
+CREATE TABLE IF NOT EXISTS linear_pr_head_generations (
+    repository          TEXT NOT NULL,
+    pr_number            INTEGER NOT NULL,
+    head_sha             TEXT NOT NULL,
+    first_observed_at    INTEGER NOT NULL,
+    provider_revision    INTEGER NOT NULL,
+    state_at_observation TEXT NOT NULL,
+    PRIMARY KEY (repository, pr_number, head_sha)
+);
+
+-- CodeRabbit is a read-only, asynchronous evidence producer.  The trusted
+-- current-head pointer is kept separate from immutable review observations so
+-- a head change can invalidate old evidence without deleting its audit trail.
+CREATE TABLE IF NOT EXISTS coderabbit_pr_heads (
+    repository          TEXT NOT NULL,
+    pr_number            INTEGER NOT NULL,
+    current_head_sha     TEXT NOT NULL,
+    observed_at          INTEGER NOT NULL,
+    updated_at           INTEGER NOT NULL,
+    PRIMARY KEY (repository, pr_number)
+);
+
+CREATE TABLE IF NOT EXISTS coderabbit_review_observations (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider             TEXT NOT NULL,
+    observation_id       TEXT NOT NULL,
+    repository           TEXT NOT NULL,
+    pr_number             INTEGER NOT NULL,
+    head_sha              TEXT NOT NULL,
+    review_generation     INTEGER NOT NULL,
+    observed_at           INTEGER NOT NULL,
+    check_status          TEXT NOT NULL,
+    snapshot_json         TEXT NOT NULL,
+    snapshot_sha256       TEXT NOT NULL,
+    payload_sha256        TEXT NOT NULL,
+    assessment_state      TEXT NOT NULL,
+    assessment_reason     TEXT NOT NULL,
+    received_at           INTEGER NOT NULL
+);
+
+-- Exactly one current aggregate per PR/head.  Finding IDs are grouped by
+-- thread, so downstream correction orchestration gets one stable work key per
+-- PR/head rather than one Kanban card per CodeRabbit comment.
+CREATE TABLE IF NOT EXISTS coderabbit_head_assessments (
+    repository                    TEXT NOT NULL,
+    pr_number                      INTEGER NOT NULL,
+    head_sha                       TEXT NOT NULL,
+    review_generation              INTEGER NOT NULL,
+    observed_at                    INTEGER NOT NULL,
+    state                          TEXT NOT NULL,
+    reason                         TEXT NOT NULL,
+    actionable_count               INTEGER NOT NULL,
+    unresolved_count               INTEGER NOT NULL,
+    resolved_count                 INTEGER NOT NULL,
+    outdated_count                 INTEGER NOT NULL,
+    superseded_count               INTEGER NOT NULL,
+    non_blocking_count             INTEGER NOT NULL,
+    actionable_finding_ids_json    TEXT NOT NULL,
+    snapshot_sha256                TEXT NOT NULL,
+    correction_work_key            TEXT NOT NULL,
+    loop_prevention_key            TEXT NOT NULL,
+    correction_attempt_count       INTEGER NOT NULL DEFAULT 0,
+    max_correction_attempts        INTEGER NOT NULL DEFAULT 1,
+    created_at                     INTEGER NOT NULL,
+    updated_at                     INTEGER NOT NULL,
+    PRIMARY KEY (repository, pr_number, head_sha)
+);
+
+-- Reservations are metadata-only loop guards.  This phase never creates a
+-- correction task/card and never performs an external write.
+CREATE TABLE IF NOT EXISTS coderabbit_correction_attempts (
+    repository             TEXT NOT NULL,
+    pr_number               INTEGER NOT NULL,
+    head_sha                TEXT NOT NULL,
+    review_generation       INTEGER NOT NULL,
+    correction_work_key     TEXT NOT NULL,
+    loop_prevention_key     TEXT NOT NULL,
+    attempt_number          INTEGER NOT NULL,
+    created_at              INTEGER NOT NULL,
+    PRIMARY KEY (repository, pr_number, head_sha, loop_prevention_key)
+);
+
+-- GitHub remains the authoritative readback for PR identity, state, checks,
+-- reviews, threads, and requested reviewers.  This outbox stores restricted
+-- human-review intents only; it contains no credentials and exposes no merge,
+-- branch-write, push, approval, or auto-merge operation.
+CREATE TABLE IF NOT EXISTS github_human_review_outbox (
+    id                         TEXT PRIMARY KEY,
+    gate_id                    TEXT NOT NULL,
+    repository                 TEXT NOT NULL,
+    pr_number                  INTEGER NOT NULL,
+    head_sha                   TEXT NOT NULL,
+    surface                    TEXT NOT NULL,
+    operation                  TEXT NOT NULL,
+    payload_json               TEXT NOT NULL,
+    payload_sha256             TEXT NOT NULL,
+    idempotency_key            TEXT NOT NULL,
+    state                      TEXT NOT NULL,
+    attempt_count              INTEGER NOT NULL DEFAULT 0,
+    max_attempts               INTEGER NOT NULL DEFAULT 3,
+    next_attempt_at            INTEGER,
+    external_id                TEXT,
+    last_snapshot_sha256       TEXT,
+    last_snapshot_observed_at  INTEGER,
+    last_failure_kind          TEXT,
+    last_error                 TEXT,
+    created_at                 INTEGER NOT NULL,
+    updated_at                 INTEGER NOT NULL,
+    sent_at                    INTEGER
+);
+
+-- Append-only delivery outcomes make retries and timeout-after-send recovery
+-- auditable without replaying an already accepted provider operation.
+CREATE TABLE IF NOT EXISTS github_human_review_attempts (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    intent_id         TEXT NOT NULL,
+    attempt_number    INTEGER NOT NULL,
+    outcome           TEXT NOT NULL,
+    retryable         INTEGER NOT NULL,
+    snapshot_sha256   TEXT,
+    external_id       TEXT,
+    failure_kind      TEXT,
+    error             TEXT,
+    attempted_at      INTEGER NOT NULL
+);
+
+-- Slack is a notification and acknowledgement surface only. Routing identity
+-- is explicit and immutable: no channel, thread, mention, or acknowledgement
+-- is inferred from ambient gateway state. The outbox contains no credentials
+-- and exposes no GitHub approval, merge, branch-write, or channel-management
+-- capability.
+CREATE TABLE IF NOT EXISTS slack_human_review_outbox (
+    id                         TEXT PRIMARY KEY,
+    gate_id                    TEXT NOT NULL,
+    source_intent_id           TEXT,
+    repository                 TEXT NOT NULL,
+    pr_number                  INTEGER NOT NULL,
+    head_sha                   TEXT NOT NULL,
+    channel_id                 TEXT NOT NULL,
+    thread_ts                  TEXT NOT NULL DEFAULT '',
+    surface                    TEXT NOT NULL,
+    operation                  TEXT NOT NULL,
+    payload_json               TEXT NOT NULL,
+    payload_sha256             TEXT NOT NULL,
+    idempotency_key            TEXT NOT NULL,
+    state                      TEXT NOT NULL,
+    attempt_count              INTEGER NOT NULL DEFAULT 0,
+    max_attempts               INTEGER NOT NULL DEFAULT 3,
+    next_attempt_at            INTEGER,
+    external_message_ts        TEXT,
+    delivered_thread_ts        TEXT,
+    last_snapshot_sha256       TEXT,
+    last_snapshot_observed_at  INTEGER,
+    last_failure_kind          TEXT,
+    last_error                 TEXT,
+    created_at                 INTEGER NOT NULL,
+    updated_at                 INTEGER NOT NULL,
+    sent_at                    INTEGER
+);
+
+-- Append-only delivery outcomes preserve timeout-after-send/readback evidence
+-- and make each independently retryable Slack destination auditable.
+CREATE TABLE IF NOT EXISTS slack_human_review_attempts (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    intent_id         TEXT NOT NULL,
+    attempt_number    INTEGER NOT NULL,
+    outcome           TEXT NOT NULL,
+    retryable         INTEGER NOT NULL,
+    snapshot_sha256   TEXT,
+    external_message_ts TEXT,
+    failure_kind      TEXT,
+    error             TEXT,
+    attempted_at      INTEGER NOT NULL
+);
+
+-- Inbound Slack reactions/text/buttons are normalized to acknowledgement-only
+-- evidence tied to the stored notification route and exact PR head. Raw text is
+-- not persisted, and these receipts never mutate GitHub review authority.
+CREATE TABLE IF NOT EXISTS slack_human_review_acknowledgements (
+    id                    TEXT PRIMARY KEY,
+    source_intent_id      TEXT NOT NULL,
+    provider              TEXT NOT NULL,
+    event_id              TEXT NOT NULL,
+    gate_id               TEXT NOT NULL,
+    repository            TEXT NOT NULL,
+    pr_number             INTEGER NOT NULL,
+    head_sha              TEXT NOT NULL,
+    channel_id            TEXT NOT NULL,
+    thread_ts             TEXT NOT NULL,
+    message_ts            TEXT NOT NULL,
+    user_id               TEXT NOT NULL,
+    source                TEXT NOT NULL,
+    normalized_action     TEXT NOT NULL,
+    payload_sha256        TEXT NOT NULL,
+    observed_at           INTEGER NOT NULL,
+    recorded_at           INTEGER NOT NULL
+);
+
+-- Cross-system reconciliation is an audit/recommendation boundary only. A
+-- run stores deterministic machine and human reports, but never mutates the
+-- Linear, GitHub, CodeRabbit, human-gate, or Slack source rows it inspected.
+CREATE TABLE IF NOT EXISTS reconciliation_runs (
+    id                       TEXT PRIMARY KEY,
+    schema_version           INTEGER NOT NULL,
+    policy_version           TEXT NOT NULL,
+    input_sha256             TEXT NOT NULL,
+    status                   TEXT NOT NULL,
+    finding_count            INTEGER NOT NULL,
+    report_json              TEXT NOT NULL,
+    report_sha256            TEXT NOT NULL,
+    report_markdown          TEXT NOT NULL,
+    markdown_sha256          TEXT NOT NULL,
+    created_at               INTEGER NOT NULL
+);
+
+-- Findings are copied out of the immutable report for indexed querying. The
+-- stable finding key is scoped to one idempotent run and contains no action
+-- capability; later migration/delivery phases must re-read source truth.
+CREATE TABLE IF NOT EXISTS reconciliation_findings (
+    run_id                    TEXT NOT NULL,
+    finding_key               TEXT NOT NULL,
+    category                  TEXT NOT NULL,
+    severity                  TEXT NOT NULL,
+    source                    TEXT NOT NULL,
+    linear_issue_id           TEXT,
+    repository                TEXT,
+    pr_number                 INTEGER,
+    expected_head_sha         TEXT,
+    observed_head_sha         TEXT,
+    finding_json              TEXT NOT NULL,
+    PRIMARY KEY (run_id, finding_key)
+);
+
+-- Dry-run-first exact-head human-review migration plans. Plans and actions
+-- are content-addressed; checkpoints are append-only local audit evidence.
+CREATE TABLE IF NOT EXISTS review_migration_plans (
+    id                            TEXT PRIMARY KEY,
+    idempotency_key               TEXT NOT NULL UNIQUE,
+    schema_version                INTEGER NOT NULL,
+    policy_version                TEXT NOT NULL,
+    reconciliation_input_sha256   TEXT NOT NULL,
+    reconciliation_report_sha256  TEXT NOT NULL,
+    plan_json                     TEXT NOT NULL,
+    plan_sha256                   TEXT NOT NULL,
+    status                        TEXT NOT NULL DEFAULT 'prepared'
+        CHECK(status IN ('prepared','in_progress','completed','rolled_back','rollback_blocked')),
+    action_count                  INTEGER NOT NULL DEFAULT 0,
+    checkpoint_count              INTEGER NOT NULL DEFAULT 0,
+    created_at                    INTEGER NOT NULL,
+    updated_at                    INTEGER NOT NULL,
+    completed_at                  INTEGER,
+    rollback_completed_at         INTEGER,
+    last_error                    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS review_migration_actions (
+    plan_id             TEXT NOT NULL REFERENCES review_migration_plans(id) ON DELETE CASCADE,
+    ordinal             INTEGER NOT NULL,
+    action_id           TEXT NOT NULL,
+    idempotency_key     TEXT NOT NULL UNIQUE,
+    action_kind         TEXT NOT NULL,
+    target_type         TEXT NOT NULL,
+    target_ids_json     TEXT NOT NULL,
+    repository          TEXT NOT NULL,
+    pr_number           INTEGER NOT NULL,
+    head_sha            TEXT NOT NULL,
+    action_json         TEXT NOT NULL,
+    action_sha256       TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','applied','rolled_back')),
+    applied_at          INTEGER,
+    rolled_back_at      INTEGER,
+    PRIMARY KEY(plan_id, action_id),
+    UNIQUE(plan_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS review_migration_checkpoints (
+    plan_id         TEXT NOT NULL REFERENCES review_migration_plans(id) ON DELETE CASCADE,
+    action_id       TEXT NOT NULL,
+    sequence        INTEGER NOT NULL,
+    phase           TEXT NOT NULL CHECK(phase IN ('apply','rollback')),
+    status          TEXT NOT NULL CHECK(status IN ('applied','rolled_back')),
+    operator        TEXT NOT NULL,
+    before_json     TEXT NOT NULL,
+    after_json      TEXT NOT NULL,
+    rollback_json   TEXT NOT NULL,
+    recorded_at     INTEGER NOT NULL,
+    PRIMARY KEY(plan_id, sequence),
+    UNIQUE(plan_id, action_id, phase)
+);
+
+-- One board-local scheduler/gateway lease prevents overlapping shadow/live
+-- reconciliation/outbox passes. Dry-run never touches this table. A crashed
+-- owner can be replaced only after expires_at, while per-intent outbox CAS and
+-- idempotency remain the final double-delivery backstop.
+CREATE TABLE IF NOT EXISTS review_boundary_runner_leases (
+    lease_key                 TEXT PRIMARY KEY,
+    owner_id                  TEXT NOT NULL,
+    acquired_at               INTEGER NOT NULL,
+    heartbeat_at              INTEGER NOT NULL,
+    expires_at                INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1374,6 +1798,77 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_human_review_gate_exact_head
+    ON human_review_gates(repo, pr_number, gate_kind, approved_head_sha);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_human_review_gate_active_pr
+    ON human_review_gates(repo, pr_number, gate_kind)
+    WHERE state IN ('pending_delivery', 'awaiting_human', 'seen', 'delivery_failed');
+CREATE UNIQUE INDEX IF NOT EXISTS uq_review_gate_delivery_channel
+    ON review_gate_deliveries(gate_id, channel);
+CREATE INDEX IF NOT EXISTS idx_review_gate_delivery_due
+    ON review_gate_deliveries(state, next_attempt_at, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_linear_event_provider_id
+    ON linear_event_inbox(provider, event_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_linear_event_source_revision
+    ON linear_event_inbox(provider, source_key, source_revision);
+CREATE INDEX IF NOT EXISTS idx_linear_event_status
+    ON linear_event_inbox(status, received_at, id);
+CREATE INDEX IF NOT EXISTS idx_linear_issue_pr
+    ON linear_issue_pr_links(repository, pr_number, linear_issue_id);
+CREATE INDEX IF NOT EXISTS idx_linear_pr_state
+    ON linear_pr_aggregates(state, repository, pr_number);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_coderabbit_observation_provider_id
+    ON coderabbit_review_observations(provider, observation_id);
+CREATE INDEX IF NOT EXISTS idx_coderabbit_observation_pr_head
+    ON coderabbit_review_observations(
+        repository, pr_number, head_sha, review_generation, observed_at
+    );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_coderabbit_correction_work
+    ON coderabbit_head_assessments(correction_work_key);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_coderabbit_correction_attempt_number
+    ON coderabbit_correction_attempts(
+        repository, pr_number, head_sha, attempt_number
+    );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_github_outbox_semantic_identity
+    ON github_human_review_outbox(
+        repository, pr_number, head_sha, surface, operation
+    );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_github_outbox_idempotency_key
+    ON github_human_review_outbox(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_github_outbox_due
+    ON github_human_review_outbox(state, next_attempt_at, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_github_attempt_number
+    ON github_human_review_attempts(intent_id, attempt_number);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_slack_outbox_semantic_identity
+    ON slack_human_review_outbox(
+        channel_id, thread_ts, repository, pr_number, head_sha, surface, operation
+    );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_slack_outbox_idempotency_key
+    ON slack_human_review_outbox(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_slack_outbox_due
+    ON slack_human_review_outbox(state, next_attempt_at, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_slack_attempt_number
+    ON slack_human_review_attempts(intent_id, attempt_number);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_slack_ack_provider_event
+    ON slack_human_review_acknowledgements(provider, event_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_slack_ack_semantic_replay
+    ON slack_human_review_acknowledgements(source_intent_id, payload_sha256);
+CREATE INDEX IF NOT EXISTS idx_slack_ack_thread
+    ON slack_human_review_acknowledgements(channel_id, thread_ts, observed_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_reconciliation_run_input
+    ON reconciliation_runs(policy_version, input_sha256);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_run_status
+    ON reconciliation_runs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_finding_category
+    ON reconciliation_findings(category, severity, repository, pr_number);
+CREATE INDEX IF NOT EXISTS idx_review_migration_plans_status
+    ON review_migration_plans(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_review_migration_actions_status
+    ON review_migration_actions(plan_id, status, ordinal);
+CREATE INDEX IF NOT EXISTS idx_review_migration_checkpoints_action
+    ON review_migration_checkpoints(plan_id, action_id, phase);
+CREATE INDEX IF NOT EXISTS idx_review_boundary_runner_lease_expiry
+    ON review_boundary_runner_leases(expires_at);
 """
 
 
@@ -3455,6 +3950,10 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         ).fetchone()
         if not row:
             return False
+        if row["status"] == "awaiting_human":
+            raise RuntimeError(
+                f"cannot reassign {task_id}: awaiting-human gates are system-owned"
+            )
         if row["claim_lock"] is not None and row["status"] == "running":
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
@@ -3507,8 +4006,10 @@ def set_model_override(
         ).fetchone()
         if not row:
             return False
-        if row["status"] == "archived":
-            raise RuntimeError(f"cannot set model override on archived task {task_id}")
+        if row["status"] in {"archived", "awaiting_human"}:
+            raise RuntimeError(
+                f"cannot set model override on {row['status']} task {task_id}"
+            )
         conn.execute(
             "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?",
             (model, provider, task_id),
@@ -3544,9 +4045,9 @@ def set_reasoning_effort(
         ).fetchone()
         if not row:
             return False
-        if row["status"] == "archived":
+        if row["status"] in {"archived", "awaiting_human"}:
             raise RuntimeError(
-                f"cannot set reasoning effort on archived task {task_id}"
+                f"cannot set reasoning effort on {row['status']} task {task_id}"
             )
         conn.execute(
             "UPDATE tasks SET reasoning_effort = ? WHERE id = ?",
@@ -7151,7 +7652,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status != 'archived'",
+            "WHERE id = ? AND status NOT IN ('archived', 'awaiting_human')",
             (task_id,),
         )
         if cur.rowcount != 1:
@@ -7186,6 +7687,11 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
+        if conn.execute(
+            "SELECT 1 FROM human_review_gates WHERE task_id = ?",
+            (task_id,),
+        ).fetchone():
+            return False
         conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
@@ -7209,6 +7715,11 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
+        if conn.execute(
+            "SELECT 1 FROM human_review_gates WHERE task_id = ?",
+            (task_id,),
+        ).fetchone():
+            return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False

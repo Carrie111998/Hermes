@@ -2406,6 +2406,73 @@ DEFAULT_CONFIG = {
         # to the TTL/crash/stale recovery paths. Set false to keep orphans
         # frozen for manual forensics.
         "reconcile_orphans": True,
+        # Exact-head QA-to-human gate. The model-facing transition remains
+        # hidden unless this flag and the complete live review-runner provider
+        # policy below are enabled. Provider credentials remain MCP-managed.
+        "human_review": {
+            "enabled": False,
+        },
+        # Script-only exact-head reconciliation/outbox runner. No cron job is
+        # installed automatically. Dry-run remains available for deterministic
+        # read-only audits; shadow/live require enabled=true, and gateway
+        # invocation has its own opt-in gate.
+        "review_runner": {
+            "enabled": False,
+            "gateway_enabled": False,
+            "mode": "dry-run",
+            "timeout_seconds": 120,
+            "lease_seconds": 180,
+            "max_items_per_run": 50,
+            "retry_ceiling": 3,
+            # Per-MCP-read outer timeout. The selected MCP server's own request
+            # timeout is narrowed to the same value; it may never exceed the
+            # runner's wall-clock budget.
+            # A worst-case delivery attempt can span seven MCP requests. The
+            # 15-second cap keeps that attempt inside the 120-second runner
+            # budget with headroom for persistence and lease handling.
+            "provider_timeout_seconds": 15,
+            "providers": {
+                "github": {
+                    "enabled": False,
+                    # Independent write gate. Enabling reads never enables receipts.
+                    "delivery_enabled": False,
+                    "adapter": "disabled",
+                    "mcp_server": "github",
+                    # Required when adapter=mcp. Exact owner/name entries only.
+                    "repositories": [],
+                    # Exact GitHub logins allowed to make the terminal human
+                    # review decision for an MCP-created gate.
+                    "reviewer_logins": [],
+                    "coderabbit_logins": ["coderabbitai[bot]", "coderabbitai"],
+                },
+                "slack": {
+                    "enabled": False,
+                    # Independent write gate. Enabling reads never enables receipts.
+                    "delivery_enabled": False,
+                    "adapter": "disabled",
+                    "mcp_server": "slack",
+                    # Both allowlists are mandatory when adapter=mcp. Reads are
+                    # restricted to existing stored threads on these channels.
+                    "channel_ids": [],
+                    # One exact QA-to-human notification destination. It must
+                    # also appear in channel_ids; the runner never broadcasts
+                    # a gate to every channel in the read allowlist.
+                    "notification_channel_id": "",
+                    "acknowledgement_user_ids": [],
+                },
+            },
+        },
+        # Read-only Linear OAuth MCP adapter for the normalized Linear
+        # coordinator boundary. It is invoked explicitly by the health CLI or
+        # injected coordinator callers; it never registers event delivery,
+        # webhooks, or a Linear write transport.
+        "linear_mcp": {
+            "mcp_server": "linear",
+            "provider_timeout_seconds": 20,
+            "retry_attempts": 3,
+            "page_size": 50,
+            "max_pages": 10,
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

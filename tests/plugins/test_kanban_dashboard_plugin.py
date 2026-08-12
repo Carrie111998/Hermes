@@ -81,6 +81,51 @@ def test_board_empty(client):
     assert data["latest_event_id"] == 0
 
 
+def test_awaiting_human_is_visible_and_dashboard_cannot_move_or_delete(client):
+    conn = kb.connect()
+    task_id = kb._new_task_id()
+    now = int(time.time())
+    with kb.write_txn(conn):
+        conn.execute(
+            "INSERT INTO tasks (id, title, assignee, status, created_by, created_at) "
+            "VALUES (?, ?, ?, 'awaiting_human', ?, ?)",
+            (task_id, "Human gate", "srdja", "echlon-qa", now),
+        )
+    conn.close()
+
+    board = client.get("/api/plugins/kanban/board").json()
+    awaiting = next(column for column in board["columns"] if column["name"] == "awaiting_human")
+    assert [task["id"] for task in awaiting["tasks"]] == [task_id]
+
+    move = client.patch(f"/api/plugins/kanban/tasks/{task_id}", json={"status": "ready"})
+    assert move.status_code == 409
+    assert "system-owned" in move.json()["detail"]
+
+    reassign = client.patch(f"/api/plugins/kanban/tasks/{task_id}", json={"assignee": "default"})
+    assert reassign.status_code == 409
+    assert "Dashboard edits are disabled" in reassign.json()["detail"]
+
+    recovery_reassign = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/reassign",
+        json={"profile": "default"},
+    )
+    assert recovery_reassign.status_code == 409
+    assert "system-owned" in recovery_reassign.json()["detail"]
+
+    bulk = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [task_id], "archive": True, "assignee": "default"},
+    )
+    assert bulk.status_code == 200
+    assert bulk.json()["results"] == [
+        {"id": task_id, "ok": False, "error": "awaiting-human gates are system-owned"}
+    ]
+
+    delete = client.delete(f"/api/plugins/kanban/tasks/{task_id}")
+    assert delete.status_code == 409
+    assert "cannot be deleted" in delete.json()["detail"]
+
+
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------

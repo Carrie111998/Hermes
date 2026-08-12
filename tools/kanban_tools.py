@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
+ECHLON_LINEAR_FIXES_BOARD = "echlon-linear-fixes"
 
 
 def _profile_has_kanban_toolset() -> bool:
@@ -133,6 +134,57 @@ def _check_kanban_orchestrator_mode() -> bool:
     if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
         return False
     return _profile_has_kanban_toolset()
+
+
+def _human_review_enabled() -> bool:
+    """Return the operator-controlled rollout flag (disabled by default)."""
+    try:
+        return bool(
+            cfg_get(
+                load_config(),
+                "kanban",
+                "human_review",
+                "enabled",
+                default=False,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _human_review_runner_config():
+    """Load the operator policy that gates the production MCP boundary."""
+    from hermes_cli.kanban_review_runner import ReviewRunnerConfig
+
+    runtime = load_config() or {}
+    kanban = runtime.get("kanban") if isinstance(runtime, dict) else {}
+    kanban = kanban if isinstance(kanban, dict) else {}
+    return ReviewRunnerConfig.from_mapping(kanban.get("review_runner"))
+
+
+def _redacted_human_review_failure(exc: BaseException) -> dict[str, str]:
+    try:
+        from hermes_cli.kanban_review_runner import _redacted_adapter_setup_failure
+
+        return _redacted_adapter_setup_failure(exc)
+    except Exception:
+        return {"type": "Exception", "kind": "unknown"}
+
+
+def _check_human_review_qa_mode() -> bool:
+    """Expose exact-head advancement only to the pinned Echlon QA worker."""
+    try:
+        provider_ready = _human_review_runner_config().human_review_runtime_ready()
+    except Exception:
+        provider_ready = False
+    return bool(
+        _check_kanban_mode()
+        and _human_review_enabled()
+        and provider_ready
+        and os.environ.get("HERMES_PROFILE") == "echlon-qa"
+        and os.environ.get("HERMES_KANBAN_BOARD") == ECHLON_LINEAR_FIXES_BOARD
+        and os.environ.get("HERMES_KANBAN_TASK")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +702,149 @@ def _handle_list(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_list failed")
         return tool_error(f"kanban_list: {e}")
+
+
+def _handle_advance_linear_pr_after_qa(args: dict, **kw) -> str:
+    """Advance this trusted QA run through the typed exact-head gate."""
+    delegated_err = _reject_delegated_child_mutation(
+        "kanban_advance_linear_pr_after_qa"
+    )
+    if delegated_err:
+        return delegated_err
+    if not _human_review_enabled():
+        return tool_error(
+            "kanban_advance_linear_pr_after_qa is disabled; an operator must "
+            "set kanban.human_review.enabled=true only after wiring the complete "
+            "live GitHub/Slack MCP review-runner policy"
+        )
+    if os.environ.get("HERMES_PROFILE") != "echlon-qa":
+        return tool_error(
+            "kanban_advance_linear_pr_after_qa requires the exact echlon-qa profile"
+        )
+
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK)")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    expected_run_id = _worker_run_id(tid)
+    if expected_run_id is None:
+        return tool_error(
+            "kanban_advance_linear_pr_after_qa requires the dispatcher's trusted "
+            "HERMES_KANBAN_RUN_ID for this task"
+        )
+
+    board = args.get("board")
+    if board != ECHLON_LINEAR_FIXES_BOARD:
+        return tool_error(
+            f"kanban_advance_linear_pr_after_qa requires board "
+            f"{ECHLON_LINEAR_FIXES_BOARD!r}"
+        )
+    if os.environ.get("HERMES_KANBAN_BOARD") != ECHLON_LINEAR_FIXES_BOARD:
+        return tool_error(
+            "kanban_advance_linear_pr_after_qa refused a wrong-board worker env"
+        )
+    packet = args.get("approval_packet")
+    if not isinstance(packet, dict):
+        return tool_error("approval_packet must be an object")
+    try:
+        packet = json.loads(
+            redact_sensitive_text(json.dumps(packet), force=True)
+        )
+    except (TypeError, json.JSONDecodeError) as exc:
+        return tool_error(f"human-review payload must be JSON serializable: {exc}")
+
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_human_review as human_review
+        from hermes_cli import kanban_review_runner as review_runner
+
+        # A dispatcher pins HERMES_KANBAN_DB. Verify that override resolves to
+        # the explicit engineering board instead of trusting a stale/wrong env.
+        expected_path = (kb.board_dir(ECHLON_LINEAR_FIXES_BOARD) / "kanban.db").resolve()
+        actual_path = kb.kanban_db_path(board=ECHLON_LINEAR_FIXES_BOARD).resolve()
+        if actual_path != expected_path:
+            return tool_error(
+                "kanban_advance_linear_pr_after_qa refused a wrong-board "
+                f"HERMES_KANBAN_DB override ({actual_path} != {expected_path})"
+            )
+
+        conn = kb.connect(db_path=expected_path)
+        try:
+            runtime_config = _human_review_runner_config()
+            if not runtime_config.human_review_runtime_ready():
+                return tool_error(
+                    "kanban_advance_linear_pr_after_qa requires the complete live "
+                    "GitHub/Slack MCP review-runner configuration"
+                )
+            adapters = review_runner._build_configured_mcp_adapters(runtime_config)
+            provider = adapters.github_snapshot_provider
+            if provider is None:
+                return tool_error(
+                    "kanban_advance_linear_pr_after_qa: configured GitHub read "
+                    "adapter is unavailable"
+                )
+            snapshot = provider.read_snapshot(
+                repository=str(packet.get("repo") or ""),
+                pr_number=int(packet.get("pr_number") or 0),
+            )
+            outboxes: dict[str, Any] = {}
+
+            def enqueue_typed_outboxes(
+                transaction_conn,
+                gate,
+                changed_at: int,
+            ) -> None:
+                outboxes.update(
+                    review_runner.enqueue_human_review_gate_outboxes(
+                        transaction_conn,
+                        gate_id=gate.id,
+                        snapshot=snapshot,
+                        config=runtime_config,
+                        now=changed_at,
+                        _within_transaction=True,
+                    )
+                )
+
+            result = human_review.advance_linear_pr_after_qa(
+                conn,
+                qa_task_id=tid,
+                expected_run_id=expected_run_id,
+                approval_packet=packet,
+                pr_snapshot=snapshot.to_human_review_mapping(),
+                board=ECHLON_LINEAR_FIXES_BOARD,
+                worker_session_id=os.environ.get("HERMES_SESSION_ID") or None,
+                outbox_enqueuer=enqueue_typed_outboxes,
+            )
+        finally:
+            conn.close()
+        return json.dumps(
+            {
+                "ok": True,
+                "gate_id": result.gate_id,
+                "task_id": result.task_id,
+                "approval_packet_sha256": result.approval_packet_sha256,
+                "created": result.created,
+                "delivery_state": "pending_delivery",
+                "live_delivery_enabled": True,
+                "github_intent_id": outboxes["github_intent_id"],
+                "slack_intent_ids": outboxes["slack_intent_ids"],
+            }
+        )
+    except ValueError as exc:
+        return tool_error(f"kanban_advance_linear_pr_after_qa: {exc}")
+    except Exception as exc:
+        failure = _redacted_human_review_failure(exc)
+        logger.error(
+            "kanban_advance_linear_pr_after_qa failed: %s (%s)",
+            failure["type"],
+            failure["kind"],
+        )
+        return tool_error(
+            "kanban_advance_linear_pr_after_qa: provider boundary failed: "
+            f"{failure['type']} ({failure['kind']})"
+        )
 
 
 def _handle_complete(args: dict, **kw) -> str:
@@ -1734,8 +1929,8 @@ KANBAN_LIST_SCHEMA = {
             "status": {
                 "type": "string",
                 "enum": [
-                    "triage", "todo", "ready", "running",
-                    "blocked", "done", "archived",
+                    "triage", "scheduled", "todo", "ready", "running",
+                    "review", "awaiting_human", "blocked", "done", "archived",
                 ],
                 "description": "Optional task status filter.",
             },
@@ -1756,6 +1951,47 @@ KANBAN_LIST_SCHEMA = {
         "required": [],
     },
 }
+
+KANBAN_ADVANCE_LINEAR_PR_AFTER_QA_SCHEMA = {
+    "name": "kanban_advance_linear_pr_after_qa",
+    "description": (
+        "Atomically complete the current trusted echlon-qa run and create one "
+        "non-dispatchable, exact-head human review gate plus a durable delivery "
+        "outbox. Restricted to board 'echlon-linear-fixes', profile 'echlon-qa', "
+        "and the dispatcher's current task/run identity. Disabled by default; "
+        "requires kanban.human_review.enabled=true and a trusted read-only PR "
+        "snapshot source. This operation never merges, pushes, or sends live "
+        "notifications itself."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "board": {
+                "type": "string",
+                "enum": [ECHLON_LINEAR_FIXES_BOARD],
+                "description": "Required engineering board constant.",
+            },
+            "approval_packet": {
+                "type": "object",
+                "description": (
+                    "Immutable QA handoff with exact Linear/PR/head identity, linked "
+                    "implementation_task_id, QA verdict and attempt counters, changed "
+                    "files, test evidence, risks, unchecked items, CodeRabbit "
+                    "disposition, human_only merge policy, and "
+                    "requires_srdja_review=true. The kernel derives QA "
+                    "task/run/profile/session identity and computes the SHA-256."
+                ),
+                "additionalProperties": True,
+            },
+        },
+        "required": ["board", "approval_packet"],
+    },
+}
+
 
 KANBAN_COMPLETE_SCHEMA = {
     "name": "kanban_complete",
@@ -2365,6 +2601,15 @@ registry.register(
     handler=_handle_list,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="📋",
+)
+
+registry.register(
+    name="kanban_advance_linear_pr_after_qa",
+    toolset="kanban",
+    schema=KANBAN_ADVANCE_LINEAR_PR_AFTER_QA_SCHEMA,
+    handler=_handle_advance_linear_pr_after_qa,
+    check_fn=_check_human_review_qa_mode,
+    emoji="👤",
 )
 
 registry.register(
