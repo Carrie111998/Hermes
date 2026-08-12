@@ -1188,6 +1188,10 @@ DEFAULT_CONFIG = {
         # Per-platform overrides via display.platforms.<platform>.memory_notifications.
         "memory_notifications": "on",
         "streaming": False,
+        # Left padding (in spaces) for streamed response text in the CLI.
+        # 0 = flush-left (default, best for copy/paste). Set to 2-4 for
+        # visual breathing room. Clamped to 0-8 at runtime.
+        "tui_padding": 0,
         "timestamps": False,      # Show timestamp on user and assistant labels
         "timestamp_format": "%H:%M",  # strftime format for timestamps (e.g. "%b-%d %H:%M")
         "final_response_markdown": "strip",  # render | strip | raw
