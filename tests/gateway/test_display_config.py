@@ -148,7 +148,8 @@ class TestPlatformDefaults:
         # Real model voice — keep on. Without this, Telegram users see
         # "typing..." for the entire turn duration with no feedback.
         assert resolve_display_setting({}, "telegram", "interim_assistant_messages") is True
-        # Periodic "Working — N min" heartbeat — keep on. Otherwise long
+        # Periodic "Still working — about N minutes in." heartbeat — keep
+        # on. Otherwise long
         # turns appear completely silent.
         assert resolve_display_setting({}, "telegram", "long_running_notifications") is True
         # Verbose iteration counter in busy-ack and heartbeat — off by

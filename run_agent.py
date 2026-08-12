@@ -1078,7 +1078,7 @@ class AIAgent:
         - TUI / Desktop: the same callback is bridged to the ``thinking.delta``
           event, which both render as the live spinner/status line.
         - Gateway: ``_touch_activity`` stores the text as the activity
-          description, which the "⏳ Working — N min" heartbeat includes.
+          description, which the "⏳ Still working" heartbeat includes.
 
         Never raises — a wait notice must not break the API-call wait loop.
         """

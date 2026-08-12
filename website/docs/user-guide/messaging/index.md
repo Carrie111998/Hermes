@@ -738,7 +738,7 @@ Telegram is usually a mobile inbox, so the defaults are tuned for that surface:
 - **`tool_progress`** defaults to **`off`** — no per-tool breadcrumb stream filling up the chat.
 - **`busy_ack_detail`** defaults to **`off`** — busy-state acknowledgments and long-running heartbeats stay terse (no `iteration 21/60` debug detail).
 - **`interim_assistant_messages`** stays **on** — real mid-turn assistant commentary (the model literally telling you what it's about to do) is signal, not noise.
-- **`long_running_notifications`** stays **on** — a single edit-in-place "⏳ Working — N min" bubble updates every few minutes so you have a heartbeat instead of staring at `typing…` for half an hour.
+- **`long_running_notifications`** stays **on** — a single edit-in-place "⏳ Still working — about N minutes in." bubble updates every few minutes so you have a heartbeat instead of staring at `typing…` for half an hour.
 
 Opt out of either of the kept-on defaults or opt back into verbose progress per platform:
 
