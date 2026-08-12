@@ -54,6 +54,7 @@ import {
   isSessionStripPane,
   noteActiveTreeGroup,
   reloadTreePane,
+  resolveRenderedTreeGroupSelection,
   restoreTreePane,
   SESSION_TILE_DRAG,
   setTreeGroupHeaderHidden,
@@ -237,11 +238,13 @@ export function TreeGroup({
   // shown one (render-side — the tree keeps `active`).
   // Edit mode forces toggle-hidden panes visible so they can be rearranged
   // (mirrors tree-split's paneGone) — restores itself on exit.
-  const paneShown = (id: string) =>
-    Boolean(paneFor(id)) && (editMode || !hiddenPanes.has(id)) && !(narrow && paneChrome(paneFor(id)).collapsible)
+  const { activeId: renderedActiveId, shown } = resolveRenderedTreeGroupSelection(node, {
+    editMode,
+    hiddenPanes,
+    narrow
+  })
 
-  const shown = node.panes.filter(paneShown)
-  const activeId = shown.includes(node.active) ? node.active : (shown[0] ?? node.active)
+  const activeId = renderedActiveId ?? node.active
   const active = paneFor(activeId)
   const isEmpty = node.panes.length === 0
 

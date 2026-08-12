@@ -352,6 +352,31 @@ export function closeActiveTerminal(): boolean {
   return closed
 }
 
+/** Close the terminal tab that owns DOM focus. Persistent xterm panels can
+ * retain focus while another action changes the selected rail tab, so deriving
+ * solely from `$activeTerminalId` can close the wrong terminal. `null` means
+ * focus is outside the terminal surface; rail focus intentionally falls back
+ * to the selected terminal because the rail has no per-instance panel id. */
+export function closeFocusedTerminal(): boolean | null {
+  if (typeof document === 'undefined' || !(document.activeElement instanceof Element)) {
+    return null
+  }
+
+  const focused = document.activeElement
+
+  if (!focused.closest('[data-terminal]')) {
+    return null
+  }
+
+  const focusedId = focused.closest<HTMLElement>('[data-terminal-id]')?.dataset.terminalId
+
+  if (focusedId && $terminals.get().some(term => term.id === focusedId)) {
+    return closeTerminalWithFocusRecovery(focusedId)
+  }
+
+  return closeActiveTerminal()
+}
+
 export function closeAllTerminals(): void {
   if ($terminals.get().length === 0) {
     return

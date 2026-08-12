@@ -91,6 +91,16 @@ test('reveals a close control and closes an identified inactive tab without chan
   const closeIcon = closeButton.locator('[data-slot="pane-tab-close-icon"]')
   await expect(closeIcon).toHaveCSS('opacity', '0')
 
+  // The close glyph is a sibling of the tab control. Its right-click must
+  // still reach the session trigger that wraps the whole visual tab, rather
+  // than falling into the strip menu's dead zone.
+  await closeButton.click({ button: 'right' })
+  const sessionMenu = page.getByRole('menu', { name: 'Session actions' })
+  await expect(sessionMenu).toBeVisible()
+  await expect(sessionMenu.getByRole('menuitem', { name: 'Close', exact: true })).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(sessionMenu).toBeHidden()
+
   await inactiveTabItem.hover()
   await expect(closeIcon).toHaveCSS('opacity', '1')
   await page.screenshot({ path: testInfo.outputPath('tab-close-hover.png') })

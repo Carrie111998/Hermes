@@ -619,24 +619,24 @@ export function SessionTabMenu({
   const pinned = pinnedSessionIds.includes(pinId)
 
   return (
-    <span className="contents" onContextMenu={event => event.stopPropagation()}>
-      <SessionContextMenu
-        onArchive={() => void sessionTileDelegate()?.archiveSession(storedSessionId)}
-        onBranch={() => void sessionTileDelegate()?.branchSession(storedSessionId)}
-        onClose={onClose}
-        onDelete={() => void sessionTileDelegate()?.deleteSession(storedSessionId)}
-        onHideTabBar={onHideTabBar}
-        onPin={() => (pinned ? unpinSession(pinId) : pinSession(pinId))}
-        pinned={pinned}
-        profile={profile}
-        sessionId={storedSessionId}
-        surface="tab"
-        tabPaneId={tabPaneId}
-        title={title}
-      >
+    <SessionContextMenu
+      onArchive={() => void sessionTileDelegate()?.archiveSession(storedSessionId)}
+      onBranch={() => void sessionTileDelegate()?.branchSession(storedSessionId)}
+      onClose={onClose}
+      onDelete={() => void sessionTileDelegate()?.deleteSession(storedSessionId)}
+      onHideTabBar={onHideTabBar}
+      onPin={() => (pinned ? unpinSession(pinId) : pinSession(pinId))}
+      pinned={pinned}
+      profile={profile}
+      sessionId={storedSessionId}
+      surface="tab"
+      tabPaneId={tabPaneId}
+      title={title}
+    >
+      <span className="contents" onContextMenu={event => event.stopPropagation()}>
         {children}
-      </SessionContextMenu>
-    </span>
+      </span>
+    </SessionContextMenu>
   )
 }
 

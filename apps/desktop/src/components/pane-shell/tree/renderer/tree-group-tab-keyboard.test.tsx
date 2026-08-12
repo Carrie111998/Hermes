@@ -7,6 +7,7 @@ import type { ClientSessionState } from '@/app/types'
 import { registry } from '@/contrib/registry'
 import { $sessionStates, $sessionTiles } from '@/store/session-states'
 
+import { $layoutEditMode } from '../../edit-mode'
 import { findGroup, group, split } from '../model'
 import {
   $collapsedTreeSides,
@@ -74,6 +75,7 @@ const disposers: (() => void)[] = []
 
 beforeEach(() => {
   window.localStorage.clear()
+  $layoutEditMode.set(false)
   $collapsedTreeSides.set(new Set())
   $dismissedPanes.set(new Set())
   $hiddenTreePanes.set(new Set())
@@ -119,6 +121,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  $layoutEditMode.set(false)
   $collapsedTreeSides.set(new Set())
   $layoutTree.set(null)
   $treeFocusRequest.set(null)
@@ -336,11 +339,25 @@ describe('TreeGroup tab keyboard interaction', () => {
         expect(window.document.activeElement).toBe(tabControl('focused-side-a'))
       })
 
+      act(() => $layoutEditMode.set(true))
+      await waitFor(() => expect(tabControl('files')?.getAttribute('aria-selected')).toBe('true'))
+
       act(() => {
         expect(closeActiveTab()).toBe(true)
       })
       await waitFor(() => {
-        expect(closeFiles).not.toHaveBeenCalled()
+        expect(closeFiles).toHaveBeenCalledTimes(1)
+        expect(findGroup($layoutTree.get()!, 'grp-side')?.panes).toEqual(['focused-side-a', 'files'])
+      })
+
+      act(() => $layoutEditMode.set(false))
+      await waitFor(() => expect(window.document.activeElement).toBe(tabControl('focused-side-a')))
+
+      act(() => {
+        expect(closeActiveTab()).toBe(true)
+      })
+      await waitFor(() => {
+        expect(closeFiles).toHaveBeenCalledTimes(1)
         expect(tabControl('focused-side-a')).toBeNull()
         expect(findGroup($layoutTree.get()!, 'grp-side')?.panes).toEqual(['files'])
       })

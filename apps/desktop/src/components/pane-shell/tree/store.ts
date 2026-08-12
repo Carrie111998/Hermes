@@ -15,6 +15,8 @@ import { notify } from '@/store/notifications'
 import { clearAllPaneSizeOverrides } from '@/store/panes'
 import { isSecondaryWindow } from '@/store/windows'
 
+import { $layoutEditMode } from '../edit-mode'
+
 import {
   allPaneIds,
   type DropPosition,
@@ -464,20 +466,6 @@ export function focusedSessionTabAnchor(): null | string {
   return active && isSessionStripPane(active) ? active : (group.panes.find(isSessionStripPane) ?? null)
 }
 
-/** The pane the strip actually exposes as selected. The model intentionally
- * keeps a hidden active id so an unhide can restore it, while TreeGroup paints
- * the first shown pane instead. Global tab actions must follow that painted
- * selection or a hidden raw successor can consume every later shortcut. */
-function shownActivePaneInGroup(group: GroupNode | null): string | undefined {
-  if (!group) {
-    return undefined
-  }
-
-  const shown = shownPanesInGroup(group)
-
-  return shown.includes(group.active) ? group.active : shown[0]
-}
-
 /** ⌘W: close the FOCUSED tile zone's active tab, unless it's the uncloseable
  *  workspace itself. Any main-strip zone qualifies — a session stack, a lone
  *  Browser/page tile — while side chrome (files / terminal) in a zone of its
@@ -487,7 +475,7 @@ function shownActivePaneInGroup(group: GroupNode | null): string | undefined {
  *  stays a no-op — it never closes the window. */
 export function closeFocusedSessionTab(recoverFocus = false): boolean {
   const group = tabTargetGroup(group => group.panes.some(isMainStripPane))
-  const active = shownActivePaneInGroup(group)
+  const active = group ? resolveRenderedTreeGroupSelection(group).activeId : undefined
 
   if (!active || isUncloseablePane(active)) {
     return false
@@ -522,7 +510,7 @@ export function closeToolPane(paneId: string): PaneCloseResult {
  *  logs pane, the only tabs in the app you couldn't close from the keyboard. */
 export function closeFocusedToolTab(recoverFocus = false): boolean {
   const group = tabTargetGroup(g => g.panes.some(isCollapsePane))
-  const active = shownActivePaneInGroup(group)
+  const active = group ? resolveRenderedTreeGroupSelection(group).activeId : undefined
 
   if (!active || !isCollapsePane(active)) {
     return false
@@ -635,10 +623,21 @@ export const $newSessionTabAction = atom<(() => void) | null>(null)
  * the raw array made ⌘2 land on what the strip called tab 1 after a hidden
  * pane sat earlier in the list (classic after-⌘W-shift offset).
  */
-function shownPanesInGroup(group: { panes: readonly string[] }): string[] {
-  const hidden = $hiddenTreePanes.get()
+interface RenderedTreeGroupOptions {
+  editMode?: boolean
+  hiddenPanes?: ReadonlySet<string>
+  narrow?: boolean
+}
+
+function shownPanesInGroup(group: { panes: readonly string[] }, options: RenderedTreeGroupOptions = {}): string[] {
+  const hidden = options.hiddenPanes ?? $hiddenTreePanes.get()
   const registered = registry.getArea('panes')
   const paneFor = (id: string) => registered.find(c => c.id === id)
+  const editMode = options.editMode ?? $layoutEditMode.get()
+
+  const narrow =
+    options.narrow ??
+    (typeof window !== 'undefined' && Boolean(window.matchMedia?.(SIDEBAR_COLLAPSE_MEDIA_QUERY).matches))
 
   return group.panes.filter(id => {
     const pane = paneFor(id)
@@ -647,15 +646,14 @@ function shownPanesInGroup(group: { panes: readonly string[] }): string[] {
       return false
     }
 
-    if (hidden.has(id)) {
+    if (!editMode && hidden.has(id)) {
       return false
     }
 
     // Match TreeGroup's paneShown for the narrow breakpoint — collapsible
     // panes drop out of the strip when the viewport collapses them.
     if (
-      typeof window !== 'undefined' &&
-      window.matchMedia?.(SIDEBAR_COLLAPSE_MEDIA_QUERY).matches &&
+      narrow &&
       Boolean((pane.data as { collapsible?: boolean } | undefined)?.collapsible)
     ) {
       return false
@@ -663,6 +661,22 @@ function shownPanesInGroup(group: { panes: readonly string[] }): string[] {
 
     return true
   })
+}
+
+/** Resolve the exact tabs and selected pane TreeGroup renders. The model keeps
+ * a hidden raw active id for later restoration, while edit mode deliberately
+ * reveals toggle-hidden panes; every global tab action must use this same
+ * projection rather than interpreting the raw tree independently. */
+export function resolveRenderedTreeGroupSelection(
+  group: { active: string; panes: readonly string[] },
+  options: RenderedTreeGroupOptions = {}
+): { activeId: string | undefined; shown: string[] } {
+  const shown = shownPanesInGroup(group, options)
+
+  return {
+    activeId: shown.includes(group.active) ? group.active : shown[0],
+    shown
+  }
 }
 
 /** ⌘1…⌘9: activate the Nth *visible* tab of the target zone — the first of

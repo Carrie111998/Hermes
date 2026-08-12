@@ -10,8 +10,12 @@ import { $activeTerminalId, $terminals } from './terminals'
 import { TerminalWorkspace } from './workspace'
 
 vi.mock('./instance', () => ({
-  AgentTerminalInstance: ({ id }: { id: string }) => <div data-agent-terminal={id} />,
-  TerminalInstance: ({ id }: { id: string }) => <div data-user-terminal={id} />
+  AgentTerminalInstance: ({ id }: { id: string }) => (
+    <button aria-label={`Agent terminal ${id}`} data-agent-terminal={id} data-terminal="" type="button" />
+  ),
+  TerminalInstance: ({ id }: { id: string }) => (
+    <button aria-label={`User terminal ${id}`} data-terminal="" data-user-terminal={id} type="button" />
+  )
 }))
 
 describe('TerminalRail', () => {
@@ -91,6 +95,29 @@ describe('TerminalRail', () => {
 
       expect(closeActiveTab()).toBe(true)
     })
+    expect($terminals.get().map(term => term.id)).toEqual(['term-1'])
+  })
+
+  it('routes ⌘W to the focused terminal instance when selection has drifted', () => {
+    $terminals.set([
+      { auto: true, cwd: 'C:\\repo', id: 'term-1', kind: 'user', title: 'PowerShell' },
+      { auto: true, cwd: 'C:\\repo', id: 'term-2', kind: 'user', title: 'zsh' }
+    ])
+    $activeTerminalId.set('term-2')
+    render(<TerminalWorkspace onAddSelectionToChat={() => undefined} />)
+
+    const focusedTerminal = screen.getByRole('button', { name: 'User terminal term-2' })
+    act(() => focusedTerminal.focus())
+
+    // Selection can change while xterm retains DOM focus (for example when a
+    // nested terminal group is activated from another surface).
+    act(() => $activeTerminalId.set('term-1'))
+    expect(window.document.activeElement).toBe(focusedTerminal)
+
+    act(() => {
+      expect(closeActiveTab()).toBe(true)
+    })
+
     expect($terminals.get().map(term => term.id)).toEqual(['term-1'])
   })
 

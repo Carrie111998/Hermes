@@ -5,9 +5,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ClientSessionState } from '@/app/types'
 import { group } from '@/components/pane-shell/tree/model'
 import { closeOtherTreeTabs, declareDefaultTree, registerPaneCloser } from '@/components/pane-shell/tree/store'
+import { PaneTab, PaneTabLabel } from '@/components/ui/pane-tab'
 import { $sessionStates, $sessionTiles } from '@/store/session-states'
 
-import { requestCloseSessionTile, SessionTileCloseConfirm } from './session-tile'
+import { requestCloseSessionTile, SessionTabMenu, SessionTileCloseConfirm } from './session-tile'
 
 const busyTileState: ClientSessionState = {
   adoptedRunningTurn: false,
@@ -77,6 +78,27 @@ describe('busy session tile close confirmation', () => {
     vi.unstubAllGlobals()
     $sessionStates.set({})
     $sessionTiles.set([])
+  })
+
+  it('opens the session tab menu when right-clicking its close control', async () => {
+    render(
+      <SessionTabMenu
+        onClose={vi.fn()}
+        storedSessionId="busy-session"
+        tabPaneId="session-tile:busy-session"
+      >
+        <PaneTab onClose={vi.fn()}>
+          <PaneTabLabel>Busy session</PaneTabLabel>
+        </PaneTab>
+      </SessionTabMenu>
+    )
+
+    const closeButton = screen.getByRole('button', { name: 'Close tab' })
+    fireEvent.pointerDown(closeButton, { button: 2, pointerType: 'mouse' })
+    fireEvent.contextMenu(closeButton)
+
+    expect(await screen.findByRole('menu')).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: /^close$/i })).toBeTruthy()
   })
 
   it('keeps a busy close pending through StrictMode dialog mounting', async () => {

@@ -1,9 +1,8 @@
 import { mainChatOccupied } from '@/app/open-session'
-import { closeActiveTerminal } from '@/app/right-sidebar/terminal/terminals'
+import { closeFocusedTerminal } from '@/app/right-sidebar/terminal/terminals'
 import { $workspaceIsPage } from '@/app/routes'
 import { closeFocusedSessionTab, closeFocusedToolTab } from '@/components/pane-shell/tree/store'
 import { hasPendingTreeCloseFocusRecovery } from '@/components/pane-shell/tree/tree-focus'
-import { isFocusWithin } from '@/lib/keybinds/combo'
 import { requestFreshSession } from '@/store/profile'
 import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
 import { closeSessionTile, nextSessionTileForWorkspace } from '@/store/session-states'
@@ -75,9 +74,7 @@ export function closeActiveTab(loadSessionIntoWorkspace?: (storedSessionId: stri
     return false
   }
 
-  if (isFocusWithin('[data-terminal]')) {
-    closeActiveTerminal()
-
+  if (closeFocusedTerminal() !== null) {
     return true
   }
 

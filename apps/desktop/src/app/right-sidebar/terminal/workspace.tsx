@@ -7,7 +7,7 @@ import { seedAgentTerminalCommand, syncAgentTerminalSnapshot } from './agent-ter
 import { setActiveTerminalId } from './buffer'
 import { AgentTerminalInstance, TerminalInstance } from './instance'
 import { terminalPanelId, terminalTabId } from './tab-aria'
-import { $activeTerminalId, $terminals, ensureAgentTerminal } from './terminals'
+import { $activeTerminalId, $terminals, ensureAgentTerminal, selectTerminal } from './terminals'
 
 interface TerminalWorkspaceProps {
   onAddSelectionToChat: (text: string, label?: string) => void
@@ -54,8 +54,11 @@ export function TerminalWorkspace({ onAddSelectionToChat }: TerminalWorkspacePro
           <div
             aria-hidden={!active}
             aria-labelledby={terminalTabId(term.id)}
+            data-terminal=""
+            data-terminal-id={term.id}
             id={terminalPanelId(term.id)}
             key={term.id}
+            onFocusCapture={() => selectTerminal(term.id)}
             role="tabpanel"
           >
             {term.kind === 'agent' ? (

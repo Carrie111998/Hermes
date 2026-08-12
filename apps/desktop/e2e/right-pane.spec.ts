@@ -210,6 +210,39 @@ test('terminal rail uses roving tabs with matching panels and its global close g
   await expect(railTablist.locator('[role="tab"][aria-selected="true"]')).toBeFocused()
 })
 
+test('global close identifies the focused real xterm panel', async () => {
+  const page = fixture!.page
+  const terminalSlot = page.locator('[data-terminal-slot]')
+
+  if (!(await terminalSlot.isVisible())) {
+    await page.keyboard.press('Control+`')
+    await terminalSlot.waitFor({ state: 'visible', timeout: 30_000 })
+  }
+
+  const railTabs = page.locator('[data-terminal-rail-tab][role="tab"]')
+  await expect(railTabs).toHaveCount(1, { timeout: 30_000 })
+  await page.getByRole('button', { name: 'New terminal' }).click()
+  await expect(railTabs).toHaveCount(2, { timeout: 30_000 })
+
+  const focusedTab = page.locator('[data-terminal-rail-tab][role="tab"][aria-selected="true"]')
+  const terminalId = await focusedTab.getAttribute('data-terminal-rail-tab')
+  const panelId = await focusedTab.getAttribute('aria-controls')
+
+  if (!terminalId || !panelId) {
+    throw new Error('Expected the selected terminal tab to identify its xterm panel')
+  }
+
+  const panel = page.locator(`[role="tabpanel"][id="${panelId}"]`)
+  const xtermInput = panel.locator('.xterm textarea').first()
+  await expect(panel).toHaveAttribute('data-terminal-id', terminalId)
+  await xtermInput.focus()
+  await expect(xtermInput).toBeFocused()
+
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+w' : 'Control+w')
+  await expect(railTabs).toHaveCount(1)
+  await expect(railTabs).not.toHaveAttribute('data-terminal-rail-tab', terminalId)
+})
+
 test('terminal rail keeps focus after its selected survivor finishes initializing', async () => {
   const page = fixture!.page
   const terminalSlot = page.locator('[data-terminal-slot]')
