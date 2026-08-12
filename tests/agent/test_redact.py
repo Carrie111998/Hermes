@@ -338,6 +338,24 @@ class TestRedactingFormatter:
         assert "abc123def456" not in result
         assert "sk-pro" in result
 
+    def test_query_string_tokens_redacted_in_logs(self):
+        """Regression for #84746: log output is a non-navigation egress
+        boundary — WS/download tokens in query strings must not survive
+        verbatim into log files."""
+        formatter = RedactingFormatter("%(message)s")
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="ws connect https://127.0.0.1:9119/api/ws?token=abc123def456ghi789",
+            args=(),
+            exc_info=None,
+        )
+        result = formatter.format(record)
+        assert "abc123def456ghi789" not in result
+        assert "token=***" in result
+
 
 class TestPrintenvSimulation:
     """Simulate what happens when the agent runs `env` or `printenv`."""

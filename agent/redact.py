@@ -1194,4 +1194,9 @@ class RedactingFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         original = super().format(record)
-        return redact_sensitive_text(original)
+        # Logs are a NON-NAVIGATION egress boundary: query-string tokens
+        # (WS tickets, download tokens) must never survive verbatim into log
+        # files, proxies or history. Navigation flows (OAuth callbacks,
+        # magic links, pre-signed URLs) never round-trip through logs, so
+        # the strict URL-credential redaction cannot break them here. (#84746)
+        return redact_sensitive_text(original, redact_url_credentials=True)
