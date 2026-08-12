@@ -12,6 +12,7 @@ export type Locale =
   | "ko"
   | "it"
   | "ga"
+  | "pt-br"
   | "pt"
   | "ru"
   | "hu"
