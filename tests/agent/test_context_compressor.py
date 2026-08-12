@@ -3352,3 +3352,52 @@ class TestPreLlmFeasibilityCheck:
             feasibility_skip=compressor._last_feasibility_skip,
         )
         assert compressor._fallback_compression_streak == 1
+
+
+class TestOversizeSummaryValidation:
+    """Regression for #84736: the summary budget is prompt-level guidance
+    only; an oversized returned summary must not be stored (it would ride in
+    the prompt and feed every iterative update forever). It routes through
+    the same failure machinery as empty content (cooldown)."""
+
+    def test_oversize_summary_treated_as_failure(self):
+        from agent.context_compressor import _SUMMARY_MAX_CHARS
+
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "x" * (_SUMMARY_MAX_CHARS + 100)
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            # summary_model == model here, so no fallback path: straight to cooldown.
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            summary = c._generate_summary(messages)
+        assert summary is None, "oversized summary must be rejected, not stored"
+        assert c._summary_failure_cooldown_until > 0
+
+    def test_below_ceiling_summary_is_stored(self):
+        from agent.context_compressor import _SUMMARY_MAX_CHARS
+
+        # Comfortably below the ceiling (the stored summary carries a
+        # handoff prefix, so a body exactly AT the ceiling would exceed it).
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "y" * (_SUMMARY_MAX_CHARS - 2_000)
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            summary = c._generate_summary(messages)
+        assert summary is not None

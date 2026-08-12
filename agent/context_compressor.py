@@ -134,6 +134,11 @@ SUMMARY_PREFIX = (
 )
 LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 
+# Absolute ceiling for a stored compaction summary (~10K tokens ≈ 40K chars,
+# the documented advisory budget). Prompt-level guidance is not enforceable;
+# this is the post-response validation bound (#84736).
+_SUMMARY_MAX_CHARS = 40_000
+
 # Metadata key added to context compression summary messages so that frontends
 # (CLI, Desktop, gateway, TUI) can distinguish them from real assistant/user
 # messages and filter or render them appropriately without content-prefix
@@ -4286,6 +4291,22 @@ This compaction should PRIORITISE preserving all information related to the focu
             summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
             summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
             self._validate_summary_user_provenance(summary, has_user_turn)
+            # Post-response size validation (#84736): the prompt-level
+            # ``summary_budget`` is advisory only — a model that ignores it
+            # (or a reasoning model that spends its output ceiling on
+            # thinking before the body) can return a summary several times
+            # the ~10K-token ceiling, which then rides in the prompt forever
+            # and feeds every iterative update. Enforce an absolute ceiling
+            # on the FINAL stored summary (post-strip/redact/reinject) and
+            # route oversize through the same failure machinery as empty
+            # content (main-model fallback + cooldown) instead of storing it.
+            if len(summary) > _SUMMARY_MAX_CHARS:
+                raise RuntimeError(
+                    "Context compression LLM returned an oversized summary "
+                    f"({len(summary)} chars > {_SUMMARY_MAX_CHARS} ceiling; "
+                    f"provider={self.provider or 'auto'} "
+                    f"model={self.summary_model or self.model})"
+                )
             # Store for iterative updates on next compaction
             self._previous_summary = summary
             self._clear_compression_failure_cooldown()
