@@ -4,6 +4,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
+
 import gateway.agent_mail_watchers as watcher
 from gateway.agent_mail_watchers import _agent_mail_source, _wake_text
 from gateway.config import Platform
@@ -32,6 +34,32 @@ def test_agent_mail_source_uses_an_internal_session_key_not_the_watched_user():
     assert build_session_key(wake_source) == "agent:main:internal:agent-mail:default:SilverHarbor"
     assert build_session_key(wake_source) != build_session_key(human_source)
     assert "internal_session_id" not in wake_source.to_dict()
+
+
+@pytest.mark.asyncio
+async def test_agent_mail_wake_bypasses_busy_session_human_authorization_gate():
+    """A local control-plane wake must not be discarded as a Discord user."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._draining = True
+    runner._is_user_authorized = lambda source: False
+    adapter_lookups: list[object] = []
+    runner._adapter_for_source = lambda source: adapter_lookups.append(source) or None
+    source = _agent_mail_source(
+        channel_id="channel-1", profile="daery", identity="BrightTower"
+    )
+    event = MessageEvent(
+        text="internal mail", message_type=MessageType.TEXT, source=source,
+        internal=True, metadata={"suppress_public_delivery": True},
+    )
+
+    handled = await runner._handle_active_session_busy_message(
+        event, build_session_key(source)
+    )
+
+    assert handled is True
+    assert adapter_lookups == [source]
 
 
 def test_only_explicit_internal_control_plane_events_suppress_public_delivery():
