@@ -162,12 +162,38 @@ If `gh` is installed, it handles both API access and git credentials in one step
 
 ### Interactive Browser Login (Desktop)
 
+> **PITFALL (Windows / agent-driven sessions):** Do NOT drive `gh auth login` interactively via pty background process on Windows. gh's survey prompts read Win32 console key events, not stdin bytes — `process(submit)` Enter presses never register at the "Press Enter to open browser" prompt, the process hangs invisibly, and turn interrupts kill it (invalidating any device code the user already entered). Use the **manual device flow** below instead.
+
 ```bash
 gh auth login
 # Select: GitHub.com
 # Select: HTTPS
 # Authenticate via browser
 ```
+
+### Manual OAuth Device Flow (Windows-safe, no TTY needed — PROVEN)
+
+Uses gh's public OAuth client id directly. No interactive prompts, no browser launch dependency; user just enters a code at github.com/login/device.
+
+```bash
+# 1. Request a device code (gh's official client_id)
+curl -s -X POST -H "Accept: application/json" \
+  -d "client_id=178c6fc778ccc68e1d6a&scope=repo,read:org,gist,workflow" \
+  https://github.com/login/device/code
+# -> gives user_code (show it to the user with https://github.com/login/device) and device_code
+
+# 2. Poll for the token in a background process (every 5s, ~15 min expiry),
+#    and on success complete login non-interactively:
+RESP=$(curl -s -X POST -H "Accept: application/json" \
+  -d "client_id=178c6fc778ccc68e1d6a&device_code=<DEVICE_CODE>&grant_type=urn:ietf:params:oauth:grant-type:device_code" \
+  https://github.com/login/oauth/access_token)
+# while "authorization_pending": keep polling; on access_token:
+echo "$TOKEN" | gh auth login --with-token
+gh auth setup-git
+gh auth status
+```
+
+Note: on Windows winget installs, gh lands at `/c/Program Files/GitHub CLI` — add it to PATH in the same shell: `export PATH="$PATH:/c/Program Files/GitHub CLI"`.
 
 ### Token-Based Login (Headless / SSH Servers)
 

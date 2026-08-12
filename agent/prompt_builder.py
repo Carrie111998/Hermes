@@ -1111,7 +1111,12 @@ _WINDOWS_BASH_SHELL_HINT = (
     "calls. MSYS-style paths like `/c/Users/<user>/...` work alongside "
     "native `C:\\Users\\<user>\\...` paths. PowerShell builtins "
     "(`Get-ChildItem`, `$env:FOO`, `Select-String`) will NOT work — use their "
-    "POSIX equivalents (`ls`, `$FOO`, `grep`)."
+    "POSIX equivalents (`ls`, `$FOO`, `grep`). Interactive console TUIs "
+    "(e.g. `gh auth login`, installers with arrow-key prompts) read Win32 "
+    "console key events, not stdin bytes — driving them via pty/process-stdin "
+    "silently hangs on this host. Prefer each tool's non-interactive path "
+    "(flags, `--with-token`, config files, or an OAuth device flow polled "
+    "with curl) instead of answering prompts programmatically."
 )
 
 
