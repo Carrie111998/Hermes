@@ -296,7 +296,11 @@ class CodexAppServerSession:
         self._owns_codex_home = restrict_native_tools
         self._codex_home = codex_home
         if restrict_native_tools:
-            auth_home = codex_home or os.path.expanduser("~/.codex")
+            auth_home = (
+                codex_home
+                or os.environ.get("CODEX_HOME")
+                or os.path.expanduser("~/.codex")
+            )
             self._codex_home = tempfile.mkdtemp(prefix="hermes-codex-")
             try:
                 os.chmod(self._codex_home, 0o700)
@@ -312,7 +316,20 @@ class CodexAppServerSession:
                 # the only allowed surface.
                 config_path = os.path.join(self._codex_home, "config.toml")
                 with open(config_path, "w", encoding="utf-8") as config_file:
-                    config_file.write("[features]\nshell_tool = false\n")
+                    config_file.write(
+                        'web_search = "disabled"\n\n'
+                        "[features]\n"
+                        "apps = false\n"
+                        "browser_use = false\n"
+                        "code_mode_host = false\n"
+                        "computer_use = false\n"
+                        "image_generation = false\n"
+                        "in_app_browser = false\n"
+                        "shell_snapshot = false\n"
+                        "shell_tool = false\n"
+                        "unified_exec = false\n"
+                        "view_image = false\n"
+                    )
                 os.chmod(config_path, 0o600)
             except Exception:
                 shutil.rmtree(self._codex_home, ignore_errors=True)
