@@ -6488,6 +6488,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
+        # A request-level approval bypass is only valid on the authenticated
+        # API-server surface. Production connect() already requires a key, but
+        # keep unsupported/manual no-key wiring fail-closed as well.
+        yolo_enabled = bool(self._expected_api_key()) and _coerce_request_bool(
+            body.get("yolo"), default=False
+        )
 
         # Accept explicit conversation_history from the request body.
         # Precedence: explicit conversation_history > previous_response_id.
@@ -6658,6 +6664,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 def _run_sync():
                     from gateway.session_context import clear_session_vars
                     from tools.approval import (
+                        disable_session_yolo,
+                        enable_session_yolo,
                         register_gateway_notify,
                         reset_current_session_key,
                         set_current_session_key,
@@ -6686,6 +6694,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_key=approval_session_key,
                                 session_id=session_id or "",
                             )
+                            if yolo_enabled:
+                                enable_session_yolo(approval_session_key)
                             register_gateway_notify(approval_session_key, _approval_notify)
                             # /v1/runs runs its own agent lifecycle (no
                             # TurnRunner, no _run_agent) — record turn process
@@ -6707,6 +6717,10 @@ class APIServerAdapter(BasePlatformAdapter):
                             try:
                                 unregister_gateway_notify(approval_session_key)
                             finally:
+                                # The run ID is an isolated authorization
+                                # namespace. Never leave its bypass state behind
+                                # after success, failure, stop, or cancellation.
+                                disable_session_yolo(approval_session_key)
                                 if approval_token is not None:
                                     try:
                                         reset_current_session_key(approval_token)

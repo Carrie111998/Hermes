@@ -190,6 +190,108 @@ class TestStartRun:
             "runs route must bind chat_id so delegation dispatch sees a wake target"
         )
 
+    @pytest.mark.asyncio
+    async def test_yolo_is_scoped_to_one_run_and_cleared_after_exit(self, auth_adapter):
+        """A trusted runs client can bypass prompts for exactly one run.
+
+        The client session id is conversation state, not an authorization
+        namespace. YOLO therefore belongs to the generated run approval key
+        and must be removed when that executor exits, including before another
+        run reuses the same client session id.
+        """
+        adapter = auth_adapter
+        app = _create_runs_app(adapter)
+        observed = []
+
+        def _agent_for_request(**_kwargs):
+            mock_agent = MagicMock()
+
+            def _capture_run(**_run_kwargs):
+                from tools.approval import (
+                    get_current_session_key,
+                    is_session_yolo_enabled,
+                )
+
+                key = get_current_session_key(default="")
+                observed.append((key, is_session_yolo_enabled(key)))
+                return {"final_response": "done"}
+
+            mock_agent.run_conversation.side_effect = _capture_run
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_agent_for_request):
+                for yolo in (True, False):
+                    resp = await cli.post(
+                        "/v1/runs",
+                        json={
+                            "input": "hello",
+                            "session_id": "shared-browser-session",
+                            "yolo": yolo,
+                        },
+                        headers={"Authorization": "Bearer sk-secret"},
+                    )
+                    assert resp.status == 202
+                    run_id = (await resp.json())["run_id"]
+
+                    status = {"status": "queued"}
+                    for _ in range(40):
+                        status_resp = await cli.get(
+                            f"/v1/runs/{run_id}",
+                            headers={"Authorization": "Bearer sk-secret"},
+                        )
+                        status = await status_resp.json()
+                        if status["status"] == "completed":
+                            break
+                        await asyncio.sleep(0.05)
+                    assert status["status"] == "completed"
+
+        assert [enabled for _key, enabled in observed] == [True, False]
+        first_key, second_key = (key for key, _enabled in observed)
+        assert first_key != second_key
+        assert first_key.startswith("run_")
+        assert second_key.startswith("run_")
+        assert approval_mod.is_session_yolo_enabled(first_key) is False
+        assert approval_mod.is_session_yolo_enabled(second_key) is False
+
+    @pytest.mark.asyncio
+    async def test_yolo_fails_closed_without_api_auth(self, adapter):
+        app = _create_runs_app(adapter)
+        observed = []
+        mock_agent = MagicMock()
+
+        def _capture_run(**_run_kwargs):
+            from tools.approval import is_current_session_yolo_enabled
+
+            observed.append(is_current_session_yolo_enabled())
+            return {"final_response": "done"}
+
+        mock_agent.run_conversation.side_effect = _capture_run
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=mock_agent):
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "yolo": True},
+                )
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+                status = {"status": "queued"}
+                for _ in range(40):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert status["status"] == "completed"
+        assert observed == [False]
 
     @pytest.mark.asyncio
     async def test_start_rejects_conflicting_route_and_request_provider(self):
