@@ -4,10 +4,11 @@ description: "Use when developing or debugging Hermes xAI/Grok provider."
 version: 0.1.0
 author: Axl Ibiza, MBA
 license: MIT
+platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [xAI, Grok, OAuth, provider, Campaign]
-    related_skills: [feature-parity-alignment-campaigns, hermes-agent-troubleshooting]
+    related_skills: [grok, hermes-agent, systematic-debugging]
 ---
 
 # xAI / Grok developer skill
