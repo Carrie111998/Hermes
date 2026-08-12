@@ -126,3 +126,59 @@ def test_push_with_an_upstream_still_pushes_to_that_upstream(tmp_path):
     web_git.review_push(str(repo))
 
     assert _git(fork, "rev-parse", "feature/x") == _git(repo, "rev-parse", "HEAD")
+
+
+# --- diff base ---------------------------------------------------------------
+# `_branch_base` is the Python twin of the desktop's `branchBase`: it picks the
+# ref the review diff is computed against. Hardcoding `origin/main` is wrong in a
+# fork, where `origin` is the upstream project and the merge-base sits thousands
+# of commits back. The fixture puts the FORK trunk AHEAD of origin's, which is the
+# only shape that discriminates -- with upstream ahead, merge-base returns the
+# shared tip either way and the test passes against the buggy code.
+
+
+def _forked_repo(tmp_path):
+    upstream = _bare(tmp_path, "upstream.git")
+    fork = _bare(tmp_path, "fork.git")
+    repo = tmp_path / "work"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "hermes-test@example.com")
+    _git(repo, "config", "user.name", "Hermes Test")
+    _git(repo, "checkout", "-q", "-B", "main")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _git(repo, "add", "tracked.txt")
+    _git(repo, "commit", "-qm", "first")
+    _git(repo, "remote", "add", "origin", str(upstream))
+    _git(repo, "remote", "add", "fork", str(fork))
+    _git(repo, "push", "-q", "origin", "main")
+    at_origin = _git(repo, "rev-parse", "HEAD")
+
+    (repo / "tracked.txt").write_text("two\n", encoding="utf-8")
+    _git(repo, "commit", "-qam", "fork-only commit")
+    _git(repo, "push", "-q", "fork", "main")
+    at_fork = _git(repo, "rev-parse", "HEAD")
+
+    _git(repo, "fetch", "-q", "origin")
+    _git(repo, "fetch", "-q", "fork")
+    _git(repo, "checkout", "-q", "-b", "feature/x")
+    (repo / "tracked.txt").write_text("feature\n", encoding="utf-8")
+    _git(repo, "commit", "-qam", "feature work")
+    return at_fork, at_origin, repo
+
+
+def test_branch_base_prefers_the_trunk_configured_upstream(tmp_path):
+    at_fork, at_origin, repo = _forked_repo(tmp_path)
+    _git(repo, "config", "branch.main.remote", "fork")
+    _git(repo, "config", "branch.main.merge", "refs/heads/main")
+
+    base = web_git._branch_base(str(repo))
+
+    assert base == at_fork, "diff base should follow the fork trunk"
+    assert base != at_origin, "diff base fell back to the upstream project"
+
+
+def test_branch_base_still_falls_back_to_origin_without_a_trunk_upstream(tmp_path):
+    _at_fork, at_origin, repo = _forked_repo(tmp_path)
+
+    assert web_git._branch_base(str(repo)) == at_origin

@@ -122,6 +122,18 @@ def _fill_untracked_counts(cwd: str, files: list[dict]) -> None:
 def _branch_base(cwd: str) -> str | None:
     """Merge-base with the remote default branch for "all branch changes"."""
     candidates: list[str] = []
+    # The trunk's CONFIGURED upstream names this repo's own lineage, so prefer it
+    # over a hardcoded ``origin/...``: in a fork checkout ``origin`` is often the
+    # UPSTREAM project, whose merge-base sits thousands of commits back and makes
+    # the diff show the whole fork delta instead of the branch's work.
+    # Deliberately NOT HEAD's own ``@{upstream}`` -- on a feature branch that is
+    # the branch's own tip, i.e. an empty diff (see web_server.py's note).
+    for trunk in _TRUNK_BRANCHES:
+        upstream = _git_out(
+            cwd, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", f"{trunk}@{{upstream}}"]
+        ).strip()
+        if upstream:
+            candidates.append(upstream)
     head = _git_out(cwd, ["rev-parse", "--abbrev-ref", "origin/HEAD"]).strip()
     if head:
         candidates.append(head)
