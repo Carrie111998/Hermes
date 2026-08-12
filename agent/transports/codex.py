@@ -224,26 +224,19 @@ def _is_post_tool_replay(messages: Optional[List[Dict[str, Any]]]) -> bool:
     """
     from agent.codex_responses_adapter import _split_responses_tool_id
 
-    def _call_ids(tool_call: Dict[str, Any]) -> set:
-        """Every call id this tool call could pair on, converter-order."""
-        candidates = set()
-        embedded_call_id, embedded_item_id = _split_responses_tool_id(
-            tool_call.get("id")
-        )
-        explicit = tool_call.get("call_id")
+    def _pair_ids(raw: Any, explicit: Any = None) -> set:
+        """Every call id a stored tool id could pair on, converter-order."""
+        embedded_call_id, item_id = _split_responses_tool_id(raw)
+        ids = {embedded_call_id} if embedded_call_id else set()
         if isinstance(explicit, str) and explicit.strip():
-            candidates.add(explicit.strip())
-        if embedded_call_id:
-            candidates.add(embedded_call_id)
-        if (
-            isinstance(embedded_item_id, str)
-            and embedded_item_id.startswith("fc_")
-            and len(embedded_item_id) > len("fc_")
-        ):
-            candidates.add(f"call_{embedded_item_id[len('fc_'):]}")
-        return candidates
+            ids.add(explicit.strip())
+        if not ids and isinstance(raw, str) and raw.strip():
+            ids.add(raw.strip())
+        if isinstance(item_id, str) and item_id.startswith("fc_") and item_id[3:]:
+            ids.add(f"call_{item_id[3:]}")
+        return ids
 
-    trailing_call_ids = set()
+    trailing = set()
     for msg in reversed(messages or ()):
         if not isinstance(msg, dict):
             return False
@@ -251,25 +244,21 @@ def _is_post_tool_replay(messages: Optional[List[Dict[str, Any]]]) -> bool:
         if role == "system":
             continue
         if role == "tool":
-            raw = msg.get("tool_call_id")
-            call_id, _ = _split_responses_tool_id(raw)
-            if not call_id and isinstance(raw, str) and raw.strip():
-                call_id = raw.strip()
-            if not call_id:
+            ids = _pair_ids(msg.get("tool_call_id"))
+            if not ids:
                 return False
-            trailing_call_ids.add(call_id)
+            trailing |= ids
             continue
         # First message before the trailing run of tool results. It must be
         # the assistant turn that issued them for this to be the follow-up
-        # payload; a non-empty ``trailing_call_ids`` is what proves the run
-        # existed at all.
+        # payload; a non-empty ``trailing`` is what proves the run existed.
         if role != "assistant":
             return False
-        issued = set()
-        for call in msg.get("tool_calls") or []:
-            if isinstance(call, dict):
-                issued |= _call_ids(call)
-        return bool(trailing_call_ids & issued)
+        return any(
+            trailing & _pair_ids(call.get("id"), call.get("call_id"))
+            for call in msg.get("tool_calls") or []
+            if isinstance(call, dict)
+        )
 
     return False
 
