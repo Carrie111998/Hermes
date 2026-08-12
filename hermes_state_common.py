@@ -97,10 +97,20 @@ _COMPRESSION_CHILD_SQL = (
     "        AND p.end_reason = 'compression')"
 )
 
+_RESET_CHILD_SQL = (
+    "EXISTS (SELECT 1 FROM sessions p"
+    "        WHERE p.id = {a}.parent_session_id"
+    "        AND p.end_reason = 'session_reset')"
+)
 
-# Rows that surface in pickers: roots + branch children (subagent runs and
-# compression continuations stay hidden).
-_LISTABLE_CHILD_SQL = f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')})"
+
+# Rows that surface in pickers: roots + branch children + reset children
+# (subagent runs and compression continuations stay hidden).
+_LISTABLE_CHILD_SQL = (
+    f"(s.parent_session_id IS NULL"
+    f" OR {_BRANCH_CHILD_SQL.format(a='s')}"
+    f" OR {_RESET_CHILD_SQL.format(a='s')})"
+)
 
 
 def _ephemeral_child_sql(alias: str = "s") -> str:

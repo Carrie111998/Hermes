@@ -52,6 +52,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _FTS_CJK_TRIGGERS,
     _FTS_TRIGGERS,
     _LISTABLE_CHILD_SQL,
+    _RESET_CHILD_SQL,
     _PREVIEW_RAW_SELECT,
     _ephemeral_child_sql,
     _shape_preview,
