@@ -60,7 +60,7 @@ def _standalone_sanitize_error(text) -> str:
     # Mask anything that looks like a Bot token in an Authorization header.
     import re as _re_san
     return _re_san.sub(
-        r"(Authorization:.*?Bot\s+)[^\s,}]+",
+        r"(Authorization:\s*Bot\s+)\S+",
         r"\1***",
         s,
         flags=_re_san.IGNORECASE,
