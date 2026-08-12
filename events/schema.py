@@ -281,6 +281,25 @@ class EventType(Enum):
     # per-failure signals, so an operator scanning watchdog_alerts can spot the
     # once-a-day summary at a glance.
     WATCHDOG_DAILY = ("watchdog_daily", Priority.NORMAL, "🩺")
+    # Cumulative container restart budget -- added 2026-08-12 after the
+    # hindsight-app 429 crash-loop ran for a week. laptop-monitor's churn
+    # verdict (Get-ContainerChurnVerdict) is a ONE-PASS delta with a 600s
+    # self-clear, so a container that burned 264 restarts in a morning renders
+    # "RestartCount stable (266)" and GREEN -- the absolute count is fetched,
+    # printed into the detail string, and then thrown away. This event is the
+    # missing aggregate: restarts summed over a rolling 24h window, emitted
+    # EVEN WHILE THE TRAY ROW READS HEALTHY. Payload schema:
+    #   {
+    #     "container": str, "restarts_24h": int, "restart_count_now": int,
+    #     "threshold": int, "tray_state": str, "tray_tier": str,
+    #     "tray_detail": str,
+    #   }
+    # Emit logic: ~/.hermes/profiles/watchdog/workspace/watchdog_sweep.py
+    # (_restart_budget_alarms, sourced from laptop-monitor's
+    # ~/.claude/logs/container-churn-state.json). Deliberately NOT tier-gated:
+    # a crash-looping container is broken at any row tier, and tier only ever
+    # set PRIORITY in the sweep, never reachability.
+    CONTAINER_CRASH_LOOP = ("container_crash_loop", Priority.HIGH, "🔁")
     AGENT_FAILURE_CLUSTER = ("agent_failure_cluster", Priority.HIGH, "🌪️")
 
     # Curator nightly consolidation -- added 2026-04-26.

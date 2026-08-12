@@ -202,6 +202,7 @@ WHATSAPP_TITLE_BY_EVENT = {
     EventType.WATCHDOG_BURST:              "SYSTEM HEALTH ALERT",
     EventType.WATCHDOG_PROBE_TRANSITION:   "SYSTEM HEALTH ALERT",
     EventType.WATCHDOG_SILENCE_ALERT:      "AGENT WENT QUIET",
+    EventType.CONTAINER_CRASH_LOOP:        "CONTAINER CRASH-LOOPING",
     EventType.AGENT_FAILURE_CLUSTER:       "REPEATED FAILURES",
     EventType.GATEWAY_HEALTH:              "GATEWAY HEALTH",
     EventType.CREDENTIAL_LOSS:             "CREDENTIAL LOST",
@@ -444,6 +445,35 @@ def probe_transition_body(payload: dict) -> str:
             text += " This is a critical check."
     if detail:
         text += f" {detail[:140]}"
+    return text
+
+
+def container_crash_loop_body(payload: dict) -> str:
+    """A container burned its 24h restart budget — say how many, and that it may read green.
+
+    Leads with the fact that makes this event exist at all: the tray row is
+    very often HEALTHY right now. laptop-monitor's churn verdict is a one-pass
+    RestartCount delta that self-clears 600s after the last restart, so a
+    container that restarted 264 times in one morning renders
+    "running, RestartCount stable (266)" and green (observed 2026-08-10T08:15
+    for hindsight-app). Without that sentence an operator reads this alert,
+    glances at a green tray, and dismisses it as stale.
+    """
+    name = payload.get("container", "?")
+    restarts = payload.get("restarts_24h", "?")
+    threshold = payload.get("threshold", "?")
+    state = str(payload.get("tray_state") or "unknown").upper()
+    detail = str(payload.get("tray_detail") or "").strip()
+    text = (f"🔁 Container {name} restarted {restarts} times in the last 24h "
+            f"(budget {threshold}).")
+    if state == "HEALTHY":
+        text += (" The monitor row reads HEALTHY right now — this is the 24h "
+                 "total, not the current sample, so a green tray does not "
+                 "clear it.")
+    else:
+        text += f" The monitor row currently reads {state}."
+    if detail:
+        text += f" Latest probe detail: {detail[:160]}"
     return text
 
 

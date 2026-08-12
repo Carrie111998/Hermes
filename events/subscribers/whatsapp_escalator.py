@@ -352,6 +352,7 @@ class WhatsAppEscalator(BaseSubscriber):
         """
         from events.formatting import (
             boot_summary_body,
+            container_crash_loop_body,
             failure_cluster_body,
             format_whatsapp_message,
             humanize_health_detail,
@@ -409,6 +410,8 @@ class WhatsAppEscalator(BaseSubscriber):
             text = silence_alert_body(p)
         elif et == EventType.AGENT_FAILURE_CLUSTER:
             text = failure_cluster_body(p)
+        elif et == EventType.CONTAINER_CRASH_LOOP:
+            text = container_crash_loop_body(p)
         elif et == EventType.BOOT_SUMMARY:
             # Only reachable via an explicit --priority critical emit (WARN
             # pages at CRITICAL); the scalar fallback would silently DROP

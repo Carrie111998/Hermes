@@ -525,6 +525,10 @@ class TelegramNotifier(BaseSubscriber):
             from events.formatting import watchdog_self_degraded_body
             return watchdog_self_degraded_body(p)
 
+        if et == EventType.CONTAINER_CRASH_LOOP:
+            from events.formatting import container_crash_loop_body
+            return container_crash_loop_body(p)
+
         if et == EventType.AGENT_FAILURE_CLUSTER:
             from events.formatting import failure_cluster_body
             return failure_cluster_body(p)

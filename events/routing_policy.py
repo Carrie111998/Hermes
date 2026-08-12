@@ -201,6 +201,12 @@ _POLICY: Dict[EventType, _Spec] = {
     _E.WATCHDOG_RECOVERED: _Spec(Attention.TRACE, ALERTS),
     _E.WATCHDOG_SELF_DEGRADED: _Spec(Attention.WARN, ALERTS),  # hook: blackout → security
     _E.WATCHDOG_DAILY: _Spec(Attention.INFO, ALERTS),
+    # A container burning restarts is broken even when the tray currently reads
+    # GREEN — laptop-monitor's churn verdict is a per-pass delta that self-clears
+    # 600s after the last restart, so bursts recover before anyone looks (the
+    # 2026-08-12 hindsight-app postmortem). WARN + urgent so it survives
+    # significant_only and reaches the phone; never batched.
+    _E.CONTAINER_CRASH_LOOP: _Spec(Attention.WARN, ALERTS, wa=WA_URGENT),
     _E.BACKEND_CONTRACT_DRIFT: _Spec(Attention.WARN, SECURITY),
     # ----- critic domain ---------------------------------------------
     _E.CRITIC_PROPOSAL: _Spec(Attention.INFO, CRITIC),

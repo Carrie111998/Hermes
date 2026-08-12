@@ -1094,6 +1094,33 @@ class TestHumanReadableMessages:
         assert "watchdog_type" not in msg
         assert "Details in Telegram" in msg
 
+    def test_container_crash_loop_message_is_readable(self, bus, quiet_config,
+                                                      queue_path):
+        """The 2026-08-12 hindsight-app payload must page as English, not JSON.
+
+        The body has one job beyond readability: warn that the tray row reads
+        GREEN. A container that loops in bursts is healthy at most samples, so
+        an alert that omits this reads as stale on arrival.
+        """
+        escalator = self._escalator(bus, quiet_config, queue_path)
+        event = Event.create(
+            EventType.CONTAINER_CRASH_LOOP, "watchdog",
+            {"watchdog_type": "container_crash_loop",
+             "container": "hindsight-app", "restarts_24h": 266,
+             "restart_count_now": 266, "threshold": 20,
+             "tray_state": "healthy", "tray_tier": "important",
+             "tray_detail": "running, RestartCount stable (266), up 902s"},
+            priority=Priority.HIGH,
+        )
+        msg = escalator.format_message(event)
+        assert "hindsight-app" in msg
+        assert "266" in msg
+        assert "CONTAINER CRASH-LOOPING" in msg       # plain header title
+        assert "CONTAINER_CRASH_LOOP" not in msg      # no enum jargon
+        assert "{" not in msg and "}" not in msg      # no raw JSON
+        assert "watchdog_type" not in msg
+        assert "HEALTHY" in msg, "must say the row currently reads green"
+
     def test_silence_alert_message_is_readable(self, bus, quiet_config, queue_path):
         escalator = self._escalator(bus, quiet_config, queue_path)
         event = Event.create(
