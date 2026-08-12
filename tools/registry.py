@@ -275,6 +275,11 @@ def _prune_check_fn_caches(now: float) -> None:
     for key, (timestamp, _) in list(_check_fn_cache.items()):
         if now - timestamp >= _CHECK_FN_TTL_SECONDS:
             _check_fn_cache.pop(key, None)
+    # NOTE: _check_fn_last_verdict deliberately survives the cache TTL — the
+    # whole point is comparing the NEXT effective verdict against the previous
+    # one; pruning it here would erase the baseline and mute the generation
+    # bump on the very change the outer layers need to observe. The MAX cap
+    # below bounds its memory.
     for key, timestamp in list(_check_fn_last_good.items()):
         if now - timestamp >= _CHECK_FN_FAILURE_GRACE_SECONDS:
             _check_fn_last_good.pop(key, None)
@@ -338,6 +343,7 @@ def _check_fn_cached(fn: Callable) -> bool:
         if cached is not None:
             ts, value = cached
             if now - ts < _CHECK_FN_TTL_SECONDS:
+                registry._record_check_fn_verdict(cache_key, value)
                 return value
 
     raised = False
@@ -352,6 +358,7 @@ def _check_fn_cached(fn: Callable) -> bool:
         if value:
             _check_fn_last_good[cache_key] = now
             _check_fn_cache[cache_key] = (now, True)
+            registry._record_check_fn_verdict(cache_key, True)
             return True
 
         last_good = _check_fn_last_good.get(cache_key)
@@ -366,6 +373,7 @@ def _check_fn_cached(fn: Callable) -> bool:
                 "raised" if raised else "returned False",
                 _CHECK_FN_FAILURE_GRACE_SECONDS,
             )
+            registry._record_check_fn_verdict(cache_key, True)
             return True
 
         # No recent success (or grace expired) — honor the failure. Log it so
@@ -376,6 +384,7 @@ def _check_fn_cached(fn: Callable) -> bool:
             "raised" if raised else "returned False",
         )
         _check_fn_cache[cache_key] = (now, False)
+        registry._record_check_fn_verdict(cache_key, False)
         return False
 
 
@@ -434,6 +443,24 @@ class ToolRegistry:
         # against it: a cache entry keyed on the generation is valid for as
         # long as the generation hasn't changed.
         self._generation: int = 0
+        # check_fn verdict generation: bumped whenever any check_fn's
+        # EFFECTIVE verdict flips (tool comes up or goes down). Outer memo
+        # layers (get_tool_definitions) key on it so availability changes
+        # rebuild instead of serving a stale toolset for the process
+        # lifetime (#84726). Last effective verdict per (fn, scope) is the
+        # baseline for the flip comparison.
+        self._check_fn_generation: int = 0
+        self._check_fn_last_verdict: Dict[tuple, Optional[bool]] = {}
+
+    def _record_check_fn_verdict(self, cache_key, value: bool) -> None:
+        """Register the served verdict; bump the generation on a change.
+
+        Caller must hold ``_check_fn_cache_lock``.
+        """
+        prev = self._check_fn_last_verdict.get(cache_key)
+        if prev is not None and prev != value:
+            self._check_fn_generation += 1
+        self._check_fn_last_verdict[cache_key] = value
 
     def _snapshot_state(self) -> tuple[List[ToolEntry], Dict[str, Callable]]:
         """Return a coherent snapshot of registry entries and toolset checks."""

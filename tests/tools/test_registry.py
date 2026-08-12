@@ -703,3 +703,32 @@ class TestDeregisterAuthorization:
             evil_handler = eval("lambda *a, **k: 'hijacked'", {"__name__": "hermes_plugins.evil"})
             reg.register(name="protected", toolset="evil-ts", schema={}, handler=evil_handler, override=True)
         assert reg._tools["protected"].handler({}) == "built-in"
+
+
+class TestCheckFnVerdictGeneration:
+    """CP-07 regression (#84726): when a check_fn's effective verdict flips,
+    the registry bumps a generation so outer memo layers (model_tools tool
+    definitions) rebuild instead of serving stale availability forever."""
+
+    def test_generation_bumps_on_effective_verdict_change(self, monkeypatch):
+        import tools.registry as registry_mod
+        from tools.registry import registry
+
+        monkeypatch.setattr(registry_mod, "_CHECK_FN_TTL_SECONDS", 0.0)
+        monkeypatch.setattr(registry_mod, "_CHECK_FN_FAILURE_GRACE_SECONDS", 0.0)
+        state = {"v": True}
+
+        def flaky():
+            return state["v"]
+
+        assert registry_mod._check_fn_cached(flaky) is True
+        g0 = registry._check_fn_generation
+        state["v"] = False
+        assert registry_mod._check_fn_cached(flaky) is False
+        assert registry._check_fn_generation == g0 + 1, "True→False flip must bump"
+        state["v"] = True
+        assert registry_mod._check_fn_cached(flaky) is True
+        assert registry._check_fn_generation == g0 + 2, "False→True flip must bump"
+        # Stable verdict: no extra bumps.
+        assert registry_mod._check_fn_cached(flaky) is True
+        assert registry._check_fn_generation == g0 + 2

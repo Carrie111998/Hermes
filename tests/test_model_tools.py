@@ -509,3 +509,34 @@ class TestDisabledToolsetsPostureToolset:
             )
         }
         assert "write_file" not in no_file
+
+
+class TestToolDefsCacheCheckFnGeneration:
+    def test_outer_cache_misses_when_check_fn_generation_changes(self, monkeypatch):
+        """Regression for #84726: the outer tool-definitions memo key must
+        include the registry's check_fn verdict generation, so a tool that
+        comes up or goes down is re-resolved on the next call."""
+        import model_tools as mt
+        from tools.registry import registry
+
+        calls = {"n": 0}
+        orig = mt._compute_tool_definitions
+
+        def counting(*a, **k):
+            calls["n"] += 1
+            return orig(*a, **k)
+
+        monkeypatch.setattr(mt, "_compute_tool_definitions", counting)
+        mt._tool_defs_cache.clear()
+        try:
+            mt.get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True)
+            assert calls["n"] == 1
+            # Warm hit: no rebuild.
+            mt.get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True)
+            assert calls["n"] == 1
+            # A check_fn verdict flip bumps the generation → next call rebuilds.
+            registry._check_fn_generation += 1
+            mt.get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True)
+            assert calls["n"] == 2, "outer cache must miss after a verdict change"
+        finally:
+            mt._tool_defs_cache.clear()

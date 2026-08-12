@@ -349,6 +349,12 @@ def get_tool_definitions(
                 frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
                 frozenset(disabled_toolsets) if disabled_toolsets else None,
                 registry._generation,
+                # check_fn verdict generation: bumped by the registry whenever
+                # any check_fn's EFFECTIVE verdict flips (tool comes up or
+                # goes down), so the outer memo re-resolves availability
+                # instead of serving a stale toolset for the process
+                # lifetime. (#84726)
+                registry._check_fn_generation,
                 cfg_fp,
                 bool(os.environ.get("HERMES_KANBAN_TASK")),
                 bool(skip_tool_search_assembly),
