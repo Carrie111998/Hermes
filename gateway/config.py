@@ -636,10 +636,11 @@ PLATFORM_TOKEN_ENV_NAMES: dict["Platform", str] = {
 
 
 MAX_LOADING_MESSAGES = 10
+_LOADING_MESSAGES_UNSET = object()
 
 
 def _validate_loading_messages(value: Any) -> Optional[List[str]]:
-    if value is None:
+    if value is _LOADING_MESSAGES_UNSET:
         return None
     if not isinstance(value, list) or not 1 <= len(value) <= MAX_LOADING_MESSAGES:
         raise ValueError("loading_messages must contain between 1 and 10 strings")
@@ -748,9 +749,13 @@ class PlatformConfig:
         if _typing_text is None:
             _typing_text = extra.get("typing_status_text")
 
-        _loading_messages = data.get("loading_messages")
-        if _loading_messages is None:
-            _loading_messages = extra.get("loading_messages")
+        _loading_messages = data.get(
+            "loading_messages", _LOADING_MESSAGES_UNSET
+        )
+        if _loading_messages is _LOADING_MESSAGES_UNSET:
+            _loading_messages = extra.get(
+                "loading_messages", _LOADING_MESSAGES_UNSET
+            )
         _loading_messages = _validate_loading_messages(_loading_messages)
 
         channel_overrides: Dict[str, ChannelOverride] = {}
@@ -1166,9 +1171,10 @@ class GatewayConfig:
                 continue
             try:
                 platform = Platform(platform_name)
-                platforms[platform] = PlatformConfig.from_dict(platform_data)
             except ValueError:
                 pass  # Skip unknown platforms
+            else:
+                platforms[platform] = PlatformConfig.from_dict(platform_data)
         
         reset_by_type = {}
         for type_name, policy_data in _coerce_dict(data.get("reset_by_type", {})).items():
