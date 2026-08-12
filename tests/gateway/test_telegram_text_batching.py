@@ -58,6 +58,37 @@ def _make_event(text: str, chat_id: str = "12345") -> MessageEvent:
     )
 
 
+async def _drain_delivery_tasks(*task_maps) -> None:
+    """Await the adapter's scheduled delivery tasks instead of racing a sleep.
+
+    Text, photo and media-group bursts are all dispatched from a background
+    task that first sleeps its configured delay.  These tests used to wait for
+    that with ``await asyncio.sleep(0.2)`` against a 0.1s delay -- nominally a
+    2x margin, but a 0.1s flush is observed completing in ~0.22s on this box
+    even when idle, because the task still needs loop turns after its deadline
+    to finish dispatching.  The margin was already negative; a loaded box just
+    makes it obvious, as "Expected 'handle_message' to have been called once".
+
+    The disconnect tests need this just as much as the happy path: their
+    ``assert adapter._pending_text_batch_tasks == {}`` only holds once the
+    flush task has actually run, seen ``_should_drop_delayed_delivery()`` and
+    popped its own key.  Draining strengthens their ``assert_not_called()``
+    too -- a task that wrongly dispatches is awaited here rather than raced.
+
+    Snapshot the values first: each flush pops its own key in a ``finally``,
+    which would otherwise raise "dictionary changed size during iteration".
+    ``return_exceptions=True`` keeps this a wait and not an assertion --
+    superseded and disconnected tasks are cancelled by design, and the sleep
+    it replaces never raised either.
+
+    Deliberately no fallback when a map is empty -- if nothing was scheduled,
+    the caller's assertion must still stand on its own.
+    """
+    tasks = tuple(t for task_map in task_maps for t in task_map.values())
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 class TestTextBatching:
     @pytest.mark.asyncio
     async def test_single_message_dispatched_after_delay(self):
@@ -70,7 +101,7 @@ class TestTextBatching:
         adapter.handle_message.assert_not_called()
 
         # Wait for flush
-        await asyncio.sleep(0.2)
+        await _drain_delivery_tasks(adapter._pending_text_batch_tasks)
 
         adapter.handle_message.assert_called_once()
         dispatched = adapter.handle_message.call_args[0][0]
@@ -82,14 +113,14 @@ class TestTextBatching:
         adapter = _make_adapter()
 
         adapter._enqueue_text_event(_make_event("This is part one of a long"))
-        await asyncio.sleep(0.02)  # small gap, within batch window
+        await asyncio.sleep(0)  # same batch window, no wall-clock gap
         adapter._enqueue_text_event(_make_event("message that was split by Telegram."))
 
         # Not dispatched yet (timer restarted)
         adapter.handle_message.assert_not_called()
 
         # Wait for flush
-        await asyncio.sleep(0.2)
+        await _drain_delivery_tasks(adapter._pending_text_batch_tasks)
 
         adapter.handle_message.assert_called_once()
         dispatched = adapter.handle_message.call_args[0][0]
@@ -102,12 +133,12 @@ class TestTextBatching:
         adapter = _make_adapter()
 
         adapter._enqueue_text_event(_make_event("chunk 1"))
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0)  # let the first flush task start
         adapter._enqueue_text_event(_make_event("chunk 2"))
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0)  # let the second flush task start
         adapter._enqueue_text_event(_make_event("chunk 3"))
 
-        await asyncio.sleep(0.2)
+        await _drain_delivery_tasks(adapter._pending_text_batch_tasks)
 
         adapter.handle_message.assert_called_once()
         text = adapter.handle_message.call_args[0][0].text
@@ -123,7 +154,7 @@ class TestTextBatching:
         adapter._enqueue_text_event(_make_event("from user A", chat_id="111"))
         adapter._enqueue_text_event(_make_event("from user B", chat_id="222"))
 
-        await asyncio.sleep(0.2)
+        await _drain_delivery_tasks(adapter._pending_text_batch_tasks)
 
         assert adapter.handle_message.call_count == 2
 
@@ -133,7 +164,7 @@ class TestTextBatching:
         adapter = _make_adapter()
 
         adapter._enqueue_text_event(_make_event("test"))
-        await asyncio.sleep(0.2)
+        await _drain_delivery_tasks(adapter._pending_text_batch_tasks)
 
         assert len(adapter._pending_text_batches) == 0
         assert len(adapter._pending_text_batch_tasks) == 0
@@ -175,7 +206,7 @@ class TestTextBatching:
         assert _key("1") not in adapter._pending_text_batches
         assert event.source.thread_id == "222"
 
-        await asyncio.sleep(0.2)
+        await _drain_delivery_tasks(adapter._pending_text_batch_tasks)
 
         adapter.handle_message.assert_called_once()
         dispatched = adapter.handle_message.call_args[0][0]
@@ -188,7 +219,7 @@ class TestTextBatching:
 
         adapter._enqueue_text_event(_make_event("stale text"))
         await adapter.disconnect()
-        await asyncio.sleep(0.2)
+        await _drain_delivery_tasks(adapter._pending_text_batch_tasks)
 
         adapter.handle_message.assert_not_called()
         assert adapter._pending_text_batches == {}
@@ -201,7 +232,7 @@ class TestTextBatching:
 
         adapter._enqueue_text_event(_make_event("stale text"))
         adapter._mark_disconnected()
-        await asyncio.sleep(0.2)
+        await _drain_delivery_tasks(adapter._pending_text_batch_tasks)
 
         adapter.handle_message.assert_not_called()
         assert adapter._pending_text_batches == {}
@@ -214,7 +245,7 @@ class TestTextBatching:
         adapter._mark_disconnected()
 
         adapter._enqueue_text_event(_make_event("late text"))
-        await asyncio.sleep(0.2)
+        await _drain_delivery_tasks(adapter._pending_text_batch_tasks)
 
         adapter.handle_message.assert_not_called()
         assert adapter._pending_text_batches == {}
@@ -231,7 +262,7 @@ class TestTextBatching:
 
         adapter._enqueue_photo_event("chat:photo-burst", event)
         adapter._mark_disconnected()
-        await asyncio.sleep(0.2)
+        await _drain_delivery_tasks(adapter._pending_photo_batch_tasks)
 
         adapter.handle_message.assert_not_called()
         assert adapter._pending_photo_batches == {}
@@ -250,7 +281,7 @@ class TestTextBatching:
         with patch.object(TelegramAdapter, "MEDIA_GROUP_WAIT_SECONDS", 0.1):
             await adapter._queue_media_group_event("album-1", event)
             adapter._mark_disconnected()
-            await asyncio.sleep(0.2)
+            await _drain_delivery_tasks(adapter._media_group_tasks)
 
         adapter.handle_message.assert_not_called()
         assert adapter._media_group_events == {}

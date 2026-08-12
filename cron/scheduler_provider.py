@@ -209,7 +209,24 @@ class InProcessCronScheduler(CronScheduler):
 
         logger = logging.getLogger("cron.scheduler_provider")
         logger.info("In-process cron scheduler started (interval=%ds)", interval)
-        recovered = self.recover_interrupted()
+        # Startup-phase recovery must NEVER be able to kill this thread. It runs
+        # BEFORE the tick loop, so the loop's own `except BaseException` guard
+        # does not cover it — on 2026-08-11 a transiently half-applied checkout
+        # made this raise ImportError, the daemon thread died before its first
+        # tick, and the gateway ran for 5h08m with NO scheduler while logging a
+        # clean "In-process cron scheduler started" line one statement earlier.
+        # Zero of 69 jobs fired. A failed recovery pass only costs interrupted
+        # runs their `unknown` stamp; losing the ticker stops cron entirely, so
+        # degrade to the former and always enter the loop.
+        try:
+            recovered = self.recover_interrupted()
+        except BaseException as e:
+            logger.error(
+                "Cron startup recovery failed — continuing WITHOUT it so the "
+                "ticker still runs (interrupted runs keep their stale status): %s",
+                e, exc_info=True,
+            )
+            recovered = 0
         if recovered:
             logger.warning(
                 "Marked %d interrupted cron execution(s) unknown after restart",

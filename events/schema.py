@@ -36,17 +36,46 @@ class Priority(Enum):
 class EventType(Enum):
     """Catalog of all event types emitted by the Hermes Event Bus.
 
-    Each member is a tuple of (event_type_string, default_priority).
+    Each member is a tuple of (event_type_string, default_priority, icon).
 
-    ADDING A MEMBER IS NOT A ONE-FILE CHANGE. Every member also needs an entry
-    in the sibling tables contracted to be total over this enum:
+    The icon is a REQUIRED member field, on purpose
+    -----------------------------------------------
+    It used to live in a parallel ``EVENT_TYPE_EMOJI`` dict in
+    events/formatting.py, which drifted out of sync with this enum FOUR times
+    (2026-04-27 twice, 2026-05-29, 2026-08-11). Each time a member landed with
+    complete schema + routing_policy entries but no icon, ``event_icon()``
+    returned "" and the event rendered in Telegram with a double-space gap in
+    the header. The last one hid all twelve DevFlow Delegation Plane types for
+    five days.
 
-        events/formatting.py    EVENT_TYPE_EMOJI  (the notification icon)
+    Nothing caught it earlier: ruff F601/F602 structurally cannot see it (the
+    dict keys were EventType attribute accesses, not string literals), and a
+    test only fires after the member has already landed on a branch.
+
+    Making the icon a required member field removes the failure mode instead of
+    detecting it: "an EventType with no icon" is now unrepresentable. Omitting
+    the third element is a TypeError at class-creation time, so ``import
+    events.schema`` fails outright — and every producer imports events.schema,
+    not events.formatting, which is exactly why the old placement let authors
+    ship green. Passing "" or "   " is the ValueError in ``__init__`` below.
+    Neither can be bypassed by ``--no-verify`` or by a path that never runs
+    pre-commit. ``EVENT_TYPE_EMOJI`` is now a read-only view derived from this
+    enum; there is no second table to keep in sync.
+
+    Adding a member? Pick a glyph disjoint from its neighbours in the same
+    Telegram topic, and put the rationale for any non-obvious pick in a comment
+    right above the member.
+
+    STILL NOT A ONE-FILE CHANGE. The routing table is a separate, genuinely
+    partial table and is NOT enforced here — ``classify()`` degrades to
+    WARN-on-watchdog_alerts for an unmapped type by design, and turning that
+    into an import-time raise would trade a cosmetic routing defect for a
+    gateway that will not boot. So it stays a check rather than a constructor
+    invariant:
+
         events/routing_policy.py _POLICY          (topic + WhatsApp tier)
 
-    Nothing in the language enforces that, and it has silently broken four
-    times (2026-04-27 twice, 2026-05-29, 2026-08-11). ruff cannot catch it:
-    the keys are attribute accesses, which F601/F602 do not reach. Run
+    Run
 
         python -m events.coverage
 
@@ -56,25 +85,25 @@ class EventType(Enum):
     """
 
     # Cron lifecycle
-    CRON_STARTED = ("cron_started", Priority.LOW)
+    CRON_STARTED = ("cron_started", Priority.LOW, "▶️")
     # Off-schedule trigger record — emitted by trigger_job() in cron/jobs.py
     # whenever a caller sets next_run_at = NOW (CLI `hermes cron run`, LLM
     # cronjob tool action="run", HTTP API trigger endpoint). Carries caller
     # + reason + previous/new next_run_at so off-schedule fires can be
     # attributed in postmortems. LOW priority => audit-logger captures it
     # but Telegram/WhatsApp routing leaves it out by default.
-    CRON_TRIGGERED = ("cron_triggered", Priority.LOW)
-    CRON_COMPLETED = ("cron_completed", Priority.NORMAL)
-    CRON_FAILED = ("cron_failed", Priority.HIGH)
-    CRON_FAILED_CONSECUTIVE = ("cron_failed_consecutive", Priority.CRITICAL)
-    CRON_STALE = ("cron_stale", Priority.HIGH)
+    CRON_TRIGGERED = ("cron_triggered", Priority.LOW, "👆")
+    CRON_COMPLETED = ("cron_completed", Priority.NORMAL, "✔️")
+    CRON_FAILED = ("cron_failed", Priority.HIGH, "💥")
+    CRON_FAILED_CONSECUTIVE = ("cron_failed_consecutive", Priority.CRITICAL, "🔥")
+    CRON_STALE = ("cron_stale", Priority.HIGH, "⌛")
     # Added 2026-04-30: emitted by cron/scheduler.py:tick() when a recurring
     # job is fast-forwarded past a missed fire window (gateway downtime
     # exceeded the catch-up grace, OR the job is opted out of fire-once via
     # recovery_policy="skip_only"). Spec: 2026-04-30-cron-restart-catchup-gap-design.md.
     # Distinct from CRON_SKIPPED_DUPLICATE below — that one is the concurrency-
     # guard reject; this one is the gateway-downtime miss.
-    CRON_SKIPPED = ("cron_skipped", Priority.HIGH)
+    CRON_SKIPPED = ("cron_skipped", Priority.HIGH, "💤")
     # Cron same-job concurrency guard -- added 2026-04-30 to close the
     # 2026-04-30 sentinel-vip-morning triple-fire (canonical case
     # event_id 4edcb4b1-aa07-4dbb-b799-8af167d4f92e). Emitted by the
@@ -87,7 +116,7 @@ class EventType(Enum):
     # where reason is one of:
     #   concurrent_fire_blocked      (prior is healthy, still running)
     #   prior_fire_exceeded_timeout  (prior is wedged-but-tracked)
-    CRON_SKIPPED_DUPLICATE = ("cron_skipped_duplicate", Priority.LOW)
+    CRON_SKIPPED_DUPLICATE = ("cron_skipped_duplicate", Priority.LOW, "⏭️")
     # Cron min-interval-since-last-fire guard (Guard #4) -- added
     # 2026-04-30 to close the SEQUENTIAL-burst gap left by Guard #3
     # (CRON_SKIPPED_DUPLICATE only catches CONCURRENT fires). The
@@ -104,38 +133,43 @@ class EventType(Enum):
     # Payload:
     #   job_id, job_name, last_run_at, elapsed_since_last_seconds,
     #   min_seconds_between_fires
-    CRON_SKIPPED_MIN_INTERVAL = ("cron_skipped_min_interval", Priority.LOW)
+    CRON_SKIPPED_MIN_INTERVAL = ("cron_skipped_min_interval", Priority.LOW, "⏳")
 
     # Job discovery & scoring
-    JOB_DISCOVERED = ("job_discovered", Priority.NORMAL)
-    JOB_SCORED = ("job_scored", Priority.NORMAL)
-    JOB_HIGH_SCORE = ("job_high_score", Priority.HIGH)
-    JOB_VIP_DISCOVERED = ("job_vip_discovered", Priority.HIGH)
+    JOB_DISCOVERED = ("job_discovered", Priority.NORMAL, "🎯")
+    JOB_SCORED = ("job_scored", Priority.NORMAL, "📊")
+    JOB_HIGH_SCORE = ("job_high_score", Priority.HIGH, "⭐")
+    JOB_VIP_DISCOVERED = ("job_vip_discovered", Priority.HIGH, "💎")
 
     # Tailoring & applications
-    TAILOR_COMPLETED = ("tailor_completed", Priority.NORMAL)
-    APPLICATION_READY = ("application_ready", Priority.HIGH)
-    APPLICATION_SUBMITTED = ("application_submitted", Priority.HIGH)
-    APPLICATION_FAILED = ("application_failed", Priority.CRITICAL)
-    APPLICATION_BLOCKED = ("application_blocked", Priority.CRITICAL)
+    TAILOR_COMPLETED = ("tailor_completed", Priority.NORMAL, "✍️")
+    APPLICATION_READY = ("application_ready", Priority.HIGH, "📋")
+    APPLICATION_SUBMITTED = ("application_submitted", Priority.HIGH, "✅")
+    APPLICATION_FAILED = ("application_failed", Priority.CRITICAL, "❌")
+    APPLICATION_BLOCKED = ("application_blocked", Priority.CRITICAL, "🚧")
 
     # Pipeline tracking
-    STAGE_TRANSITION = ("stage_transition", Priority.NORMAL)
-    INTERVIEW_SIGNAL = ("interview_signal", Priority.CRITICAL)
-    OFFER_SIGNAL = ("offer_signal", Priority.CRITICAL)
-    FOLLOWUP_DUE = ("followup_due", Priority.HIGH)
+    STAGE_TRANSITION = ("stage_transition", Priority.NORMAL, "➡️")
+    INTERVIEW_SIGNAL = ("interview_signal", Priority.CRITICAL, "🗓️")
+    OFFER_SIGNAL = ("offer_signal", Priority.CRITICAL, "💰")
+    FOLLOWUP_DUE = ("followup_due", Priority.HIGH, "⏰")
 
     # System
-    DIGEST_GENERATED = ("digest_generated", Priority.LOW)
-    GATEWAY_HEALTH = ("gateway_health", Priority.HIGH)
-    AGENT_ERROR = ("agent_error", Priority.HIGH)
-    MEMORY_CONSOLIDATED = ("memory_consolidated", Priority.LOW)
-    SKILL_EVOLVED = ("skill_evolved", Priority.LOW)
-    MAILBOX_MESSAGE = ("mailbox_message", Priority.LOW)
-    USER_INBOUND_MESSAGE = ("user_inbound_message", Priority.NORMAL)
+    DIGEST_GENERATED = ("digest_generated", Priority.LOW, "📝")
+    GATEWAY_HEALTH = ("gateway_health", Priority.HIGH, "🛰️")
+    AGENT_ERROR = ("agent_error", Priority.HIGH, "⚠️")
+    MEMORY_CONSOLIDATED = ("memory_consolidated", Priority.LOW, "🧠")
+    SKILL_EVOLVED = ("skill_evolved", Priority.LOW, "🚀")
+    MAILBOX_MESSAGE = ("mailbox_message", Priority.LOW, "📨")
+    USER_INBOUND_MESSAGE = ("user_inbound_message", Priority.NORMAL, "💬")
 
     # Security
-    SECRET_DETECTED = ("secret_detected", Priority.HIGH)
+    # Icon: padlock, because (a) no existing icon conflicts and (b) operators
+    # scanning the Security topic need a visual hook distinct from the generic
+    # HIGH dot. Added 2026-04-19 per SR-408 post-flood remediation — before it
+    # existed the header rendered with a double-space gap that swam in a noisy
+    # feed.
+    SECRET_DETECTED = ("secret_detected", Priority.HIGH, "🔐")
     # Credential/infra loss detected by the laptop-monitor watchdog sweep
     # (2026-07-10, R70 alert-gap fix). A curated allowlist of probes (WhatsApp
     # session creds, the ENOSPC 0-byte credential/config sweep, OAuth token
@@ -146,11 +180,13 @@ class EventType(Enum):
     # hours. Closes the 2026-07-10 02:44 WhatsApp-creds-zeroing miss where the
     # burst-coalesced, URGENT-tier, quiet-hours-queued signal never woke Diego.
     # See memory whatsapp_session_zeroed_repair_pending.md.
-    CREDENTIAL_LOSS = ("credential_loss", Priority.CRITICAL)
+    # Icon: key = a credential is gone; deliberately distinct from the padlock
+    # on SECRET_DETECTED, which is a secret being *found*.
+    CREDENTIAL_LOSS = ("credential_loss", Priority.CRITICAL, "🔑")
 
     # Phase B Stage-3 iter2 (HITL + apply + tracker -> Postgres)
-    APPROVAL_REQUEST = ("approval_request", Priority.HIGH)
-    APPLY_PACKET = ("apply_packet", Priority.NORMAL)
+    APPROVAL_REQUEST = ("approval_request", Priority.HIGH, "🙋")
+    APPLY_PACKET = ("apply_packet", Priority.NORMAL, "📦")
 
     # Tailor structured iteration event — added 2026-04-29 (plan
     # 2026-04-29-tailor-structured-iteration-event). Emitted by the
@@ -159,7 +195,7 @@ class EventType(Enum):
     # "nothing to do" from "something is broken" — a discrimination
     # the existing `[SILENT]` marker cannot make. Bus-only metadata;
     # the human-readable Telegram pathway is unchanged.
-    TAILOR_ITERATION = ("tailor_iteration", Priority.LOW)
+    TAILOR_ITERATION = ("tailor_iteration", Priority.LOW, "✂️")
 
     # Generic per-agent iteration summary event — added 2026-04-30 to
     # extend the TAILOR_ITERATION pattern to every cron-driven agent
@@ -177,16 +213,34 @@ class EventType(Enum):
     # telegram_notifier.py) so jobflow agents land in jobflow_firehose,
     # platform agents in their own topics. LOW priority => batched 5-min
     # coalescing window keeps volume bounded.
-    AGENT_ITERATION = ("agent_iteration", Priority.LOW)
+    AGENT_ITERATION = ("agent_iteration", Priority.LOW, "🔁")
 
     # Phase C iter2 (Critic proposals routed to WhatsApp/Telegram)
-    CRITIC_PROPOSAL = ("critic_proposal", Priority.NORMAL)
+    CRITIC_PROPOSAL = ("critic_proposal", Priority.NORMAL, "🧐")
     # Critic auto-apply event — added 2026-04-29 (consolidation phase C).
     # Emitted by auto_applier.apply_decision after a successful mutation +
     # changelog write. Existing TOPIC_ROUTING in telegram_notifier.py already
     # routes critic_auto_applied -> critic_proposals topic; this enum entry
     # makes the event actually emittable via EventType.from_string().
-    CRITIC_AUTO_APPLIED = ("critic_auto_applied", Priority.NORMAL)
+    # ✅ COLLISION VERDICT (settled 2026-08-11 — do NOT re-open):
+    #   ✅ is also APPLICATION_SUBMITTED's. This is DRIFT, not design:
+    #   fa9915e07 added this entry purely to close a coverage gap ("Additions
+    #   only"), and its verification line names test_event_icons_cover_all_types
+    #   only — never a uniqueness check. Compare SECRET_DETECTED above, where the
+    #   author explicitly recorded "no existing icon conflicts"; that sentence is
+    #   absent here because nobody looked.
+    #   It is nonetheless LEGAL and is being KEPT: the standard is per-topic
+    #   (see the EventType docstring — "disjoint from its neighbours in the same
+    #   Telegram topic"), and these two land in different lanes —
+    #   application_submitted -> JOBFLOW, critic_auto_applied -> CRITIC
+    #   (events/routing_policy.py). No operator sees both ✅ in one feed, which
+    #   is exactly what test_event_icons_are_unique_within_a_telegram_topic
+    #   asserts — it permits this pair on purpose.
+    #   If a future change ever makes it worth de-duping, CRITIC_AUTO_APPLIED is
+    #   the safer target (narrower audience) — but these glyphs are operator-
+    #   facing muscle memory, so ASK DIEGO before changing one.
+    #   Contrast 🟢 (GATEWAY_STARTED, below): that cross-topic dupe IS deliberate.
+    CRITIC_AUTO_APPLIED = ("critic_auto_applied", Priority.NORMAL, "✅")
 
     # Watchdog signals — added 2026-04-25 (iter5).
     # Previously these were emitted via _emit_event()'s AGENT_ERROR fallback
@@ -196,8 +250,8 @@ class EventType(Enum):
     # emitted more AGENT_ERRORs -> next sweep saw a bigger cluster -> ...).
     # Promoting them to first-class EventType members removes the
     # source=watchdog hack downstream.
-    WATCHDOG_TICK = ("watchdog_tick", Priority.LOW)
-    WATCHDOG_PROBE_TRANSITION = ("watchdog_probe_transition", Priority.HIGH)
+    WATCHDOG_TICK = ("watchdog_tick", Priority.LOW, "💓")
+    WATCHDOG_PROBE_TRANSITION = ("watchdog_probe_transition", Priority.HIGH, "🔄")
     # Coalesced form of N>=5 simultaneous probe transitions emitted by the
     # watchdog sweep. Payload schema:
     #   {
@@ -207,10 +261,10 @@ class EventType(Enum):
     #   }
     # Added 2026-04-28 after Docker-crash -> 22-event WAL-lock flood incident.
     # See docs/superpowers/plans/2026-04-28-watchdog-burst-coalesce-and-ack-dead-letter.md
-    WATCHDOG_BURST = ("watchdog_burst", Priority.HIGH)
-    WATCHDOG_SILENCE_ALERT = ("watchdog_silence_alert", Priority.HIGH)
-    WATCHDOG_RECOVERED = ("watchdog_recovered", Priority.NORMAL)
-    WATCHDOG_SELF_DEGRADED = ("watchdog_self_degraded", Priority.HIGH)
+    WATCHDOG_BURST = ("watchdog_burst", Priority.HIGH, "🌊")
+    WATCHDOG_SILENCE_ALERT = ("watchdog_silence_alert", Priority.HIGH, "🔕")
+    WATCHDOG_RECOVERED = ("watchdog_recovered", Priority.NORMAL, "💚")
+    WATCHDOG_SELF_DEGRADED = ("watchdog_self_degraded", Priority.HIGH, "🤕")
     # Once-per-day aggregate health heartbeat — added 2026-04-30. Diego's
     # B9 visibility-restoration ask: per-failure events already cover "fire
     # when something breaks"; the missing half is a 7am ET heartbeat with
@@ -222,24 +276,28 @@ class EventType(Enum):
     # alongside HIGH+ failure-fires for operators who want both without LOW
     # chatter. Emit logic lives in ~/.hermes/profiles/watchdog/workspace/
     # watchdog_sweep.py (snapshot-anchored to last_daily_summary_emitted).
-    WATCHDOG_DAILY = ("watchdog_daily", Priority.NORMAL)
-    AGENT_FAILURE_CLUSTER = ("agent_failure_cluster", Priority.HIGH)
+    # Icon: the stethoscope picks up the existing health-theme set (💓 tick,
+    # 🤕 self-degraded, 💚 recovered) while staying visually distinct from the
+    # per-failure signals, so an operator scanning watchdog_alerts can spot the
+    # once-a-day summary at a glance.
+    WATCHDOG_DAILY = ("watchdog_daily", Priority.NORMAL, "🩺")
+    AGENT_FAILURE_CLUSTER = ("agent_failure_cluster", Priority.HIGH, "🌪️")
 
     # Curator nightly consolidation -- added 2026-04-26.
     # Emitted by curator.orchestrator after backfill / nightly delta
     # passes. Consumed by Scribe (morning digest) and the memory-writer
     # subscriber for cursor advance.
-    CURATOR_DAILY = ("curator_daily", Priority.NORMAL)
+    CURATOR_DAILY = ("curator_daily", Priority.NORMAL, "📚")
 
     # DevFlow bridge -- added 2026-04-26.
     # Emitted by the devflow profile (see ~/.hermes/profiles/devflow/SOUL.md
     # emit-hooks section) and consumed by ~/.hermes/bridges/hermes_to_devflow.py
     # which projects them into DevFlow Postgres so Mission Control UI :3040
     # reflects live agent activity.
-    DEVFLOW_RUN_STARTED = ("devflow.run_started", Priority.NORMAL)
-    DEVFLOW_RUN_COMPLETED = ("devflow.run_completed", Priority.NORMAL)
-    DEVFLOW_APPROVAL_REQUESTED = ("devflow.approval_requested", Priority.HIGH)
-    DEVFLOW_TRACE_SNAPSHOT = ("devflow.trace_snapshot", Priority.LOW)
+    DEVFLOW_RUN_STARTED = ("devflow.run_started", Priority.NORMAL, "🏃")
+    DEVFLOW_RUN_COMPLETED = ("devflow.run_completed", Priority.NORMAL, "🏁")
+    DEVFLOW_APPROVAL_REQUESTED = ("devflow.approval_requested", Priority.HIGH, "🗳️")
+    DEVFLOW_TRACE_SNAPSHOT = ("devflow.trace_snapshot", Priority.LOW, "📷")
 
     # DevFlow PR + build telemetry -- added 2026-04-30 (visibility-restoration
     # B11 item 2-3). Surfaces SDLC activity in the devflow_firehose and
@@ -248,13 +306,13 @@ class EventType(Enum):
     # are deferred -- see events/producers/devflow_pr_build.py for emitter
     # helpers any future poller / webhook receiver / manual trigger can
     # call. Spec at docs/superpowers/specs/2026-04-30-devflow-pr-build-events.md.
-    DEVFLOW_PR_OPENED = ("devflow.pr_opened", Priority.NORMAL)
-    DEVFLOW_PR_MERGED = ("devflow.pr_merged", Priority.HIGH)
-    DEVFLOW_PR_CLOSED = ("devflow.pr_closed", Priority.NORMAL)
-    DEVFLOW_PR_REVIEW_REQUESTED = ("devflow.pr_review_requested", Priority.HIGH)
-    DEVFLOW_BUILD_STARTED = ("devflow.build_started", Priority.LOW)
-    DEVFLOW_BUILD_SUCCEEDED = ("devflow.build_succeeded", Priority.NORMAL)
-    DEVFLOW_BUILD_FAILED = ("devflow.build_failed", Priority.HIGH)
+    DEVFLOW_PR_OPENED = ("devflow.pr_opened", Priority.NORMAL, "🔃")
+    DEVFLOW_PR_MERGED = ("devflow.pr_merged", Priority.HIGH, "🟣")
+    DEVFLOW_PR_CLOSED = ("devflow.pr_closed", Priority.NORMAL, "🚫")
+    DEVFLOW_PR_REVIEW_REQUESTED = ("devflow.pr_review_requested", Priority.HIGH, "👀")
+    DEVFLOW_BUILD_STARTED = ("devflow.build_started", Priority.LOW, "🔨")
+    DEVFLOW_BUILD_SUCCEEDED = ("devflow.build_succeeded", Priority.NORMAL, "🟢")
+    DEVFLOW_BUILD_FAILED = ("devflow.build_failed", Priority.HIGH, "🧨")
 
     # DevFlow Delegation Plane (DDP) lifecycle -- added 2026-08-06. Stage 1
     # control plane of the delegation design (spec:
@@ -267,18 +325,29 @@ class EventType(Enum):
     # (LOW so they batch quietly), while declined is NORMAL (a real decision
     # worth surfacing); merge/deploy members land in Stage 2/3 but are
     # registered now so the routing table is total.
-    DEVFLOW_WORK_REQUESTED = ("devflow.work_requested", Priority.NORMAL)
-    DEVFLOW_WORK_TRIAGED = ("devflow.work_triaged", Priority.NORMAL)
-    DEVFLOW_WORK_PLANNED = ("devflow.work_planned", Priority.NORMAL)
-    DEVFLOW_WORK_DUPLICATE = ("devflow.work_duplicate", Priority.LOW)
-    DEVFLOW_WORK_DECLINED = ("devflow.work_declined", Priority.NORMAL)
-    DEVFLOW_WORK_SUPPRESSED = ("devflow.work_suppressed", Priority.LOW)
-    DEVFLOW_MERGE_PENDING = ("devflow.merge_pending", Priority.HIGH)
-    DEVFLOW_MERGED = ("devflow.merged", Priority.HIGH)
-    DEVFLOW_AUTO_MERGED = ("devflow.auto_merged", Priority.HIGH)
-    DEVFLOW_DEPLOY_STARTED = ("devflow.deploy_started", Priority.NORMAL)
-    DEVFLOW_DEPLOYED = ("devflow.deployed", Priority.NORMAL)
-    DEVFLOW_DEPLOY_FAILED = ("devflow.deploy_failed", Priority.HIGH)
+    # Icons for this block are deliberately disjoint from the PR/build set above
+    # so an operator scanning devflow_firehose can tell a *delegation* signal
+    # from an *SDLC* one: 🎫 work arrives, 🏷️ triaged, 🗺️ planned. The two
+    # flood-control outcomes read as 'nothing new' (👯 dupe, 🔇 suppressed) and
+    # stay visually quieter than 🙅, which is a real decision.
+    DEVFLOW_WORK_REQUESTED = ("devflow.work_requested", Priority.NORMAL, "🎫")
+    DEVFLOW_WORK_TRIAGED = ("devflow.work_triaged", Priority.NORMAL, "🏷️")
+    DEVFLOW_WORK_PLANNED = ("devflow.work_planned", Priority.NORMAL, "🗺️")
+    DEVFLOW_WORK_DUPLICATE = ("devflow.work_duplicate", Priority.LOW, "👯")
+    DEVFLOW_WORK_DECLINED = ("devflow.work_declined", Priority.NORMAL, "🙅")
+    DEVFLOW_WORK_SUPPRESSED = ("devflow.work_suppressed", Priority.LOW, "🔇")
+    # Icons: 🚦 = gated waiting for green; 🧩 = the pieces fit (distinct from
+    # 🟣 devflow.pr_merged, which is the *PR* event, and from 🔀 CODE_DRIFT);
+    # 🤖 marks the merge that happened with no human gate, which is why
+    # routing_policy gives it WARN and not INFO.
+    DEVFLOW_MERGE_PENDING = ("devflow.merge_pending", Priority.HIGH, "🚦")
+    DEVFLOW_MERGED = ("devflow.merged", Priority.HIGH, "🧩")
+    DEVFLOW_AUTO_MERGED = ("devflow.auto_merged", Priority.HIGH, "🤖")
+    DEVFLOW_DEPLOY_STARTED = ("devflow.deploy_started", Priority.NORMAL, "🛫")
+    DEVFLOW_DEPLOYED = ("devflow.deployed", Priority.NORMAL, "🛬")
+    # Icon: siren, not 🧨/💥/❌ — those are build/cron/application failures; a
+    # failed deploy is the one that escalates to WhatsApp (WA_URGENT).
+    DEVFLOW_DEPLOY_FAILED = ("devflow.deploy_failed", Priority.HIGH, "🚨")
 
     # Notification delivery reverse-signal — added 2026-04-30. The bus
     # is one-way today: events emit -> telegram_notifier / whatsapp_escalator
@@ -297,8 +366,13 @@ class EventType(Enum):
     #   NOTIFICATION_FAILED — NORMAL so it surfaces in operator alerts
     #   (digest_only verbosity passes it through alongside HIGH+ failures);
     #   carries the same fields plus error.kind / error.message.
-    NOTIFICATION_DELIVERED = ("notification_delivered", Priority.LOW)
-    NOTIFICATION_FAILED = ("notification_failed", Priority.NORMAL)
+    # Icons: 📬/📭 are distinct from the generic green/red so an operator
+    # scanning watchdog_alerts can tell a delivery report apart from a
+    # build/system signal at a glance. The cycle guard in handle() makes these
+    # effectively unreachable in chat; the icons still matter as a fallback
+    # render if that guard ever regresses.
+    NOTIFICATION_DELIVERED = ("notification_delivered", Priority.LOW, "📬")
+    NOTIFICATION_FAILED = ("notification_failed", Priority.NORMAL, "📭")
 
     # Gateway lifecycle — added 2026-04-30 (gateway-restart-cluster
     # mitigation M1, profiles/sentinel/workspace/
@@ -313,8 +387,10 @@ class EventType(Enum):
     # synthesizer can see what got killed. NORMAL priority so digest_only
     # verbosity surfaces them alongside HIGH+ failures, but not LOW where
     # they'd batch out of operator visibility.
-    GATEWAY_STARTED = ("gateway_started", Priority.NORMAL)
-    GATEWAY_STOPPED = ("gateway_stopped", Priority.NORMAL)
+    # Icons: green up / red down, mirroring the build up/down convention but
+    # for the gateway process itself.
+    GATEWAY_STARTED = ("gateway_started", Priority.NORMAL, "🟢")
+    GATEWAY_STOPPED = ("gateway_stopped", Priority.NORMAL, "🔴")
 
     # R57 backend-drift detection nets (added 2026-05-29, ADR-0024 §2-3).
     # BACKEND_CONTRACT_DRIFT: the synthetic canary (obs/backend_conformance_canary)
@@ -323,8 +399,14 @@ class EventType(Enum):
     # loop hit an unhandled stream-accumulation exception that the classifier would
     # otherwise have buried as a silent non-retryable "empty response" (SR-471).
     # Both HIGH so they survive significant_only/digest_only verbosity.
-    BACKEND_CONTRACT_DRIFT = ("backend_contract_drift", Priority.HIGH)
-    AGENT_LOOP_FAULT = ("agent_loop_fault", Priority.HIGH)
+    # Icons: 📐 = contract/conformance check; 🌀 = loop fault at non-retryable
+    # abort.
+    # 🌀 (spiral = the agent loop itself) replaced 💥 on 2026-08-11: 💥 was
+    # already CRON_FAILED's, and both route to watchdog_alerts, so an operator
+    # scanning that feed saw two different failures wearing one glyph. The
+    # cron family keeps 💥/🔥; this is the agent's own loop dying, not a job's.
+    BACKEND_CONTRACT_DRIFT = ("backend_contract_drift", Priority.HIGH, "📐")
+    AGENT_LOOP_FAULT = ("agent_loop_fault", Priority.HIGH, "🌀")
 
     # System-resource exhaustion early-warning — added 2026-06-11 after the
     # pagefile-expansion disk burst (commit charge hit 84.2/85.6 GB = 98.4%,
@@ -344,7 +426,11 @@ class EventType(Enum):
     #   pagefile_growth_gb_10min (float) — rise over the trailing 10-min window
     #   disk_c_free_gb (float)
     #   thresholds (dict)                — the limits that were evaluated
-    RESOURCE_PRESSURE = ("resource_pressure", Priority.HIGH)
+    # Icon: fire extinguisher = 'resource exhaustion fire, grab it now.'
+    # Distinct from every other watchdog_alerts icon and (deliberately) not a
+    # priority dot, so it does not render adjacent to its own HIGH 🟠 dot in
+    # the header.
+    RESOURCE_PRESSURE = ("resource_pressure", Priority.HIGH, "🧯")
 
     # Tracker-intent-applier partial-backlog early-warning — added 2026-07-14.
     # On 2026-07-13 thirteen APPROVAL_INTENT partials piled up in
@@ -361,7 +447,9 @@ class EventType(Enum):
     #   oldest_age_seconds (float) — age of the oldest partial (entered-partial mtime)
     #   capped_count (int)         — number of job IDs in sample_job_ids
     #   sample_job_ids (list[str]) — up to SAMPLE_CAP job IDs for triage
-    TRACKER_PARTIAL_BACKLOG = ("tracker_partial_backlog", Priority.HIGH)
+    # Icon: the inbox tray reads as 'pile-up' — a growing queue of intents
+    # whose Postgres mirror is stuck.
+    TRACKER_PARTIAL_BACKLOG = ("tracker_partial_backlog", Priority.HIGH, "📥")
 
     # Agent-src code-drift alert — added 2026-07-21. The gateway's editable
     # install imports the WORKING TREE of ~/.hermes/agent-src, which is
@@ -381,7 +469,9 @@ class EventType(Enum):
     #   dirty (bool)            — uncommitted changes in the checkout
     #   missed_subjects (list[str]) — up to 5 "<sha> <subject>" lines (behind)
     #   repo (str)              — checkout path probed
-    CODE_DRIFT = ("code_drift", Priority.HIGH)
+    # Icon: shuffle arrows read as 'the code paths crossed'; distinct from
+    # 🔃 (devflow.pr_opened).
+    CODE_DRIFT = ("code_drift", Priority.HIGH, "🔀")
 
     # Laptop boot report — added 2026-07-27. ~/laptop-start.ps1 posts a summary
     # of the logon boot (which services came up, which failed, which anomalies
@@ -401,11 +491,28 @@ class EventType(Enum):
     #   total/done/failed/skipped (int) — step counts for the boot
     #   failures (list[str])   — "[tier] name: detail" per failed step
     #   anomalies (list[str])  — "kind: detail" per error-severity anomaly
-    BOOT_SUMMARY = ("boot_summary", Priority.HIGH)
+    # Icon: the boot glyph is deliberately the same code point that
+    # ~/laptop-start.ps1 hardcodes in its non-bus fallback header (U+1F97E), so
+    # a fallback message and a bus-rendered one look alike; changing it here
+    # means changing it there too.
+    BOOT_SUMMARY = ("boot_summary", Priority.HIGH, "🥾")
 
-    def __init__(self, type_string: str, default_priority: Priority):
+    def __init__(self, type_string: str, default_priority: Priority, icon: str):
+        # The icon is REQUIRED, and that is the whole point of it living here
+        # rather than in a parallel dict — see the class docstring. Omitting it
+        # is a TypeError from Enum's member construction; passing "" to silence
+        # that TypeError is this ValueError. Either way the failure is on the
+        # line being edited, at class-creation time, and no importer of
+        # events.schema (i.e. every producer) can get past it.
+        if not isinstance(icon, str) or not icon.strip():
+            raise ValueError(
+                f"EventType.{type_string}: icon must be a non-empty string. "
+                "Every event type needs a distinct glyph — an empty icon "
+                "renders in Telegram as a double-space gap in the header."
+            )
         self.type_string = type_string
         self.default_priority = default_priority
+        self.icon = icon
 
     @classmethod
     def from_string(cls, value: str) -> Optional["EventType"]:

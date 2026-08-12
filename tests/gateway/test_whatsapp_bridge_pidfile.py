@@ -27,6 +27,7 @@ from plugins.platforms.whatsapp.adapter import (
     _kill_port_process,
     _kill_stale_bridge_by_pidfile,
     _listener_pids_on_port,
+    _listener_pids_on_port_netstat,
     _write_bridge_pidfile,
 )
 from gateway.status import get_process_start_time, _pid_exists
@@ -158,6 +159,32 @@ class TestKillPortProcess:
             client.wait()
             srv.close()
 
+    def test_netstat_is_not_spawned_when_psutil_answers(self, monkeypatch):
+        """The fast path must not pay a process spawn at all.
+
+        The original defect was not a slow discovery but a *silent* one:
+        ``netstat -ano -p TCP`` under ``timeout=5`` (measured 8.2s/9.6s/21.3s on
+        this host) raised TimeoutExpired inside a bare ``except Exception``, so
+        ``_kill_port_process`` killed nothing every single time. Asserting that
+        psutil short-circuits before any spawn is what keeps that spawn from
+        creeping back onto the hot path.
+        """
+        def _boom(*a, **kw):  # pragma: no cover - only runs on regression
+            raise AssertionError("netstat/lsof spawned while psutil could answer")
+
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        port = srv.getsockname()[1]
+        srv.listen(5)
+        try:
+            if os.getpid() not in _listener_pids_on_port(port):
+                pytest.skip("psutil cannot read the connection table here")
+            monkeypatch.setattr(subprocess, "run", _boom)
+            assert os.getpid() in _listener_pids_on_port(port)
+        finally:
+            srv.close()
+
     def test_kill_port_spares_client_process(self):
         # Listener in a SEPARATE process — the legitimate kill target. This
         # pytest process is the CLIENT: if port cleanup matched clients it would
@@ -199,3 +226,63 @@ class TestKillPortProcess:
             if listener.poll() is None:
                 listener.kill()
                 listener.wait()
+
+
+class TestNetstatFallbackDiscovery:
+    """Direct cover for the Windows fallback under the psutil fast path.
+
+    Every other test in this file is answered by psutil, so
+    ``_listener_pids_on_port_netstat`` never executes and a regression in it
+    would be invisible here. That matters more than usual: this fallback is the
+    surviving descendant of the code that caused the original outage, where
+    ``timeout=5`` against a netstat measured at 8.2s/9.6s/21.3s turned a live
+    listener into "no listener" and the caller silently killed nothing.
+    """
+
+    # PID 4242 is the only LISTENER on 3000. 9999 is ESTABLISHED on the same
+    # port (a client — killing it is the browser-closing bug), and 13000 is the
+    # substring trap that an unanchored match would wrongly accept.
+    _TABLE = (
+        "\nActive Connections\n\n"
+        "  Proto  Local Address          Foreign Address        State           PID\n"
+        "  TCP    127.0.0.1:3000         0.0.0.0:0              LISTENING       4242\n"
+        "  TCP    127.0.0.1:3000         127.0.0.1:51515        ESTABLISHED     9999\n"
+        "  TCP    127.0.0.1:13000        0.0.0.0:0              LISTENING       7777\n"
+    )
+
+    def _capture(self, monkeypatch, stdout=None, raises=None):
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            seen["timeout"] = kwargs.get("timeout")
+            if raises is not None:
+                raise raises
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        return seen
+
+    def test_returns_only_the_listener_on_the_exact_port(self, monkeypatch):
+        self._capture(monkeypatch, stdout=self._TABLE)
+
+        assert _listener_pids_on_port_netstat(3000) == [4242]
+
+    def test_budget_survives_a_loaded_host(self, monkeypatch):
+        """The 5s budget is what made this silently return nothing."""
+        seen = self._capture(monkeypatch, stdout=self._TABLE)
+
+        _listener_pids_on_port_netstat(3000)
+
+        assert seen["timeout"] >= 60, (
+            f"netstat budget regressed to {seen['timeout']}s; it is routinely "
+            "overrun on this host and an overrun reports 'no listener'"
+        )
+
+    def test_wedged_netstat_reports_no_listener_without_raising(self, monkeypatch):
+        """A genuinely wedged netstat must not escape into the restart path."""
+        self._capture(
+            monkeypatch, raises=subprocess.TimeoutExpired(["netstat"], 60),
+        )
+
+        assert _listener_pids_on_port_netstat(3000) == []

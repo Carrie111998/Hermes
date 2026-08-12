@@ -1239,7 +1239,13 @@ def test_text_reply_to_photo_caches_referenced_media(monkeypatch, tmp_path):
         update = SimpleNamespace(update_id=3010, message=msg, effective_message=msg)
 
         await adapter._handle_text_message(update, SimpleNamespace())
-        await asyncio.sleep(0.05)
+        # Wait on the scheduled flush task, not a 5x multiple of the 0.01s
+        # batch delay -- the task needs loop turns past its own deadline to
+        # finish dispatching, which no sleep can express.
+        await asyncio.gather(
+            *tuple(adapter._pending_text_batch_tasks.values()),
+            return_exceptions=True,
+        )
 
         adapter.handle_message.assert_awaited_once()
         await_args = adapter.handle_message.await_args

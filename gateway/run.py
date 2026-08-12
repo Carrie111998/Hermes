@@ -1419,9 +1419,14 @@ from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, i
 # Resolved per call, never at import.  Import happens at test-COLLECTION time,
 # before conftest's ``_hermetic_environment`` fixture can redirect HERMES_HOME,
 # so a constant here would bake in the developer's real ``~/.hermes`` and every
-# write below would land there.  ``None`` means "resolve live"; the ~150
-# existing ``patch("gateway.run._hermes_home", tmp_path)`` sites keep working
-# because a non-None value still wins.
+# write below would land there — the write sites (voice-mode state,
+# .clean_shutdown, the update/restart markers, and mark_seen ->
+# atomic_config_write on config.yaml) all did.  The same bug class destroyed the
+# real ``~/.hermes/config.yaml`` on 2026-08-11.
+#
+# ``None`` means "resolve live"; the 200-plus existing
+# ``patch("gateway.run._hermes_home", tmp_path)`` sites keep working because a
+# non-None value still wins.
 # See GBrain ``concepts/import-time-hermes-home-snapshot-bug``.
 _hermes_home: Optional[Path] = None
 
@@ -1456,7 +1461,8 @@ from hermes_cli.env_loader import load_hermes_dotenv
 # cannot leak a stale home.  The name is kept because seven tests
 # (test_discord_channel_prompts, test_fast_command, test_reasoning_command)
 # ``monkeypatch.setattr`` it, which raises when the attribute is absent.
-# Do NOT introduce a runtime read of it — that would make it a second snapshot.
+# Do NOT introduce a runtime read of it — that would make it a second
+# import-time snapshot, which is the whole defect this seam removes.
 _env_path = _resolve_hermes_home() / '.env'
 load_hermes_dotenv(hermes_home=_resolve_hermes_home(), project_env=Path(__file__).resolve().parents[1] / '.env')
 
@@ -1923,6 +1929,12 @@ if _config_path.exists():
             "your current config.yaml. Run `hermes doctor` to investigate.",
             file=sys.stderr,
         )
+
+# Drop the import-time path so it cannot become a second stale snapshot: it is
+# resolved and consumed entirely within the bridge above, and anything reading
+# it later would be addressing the home this process was IMPORTED under rather
+# than the live one. Runtime readers must call _resolve_hermes_home().
+del _config_path
 
 # Apply IPv4 preference if configured (before any HTTP clients are created).
 try:
@@ -2611,9 +2623,9 @@ def _load_gateway_config() -> dict:
     """Load and parse ~/.hermes/config.yaml, returning {} on any error.
 
     Resolves the home through ``_resolve_hermes_home()`` (so tests that
-    monkeypatch ``_hermes_home`` still see their fixture) and shares the
-    mtime-keyed raw-yaml cache from ``hermes_cli.config.read_raw_config`` when
-    the paths match.
+    monkeypatch the module-level ``_hermes_home`` override still see their
+    fixture) and shares the mtime-keyed raw-yaml cache from
+    ``hermes_cli.config.read_raw_config`` when the paths match.
 
     Managed scope is overlaid on the result (via the shared helper) so the
     gateway honors administrator-pinned values — neither read_raw_config nor a
@@ -3614,11 +3626,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # -- Voice mode persistence ------------------------------------------
 
     # A DERIVED snapshot, and the only one here that is read and written long
-    # after import — so it needs its own seam, not just a fixed root.  Kept as a
-    # plain (overridable) class attribute rather than a property because
-    # existing tests set it on the INSTANCE (``runner._VOICE_MODE_PATH = ...``
-    # in test_voice_command, ``patch.object(runner, ...)`` in
-    # test_voice_mode_platform_isolation), which a data descriptor would break.
+    # after import — so it needs its own seam, not just a fixed root.  Evaluated
+    # in the class body it bound the REAL ~/.hermes under pytest, so
+    # _save_voice_modes() wrote the user's live voice state instead of the
+    # per-test home.
+    #
+    # Kept as a plain (overridable) class attribute rather than a property
+    # because existing tests set it on the INSTANCE
+    # (``runner._VOICE_MODE_PATH = ...`` in test_voice_command,
+    # ``patch.object(runner, ...)`` in test_voice_mode_platform_isolation),
+    # which a data descriptor would break.
     _VOICE_MODE_PATH: Optional[Path] = None
 
     def _voice_mode_path(self) -> Path:
@@ -23650,6 +23667,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # HERMES_HOME and touches the auth store — under pytest that lands
         # long after the test that called start_gateway() has torn down.
         _stop_nous_keepalive_quietly()
+        # The planned-stop watcher was started ~70 lines above, but its stop
+        # sits at the very bottom of this function. Same defect, same reason:
+        # it is an unbounded 0.5s poll loop, and every tick calls
+        # planned_stop_marker_targets_self(), which re-resolves the marker
+        # path and unlinks stale/malformed markers.
+        _planned_stop_watcher_stop.set()
         return False
     if runner.should_exit_cleanly:
         if runner.exit_reason:
@@ -23657,6 +23680,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # Same reason as the `not success` path above — this branch returns
         # (or raises SystemExit) without ever reaching wait_for_shutdown().
         _stop_nous_keepalive_quietly()
+        _planned_stop_watcher_stop.set()
         # A clean exit that carries an explicit exit code (e.g. a fatal
         # config error stamped with GATEWAY_FATAL_CONFIG_EXIT_CODE) must
         # propagate that code to the process so the s6 finish script can
@@ -23670,6 +23694,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if not runner._running:
         # Startup was intentionally aborted by restart/shutdown before entering
         # running mode; preserve that lifecycle path without starting cron.
+        #
+        # Both returns below skip the stop that sits at the bottom of this
+        # function, and the watcher has been polling since well before
+        # runner.start(). cron_stop does not exist yet on this path, so the
+        # watcher is the only boot thread that can leak here.
+        _planned_stop_watcher_stop.set()
         await runner.wait_for_shutdown()
         if runner.should_exit_with_failure:
             if runner.exit_reason:
@@ -23741,6 +23771,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if runner.should_exit_with_failure:
         if runner.exit_reason:
             logger.error("Gateway exiting with failure: %s", runner.exit_reason)
+        # This return skips the cron_stop.set() / _planned_stop_watcher_stop.set()
+        # that sit below it, leaking both loops for the life of the process.
+        # Housekeeping is the costly one: its hourly chore calls
+        # cleanup_image_cache(), which resolves get_image_cache_dir() live and
+        # unlinks every file older than 24h — so once HERMES_HOME is restored,
+        # a leaked thread deletes real ~/.hermes/image_cache entries.
+        cron_stop.set()
+        _planned_stop_watcher_stop.set()
         return False
     
     # Stop cron scheduler + housekeeping cleanly.

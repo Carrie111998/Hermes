@@ -1193,7 +1193,25 @@ class TestMatrixDisplayName:
 # Requirements check
 # ---------------------------------------------------------------------------
 
+# The probe below spawns a clean interpreter that imports the whole
+# plugins.platforms.matrix graph. Measured here over five cold spawns:
+# 11.59s / 13.66s / 16.61s / 18.50s / 24.71s (mean 17.01s) — every one of them
+# over the 10s budget this test used to carry. It had stopped being the
+# "load artifact" it was filed as and failed in isolation too.
+#
+# Two budgets have to agree, which is the part that bites. pyproject's addopts
+# set a global --timeout=30, below this test's own cost, and pytest-timeout's
+# thread method HARD-EXITS the whole pytest process — so blowing that cap takes
+# the entire FILE down and every test in it reports as never having run.
+# tests/gateway/test_feishu_lazy_sdk_import.py names test_matrix.py as one of
+# the files lost that way in the 2026-08-11 nightly gate. So: the marker
+# overrides the global cap, and is sized ABOVE the subprocess budget so
+# subprocess.TimeoutExpired fires FIRST and says what actually happened.
+_SUBPROCESS_TIMEOUT_S = 180
+
+
 class TestMatrixModuleImport:
+    @pytest.mark.timeout(_SUBPROCESS_TIMEOUT_S + 30)
     def test_module_importable_without_mautrix(self):
         """plugins.platforms.matrix.adapter must be importable even when mautrix is
         not installed — otherwise the gateway crashes for ALL platforms.
@@ -1204,28 +1222,45 @@ class TestMatrixModuleImport:
         in subsequent tests).
         """
         import subprocess
-        result = subprocess.run(
-            [sys.executable, "-c", (
-                "import sys\n"
-                "# Block mautrix completely\n"
-                "class _Blocker:\n"
-                "    def find_module(self, name, path=None):\n"
-                "        if name.startswith('mautrix'): return self\n"
-                "    def load_module(self, name):\n"
-                "        raise ImportError(f'blocked: {name}')\n"
-                "sys.meta_path.insert(0, _Blocker())\n"
-                "for k in list(sys.modules):\n"
-                "    if k.startswith('mautrix'): del sys.modules[k]\n"
-                "from unittest.mock import patch\n"
-                "from plugins.platforms.matrix.adapter import check_matrix_requirements\n"
-                "with patch('tools.lazy_deps.ensure', side_effect=ImportError('blocked')):\n"
-                "    assert not check_matrix_requirements()\n"
-                "print('OK')\n"
-            )],
-            capture_output=True, text=True, timeout=10,
-        )
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", (
+                    "import sys\n"
+                    "# Block mautrix completely\n"
+                    "class _Blocker:\n"
+                    "    def find_module(self, name, path=None):\n"
+                    "        if name.startswith('mautrix'): return self\n"
+                    "    def load_module(self, name):\n"
+                    "        raise ImportError(f'blocked: {name}')\n"
+                    "sys.meta_path.insert(0, _Blocker())\n"
+                    "for k in list(sys.modules):\n"
+                    "    if k.startswith('mautrix'): del sys.modules[k]\n"
+                    "from unittest.mock import patch\n"
+                    "from plugins.platforms.matrix.adapter import check_matrix_requirements\n"
+                    "with patch('tools.lazy_deps.ensure', side_effect=ImportError('blocked')):\n"
+                    "    assert not check_matrix_requirements()\n"
+                    "print('OK')\n"
+                )],
+                capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            # Distinguish "the module is not importable" from "the box was too
+            # slow to find out". The raw TimeoutExpired still prints above this
+            # as chained context — useful, it names the command and the budget —
+            # but on its own it read like a product defect.
+            pytest.fail(
+                f"the import probe did not finish within {_SUBPROCESS_TIMEOUT_S}s "
+                f"(cold spawns measured 11.6-24.7s on this host). This is a budget "
+                f"overrun — nothing was proven either way about importing "
+                f"plugins.platforms.matrix.adapter without mautrix."
+            )
         assert result.returncode == 0, (
             f"Subprocess failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        # returncode 0 alone does not prove the probe reached its assertion.
+        assert "OK" in result.stdout, (
+            f"probe exited 0 without reaching its final print:\n"
+            f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}"
         )
 
 
@@ -3028,6 +3063,29 @@ class TestMatrixLinkSanitization:
 # Reactions
 # ---------------------------------------------------------------------------
 
+
+async def _drain_reaction_redactions(adapter) -> None:
+    """Await the adapter's scheduled redaction tasks instead of racing a sleep.
+
+    ``_schedule_reaction_redaction`` fires the redaction from a background task
+    that first sleeps ``_reaction_redaction_delay_seconds``.  These tests used to
+    wait for it with ``await asyncio.sleep(0.03)`` against a 0.01s delay -- a 3x
+    margin that a loaded box loses, producing a spurious "Expected mock to have
+    been awaited once. Awaited 0 times."  The adapter already tracks every such
+    task in ``_reaction_redaction_tasks``, so wait on the work itself.
+
+    Snapshot the set first: ``add_done_callback(...discard)`` mutates it as tasks
+    finish, which would otherwise raise "Set changed size during iteration".
+    ``_redact_later`` swallows its own exceptions, so gathering cannot raise.
+
+    Deliberately no fallback when the set is empty -- if nothing was scheduled,
+    the caller's ``assert_awaited*`` must still fail.
+    """
+    tasks = tuple(adapter._reaction_redaction_tasks)
+    if tasks:
+        await asyncio.gather(*tasks)
+
+
 class TestMatrixReactions:
     def setup_method(self):
         self.adapter = _make_adapter()
@@ -3097,7 +3155,7 @@ class TestMatrixReactions:
         await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
         self.adapter._redact_reaction.assert_not_awaited()
         self.adapter._send_reaction.assert_called_once_with("!room:ex", "$msg1", "\u2705")
-        await asyncio.sleep(0.03)
+        await _drain_reaction_redactions(self.adapter)
         self.adapter._redact_reaction.assert_awaited_once_with(
             "!room:ex",
             "$eyes_reaction_123",
@@ -3126,7 +3184,7 @@ class TestMatrixReactions:
         await self.adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
         self.adapter._redact_reaction.assert_not_awaited()
         self.adapter._send_reaction.assert_called_once_with("!room:ex", "$msg1", "\u274c")
-        await asyncio.sleep(0.03)
+        await _drain_reaction_redactions(self.adapter)
         self.adapter._redact_reaction.assert_awaited_once_with(
             "!room:ex",
             "$eyes_reaction_123",
@@ -3190,7 +3248,7 @@ class TestMatrixReactions:
         await self.adapter._redact_bot_approval_reactions("!room:ex", prompt)
 
         self.adapter._redact_reaction.assert_not_awaited()
-        await asyncio.sleep(0.03)
+        await _drain_reaction_redactions(self.adapter)
         self.adapter._redact_reaction.assert_any_await(
             "!room:ex",
             "$allow_reaction",

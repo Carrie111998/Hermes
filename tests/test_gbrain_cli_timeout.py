@@ -6,7 +6,10 @@ exists to prevent: ``subprocess.run(capture_output=True, timeout=N)`` does NOT
 reliably time out when the spawned child spawns a *grandchild* that inherits the
 capture pipe handles. The grandchild keeps the pipe's write end open, so the
 reader-thread drain never reaches EOF and the caller blocks forever. The helper
-tree-kills the whole process group on timeout so every write end closes.
+captures into temp files instead, so there is no pipe to hold open and no
+reader thread to drain — that, not the tree-kill, is what makes the bound hold.
+The tree-kill is still done on timeout, but only to avoid leaking the process
+tree, and it is synchronous, so the real bound is ``timeout`` + up to ~10s.
 """
 
 import os

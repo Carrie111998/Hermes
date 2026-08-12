@@ -13,14 +13,17 @@ so a table added later is covered without a new hand-written test.
 
 import importlib
 import logging
+from collections.abc import Mapping
 
 import pytest
 
 from events import coverage
 from events.coverage import (
+    ALL_TOTAL,
     KNOWN_PARTIAL,
     MANIFEST,
     REQUIRED_TOTAL,
+    TOTAL_BY_CONSTRUCTION,
     TableSpec,
     coverage_gaps,
     discover_tables,
@@ -35,10 +38,15 @@ from events.schema import EventType
 # ── the actual coverage contract ────────────────────────────────────────────
 
 @pytest.mark.parametrize(
-    "spec", REQUIRED_TOTAL, ids=lambda s: s.qualname,
+    "spec", ALL_TOTAL, ids=lambda s: s.qualname,
 )
-def test_required_total_table_covers_every_event_type(spec):
-    """Every EventType member has an entry in every required-total table.
+def test_total_table_covers_every_event_type(spec):
+    """Every EventType member has an entry in every table contracted total.
+
+    Parametrized over ALL_TOTAL, not REQUIRED_TOTAL: a table being total by
+    construction is a reason to expect it to pass, not a reason to stop
+    asserting it. Dropping TOTAL_BY_CONSTRUCTION here would remove the only
+    test that notices the day the construction stops holding.
 
     The whole missing set is reported, not just the first miss.
     """
@@ -66,8 +74,9 @@ def test_no_undeclared_event_type_tables():
             f"{len(t.missing)} EventType members absent)"
             for t in undeclared
         )
-        + ". Add each to REQUIRED_TOTAL (must cover every EventType) or to "
-        "KNOWN_PARTIAL (deliberately a subset) in events/coverage.py."
+        + ". Add each to REQUIRED_TOTAL (must cover every EventType), "
+        "TOTAL_BY_CONSTRUCTION (a gap is unrepresentable), or KNOWN_PARTIAL "
+        "(deliberately a subset) in events/coverage.py."
     )
 
 
@@ -84,10 +93,15 @@ def test_every_events_module_imports():
 
 
 def test_manifest_entries_still_resolve():
-    """No MANIFEST entry points at a renamed or deleted table."""
+    """No MANIFEST entry points at a renamed or deleted table.
+
+    ``Mapping``, not ``dict``: EVENT_TYPE_EMOJI is a MappingProxyType derived
+    from EventType.icon, which is not a dict. Same widening as
+    coverage.discover_tables() — see that function's docstring.
+    """
     for spec in MANIFEST:
         table = spec.resolve()
-        assert isinstance(table, dict), f"{spec.qualname} is not a dict"
+        assert isinstance(table, Mapping), f"{spec.qualname} is not a mapping"
         assert all(isinstance(k, EventType) for k in table), (
             f"{spec.qualname} has non-EventType keys; it does not belong in "
             f"the events.coverage manifest"
@@ -98,11 +112,116 @@ def test_historically_drifted_tables_are_required_total():
     """Pin the two tables whose drift caused the four recorded recurrences.
 
     Demoting either to KNOWN_PARTIAL would silently reopen the gap, so it has
-    to be a deliberate, test-breaking act.
+    to be a deliberate, test-breaking act. Asserted against ALL_TOTAL so that
+    reorganizing the manifest into kinds — as happened when EVENT_TYPE_EMOJI
+    became total by construction — stays a free refactor, while dropping a
+    table out of the total contract altogether still breaks a test.
     """
-    required = {spec.qualname for spec in REQUIRED_TOTAL}
-    assert "events.formatting.EVENT_TYPE_EMOJI" in required
-    assert "events.routing_policy._POLICY" in required
+    total = {spec.qualname for spec in ALL_TOTAL}
+    assert "events.formatting.EVENT_TYPE_EMOJI" in total
+    assert "events.routing_policy._POLICY" in total
+
+
+def test_the_two_kinds_of_total_are_correctly_assigned():
+    """Which bucket a table sits in is a claim about what can break it.
+
+    EVENT_TYPE_EMOJI is derived from EventType.icon, a required member field
+    validated at class creation, so a gap is unrepresentable. _POLICY is an
+    ordinary partial dict with a runtime fallback in classify(), so only this
+    check stands between it and a misrouted notification. Swapping them would
+    misrepresent exactly the distinction the split exists to make visible.
+    """
+    assert {s.qualname for s in TOTAL_BY_CONSTRUCTION} == {
+        "events.formatting.EVENT_TYPE_EMOJI"
+    }
+    assert {s.qualname for s in REQUIRED_TOTAL} == {
+        "events.routing_policy._POLICY"
+    }
+    assert ALL_TOTAL == REQUIRED_TOTAL + TOTAL_BY_CONSTRUCTION
+    assert set(ALL_TOTAL).issubset(set(MANIFEST))
+    assert all(spec.total for spec in ALL_TOTAL)
+
+
+def test_splitting_the_manifest_did_not_narrow_the_check(monkeypatch):
+    """coverage_gaps() must still examine BOTH kinds by default.
+
+    The refactor that split REQUIRED_TOTAL from TOTAL_BY_CONSTRUCTION had one
+    plausible way to make things worse: leaving coverage_gaps() defaulted to
+    REQUIRED_TOTAL, which would quietly drop EVENT_TYPE_EMOJI out of the
+    pre-commit check while every report still said OK. Assert the default
+    covers the union, by proving a gap in the by-construction table is caught
+    through the no-argument call the CLI and hook actually use.
+    """
+    import events.formatting as fmt
+
+    victim = EventType.BOOT_SUMMARY
+    gapped = {k: v for k, v in fmt.EVENT_TYPE_EMOJI.items() if k is not victim}
+    assert len(gapped) == len(fmt.EVENT_TYPE_EMOJI) - 1, "victim not in table"
+    monkeypatch.setattr(fmt, "EVENT_TYPE_EMOJI", gapped)
+
+    gaps = coverage_gaps()  # no argument — the CLI/hook path
+
+    assert gaps.get("events.formatting.EVENT_TYPE_EMOJI") == [
+        victim.type_string
+    ], (
+        "coverage_gaps() no longer checks TOTAL_BY_CONSTRUCTION tables by "
+        "default — EVENT_TYPE_EMOJI has silently left the pre-commit check"
+    )
+
+
+def test_policy_check_is_still_armed_against_a_real_gap(monkeypatch):
+    """The _POLICY check must FAIL on a table that is actually missing an entry.
+
+    This is the anti-false-green test. On 2026-08-11 a competing branch
+    (archive/eventtype-icon-as-enum-field-20260811) added a _finalize_policy()
+    that back-filled every unmapped EventType with a fallback AT IMPORT TIME.
+    coverage.py reads _POLICY *after* import, so the check reported
+    "_POLICY: 79/79" and exited 0 on a table with a hole in it — a guard that
+    looks armed and is not, which is worse than no guard.
+
+    So: remove a real entry and assert the check notices. A green suite must
+    not be consistent with "_POLICY is total by construction now".
+    """
+    import events.routing_policy as rp
+
+    victim = EventType.NOTIFICATION_FAILED
+    gapped = {k: v for k, v in rp._POLICY.items() if k is not victim}
+    assert len(gapped) == len(rp._POLICY) - 1, "victim was not in _POLICY"
+    monkeypatch.setattr(rp, "_POLICY", gapped)
+
+    gaps = coverage_gaps()
+    assert gaps.get("events.routing_policy._POLICY") == [victim.type_string], (
+        "coverage_gaps() did not report a _POLICY entry that is genuinely "
+        "missing — the table is being back-filled somewhere before the check "
+        "reads it, and every green run from here is meaningless"
+    )
+
+    report, ok = format_report()
+    assert ok is False
+    assert victim.type_string in report
+
+
+def test_policy_is_not_backfilled_at_import(monkeypatch):
+    """classify() must degrade at CALL time, not by pre-filling the table.
+
+    The graceful fallback for an unmapped type is deliberate and stays. What
+    must not exist is an import-time back-fill: that is what turns the
+    pre-commit check tautological. Pin the mechanism, not just the outcome.
+    """
+    import events.routing_policy as rp
+
+    assert not hasattr(rp, "_finalize_policy"), (
+        "_finalize_policy() back-fills _POLICY at import time and disarms "
+        "events.coverage — see test_policy_check_is_still_armed_against_a_real_gap"
+    )
+    assert not hasattr(rp, "UNROUTED_EVENT_TYPES")
+
+    # A type absent from the table still classifies (fallback), and is still
+    # absent afterwards — .get() must not be a setdefault in disguise.
+    victim = EventType.NOTIFICATION_FAILED
+    gapped = {k: v for k, v in rp._POLICY.items() if k is not victim}
+    monkeypatch.setattr(rp, "_POLICY", gapped)
+    assert missing_members(rp._POLICY) == [victim.type_string]
 
 
 def test_manifest_has_no_duplicate_entries():
@@ -194,7 +313,7 @@ def test_format_report_names_every_missing_member(monkeypatch):
     missing = ["devflow.work_requested", "devflow.merged", "devflow.deployed"]
     monkeypatch.setattr(
         coverage, "coverage_gaps",
-        lambda specs=REQUIRED_TOTAL: {
+        lambda specs=ALL_TOTAL: {
             "events.formatting.EVENT_TYPE_EMOJI": list(missing)
         },
     )
@@ -256,7 +375,7 @@ def test_main_exits_zero_when_coverage_is_complete(capsys):
 def test_main_exits_nonzero_on_a_gap(monkeypatch, capsys):
     monkeypatch.setattr(
         coverage, "coverage_gaps",
-        lambda specs=REQUIRED_TOTAL: {
+        lambda specs=ALL_TOTAL: {
             "events.formatting.EVENT_TYPE_EMOJI": ["devflow.work_requested"]
         },
     )
@@ -266,9 +385,9 @@ def test_main_exits_nonzero_on_a_gap(monkeypatch, capsys):
 
 # ── discovery ───────────────────────────────────────────────────────────────
 
-def test_discovery_finds_the_required_total_tables():
+def test_discovery_finds_the_total_tables():
     found = {name for table in discover_tables() for name in table.qualnames}
-    for spec in REQUIRED_TOTAL:
+    for spec in ALL_TOTAL:
         assert spec.qualname in found, (
             f"{spec.qualname} was not discovered by walking the events package"
         )
@@ -424,7 +543,7 @@ class TestRequiredTotalTablesSignalAtRuntime:
         """The runtime record and the commit-time check must not diverge."""
         module = importlib.import_module(module_name)
         spec = next(
-            s for s in REQUIRED_TOTAL
+            s for s in ALL_TOTAL
             if s.module == module_name and s.attribute == attribute
         )
         assert list(getattr(module, record_name)) == missing_members(
