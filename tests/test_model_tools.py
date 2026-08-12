@@ -509,3 +509,40 @@ class TestDisabledToolsetsPostureToolset:
             )
         }
         assert "write_file" not in no_file
+
+
+# =========================================================================
+# get_tool_definitions memo: real LRU eviction
+# =========================================================================
+
+class TestToolDefsCacheLRU:
+    def test_hot_key_survives_eviction(self, monkeypatch):
+        """Regression for #84739: the memoized tool-definitions cache claimed
+        LRU eviction but hits never touched the key, so eviction was FIFO — a
+        hot toolset/config fingerprint (the gateway's actual working set)
+        could be evicted by one-time builds while cold entries lingered.
+
+        With a cap of 2: A (hot, hit repeatedly), B (one-time), then C.
+        Under real LRU, the evicted entry is B (least-recently-used) and A
+        survives; under FIFO, the evicted entry is A.
+        """
+        import model_tools as mt
+
+        monkeypatch.setattr(mt, "_TOOL_DEFS_CACHE_MAX", 2)
+        mt._tool_defs_cache.clear()
+        try:
+            a = mt.get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True)
+            # Warm hit — must refresh recency.
+            assert mt.get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True) == a
+            mt.get_tool_definitions(enabled_toolsets=["file"], quiet_mode=True)
+            assert len(mt._tool_defs_cache) == 2
+            # Touch A again so it is the most-recently-used entry.
+            assert mt.get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True) == a
+            # Inserting C must evict the least-recently-used entry.
+            mt.get_tool_definitions(enabled_toolsets=["terminal", "file"], quiet_mode=True)
+            assert len(mt._tool_defs_cache) == 2
+            assert any(
+                k[0] == frozenset({"terminal"}) for k in mt._tool_defs_cache
+            ), "hot terminal-toolset key was evicted — eviction is FIFO, not LRU"
+        finally:
+            mt._tool_defs_cache.clear()

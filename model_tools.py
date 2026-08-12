@@ -358,6 +358,12 @@ def get_tool_definitions(
             )
         cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
         if cached is not None:
+            # Touch the key so eviction is real LRU, not FIFO: a hot
+            # toolset/config fingerprint (the gateway's actual working set)
+            # must not be evicted by one-time builds while cold entries
+            # linger. #84739. Plain dicts are insertion-ordered but have no
+            # move_to_end, so re-insert (pop + assign) to refresh recency.
+            _tool_defs_cache[cache_key] = _tool_defs_cache.pop(cache_key)
             # Update _last_resolved_tool_names so downstream callers see
             # consistent state even on a cache hit.
             global _last_resolved_tool_names
@@ -379,8 +385,10 @@ def get_tool_definitions(
         # Bound the cache with LRU eviction so a long-lived Gateway process
         # doesn't accumulate entries unboundedly across the many distinct
         # toolset/config fingerprints it sees over its lifetime (#19251).
+        # Hits move the key to the end (see the cache-hit path above), so the
+        # evicted entry is the least-recently-USED, not merely the oldest.
         if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
-            _tool_defs_cache.pop(next(iter(_tool_defs_cache)))  # evict oldest
+            _tool_defs_cache.pop(next(iter(_tool_defs_cache)))  # evict LRU entry
         _tool_defs_cache[cache_key] = result
         return list(result)
     if quiet_mode:
