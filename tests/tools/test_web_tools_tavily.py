@@ -46,6 +46,9 @@ class TestTavilyRequest:
                 assert payload["api_key"] == "tvly-test-key"
                 assert payload["query"] == "hello"
                 assert "api.tavily.com/search" in call_kwargs.args[0]
+                assert call_kwargs.kwargs["headers"] == {
+                    "X-Client-Source": "hermes-agent"
+                }
 
     def test_raises_on_http_error(self):
         """Non-2xx responses propagate as httpx.HTTPStatusError."""
