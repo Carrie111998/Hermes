@@ -1841,13 +1841,13 @@ class TestConfigRoundTrip:
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
 
-    def test_settings_save_preserves_extra_root_keys(self, tmp_path, monkeypatch):
+    def test_settings_save_preserves_extra_root_keys(self):
         """A schema-driven save must round-trip the complete root document."""
         import yaml
 
         from hermes_cli import config as config_mod
 
-        config_path = tmp_path / "config.yaml"
+        config_path = config_mod.get_config_path()
         preserved = {
             "multiplex_profiles": True,
             "approvals": {"mode": "off", "cron_mode": "approve"},
@@ -1857,8 +1857,6 @@ class TestConfigRoundTrip:
             yaml.safe_dump({**preserved, "timezone": "UTC"}, sort_keys=False),
             encoding="utf-8",
         )
-        monkeypatch.setattr(config_mod, "get_config_path", lambda: config_path)
-
         response = self.client.put(
             "/api/config",
             json={"config": {"timezone": "Asia/Bangkok"}},
