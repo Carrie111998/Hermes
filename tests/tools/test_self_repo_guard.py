@@ -558,7 +558,8 @@ class TestExplicitGitTargetPaths:
         normalized = _normalize_git_path_operand(r"D:\work\hermes-agent")
         assert normalized == r"D:\work\hermes-agent"
         path = _explicit_git_path(r"D:\work\hermes-agent", Path("/tmp"))
-        assert "D:" in str(path).replace("\\", "/") or str(path).startswith("D:")
+        assert path == _explicit_git_path("D:/work/hermes-agent", Path("/tmp"))
+        assert path.is_absolute()
         text = str(path).replace("\\", "/")
         assert "work" in text and "hermes-agent" in text
 
@@ -568,8 +569,9 @@ class TestExplicitGitTargetPaths:
         assert _windows_git_bash_to_drive("/c") == "C:/"
         assert _normalize_git_path_operand("/d/work/hermes-agent") == "D:/work/hermes-agent"
         path = _explicit_git_path("/d/work/hermes-agent", Path("/var/tmp"))
+        assert path == _explicit_git_path("D:/work/hermes-agent", Path("/var/tmp"))
+        assert path.is_absolute()
         text = str(path).replace("\\", "/")
-        assert "D:" in text
         assert "work/hermes-agent" in text
         # Use non-escape string forms: "/tmp/..." embeds a TAB via \t in
         # ordinary Python literals and would accidentally pass a looser regex.
