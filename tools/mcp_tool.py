@@ -3105,12 +3105,17 @@ class MCPServerTask:
                 # behind OAuth 2.1 PKCE work. Previously built but never
                 # forwarded — SSE OAuth would silently fail with 401s.
                 _sse_kwargs["auth"] = _oauth_auth
-            if client_cert is not None or ssl_verify is not True:
+            if (
+                client_cert is not None
+                or ssl_verify is not True
+                or config.get("request_hooks")
+                or config.get("response_hooks")
+            ):
                 # SSE transport doesn't expose verify/cert as kwargs, so route
                 # them through an httpx_client_factory that wraps the SDK's
-                # defaults (follow_redirects=True) and adds our TLS settings.
-                # The SDK calls the factory with (headers, auth, timeout); we
-                # forward all of those and layer verify/cert on top.
+                # defaults (follow_redirects=True) and adds Hermes TLS settings
+                # and configured request/response hooks. Supplying the factory
+                # when hooks or non-default TLS are configured is required.
                 import httpx as _httpx_mod
 
                 _cert_for_factory = client_cert

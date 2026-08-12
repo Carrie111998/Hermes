@@ -1112,15 +1112,17 @@ def test_unsupported_paste_handle_is_disabled_without_blocking_read(monkeypatch)
 class LocalTLSOAuthPeer:
     """Real HTTPS OAuth/MCP peer used by the public composition witnesses."""
 
-    def __init__(self, paths, *, cimd=False, step_up=False):
+    def __init__(self, paths, *, cimd=False, step_up=False, sse=False):
         self.paths = paths
         self.cimd = cimd
         self.step_up = step_up
+        self.sse = sse
         self.requests = []
         self.response_statuses = []
         self.tokens_issued = []
         self._server = None
         self._writers = set()
+        self._sse_writer = None
         self._mcp_calls = 0
 
     async def __aenter__(self):
@@ -1150,7 +1152,7 @@ class LocalTLSOAuthPeer:
 
     @property
     def url(self):
-        return self.base_url + "/mcp"
+        return self.base_url + ("/sse" if self.sse else "/mcp")
 
     async def _handle(self, reader, writer):
         self._writers.add(writer)
@@ -1179,16 +1181,29 @@ class LocalTLSOAuthPeer:
                     method, target, headers, payload
                 )
                 self.response_statuses.append((target, status))
+                if self.sse and method == "POST" and target.startswith("/messages"):
+                    await self._write(writer, 202, b"", content_type=None, extra={})
+                    if self._sse_writer is not None and status == 200:
+                        event = (
+                            b"event: message\n" + b"data: " + response_body + b"\n\n"
+                        )
+                        chunk = f"{len(event):X}\r\n".encode() + event + b"\r\n"
+                        self._sse_writer.write(chunk)
+                        await self._sse_writer.drain()
+                    continue
                 await self._write(
                     writer,
                     status,
                     response_body,
                     content_type=content_type,
                     extra=extra,
+                    streaming=target == "/sse" and status == 200,
                 )
                 if target == "/sse" and status == 200:
-                    await reader.read()
-                    return
+                    self._sse_writer = writer
+                    while not writer.is_closing():
+                        await reader.read()
+                        return
                 if method == "DELETE":
                     return
         except BaseException as exc:
@@ -1263,8 +1278,24 @@ class LocalTLSOAuthPeer:
         if method == "DELETE":
             return 204, b"", None, {}
         if method == "GET" and target in {"/mcp", "/sse"}:
+            if self.sse and not headers.get("authorization"):
+                return (
+                    401,
+                    b"",
+                    None,
+                    {
+                        "WWW-Authenticate": f'Bearer resource_metadata="{self.base_url}/.well-known/oauth-protected-resource/sse"'
+                    },
+                )
+            if self.sse:
+                return (
+                    200,
+                    b"event: endpoint\ndata: /messages?sessionId=tls\n\n",
+                    "text/event-stream",
+                    {"cache-control": "no-cache"},
+                )
             return 200, b"", "text/event-stream", {"cache-control": "no-cache"}
-        if method == "POST" and target in {"/mcp", "/messages"}:
+        if method == "POST" and (target == "/mcp" or target.startswith("/messages")):
             if not headers.get("authorization"):
                 return (
                     401,
@@ -1310,7 +1341,9 @@ class LocalTLSOAuthPeer:
         return 404, b"", None, {}
 
     @staticmethod
-    async def _write(writer, status, body, *, content_type=None, extra=None):
+    async def _write(
+        writer, status, body, *, content_type=None, extra=None, streaming=False
+    ):
         reason = {
             200: "OK",
             201: "Created",
@@ -1320,7 +1353,11 @@ class LocalTLSOAuthPeer:
             403: "Forbidden",
             404: "Not Found",
         }.get(status, "Error")
-        headers = {"Connection": "keep-alive", "Content-Length": str(len(body))}
+        headers = {"Connection": "keep-alive"}
+        if streaming:
+            headers["Transfer-Encoding"] = "chunked"
+        else:
+            headers["Content-Length"] = str(len(body))
         if content_type:
             headers["Content-Type"] = content_type
         headers.update(extra or {})
@@ -1329,7 +1366,10 @@ class LocalTLSOAuthPeer:
             + "".join(f"{k}: {v}\r\n" for k, v in headers.items())
             + "\r\n"
         )
-        writer.write(wire.encode() + body)
+        payload = body
+        if streaming and body:
+            payload = f"{len(body):X}\r\n".encode() + body + b"\r\n"
+        writer.write(wire.encode() + payload)
         await writer.drain()
 
 
@@ -1425,14 +1465,14 @@ async def _run_composed_tls_public(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transport", ["current", "legacy"])
+@pytest.mark.parametrize("transport", ["current", "legacy", "sse"])
 @pytest.mark.parametrize("cimd", [False, True])
 async def test_composed_cold_public_real_https_oauth_control_plane(
     transport, cimd, monkeypatch, tmp_path
 ):
     """Cold DCR/CIMD and token exchange use public _run_http over mTLS."""
     paths = _certificate_bundle(tmp_path)
-    async with LocalTLSOAuthPeer(paths, cimd=cimd) as peer:
+    async with LocalTLSOAuthPeer(paths, cimd=cimd, sse=transport == "sse") as peer:
         storage = await _run_composed_tls_public(
             peer, transport, monkeypatch, tmp_path, cimd=cimd
         )
@@ -1455,7 +1495,7 @@ async def test_composed_cold_public_real_https_oauth_control_plane(
     assert peer.response_hook_events
     observed_urls = {urlsplit(url).path for url, _status in peer.response_hook_events}
     expected_targets = {
-        target
+        urlsplit(target).path
         for _method, target, _headers, _payload in peer.requests
         if target.startswith("/")
     }
@@ -1531,6 +1571,71 @@ async def test_composed_cold_public_real_https_oauth_wrong_ca_and_missing_cert(
             config.update(config_change)
             with pytest.raises(BaseException):
                 await task._run_http(config)
+
+
+@pytest.mark.asyncio
+async def test_public_sse_default_tls_passes_configured_httpx_hooks(monkeypatch):
+    """Default secure SSE selection must provide the configured HTTPX hooks."""
+    from contextlib import asynccontextmanager
+
+    import tools.mcp_tool as tool_module
+
+    captured = {}
+
+    @asynccontextmanager
+    async def fake_sse_client(**kwargs):
+        captured.update(kwargs)
+        yield object(), object()
+
+    class FakeSession:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def initialize(self):
+            return {"ok": True}
+
+    async def request_hook(_request):
+        return None
+
+    async def response_hook(_response):
+        return None
+
+    async def discover_tools(_self):
+        return None
+
+    async def stop(_self):
+        return "shutdown"
+
+    monkeypatch.setattr(tool_module, "sse_client", fake_sse_client)
+    monkeypatch.setattr(tool_module, "ClientSession", FakeSession)
+    monkeypatch.setattr(tool_module.MCPServerTask, "_discover_tools", discover_tools)
+    monkeypatch.setattr(tool_module.MCPServerTask, "_wait_for_lifecycle_event", stop)
+
+    task = tool_module.MCPServerTask("default-sse-hooks")
+    task._auth_type = "none"
+    await task._run_http({
+        "url": "https://127.0.0.1:1/sse",
+        "transport": "sse",
+        "connect_timeout": 1,
+        "headers": {"x-witness": "default"},
+        "request_hooks": [request_hook],
+        "response_hooks": [response_hook],
+    })
+
+    assert "httpx_client_factory" in captured
+    factory = captured["httpx_client_factory"]
+    client = factory(headers={"x-witness": "default"}, timeout=None, auth=None)
+    try:
+        assert client.event_hooks["request"] == [request_hook]
+        assert client.event_hooks["response"] == [response_hook]
+    finally:
+        await client.aclose()
 
 
 @pytest.mark.asyncio
