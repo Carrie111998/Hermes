@@ -1134,6 +1134,57 @@ def spawn_background_review_thread(
     return _target, prompt
 
 
+class PluginReviewService:
+    """Stable public service returned by :attr:`PluginContext.review`.
+
+    Wraps Hermes' native background-review machinery so plugins can fork a
+    skill or memory review on a dedicated thread without importing private
+    internals that may change between Hermes versions.
+
+    Plugins obtain this service from ``ctx.review`` during ``register()``.
+    """
+
+    def __init__(self, parent_agent_resolver) -> None:
+        self._parent_agent_resolver = parent_agent_resolver
+
+    def spawn_review(
+        self,
+        messages_snapshot,
+        *,
+        review_skills: bool = False,
+        review_memory: bool = False,
+        focus: str | None = None,
+    ):
+        """Spawn a background review thread using Hermes' native machinery.
+
+        Returns a ``(thread, prompt)`` tuple.  The *caller* is responsible
+        for starting the thread (``thread.start()``) and joining it.
+        ``prompt`` is the review prompt text for observability.
+
+        ``focus`` is optional user steering appended to the review prompt
+        (same as ``/refine [instructions]`` in the CLI).
+        """
+        import threading
+
+        from tools.thread_context import propagate_context_to_thread
+
+        agent = self._parent_agent_resolver()
+        if agent is None:
+            raise RuntimeError(
+                "PluginReviewService: no active Hermes agent turn available"
+            )
+        target, prompt = spawn_background_review_thread(
+            agent,
+            messages_snapshot,
+            review_memory=review_memory,
+            review_skills=review_skills,
+            focus=focus,
+        )
+        scoped_target = propagate_context_to_thread(target)
+        thread = threading.Thread(target=scoped_target, daemon=True, name="bg-review")
+        return thread, prompt
+
+
 __all__ = [
     "_MEMORY_REVIEW_PROMPT",
     "_SKILL_REVIEW_PROMPT",
@@ -1141,4 +1192,5 @@ __all__ = [
     "spawn_background_review_thread",
     "summarize_background_review_actions",
     "build_memory_write_metadata",
+    "PluginReviewService",
 ]
