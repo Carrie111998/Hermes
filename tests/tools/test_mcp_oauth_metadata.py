@@ -87,15 +87,15 @@ async def test_explicit_sdk_metadata_request_merges_safe_client_headers():
     assert "authorization" not in seen[2].headers
 
 
-def _make_metadata(token_endpoint: str = "https://auth.example.com/oauth/token") -> OAuthMetadata:
-    return OAuthMetadata.model_validate(
-        {
-            "issuer": "https://auth.example.com",
-            "authorization_endpoint": "https://auth.example.com/oauth/authorize",
-            "token_endpoint": token_endpoint,
-            "response_types_supported": ["code"],
-        }
-    )
+def _make_metadata(
+    token_endpoint: str = "https://auth.example.com/oauth/token",
+) -> OAuthMetadata:
+    return OAuthMetadata.model_validate({
+        "issuer": "https://auth.example.com",
+        "authorization_endpoint": "https://auth.example.com/oauth/authorize",
+        "token_endpoint": token_endpoint,
+        "response_types_supported": ["code"],
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +118,6 @@ class TestMetadataStorage:
         assert loaded is not None
         assert str(loaded.token_endpoint) == "https://auth.example.com/oauth/token"
         assert str(loaded.issuer).rstrip("/") == "https://auth.example.com"
-
 
     def test_remove_deletes_meta_file(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -170,9 +169,10 @@ class TestManagerOAuthProviderMetadata:
             asyncio.run(provider._initialize())
 
         assert provider.context.oauth_metadata is not None
-        assert str(provider.context.oauth_metadata.token_endpoint) == \
-            "https://mgr.example.com/token"
-
+        assert (
+            str(provider.context.oauth_metadata.token_endpoint)
+            == "https://mgr.example.com/token"
+        )
 
     def test_async_auth_flow_persists_on_completion(self, tmp_path, monkeypatch):
         """End-to-end: running the wrapped auth_flow persists discovered metadata."""
@@ -192,11 +192,15 @@ class TestManagerOAuthProviderMetadata:
         manager = MagicMock()
         manager.invalidate_if_disk_changed = AsyncMock(return_value=False)
 
-        with patch.object(
-            _HERMES_PROVIDER_CLS.__bases__[0],
-            "async_auth_flow",
-            new=fake_parent_flow,
-        ), patch("tools.mcp_oauth_manager.get_manager", return_value=manager):
+        with (
+            patch.object(
+                _HERMES_PROVIDER_CLS.__bases__[0],
+                "async_auth_flow",
+                new=fake_parent_flow,
+            ),
+            patch("tools.mcp_oauth_manager.get_manager", return_value=manager),
+        ):
+
             async def drive():
                 gen = provider.async_auth_flow(MagicMock())
                 async for _ in gen:

@@ -4,6 +4,7 @@ The manager consolidates the eight scattered MCP-OAuth call sites into a
 single object with disk-mtime watch, dedup'd 401 handling, and a provider
 cache. See `tools/mcp_oauth_manager.py` for design rationale.
 """
+
 import asyncio
 import json
 import os
@@ -37,7 +38,9 @@ def test_manager_isolates_same_named_servers_by_profile_home(tmp_path, monkeypat
     for home in (profile_a, profile_b):
         token = set_hermes_home_override(home)
         try:
-            provider = manager.get_or_build_provider("shared", "https://mcp.example/mcp", {})
+            provider = manager.get_or_build_provider(
+                "shared", "https://mcp.example/mcp", {}
+            )
             asyncio.run(provider._initialize())
             providers.append(provider)
         finally:
@@ -60,7 +63,10 @@ def test_manager_restore_entry_preserves_newer_concurrent_entry(tmp_path, monkey
 
     manager.restore_entry("shared", old_entry)
 
-    assert manager.get_or_build_provider("shared", "https://new.example", {}) is new_provider
+    assert (
+        manager.get_or_build_provider("shared", "https://new.example", {})
+        is new_provider
+    )
     assert new_provider is not old_provider
 
 
@@ -126,7 +132,9 @@ def test_manager_keeps_provider_built_without_running_loop(tmp_path, monkeypatch
     manager = MCPOAuthManager()
 
     provider = manager.get_or_build_provider("shared", "https://mcp.example", {})
-    assert manager.get_or_build_provider("shared", "https://mcp.example", {}) is provider
+    assert (
+        manager.get_or_build_provider("shared", "https://mcp.example", {}) is provider
+    )
 
 
 async def _build_on_loop(manager, name, url):
@@ -171,10 +179,12 @@ async def test_disk_watch_invalidates_on_mtime_change(tmp_path, monkeypatch):
     token_dir = tmp_path / "mcp-tokens"
     token_dir.mkdir(parents=True)
     tokens_file = token_dir / "srv.json"
-    tokens_file.write_text(json.dumps({
-        "access_token": "OLD",
-        "token_type": "Bearer",
-    }))
+    tokens_file.write_text(
+        json.dumps({
+            "access_token": "OLD",
+            "token_type": "Bearer",
+        })
+    )
 
     mgr = MCPOAuthManager()
     provider = mgr.get_or_build_provider("srv", "https://example.com/mcp", None)
@@ -258,7 +268,9 @@ async def test_handle_401_tracks_inflight_task_to_prevent_gc(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_handle_401_dedup_survives_even_if_task_reference_dropped(tmp_path, monkeypatch):
+async def test_handle_401_dedup_survives_even_if_task_reference_dropped(
+    tmp_path, monkeypatch
+):
     """Concurrent 401s share one handler task and all callers resolve.
 
     Regression guard: if the manager ever stops holding a strong reference
@@ -325,6 +337,7 @@ def _fake_response(status, url, body):
 
 def _provider_with_token_endpoint(tmp_path, oauth_config, token_endpoint, monkeypatch):
     from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
     reset_manager_for_tests()
     # Provider construction fails fast in a non-interactive environment with no
     # cached tokens (mcp_oauth_manager.py guard). The hermetic test env has no
@@ -369,7 +382,9 @@ def test_invalid_client_metadata_does_not_trip(tmp_path, monkeypatch):
         tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
     )
     resp = _fake_response(
-        400, "https://idp.example.com/oauth/token", b'{"error":"invalid_client_metadata"}'
+        400,
+        "https://idp.example.com/oauth/token",
+        b'{"error":"invalid_client_metadata"}',
     )
 
     asyncio.run(provider._maybe_flag_poisoned_client(resp))
@@ -411,6 +426,7 @@ def test_bridge_forwards_requests_and_poisons_on_token_endpoint_400(
         forwarded.append(("in", response))
 
     from mcp.client.auth.oauth2 import OAuthClientProvider
+
     monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", fake_base_flow)
 
     provider = _provider_with_token_endpoint(tmp_path, {}, token_ep, monkeypatch)

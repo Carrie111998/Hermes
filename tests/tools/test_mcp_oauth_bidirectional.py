@@ -26,6 +26,7 @@ the full ``.asend()`` round-trip — the integration tests in
 These tests drive the wrapper through a manual ``.asend()`` sequence to prove
 the bridge forwards responses correctly into the inner SDK generator.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -126,7 +127,11 @@ async def test_hermes_provider_forwards_401_triggers_refresh(tmp_path, monkeypat
     branch which begins discovery (yielding a metadata-discovery request).
     """
     import httpx
-    from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
+    from mcp.shared.auth import (
+        OAuthClientInformationFull,
+        OAuthClientMetadata,
+        OAuthToken,
+    )
     from pydantic import AnyUrl
 
     from tools.mcp_oauth import HermesTokenStorage
@@ -181,7 +186,9 @@ async def test_hermes_provider_forwards_401_triggers_refresh(tmp_path, monkeypat
     fake_401 = httpx.Response(
         401,
         request=outbound,
-        headers={"www-authenticate": 'Bearer resource_metadata="https://example.com/.well-known/oauth-protected-resource"'},
+        headers={
+            "www-authenticate": 'Bearer resource_metadata="https://example.com/.well-known/oauth-protected-resource"'
+        },
     )
 
     # The correct bridge forwards the 401 into the SDK; the SDK then yields
@@ -202,7 +209,11 @@ async def test_hermes_provider_forwards_401_triggers_refresh(tmp_path, monkeypat
 async def test_httpx_timeout_closes_inner_flow_and_releases_lock(tmp_path, monkeypatch):
     """HTTPX teardown must release the SDK lock and leave the provider reusable."""
     import httpx
-    from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
+    from mcp.shared.auth import (
+        OAuthClientInformationFull,
+        OAuthClientMetadata,
+        OAuthToken,
+    )
     from pydantic import AnyUrl
 
     from tools.mcp_oauth import HermesTokenStorage
