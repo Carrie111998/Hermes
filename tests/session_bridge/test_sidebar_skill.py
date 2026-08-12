@@ -14,12 +14,45 @@ import zipfile
 
 import pytest
 
+from tests.timeout_budget import scaled
+
 
 ROOT = Path(__file__).resolve().parents[2]
 ASSET = ROOT / "session_bridge" / "assets" / "session-sidebar-sync"
 BASELINE = Path(__file__).parent / "fixtures" / "sidebar_skill_baseline.txt"
 LOCK_NAME = ".session-sidebar-sync.install.lock"
 BACKUP_ROOT_NAME = ".session-bridge-skill-backups"
+
+
+# ── Child deadlines ──────────────────────────────────────────────────────────
+#
+# The process-lock tests spawn one or two fresh interpreters that import
+# ``session_bridge`` and touch the filesystem. Idle that is a couple of
+# seconds; under memory/CPU pressure the same spawn can take an order of
+# magnitude longer, and the old 5s/10s/15s bounds tripped as
+# ``subprocess.TimeoutExpired`` — a failure mode indistinguishable from a
+# real lock regression, and one whose frequency tracked how many other test
+# files shared the run rather than anything in the code under test.
+#
+# None of these bounds is asserted on: no test here claims a child is *fast*,
+# only that it eventually succeeds, blocks, or raises. They are safety nets,
+# so they get a generous base scaled by ``HERMES_TEST_TIMEOUT_SCALE`` (see
+# ``tests/timeout_budget.py``).
+#
+# The one deadline that IS the assertion stays small and unscaled at its call
+# site: ``skill._LOCK_WAIT_SECONDS = 0.1`` in
+# ``test_process_lock_times_out_without_stealing_held_descriptor``, where the
+# lock is supposed to give up. Its lock holder no longer races that budget on
+# a fixed sleep — see the comment there.
+_CHILD_TIMEOUT = scaled(60.0)
+_READY_TIMEOUT = scaled(30.0)
+# Above the sum of the child bounds a single test can serialize, so a stall
+# surfaces as a pointed TimeoutExpired rather than a pytest-timeout kill
+# (which takes the summary line with it). Overrides the global
+# ``--timeout=30`` from pyproject.toml.
+_TEST_TIMEOUT = _READY_TIMEOUT + _CHILD_TIMEOUT * 4 + scaled(30.0)
+
+spawns_children = pytest.mark.timeout(_TEST_TIMEOUT)
 
 
 @pytest.mark.parametrize("relative", ("a:b", "D:/escape.txt", "D:escape.txt"))
@@ -87,8 +120,10 @@ def _start_python(code: str, *arguments: Path | str) -> subprocess.Popen[str]:
 def _run_python(
     code: str,
     *arguments: Path | str,
-    timeout: float = 15.0,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if timeout is None:
+        timeout = _CHILD_TIMEOUT
     return subprocess.run(
         [sys.executable, "-c", code, *(str(argument) for argument in arguments)],
         cwd=ROOT,
@@ -102,9 +137,11 @@ def _run_python(
 
 def _wait_for_path(path: Path, process: subprocess.Popen[str]) -> None:
     # Windows process startup can exceed five seconds when the parallel suite is
-    # launching many isolated interpreters. Keep enough headroom for scheduler
-    # contention while remaining below pytest's per-test timeout.
-    deadline = time.monotonic() + 15.0
+    # launching many isolated interpreters, and tens of seconds when the box is
+    # short on memory. Readiness is not what any caller asserts on, so this is
+    # a load-scaled safety net; callers keep it below their own
+    # ``spawns_children`` cap.
+    deadline = time.monotonic() + _READY_TIMEOUT
     while time.monotonic() < deadline:
         if path.exists():
             return
@@ -1256,6 +1293,7 @@ def test_install_sidebar_skill_serializes_concurrent_repeated_installs(
 
 
 @pytest.mark.live_system_guard_bypass
+@spawns_children
 def test_process_lock_serializes_install_and_preserves_one_backup(
     tmp_path: Path,
 ) -> None:
@@ -1287,8 +1325,8 @@ def test_process_lock_serializes_install_and_preserves_one_backup(
     time.sleep(0.15)
 
     assert installer.poll() is None, "installer must wait for the held OS lock"
-    holder_stdout, holder_stderr = holder.communicate(timeout=5)
-    installer_stdout, installer_stderr = installer.communicate(timeout=10)
+    holder_stdout, holder_stderr = holder.communicate(timeout=_CHILD_TIMEOUT)
+    installer_stdout, installer_stderr = installer.communicate(timeout=_CHILD_TIMEOUT)
     assert holder.returncode == 0, (holder_stdout, holder_stderr)
     assert installer.returncode == 0, (installer_stdout, installer_stderr)
     backups = list((codex_home / BACKUP_ROOT_NAME).glob("session-sidebar-sync.backup*"))
@@ -1299,6 +1337,7 @@ def test_process_lock_serializes_install_and_preserves_one_backup(
 
 
 @pytest.mark.live_system_guard_bypass
+@spawns_children
 def test_process_lock_crash_releases_descriptor_without_unlinking(
     tmp_path: Path,
 ) -> None:
@@ -1319,7 +1358,7 @@ def test_process_lock_crash_releases_descriptor_without_unlinking(
     _wait_for_path(ready, holder)
     lock_path = skills / LOCK_NAME
     identity_before = (lock_path.stat().st_dev, lock_path.stat().st_ino)
-    holder.wait(timeout=5)
+    holder.wait(timeout=_CHILD_TIMEOUT)
     result = _run_python(
         "from pathlib import Path\n"
         "import sys\n"
@@ -1335,6 +1374,7 @@ def test_process_lock_crash_releases_descriptor_without_unlinking(
 
 
 @pytest.mark.live_system_guard_bypass
+@spawns_children
 def test_process_lock_ignores_malformed_persistent_contents(
     tmp_path: Path,
 ) -> None:
@@ -1360,6 +1400,7 @@ def test_process_lock_ignores_malformed_persistent_contents(
 
 
 @pytest.mark.live_system_guard_bypass
+@spawns_children
 def test_process_lock_times_out_without_stealing_held_descriptor(
     tmp_path: Path,
 ) -> None:
@@ -1367,16 +1408,30 @@ def test_process_lock_times_out_without_stealing_held_descriptor(
     skills = codex_home / "skills"
     skills.mkdir(parents=True)
     ready = tmp_path / "timeout-ready"
+    release = tmp_path / "timeout-release"
+    # The holder must still own the lock when the installer below reaches its
+    # 0.1s wait — that is the whole premise of the test. A fixed
+    # ``time.sleep(5.0)`` made that a race against interpreter startup: under
+    # memory pressure the installer needs tens of seconds just to import
+    # ``session_bridge``, by which time a 5s hold has long since released and
+    # the install succeeds ("lock was stolen"). Holding until *this* process
+    # says so removes the race without touching the 0.1s budget that is the
+    # actual assertion. The deadline is only a backstop so a failed test
+    # cannot strand the holder.
     holder = _start_python(
         "from pathlib import Path\n"
         "import sys, time\n"
         "from session_bridge.sidebar_skill import _filesystem_install_lock\n"
-        "skills, ready = Path(sys.argv[1]), Path(sys.argv[2])\n"
+        "skills, ready, release = (Path(a) for a in sys.argv[1:4])\n"
+        "deadline = time.monotonic() + float(sys.argv[4])\n"
         "with _filesystem_install_lock(skills):\n"
         "    ready.write_text('ready', encoding='utf-8')\n"
-        "    time.sleep(5.0)\n",
+        "    while not release.exists() and time.monotonic() < deadline:\n"
+        "        time.sleep(0.02)\n",
         skills,
         ready,
+        release,
+        str(_CHILD_TIMEOUT),
     )
     _wait_for_path(ready, holder)
     result = _run_python(
@@ -1395,13 +1450,18 @@ def test_process_lock_times_out_without_stealing_held_descriptor(
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "timeout"
-    holder_stdout, holder_stderr = holder.communicate(timeout=5)
+    # The install attempt is over, so the hold has served its purpose: let the
+    # holder exit. Reaping it is incidental — the bound that mattered, the
+    # 0.1s lock wait the installer had to give up on, is asserted above.
+    release.write_text("go", encoding="utf-8")
+    holder_stdout, holder_stderr = holder.communicate(timeout=_CHILD_TIMEOUT)
     assert holder.returncode == 0, (holder_stdout, holder_stderr)
     assert (skills / LOCK_NAME).is_file()
     assert not (skills / "session-sidebar-sync").exists()
 
 
 @pytest.mark.live_system_guard_bypass
+@spawns_children
 def test_process_lock_concurrent_installers_do_not_lose_backup_or_install(
     tmp_path: Path,
 ) -> None:
@@ -1418,7 +1478,7 @@ def test_process_lock_concurrent_installers_do_not_lose_backup_or_install(
     )
     installers = [_start_python(code, codex_home) for _index in range(4)]
 
-    outputs = [process.communicate(timeout=15) for process in installers]
+    outputs = [process.communicate(timeout=_CHILD_TIMEOUT) for process in installers]
 
     assert [process.returncode for process in installers] == [0, 0, 0, 0], outputs
     backups = list((codex_home / BACKUP_ROOT_NAME).glob("session-sidebar-sync.backup*"))
@@ -1447,7 +1507,7 @@ _WHEEL_TEST_BUDGET = _WHEEL_BUILD_TIMEOUT + _WHEEL_KILL_TAIL + _WHEEL_BACKSTOP_S
     "built_wheel" not in " ".join(sys.argv),
     reason="run explicitly because a full repository wheel exceeds focused timeout",
 )
-@pytest.mark.timeout(_WHEEL_TEST_BUDGET)
+@pytest.mark.timeout(scaled(_WHEEL_TEST_BUDGET))
 def test_built_wheel_contains_the_sidebar_skill_assets(tmp_path: Path) -> None:
     environment = dict(os.environ)
     environment["UV_NO_PROGRESS"] = "1"
@@ -1464,7 +1524,7 @@ def test_built_wheel_contains_the_sidebar_skill_assets(tmp_path: Path) -> None:
         ["uv", "build", "--wheel", "--out-dir", str(tmp_path)],
         cwd=ROOT,
         env=environment,
-        timeout=_WHEEL_BUILD_TIMEOUT,
+        timeout=scaled(_WHEEL_BUILD_TIMEOUT),
     ).check_returncode()
     wheel = next(tmp_path.glob("*.whl"))
 
@@ -1501,7 +1561,7 @@ def test_built_wheel_contains_the_sidebar_skill_assets(tmp_path: Path) -> None:
         check=False,
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=_CHILD_TIMEOUT,
     )
 
     assert installed.returncode == 0, installed.stderr

@@ -32,6 +32,65 @@ import pytest
 
 from hermes_cli._subprocess_compat import run_text_capture
 from scripts import run_tests_parallel
+from tests.timeout_budget import scaled
+
+
+# ── Child deadlines ──────────────────────────────────────────────────────────
+#
+# Every spawn in this file is two generations deep: we launch
+# ``scripts/run_tests_parallel.py``, which launches one ``python -m pytest``
+# worker per probe file. Idle, that costs a few seconds; under memory/CPU
+# pressure on a loaded box it costs several times that. The bounds below are
+# safety nets against a *wedged* runner, not assertions about how fast it is
+# — nothing in this file asserts on elapsed time — so they are sized
+# generously and scaled by ``HERMES_TEST_TIMEOUT_SCALE``. See
+# ``tests/timeout_budget.py`` for the rationale.
+#
+# ``_FILE_TIMEOUT`` is the runner's own per-file deadline for the nested
+# pytest. It stays well below ``_RUNNER_TIMEOUT`` so a wedged *file* is
+# reported by the runner (which is the behaviour under test) instead of the
+# whole runner being killed out from under it.
+#
+# The three bounds are deliberately ordered
+# ``_FILE_TIMEOUT < _RUNNER_TIMEOUT < _TEST_TIMEOUT`` so a stall is reported
+# by the innermost layer that can explain it, and the pytest-level cap never
+# fires first (a pytest-timeout kill takes the summary line with it).
+# ``_TEST_TIMEOUT`` overrides the global ``--timeout=30`` from pyproject.toml,
+# which cannot bound a nested pytest run.
+_FILE_TIMEOUT_SECONDS = scaled(120.0)
+_FILE_TIMEOUT = str(int(_FILE_TIMEOUT_SECONDS))
+_RUNNER_TIMEOUT = _FILE_TIMEOUT_SECONDS * 2
+_TEST_TIMEOUT = _RUNNER_TIMEOUT + scaled(60.0)
+
+spawns_runner = pytest.mark.timeout(_TEST_TIMEOUT)
+
+
+def _rootdir_flag(probe_root: Path) -> str:
+    """Confine the nested pytest's collection tree to the probe directory.
+
+    Every probe below lives under ``tmp_path`` — i.e. under the shared
+    ``%TEMP%`` — while the runner launches pytest with ``cwd=repo_root``. The
+    argument therefore sits OUTSIDE the rootdir pytest derives from that cwd,
+    so pytest builds ``Dir`` collectors for the whole chain from the common
+    ancestor down: ``C:\\Users`` → ``diego`` → ``AppData`` → ``Local`` →
+    ``Temp`` → the probe dir. Collecting those directories walks the entire
+    user profile.
+
+    Two consequences, both measured on this host:
+
+    * Collection of a two-line probe takes ~33s instead of ~0.01s — which is
+      most of what the 60s child bounds used to be spent on, and why they
+      tripped under load.
+    * Enumerating ``%TEMP%`` races every other process that creates and
+      deletes temp dirs there, so collection dies with
+      ``FileNotFoundError: [WinError 2] ... 'C:\\...\\Temp\\<vanished-dir>'``
+      before any test runs. Reproduced twice, naming a different vanished
+      directory each time.
+
+    Pinning ``--rootdir`` to the probe directory bounds the tree at the probe
+    itself. It changes only nodeid display, which nothing here asserts on.
+    """
+    return f"--rootdir={probe_root}"
 
 
 # Both tests share the same handoff file: the leaker writes here, the
@@ -96,6 +155,7 @@ def _pid_alive(pid: int) -> bool:
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only probe")
 @pytest.mark.live_system_guard_bypass
+@spawns_runner
 def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
     """Run the parallel runner over a probe file and verify cleanup.
 
@@ -169,16 +229,17 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
             str(probe_dir),
             "-j",
             "1",
-            # Tight per-file timeout: the probe finishes in <1s, no
-            # need for 10min.
+            # Bounded per-file timeout: the probe finishes in <1s, no
+            # need for the runner's 10min default.
             "--file-timeout",
-            "30",
+            _FILE_TIMEOUT,
+            _rootdir_flag(probe_dir),
         ],
         cwd=repo_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        timeout=60,
+        timeout=_RUNNER_TIMEOUT,
     )
 
     assert handoff.exists(), (
@@ -199,7 +260,7 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
     # The grandchild must be gone. Poll for a bit because process-group
     # SIGKILL + reaping isn't synchronous; on a loaded box it can take
     # a beat.
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + scaled(5.0)
     while time.monotonic() < deadline:
         if not _pid_alive(grandchild_pid):
             break
@@ -268,12 +329,14 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
     # Windows has no such guarantee and is exactly where the hang lands.
     return _merged(run_text_capture(
         [sys.executable, str(runner), "--paths", str(probe_dir),
-         "-j", "1", "--file-timeout", "30", *extra],
+         "-j", "1", "--file-timeout", _FILE_TIMEOUT,
+         _rootdir_flag(probe_dir), *extra],
         cwd=repo_root,
-        timeout=60,
+        timeout=_RUNNER_TIMEOUT,
     ))
 
 
+@spawns_runner
 def test_bare_q_flag_passes_through(tmp_path: Path) -> None:
     """A bare ``-q`` (no ``--``) runs clean instead of erroring out."""
     probe_dir = _make_probe_dir(tmp_path)
@@ -282,6 +345,7 @@ def test_bare_q_flag_passes_through(tmp_path: Path) -> None:
     assert "unrecognized arguments" not in proc.stdout
 
 
+@spawns_runner
 def test_bare_value_flag_keeps_its_value(tmp_path: Path) -> None:
     """``-k test_alpha`` reaches pytest as a selector, not as a path.
 
@@ -302,6 +366,7 @@ def test_bare_value_flag_keeps_its_value(tmp_path: Path) -> None:
     )
 
 
+@spawns_runner
 def test_explicit_double_dash_still_works(tmp_path: Path) -> None:
     """The legacy ``--`` separator keeps working alongside bare flags."""
     probe_dir = _make_probe_dir(tmp_path)
@@ -310,6 +375,7 @@ def test_explicit_double_dash_still_works(tmp_path: Path) -> None:
     assert "unrecognized arguments" not in proc.stdout
 
 
+@spawns_runner
 def test_positional_path_not_treated_as_flag(tmp_path: Path) -> None:
     """A positional path arg still overrides discovery (not routed to pytest)."""
     probe_dir = _make_probe_dir(tmp_path)
@@ -319,8 +385,8 @@ def test_positional_path_not_treated_as_flag(tmp_path: Path) -> None:
     # run_text_capture: pytest workers are grandchildren here — see _run_runner.
     proc = _merged(run_text_capture(
         [sys.executable, str(runner), str(probe_dir), "-j", "1",
-         "--file-timeout", "30", "-q"],
-        cwd=repo_root, timeout=60,
+         "--file-timeout", _FILE_TIMEOUT, _rootdir_flag(probe_dir), "-q"],
+        cwd=repo_root, timeout=_RUNNER_TIMEOUT,
     ))
     assert proc.returncode == 0, proc.stdout
     # Discovery found the probe file (2 tests), proving the positional path
@@ -359,6 +425,7 @@ def test_each_file_gets_a_unique_run_scoped_basetemp() -> None:
     assert run_tests_parallel._basetemp_for(a, repo_root) == bt_a
 
 
+@spawns_runner
 def test_basetemp_is_wired_into_the_pytest_subprocess(tmp_path: Path) -> None:
     """The unique basetemp actually reaches pytest — a probe reading its own
     ``tmp_path`` reports a dir under the runner's per-run basetemp root.
@@ -412,6 +479,7 @@ def test_files_list_preserves_windows_drive_colons() -> None:
     ]
 
 
+@spawns_runner
 def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:
     """A pass-on-retry is green, loud, and retains the failing traceback."""
     repo_root = Path(__file__).resolve().parent.parent
@@ -446,10 +514,11 @@ def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:
             "1",
             "-j",
             "1",
+            _rootdir_flag(probe.parent),
             "-q",
         ],
         cwd=repo_root,
-        timeout=60,
+        timeout=_RUNNER_TIMEOUT,
     ))
 
     assert proc.returncode == 0, proc.stdout
@@ -459,6 +528,7 @@ def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:
     assert "retry output" in proc.stdout
 
 
+@spawns_runner
 def test_file_retry_does_not_launder_deterministic_failure(tmp_path: Path) -> None:
     """A real regression fails both attempts and the runner remains red."""
     repo_root = Path(__file__).resolve().parent.parent
@@ -481,10 +551,11 @@ def test_file_retry_does_not_launder_deterministic_failure(tmp_path: Path) -> No
             "1",
             "-j",
             "1",
+            _rootdir_flag(probe.parent),
             "-q",
         ],
         cwd=repo_root,
-        timeout=60,
+        timeout=_RUNNER_TIMEOUT,
     ))
 
     assert proc.returncode == 1, proc.stdout
