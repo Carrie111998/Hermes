@@ -80,8 +80,19 @@ traceback. There is none, because they passed. Do **not** record this as fixed:
 
 ## The 14, by cause
 
-*(9 of these are now fixed — see the baseline note above. Groups A and B are annotated;
-C, D and E are untouched and still need the re-check.)*
+*(All 14 are now fixed — see the status table above. Every group carries a ✅ banner with
+its evidence; the original triage is preserved verbatim underneath each one.)*
+
+**One flaky test in this suite is NOT one of the 14, and you will still see it fail.**
+`test_matrix.py::TestMatrixReactions::test_on_processing_complete_sends_cross_on_failure`
+failed once in three whole-file runs on 2026-08-11 and then passed **8/8 in isolation** and
+in a clean `250 passed, 1 skipped` whole-file rerun. It is a wall-clock race, not a
+regression: the test sets `_reaction_redaction_delay_seconds = 0.01`, then
+`await asyncio.sleep(0.03)` before asserting the background task already ran — a 3× margin
+that a loaded box loses, giving `Expected mock to have been awaited once. Awaited 0 times.`
+**Two sibling tests in the same class use the identical 0.01/0.03 pattern** (around
+`test_matrix.py:3117`, `:3146`, `:3216`), so any of the three can fire. Do not chase it as a
+break in the code under test; the fix is to wait on the effect rather than on the clock.
 
 ### A. ✅ FIXED — Stale test scaffolding — 5 — `test_multiplex_adapter_registry.py`
 
