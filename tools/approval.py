@@ -1144,9 +1144,14 @@ def _home_prefix_fold_regex(path: str):
     if not components or (not posix_absolute and len(components) < 2):
         return None
     body = r"[/\\]+".join(re.escape(c) for c in components)
-    # Keep the root separator mandatory for POSIX paths: besides preserving
-    # absoluteness, this prevents /root from matching the suffix of /srv/root.
-    root = r"[/\\]+" if posix_absolute else r"[/\\]*"
+    # Keep the root separator mandatory for POSIX paths and require it to begin
+    # a path token. Without the boundary, the regex engine can still start at
+    # the second separator in /srv/root and corrupt it into /srv~.
+    root = (
+        r"(?<![^\s'\"`;|&<>()=])[/\\]+"
+        if posix_absolute
+        else r"[/\\]*"
+    )
     return re.compile(root + body + _PATH_TAIL)
 
 

@@ -552,10 +552,14 @@ class TestSingleSegmentPosixHomeFolding:
     def test_nested_same_name_is_not_treated_as_home(self, monkeypatch):
         monkeypatch.setenv("HOME", "/root")
 
+        normalized = approval_module._normalize_command_for_detection(
+            "cat key >> /srv/root/.ssh/authorized_keys"
+        )
         dangerous, key, _ = detect_dangerous_command(
             "cat key >> /srv/root/.ssh/authorized_keys"
         )
 
+        assert normalized == "cat key >> /srv/root/.ssh/authorized_keys"
         assert dangerous is False
         assert key is None
 
