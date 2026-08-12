@@ -53,6 +53,29 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def _tool_exec_error(
+    message: str,
+    *,
+    effect_disposition: str = "unknown",
+    retryable: bool = False,
+) -> str:
+    """Structured JSON error result for executor-level failures.
+
+    Timeout / exception / thread-failure paths used to emit free-text
+    ``"Error executing tool 'X': ..."`` while tool handlers return
+    ``tool_error()``'s JSON envelope — the model could not tell whether a side
+    effect had happened or whether retry was safe. Route executor errors through
+    the same envelope with ``effect_disposition`` and ``retryable`` signals.
+    """
+    from tools.registry import tool_error
+
+    return tool_error(
+        message,
+        effect_disposition=effect_disposition,
+        retryable=retryable,
+    )
+
+
 def _ensure_file_checkpoint(
     agent,
     function_name: str,
@@ -1095,7 +1118,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
                 return
             except Exception as tool_error:
-                result = f"Error executing tool '{function_name}': {tool_error}"
+                result = _tool_exec_error(f"Error executing tool '{function_name}': {tool_error}")
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
             duration = time.time() - start
             if not blocked and not dispatched:
@@ -1209,9 +1232,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         ) in skipped_calls:
                             if results[skipped_i] is None:
                                 middleware_trace = parsed_calls[skipped_i][3]
-                                result = (
+                                result = _tool_exec_error(
                                     f"Error executing tool '{skipped_name}': "
-                                    "Python interpreter is shutting down; tool was not started"
+                                    "Python interpreter is shutting down; tool was not started",
+                                    effect_disposition="not_started",
+                                    retryable=True,
                                 )
                                 results[skipped_i] = (
                                     skipped_name,
@@ -1366,7 +1391,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         effect_disposition = None
         if i in timed_out_indices and r is None:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
-            function_result = f"Error executing tool '{name}': timed out after {suffix}"
+            function_result = _tool_exec_error(
+                f"Error executing tool '{name}': timed out after {suffix}",
+                effect_disposition="unknown",
+                retryable=False,
+            )
             effect_disposition = "unknown"
             _emit_terminal_post_tool_call(
                 agent,
@@ -1399,7 +1428,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     middleware_trace=list(middleware_trace),
                 )
             else:
-                function_result = f"Error executing tool '{name}': thread did not return a result"
+                function_result = _tool_exec_error(
+                    f"Error executing tool '{name}': thread did not return a result",
+                    effect_disposition="unknown",
+                    retryable=False,
+                )
                 _emit_terminal_post_tool_call(
                     agent,
                     function_name=name,
@@ -2089,7 +2122,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
                 raise
             except Exception as tool_error:
-                function_result = f"Error executing tool '{function_name}': {tool_error}"
+                function_result = _tool_exec_error(f"Error executing tool '{function_name}': {tool_error}")
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             finally:
                 tool_duration = time.time() - tool_start_time
@@ -2165,7 +2198,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
                 raise
             except Exception as tool_error:
-                function_result = f"Error executing tool '{function_name}': {tool_error}"
+                function_result = _tool_exec_error(f"Error executing tool '{function_name}': {tool_error}")
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
 
