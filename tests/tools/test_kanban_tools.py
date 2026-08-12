@@ -418,6 +418,72 @@ def test_review_target_reads_only_pinned_commits(reviewer_target_env):
     assert result["complete"] is True
 
 
+def test_review_target_accepts_dispatcher_pinned_default_review(reviewer_target_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET workflow_template_id=NULL, current_step_key=NULL, "
+            "source_commit_forbidden=1, branch_name='main' WHERE id=?",
+            (reviewer_target_env["task_id"],),
+        )
+        conn.execute(
+            "UPDATE task_runs SET step_key=NULL, metadata=? WHERE id=?",
+            (
+                json.dumps(
+                    {
+                        "review_contract_kind": "default",
+                        "review_branch": "main",
+                        "review_base_sha": reviewer_target_env["base_sha"],
+                        "review_head_sha": reviewer_target_env["head_sha"],
+                    }
+                ),
+                reviewer_target_env["run_id"],
+            ),
+        )
+        conn.commit()
+
+    result = json.loads(kt._handle_review_target({"offset": 0}))
+
+    assert result["base_sha"] == reviewer_target_env["base_sha"]
+    assert result["head_sha"] == reviewer_target_env["head_sha"]
+    assert result["changed_files"] == ["reviewed.txt"]
+
+
+def test_review_target_rejects_fabricated_default_contract_metadata(
+    reviewer_target_env,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET workflow_template_id=NULL, current_step_key=NULL, "
+            "source_commit_forbidden=0, branch_name='main' WHERE id=?",
+            (reviewer_target_env["task_id"],),
+        )
+        conn.execute(
+            "UPDATE task_runs SET step_key=NULL, metadata=? WHERE id=?",
+            (
+                json.dumps(
+                    {
+                        "review_contract_kind": "default",
+                        "review_branch": "main",
+                        "review_base_sha": reviewer_target_env["base_sha"],
+                        "review_head_sha": reviewer_target_env["head_sha"],
+                    }
+                ),
+                reviewer_target_env["run_id"],
+            ),
+        )
+        conn.commit()
+
+    result = json.loads(kt._handle_review_target({}))
+
+    assert "not owned by the current reviewer run" in result["error"]
+
+
 def test_review_target_pages_diff_with_stable_offsets(
     reviewer_target_env, monkeypatch,
 ):

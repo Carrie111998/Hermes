@@ -963,20 +963,33 @@ def _handle_review_target(args: dict, **kw) -> str:
         kb, conn = _connect()
         try:
             task = kb.get_task(conn, task_id)
+            run = kb.get_run(conn, run_id)
+            metadata = run.metadata if run and isinstance(run.metadata, dict) else {}
+            review_shape = (
+                (task.workflow_template_id, task.current_step_key, run.step_key)
+                if task is not None and run is not None else None
+            )
+            product_review = review_shape == ("product", "review", "review")
+            default_review = (
+                review_shape == (None, None, None)
+                and task.assignee == "reviewer"
+                and task.source_commit_forbidden
+                and task.branch_name
+                and metadata.get("review_branch") == task.branch_name
+                and metadata.get("review_contract_kind") == "default"
+            )
             if (
                 task is None
-                or task.current_step_key != "review"
                 or task.current_run_id != run_id
+                or not (product_review or default_review)
             ):
                 return tool_error(
                     "review_target: task is not owned by the current reviewer run"
                 )
-            run = kb.get_run(conn, run_id)
             if (
                 run is None
                 or run.task_id != task_id
                 or run.profile != "reviewer"
-                or run.step_key != "review"
                 or run.ended_at is not None
                 or run.status != "running"
             ):
@@ -992,7 +1005,6 @@ def _handle_review_target(args: dict, **kw) -> str:
                 return tool_error(
                     "review_target: task is not owned by the current reviewer claim"
                 )
-            metadata = run.metadata if isinstance(run.metadata, dict) else {}
             base_sha = metadata.get("review_base_sha")
             head_sha = metadata.get("review_head_sha")
             if (

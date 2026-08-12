@@ -7840,6 +7840,265 @@ def test_dispatch_pins_review_target_before_reviewer_spawn(
     ]
 
 
+def test_default_review_dispatch_requires_structural_target_contract(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    """A generic review card must not launch without an explicit target contract."""
+    board = "default-review-contract"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    base_sha = _head_sha(repo)
+    head_sha = _commit_file(repo, "reviewed.txt", "candidate\n", "candidate")
+    _set_generated_path_policy(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Default review without product step",
+            board=board,
+            assignee="reviewer",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            source_commit_forbidden=True,
+        )
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        conn.commit()
+
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: pytest.fail("review launched without contract"),
+        )
+        task = kb.get_task(conn, tid)
+
+    assert result.spawned == []
+    assert task is not None and task.status == "blocked"
+    assert task.current_step_key is None
+    assert task.last_failure_error is not None
+    assert "review execution contract" in task.last_failure_error
+    assert base_sha != head_sha
+
+
+def test_default_review_dispatch_pins_completed_predecessor_target(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "default-review-target-pinned"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    base_sha = _head_sha(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "-b", "review-candidate"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    head_sha = _commit_file(repo, "reviewed.txt", "candidate\n", "candidate")
+    _set_generated_path_policy(board, repo)
+    observed = []
+
+    with kb.connect(board=board) as conn:
+        predecessor_id = kb.create_task(
+            conn,
+            title="Completed test gate",
+            board=board,
+            assignee="tester",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            source_commit_forbidden=True,
+        )
+        kb.set_branch_name(conn, predecessor_id, "review-candidate")
+        conn.execute(
+            "UPDATE tasks SET status='done', completed_at=1 WHERE id=?",
+            (predecessor_id,),
+        )
+        predecessor_run_id = kb._synthesize_ended_run(
+            conn,
+            predecessor_id,
+            outcome="completed",
+            metadata={"candidate_sha": head_sha},
+        )
+        tid = kb.create_task(
+            conn,
+            title="Default immutable review",
+            board=board,
+            assignee="reviewer",
+            parents=[predecessor_id],
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            source_commit_forbidden=True,
+        )
+        kb.set_branch_name(conn, tid, "review-candidate")
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        conn.commit()
+
+        def capture_spawn(task, launched_workspace, board=None):
+            run = kb.get_run(conn, task.current_run_id)
+            observed.append((launched_workspace, run.step_key, run.metadata))
+            return 4242
+
+        result = kb.dispatch_once(conn, board=board, spawn_fn=capture_spawn)
+        task = kb.get_task(conn, tid)
+
+    assert result.spawned[0][0] == tid
+    assert task is not None
+    assert task.workflow_template_id is None
+    assert task.current_step_key is None
+    assert predecessor_run_id > 0
+    assert observed == [
+        (
+            str(repo),
+            None,
+            {
+                "review_contract_kind": "default",
+                "review_branch": "review-candidate",
+                "review_base_sha": base_sha,
+                "review_head_sha": head_sha,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "invalid_contract",
+    [
+        "missing_candidate",
+        "invalid_candidate",
+        "missing_source_policy",
+        "dirty_workspace",
+        "mismatched_branch",
+        "mismatched_repository",
+        "moved_candidate",
+        "wrong_active_profile",
+        "absent_predecessor",
+    ],
+)
+def test_default_review_dispatch_rejects_invalid_target_contract_before_spawn(
+    kanban_home, tmp_path, all_assignees_spawnable, monkeypatch, invalid_contract,
+):
+    board = f"default-review-invalid-{invalid_contract}"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "-b", "review-candidate"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    head_sha = _commit_file(repo, "reviewed.txt", "candidate\n", "candidate")
+    configured_repo = repo
+    if invalid_contract == "mismatched_repository":
+        configured_repo = tmp_path / "configured-repo"
+        _init_git_repo(configured_repo)
+    _set_generated_path_policy(board, configured_repo)
+
+    with kb.connect(board=board) as conn:
+        predecessor_id = kb.create_task(
+            conn,
+            title="Completed Tester gate",
+            board=board,
+            assignee="tester",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            source_commit_forbidden=True,
+        )
+        kb.set_branch_name(
+            conn,
+            predecessor_id,
+            "main" if invalid_contract == "mismatched_branch" else "review-candidate",
+        )
+        conn.execute(
+            "UPDATE tasks SET status='done', completed_at=1 WHERE id=?",
+            (predecessor_id,),
+        )
+        predecessor_metadata = {
+            "candidate_sha": (
+                "not-a-full-sha" if invalid_contract == "invalid_candidate" else head_sha
+            )
+        }
+        if invalid_contract == "missing_candidate":
+            predecessor_metadata = {}
+        kb._synthesize_ended_run(
+            conn,
+            predecessor_id,
+            outcome="completed",
+            metadata=predecessor_metadata,
+        )
+        tid = kb.create_task(
+            conn,
+            title="Invalid Default review target",
+            board=board,
+            assignee="reviewer",
+            parents=[] if invalid_contract == "absent_predecessor" else [predecessor_id],
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            source_commit_forbidden=invalid_contract != "missing_source_policy",
+        )
+        kb.set_branch_name(conn, tid, "review-candidate")
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        conn.commit()
+        if invalid_contract == "dirty_workspace":
+            (repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+        elif invalid_contract == "moved_candidate":
+            _commit_file(repo, "moved.txt", "moved\n", "moved review head")
+        if invalid_contract == "wrong_active_profile":
+            original_stamp = kb._stamp_run_executor_identity
+
+            def stamp_wrong_profile(active_conn, claimed):
+                original_stamp(active_conn, claimed)
+                active_conn.execute(
+                    "UPDATE task_runs SET profile='default' WHERE id=?",
+                    (claimed.current_run_id,),
+                )
+                active_conn.commit()
+
+            monkeypatch.setattr(kb, "_stamp_run_executor_identity", stamp_wrong_profile)
+
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 4242,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert result.spawned == []
+    assert task is not None and task.status == "blocked"
+    assert task.workflow_template_id is None
+    assert task.current_step_key is None
+    assert task.last_failure_error is not None
+    assert "review target preparation" in task.last_failure_error
+
+
+def test_non_review_source_forbidden_task_remains_outside_default_review_contract(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "default-read-only-non-review"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    spawned = []
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Read-only inspection",
+            board=board,
+            assignee="default",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            source_commit_forbidden=True,
+        )
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda task, workspace: spawned.append((task.id, workspace)) or 4242,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert result.spawned[0][0] == tid
+    assert spawned == [(tid, str(repo))]
+    assert task is not None and task.status == "running"
+    assert task.last_failure_error is None
+
+
 def test_pinned_review_target_survives_run_completion(
     kanban_home, tmp_path, all_assignees_spawnable,
 ):

@@ -16514,13 +16514,26 @@ def _prepare_review_target(
     workspace: Path | str,
     *,
     board: Optional[str] = None,
+    default_review_status: bool = False,
 ) -> Optional[dict[str, str]]:
     """Pin immutable base/head commits into the active review run."""
     task = get_task(conn, task_id)
     if task is None:
         raise ReviewTargetPreparationError(f"task {task_id} not found")
-    if task.current_step_key != "review":
+    product_review = (
+        task.workflow_template_id == "product" and task.current_step_key == "review"
+    )
+    default_review = (
+        default_review_status
+        and task.workflow_template_id is None
+        and task.current_step_key is None
+    )
+    if not product_review and not default_review:
         return None
+    if default_review and (task.assignee != "reviewer" or not task.source_commit_forbidden):
+        raise ReviewTargetPreparationError(
+            "Default review requires reviewer ownership and forbidden source commits"
+        )
     if not task.workspace_path:
         raise ReviewTargetPreparationError("task has no workspace path")
     try:
@@ -16546,7 +16559,7 @@ def _prepare_review_target(
         or run.ended_at is not None
         or run.status != "running"
         or run.profile != "reviewer"
-        or run.step_key != "review"
+        or run.step_key != ("review" if product_review else None)
     ):
         raise ReviewTargetPreparationError("active run is not the current review run")
 
@@ -16563,15 +16576,67 @@ def _prepare_review_target(
     head_sha = _review_git_output(
         actual_workspace, "rev-parse", "--verify", "HEAD^{commit}"
     )
-    tested_target = _latest_test_target(conn, task_id)
-    if tested_target:
-        if tested_target["test_branch"] != workspace_branch:
-            raise ReviewTargetPreparationError("review branch does not match tested branch")
-        if tested_target["test_head_sha"] != head_sha:
-            raise ReviewTargetPreparationError("review head does not match tested SHA")
-    base_ref = _review_target_branch(
-        conn, task_id, actual_workspace, board=board
-    )
+    if product_review:
+        tested_target = _latest_test_target(conn, task_id)
+        if tested_target:
+            if tested_target["test_branch"] != workspace_branch:
+                raise ReviewTargetPreparationError("review branch does not match tested branch")
+            if tested_target["test_head_sha"] != head_sha:
+                raise ReviewTargetPreparationError("review head does not match tested SHA")
+        base_ref = _review_target_branch(
+            conn, task_id, actual_workspace, board=board
+        )
+    else:
+        if not task.branch_name:
+            raise ReviewTargetPreparationError(
+                "Default review execution contract has no task branch binding"
+            )
+        board_meta = read_board_metadata(board)
+        try:
+            contract = repository_contract_for_metadata(board_meta)
+        except RepositoryConfigurationError as exc:
+            raise ReviewTargetPreparationError(
+                f"Default review repository binding is invalid: {exc.code}"
+            ) from exc
+        if contract is None:
+            raise ReviewTargetPreparationError(
+                "Default review execution contract has no repository binding"
+            )
+        if _git_common_dir(contract.repo_root) != _git_common_dir(actual_workspace):
+            raise ReviewTargetPreparationError(
+                "Default review workspace does not match the configured repository"
+            )
+        predecessor = conn.execute(
+            "SELECT json_extract(r.metadata, '$.candidate_sha') AS candidate_sha "
+            "FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+            "JOIN task_runs r ON r.task_id = p.id "
+            "WHERE l.child_id = ? AND p.status = 'done' "
+            "AND r.ended_at IS NOT NULL AND r.outcome = 'completed' "
+            "AND p.workspace_path = ? AND p.branch_name = ? "
+            "AND json_valid(COALESCE(r.metadata, '{}')) "
+            "ORDER BY p.completed_at DESC, r.ended_at DESC, r.id DESC LIMIT 1",
+            (task_id, task.workspace_path, task.branch_name),
+        ).fetchone()
+        if predecessor is None:
+            raise ReviewTargetPreparationError(
+                "Default review execution contract has no completed predecessor target"
+            )
+        candidate_sha = str(predecessor["candidate_sha"] or "").strip()
+        if not _FULL_GIT_SHA_RE.fullmatch(candidate_sha):
+            raise ReviewTargetPreparationError(
+                "Default review predecessor has no full candidate SHA"
+            )
+        resolved_candidate = _review_git_output(
+            actual_workspace,
+            "rev-parse",
+            "--verify",
+            f"{candidate_sha}^{{commit}}",
+        )
+        if resolved_candidate != candidate_sha or candidate_sha != head_sha:
+            raise ReviewTargetPreparationError(
+                "Default review head does not match the completed predecessor candidate"
+            )
+        base_ref = contract.base_ref
     base_sha = _review_git_output(
         actual_workspace, "merge-base", base_ref, head_sha
     )
@@ -16590,6 +16655,8 @@ def _prepare_review_target(
             "review_head_sha": head_sha,
         }
     )
+    if default_review:
+        metadata["review_contract_kind"] = "default"
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE task_runs SET metadata = ? "
@@ -16613,11 +16680,29 @@ def _pin_review_target_or_block(
     workspace: Path | str,
     *,
     board: Optional[str] = None,
+    default_review_status: bool = False,
 ) -> bool:
-    if task.current_step_key != "review" or task.assignee != "reviewer":
+    product_review = (
+        task.workflow_template_id == "product"
+        and task.current_step_key == "review"
+        and task.assignee == "reviewer"
+    )
+    default_review_candidate = (
+        default_review_status
+        and task.workflow_template_id is None
+        and task.current_step_key is None
+        and task.assignee == "reviewer"
+    )
+    if not product_review and not default_review_candidate:
         return True
     try:
-        _prepare_review_target(conn, task.id, workspace, board=board)
+        _prepare_review_target(
+            conn,
+            task.id,
+            workspace,
+            board=board,
+            default_review_status=default_review_status,
+        )
         return True
     except Exception as exc:
         _record_task_failure(
@@ -19578,7 +19663,11 @@ def _dispatch_once_locked(
             result.auto_blocked.append(claimed.id)
             continue
         if not _pin_review_target_or_block(
-            conn, claimed, workspace, board=board
+            conn,
+            claimed,
+            workspace,
+            board=board,
+            default_review_status=True,
         ):
             result.auto_blocked.append(claimed.id)
             continue
