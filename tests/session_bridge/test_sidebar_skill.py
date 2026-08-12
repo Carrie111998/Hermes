@@ -1436,15 +1436,21 @@ def test_process_lock_concurrent_installers_do_not_lose_backup_or_install(
 def test_built_wheel_contains_the_sidebar_skill_assets(tmp_path: Path) -> None:
     environment = dict(os.environ)
     environment["UV_NO_PROGRESS"] = "1"
-    subprocess.run(
+    # run_text_capture, not capture_output=True: `uv build` runs the PEP 517
+    # build backend in its own process, so the backend is a grandchild that
+    # inherits the capture pipe handles and holds the write end open — the pipe
+    # never reaches EOF and the 120s below never bounds the call. check=True is
+    # open-coded via check_returncode(), which the helper does not accept;
+    # without it a failed build would surface as the far less useful
+    # StopIteration from the tmp_path.glob("*.whl") below.
+    from hermes_cli._subprocess_compat import run_text_capture
+
+    run_text_capture(
         ["uv", "build", "--wheel", "--out-dir", str(tmp_path)],
         cwd=ROOT,
         env=environment,
-        check=True,
-        capture_output=True,
-        text=True,
         timeout=120,
-    )
+    ).check_returncode()
     wheel = next(tmp_path.glob("*.whl"))
 
     with zipfile.ZipFile(wheel) as archive:

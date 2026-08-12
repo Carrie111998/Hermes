@@ -30,6 +30,8 @@ from pathlib import Path
 
 import pytest
 
+from hermes_cli._subprocess_compat import run_text_capture
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -38,11 +40,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 def test_installed_wheel_renders_i18n_strings(tmp_path):
     # 1. Build the wheel from the current tree.
     wheel_dir = tmp_path / "wheel"
-    build = subprocess.run(
+    # run_text_capture, not capture_output=True: `uv build` runs the PEP 517
+    # build backend in its own process, so the backend is a grandchild of this
+    # call and inherits the capture pipe handles. On Windows it holds the write
+    # end open, the pipe never reaches EOF, and subprocess.run kills only uv at
+    # 600s before blocking on a drain that can never finish. Same class as the
+    # uv/pip installs converted in tools/lazy_deps.py.
+    build = run_text_capture(
         ["uv", "build", "--wheel", "--out-dir", str(wheel_dir), "."],
         cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
         timeout=600,
     )
     assert build.returncode == 0, f"uv build failed:\n{build.stderr}"
@@ -105,11 +111,11 @@ def test_built_sdist_ships_locale_catalogs(tmp_path):
     #27632 / #35374 / #23943.
     """
     sdist_dir = tmp_path / "sdist"
-    build = subprocess.run(
+    # run_text_capture: the PEP 517 backend is a grandchild here too — see the
+    # note on the --wheel build above.
+    build = run_text_capture(
         ["uv", "build", "--sdist", "--out-dir", str(sdist_dir), "."],
         cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
         timeout=600,
     )
     assert build.returncode == 0, f"uv build --sdist failed:\n{build.stderr}"
