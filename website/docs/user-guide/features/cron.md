@@ -413,6 +413,22 @@ cron:
 
 Or set the `HERMES_CRON_SCRIPT_TIMEOUT` environment variable. The resolution order is: env var → config.yaml → 3600s default.
 
+### Morning briefing weather
+
+The built-in `morning-brief` blueprint collects weather before the agent runs,
+so a weather outage or URL approval gate cannot prevent the rest of the brief
+from being delivered. Set the location in `config.yaml`:
+
+```yaml
+cron:
+  morning_brief:
+    weather_location: Taipei
+```
+
+The collector uses a fixed HTTPS endpoint with a bounded timeout and retry
+count. If the location is empty or the upstream is unavailable, it injects a
+`WEATHER_UNAVAILABLE` marker and the briefing continues without weather.
+
 ## No-agent mode (script-only jobs)
 
 For recurring jobs that don't need LLM reasoning — classic watchdogs, disk/memory alerts, heartbeats, CI pings — pass `no_agent=True` at creation time. The scheduler runs your script on schedule and delivers its stdout directly, skipping the agent entirely:
