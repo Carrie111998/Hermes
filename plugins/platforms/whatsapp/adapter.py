@@ -458,6 +458,46 @@ def _file_content_hash(path: Path) -> str:
 _NODE_PROBE_TIMEOUT_S = 60
 
 
+# How many consecutive "the environment is missing" fatals (Node absent,
+# bridge script absent) still deserve a reconnect attempt before WhatsApp is
+# declared permanently down.  These conditions look static — a runtime is
+# either installed or it isn't — but on this host every observed occurrence
+# was transient: the probe overran its budget (2026-06-12, 2026-08-11 01:40,
+# 2026-08-11 23:23) or the bridge tree was mid-`npm install`/mid-deploy.  The
+# two failure modes are not symmetric.  A wrong non-retryable is silent
+# multi-hour downtime that only a manual gateway restart clears; a wrong
+# retryable is one log line per backoff tick.  So retry — but bounded, so a
+# genuinely uninstalled Node still settles into the actionable "fatal" state
+# in /platform list instead of claiming "retrying" forever.
+#
+# 12 attempts against gateway/run.py's 30 → 60 → 120 → 240 → 300s (cap)
+# backoff is ~48 minutes of self-healing window.
+#
+# Deliberately NOT applied to whatsapp_not_paired below: pairing needs a human
+# at a QR code, so no amount of retrying can change it, and the retry would
+# hammer an unconfigured platform.
+_ENV_FATAL_RETRY_CEILING = 12
+_env_fatal_attempts = 0
+
+
+def _count_env_fatal_and_get_retryable() -> bool:
+    """Record one environment fatal; return whether it still deserves a retry."""
+    global _env_fatal_attempts
+    _env_fatal_attempts += 1
+    return _env_fatal_attempts <= _ENV_FATAL_RETRY_CEILING
+
+
+def _reset_env_fatal_attempts() -> None:
+    """Clear the ceiling once the environment checks pass again.
+
+    Module-level, not per-adapter: the reconnect watcher builds a fresh
+    adapter for every attempt, so an instance counter would reset itself
+    each round and never reach the ceiling.
+    """
+    global _env_fatal_attempts
+    _env_fatal_attempts = 0
+
+
 def check_whatsapp_requirements() -> bool:
     """
     Check if WhatsApp dependencies are available.
@@ -900,22 +940,40 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         """
         if not check_whatsapp_requirements():
             logger.warning("[%s] Node.js not found. WhatsApp requires Node.js.", self.name)
+            # Retryable up to _ENV_FATAL_RETRY_CEILING — see the rationale
+            # there.  Node missing reads like a static condition, but on this
+            # host it has only ever been a transient probe failure, and a
+            # wrong non-retryable costs silent multi-hour downtime.
+            _retryable = _count_env_fatal_and_get_retryable()
             self._set_fatal_error(
                 "whatsapp_node_missing",
-                "Node.js is not installed — install Node.js and re-run `hermes gateway`.",
-                retryable=False,
+                "Node.js is not installed — install Node.js"
+                + (
+                    "; WhatsApp reconnects on its own once it is there."
+                    if _retryable
+                    # Only true once the ceiling is spent: before that the
+                    # watcher picks the platform back up without a restart.
+                    else " and re-run `hermes gateway`."
+                ),
+                retryable=_retryable,
             )
             return False
-        
+
         bridge_path = Path(self._bridge_script)
         if not bridge_path.exists():
             logger.warning("[%s] Bridge script not found: %s", self.name, bridge_path)
+            # Same shape, same ceiling: the bridge tree can be absent mid
+            # `npm install` or mid-deploy and be back before the next tick.
             self._set_fatal_error(
                 "whatsapp_bridge_missing",
                 f"WhatsApp bridge script missing at {bridge_path}.",
-                retryable=False,
+                retryable=_count_env_fatal_and_get_retryable(),
             )
             return False
+
+        # Both environment preconditions hold — whatever tripped the ceiling
+        # is gone, so the next outage gets a full retry budget of its own.
+        _reset_env_fatal_attempts()
 
         # Pre-flight: skip the 30s bridge bootstrap entirely if the user
         # never finished pairing.  Without creds.json the bridge prints
