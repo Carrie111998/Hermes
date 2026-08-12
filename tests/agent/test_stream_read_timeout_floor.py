@@ -1,8 +1,9 @@
 """Stream read timeout must never preempt the stale-stream detector.
 
 Reasoning models (e.g. Opus) routinely pause mid-stream for minutes during
-extended thinking.  The stale-stream detector is deliberately scaled up to
-tolerate this (180s base, raised to 240s/300s for large contexts).  The httpx
+extended thinking. The stale-stream detector is deliberately scaled up to
+tolerate this (180s base, raised to 240s/300s for large contexts). Local
+providers use a bounded 300s default rather than an infinite wait. The httpx
 socket read timeout, however, defaulted to a flat 120s for cloud providers and
 fired *first* — tearing down a healthy reasoning stream before the stale
 detector (which owns retry + diagnostics) could act.
@@ -25,7 +26,7 @@ from agent.model_metadata import is_local_endpoint
 def _resolve_stale_timeout(base_url, est_tokens, stale_base=180.0):
     """Mirror of the stale-stream detector resolution."""
     if stale_base == 180.0 and base_url and is_local_endpoint(base_url):
-        return float("inf")  # detector disabled for local providers
+        return 300.0  # bounded default for local providers
     if est_tokens > 100_000:
         return max(stale_base, 300.0)
     if est_tokens > 50_000:
@@ -100,11 +101,11 @@ class TestLocalUnaffected:
             yield
 
     def test_local_still_raised_to_base(self):
-        """Local providers keep their existing behavior (raise to base timeout)."""
+        """Local providers keep a long read timeout but finite stale detection."""
         stale = _resolve_stale_timeout("http://localhost:11434", est_tokens=0)
-        assert stale == float("inf")  # detector disabled for local
+        assert stale == 300.0
         read = _resolve_read_timeout("http://localhost:11434", stale)
-        assert read == 1800.0  # not clamped by inf
+        assert read == 1800.0  # read timeout remains the full request timeout
 
     def test_stale_none_falls_back_to_default(self):
         """If the stale value is unresolved, the read timeout keeps its default."""

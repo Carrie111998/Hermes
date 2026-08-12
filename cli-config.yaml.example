@@ -369,13 +369,13 @@ browser:
 # =============================================================================
 # Tool Loop Guardrails
 # =============================================================================
-# Soft warnings are enabled by default. They append guidance to repeated failed
-# or non-progressing tool results but still let the tool execute. Hard stops are
-# opt-in circuit breakers for autonomous/cron sessions where stopping a loop is
-# preferable to spending the full iteration budget.
+# Soft warnings are enabled by default. Interactive CLI/TUI sessions keep the
+# warning-only behavior; gateway and cron sessions default to hard stops so an
+# unattended loop cannot spend the full iteration budget. Set the value below
+# explicitly to override that runtime default.
 tool_loop_guardrails:
   warnings_enabled: true
-  hard_stop_enabled: false
+  # hard_stop_enabled: false   # explicit override; omit for gateway/cron default
   warn_after:
     exact_failure: 2
     same_tool_failure: 3
@@ -687,6 +687,10 @@ skills:
 # Agent Behavior
 # =============================================================================
 agent:
+  # Maximum no-output wait for implicit local LLM calls (Ollama/NIM/etc.).
+  # Explicit providers.<id>[.models.<model>].stale_timeout_seconds wins.
+  # 300s allows slow prefill without leaving Telegram jobs waiting forever.
+  local_stale_timeout_seconds: 300
   # Maximum tool-calling iterations per conversation
   # Higher = more room for complex tasks, but costs more tokens
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration

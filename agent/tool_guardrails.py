@@ -81,10 +81,20 @@ class ToolCallGuardrailConfig:
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any] | None) -> "ToolCallGuardrailConfig":
-        """Build config from the `tool_loop_guardrails` config.yaml section."""
+    def from_mapping(
+        cls,
+        data: Mapping[str, Any] | None,
+        *,
+        default_hard_stop_enabled: bool = False,
+    ) -> "ToolCallGuardrailConfig":
+        """Build config from the ``tool_loop_guardrails`` config section.
+
+        ``default_hard_stop_enabled`` lets unattended runtimes choose a safe
+        default without changing the interactive CLI/TUI behavior. An
+        explicit ``hard_stop_enabled`` value in config always wins.
+        """
         if not isinstance(data, Mapping):
-            return cls()
+            return cls(hard_stop_enabled=default_hard_stop_enabled)
 
         warn_after = data.get("warn_after")
         if not isinstance(warn_after, Mapping):
@@ -93,7 +103,7 @@ class ToolCallGuardrailConfig:
         if not isinstance(hard_stop_after, Mapping):
             hard_stop_after = {}
 
-        defaults = cls()
+        defaults = cls(hard_stop_enabled=default_hard_stop_enabled)
         return cls(
             warnings_enabled=_as_bool(data.get("warnings_enabled"), defaults.warnings_enabled),
             hard_stop_enabled=_as_bool(data.get("hard_stop_enabled"), defaults.hard_stop_enabled),

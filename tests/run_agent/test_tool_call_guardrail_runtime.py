@@ -36,7 +36,12 @@ def _mock_response(content="Hello", finish_reason="stop", tool_calls=None):
     return SimpleNamespace(choices=[choice], model="test/model", usage=None)
 
 
-def _make_agent(*tool_names: str, max_iterations: int = 10, config: dict | None = None) -> AIAgent:
+def _make_agent(
+    *tool_names: str,
+    max_iterations: int = 10,
+    config: dict | None = None,
+    platform: str | None = None,
+) -> AIAgent:
     with (
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs(*tool_names)),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -50,6 +55,7 @@ def _make_agent(*tool_names: str, max_iterations: int = 10, config: dict | None 
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
+            platform=platform,
         )
     agent.client = MagicMock()
     agent._cached_system_prompt = "You are helpful."
@@ -58,6 +64,21 @@ def _make_agent(*tool_names: str, max_iterations: int = 10, config: dict | None 
     agent.compression_enabled = False
     agent.save_trajectories = False
     return agent
+
+
+def test_unattended_platforms_default_to_hard_stop():
+    for platform in ("telegram", "cron"):
+        agent = _make_agent("web_search", platform=platform)
+        assert agent._tool_guardrails.config.hard_stop_enabled is True
+
+
+def test_explicit_soft_policy_is_preserved_for_unattended_platform():
+    agent = _make_agent(
+        "web_search",
+        platform="telegram",
+        config={"tool_loop_guardrails": {"hard_stop_enabled": False}},
+    )
+    assert agent._tool_guardrails.config.hard_stop_enabled is False
 
 
 def _seed_exact_failures(agent: AIAgent, tool_name: str, args: dict, count: int = 2) -> None:

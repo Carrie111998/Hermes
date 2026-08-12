@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 
+DEFAULT_LOCAL_STALE_TIMEOUT_SECONDS = 300.0
+
+
 def _coerce_timeout(raw: object) -> float | None:
     try:
         timeout = float(raw)
@@ -67,6 +70,29 @@ def get_provider_stale_timeout(
             return timeout
 
     return _coerce_timeout(provider_config.get("stale_timeout_seconds"))
+
+
+def get_local_stale_timeout() -> float:
+    """Return the bounded stale timeout for implicit local model calls.
+
+    Local providers need more time for prompt prefill than cloud providers,
+    but an implicit infinite wait makes a wedged request look healthy forever.
+    This is a behavioral config value; explicit provider/model stale settings
+    are resolved before callers reach this fallback.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+    except Exception:
+        return DEFAULT_LOCAL_STALE_TIMEOUT_SECONDS
+
+    agent_config = config.get("agent", {}) if isinstance(config, dict) else {}
+    if isinstance(agent_config, dict):
+        configured = _coerce_timeout(agent_config.get("local_stale_timeout_seconds"))
+        if configured is not None:
+            return configured
+    return DEFAULT_LOCAL_STALE_TIMEOUT_SECONDS
 
 
 def _get_model_config(

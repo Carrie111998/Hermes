@@ -3,6 +3,8 @@ from __future__ import annotations
 import textwrap
 
 from hermes_cli.timeouts import (
+    DEFAULT_LOCAL_STALE_TIMEOUT_SECONDS,
+    get_local_stale_timeout,
     get_provider_request_timeout,
     get_provider_stale_timeout,
 )
@@ -128,6 +130,24 @@ def test_invalid_stale_timeout_values_return_none(monkeypatch, tmp_path):
 
     assert get_provider_stale_timeout("openai-codex", "gpt-5.4") is None
     assert get_provider_stale_timeout("openai-codex", "gpt-5.5") is None
+
+
+def test_local_stale_timeout_defaults_to_bounded_value(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(tmp_path, "{}\n")
+    assert get_local_stale_timeout() == DEFAULT_LOCAL_STALE_TIMEOUT_SECONDS
+
+
+def test_local_stale_timeout_reads_agent_config(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        agent:
+          local_stale_timeout_seconds: 480
+        """,
+    )
+    assert get_local_stale_timeout() == 480.0
 
 
 def test_anthropic_adapter_honors_timeout_kwarg():
@@ -268,7 +288,7 @@ def test_resolved_api_call_stale_timeout_priority(monkeypatch, tmp_path):
     assert agent2._resolved_api_call_stale_timeout_base() == (90.0, True)
 
 
-def test_default_non_stream_stale_timeout_auto_disables_for_local_endpoints(monkeypatch, tmp_path):
+def test_default_non_stream_stale_timeout_is_bounded_for_local_endpoints(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / ".env").write_text("", encoding="utf-8")
     monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
@@ -285,7 +305,30 @@ def test_default_non_stream_stale_timeout_auto_disables_for_local_endpoints(monk
         platform="cli",
     )
 
-    assert agent._compute_non_stream_stale_timeout([]) == float("inf")
+    assert agent._compute_non_stream_stale_timeout([]) == 300.0
+
+
+def test_configured_local_stale_timeout_is_used(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    _write_config(tmp_path, """\
+        agent:
+          local_stale_timeout_seconds: 480
+        """)
+
+    from run_agent import AIAgent
+    agent = AIAgent(
+        model="qwen3:32b",
+        provider="ollama-local",
+        api_key="sk-dummy",
+        base_url="http://127.0.0.1:11434/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        platform="cli",
+    )
+
+    assert agent._compute_non_stream_stale_timeout([]) == 480.0
 
 
 def test_explicit_non_stream_stale_timeout_is_honored_for_local_endpoints(monkeypatch, tmp_path):

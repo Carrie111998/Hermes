@@ -74,6 +74,21 @@ def test_config_parses_nested_warn_and_hard_stop_thresholds():
     assert cfg.no_progress_block_after == 8
 
 
+def test_unattended_default_can_enable_hard_stop_without_changing_plain_default():
+    cfg = ToolCallGuardrailConfig.from_mapping({}, default_hard_stop_enabled=True)
+
+    assert cfg.hard_stop_enabled is True
+
+
+def test_explicit_hard_stop_value_overrides_unattended_default():
+    cfg = ToolCallGuardrailConfig.from_mapping(
+        {"hard_stop_enabled": False},
+        default_hard_stop_enabled=True,
+    )
+
+    assert cfg.hard_stop_enabled is False
+
+
 def test_default_repeated_identical_failed_call_warns_without_blocking():
     controller = ToolCallGuardrailController()
     args = {"query": "same"}
