@@ -374,6 +374,7 @@ class PluginContext:
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
+        self._review: Any = None
 
     # -- host-owned LLM access ----------------------------------------------
 
@@ -411,6 +412,26 @@ class PluginContext:
                 get_active_subagent_parent
             )
         return self._subagent_lifecycle
+
+    @property
+    def review(self) -> Any:
+        """Return the public, plugin-safe review service.
+
+        Wraps Hermes' native background-review machinery so plugins can
+        fork a skill or memory review on a dedicated thread without
+        importing private internals.  Plugins that need supervised review
+        access (e.g. evaluation loops that refine candidates through
+        Hermes' own model) should use this instead of reaching into
+        ``agent.background_review`` directly.
+
+        See :class:`agent.background_review.PluginReviewService` for the
+        full surface.
+        """
+        if self._review is None:
+            from agent.background_review import PluginReviewService
+            from agent.subagent_lifecycle import get_active_subagent_parent
+            self._review = PluginReviewService(get_active_subagent_parent)
+        return self._review
 
     # -- profile awareness --------------------------------------------------
 
