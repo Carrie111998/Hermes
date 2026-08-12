@@ -612,6 +612,9 @@ class CreateTaskBody(BaseModel):
     goal_max_turns: Optional[int] = None
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
+    resource_keys: list[str] = Field(
+        default_factory=list, max_length=kanban_db.MAX_RESOURCE_KEYS
+    )
     # Per-task thinking depth (none|minimal|…|ultra). None = inherit the
     # assigned profile's own agent.reasoning_effort.
     reasoning_effort: Optional[str] = None
@@ -644,6 +647,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             goal_max_turns=payload.goal_max_turns,
             model_override=payload.model_override,
             provider_override=payload.provider_override,
+            resource_keys=payload.resource_keys,
             reasoning_effort=payload.reasoning_effort,
             project_id=payload.project_id,
             board=board,
@@ -845,6 +849,9 @@ class UpdateTaskBody(BaseModel):
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
     clear_model_override: bool = False
+    resource_keys: Optional[list[str]] = Field(
+        default=None, max_length=kanban_db.MAX_RESOURCE_KEYS
+    )
     # Per-task thinking depth. ``"none"`` is a VALUE (thinking off), not a
     # clear — use ``clear_reasoning_effort=True`` to fall back to the
     # profile's own level. Separate from the model clear so dropping a model
@@ -891,6 +898,14 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 raise HTTPException(status_code=409, detail=str(e))
             if not ok:
                 raise HTTPException(status_code=404, detail="task not found")
+
+        if payload.resource_keys is not None:
+            try:
+                kanban_db.set_resource_keys(conn, task_id, payload.resource_keys)
+            except RuntimeError as e:
+                raise HTTPException(status_code=409, detail=str(e))
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
 
         # --- status -------------------------------------------------------
         if payload.status is not None:
@@ -1085,7 +1100,9 @@ def _parents_blocking_ready(
 def _invalidate_descendants_for_parent_reopen(
     conn: sqlite3.Connection,
     parent_id: str,
-    terminations: list[tuple[Optional[int], Optional[str]]],
+    terminations: list[
+        tuple[Optional[int], Optional[str], Optional[int], bool]
+    ],
 ) -> None:
     """Delegate to the domain-layer implementation in :mod:`kanban_db`.
 
@@ -1117,12 +1134,15 @@ def _set_status_direct(
     orphaned. ``running -> ready`` via drag-drop is the common case
     (user yanking a stuck worker back to the queue).
     """
-    terminations: list[tuple[Optional[int], Optional[str]]] = []
+    lease_owner = kanban_db.get_task(conn, task_id)
+    terminations: list[
+        tuple[Optional[int], Optional[str], Optional[int], bool]
+    ] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
-            "SELECT status, current_run_id, worker_pid, claim_lock "
+            "SELECT status, current_run_id, worker_pid, worker_start_time, claim_lock "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -1165,9 +1185,12 @@ def _set_status_direct(
             "UPDATE tasks SET status = ?, "
             "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
             "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
-            "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
+            "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END, "
+            "  worker_start_time = CASE WHEN ? = 'running' "
+            "    THEN worker_start_time ELSE NULL END "
             "WHERE id = ?",
             (
+                effective_status,
                 effective_status,
                 effective_status,
                 effective_status,
@@ -1184,7 +1207,14 @@ def _set_status_direct(
                 outcome="reclaimed", status="reclaimed",
                 summary=f"status changed to {effective_status} (dashboard/direct)",
             )
-            terminations.append((prev["worker_pid"], prev["claim_lock"]))
+            terminations.append(
+                (
+                    prev["worker_pid"],
+                    prev["claim_lock"],
+                    prev["worker_start_time"],
+                    bool(lease_owner and lease_owner.resource_keys),
+                )
+            )
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
             "VALUES (?, ?, 'status', ?, ?)",
@@ -1206,8 +1236,15 @@ def _set_status_direct(
                 task_id,
                 terminations,
             )
-    for pid, claim_lock in terminations:
-        kanban_db._terminate_reclaimed_worker(pid, claim_lock)
+    for pid, claim_lock, worker_start_time, require_identity in terminations:
+        kanban_db._terminate_reclaimed_worker(
+            pid,
+            claim_lock,
+            worker_start_time=worker_start_time,
+            require_identity=require_identity,
+        )
+    if was_running and effective_status != "running" and lease_owner is not None:
+        kanban_db.release_task_resource_leases(lease_owner, conn)
     # If we re-opened something, children may have gone stale.
     if effective_status in {"done", "ready", "review"}:
         kanban_db.recompute_ready(conn)
