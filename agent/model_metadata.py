@@ -652,6 +652,43 @@ def _is_openrouter_base_url(base_url: str) -> bool:
     return base_url_host_matches(base_url, "openrouter.ai")
 
 
+_LOCAL_OLLAMA_PROVIDERS: frozenset[str] = frozenset({"ollama"})
+
+
+def _should_probe_ollama_api_show(provider: str, base_url: str) -> bool:
+    """Whether an Ollama ``/api/show`` probe is worth attempting.
+
+    Regression guard for #31555. ``/api/show`` is an Ollama-server endpoint;
+    firing it at a hosted provider costs a doomed HTTP roundtrip (up to the
+    3s probe timeout) on a path that runs during agent startup, and every
+    cloud endpoint answers it with a 404 at best.
+
+    The provider name is checked first, then inferred from the base URL, so
+    the gate still holds for callers that pass an endpoint without naming a
+    provider — which is how the OpenRouter case reached the probe in the
+    first place.
+    """
+    name = (provider or "").strip().lower()
+    if not name:
+        host_provider = _URL_TO_PROVIDER.get(base_url_hostname(base_url) or "")
+        name = (host_provider or "").strip().lower()
+
+    # `ollama` is the local server this endpoint belongs to, and it lives in
+    # _PROVIDER_PREFIXES alongside the hosted names — that set answers "can
+    # this appear as a model prefix?", not "is this hosted?". Checked first so
+    # the hosted test below cannot swallow it. `ollama-cloud` is deliberately
+    # NOT here: it is Ollama's hosted service and serves no /api/show.
+    if name in _LOCAL_OLLAMA_PROVIDERS:
+        return True
+
+    if name and name in _PROVIDER_PREFIXES:
+        return False
+
+    # Belt and braces for the one host that motivated the bug report, in case
+    # the mapping above is bypassed by a proxy URL that still lands there.
+    return not _is_openrouter_base_url(base_url)
+
+
 def _is_custom_endpoint(base_url: str) -> bool:
     normalized = _normalize_base_url(base_url)
     return bool(normalized) and not _is_openrouter_base_url(normalized)

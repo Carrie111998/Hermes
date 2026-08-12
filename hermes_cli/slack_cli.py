@@ -88,6 +88,10 @@ def _build_full_manifest(
     bot_scopes = [
         "app_mentions:read",
         "channels:history",
+        # Lets the bot self-join public channels via conversations.join, which
+        # is what `hermes slack invite --all` drives. Without it that command
+        # fails per-channel with missing_scope on an otherwise valid install.
+        "channels:join",
         "channels:read",
         "chat:write",
         "commands",
@@ -272,6 +276,12 @@ def slack_manifest_command(args) -> int:
             messaging_experience=messaging_experience,
             long_description=long_description,
         )
+
+    # Read off args like every other option in this function. Defaults to
+    # False (JSON), which is what the default write target
+    # (`slack-manifest.json`) and the CLI's own output contract assume; the
+    # name was previously used here without ever being assigned.
+    as_yaml = getattr(args, "yaml", False)
 
     payload = _render_manifest(manifest, as_yaml)
     ext = "yaml" if as_yaml else "json"

@@ -7,6 +7,7 @@ provider/model override.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -77,6 +78,35 @@ FINANCE_SKILLS = {
     "dcf-model",
 }
 
+# Keywords that are acronyms rather than words. These must match as whole
+# tokens: a plain substring scan for "je" (journal entry) fires on "project",
+# "subject", "rejected" and "Jenkins", which would tag most ordinary cron jobs
+# as finance work and — once the route check runs — refuse any of them that
+# pins a model. Acronyms don't take suffixes, so both edges are anchored.
+ACRONYM_KEYWORDS = {"je", "qbo", "pii", "ustc", "usti", "jhj", "hhs", "cbca"}
+
+
+def _keyword_pattern(keywords: Iterable[str]) -> re.Pattern[str]:
+    """Compile *keywords* into one alternation anchored at a token start.
+
+    Ordinary keywords are anchored at the start only, so inflections still
+    match ("reconciliation" -> "reconciliations") while a keyword buried
+    inside an unrelated word does not ("books" must not fire on
+    "notebooks"). Acronyms are anchored at both ends — see
+    ``ACRONYM_KEYWORDS``.
+
+    Longest-first so an alternation never settles for a shorter prefix.
+    """
+    parts = []
+    for keyword in sorted(keywords, key=len, reverse=True):
+        suffix = r"(?!\w)" if keyword in ACRONYM_KEYWORDS else ""
+        parts.append(re.escape(keyword) + suffix)
+    return re.compile(r"(?<!\w)(?:" + "|".join(parts) + r")")
+
+
+_LEGAL_PATTERN = _keyword_pattern(LEGAL_KEYWORDS)
+_FINANCE_PATTERN = _keyword_pattern(FINANCE_KEYWORDS)
+
 
 @dataclass(frozen=True)
 class ModelPolicyDecision:
@@ -125,9 +155,9 @@ def detect_privileged_workload_tags(job: dict[str, Any]) -> tuple[str, ...]:
         skill_values.add(_norm(job.get("skill")))
 
     tags: set[str] = set()
-    if any(keyword in haystack for keyword in LEGAL_KEYWORDS) or skill_values.intersection(LEGAL_SKILLS):
+    if _LEGAL_PATTERN.search(haystack) or skill_values.intersection(LEGAL_SKILLS):
         tags.add("legal")
-    if any(keyword in haystack for keyword in FINANCE_KEYWORDS) or skill_values.intersection(FINANCE_SKILLS):
+    if _FINANCE_PATTERN.search(haystack) or skill_values.intersection(FINANCE_SKILLS):
         tags.add("finance")
     return tuple(sorted(tags))
 

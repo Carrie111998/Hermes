@@ -399,6 +399,38 @@ ALIASES: Dict[str, str] = {
 # Built dynamically from models.dev + overlays.  Fallback for providers
 # not in the catalog.
 
+def _display_name(canonical: str) -> str:
+    """Best available human-readable name for a provider id.
+
+    Order: this module's overrides, then the provider registry in
+    ``hermes_cli.models``, then the id itself.
+
+    The registry step matters because models.dev is a *remote* catalog. A
+    Hermes-only provider — or any provider at all when the catalog is
+    unavailable — used to fall straight through to the bare id, which is how
+    the model picker collapsed the xAI API-key entry to "xai" and made it
+    indistinguishable from its OAuth sibling. The registry already carries
+    ``ProviderEntry("xai", "xAI", ...)``; duplicating those names into
+    ``_LABEL_OVERRIDES`` would be a second copy to drift.
+
+    Imported lazily because ``hermes_cli.models`` imports this module.
+    Guarded on a non-empty id: ``provider_label`` defaults an empty one to
+    "OpenRouter", which is not a sensible answer to "what is this called?".
+    """
+    override = _LABEL_OVERRIDES.get(canonical)
+    if override:
+        return override
+
+    if canonical:
+        from hermes_cli.models import provider_label  # noqa: PLC0415
+
+        label = provider_label(canonical)
+        if label:
+            return label
+
+    return canonical
+
+
 _LABEL_OVERRIDES: Dict[str, str] = {
     "moa": "Mixture of Agents",
     "nous": "Nous Portal",
@@ -503,7 +535,7 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
         # Hermes-only provider (not in models.dev)
         return ProviderDef(
             id=canonical,
-            name=_LABEL_OVERRIDES.get(canonical, canonical),
+            name=_display_name(canonical),
             transport=overlay.transport,
             api_key_env_vars=overlay.extra_env_vars,
             base_url=overlay.base_url_override,
@@ -529,7 +561,7 @@ def get_label(provider_id: str) -> str:
     if pdef:
         return pdef.name
 
-    return canonical
+    return _display_name(canonical)
 
 
 

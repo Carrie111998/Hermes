@@ -4094,6 +4094,11 @@ def generate_launchd_plist() -> str:
         "<string>-m</string>",
         "<string>hermes_cli.main</string>",
     ]
+    # The wrapper execs whatever follows it, so it goes in front of the python
+    # + module args rather than replacing them; without it we emit the
+    # direct-python form, which is the self-heal path described above.
+    prog_args = [f"<string>{wrapper_path}</string>"] if use_wrapper else []
+    prog_args.extend(core_args)
     if profile_arg:
         for part in profile_arg.split():
             prog_args.append(f"<string>{part}</string>")

@@ -904,7 +904,6 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
 
     # Clear module cache so a fresh connect() is attempted
     kb._INITIALIZED_PATHS.clear()
-    hermes_state._wal_fallback_warned_paths.clear()
 
     # The kanban_home fixture already called kb.init_db(), which persisted
     # journal_mode=wal onto the DB file on disk (a SQLite header property,

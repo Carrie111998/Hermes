@@ -437,8 +437,6 @@ class Mem0MemoryProvider(MemoryProvider):
             self._prefetch_result = ""
             self._prefetch_done = False
 
-        effective_user_id = user_id or self._user_id
-
         def _run():
             body = ""
             try:

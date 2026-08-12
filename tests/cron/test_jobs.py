@@ -280,6 +280,42 @@ class TestPrivilegedModelPolicy:
         )
         assert job["model"] == "openrouter/owl-alpha"
 
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            "Summarize the project changelog",
+            "Check the projects board",
+            "Watch Jenkins for failures",
+            "Rejected subject lines report",
+            "Digest my notebooks",
+        ],
+    )
+    def test_ordinary_prompts_are_not_tagged_privileged(self, tmp_cron_dir, prompt):
+        """Keyword matching must not fire on a keyword buried in another word.
+
+        The detector deliberately over-tags, but the keywords include
+        acronyms: a plain substring scan for "je" (journal entry) matches
+        "project", "subject", "rejected" and "Jenkins", and "books" matches
+        "notebooks". Because the gate refuses any privileged job pinned to a
+        non-allowlisted route, an over-broad match doesn't just mislabel the
+        job — it stops an ordinary one from being created at all.
+        """
+        assert detect_privileged_workload_tags({"prompt": prompt}) == ()
+
+        job = create_job(
+            prompt=prompt, schedule="30m", provider="openai", model="gpt-5"
+        )
+        assert job["model"] == "gpt-5"
+
+    def test_inflected_privileged_keywords_still_tag(self, tmp_cron_dir):
+        """Anchoring the match must not cost the plural/inflected forms."""
+        assert "finance" in detect_privileged_workload_tags(
+            {"prompt": "Draft reconciliations for the quarter"}
+        )
+        assert "legal" in detect_privileged_workload_tags(
+            {"prompt": "Email the attorneys about settlements"}
+        )
+
 
 class TestUpdateJob:
     def test_update_name(self, tmp_cron_dir):

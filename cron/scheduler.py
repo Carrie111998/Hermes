@@ -283,7 +283,30 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
+from cron.jobs import get_ticker_heartbeat_age
 from cron.executions import create_execution, finish_execution, mark_execution_running
+
+
+def ticker_heartbeat_is_stale(interval: float, stale_multiplier: float) -> bool:
+    """Return True when the ticker heartbeat is older than the stale threshold.
+
+    The gateway's cron supervisor (``gateway/run.py``) imports this together
+    with :func:`get_ticker_heartbeat_age` to decide whether to restart a wedged
+    ticker thread. Both are imported *from here* rather than from ``cron.jobs``
+    because the supervisor and its tests treat ``cron.scheduler`` as the
+    ticker's public surface; the age reader is re-exported above for the same
+    reason.
+
+    An unknown age is **not** stale. ``get_ticker_heartbeat_age`` returns None
+    when the heartbeat file is missing or unreadable — an older build, a ticker
+    that has not run yet, or a torn read — and its contract says callers treat
+    that as "cannot determine", not "dead". Restarting the ticker on a torn
+    read would turn a transient filesystem hiccup into a restart loop.
+    """
+    age = get_ticker_heartbeat_age()
+    if age is None:
+        return False
+    return age > interval * stale_multiplier
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved

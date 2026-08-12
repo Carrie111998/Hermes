@@ -810,8 +810,36 @@ class CredentialPool:
         *,
         persist: bool = True,
         failure_reason: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> PooledCredential:
         normalized_error = _normalize_error_context(error_context)
+
+        # Per-model lockout: a 429 for one model says nothing about the others,
+        # so bench the credential *for that model only* and leave it selectable
+        # elsewhere. The record shape is the one `hermes auth` already renders
+        # via _model_exhausted_until().
+        #
+        # A terminal auth failure is deliberately excluded — a revoked or
+        # invalid token is dead for every model, and recording it per-model
+        # would leave the credential in rotation for the rest of them, failing
+        # instantly on each.
+        if model and not self._is_terminal_auth_failure(status_code, normalized_error):
+            updated_extra = dict(entry.extra)
+            locked = dict(updated_extra.get("exhausted_models") or {})
+            locked[model] = {
+                "last_status": STATUS_EXHAUSTED,
+                "last_status_at": time.time(),
+                "last_error_code": status_code,
+                "last_error_reason": normalized_error.get("reason"),
+                "last_error_message": normalized_error.get("message"),
+                "last_error_reset_at": normalized_error.get("reset_at"),
+            }
+            updated_extra["exhausted_models"] = locked
+            updated = replace(entry, extra=updated_extra)
+            self._replace_entry(entry, updated)
+            if persist:
+                self._persist()
+            return updated
         # Permanent OAuth failures (token_invalidated, token_revoked, etc.)
         # transition to STATUS_DEAD instead of STATUS_EXHAUSTED.  Without this,
         # a revoked credential gets a 1-hour TTL cooldown and then re-enters
@@ -1778,8 +1806,8 @@ class CredentialPool:
             return False
         return False
 
-    def select(self) -> Optional[PooledCredential]:
-        entry, pending_refresh = self._select_under_lock()
+    def select(self, *, model: Optional[str] = None) -> Optional[PooledCredential]:
+        entry, pending_refresh = self._select_under_lock(model=model)
         if pending_refresh:
             self._refresh_pending_entries(pending_refresh)
         if entry is not None:
@@ -1788,15 +1816,17 @@ class CredentialPool:
         # If no entry was available but we just refreshed some, re-select
         # now that the refreshed entries are back in the pool.
         if pending_refresh:
-            entry, _ = self._select_under_lock()
+            entry, _ = self._select_under_lock(model=model)
             if entry is not None:
                 self._unmatched_rotation_streak = 0
         return entry
 
-    def _select_under_lock(self) -> Tuple[Optional[PooledCredential], List[tuple]]:
+    def _select_under_lock(
+        self, *, model: Optional[str] = None,
+    ) -> Tuple[Optional[PooledCredential], List[tuple]]:
         """Run selection under the lock, returning entry + pending refreshes."""
         with self._lock:
-            return self._select_unlocked()
+            return self._select_unlocked(model=model)
 
     def _refresh_pending_entries(self, pending: List[tuple]) -> None:
         """Refresh deferred single-use-token entries outside the lock.
@@ -1987,13 +2017,77 @@ class CredentialPool:
         self._last_no_entries_log_at = now
         logger.info("credential pool: no available entries (all exhausted or empty)")
 
-    def _select_unlocked(self, *, refresh: bool = True) -> Tuple[Optional[PooledCredential], List[tuple]]:
+    def _model_is_locked_out(self, entry: PooledCredential, model: str) -> bool:
+        """Whether *entry* is benched for *model* specifically, right now."""
+        locked = entry.extra.get("exhausted_models") if entry.extra else None
+        if not isinstance(locked, dict):
+            return False
+        details = locked.get(model)
+        if not isinstance(details, dict):
+            return False
+        until = _model_exhausted_until(details)
+        return until is not None and time.time() < until
+
+    def _prune_expired_model_lockouts(self) -> bool:
+        """Drop per-model lockouts whose cooldown has elapsed.
+
+        Mirrors what ``_available_entries(clear_expired=True)`` does for the
+        credential-wide status. Without it an expired record would linger in
+        ``extra`` forever — harmless to selection, since the filter checks the
+        deadline, but it would keep showing in ``hermes auth`` output and grow
+        without bound across models.
+
+        Returns True when anything changed, so the caller can persist once.
+        """
+        now = time.time()
+        changed = False
+        rebuilt: List[PooledCredential] = []
+        for entry in self._entries:
+            locked = entry.extra.get("exhausted_models") if entry.extra else None
+            if not isinstance(locked, dict) or not locked:
+                rebuilt.append(entry)
+                continue
+            live = {}
+            for name, details in locked.items():
+                if not isinstance(details, dict):
+                    continue
+                until = _model_exhausted_until(details)
+                if until is not None and now < until:
+                    live[name] = details
+            if len(live) == len(locked):
+                rebuilt.append(entry)
+                continue
+            changed = True
+            updated_extra = dict(entry.extra)
+            if live:
+                updated_extra["exhausted_models"] = live
+            else:
+                updated_extra.pop("exhausted_models", None)
+            rebuilt.append(replace(entry, extra=updated_extra))
+        if changed:
+            self._entries = rebuilt
+        return changed
+
+    def _select_unlocked(
+        self, *, refresh: bool = True, model: Optional[str] = None,
+    ) -> Tuple[Optional[PooledCredential], List[tuple]]:
         """Select the best available credential entry.
 
         Returns ``(entry, pending_refresh)`` where *pending_refresh* contains
         single-use-token entries that must be refreshed outside the lock.
+
+        When *model* is given, entries benched for that model are excluded on
+        top of the credential-wide filtering — a key rate-limited on one model
+        keeps serving the others.
         """
+        # Before filtering, so a lapsed lockout frees its credential in the
+        # same call rather than one selection later.
+        if self._prune_expired_model_lockouts():
+            self._persist()
+
         available, pending_refresh = self._available_entries(clear_expired=True, refresh=refresh)
+        if model:
+            available = [e for e in available if not self._model_is_locked_out(e, model)]
         if not available:
             self._current_id = None
             self._log_no_available_entries()
@@ -2297,7 +2391,21 @@ class CredentialPool:
             count = 0
             new_entries = []
             for entry in self._entries:
-                if entry.last_status or entry.last_status_at or entry.last_error_code:
+                # Per-model lockouts count as status too: a credential can be
+                # benched for a model while its credential-wide fields are all
+                # clear, and `reset` must free that as well.
+                has_model_lockout = bool(
+                    isinstance(entry.extra, dict)
+                    and entry.extra.get("exhausted_models")
+                )
+                if (
+                    entry.last_status
+                    or entry.last_status_at
+                    or entry.last_error_code
+                    or has_model_lockout
+                ):
+                    cleared_extra = dict(entry.extra) if entry.extra else {}
+                    cleared_extra.pop("exhausted_models", None)
                     new_entries.append(
                         replace(
                             entry,
@@ -2307,6 +2415,7 @@ class CredentialPool:
                             last_error_reason=None,
                             last_error_message=None,
                             last_error_reset_at=None,
+                            extra=cleared_extra,
                         )
                     )
                     count += 1

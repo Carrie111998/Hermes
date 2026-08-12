@@ -12,6 +12,14 @@
       "env": {
         "TOLARIA_MCP_URL": "ws://127.0.0.1:9710"
       }
+    },
+    "memory": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-memory@0.6.2"
+      ]
     }
   }
 }

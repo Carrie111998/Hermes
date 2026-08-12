@@ -95,5 +95,36 @@ def test_gateway_async_code_uses_one_awaited_session_store_boundary() -> None:
 
 
 def test_no_repository_local_claude_permissions_file() -> None:
+    """Tracked ``.claude/settings.json`` carries ``hooks`` and nothing else.
+
+    Two things must never land in it (AGENTS.md, *MCP servers for Claude
+    Code*): a ``permissions`` block, which would grant tool access to every
+    agent that opens the repo, and an ``mcpServers`` block. The latter is not
+    cosmetic — Claude Code documents ``${VAR}`` expansion for ``.mcp.json``
+    and ``~/.claude.json`` but *not* for ``settings.json``, so a server
+    declared here needs a literal absolute path and then starts on exactly
+    one machine, failing silently everywhere else. That is what happened:
+    the block was removed deliberately on 2026-07-28 in favour of
+    ``.mcp.json.example``, and an unrelated dependabot bump (7e38fa5)
+    restored a copy carrying a hardcoded ``/Users/<name>/`` path.
+
+    The file itself must stay — ``.claude/hooks/session-start.sh`` is tracked
+    and reached only from here via ``$CLAUDE_PROJECT_DIR``, which *does*
+    expand in hook commands.
+    """
+    import json
+
     root = Path(__file__).resolve().parents[2]
-    assert not (root / ".claude" / "settings.json").exists()
+    settings_path = root / ".claude" / "settings.json"
+    if not settings_path.exists():
+        return
+
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    forbidden = {"permissions", "mcpServers"}.intersection(settings)
+    assert not forbidden, (
+        f".claude/settings.json declares {sorted(forbidden)}; it may carry "
+        "`hooks` only. Move MCP servers to .mcp.json (template: "
+        ".mcp.json.example) — settings.json does not expand ${VAR}, so a "
+        "server declared here silently fails to start off the machine its "
+        "absolute path was written on."
+    )

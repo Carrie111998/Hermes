@@ -15,6 +15,7 @@ This module provides:
 """
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -24,12 +25,14 @@ import shutil
 import stat
 import subprocess
 import sys
+from contextlib import contextmanager
 import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Set
+from datetime import datetime
+from typing import Dict, Any, Optional, List, Tuple, Set, Union
 
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.secret_prompt import masked_secret_prompt
@@ -3627,6 +3630,340 @@ def save_config(
         _RAW_CONFIG_CACHE.pop(str(config_path), None)
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
 
+        # This write is authorized by definition — it came through save_config.
+        # Re-seal both baselines so the Config Integrity Watchdog sees an
+        # authorized change rather than tampering. Neither can raise; a broken
+        # or absent watchdog must never fail the primary config write.
+        seal_config()
+        _reseal_git_backed_integrity_baseline(config_path)
+
+
+
+# ── Config integrity: interprocess locks + seal/verify ───────────────────────
+#
+# Two independent baselines guard config.yaml against silent tampering:
+#
+#   * the **local seal** — a `config.yaml.sha256` sidecar next to the config,
+#     managed here by seal_config()/verify_config_integrity();
+#   * the **git-backed baseline** — a JSONL log committed to the operator's
+#     dotfiles repo, owned by skills/devops/config-integrity-watchdog and
+#     refreshed here by _reseal_git_backed_integrity_baseline().
+#
+# Both are re-sealed by save_config() and restore_config(), because a write
+# through those functions is authorized by definition. Anything that edits
+# config.yaml behind their back leaves the hashes disagreeing, which is exactly
+# what the watchdog reports.
+#
+# The locks are advisory and interprocess (flock on POSIX, msvcrt on Windows),
+# and complement the in-process `_CONFIG_LOCK` threading lock: that one only
+# orders threads inside a single interpreter, while several Hermes processes
+# (gateway, CLI, cron) share one config file.
+
+
+_BRACED_ENV_REF = re.compile(r"\$\{([^{}]*)\}")
+_BARE_ENV_REF = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _expand_value_from_environ(value: str) -> str:
+    """Expand shell-style environment references in a single config value.
+
+    Supports the three shapes an operator expects from a shell:
+
+    * ``${NAME}``            — the value of NAME
+    * ``${NAME:-fallback}``  — NAME if set and non-empty, else ``fallback``
+    * ``$NAME``              — bare form, same as ``${NAME}``
+
+    **An unset name with no default is left verbatim, not blanked.** Silently
+    substituting "" would turn a typo'd or not-yet-exported variable into an
+    empty API key or an empty base URL — a confusing runtime failure far from
+    its cause — where leaving ``$NOT_SET`` in place makes the mistake legible
+    in the config and in the error. It also matches the surrounding
+    ``_env_expand_match``, which keeps the literal placeholder and warns.
+
+    That rule is also what separates the two bare-form cases: ``$PATH``
+    expands because PATH is set, while ``literal-$var`` survives untouched
+    because nothing named ``var`` is exported.
+
+    Deliberately standalone: this is the single-*value* expander, and it is
+    not wired into config loading. ``_expand_env_vars`` walks a whole document
+    and additionally resolves ``${env:NAME}`` SecretRefs with their own
+    warning behaviour, so quietly routing one through the other would change
+    config semantics rather than restore a helper.
+    """
+    if not value or "$" not in value:
+        return value
+
+    def _braced(match: "re.Match[str]") -> str:
+        inner = match.group(1).strip()
+        if not inner:
+            return match.group(0)
+
+        name, sep, default = inner.partition(":-")
+        name = name.strip()
+        if not name:
+            return match.group(0)
+
+        current = os.environ.get(name)
+        if current:
+            return current
+        if sep:
+            return default
+        return match.group(0)
+
+    def _bare(match: "re.Match[str]") -> str:
+        current = os.environ.get(match.group(1))
+        return current if current is not None else match.group(0)
+
+    return _BARE_ENV_REF.sub(_bare, _BRACED_ENV_REF.sub(_braced, value))
+
+
+def get_config_lock_path() -> Path:
+    """Path of the advisory lock file — always beside config.yaml."""
+    config_path = get_config_path()
+    return config_path.with_name(config_path.name + ".lock")
+
+
+def get_config_seal_path() -> Path:
+    """Path of the local seal sidecar — always beside config.yaml."""
+    config_path = get_config_path()
+    return config_path.with_name(config_path.name + ".sha256")
+
+
+@contextmanager
+def _config_flock(exclusive: bool):
+    """Hold an advisory lock on the config lock file for the block's duration.
+
+    Best-effort by design. A platform without a working lock primitive, or a
+    home directory that cannot host the lock file, degrades to "no lock" rather
+    than making config unreadable — the callers' in-process `_CONFIG_LOCK`
+    still orders same-process access, and an unlocked read is what every
+    caller did before these helpers existed.
+    """
+    lock_path = get_config_lock_path()
+    handle = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        # Binary: the file is a lock handle, never read or written as text,
+        # so there is no encoding to get wrong.
+        handle = open(lock_path, "ab+")
+    except OSError:
+        yield
+        return
+
+    try:
+        if _fcntl is not None:
+            _fcntl.flock(
+                handle.fileno(),
+                _fcntl.LOCK_EX if exclusive else _fcntl.LOCK_SH,
+            )
+        elif _msvcrt is not None and exclusive:
+            # msvcrt has no shared mode; readers go unlocked rather than
+            # serializing every read behind an exclusive lock on Windows.
+            handle.seek(0)
+            _msvcrt.locking(handle.fileno(), _msvcrt.LK_LOCK, 1)
+    except OSError:
+        handle.close()
+        yield
+        return
+
+    try:
+        yield
+    finally:
+        try:
+            if _fcntl is not None:
+                _fcntl.flock(handle.fileno(), _fcntl.LOCK_UN)
+            elif _msvcrt is not None and exclusive:
+                handle.seek(0)
+                _msvcrt.locking(handle.fileno(), _msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        handle.close()
+
+
+@contextmanager
+def config_write_lock():
+    """Exclusive interprocess lock around a config write."""
+    with _config_flock(exclusive=True):
+        yield
+
+
+@contextmanager
+def config_read_lock():
+    """Shared interprocess lock around a config read.
+
+    Multiple readers hold this concurrently; a writer waiting on
+    :func:`config_write_lock` blocks until they finish.
+    """
+    with _config_flock(exclusive=False):
+        yield
+
+
+def _hash_file(path: Path) -> str:
+    """SHA-256 of *path*, or "" when it cannot be read."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def seal_config() -> None:
+    """Record the current config.yaml hash as the authorized local baseline.
+
+    Never raises: sealing is a side effect of an authorized write, and a
+    failure to record the baseline must not fail the write itself. A missing
+    config is not sealed — there is nothing to attest.
+    """
+    try:
+        config_path = get_config_path()
+        if not config_path.exists():
+            return
+        digest = _hash_file(config_path)
+        if not digest:
+            return
+        seal_path = get_config_seal_path()
+        seal_path.write_text(digest + "\n", encoding="utf-8")
+        _secure_file(seal_path)
+    except OSError:
+        pass
+
+
+def verify_config_integrity(locked: bool = False) -> Tuple[bool, str, str]:
+    """Compare config.yaml against its local seal.
+
+    Returns ``(ok, current_hash, sealed_hash)``.
+
+    Two cases are deliberately reported as OK rather than as tampering, because
+    neither is evidence of it:
+
+    * **no config file** — nothing to protect yet; both hashes are "".
+    * **no seal sidecar** — a config that predates sealing, or one whose
+      sidecar was cleaned up. Absence of a baseline is not a mismatch, and
+      failing here would flag every pre-existing install as compromised.
+
+    ``locked=True`` takes the shared read lock first, so a verify racing a
+    concurrent write sees a whole file rather than a half-written one.
+    """
+    def _compare() -> Tuple[bool, str, str]:
+        config_path = get_config_path()
+        if not config_path.exists():
+            return True, "", ""
+
+        current = _hash_file(config_path)
+        seal_path = get_config_seal_path()
+        if not seal_path.exists():
+            return True, current, ""
+
+        try:
+            sealed = seal_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return True, current, ""
+
+        if not sealed:
+            return True, current, ""
+
+        return current == sealed, current, sealed
+
+    if locked:
+        with config_read_lock():
+            return _compare()
+    return _compare()
+
+
+def _reseal_git_backed_integrity_baseline(config_path: Path) -> None:
+    """Refresh the git-backed watchdog baseline after an authorized write.
+
+    The local sidecar above is per-machine and mutable; the watchdog's real
+    baseline is a JSONL log committed to the operator's dotfiles repo. Without
+    this call an authorized ``save_config()`` (the model scanner, ``/model``,
+    a platform setup flow) leaves that log stale, and the watchdog cron job
+    reports the legitimate change as tampering.
+
+    A **no-op unless the dotfiles directory already exists**: the watchdog is
+    opt-in, and creating the directory here would fabricate a baseline on
+    machines that never configured one.
+
+    Never raises. The dotfiles repo lives outside Hermes' control — it can be
+    absent, not a git repo, mid-rebase, or read-only — and none of that is a
+    reason to fail the config write it is trailing.
+    """
+    try:
+        from hermes_cli.config_integrity_cli import _find_core_module  # noqa: PLC0415
+
+        core = _find_core_module()
+        if core is None:
+            return
+
+        dotfiles = Path(
+            os.environ.get("HERMES_DOTFILES_DIR", "~/Dev/dotfiles")
+        ).expanduser()
+        if not dotfiles.is_dir():
+            return
+
+        core.seal(config_path=config_path, dotfiles_dir=dotfiles, quiet=True)
+    except Exception:
+        # Deliberately broad: this is a trailing side effect of a write that
+        # has already succeeded, and the failure modes are entirely in
+        # third-party territory (git, filesystem, an unimportable skill).
+        pass
+
+
+def restore_config(
+    config: Union[Dict[str, Any], str],
+    *,
+    reason: str = "",
+    **kwargs: Any,
+) -> Path:
+    """Replace config.yaml wholesale and return the pre-restore backup path.
+
+    Accepts either a parsed mapping or raw YAML text, because the two callers
+    differ: a backup snapshot restores structured data, while the integrity
+    watchdog hands back the exact bytes it recorded.
+
+    The current config is copied aside first as
+    ``config.yaml.pre-restore-<timestamp>[-<reason>]``. A restore is the one
+    operation that discards the live file entirely, so the thing it overwrites
+    is preserved unconditionally — including when the live file is itself
+    corrupt, which is the usual reason a restore is happening.
+
+    Re-sealing is inherited from :func:`save_config`, which is what stops the
+    watchdog reading the restore as tampering.
+    """
+    if isinstance(config, str):
+        parsed = yaml.safe_load(config)
+        if parsed is None:
+            parsed = {}
+        if not isinstance(parsed, dict):
+            raise ValueError("restore_config: YAML must parse to a mapping")
+        config = parsed
+
+    config_path = get_config_path()
+
+    # Timestamp first so backups sort chronologically; reason last so it stays
+    # readable however long it is. Non-filename characters are collapsed —
+    # a reason is free text and reaches here from a watchdog message.
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    suffix = re.sub(r"[^A-Za-z0-9_.-]+", "-", reason).strip("-")
+    backup_name = f"{config_path.name}.pre-restore-{stamp}"
+    if suffix:
+        backup_name = f"{backup_name}-{suffix}"
+    backup_path = config_path.with_name(backup_name)
+
+    try:
+        if config_path.exists():
+            shutil.copy2(config_path, backup_path)
+        else:
+            # Nothing to preserve, but the caller is promised a real path it
+            # can point at, so leave an explicit empty marker rather than a
+            # dangling name.
+            backup_path.write_text("", encoding="utf-8")
+        _secure_file(backup_path)
+    except OSError:
+        logger.warning("Could not write pre-restore backup to %s", backup_path)
+
+    logger.info("Restoring config.yaml%s", f" ({reason})" if reason else "")
+    save_config(config, **kwargs)
+
+    return backup_path
 
 def _parse_env_value(raw_value: str) -> str:
     """Parse the small .env value subset Hermes writes itself."""

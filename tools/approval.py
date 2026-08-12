@@ -81,6 +81,42 @@ def reset_hermes_interactive_context(token: contextvars.Token) -> None:
     _hermes_interactive_ctx.reset(token)
 
 
+def _redact_command_for_display(command: str) -> str:
+    """Mask secrets in a command before showing it to a human.
+
+    **Display-only.** The original command still runs verbatim; this exists so
+    an approval prompt — which is echoed into a Slack channel, a terminal
+    scrollback, and any notification transport in between — does not become the
+    thing that leaks the secret it is asking about.
+
+    Motivated by the 2026-07-13 incident: a heredoc appending a Slack
+    app-level token to ``~/.hermes/.env``. The approval prompt reproduced the
+    command in full, so asking permission published the credential more widely
+    than running it would have.
+
+    The variable name survives (``SLACK_APP_TOKEN=***``) because the reviewer
+    needs to know *which* secret is being written to judge the command; only
+    the value is masked.
+
+    ``force=True`` per ``redact_sensitive_text``'s own contract — it is
+    documented for "safety boundaries that must never return raw secrets
+    regardless of the user's global logging redaction preference". Someone who
+    disables ``security.redact_secrets`` for log verbosity has not asked for
+    their tokens broadcast into Slack.
+
+    ``redact_url_credentials=True`` because this is an egress boundary, not a
+    tool flow: the default exists so actionable OAuth and pre-signed URLs
+    survive ordinary use, which is not what an approval echo is for.
+    """
+    if not command:
+        return command
+    from agent.redact import redact_sensitive_text  # noqa: PLC0415
+
+    return redact_sensitive_text(
+        command, force=True, redact_url_credentials=True,
+    )
+
+
 def _is_interactive_cli() -> bool:
     """True when running an interactive CLI/ACP session.
 
@@ -1067,6 +1103,13 @@ _PATH_TOKEN_STOP = r"""\s'"`;|&<>()"""
 _PATH_TAIL = r"(?P<tail>(?:[/\\][^/\\" + _PATH_TOKEN_STOP + r"]*)+)"
 
 
+# Single-component directories that hold *other* users' homes rather than being
+# one. Folding these would rewrite unrelated absolute paths to ``~``.
+_HOME_CONTAINER_DIRS = frozenset({
+    "home", "users", "usr", "var", "mnt", "media", "opt", "srv", "tmp", "c", "d",
+})
+
+
 @functools.lru_cache(maxsize=64)
 def _home_prefix_fold_regex(path: str):
     """Compile a regex matching *path* used as an absolute directory prefix.
@@ -1087,11 +1130,21 @@ def _home_prefix_fold_regex(path: str):
     if not path:
         return None
     components = [c for c in re.split(r"[/\\]+", path) if c]
-    # Require at least two non-empty components below the root. For POSIX this
-    # mirrors the historical ``count("/") >= 2`` guard (``/home/alice`` folds,
-    # ``/home`` does not); for Windows it rejects a bare drive root (``C:\\``)
-    # while accepting a real home (``C:\\Users\\alice``).
-    if len(components) < 2:
+    if not components:
+        # A bare root (``/``, ``C:\\``, ``""``) would rewrite every absolute
+        # path in the command.
+        return None
+    # Two components below the root is the ordinary shape (``/home/alice``,
+    # ``C:\\Users\\alice``). A single component is accepted only when it is not
+    # a directory that *contains* homes — folding ``/home`` would rewrite every
+    # user's path to ``~``, which is the bypass this guard exists to prevent.
+    #
+    # The exception matters: ``/root`` is a real home with one component, so the
+    # old count-only rule left root-run deployments (the Docker image, CI
+    # containers, anything under sudo) with ``~/.ssh/authorized_keys`` guarded
+    # but the equivalent ``/root/.ssh/authorized_keys`` unguarded — the tilde
+    # and absolute spellings of the same file disagreeing.
+    if len(components) < 2 and components[0].lower().rstrip(":") in _HOME_CONTAINER_DIRS:
         return None
     body = r"[/\\]+".join(re.escape(c) for c in components)
     # Optional leading root separator (POSIX ``/`` or UNC ``\\``); a Windows

@@ -540,9 +540,6 @@ def test_references_parallel_interrupt_aborts_wait(monkeypatch):
 
     def fake_call_llm(**kwargs):
         if kwargs["provider"] == "fast":
-            # Simulate the interrupt arriving right after the fast reference
-            # finishes, while the wedged one is still in flight.
-            fake_agent._interrupt_requested = True
             return _response("fast output")
         # "wedged" — never returns within the test unless released, standing
         # in for a reference whose own (possibly very long) timeout hasn't
@@ -552,6 +549,17 @@ def test_references_parallel_interrupt_aborts_wait(monkeypatch):
 
     monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
 
+    # Raise the interrupt from the progress callback, which the fan-out
+    # invokes immediately after it records a completed reference's result.
+    # Setting it inside the "fast" stub instead would raise the flag *before*
+    # that stub's return value reaches the future, so a poll landing in the
+    # gap sees an interrupt with the reference still in flight and correctly
+    # marks it skipped — the assertion below then fails for a reason the test
+    # isn't about. Rare locally, seen on a loaded CI runner.
+    def interrupt_after_first(done_count, _total, _label):
+        if done_count == 1:
+            fake_agent._interrupt_requested = True
+
     refs = [
         {"provider": "fast", "model": "m1"},
         {"provider": "wedged", "model": "m2"},
@@ -559,7 +567,10 @@ def test_references_parallel_interrupt_aborts_wait(monkeypatch):
     try:
         start = time.monotonic()
         out = moa_loop._run_references_parallel(
-            refs, [{"role": "user", "content": "hi"}], agent=fake_agent,
+            refs,
+            [{"role": "user", "content": "hi"}],
+            agent=fake_agent,
+            progress_callback=interrupt_after_first,
         )
         elapsed = time.monotonic() - start
 

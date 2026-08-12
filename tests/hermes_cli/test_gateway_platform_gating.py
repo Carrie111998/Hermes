@@ -63,15 +63,37 @@ class TestBuiltinAdaptersStayInPicker:
         The generic _setup_standard_platform() fallback treats the first
         `vars` entry (token_var) as mandatory and aborts the whole wizard
         if left empty — which would silently break Matrix's documented
-        password-login path. These three must resolve to their bespoke
-        hermes_cli.setup functions, not fall through to the generic flow.
+        password-login path. These three must resolve to a bespoke setup
+        function, not fall through to the generic flow.
+
+        Where that function lives moved in #41112: it used to be
+        ``hermes_cli.setup._setup_<key>``, reached via
+        ``_builtin_setup_fn()``; it is now ``interactive_setup`` registered
+        on the plugin's registry entry by
+        ``plugins/platforms/<key>/adapter.py::register()``. The invariant is
+        unchanged — ``_configure_platform()`` tries the registry entry's
+        ``setup_fn`` *first*, so a non-None ``setup_fn`` is exactly what
+        keeps these three off the generic path. Assert that, not the
+        retired lookup, or this guard passes on a mechanism nothing uses.
         """
         import hermes_cli.gateway as gateway_mod
-        from hermes_cli import setup as _s
 
-        assert gateway_mod._builtin_setup_fn("telegram") is _s._setup_telegram
-        assert gateway_mod._builtin_setup_fn("slack") is _s._setup_slack
-        assert gateway_mod._builtin_setup_fn("matrix") is _s._setup_matrix
+        # matrix is gated off Windows; pin the host so the entry exists.
+        monkeypatch.setattr(gateway_mod.sys, "platform", "linux")
+        by_key = {p["key"]: p for p in gateway_mod._all_platforms()}
+
+        for key in ("telegram", "slack", "matrix"):
+            platform = by_key.get(key)
+            assert platform is not None, f"{key} is missing from the picker"
+
+            entry = platform.get("_registry_entry")
+            builtin = gateway_mod._builtin_setup_fn(key)
+            assert (entry is not None and entry.setup_fn is not None) or builtin is not None, (
+                f"{key} resolves to neither a plugin setup_fn nor a built-in "
+                "setup function, so _configure_platform() falls through to "
+                "_setup_standard_platform() — which aborts the wizard when the "
+                "first `vars` entry is left empty."
+            )
 
 
 class TestMatrixHiddenOnWindows:

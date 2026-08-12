@@ -39,6 +39,7 @@ from typing import Optional, Dict, List, Any, Set, Tuple, Union
 logger = logging.getLogger(__name__)
 
 from hermes_time import now as _hermes_now
+from cron.model_policy import enforce_privileged_model_route
 from utils import atomic_replace, atomic_write_text
 
 # ``croniter`` compiles ~15 ms of regexes at import and only matters for
@@ -1433,6 +1434,12 @@ def create_job(
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
 
+    # Privileged (legal/finance) workloads may not be pinned to a denylisted or
+    # non-allowlisted provider/model. Checked on the assembled record — the
+    # policy reads prompt/skills for the tags and provider/model/base_url for
+    # the route — and before save_jobs(), so a rejected job never lands on disk.
+    enforce_privileged_model_route(job)
+
     with _jobs_lock():
         jobs = load_jobs()
         jobs.append(job)
@@ -1598,6 +1605,13 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                         f"(grace window: {ONESHOT_GRACE_SECONDS}s) and cannot be scheduled."
                     )
                 updated["next_run_at"] = next_run
+
+            # Same guard as create_job, applied to the *merged* record: the
+            # privileged tags usually come from the stored prompt/skills while
+            # the offending route arrives in `updates`, so neither half is
+            # conclusive alone. Raises before save_jobs(), leaving the stored
+            # job untouched.
+            enforce_privileged_model_route(updated)
 
             jobs[i] = updated
             save_jobs(jobs)

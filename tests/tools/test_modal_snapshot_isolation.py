@@ -76,6 +76,18 @@ def _install_modal_test_modules(
     env_package.__path__ = [str(TOOLS_DIR / "environments")]  # type: ignore[attr-defined]
     sys.modules["tools.environments"] = env_package
 
+    # modal.py calls tools.lazy_deps.ensure("terminal.modal") before touching
+    # the SDK. That check asks whether the *distribution* is installed, so the
+    # stubbed `modal` module below cannot satisfy it — on any machine without
+    # the real package (CI included) it raises FeatureUnavailable and the test
+    # dies before reaching the snapshot logic it exists to cover. These tests
+    # stub the whole world already; dependency resolution is simply one more
+    # thing to stub, not the thing under test.
+    sys.modules["tools.lazy_deps"] = types.SimpleNamespace(
+        ensure=lambda *a, **k: None,
+        ensure_and_bind=lambda *a, **k: None,
+    )
+
     class _DummyBaseEnvironment:
         def __init__(self, cwd: str, timeout: int, env=None):
             self.cwd = cwd
