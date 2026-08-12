@@ -273,6 +273,50 @@ function codeSignals(body: string): CodeSignals {
   }
 }
 
+// A sentence-ending punctuation mark followed by whitespace or end-of-line.
+// Real wrapped prose has these; config/structured listings almost never do.
+const SENTENCE_PUNCTUATION_RE = /[.!?](?:\s|$)/
+// `Key value` or `Key: value` / `Key = value` — the shape of a config
+// directive (`Host example`, `Port 22`, `HostName 10.0.0.1`) or a settings
+// line. The key is a bare identifier, so this does NOT match ordinary prose
+// sentences (which start with a capitalized word but continue with lowercase
+// prose, not a single value token).
+const CONFIG_LINE_RE = /^[A-Za-z0-9_][\w.-]*(?:\s+\S|\s*[:=]\s*\S)/
+
+/**
+ * True when a fenced block looks like structured / config / tabular text
+ * rather than wrapped prose. Such blocks (SSH config, .env dumps, INI-style
+ * settings, key/value listings) trip the prose heuristics' "3+ plain lines,
+ * no JS/SQL tokens" rule and get their fence stripped — rendering as a flat
+ * paragraph instead of a code block. This veto keeps them fenced.
+ *
+ * Two signals, biased toward keeping the fence when ambiguous:
+ *   - ANY indented continuation line (leading whitespace before content):
+ *     prose is not indented line-by-line, but config stanzas are
+ *     (`Host x` / `    HostName y`).
+ *   - No sentence-ending punctuation AND a majority of lines are
+ *     `Key value` / `Key: value` directives.
+ */
+export function isLikelyStructuredText(body: string): boolean {
+  const lines = body.split('\n').filter(line => line.trim())
+
+  if (lines.length < 2) {
+    return false
+  }
+
+  if (lines.some(line => /^\s+\S/.test(line))) {
+    return true
+  }
+
+  if (lines.some(line => SENTENCE_PUNCTUATION_RE.test(line.trim()))) {
+    return false
+  }
+
+  const configLines = lines.filter(line => CONFIG_LINE_RE.test(line.trim())).length
+
+  return configLines >= Math.max(2, Math.ceil(lines.length * 0.6))
+}
+
 export function isLikelyProseFence(info: string, body: string): boolean {
   const trimmedInfo = info.trim()
   const rawInfo = trimmedInfo.toLowerCase()
@@ -302,6 +346,13 @@ export function isLikelyProseFence(info: string, body: string): boolean {
     return false
   }
 
+  // Config / key-value / indented listings are not prose — keep their fence
+  // so an SSH config, .env, or INI block renders as a code block instead of
+  // being unwrapped into a paragraph.
+  if (isLikelyStructuredText(body)) {
+    return false
+  }
+
   return (
     (signals.bulletLines >= 2 && signals.hasMarkdown && signals.codeSignals <= 2) ||
     (signals.proseLines >= 3 && signals.codeSignals === 0)
@@ -316,8 +367,17 @@ export function isLikelyProseCodeBlock(language: string | undefined, code: strin
     return false
   }
 
+  // A bullet list with markdown emphasis is prose even when it happens to be
+  // structured; the config veto below is only meant to protect config/kv
+  // listings, so let the bullet-prose case win first.
   if (signals.bulletLines >= 1 && (signals.hasMarkdown || signals.proseLines >= 2)) {
     return true
+  }
+
+  // Config / key-value / indented listings are code, not prose — never
+  // unwrap them (SSH config, .env, INI, key/value tables).
+  if (isLikelyStructuredText(code || '')) {
+    return false
   }
 
   if (NON_CODE_FENCE_LANGUAGES.has(cleanLanguage)) {
