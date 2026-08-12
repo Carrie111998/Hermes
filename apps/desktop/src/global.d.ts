@@ -29,6 +29,31 @@ declare global {
       // reaper spares it while its chat is active.
       touchBackend: (profile?: string | null) => Promise<{ ok: boolean }>
       getGatewayWsUrl: (profile?: null | string) => Promise<GatewayWsUrlResult>
+      // Hermes Office (Claw3d) — 3D interface manager (dev server + gateway
+      // adapter). Local/token connections only; OAuth gateways are surfaced
+      // as unsupported through getStatus/start.
+      claw3d: {
+        getStatus: (profile?: null | string) => Promise<{
+          cloned: boolean
+          installed: boolean
+          devServerRunning: boolean
+          adapterRunning: boolean
+          running: boolean
+          port: number
+          portInUse: boolean
+          url: string
+          error: string
+          oauthUnsupported: boolean
+        }>
+        setup: (profile?: null | string) => Promise<{ ok: boolean }>
+        start: (profile?: null | string) => Promise<{ success: boolean; error?: string }>
+        stop: () => Promise<{ ok: boolean }>
+        getLogs: () => Promise<{ logs: string }>
+        open: (profile?: null | string) => Promise<{ ok: boolean; error?: string }>
+        onSetupProgress: (
+          callback: (progress: { step: number; totalSteps: number; title: string; detail: string; log: string }) => void
+        ) => () => void
+      }
       // Open (or focus) a standalone OS window for a single chat session so
       // the user can work with multiple chats side by side. Returns ok:false
       // with an error code when the sessionId is empty/invalid. `watch` opens

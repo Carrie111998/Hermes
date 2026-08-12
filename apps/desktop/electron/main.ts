@@ -49,6 +49,7 @@ import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from '
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
+import * as claw3d from './claw3d'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
 import {
   authModeFromStatus,
@@ -9809,6 +9810,45 @@ function createWindow() {
 }
 
 ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(profile))
+// ── Hermes Office (Claw3d) ──────────────────────────────────────────────────
+// The Office manager needs the active gateway connection (HTTP base URL +
+// session token) to write ~/.openclaw/claw3d/settings.json and the
+// hermes-office .env. Local/token connections work; OAuth-gated gateways are
+// surfaced as unsupported by getClaw3dStatus/startAll.
+claw3d.setConnectionResolver(async profile => {
+  const conn = await ensureBackend(profile)
+  let token = ''
+  if (conn.authMode !== 'oauth' && typeof conn.wsUrl === 'string') {
+    try {
+      token = new URL(conn.wsUrl).searchParams.get('token') ?? ''
+    } catch {
+      token = ''
+    }
+  }
+  return { baseUrl: conn.baseUrl, token, authMode: conn.authMode }
+})
+ipcMain.handle('hermes:claw3d:status', async (_event, profile) => claw3d.getClaw3dStatus(profile))
+ipcMain.handle('hermes:claw3d:setup', async (event, profile) => {
+  const broadcast = (progress: claw3d.Claw3dSetupProgress) => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      win.webContents.send('hermes:claw3d:setup-progress', progress)
+    }
+  }
+  await claw3d.setupClaw3d(broadcast, profile)
+  return { ok: true }
+})
+ipcMain.handle('hermes:claw3d:start', async (_event, profile) => claw3d.startAll(profile))
+ipcMain.handle('hermes:claw3d:stop', async () => {
+  claw3d.stopAll()
+  return { ok: true }
+})
+ipcMain.handle('hermes:claw3d:logs', async () => ({ logs: claw3d.getClaw3dLogs() }))
+ipcMain.handle('hermes:claw3d:open', async (_event, profile) => {
+  const status = await claw3d.getClaw3dStatus(profile)
+  if (!status.running) return { ok: false, error: 'Office is not running' }
+  await shell.openExternal(`http://127.0.0.1:${status.port}`)
+  return { ok: true }
+})
 // Reconnect-after-wake recovery. A REMOTE primary backend has no child process,
 // so the 'exit'/'error' handlers that would clear a dead connection promise never
 // fire — once the remote becomes unreachable across a sleep/wake the renderer

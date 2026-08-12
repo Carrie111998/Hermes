@@ -1,0 +1,8 @@
+{
+  "name": "knowledge",
+  "label": "Knowledge",
+  "description": "Interactive knowledge graph over the ~/.hermes/knowledge markdown wiki — force-directed canvas, page browser, search, links and backlinks",
+  "icon": "Graph",
+  "version": "1.0.0",
+  "api": "plugin_api.py"
+}
