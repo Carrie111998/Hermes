@@ -393,7 +393,17 @@ def node_tool_runnable(path: str | None) -> bool:
 
         result = subprocess.run(
             [path, "--version"],
-            capture_output=True,
+            # DEVNULL, not capture_output=True: ``path`` is ``npm.cmd`` on
+            # Windows, so the direct child is cmd.exe and the version probe
+            # runs in a node grandchild that inherits the capture pipes. On
+            # timeout subprocess.run kills only cmd.exe, then blocks
+            # re-draining a pipe the grandchild still holds open — so the 10s
+            # bound would not hold for exactly the broken wrapper this
+            # function exists to detect. We only read returncode, so there is
+            # no output to preserve.
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
             timeout=10,
             env=with_hermes_node_path(),
             creationflags=windows_hide_flags(),
@@ -641,7 +651,14 @@ def agent_browser_runnable(path: str | None) -> bool:
 
         result = subprocess.run(
             [path, "--version"],
-            capture_output=True,
+            # DEVNULL, not capture_output=True — same reasoning as
+            # node_tool_runnable above: an ``npx``/``npm`` shim is a .cmd on
+            # Windows, so the real work is a grandchild that keeps a capture
+            # pipe open past the direct child's death and defeats the timeout.
+            # Only returncode is read here.
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
             timeout=10,
             env=with_hermes_node_path(),
             creationflags=windows_hide_flags(),

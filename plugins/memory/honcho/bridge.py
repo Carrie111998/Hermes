@@ -129,11 +129,9 @@ def merge_compiled_truth(page_md: str, facts: list[str]) -> str:
     return f"{above}{_TIMELINE_MARKER}{below}"
 
 
-# Per-call budget for the `gbrain` CLI. This is a FLOOR, not a bound:
-# run_text_capture's timeout path adds a synchronous tree-kill plus, if that
-# kill misses, a dead pipe drain and an uncapped close/wait — see its docstring.
-# A wedged `gbrain` can therefore cost this plus tens of seconds, so don't size
-# this as though 15 were the ceiling.
+# Per-call budget for the `gbrain` CLI. Note run_text_capture's real bound is
+# this plus the synchronous tree-kill it does on timeout — up to ~10s more on
+# Windows (see its docstring), so a wedged `gbrain` costs ~25s, not 15s.
 _GBRAIN_TIMEOUT = 15
 
 
