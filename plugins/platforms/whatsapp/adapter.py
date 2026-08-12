@@ -450,10 +450,18 @@ def _file_content_hash(path: Path) -> str:
         return ""
 
 
+# Budget for the `node --version` sanity probe.  60s, not 5s, for the same
+# reason _listener_pids_on_port_netstat carries 60s: process spawn on this host
+# is not bounded by a few seconds under load (netstat measured 8.2s / 9.6s /
+# 21.3s while idle).  A budget the probe routinely overruns turns a healthy
+# Node into "not installed" — see the TimeoutExpired branch below.
+_NODE_PROBE_TIMEOUT_S = 60
+
+
 def check_whatsapp_requirements() -> bool:
     """
     Check if WhatsApp dependencies are available.
-    
+
     WhatsApp requires a Node.js bridge for most implementations.
     """
     # Prefer Hermes-managed Node/npm so Windows installs are not broken by a
@@ -466,9 +474,23 @@ def check_whatsapp_requirements() -> bool:
             [_node, "--version"],
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=_NODE_PROBE_TIMEOUT_S,
         )
         return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        # Node resolved to a real executable above — that IS the installation
+        # check.  A probe that overruns its budget says the host is loaded,
+        # not that the runtime is absent, and reporting "missing" here makes
+        # connect() stamp a non-retryable whatsapp_node_missing fatal that
+        # keeps WhatsApp down until the next gateway boot.  Observed doing
+        # exactly that on 2026-08-11 at 23:23:47 with node v24.14.0 installed.
+        # If node really is wedged, the bridge spawn below fails with a
+        # retryable error instead of a permanent one.
+        logger.warning(
+            "node --version exceeded %ss; treating Node as present since %s "
+            "resolved on disk", _NODE_PROBE_TIMEOUT_S, _node,
+        )
+        return True
     except Exception:
         return False
 
