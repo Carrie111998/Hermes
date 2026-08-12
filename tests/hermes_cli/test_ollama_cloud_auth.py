@@ -68,6 +68,38 @@ class TestOllamaCloudCredentials:
 
         assert runtime["api_key"] == "alias-key"
 
+    def test_named_custom_endpoint_explicit_key_beats_pool_entry(self, monkeypatch):
+        """A direct alias may name a configured custom provider but select a
+        different endpoint. Its explicit key must win before pool lookup."""
+        from hermes_cli import runtime_provider as rp
+
+        monkeypatch.setattr(
+            rp,
+            "_get_named_custom_provider",
+            lambda _name: {
+                "name": "foo",
+                "base_url": "https://configured.example/v1",
+            },
+        )
+        monkeypatch.setattr(
+            rp,
+            "_try_resolve_from_custom_pool",
+            lambda *args, **kwargs: {
+                "api_key": "pool-key-that-must-not-leak",
+                "base_url": "https://alias.example/v1",
+                "api_mode": "chat_completions",
+            },
+        )
+
+        runtime = rp.resolve_runtime_provider(
+            requested="custom:foo",
+            explicit_base_url="https://alias.example/v1",
+            explicit_api_key="alias-key",
+        )
+
+        assert runtime["api_key"] == "alias-key"
+        assert runtime["base_url"] == "https://alias.example/v1"
+
 
 # ---------------------------------------------------------------------------
 # Direct alias resolution

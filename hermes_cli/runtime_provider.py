@@ -1127,8 +1127,21 @@ def _resolve_named_custom_runtime(
     if not base_url:
         return None
 
+    # An explicit alias key is bound to the explicit endpoint.  Do not let a
+    # credential-pool entry for the named provider override it: an alias may
+    # deliberately target a different host, and substituting the pool key
+    # would disclose that secret to the alias endpoint (#83612).
+    explicit_key = (explicit_api_key or "").strip()
+    if has_usable_secret(explicit_key):
+        pool_result = None
+    else:
+        pool_result = _try_resolve_from_custom_pool(
+            base_url,
+            "custom",
+            custom_provider.get("api_mode"),
+            provider_name=custom_provider.get("name"),
+        )
     # Check if a credential pool exists for this custom endpoint
-    pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"), provider_name=custom_provider.get("name"))
     if pool_result:
         # Propagate the model name even when using pooled credentials —
         # the pool doesn't know about the custom_providers model field.
@@ -1153,7 +1166,7 @@ def _resolve_named_custom_runtime(
     _cp_is_openai_url   = base_url_host_matches(base_url, "openai.com") or base_url_host_matches(base_url, "openai.azure.com")
     _cp_is_openrouter   = base_url_host_matches(base_url, "openrouter.ai")
     api_key_candidates = [
-        (explicit_api_key or "").strip(),
+        explicit_key,
         str(custom_provider.get("api_key", "") or "").strip(),
         _getenv(str(custom_provider.get("key_env", "") or "").strip(), "").strip(),
         # Gate provider env keys on their authoritative hosts — sending
