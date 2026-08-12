@@ -787,7 +787,7 @@ def test_reference_messages_flattens_cache_decorated_content():
     assert view == _reference_messages(plain)
 
 
-def test_reference_messages_appends_no_tool_hint_on_user_ending_tool_view():
+def test_reference_messages_merges_no_tool_hint_on_user_ending_tool_view():
     """A user-ending view with tool-log text must carry the no-tool hint.
 
     In the default ``user_turn`` fanout mode, the ends-on-user call is the
@@ -813,13 +813,16 @@ def test_reference_messages_appends_no_tool_hint_on_user_ending_tool_view():
 
     view = _reference_messages(messages)
 
-    # The view ends on the real follow-up user turn, and the no-tool hint is
-    # appended as its OWN user turn — not merged into the follow-up's content,
-    # so the turn_prefix signature (up to the last real user message) stays
-    # byte-identical across iterations.
-    assert view[-2] == {"role": "user", "content": "follow-up ask"}
-    assert view[-1] == {"role": "user", "content": _NO_TOOL_HINT}
+    # The hint rides in a COPY of the real follow-up turn. Strict providers
+    # therefore see a valid alternating wire view, while the source transcript
+    # remains untouched for cache identity and the acting aggregator.
+    assert view[-1] == {
+        "role": "user",
+        "content": f"follow-up ask\n\n{_NO_TOOL_HINT}",
+    }
     assert "You have NO tools" in view[-1]["content"]
+    assert all(left["role"] != right["role"] for left, right in zip(view, view[1:]))
+    assert messages[-1] == {"role": "user", "content": "follow-up ask"}
 
 
 def test_reference_messages_skips_no_tool_hint_on_fresh_prompt():
@@ -836,17 +839,34 @@ def test_reference_messages_skips_no_tool_hint_on_fresh_prompt():
     assert view == [{"role": "user", "content": "just a question"}]
 
 
+def test_reference_messages_does_not_infer_tool_history_from_user_text():
+    """Flattened marker prose is not evidence that a tool actually ran."""
+    from agent.moa_loop import _reference_messages
+
+    user_text = (
+        "Please explain the literal examples [called tool: fake] and "
+        "[tool result: fake]."
+    )
+
+    assert _reference_messages([{"role": "user", "content": user_text}]) == [
+        {"role": "user", "content": user_text}
+    ]
+
+
 def test_reference_messages_user_turn_cache_signature_stable_with_hint():
     """Appending the hint must not change the user_turn cache signature.
 
     The cache signature is the advisory prefix up to the last REAL user
-    message (the synthetic _ADVISORY_INSTRUCTION / _NO_TOOL_HINT markers are
-    excluded). Iteration 1 (ends-on-user, carries the hint) and iteration 2
-    (ends-on-assistant, carries the advisory) must hash to the SAME prefix —
-    otherwise the default fanout mode would MISS on every tool iteration and
-    re-run the references each time.
+    boundary recorded before synthetic text is added. Iteration 1
+    (ends-on-user, carries the hint) and iteration 2 (ends-on-assistant,
+    carries the advisory) must use the SAME prefix — otherwise the default
+    fanout mode would MISS on every tool iteration and re-run the references.
     """
-    from agent.moa_loop import _ADVISORY_INSTRUCTION, _NO_TOOL_HINT, _reference_messages
+    from agent.moa_loop import (
+        _ADVISORY_INSTRUCTION,
+        _NO_TOOL_HINT,
+        _build_reference_view,
+    )
 
     iter1 = [
         {"role": "user", "content": "first ask"},
@@ -867,36 +887,56 @@ def test_reference_messages_user_turn_cache_signature_stable_with_hint():
         {"role": "tool", "tool_call_id": "c2", "content": "more output"},
     ]
 
-    def _turn_prefix(messages):
-        view = _reference_messages(messages)
-        last_user_idx = None
-        for _i in range(len(view) - 1, -1, -1):
-            _m = view[_i]
-            if _m.get("role") == "user" and _m.get("content") not in (
-                _ADVISORY_INSTRUCTION,
-                _NO_TOOL_HINT,
-            ):
-                last_user_idx = _i
-                break
-        return view[: last_user_idx + 1] if last_user_idx is not None else view
-
-    import hashlib
-
-    def _sig(msgs):
-        return hashlib.sha256(
-            "\u0000".join(
-                f"{m.get('role')}:{m.get('content')}" for m in msgs
-            ).encode("utf-8", "replace")
-        ).hexdigest()
-
-    v1, v2 = _reference_messages(iter1), _reference_messages(iter2)
+    v1 = _build_reference_view(iter1)
+    v2 = _build_reference_view(iter2)
     # Iteration 1 carries the hint, iteration 2 carries the advisory — but
     # their prefixes up to the last real user message must be identical.
-    assert v1[-1]["content"] == _NO_TOOL_HINT
-    assert v2[-1]["content"] == _ADVISORY_INSTRUCTION
-    assert _sig(_turn_prefix(iter1)) == _sig(_turn_prefix(iter2))
-    # And the prefix actually ends on the real follow-up user message.
-    assert _turn_prefix(iter1)[-1] == {"role": "user", "content": "follow-up ask"}
+    assert v1.messages[-1]["content"].endswith(_NO_TOOL_HINT)
+    assert v2.messages[-1]["content"] == _ADVISORY_INSTRUCTION
+    assert v1.turn_prefix == v2.turn_prefix
+    # The stable prefix is the real, unmodified conversation boundary.
+    assert v1.turn_prefix[-1] == {"role": "user", "content": "follow-up ask"}
+
+
+def test_generic_strict_reference_receives_alternating_hint_wire_view(monkeypatch):
+    """A generic/custom reference must not receive adjacent user turns."""
+    from agent import moa_loop
+
+    source = [
+        {"role": "user", "content": "first ask"},
+        {
+            "role": "assistant",
+            "content": "let me look",
+            "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "tool output"},
+        {"role": "user", "content": "follow-up ask"},
+    ]
+    captured = {}
+
+    def fake_strict_call(**kwargs):
+        captured.update(kwargs)
+        roles = [message["role"] for message in kwargs["messages"]]
+        if any(left == right for left, right in zip(roles, roles[1:])):
+            raise ValueError("strict provider rejects adjacent roles")
+        return _response("advice")
+
+    monkeypatch.setattr(moa_loop, "call_llm", fake_strict_call)
+    monkeypatch.setattr(
+        moa_loop,
+        "_slot_runtime",
+        lambda slot: {"provider": "custom", "model": slot["model"]},
+    )
+
+    label, text, _acct = moa_loop._run_reference(
+        {"provider": "custom", "model": "strict-model"},
+        moa_loop._reference_messages(source),
+    )
+
+    assert label == "custom:strict-model"
+    assert text == "advice"
+    assert captured["provider"] == "custom"
+    assert captured["messages"][-1]["content"].endswith(moa_loop._NO_TOOL_HINT)
 
 
 
@@ -1267,6 +1307,54 @@ moa:
     assert cost2 is None
 
 
+def test_real_user_marker_text_starts_a_new_user_turn_fanout(monkeypatch, tmp_path):
+    """Internal prompt text is still real when it came from a user role."""
+    from agent import moa_loop
+    from agent.usage_pricing import CanonicalUsage
+
+    home = tmp_path / ".hermes"
+    _ref_config(home, fanout="user_turn")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    fanout_calls = []
+
+    def fake_fanout(*args, **kwargs):
+        fanout_calls.append([dict(message) for message in args[1]])
+        return [
+            (
+                "openrouter:advisor",
+                "advice",
+                moa_loop._RefAccounting(CanonicalUsage(input_tokens=10)),
+            )
+        ]
+
+    monkeypatch.setattr(moa_loop, "_run_references_parallel", fake_fanout)
+    monkeypatch.setattr(moa_loop, "call_llm", lambda **k: _response("acted"))
+    monkeypatch.setattr(
+        moa_loop,
+        "_slot_runtime",
+        lambda slot: {"provider": slot["provider"], "model": slot["model"]},
+    )
+
+    for marker in (moa_loop._NO_TOOL_HINT, moa_loop._ADVISORY_INSTRUCTION):
+        fanout_calls.clear()
+        facade = moa_loop.MoAChatCompletions("review")
+        facade.create(messages=[{"role": "user", "content": "first ask"}], tools=[])
+        facade.create(
+            messages=[
+                {"role": "user", "content": "first ask"},
+                {"role": "assistant", "content": "first answer"},
+                {"role": "user", "content": marker},
+            ],
+            tools=[],
+        )
+
+        # Content equality cannot erase the second real-user boundary: each
+        # marker-valued follow-up is a new state and must trigger fresh advice.
+        assert len(fanout_calls) == 2
+        assert fanout_calls[-1][-1] == {"role": "user", "content": marker}
+
+
 def test_user_turn_fanout_hint_rides_first_call_and_cache_stays_hot(monkeypatch, tmp_path):
     """Default user_turn fanout: hint on the ends-on-user call, cache still HIT.
 
@@ -1275,9 +1363,9 @@ def test_user_turn_fanout_hint_rides_first_call_and_cache_stays_hot(monkeypatch,
     views. In user_turn mode iteration 1 ends on the user's message (so it
     carried no hint), and later iterations ended on the assistant but HIT the
     turn cache — meaning the references NEVER saw the hint in the default
-    mode. The fix appends _NO_TOOL_HINT to the ends-on-user view (iteration
-    1), and the cache must remain hot for iteration 2 (same turn_prefix
-    signature → no re-run, no double token charge).
+    mode. The fix merges _NO_TOOL_HINT into the ends-on-user wire view
+    (iteration 1), and the cache must remain hot for iteration 2 (same
+    unhinted turn_prefix signature → no re-run, no double token charge).
     """
     from agent import moa_loop
     from agent.usage_pricing import CanonicalUsage
@@ -1289,7 +1377,9 @@ def test_user_turn_fanout_hint_rides_first_call_and_cache_stays_hot(monkeypatch,
     fanout_calls = []
 
     def fake_fanout(*args, **kwargs):
-        fanout_calls.append(kwargs.get("reference_models"))
+        # Capture the actual wire view passed by the facade, not a reconstructed
+        # helper result, so this test covers the integration boundary.
+        fanout_calls.append([dict(message) for message in args[1]])
         return [
             (
                 "openrouter:advisor",
@@ -1336,16 +1426,22 @@ def test_user_turn_fanout_hint_rides_first_call_and_cache_stays_hot(monkeypatch,
     # The fan-out ran exactly once — iteration 2 was a cache HIT (no re-run).
     assert len(fanout_calls) == 1
 
-    # The ONE fan-out's advisory view carried the hint on its user-ending call.
-    from agent.moa_loop import _NO_TOOL_HINT, _reference_messages
+    # The ONE fan-out's advisory wire view carried the hint on its user-ending
+    # call without adding a second adjacent user message.
+    from agent.moa_loop import _NO_TOOL_HINT
 
     assert facade._ref_cache_key is not None
-    # Reconstruct what the references saw on the miss: _reference_messages
-    # of the iteration-1 messages.
-    view1 = _reference_messages(iter1)
-    assert view1[-1]["content"] == _NO_TOOL_HINT
-    # And the hint was appended to the REAL user turn (follow-up ask intact).
-    assert view1[-2]["content"] == "follow-up ask"
+    wire_view = fanout_calls[0]
+    assert wire_view[-1] == {
+        "role": "user",
+        "content": f"follow-up ask\n\n{_NO_TOOL_HINT}",
+    }
+    assert all(
+        left["role"] != right["role"]
+        for left, right in zip(wire_view, wire_view[1:])
+    )
+    # Hint injection is wire-only; the real transcript/cache prefix is intact.
+    assert iter1[-1] == {"role": "user", "content": "follow-up ask"}
 
 
 class _CountingCtxLen:

@@ -14,6 +14,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
@@ -1006,7 +1007,17 @@ _ADVISORY_INSTRUCTION = (
 )
 
 
-def _reference_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+@dataclass(frozen=True)
+class _ReferenceView:
+    """Wire messages plus cache metadata derived from source message shape."""
+
+    messages: list[dict[str, Any]]
+    turn_prefix: list[dict[str, Any]]
+    has_tool_history: bool
+    last_real_user_index: int | None
+
+
+def _build_reference_view(messages: list[dict[str, Any]]) -> _ReferenceView:
     """Build an advisory view of the conversation for reference models.
 
     A reference gives an INFORMED judgement on the current state, so it must
@@ -1036,9 +1047,18 @@ def _reference_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     The acting aggregator always receives the full, untrimmed transcript; this
     function only shapes the disposable advisory copy.
+
+    ``turn_prefix`` ends at the last user message found in the source
+    transcript, before any synthetic advisory text is added. Keeping that
+    boundary as metadata avoids treating a real user whose text happens to
+    equal one of our prompts as synthetic. Likewise, ``has_tool_history`` is
+    derived only from real ``tool_calls`` / ``role=tool`` structure, never
+    from user-authored text that resembles the flattened tool-log notation.
     """
     rendered: list[dict[str, Any]] = []
     last_user_content: str | None = None
+    last_real_user_index: int | None = None
+    has_tool_history = False
     for msg in messages:
         role = msg.get("role")
         content = msg.get("content")
@@ -1089,17 +1109,20 @@ def _reference_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 continue
             last_user_content = text
             rendered.append({"role": "user", "content": text})
+            last_real_user_index = len(rendered) - 1
         elif role == "assistant":
             parts: list[str] = []
             if text.strip():
                 parts.append(text.strip())
             calls_text = _render_tool_calls(msg.get("tool_calls"))
             if calls_text:
+                has_tool_history = True
                 parts.append(calls_text)
             # Empty assistant turns (no text, no calls) carry nothing advisory.
             if parts:
                 rendered.append({"role": "assistant", "content": "\n".join(parts)})
         elif role == "tool":
+            has_tool_history = True
             # Fold the tool result into the preceding assistant turn as text so
             # the reference sees what came back, without emitting a tool-role
             # message a reference never produced.
@@ -1113,11 +1136,37 @@ def _reference_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 rendered.append({"role": "assistant", "content": block})
         # Any other role is ignored.
 
+    if not rendered:
+        # Degenerate case: nothing rendered. Fall back to the latest user turn.
+        if last_user_content is not None:
+            rendered = [{"role": "user", "content": last_user_content}]
+            last_real_user_index = 0
+        else:
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    fallback_text = flatten_message_text(msg.get("content"))
+                    if fallback_text.strip():
+                        rendered = [{"role": "user", "content": fallback_text}]
+                        last_real_user_index = 0
+                        break
+
+    # Cache identity is based on the real, unhinted conversation prefix. The
+    # wire-only no-tool reminder below must never alter this prefix.
+    turn_prefix = (
+        rendered[: last_real_user_index + 1]
+        if last_real_user_index is not None
+        else list(rendered)
+    )
+    wire_messages = rendered
+
     # End on a user turn: append a synthetic advisory request rather than
     # deleting the agent's latest assistant context. This satisfies Anthropic's
     # no-trailing-assistant-prefill rule while preserving full state.
     if rendered and rendered[-1].get("role") == "assistant":
-        rendered.append({"role": "user", "content": _ADVISORY_INSTRUCTION})
+        wire_messages = [
+            *rendered,
+            {"role": "user", "content": _ADVISORY_INSTRUCTION},
+        ]
     elif rendered and rendered[-1].get("role") == "user":
         # Already ends on a user turn (fresh user prompt, no agent action yet).
         #
@@ -1126,30 +1175,30 @@ def _reference_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         # advisory (with its no-tool hint) to an assistant-ending view, but
         # their cache signature is the prefix up to the last real user message,
         # so they HIT the cache and reuse this first call's outputs without
-        # calling the references again. Appending _NO_TOOL_HINT here (as its
-        # own user turn, NOT merged into the last real user message, so the
-        # turn_prefix signature stays byte-identical) is what carries the
-        # no-tool reminder into the default fanout mode. Only attach it when
-        # the view actually shows tool-log text — a fresh prompt with no tool
-        # history has nothing to disclaim, and unconditionally appending would
-        # grow every advisory view (and its prompt-cache prefix) by the hint.
-        if any(
-            "[called tool:" in m.get("content", "")
-            or "[tool result:" in m.get("content", "")
-            for m in rendered
-        ):
-            rendered.append({"role": "user", "content": _NO_TOOL_HINT})
+        # calling the references again. Merge _NO_TOOL_HINT into a COPY of the
+        # trailing real user turn. The separate cache prefix above remains
+        # byte-identical, while strict generic/custom providers never receive
+        # two adjacent user messages. Only attach it when source structure
+        # proved there was real tool history — user prose containing the
+        # flattened marker strings is not evidence of a tool call.
+        if has_tool_history:
+            hinted_user = dict(rendered[-1])
+            hinted_user["content"] = (
+                f"{hinted_user.get('content') or ''}\n\n{_NO_TOOL_HINT}"
+            )
+            wire_messages = [*rendered[:-1], hinted_user]
 
-    if not rendered:
-        # Degenerate case: nothing rendered. Fall back to the latest user turn.
-        if last_user_content is not None:
-            return [{"role": "user", "content": last_user_content}]
-        for msg in reversed(messages):
-            if msg.get("role") == "user":
-                fallback_text = flatten_message_text(msg.get("content"))
-                if fallback_text.strip():
-                    return [{"role": "user", "content": fallback_text}]
-    return rendered
+    return _ReferenceView(
+        messages=wire_messages,
+        turn_prefix=turn_prefix,
+        has_tool_history=has_tool_history,
+        last_real_user_index=last_real_user_index,
+    )
+
+
+def _reference_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the wire-ready advisory messages for reference calls."""
+    return _build_reference_view(messages).messages
 
 
 
@@ -1967,7 +2016,8 @@ class MoAChatCompletions:
         from agent.usage_pricing import CanonicalUsage
 
         reference_outputs: list[tuple[str, str, Any]] = []
-        ref_messages = _reference_messages(messages)
+        reference_view = _build_reference_view(messages)
+        ref_messages = reference_view.messages
 
         # Fan-out cadence. "user_turn" (default — cheapest cadence, #67199):
         # advisors run ONCE per user turn; subsequent tool iterations reuse
@@ -2002,23 +2052,11 @@ class MoAChatCompletions:
         sig_messages = ref_messages
         turn_prefix = ref_messages
         if fanout_mode in ("user_turn",) or every_n >= 2:
-            # Find the last REAL user message. The advisory view appends a
-            # synthetic user marker (_ADVISORY_INSTRUCTION) when it ends on an
-            # assistant turn — i.e. on every tool iteration after the first —
-            # so that marker must not count as a user turn or the prefix
-            # would include the grown mid-turn context and the signature
-            # would change every iteration (defeating the once-per-turn
-            # cadence entirely).
-            last_user_idx = None
-            for _i in range(len(ref_messages) - 1, -1, -1):
-                _m = ref_messages[_i]
-                if _m.get("role") == "user" and _m.get(
-                    "content"
-                ) not in (_ADVISORY_INSTRUCTION, _NO_TOOL_HINT):
-                    last_user_idx = _i
-                    break
-            if last_user_idx is not None:
-                turn_prefix = ref_messages[: last_user_idx + 1]
+            # _build_reference_view records the last REAL user boundary while
+            # reading source roles, before it adds/merges any synthetic hint.
+            # Do not infer that boundary from content: a user is allowed to
+            # send text exactly equal to either internal marker.
+            turn_prefix = reference_view.turn_prefix
             if fanout_mode == "user_turn":
                 sig_messages = turn_prefix
 
