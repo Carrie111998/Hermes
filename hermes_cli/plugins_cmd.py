@@ -932,10 +932,16 @@ def cmd_enable(name: str, allow_tool_override: Optional[bool] = None) -> None:
 
     # Built-in tool override is a privileged grant. Bundled plugins ship with
     # Hermes core and are trusted; every other source needs operator opt-in.
-    if source == "bundled":
-        return
+    if source != "bundled":
+        _resolve_tool_override_grant(console, key, allow_tool_override)
 
-    _resolve_tool_override_grant(console, key, allow_tool_override)
+    # Enabling a plugin and exposing its model tools are separate gates. Keep
+    # the CLI flow aligned with the dashboard flow so `plugins enable` cannot
+    # leave a tool-providing plugin loaded but absent from every session.
+    # Toolset discovery may import the plugin, so it must happen only after the
+    # operator's privileged override decision above. Run this even for an
+    # already-enabled plugin to repair older drifted configurations.
+    _toggle_plugin_toolset(key, enable=True)
 
 
 def _resolve_tool_override_grant(
@@ -992,9 +998,18 @@ def cmd_disable(name: str) -> None:
     disabled = _get_disabled_set()
 
     if key not in enabled and key in disabled:
+        # Older CLI versions could leave a disabled plugin's toolset exposed.
+        # The enable path persists the discovered mapping so this repair works
+        # even though a fresh process intentionally does not load disabled
+        # plugin code.
+        _toggle_plugin_toolset(key, enable=False)
         console.print(f"[dim]Plugin '{key}' is already disabled.[/dim]")
         return
 
+    # Resolve and remove the toolset while the plugin is still enabled and its
+    # registered tools remain discoverable. Once the disabled flag is saved, a
+    # fresh CLI process will intentionally skip loading the plugin.
+    _toggle_plugin_toolset(key, enable=False)
     enabled.discard(key)
     # Drop any legacy bare-name entry from the allow-list too, so a stale
     # bare name can't keep a nested plugin loading after an explicit disable.
@@ -1919,7 +1934,12 @@ def _get_plugin_toolset_key(name: str) -> Optional[str]:
     # Check the plugin manager for tools this plugin registered
     try:
         from hermes_cli.plugins import discover_plugins, get_plugin_manager
-        discover_plugins()  # idempotent — ensures plugins are loaded
+        # The enable/disable lists may have changed earlier in this same CLI
+        # process.  A normal idempotent discovery would reuse the registry
+        # produced while the plugin was still disabled, making its tools
+        # invisible here.  Force a refresh so discovery observes the config
+        # state that the caller just persisted.
+        discover_plugins(force=True)
         manager = get_plugin_manager()
         for _key, loaded in manager._plugins.items():
             if loaded.manifest.name == name or _key == name:
@@ -1955,13 +1975,28 @@ def _toggle_plugin_toolset(name: str, *, enable: bool) -> None:
 
     Only acts if the plugin actually provides tools (has a toolset key).
     """
-    toolset_key = _get_plugin_toolset_key(name)
-    if not toolset_key:
-        return
-
     from hermes_cli.config import load_config, save_config
 
     config = load_config()
+    plugins_cfg = config.setdefault("plugins", {})
+    entries = plugins_cfg.setdefault("entries", {}) if isinstance(plugins_cfg, dict) else {}
+    entry = entries.setdefault(name, {}) if isinstance(entries, dict) else {}
+
+    mapping_changed = False
+    toolset_key = _get_plugin_toolset_key(name)
+    if toolset_key and isinstance(entry, dict):
+        # Preserve the plugin→toolset mapping for future disable/repair calls,
+        # when disabled plugin code is deliberately not imported.
+        remembered_value = [toolset_key]
+        if entry.get("toolsets") != remembered_value:
+            entry["toolsets"] = remembered_value
+            mapping_changed = True
+    elif not enable and isinstance(entry, dict):
+        remembered = entry.get("toolsets")
+        toolset_key = remembered[0] if isinstance(remembered, list) and remembered else None
+    if not toolset_key:
+        return
+
     platform_toolsets = config.get("platform_toolsets")
     if not isinstance(platform_toolsets, dict):
         platform_toolsets = {}
@@ -1984,7 +2019,7 @@ def _toggle_plugin_toolset(name: str, *, enable: bool) -> None:
         platform_toolsets["cli"] = [toolset_key]
         changed = True
 
-    if changed:
+    if changed or mapping_changed:
         save_config(config)
 
 
@@ -2002,6 +2037,7 @@ def dashboard_set_agent_plugin_enabled(name: str, *, enabled: bool) -> dict[str,
 
     if enabled:
         if name in en and name not in dis:
+            _toggle_plugin_toolset(name, enable=True)
             return {"ok": True, "name": name, "unchanged": True}
         en.add(name)
         dis.discard(name)
@@ -2011,13 +2047,18 @@ def dashboard_set_agent_plugin_enabled(name: str, *, enabled: bool) -> dict[str,
         return {"ok": True, "name": name, "unchanged": False}
 
     if name not in en and name in dis:
+        _toggle_plugin_toolset(name, enable=False)
         return {"ok": True, "name": name, "unchanged": True}
 
+    # Resolve the toolset while the plugin is still enabled. Persisting the
+    # disabled flag first makes fresh discovery intentionally skip its code,
+    # which prevents older configs without a remembered mapping from being
+    # cleaned up correctly.
+    _toggle_plugin_toolset(name, enable=False)
     en.discard(name)
     dis.add(name)
     _save_enabled_set(en)
     _save_disabled_set(dis)
-    _toggle_plugin_toolset(name, enable=False)
     return {"ok": True, "name": name, "unchanged": False}
 
 

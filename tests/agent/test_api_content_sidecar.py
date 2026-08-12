@@ -167,6 +167,7 @@ class _FakeAgent:
         self.api_key = "sk-x"
         self.api_mode = "chat_completions"
         self.platform = "cli"
+        self.enabled_toolsets: list[str] | None = None
         self.quiet_mode = True
         self.max_iterations = 90
         self.tools = []
@@ -246,6 +247,20 @@ def _stub_runtime_main():
 
 
 class TestPrologueStamping:
+    def test_pre_llm_hook_receives_resolved_toolset_scope(self):
+        agent = _FakeAgent()
+        agent.enabled_toolsets = ["memory", "associative-memory"]
+        captured = {}
+
+        def hook(_name, **kwargs):
+            captured.update(kwargs)
+            return []
+
+        with patch("hermes_cli.plugins.invoke_hook", side_effect=hook):
+            _build(agent)
+
+        assert captured["enabled_toolsets"] == agent.enabled_toolsets
+
     def test_stamps_api_content_from_plugin_context(self):
         agent = _FakeAgent()
         with patch(

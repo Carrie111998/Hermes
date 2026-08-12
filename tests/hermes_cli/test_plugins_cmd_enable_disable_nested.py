@@ -84,6 +84,179 @@ class TestResolvePluginKey:
 
 
 class TestEnableDisableNested:
+    @patch("hermes_cli.plugins.get_plugin_manager")
+    @patch("hermes_cli.plugins.discover_plugins")
+    def test_toolset_discovery_refreshes_after_config_change(
+        self, mock_discover, mock_manager,
+    ):
+        from types import SimpleNamespace
+
+        from hermes_cli.plugins_cmd import _get_plugin_toolset_key
+
+        loaded = SimpleNamespace(
+            manifest=SimpleNamespace(name="associative-memory"),
+            tools_registered=[],
+        )
+        mock_manager.return_value._plugins = {"associative-memory": loaded}
+
+        assert _get_plugin_toolset_key("associative-memory") is None
+        mock_discover.assert_called_once_with(force=True)
+
+    @patch("hermes_cli.plugins_cmd._toggle_plugin_toolset")
+    @patch("hermes_cli.plugins_cmd._save_disabled_set")
+    @patch("hermes_cli.plugins_cmd._save_enabled_set")
+    @patch("hermes_cli.plugins_cmd._get_disabled_set", return_value=set())
+    @patch("hermes_cli.plugins_cmd._get_enabled_set", return_value={"demo"})
+    @patch("hermes_cli.plugins_cmd._plugin_exists", return_value=True)
+    def test_dashboard_disable_resolves_toolset_before_persisting_state(
+        self, _exists, _enabled, _disabled, save_enabled, save_disabled, toggle,
+    ):
+        from hermes_cli.plugins_cmd import dashboard_set_agent_plugin_enabled
+
+        calls = []
+        toggle.side_effect = lambda *a, **k: calls.append("toggle")
+        save_enabled.side_effect = lambda *a, **k: calls.append("save-enabled")
+        save_disabled.side_effect = lambda *a, **k: calls.append("save-disabled")
+
+        result = dashboard_set_agent_plugin_enabled("demo", enabled=False)
+
+        assert result == {"ok": True, "name": "demo", "unchanged": False}
+        assert calls == ["toggle", "save-enabled", "save-disabled"]
+
+    @patch("hermes_cli.plugins_cmd._toggle_plugin_toolset")
+    @patch("hermes_cli.plugins_cmd._get_disabled_set", return_value=set())
+    @patch("hermes_cli.plugins_cmd._get_enabled_set", return_value={"demo"})
+    @patch("hermes_cli.plugins_cmd._plugin_exists", return_value=True)
+    def test_dashboard_already_enabled_repairs_toolset(
+        self, _exists, _enabled, _disabled, toggle,
+    ):
+        from hermes_cli.plugins_cmd import dashboard_set_agent_plugin_enabled
+
+        result = dashboard_set_agent_plugin_enabled("demo", enabled=True)
+
+        assert result == {"ok": True, "name": "demo", "unchanged": True}
+        toggle.assert_called_once_with("demo", enable=True)
+
+    @patch("hermes_cli.plugins_cmd._toggle_plugin_toolset")
+    @patch("hermes_cli.plugins_cmd._get_disabled_set", return_value={"demo"})
+    @patch("hermes_cli.plugins_cmd._get_enabled_set", return_value=set())
+    @patch("hermes_cli.plugins_cmd._plugin_exists", return_value=True)
+    def test_dashboard_already_disabled_repairs_toolset(
+        self, _exists, _enabled, _disabled, toggle,
+    ):
+        from hermes_cli.plugins_cmd import dashboard_set_agent_plugin_enabled
+
+        result = dashboard_set_agent_plugin_enabled("demo", enabled=False)
+
+        assert result == {"ok": True, "name": "demo", "unchanged": True}
+        toggle.assert_called_once_with("demo", enable=False)
+
+    @patch("hermes_cli.config.save_config")
+    @patch("hermes_cli.config.load_config")
+    @patch(
+        "hermes_cli.plugins_cmd._get_plugin_toolset_key",
+        return_value="associative-memory",
+    )
+    def test_existing_toolset_still_persists_plugin_mapping(
+        self, mock_key, mock_load, mock_save,
+    ):
+        from hermes_cli.plugins_cmd import _toggle_plugin_toolset
+
+        config = {
+            "plugins": {"entries": {}},
+            "platform_toolsets": {"cli": ["associative-memory"]},
+        }
+        mock_load.return_value = config
+
+        _toggle_plugin_toolset("associative-memory", enable=True)
+
+        mock_save.assert_called_once_with(config)
+        assert config["plugins"]["entries"]["associative-memory"]["toolsets"] == [
+            "associative-memory"
+        ]
+
+    @patch("hermes_cli.plugins_cmd._resolve_tool_override_grant")
+    @patch("hermes_cli.plugins_cmd._toggle_plugin_toolset")
+    @patch("hermes_cli.plugins_cmd._save_disabled_set")
+    @patch("hermes_cli.plugins_cmd._save_enabled_set")
+    @patch("hermes_cli.plugins_cmd._get_disabled_set", return_value=set())
+    @patch("hermes_cli.plugins_cmd._get_enabled_set", return_value=set())
+    @patch(
+        "hermes_cli.plugins_cmd._resolve_plugin_key_and_source",
+        return_value=("associative-memory", "entrypoint"),
+    )
+    def test_enable_plugin_also_enables_its_toolset(
+        self, mock_resolve, mock_en, mock_dis, mock_save_en, mock_save_dis,
+        mock_toggle, mock_override,
+    ):
+        from hermes_cli.plugins_cmd import cmd_enable
+
+        cmd_enable("associative-memory", allow_tool_override=False)
+
+        mock_toggle.assert_called_once_with("associative-memory", enable=True)
+
+    @patch("hermes_cli.plugins_cmd._toggle_plugin_toolset")
+    @patch("hermes_cli.plugins_cmd._resolve_tool_override_grant")
+    @patch("hermes_cli.plugins_cmd._save_disabled_set")
+    @patch("hermes_cli.plugins_cmd._save_enabled_set")
+    @patch("hermes_cli.plugins_cmd._get_disabled_set", return_value=set())
+    @patch("hermes_cli.plugins_cmd._get_enabled_set", return_value=set())
+    @patch(
+        "hermes_cli.plugins_cmd._resolve_plugin_key_and_source",
+        return_value=("third-party", "entrypoint"),
+    )
+    def test_enable_resolves_override_consent_before_plugin_discovery(
+        self, mock_resolve, mock_en, mock_dis, mock_save_en, mock_save_dis,
+        mock_override, mock_toggle,
+    ):
+        from hermes_cli.plugins_cmd import cmd_enable
+
+        calls = []
+        mock_override.side_effect = lambda *args, **kwargs: calls.append("consent")
+        mock_toggle.side_effect = lambda *args, **kwargs: calls.append("discovery")
+
+        cmd_enable("third-party", allow_tool_override=False)
+
+        assert calls == ["consent", "discovery"]
+
+    @patch("hermes_cli.plugins_cmd._toggle_plugin_toolset")
+    @patch("hermes_cli.plugins_cmd._save_disabled_set")
+    @patch("hermes_cli.plugins_cmd._save_enabled_set")
+    @patch("hermes_cli.plugins_cmd._get_disabled_set", return_value=set())
+    @patch(
+        "hermes_cli.plugins_cmd._get_enabled_set",
+        return_value={"associative-memory"},
+    )
+    @patch(
+        "hermes_cli.plugins_cmd._resolve_plugin_key",
+        return_value="associative-memory",
+    )
+    def test_disable_plugin_also_disables_its_toolset(
+        self, mock_resolve, mock_en, mock_dis, mock_save_en, mock_save_dis,
+        mock_toggle,
+    ):
+        from hermes_cli.plugins_cmd import cmd_disable
+
+        cmd_disable("associative-memory")
+
+        mock_toggle.assert_called_once_with("associative-memory", enable=False)
+
+    @patch("hermes_cli.plugins_cmd._toggle_plugin_toolset")
+    @patch("hermes_cli.plugins_cmd._get_disabled_set", return_value={"associative-memory"})
+    @patch("hermes_cli.plugins_cmd._get_enabled_set", return_value=set())
+    @patch(
+        "hermes_cli.plugins_cmd._resolve_plugin_key",
+        return_value="associative-memory",
+    )
+    def test_already_disabled_plugin_repairs_stale_toolset_exposure(
+        self, mock_resolve, mock_en, mock_dis, mock_toggle,
+    ):
+        from hermes_cli.plugins_cmd import cmd_disable
+
+        cmd_disable("associative-memory")
+
+        mock_toggle.assert_called_once_with("associative-memory", enable=False)
+
     @patch("hermes_cli.plugins.get_bundled_plugins_dir")
     @patch("hermes_cli.plugins_cmd._plugins_dir")
     @patch("hermes_cli.plugins_cmd._save_disabled_set")
