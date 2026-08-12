@@ -38,6 +38,15 @@ _SENSITIVE_HOME_FILES = (
     Path(".npmrc"),
     Path(".pypirc"),
 )
+_TEXT_ATTACHMENT_FALLBACK_ENCODINGS = ("cp932", "gb18030", "big5", "cp1252")
+_MIN_FALLBACK_DECODE_BYTES = 8
+_TEXT_ATTACHMENT_BOMS = (
+    (b"\xff\xfe\x00\x00", "utf-32"),
+    (b"\x00\x00\xfe\xff", "utf-32"),
+    (b"\xff\xfe", "utf-16"),
+    (b"\xfe\xff", "utf-16"),
+    (b"\xef\xbb\xbf", "utf-8-sig"),
+)
 
 
 @dataclass(frozen=True)
@@ -288,7 +297,7 @@ def _expand_file_reference(
         # so it can read/convert/view the file itself.
         return None, _binary_reference_block(ref, path)
 
-    text = path.read_text(encoding="utf-8")
+    text, encoding = _read_text_attachment(path)
     if ref.line_start is not None:
         lines = text.splitlines()
         start_idx = max(ref.line_start - 1, 0)
@@ -296,8 +305,45 @@ def _expand_file_reference(
         text = "\n".join(lines[start_idx:end_idx])
 
     lang = _code_fence_language(path)
-    label = ref.raw
+    label = ref.raw if encoding == "utf-8" else f"{ref.raw} (decoded as {encoding})"
     return None, f"📄 {label} ({estimate_tokens_rough(text)} tokens)\n```{lang}\n{text}\n```"
+
+
+def _read_text_attachment(path: Path) -> tuple[str, str]:
+    data = path.read_bytes()
+
+    for bom, encoding in _TEXT_ATTACHMENT_BOMS:
+        if data.startswith(bom):
+            return data.decode(encoding), encoding
+
+    try:
+        return data.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError as utf8_error:
+        if len(data) < _MIN_FALLBACK_DECODE_BYTES:
+            raise utf8_error
+        for encoding in _TEXT_ATTACHMENT_FALLBACK_ENCODINGS:
+            try:
+                text = data.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+            if _looks_like_text_attachment(text):
+                return text, encoding
+        raise utf8_error
+
+
+def _looks_like_text_attachment(text: str) -> bool:
+    if "\ufffd" in text:
+        return False
+    if not text:
+        return True
+
+    allowed_controls = {"\t", "\n", "\r", "\f"}
+    control_count = sum(
+        1
+        for ch in text
+        if (ord(ch) < 32 and ch not in allowed_controls) or 0x7F <= ord(ch) <= 0x9F
+    )
+    return control_count / len(text) <= 0.01
 
 
 def _expand_folder_reference(

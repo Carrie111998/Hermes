@@ -121,6 +121,83 @@ def test_missing_file_becomes_warning(sample_repo: Path):
     assert "not found" in result.message.lower()
 
 
+def test_file_reference_expands_utf8_sig_text(tmp_path: Path):
+    from agent.context_references import preprocess_context_references
+
+    payload = tmp_path / "bom.csv"
+    payload.write_bytes("name,amount\nAlice,10\n".encode("utf-8-sig"))
+
+    result = preprocess_context_references(
+        "Summarize @file:bom.csv",
+        cwd=tmp_path,
+        context_length=100_000,
+    )
+
+    assert result.expanded
+    assert not result.warnings
+    assert "decoded as utf-8-sig" in result.message
+    assert "name,amount\nAlice,10" in result.message
+
+
+def test_file_reference_expands_gb18030_csv(tmp_path: Path):
+    from agent.context_references import preprocess_context_references
+
+    payload = tmp_path / "gb18030-sample.csv"
+    payload.write_bytes(
+        "交易时间,商户,金额\n2026-08-11,测试商户,19.80\n".encode("gb18030")
+    )
+
+    result = preprocess_context_references(
+        "Summarize @file:gb18030-sample.csv",
+        cwd=tmp_path,
+        context_length=100_000,
+    )
+
+    assert result.expanded
+    assert not result.warnings
+    assert "decoded as gb18030" in result.message
+    assert "交易时间,商户,金额" in result.message
+    assert "测试商户" in result.message
+
+
+def test_file_reference_expands_cp932_text_with_line_range(tmp_path: Path):
+    from agent.context_references import preprocess_context_references
+
+    payload = tmp_path / "japanese.txt"
+    payload.write_bytes("一行目\n二行目\n三行目\n".encode("cp932"))
+
+    result = preprocess_context_references(
+        "Read @file:japanese.txt:2-2",
+        cwd=tmp_path,
+        context_length=100_000,
+    )
+
+    assert result.expanded
+    assert not result.warnings
+    assert "decoded as cp932" in result.message
+    assert "二行目" in result.message
+    assert "一行目" not in result.message
+    assert "三行目" not in result.message
+
+
+def test_file_reference_warns_for_undecodable_text_bytes(tmp_path: Path):
+    from agent.context_references import preprocess_context_references
+
+    payload = tmp_path / "bad.txt"
+    payload.write_bytes(b"\x81\x81\x81\x81")
+
+    result = preprocess_context_references(
+        "Read @file:bad.txt",
+        cwd=tmp_path,
+        context_length=100_000,
+    )
+
+    assert result.expanded
+    assert result.warnings
+    assert "codec can't decode" in result.message
+    assert "\ufffd" not in result.message
+
+
 def test_binary_reference_block_maps_host_attachment_to_container_path(tmp_path: Path, monkeypatch):
     """Docker backend: a staged binary attachment's host path is rendered as the
     bind-mounted in-container path so the agent's tools can read it.
