@@ -48,8 +48,7 @@ def _headers(secret, payload):
     }
 
 
-@pytest.mark.asyncio
-async def test_health_proves_loaded_cycle_registry():
+def test_health_proves_loaded_cycle_registry():
     adapter = Adapter()
     adapter.cycle_registry = {"CYCLE_ONE": {"revision": 1}}
     service = BuilderAdapterService(adapter, object(), peer_resolver=lambda _: (0, 0))
@@ -60,7 +59,7 @@ async def test_health_proves_loaded_cycle_registry():
         if item.method == "GET" and item.resource.canonical == "/v1/health"
     )
 
-    response = await route.handler(None)
+    response = asyncio.run(route.handler(None))
     payload = json.loads(response.body)
 
     assert payload["operational"] is True
