@@ -38,8 +38,10 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import inspect
+import json
 import logging
 import os
+import re
 import sys
 import threading
 import types
@@ -75,6 +77,27 @@ class PluginToolOverrideError(PermissionError):
     """Raised when a plugin attempts to override a built-in tool without
     operator opt-in via ``plugins.entries.<plugin_id>.allow_tool_override``.
     """
+
+
+class MandatoryHookError(RuntimeError):
+    """Fail-closed result from a configured mandatory plugin hook."""
+
+    def __init__(
+        self,
+        code: str,
+        hook_name: str,
+        plugin_id: str,
+        reason: str = "",
+    ) -> None:
+        self.code = code
+        self.hook_name = hook_name
+        self.plugin_id = plugin_id
+        self.reason = reason
+        detail = f": {reason}" if reason else ""
+        super().__init__(
+            f"Provider request blocked by mandatory preflight "
+            f"({hook_name}/{plugin_id}){detail}"
+        )
 
 
 logger = logging.getLogger(__name__)
@@ -272,6 +295,146 @@ def _get_enabled_plugins() -> Optional[set]:
         return set(enabled)
     except Exception:
         return None
+
+
+_MANDATORY_PLUGIN_ID_RE = re.compile(r"^[A-Za-z0-9_.\-/]+$")
+
+
+def _get_mandatory_hook_plugins(hook_name: str) -> List[str]:
+    """Return configured plugin ids that must enforce *hook_name*.
+
+    The contract is ``plugins.mandatory_hooks.<hook>: [plugin-id, ...]``.
+    Absence is backward-compatible and leaves all hooks observer-only. Once a
+    hook is configured, malformed configuration is itself fail-closed.
+    """
+    from hermes_cli.config import load_config_readonly
+
+    config = load_config_readonly()
+    if not isinstance(config, dict):
+        raise MandatoryHookError(
+            "mandatory_hook_config_invalid", hook_name, "config"
+        )
+    plugins_config = config.get("plugins", {})
+    if plugins_config in (None, {}):
+        return []
+    if not isinstance(plugins_config, dict):
+        raise MandatoryHookError(
+            "mandatory_hook_config_invalid", hook_name, "config"
+        )
+    configured = plugins_config.get("mandatory_hooks", {})
+    if configured in (None, {}):
+        return []
+    if not isinstance(configured, dict):
+        raise MandatoryHookError(
+            "mandatory_hook_config_invalid", hook_name, "config"
+        )
+    required = configured.get(hook_name, [])
+    if required in (None, []):
+        return []
+    if not isinstance(required, list):
+        raise MandatoryHookError(
+            "mandatory_hook_config_invalid", hook_name, "config"
+        )
+
+    normalized: List[str] = []
+    for plugin_id in required:
+        if (
+            not isinstance(plugin_id, str)
+            or not plugin_id
+            or not _MANDATORY_PLUGIN_ID_RE.fullmatch(plugin_id)
+        ):
+            raise MandatoryHookError(
+                "mandatory_hook_config_invalid", hook_name, "config"
+            )
+        if plugin_id not in normalized:
+            normalized.append(plugin_id)
+    return normalized
+
+
+def has_mandatory_hook(hook_name: str) -> bool:
+    """Return whether *hook_name* has a mandatory contract configured.
+
+    Invalid configuration returns ``True`` so the enforced invocation path can
+    surface its deterministic fail-closed error instead of skipping the hook.
+    """
+    try:
+        return bool(_get_mandatory_hook_plugins(hook_name))
+    except MandatoryHookError:
+        return True
+
+
+def _sanitize_mandatory_hook_reason(value: Any) -> str:
+    """Return a bounded, secret-redacted reason safe for local display."""
+    if not isinstance(value, str):
+        return ""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        cleaned = redact_sensitive_text(value, force=True)
+    except Exception:
+        return "Policy blocked the provider request."
+    cleaned = re.sub(r"https?://\S+", "[endpoint]", cleaned)
+    cleaned = re.sub(r"\b[A-Za-z0-9_-]{18,}\b", "[redacted]", cleaned)
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:240]
+
+
+def _audit_mandatory_hook(
+    hook_name: str,
+    plugin_id: str,
+    outcome: str,
+) -> None:
+    """Emit a payload-free, key-allowlisted mandatory-hook audit event."""
+    logger.warning(
+        json.dumps(
+            {
+                "event": "mandatory_hook_preflight",
+                "hook": hook_name,
+                "outcome": outcome,
+                "plugin": plugin_id,
+            },
+            sort_keys=True,
+        )
+    )
+
+
+def _audit_mandatory_failure(exc: MandatoryHookError) -> None:
+    """Emit one payload-free audit outcome for a fail-closed decision."""
+    outcome_by_code = {
+        "mandatory_hook_missing": "missing",
+        "mandatory_hook_malformed_result": "malformed",
+        "mandatory_hook_exception": "exception",
+        "mandatory_hook_blocked": "blocked",
+        "mandatory_hook_config_invalid": "config_invalid",
+        "mandatory_hook_ambiguous": "ambiguous",
+    }
+    _audit_mandatory_hook(
+        exc.hook_name,
+        exc.plugin_id,
+        outcome_by_code.get(exc.code, "failed"),
+    )
+
+
+def _log_hook_callback_failure(
+    hook_name: str,
+    callback: Callable,
+    exc: Exception,
+) -> None:
+    """Log observer failure without exposing provider-request payloads."""
+    callback_name = getattr(callback, "__name__", type(callback).__name__)
+    if hook_name == "pre_api_request":
+        logger.warning(
+            "Hook '%s' callback %s raised; details suppressed",
+            hook_name,
+            callback_name,
+        )
+        return
+    logger.warning(
+        "Hook '%s' callback %s raised: %s",
+        hook_name,
+        callback_name,
+        exc,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1226,6 +1389,8 @@ class PluginContext:
                 ", ".join(sorted(VALID_HOOKS)),
             )
         self._manager._hooks.setdefault(hook_name, []).append(callback)
+        plugin_id = self.manifest.key or self.manifest.name
+        self._manager._hook_owners.setdefault(hook_name, []).append(plugin_id)
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
 
     # -- middleware registration -------------------------------------------
@@ -1312,6 +1477,7 @@ class PluginManager:
     def __init__(self) -> None:
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
+        self._hook_owners: Dict[str, List[Optional[str]]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
@@ -1354,6 +1520,7 @@ class PluginManager:
         if force:
             self._plugins.clear()
             self._hooks.clear()
+            self._hook_owners.clear()
             self._middleware.clear()
             self._plugin_tool_names.clear()
             self._plugin_platform_names.clear()
@@ -2129,13 +2296,150 @@ class PluginManager:
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
-                logger.warning(
-                    "Hook '%s' callback %s raised: %s",
-                    hook_name,
-                    getattr(cb, "__name__", repr(cb)),
-                    exc,
-                )
+                _log_hook_callback_failure(hook_name, cb, exc)
         return results
+
+    def invoke_mandatory_hook(
+        self,
+        hook_name: str,
+        **kwargs: Any,
+    ) -> tuple[List[Any], List[str]]:
+        """Run only the fail-closed mandatory phase for *hook_name*.
+
+        Every callback owned by a configured mandatory plugin must return
+        exactly ``{"action": "allow"}``. Missing callbacks, ``None``,
+        exceptions, malformed directives, and explicit blocks fail closed
+        before audit, observers, or transport can run. Request/execution
+        middleware may transform the outbound payload before this final gate.
+        """
+        required = _get_mandatory_hook_plugins(hook_name)
+        if not required:
+            return [], []
+
+        resolved_required: List[str] = []
+        for configured_id in required:
+            if configured_id in self._plugins:
+                resolved = configured_id
+            else:
+                matches = sorted(
+                    key
+                    for key, plugin in self._plugins.items()
+                    if plugin.enabled and plugin.manifest.name == configured_id
+                )
+                if len(matches) > 1:
+                    raise MandatoryHookError(
+                        "mandatory_hook_ambiguous", hook_name, configured_id
+                    )
+                resolved = matches[0] if matches else configured_id
+            if resolved not in resolved_required:
+                resolved_required.append(resolved)
+        required = resolved_required
+
+        callbacks = self._hooks.get(hook_name, [])
+        owners = self._hook_owners.get(hook_name, [])
+        owner_by_index = [
+            owners[index] if index < len(owners) else None
+            for index in range(len(callbacks))
+        ]
+        available = {
+            owner
+            for owner in owner_by_index
+            if owner
+            and owner in self._plugins
+            and self._plugins[owner].enabled
+        }
+        missing = next(
+            (plugin_id for plugin_id in required if plugin_id not in available),
+            None,
+        )
+        if missing is not None:
+            raise MandatoryHookError(
+                "mandatory_hook_missing", hook_name, missing
+            )
+
+        kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        results: List[Any] = []
+        for cb, owner in zip(callbacks, owner_by_index):
+            if owner not in required:
+                continue
+            try:
+                ret = cb(**kwargs)
+            except Exception:
+                raise MandatoryHookError(
+                    "mandatory_hook_exception", hook_name, owner
+                ) from None
+
+            if not isinstance(ret, dict):
+                raise MandatoryHookError(
+                    "mandatory_hook_malformed_result", hook_name, owner
+                )
+            action = ret.get("action")
+            action = action.strip().lower() if isinstance(action, str) else ""
+            if action == "allow":
+                results.append(ret)
+                continue
+            if action == "block":
+                reason = _sanitize_mandatory_hook_reason(
+                    ret.get("reason") or ret.get("message")
+                )
+                raise MandatoryHookError(
+                    "mandatory_hook_blocked", hook_name, owner, reason
+                )
+            raise MandatoryHookError(
+                "mandatory_hook_malformed_result", hook_name, owner
+            )
+
+        for plugin_id in required:
+            _audit_mandatory_hook(hook_name, plugin_id, "allowed")
+
+        return results, required
+
+    def invoke_hook_observers(
+        self,
+        hook_name: str,
+        mandatory_plugins: List[str],
+        **kwargs: Any,
+    ) -> List[Any]:
+        """Run compatibility observers after a successful mandatory phase."""
+        callbacks = self._hooks.get(hook_name, [])
+        owners = self._hook_owners.get(hook_name, [])
+        owner_by_index = [
+            owners[index] if index < len(owners) else None
+            for index in range(len(callbacks))
+        ]
+        required = set(mandatory_plugins)
+        kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        results: List[Any] = []
+        for cb, owner in zip(callbacks, owner_by_index):
+            if owner in required:
+                continue
+            try:
+                ret = cb(**kwargs)
+                if ret is not None:
+                    results.append(ret)
+            except Exception as exc:
+                _log_hook_callback_failure(hook_name, cb, exc)
+        return results
+
+    def invoke_hook_enforced(
+        self,
+        hook_name: str,
+        *,
+        before_observers: Optional[Callable[[], None]] = None,
+        **kwargs: Any,
+    ) -> List[Any]:
+        """Run mandatory guards, then audit and compatibility observers."""
+        mandatory_results, required = self.invoke_mandatory_hook(
+            hook_name, **kwargs
+        )
+        if not required:
+            return self.invoke_hook(hook_name, **kwargs)
+
+        if before_observers is not None:
+            before_observers()
+        return mandatory_results + self.invoke_hook_observers(
+            hook_name, required, **kwargs
+        )
 
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
@@ -2430,6 +2734,50 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from plugin callbacks.
     """
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+
+
+def invoke_mandatory_hook(
+    hook_name: str,
+    **kwargs: Any,
+) -> tuple[List[Any], List[str]]:
+    """Run only configured mandatory callbacks for *hook_name*."""
+    try:
+        return get_plugin_manager().invoke_mandatory_hook(hook_name, **kwargs)
+    except MandatoryHookError as exc:
+        _audit_mandatory_failure(exc)
+        raise
+
+
+def invoke_hook_observers(
+    hook_name: str,
+    mandatory_plugins: List[str],
+    **kwargs: Any,
+) -> List[Any]:
+    """Run non-mandatory plugin observers after mandatory allow."""
+    return get_plugin_manager().invoke_hook_observers(
+        hook_name, mandatory_plugins, **kwargs
+    )
+
+
+def invoke_hook_enforced(
+    hook_name: str,
+    *,
+    before_observers: Optional[Callable[[], None]] = None,
+    **kwargs: Any,
+) -> List[Any]:
+    """Invoke a hook with configured mandatory-plugin enforcement."""
+    if not _get_mandatory_hook_plugins(hook_name):
+        # Preserve the public observer seam (including callers/tests that patch
+        # module-level invoke_hook) when no mandatory contract is configured.
+        return invoke_hook(hook_name, **kwargs)
+    mandatory_results, mandatory_plugins = invoke_mandatory_hook(
+        hook_name, **kwargs
+    )
+    if before_observers is not None:
+        before_observers()
+    return mandatory_results + invoke_hook_observers(
+        hook_name, mandatory_plugins, **kwargs
+    )
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:

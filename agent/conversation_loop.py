@@ -1419,6 +1419,139 @@ def _notify_context_engine_turn_complete(
         )
 
 
+def _invoke_provider_preflight(
+    agent,
+    *,
+    request_kwargs: Dict[str, Any],
+    api_messages: List[Dict[str, Any]],
+    conversation_messages: List[Dict[str, Any]],
+    original_user_message: Any,
+    effective_task_id: str,
+    turn_id: str,
+    api_request_id: str,
+    api_call_count: int,
+    retry_count: int = 0,
+    approx_input_tokens: int = 0,
+    request_char_count: int = 0,
+    started_at: Optional[float] = None,
+    middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    phase: str = "all",
+    mandatory_plugins: Optional[List[str]] = None,
+) -> List[str]:
+    """Run mandatory and observer provider-preflight phases in strict order."""
+    from hermes_cli.lifecycle import (
+        has_hook,
+        has_mandatory_hook,
+        invoke_hook_observers,
+        invoke_hook_enforced,
+        invoke_mandatory_hook,
+    )
+    from hermes_cli.plugins import MandatoryHookError
+
+    mandatory = bool(mandatory_plugins)
+    if phase != "observers":
+        try:
+            mandatory = has_mandatory_hook("pre_api_request")
+        except MandatoryHookError:
+            raise
+        except Exception:
+            raise MandatoryHookError(
+                "mandatory_hook_config_invalid", "pre_api_request", "config"
+            ) from None
+        if phase == "mandatory" and not mandatory:
+            return []
+
+    try:
+        observed = has_hook("pre_api_request")
+    except Exception:
+        if mandatory and phase != "observers":
+            raise MandatoryHookError(
+                "mandatory_hook_exception", "pre_api_request", "runtime"
+            ) from None
+        return list(mandatory_plugins or [])
+    if not (observed or mandatory):
+        return []
+
+    try:
+        request_messages = request_kwargs.get("messages")
+        if not isinstance(request_messages, list):
+            request_messages = request_kwargs.get("input")
+        if not isinstance(request_messages, list):
+            request_messages = api_messages
+        request_payload = agent._api_request_payload_for_hook(request_kwargs)
+        hook_kwargs = dict(
+            task_id=effective_task_id,
+            turn_id=turn_id,
+            api_request_id=api_request_id,
+            session_id=agent.session_id or "",
+            user_message=original_user_message,
+            conversation_history=list(conversation_messages),
+            platform=agent.platform or "",
+            model=agent.model,
+            provider=agent.provider,
+            base_url=agent.base_url,
+            api_mode=agent.api_mode,
+            api_call_count=api_call_count,
+            retry_count=retry_count,
+            request_messages=list(request_messages),
+            message_count=len(api_messages),
+            tool_count=len(agent.tools or []),
+            approx_input_tokens=approx_input_tokens,
+            request_char_count=request_char_count,
+            max_tokens=agent.max_tokens,
+            started_at=started_at if started_at is not None else time.time(),
+            middleware_trace=list(middleware_trace or []),
+            request=request_payload,
+        )
+        if phase == "mandatory":
+            _, required = invoke_mandatory_hook(
+                "pre_api_request", **hook_kwargs
+            )
+            return required
+        if phase == "observers":
+            if mandatory_plugins:
+                invoke_hook_observers(
+                    "pre_api_request",
+                    list(mandatory_plugins),
+                    **hook_kwargs,
+                )
+            else:
+                # Preserve the public observer seam (including callers/tests
+                # patching lifecycle.invoke_hook) when no mandatory contract
+                # is configured.
+                invoke_hook_enforced("pre_api_request", **hook_kwargs)
+            return list(mandatory_plugins or [])
+        invoke_hook_enforced("pre_api_request", **hook_kwargs)
+        return []
+    except MandatoryHookError:
+        raise
+    except Exception:
+        if mandatory and phase != "observers":
+            raise MandatoryHookError(
+                "mandatory_hook_exception", "pre_api_request", "runtime"
+            ) from None
+        return list(mandatory_plugins or [])
+
+
+def _mandatory_preflight_failure_result(
+    exc: Exception,
+    messages: List[Dict[str, Any]],
+    *,
+    api_calls: int = 1,
+) -> Dict[str, Any]:
+    """Build the deterministic local failure returned by every transport path."""
+    final_response = str(exc)
+    return {
+        "final_response": final_response,
+        "messages": messages,
+        "api_calls": api_calls,
+        "completed": False,
+        "failed": True,
+        "error": final_response,
+        "failure_reason": getattr(exc, "code", "mandatory_hook_exception"),
+    }
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -1623,13 +1756,81 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
-        return agent._run_codex_app_server_turn(
-            user_message=user_message,
-            original_user_message=original_user_message,
-            messages=messages,
-            effective_task_id=effective_task_id,
-            should_review_memory=_should_review_memory,
+        from hermes_cli.middleware import (
+            apply_llm_request_middleware,
+            run_llm_execution_middleware,
         )
+        from hermes_cli.plugins import MandatoryHookError
+
+        request_kwargs = {
+            "messages": list(messages),
+            "user_message": user_message,
+        }
+        try:
+            middleware_result = apply_llm_request_middleware(
+                request_kwargs,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                api_request_id=f"{turn_id}:api:1",
+                session_id=agent.session_id or "",
+                platform=agent.platform or "",
+                model=agent.model,
+                provider=agent.provider,
+                base_url=agent.base_url,
+                api_mode=agent.api_mode,
+                api_call_count=1,
+            )
+
+            def _dispatch_codex_app_server(final_request):
+                final_messages = final_request.get("messages")
+                if not isinstance(final_messages, list):
+                    final_messages = list(messages)
+                final_user_message = final_request.get("user_message", user_message)
+                for message in reversed(final_messages):
+                    if isinstance(message, dict) and message.get("role") == "user":
+                        final_user_message = message.get("content", final_user_message)
+                        break
+                _invoke_provider_preflight(
+                    agent,
+                    request_kwargs=final_request,
+                    api_messages=final_messages,
+                    conversation_messages=messages,
+                    original_user_message=original_user_message,
+                    effective_task_id=effective_task_id,
+                    turn_id=turn_id,
+                    api_request_id=f"{turn_id}:api:1",
+                    api_call_count=1,
+                    middleware_trace=middleware_result.trace,
+                )
+                return agent._run_codex_app_server_turn(
+                    user_message=final_user_message,
+                    original_user_message=original_user_message,
+                    messages=final_messages,
+                    effective_task_id=effective_task_id,
+                    should_review_memory=_should_review_memory,
+                )
+
+            return run_llm_execution_middleware(
+                middleware_result.payload,
+                _dispatch_codex_app_server,
+                original_request=middleware_result.original_payload,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                api_request_id=f"{turn_id}:api:1",
+                session_id=agent.session_id or "",
+                platform=agent.platform or "",
+                model=agent.model,
+                provider=agent.provider,
+                base_url=agent.base_url,
+                api_mode=agent.api_mode,
+                api_call_count=1,
+                middleware_trace=list(middleware_result.trace),
+            )
+        except MandatoryHookError as exc:
+            agent._persist_session(messages, conversation_history)
+            return _mandatory_preflight_failure_result(
+                exc, messages, api_calls=0
+            )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()
@@ -2518,6 +2719,10 @@ def run_conversation(
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
+                    # Normalize provider-reserved wire tokens before request
+                    # middleware sees the payload. Middleware may rewrite it,
+                    # so the dispatch chokepoint repeats this transport
+                    # preflight immediately before mandatory policy approval.
                     api_kwargs = agent._get_transport().preflight_kwargs(
                         api_kwargs,
                         allow_stream=False,
@@ -2554,73 +2759,6 @@ def run_conversation(
                 except Exception:
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
-
-                try:
-                    from hermes_cli.lifecycle import (
-                        has_hook,
-                        invoke_hook as _invoke_hook,
-                    )
-                    if has_hook("pre_api_request"):
-                        request_messages = api_kwargs.get("messages")
-                        if not isinstance(request_messages, list):
-                            request_messages = api_kwargs.get("input")
-                        if not isinstance(request_messages, list):
-                            request_messages = api_messages
-                        # Shallow-copy the outer list so plugins that retain the
-                        # reference for async snapshotting don't observe later
-                        # mutations of api_messages.  The inner dicts are not
-                        # mutated by the agent loop, so a shallow copy is
-                        # sufficient; a deepcopy would walk every tool result
-                        # and base64 image on every API call.
-                        #
-                        # The ``request_messages`` and ``conversation_history``
-                        # kwargs below are pre-existing raw passthroughs
-                        # consumed by the bundled langfuse plugin
-                        # (``plugins/observability/langfuse/__init__.py:_coerce_request_messages``).
-                        # They predate ``request`` and are intentionally NOT
-                        # sanitised — secrets are not expected here because
-                        # ``api_kwargs`` is the same object passed to the
-                        # provider client.  New consumers should read the
-                        # sanitised view from ``request["body"]["messages"]``.
-                        _request_payload = agent._api_request_payload_for_hook(api_kwargs)
-                        _invoke_hook(
-                            "pre_api_request",
-                            task_id=effective_task_id,
-                            turn_id=turn_id,
-                            api_request_id=api_request_id,
-                            session_id=agent.session_id or "",
-                            user_message=original_user_message,
-                            conversation_history=list(messages),
-                            platform=agent.platform or "",
-                            model=agent.model,
-                            provider=agent.provider,
-                            base_url=agent.base_url,
-                            api_mode=agent.api_mode,
-                            api_call_count=api_call_count,
-                            retry_count=retry_count,
-                            request_messages=list(request_messages)
-                            if isinstance(request_messages, list)
-                            else [],
-                            message_count=len(api_messages),
-                            tool_count=len(agent.tools or []),
-                            approx_input_tokens=approx_tokens,
-                            request_char_count=total_chars,
-                            max_tokens=agent.max_tokens,
-                            started_at=api_start_time,
-                            middleware_trace=list(_llm_middleware_trace),
-                            request=_request_payload,
-                        )
-                except Exception:
-                    pass
-
-                if env_var_enabled("HERMES_DUMP_REQUESTS"):
-                    agent._dump_api_request_debug(api_kwargs, reason="preflight")
-
-                # This object is private to the in-process MoA facade.  Add it
-                # only after middleware, hooks, and debug dumps so none of them
-                # attempts to serialize it as part of the provider payload.
-                if _moa_prepared_request is not None and agent.provider == "moa":
-                    api_kwargs["_moa_prepared_request"] = _moa_prepared_request
 
                 # Always prefer the streaming path — even without stream
                 # consumers.  Streaming gives us fine-grained health
@@ -2684,6 +2822,30 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    _invoke_provider_preflight(
+                        agent,
+                        request_kwargs=next_api_kwargs,
+                        api_messages=api_messages,
+                        conversation_messages=messages,
+                        original_user_message=original_user_message,
+                        effective_task_id=effective_task_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        api_call_count=api_call_count,
+                        retry_count=retry_count,
+                        approx_input_tokens=approx_tokens,
+                        request_char_count=total_chars,
+                        started_at=api_start_time,
+                        middleware_trace=_llm_middleware_trace,
+                    )
+                    if env_var_enabled("HERMES_DUMP_REQUESTS"):
+                        agent._dump_api_request_debug(
+                            next_api_kwargs, reason="preflight"
+                        )
+                    # Private to the in-process MoA facade: add only after the
+                    # final provider-bound payload passes policy inspection.
+                    if _moa_prepared_request is not None and agent.provider == "moa":
+                        next_api_kwargs["_moa_prepared_request"] = _moa_prepared_request
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -2712,6 +2874,7 @@ def run_conversation(
                     )
 
                 from hermes_cli.middleware import run_llm_execution_middleware
+                from hermes_cli.plugins import MandatoryHookError
 
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
@@ -2723,22 +2886,38 @@ def run_conversation(
                     _model_request_active.set()
                 _redirect_crossed_response = False
                 try:
-                    response = run_llm_execution_middleware(
-                        api_kwargs,
-                        _perform_api_call,
-                        original_request=_original_api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        middleware_trace=list(_llm_middleware_trace),
-                    )
+                    try:
+                        response = run_llm_execution_middleware(
+                            api_kwargs,
+                            _perform_api_call,
+                            original_request=_original_api_kwargs,
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                            middleware_trace=list(_llm_middleware_trace),
+                        )
+                    except MandatoryHookError as exc:
+                        if thinking_spinner:
+                            thinking_spinner.stop("")
+                            thinking_spinner = None
+                        if agent.thinking_callback:
+                            agent.thinking_callback("")
+                        agent.iteration_budget.refund()
+                        api_call_count -= 1
+                        agent._api_call_count = api_call_count
+                        agent._persist_session(messages, conversation_history)
+                        return _mandatory_preflight_failure_result(
+                            exc,
+                            messages,
+                            api_calls=api_call_count,
+                        )
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:

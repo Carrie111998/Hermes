@@ -15,7 +15,10 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
         observe_lifecycle(hook_name, **kwargs)
     except Exception:
-        logger.warning("Built-in observability hook failed", exc_info=True)
+        logger.warning(
+            "Built-in observability hook failed",
+            exc_info=hook_name != "pre_api_request",
+        )
 
     from hermes_cli import plugins
 
@@ -35,6 +38,60 @@ def has_hook(hook_name: str) -> bool:
     from hermes_cli import plugins
 
     return plugins.has_hook(hook_name)
+
+
+def has_mandatory_hook(hook_name: str) -> bool:
+    """Return whether a plugin hook has a fail-closed contract configured."""
+    from hermes_cli import plugins
+
+    return plugins.has_mandatory_hook(hook_name)
+
+
+def invoke_mandatory_hook(
+    hook_name: str,
+    **kwargs: Any,
+) -> tuple[List[Any], List[str]]:
+    """Run the mandatory security phase without invoking observers."""
+    from hermes_cli import plugins
+
+    return plugins.invoke_mandatory_hook(hook_name, **kwargs)
+
+
+def invoke_hook_observers(
+    hook_name: str,
+    mandatory_plugins: List[str],
+    **kwargs: Any,
+) -> List[Any]:
+    """Notify first-party and compatibility observers after mandatory allow."""
+    try:
+        from hermes_cli.observability import observe_lifecycle
+
+        observe_lifecycle(hook_name, **kwargs)
+    except Exception:
+        logger.warning(
+            "Built-in observability hook failed",
+            exc_info=hook_name != "pre_api_request",
+        )
+
+    from hermes_cli import plugins
+
+    return plugins.invoke_hook_observers(
+        hook_name, mandatory_plugins, **kwargs
+    )
+
+
+def invoke_hook_enforced(hook_name: str, **kwargs: Any) -> List[Any]:
+    """Enforce mandatory callbacks before any lifecycle observer side effect."""
+    if not has_mandatory_hook(hook_name):
+        # Preserve the public observer seam (including callers/tests that patch
+        # module-level invoke_hook) when no mandatory contract is configured.
+        return invoke_hook(hook_name, **kwargs)
+
+    mandatory_results, required = invoke_mandatory_hook(hook_name, **kwargs)
+    observer_results = invoke_hook_observers(
+        hook_name, required, **kwargs
+    )
+    return mandatory_results + observer_results
 
 
 def finalize_session(**kwargs: Any) -> List[Any]:

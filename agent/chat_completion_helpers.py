@@ -2318,12 +2318,33 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     summary_api_request_id = f"iteration-summary:{uuid.uuid4()}"
     summary_call_outcome = "failed"
 
+    def _summary_preflight(request: dict, *, retry_count: int) -> None:
+        from agent.auxiliary_client import _enforce_auxiliary_provider_preflight
+
+        _enforce_auxiliary_provider_preflight(
+            agent,
+            request,
+            provider=str(getattr(agent, "provider", "") or "provider"),
+            api_mode=str(
+                getattr(agent, "api_mode", "") or "chat_completions"
+            ),
+            metadata={
+                "api_request_id": summary_api_request_id,
+                "call_role": "iteration_summary",
+                "retry_count": retry_count,
+            },
+        )
+
     def _managed_summary_call(request, callback, *, retry_count: int):
         from agent import relay_llm
 
+        def guarded_callback(final_request):
+            _summary_preflight(final_request, retry_count=retry_count)
+            return callback(final_request)
+
         return relay_llm.execute_current(
             request,
-            callback,
+            guarded_callback,
             name=str(getattr(agent, "provider", "") or "provider"),
             model_name=str(getattr(agent, "model", "") or ""),
             metadata={
@@ -2336,6 +2357,17 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             },
             defer_logical_completion=True,
         )
+
+    def _managed_codex_summary_call(request, *, retry_count: int):
+        transport = agent._get_transport()
+        final_request = transport.preflight_kwargs(
+            request,
+            allow_stream=False,
+            is_github_responses=agent._is_copilot_url(),
+            sanitize_harmony_tokens=agent._is_codex_backend(),
+        )
+        _summary_preflight(final_request, retry_count=retry_count)
+        return agent._run_codex_stream(final_request)
 
     # Shared constant so compaction recognizers can identify this runtime nudge
     # by its stable content after SessionDB projection strips metadata flags
@@ -2462,7 +2494,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         if agent.api_mode == "codex_responses":
             codex_kwargs = agent._build_api_kwargs(api_messages)
             codex_kwargs.pop("tools", None)
-            summary_response = agent._run_codex_stream(codex_kwargs)
+            summary_response = _managed_codex_summary_call(
+                codex_kwargs, retry_count=0
+            )
             _ct_sum = agent._get_transport()
             _cnr_sum = _ct_sum.normalize_response(summary_response)
             final_response = (_cnr_sum.content or "").strip()
@@ -2574,7 +2608,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             if agent.api_mode == "codex_responses":
                 codex_kwargs = agent._build_api_kwargs(api_messages)
                 codex_kwargs.pop("tools", None)
-                retry_response = agent._run_codex_stream(codex_kwargs)
+                retry_response = _managed_codex_summary_call(
+                    codex_kwargs, retry_count=1
+                )
                 _ct_retry = agent._get_transport()
                 _cnr_retry = _ct_retry.normalize_response(retry_response)
                 final_response = (_cnr_retry.content or "").strip()

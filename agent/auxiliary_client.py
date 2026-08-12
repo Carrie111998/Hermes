@@ -1392,11 +1392,14 @@ class _CodexCompletionsAdapter:
     """Drop-in shim that accepts chat.completions.create() kwargs and
     routes them through the Codex Responses streaming API."""
 
+    _handles_provider_preflight = True
+
     def __init__(self, real_client: OpenAI, model: str):
         self._client = real_client
         self._model = model
 
     def create(self, **kwargs) -> Any:
+        provider_preflight = kwargs.pop("_hermes_provider_preflight", None)
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
 
@@ -1695,6 +1698,16 @@ class _CodexCompletionsAdapter:
             stream_kwargs = dict(resp_kwargs)
             stream_kwargs["stream"] = True
 
+            if provider_preflight is not None:
+                provider_preflight(stream_kwargs)
+            else:
+                _enforce_auxiliary_provider_preflight(
+                    self._client,
+                    stream_kwargs,
+                    provider="openai-codex",
+                    api_mode="codex_responses",
+                )
+
             def _on_each_event(_event: Any) -> None:
                 # Re-check timeout/cancellation per event, matching the
                 # cadence the old in-line ``_check_cancelled()`` used.
@@ -1848,6 +1861,8 @@ class _AsyncCodexCompletionsAdapter:
     (web_tools, session_search) can await it as normal.
     """
 
+    _handles_provider_preflight = True
+
     def __init__(self, sync_adapter: _CodexCompletionsAdapter):
         self._sync = sync_adapter
 
@@ -1883,6 +1898,8 @@ class AsyncCodexAuxiliaryClient:
 class _AnthropicCompletionsAdapter:
     """OpenAI-client-compatible adapter for Anthropic Messages API."""
 
+    _handles_provider_preflight = True
+
     def __init__(
         self,
         real_client: Any,
@@ -1914,6 +1931,7 @@ class _AnthropicCompletionsAdapter:
         from agent.anthropic_adapter import build_anthropic_kwargs, create_anthropic_message
         from agent.transports import get_transport
 
+        provider_preflight = kwargs.pop("_hermes_provider_preflight", None)
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
         tools = kwargs.get("tools")
@@ -1998,6 +2016,16 @@ class _AnthropicCompletionsAdapter:
                 if not isinstance(existing, dict):
                     existing = {}
                 anthropic_kwargs["extra_body"] = {**existing, **passthrough}
+
+        if provider_preflight is not None:
+            provider_preflight(anthropic_kwargs)
+        else:
+            _enforce_auxiliary_provider_preflight(
+                self._client,
+                anthropic_kwargs,
+                provider="anthropic",
+                api_mode="anthropic_messages",
+            )
 
         response = create_anthropic_message(
             self._client,
@@ -3170,27 +3198,127 @@ def _relay_auxiliary_metadata(
     }
 
 
+def _sanitize_auxiliary_hook_value(value: Any) -> Any:
+    """Copy an auxiliary request for hooks without exposing credentials."""
+    if isinstance(value, dict):
+        sanitized: Dict[str, Any] = {}
+        for key, item in value.items():
+            normalized = str(key).lower().replace("-", "_")
+            if normalized in {
+                "api_key",
+                "authorization",
+                "proxy_authorization",
+                "cookie",
+                "set_cookie",
+            } or normalized.endswith("_api_key"):
+                sanitized[str(key)] = "<redacted>"
+            else:
+                sanitized[str(key)] = _sanitize_auxiliary_hook_value(item)
+        return sanitized
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_auxiliary_hook_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _enforce_auxiliary_provider_preflight(
+    client: Any,
+    request: dict[str, Any],
+    *,
+    provider: str | None,
+    api_mode: str | None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Run mandatory guards and observers at the auxiliary egress boundary."""
+    from hermes_cli.plugins import has_mandatory_hook
+
+    # Auxiliary calls historically had no provider-request observer surface.
+    # Preserve that zero-overhead path unless a fail-closed contract is
+    # explicitly configured; mandatory mode then owns the full hook sequence.
+    if not has_mandatory_hook("pre_api_request"):
+        return
+
+    from hermes_cli import lifecycle as _lifecycle
+
+    body = {
+        key: value
+        for key, value in request.items()
+        if key not in {"timeout", "http_client"}
+    }
+    hook_request = {
+        "method": "POST",
+        "body": _sanitize_auxiliary_hook_value(body),
+    }
+    context = _RELAY_AUX_CALL_CONTEXT.get() or {}
+    hook_metadata = metadata or {}
+    _lifecycle.invoke_hook_enforced(
+        "pre_api_request",
+        task_id=str(context.get("task") or "auxiliary"),
+        turn_id="",
+        api_request_id=str(hook_metadata.get("api_request_id") or ""),
+        session_id="",
+        platform="auxiliary",
+        provider=str(provider or context.get("provider") or "auxiliary"),
+        base_url=str(getattr(client, "base_url", "") or ""),
+        model=str(request.get("model") or context.get("model") or ""),
+        api_mode=str(api_mode or context.get("api_mode") or "chat_completions"),
+        api_call_count=int(hook_metadata.get("retry_count") or 0),
+        request=hook_request,
+        request_messages=hook_request["body"].get("messages", []),
+        call_role=str(hook_metadata.get("call_role") or "auxiliary"),
+        retry_count=int(hook_metadata.get("retry_count") or 0),
+        middleware_trace=[],
+    )
+
+
 def _relay_sync_completion(
     client: Any,
     kwargs: dict[str, Any],
     *,
     provider: str | None = None,
     api_mode: str | None = None,
-    create: Callable[[dict[str, Any]], Any] | None = None,
+    create: Callable[..., Any] | None = None,
+    create_handles_preflight: bool = False,
 ) -> Any:
     callback = create or (lambda request: client.chat.completions.create(**request))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    metadata = route[2] if route is not None else None
+
+    def guarded_callback(request: dict[str, Any]) -> Any:
+        def preflight(final_request: dict[str, Any]) -> None:
+            _enforce_auxiliary_provider_preflight(
+                client,
+                final_request,
+                provider=provider,
+                api_mode=api_mode,
+                metadata=metadata,
+            )
+
+        if create_handles_preflight:
+            return _run_protected_sync_provider_call(
+                lambda final_request: callback(final_request, preflight), request
+            )
+        if create is None and getattr(
+            client.chat.completions, "_handles_provider_preflight", False
+        ):
+            final_request = dict(request)
+            final_request["_hermes_provider_preflight"] = preflight
+            return _run_protected_sync_provider_call(callback, final_request)
+        preflight(request)
+        return _run_protected_sync_provider_call(callback, request)
+
     # Protected compression calls isolate only the provider callback and stream
     # aggregation.  The owning thread remains free to unwind its lease/DB
     # transaction on hard cancel without touching the process-shared client.
     if route is None:
-        return _run_protected_sync_provider_call(callback, kwargs)
+        return guarded_callback(kwargs)
     provider_name, fallback_model, metadata = route
     from agent import relay_llm
 
     return relay_llm.execute_current(
         kwargs,
-        lambda request: _run_protected_sync_provider_call(callback, request),
+        guarded_callback,
         name=provider_name,
         model_name=str(kwargs.get("model") or fallback_model),
         metadata=metadata,
@@ -3204,18 +3332,41 @@ async def _relay_async_completion(
     *,
     provider: str | None = None,
     api_mode: str | None = None,
-    create: Callable[[dict[str, Any]], Any] | None = None,
+    create: Callable[..., Any] | None = None,
+    create_handles_preflight: bool = False,
 ) -> Any:
     callback = create or (lambda request: client.chat.completions.create(**request))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+
+    async def guarded_callback(request: dict[str, Any]) -> Any:
+        def preflight(final_request: dict[str, Any]) -> None:
+            _enforce_auxiliary_provider_preflight(
+                client,
+                final_request,
+                provider=provider,
+                api_mode=api_mode,
+                metadata=route[2] if route is not None else None,
+            )
+
+        if create_handles_preflight:
+            return await callback(request, preflight)
+        if create is None and getattr(
+            client.chat.completions, "_handles_provider_preflight", False
+        ):
+            final_request = dict(request)
+            final_request["_hermes_provider_preflight"] = preflight
+            return await callback(final_request)
+        preflight(request)
+        return await callback(request)
+
     if route is None:
-        return await callback(kwargs)
+        return await guarded_callback(kwargs)
     provider_name, fallback_model, metadata = route
     from agent import relay_llm
 
     return await relay_llm.execute_current_async(
         kwargs,
-        callback,
+        guarded_callback,
         name=provider_name,
         model_name=str(kwargs.get("model") or fallback_model),
         metadata=metadata,
@@ -3231,14 +3382,32 @@ def _relay_sync_stream(
     api_mode: str | None = None,
 ) -> Any:
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+
+    def guarded_callback(request: dict[str, Any]) -> Any:
+        def preflight(final_request: dict[str, Any]) -> None:
+            _enforce_auxiliary_provider_preflight(
+                client,
+                final_request,
+                provider=provider,
+                api_mode=api_mode,
+                metadata=route[2] if route is not None else None,
+            )
+
+        if getattr(client.chat.completions, "_handles_provider_preflight", False):
+            final_request = dict(request)
+            final_request["_hermes_provider_preflight"] = preflight
+            return client.chat.completions.create(**final_request)
+        preflight(request)
+        return client.chat.completions.create(**request)
+
     if route is None:
-        return client.chat.completions.create(**kwargs)
+        return guarded_callback(kwargs)
     provider_name, fallback_model, metadata = route
     from agent import relay_llm
 
     return relay_llm.stream_current(
         kwargs,
-        lambda request: client.chat.completions.create(**request),
+        guarded_callback,
         name=provider_name,
         model_name=str(kwargs.get("model") or fallback_model),
         finalizer=dict,
@@ -8621,6 +8790,7 @@ def _create_with_progress(
     task: Optional[str] = None,
     *,
     force_stream: bool = False,
+    preflight: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Any:
     """chat.completions.create() that streams when a progress hook is active
     or the provider only accepts streamed requests.
@@ -8639,15 +8809,25 @@ def _create_with_progress(
     original error is surfaced to the normal recovery chains instead.
     """
     _notify_aux_progress()  # request dispatched counts as progress
+    completion_api = client.chat.completions
+    if getattr(completion_api, "_handles_provider_preflight", False):
+        final_request = dict(kwargs)
+        if preflight is not None:
+            final_request["_hermes_provider_preflight"] = preflight
+        return completion_api.create(**final_request)
     if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
-        return client.chat.completions.create(**kwargs)
+        if preflight is not None:
+            preflight(kwargs)
+        return completion_api.create(**kwargs)
 
     total_ceiling = _aux_stream_total_ceiling(kwargs.get("timeout"))
     stream_kwargs = dict(kwargs)
     stream_kwargs["stream"] = True
     stream_kwargs["stream_options"] = {"include_usage": True}
     try:
-        chunks = client.chat.completions.create(**stream_kwargs)
+        if preflight is not None:
+            preflight(stream_kwargs)
+        chunks = completion_api.create(**stream_kwargs)
     except Exception as exc:
         # Genuine provider failures (auth, credit, rate limit, network) are
         # not streaming's fault — surface them unchanged so the existing
@@ -8669,7 +8849,9 @@ def _create_with_progress(
             "Auxiliary %s: streamed request failed (%s); retrying "
             "non-streaming", task or "call", exc,
         )
-        return client.chat.completions.create(**kwargs)
+        if preflight is not None:
+            preflight(kwargs)
+        return completion_api.create(**kwargs)
 
     # Some shims (MoA virtual provider under quiet mode, defensive adapters)
     # return a complete response even when stream=True was requested.
@@ -8841,6 +9023,7 @@ async def _acreate_with_stream(
     client: Any,
     kwargs: Dict[str, Any],
     task: Optional[str] = None,
+    preflight: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Any:
     """Async chat.completions.create() for stream-only providers.
 
@@ -8852,6 +9035,8 @@ async def _acreate_with_stream(
     stream_kwargs = dict(kwargs)
     stream_kwargs["stream"] = True
     stream_kwargs["stream_options"] = {"include_usage": True}
+    if preflight is not None:
+        preflight(stream_kwargs)
     chunks = await client.chat.completions.create(**stream_kwargs)
     # Defensive: shims may hand back a complete response despite stream=True.
     if hasattr(chunks, "choices"):
@@ -9134,7 +9319,12 @@ def _call_llm_impl(
             # Return the provider call directly; the MoA facade converts a
             # completed response into a one-chunk delta iterator at its
             # boundary.
-            return client.chat.completions.create(**kwargs)
+            return _relay_sync_completion(
+                client,
+                kwargs,
+                provider=request_provider,
+                api_mode=resolved_api_mode,
+            )
         return _relay_sync_stream(
             client,
             kwargs,
@@ -9168,14 +9358,16 @@ def _call_llm_impl(
                     kwargs,
                     provider=request_provider,
                     api_mode=resolved_api_mode,
-                    create=lambda request: _create_with_progress(
+                    create=lambda request, preflight: _create_with_progress(
                         client,
                         request,
                         task,
                         force_stream=_provider_requires_stream(
                             request_provider, _base_info or resolved_base_url,
                         ),
+                        preflight=preflight,
                     ),
+                    create_handles_preflight=True,
                 ),
                 task,
                 provider=request_provider, base_url=_base_info)
@@ -9215,7 +9407,7 @@ def _call_llm_impl(
                             kwargs,
                             provider=request_provider,
                             api_mode=resolved_api_mode,
-                            create=lambda request: _create_with_progress(
+                            create=lambda request, preflight: _create_with_progress(
                                 client,
                                 request,
                                 task,
@@ -9223,7 +9415,9 @@ def _call_llm_impl(
                                     request_provider,
                                     _base_info or resolved_base_url,
                                 ),
+                                preflight=preflight,
                             ),
+                            create_handles_preflight=True,
                         ),
                         task)
                 except Exception as retry_transient:
@@ -9893,9 +10087,15 @@ async def _async_call_llm_impl(
             ))
         )
 
-        async def _acreate(_kwargs: Dict[str, Any]) -> Any:
+        async def _acreate(
+            _kwargs: Dict[str, Any],
+            preflight: Callable[[Dict[str, Any]], None],
+        ) -> Any:
             if _force_stream_async:
-                return await _acreate_with_stream(client, _kwargs, task)
+                return await _acreate_with_stream(
+                    client, _kwargs, task, preflight=preflight
+                )
+            preflight(_kwargs)
             return await client.chat.completions.create(**_kwargs)
 
         try:
@@ -9906,6 +10106,7 @@ async def _async_call_llm_impl(
                     provider=request_provider,
                     api_mode=resolved_api_mode,
                     create=_acreate,
+                    create_handles_preflight=True,
                 ),
                 task,
                 provider=request_provider, base_url=_client_base)
@@ -9934,6 +10135,7 @@ async def _async_call_llm_impl(
                     provider=request_provider,
                     api_mode=resolved_api_mode,
                     create=_acreate,
+                    create_handles_preflight=True,
                 ),
                 task)
     except Exception as first_err:
