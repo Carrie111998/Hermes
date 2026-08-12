@@ -264,6 +264,7 @@ def log_missing_members(
     table: Mapping[EventType, object],
     qualname: str,
     logger: Optional[logging.Logger] = None,
+    fix: Optional[str] = None,
 ) -> Tuple[str, ...]:
     """Emit ONE ``logger.error`` naming every EventType absent from ``table``.
 
@@ -286,6 +287,12 @@ def log_missing_members(
     disarming :func:`coverage_gaps`, the CLI, the hook, and the tests. Return
     the record; leave the table exactly as the source declared it.
 
+    ``fix`` overrides the remediation sentence. Pass it for a table in
+    :data:`TOTAL_BY_CONSTRUCTION`, where the default advice ("add one entry per
+    type") is actively WRONG: hand-adding the entries is how you rebuild the
+    parallel table the derivation exists to remove. Left unset it keeps the
+    wording every REQUIRED_TOTAL caller already relies on.
+
     Costs one dict lookup per enum member at import. Returns the missing type
     strings so the caller can publish them as a module constant, which is also
     what proves the check ran.
@@ -294,13 +301,13 @@ def log_missing_members(
     if missing:
         (logger or logging.getLogger(__name__)).error(
             "%s is missing an entry for %d of %d EventType members, which will "
-            "ship as a degraded notification for each: %s. Fix: add one entry "
-            "per type to %s (do not suppress this line).",
+            "ship as a degraded notification for each: %s. %s "
+            "(do not suppress this line).",
             qualname,
             len(missing),
             len(list(EventType)),
             ", ".join(missing),
-            qualname,
+            fix or f"Fix: add one entry per type to {qualname}",
         )
     return missing
 

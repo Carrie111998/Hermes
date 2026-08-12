@@ -694,5 +694,15 @@ def boot_summary_body(payload: dict, *, max_listed: int = 5) -> str:
 from events.coverage import log_missing_members  # noqa: E402 - table must exist
 
 EVENT_TYPES_WITHOUT_ICON = log_missing_members(
-    EVENT_TYPE_EMOJI, "events.formatting.EVENT_TYPE_EMOJI", logger
+    EVENT_TYPE_EMOJI,
+    "events.formatting.EVENT_TYPE_EMOJI",
+    logger,
+    # NOT the default "add one entry per type": this table is total by
+    # construction (events.coverage.TOTAL_BY_CONSTRUCTION), so hand-adding the
+    # entries would rebuild the exact parallel dict the derivation removed.
+    fix=(
+        "Fix: this table is derived from EventType.icon and cannot be partial "
+        "unless the derivation was replaced. Restore it rather than adding the "
+        "entries by hand"
+    ),
 )
