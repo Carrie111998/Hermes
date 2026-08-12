@@ -8,7 +8,10 @@ tests executed, including the ~57% past index 4257 that had never run.
 - Worktree: `.claude/worktrees/eager-kepler-ddb335` @ `e3bfc2ebc` (isolated; shared checkout untouched)
 - Command: `python -u -m pytest tests/gateway -p no:cacheprovider -q -rf --tb=short --timeout=900`
 - `CLAUDE_CODE_ENTRYPOINT` / `CLAUDECODE` / `HERMES_DISABLE_MESSAGE_TRIGRAM` cleared
-- Artifacts: `gw_full2.log` (raw), `gw_full2_failures.txt` (14 tracebacks), `gw_iso.log` (isolation re-run)
+- Artifacts, under `sources/2026-08-11-gateway-monolithic/` beside this file:
+  `gw_full2.log` (raw), `gw_full2_failures.txt` (14 tracebacks), `gw_iso.log` (isolation
+  re-run), `GW_FULL2_RUN_HANDOFF.md` (the launch note, kept as written at run time).
+  All four keep their as-run filenames; they sat at the repo root until 2026-08-11.
 - Measured rate 0.40 tests/sec, not the assumed ~1/sec: the box sat at **96.8% commit charge**
   (56 `claude` processes = 29 GB, vmmemWSL 15 GB, chrome 15 GB). This matters — see #10.
 
