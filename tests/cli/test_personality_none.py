@@ -45,6 +45,18 @@ class TestCLIPersonalityNone:
         assert ("display.personality", "helpful") in saves
         assert not any(k == "agent.system_prompt" for k, _ in saves)
 
+    @pytest.mark.parametrize("selection", ["helpful", "none"])
+    def test_replace_mode_save_failure_does_not_mutate_runtime(self, selection):
+        cli = self._make_cli()
+        baseline = cli.system_prompt
+        agent = cli.agent
+
+        with patch("hermes_cli.personality.persist_personality", return_value=False):
+            cli._handle_personality_command(f"/personality {selection}")
+
+        assert cli.system_prompt == baseline
+        assert cli.agent is agent
+
     def test_neutral_restores_manual_system_prompt_without_wiping_config(self):
         cli = self._make_cli()
         saves = []

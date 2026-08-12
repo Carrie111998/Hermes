@@ -1363,15 +1363,15 @@ class CLICommandsMixin:
                 return
 
             saved = persist_personality(name)
+            if not saved:
+                print("(^_^) Personality unchanged (config write failed)")
+                return
             overlay_mode = (
                 personality_selection_mode(getattr(self, "config", None)) == "overlay"
             )
             if overlay_mode:
                 verb = "cleared" if not name else f"set to '{name}'"
-                if saved:
-                    print(f"(^_^)b Personality {verb} (saved to config)")
-                else:
-                    print(f"(^_^) Personality {verb} (session only)")
+                print(f"(^_^)b Personality {verb} (saved to config)")
                 if not name:
                     print("  No personality overlay — using base agent behavior.")
                 else:
