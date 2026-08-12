@@ -91,6 +91,7 @@ import {
 import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
+import { isAllowedShellOpenExternalUrl } from './external-url'
 import { findGitBash as _findGitBash } from './find-git-bash'
 import { installFoundInPageForwarder, performFind, stopFind } from './find-in-page'
 import { createFirstRunSetupGate } from './first-run-setup-gate'
@@ -1350,7 +1351,9 @@ function openExternalUrl(rawUrl) {
     return true
   }
 
-  if (!['http:', 'https:', 'mailto:'].includes(parsed.protocol)) {
+  // Explicit scheme allowlist (http/https/mailto + known local app deep
+  // links like obsidian://). See electron/external-url.ts.
+  if (!isAllowedShellOpenExternalUrl(parsed.toString())) {
     return false
   }
 
