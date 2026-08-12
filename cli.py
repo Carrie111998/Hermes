@@ -4527,6 +4527,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             mcp_names = set((CLI_CONFIG.get("mcp_servers") or {}).keys())
             invalid = [t for t in toolsets if not validate_toolset(t) and t not in mcp_names]
             if invalid:
+                # Config resolution can select a persisted plugin toolset while
+                # startup discovery is still importing that plugin. Join only
+                # when validation would otherwise reject a name, preserving the
+                # background overlap for ordinary built-in-only startup.
+                try:
+                    from hermes_cli.plugins import discover_plugins
+
+                    discover_plugins()
+                except Exception:
+                    logger.debug(
+                        "plugin discovery failed during CLI toolset validation",
+                        exc_info=True,
+                    )
+                invalid = [
+                    t
+                    for t in toolsets
+                    if not validate_toolset(t) and t not in mcp_names
+                ]
+            if invalid:
                 self._console_print(f"[bold red]Warning: Unknown toolsets: {', '.join(invalid)}[/]")
         
         # Filesystem checkpoints: CLI flag > config
