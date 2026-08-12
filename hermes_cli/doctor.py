@@ -288,7 +288,10 @@ def _run_npm_audit(argv, *, cwd, timeout: float) -> subprocess.CompletedProcess:
     grandchild outlives its parent: with no capture pipe there is no reader
     thread to drain and no handle whose close can block, so the budget does
     not depend on the tree-kill landing. Raises
-    :class:`subprocess.TimeoutExpired` at ``timeout`` like ``subprocess.run``.
+    :class:`subprocess.TimeoutExpired` like ``subprocess.run`` — but note the
+    helper's real bound is ``timeout + ~10s`` on Windows, because it tree-kills
+    synchronously before raising and ``taskkill`` on a live ``node.exe`` tree
+    measures 8-11s. A timed-out `--audit` run pays that tail once per target.
     """
     from hermes_cli._subprocess_compat import run_text_capture
 

@@ -368,9 +368,29 @@ def run_text_capture(
     that outlives its parent just writes into a temp file nobody reads.
 
     On timeout we still tree-kill (``taskkill /T /F`` on Windows, ``killpg``
-    on POSIX) as a best effort not to leak the process, but correctness of the
-    bound no longer depends on that kill succeeding: we raise as soon as it
-    returns and never wait on the child again.
+    on POSIX) so as not to leak an abandoned process tree. The kill is best
+    effort — correctness no longer *depends* on it succeeding, because with
+    file-backed stdio there is nothing left to drain and we never wait on the
+    child again — but it IS synchronous, and that costs real wall clock.
+
+    **The bound is ``timeout`` plus the cost of the kill, not ``timeout``.**
+    On Windows ``_tree_kill`` shells out to ``taskkill`` under its own
+    ``timeout=10``, so the worst case is ``timeout + ~10s`` (a shade over the
+    cap: aborting the timed-out ``taskkill`` and reaping the direct child costs
+    a little more on top). That tail is paid on EVERY timeout, not just when
+    the kill fails. Measured on a loaded Windows host, staged against a real
+    wedged ``npm install`` with a 5s budget: ``taskkill`` alone took 8.47s and
+    10.48s across two probes, for 13.91s and 15.58s end to end (2026-08-11);
+    an earlier probe against a wedged ``npm audit`` tree clocked it at 11.6s.
+    On POSIX ``killpg`` is a bare syscall, so the tail there is negligible.
+
+    Callers must size their timeouts against ``timeout + 10s`` on Windows —
+    ``agent/lsp/install.py`` passing 600s really means "up to ~610s", and
+    ``hermes doctor --audit`` pays the tail once per timed-out target (~40s
+    across four). This is a bounded, predictable overshoot; what the
+    file-backed capture removed was the *unbounded* one, where a kill that
+    missed the grandchild added a 10s drain that could never reach EOF plus a
+    22.8s blocking pipe close — 75s against a nominal 30s budget.
 
     Returns a :class:`subprocess.CompletedProcess`; raises
     :class:`subprocess.TimeoutExpired` on timeout (same as ``subprocess.run``)
@@ -457,9 +477,19 @@ def _tree_kill(proc: subprocess.Popen) -> None:
     child was started in its own session (``start_new_session=True``). Either
     way this is best effort: ``run_text_capture`` captures into files, not
     pipes, so its budget holds whether or not the kill lands — the point here
-    is only to avoid leaving an abandoned process tree behind. Measured at
-    11.6s against a real ``npm audit`` tree on a loaded Windows host, which is
-    why the ``taskkill`` call carries its own timeout.
+    is only to avoid leaving an abandoned process tree behind.
+
+    Best effort is not free, though. This runs SYNCHRONOUSLY inside
+    ``run_text_capture``'s timeout path, so its duration is added to that
+    call's bound (see the note there). ``taskkill`` on a live ``npm`` tree has
+    been measured at 8.47s, 10.48s and 11.6s on a loaded Windows host, and
+    still ~3.5s on a trivial two-process Python tree — the cost scales with the
+    tree but is never zero. That is why it carries its own ``timeout=10`` cap,
+    and why the caller's real bound is ``timeout + ~10s``. Making the kill
+    fire-and-forget would tighten that, but was rejected: detaching it opens a
+    PID-reuse race between spawning ``taskkill`` and this ``Popen`` handle
+    being released, and ``taskkill /PID`` would then be free to shoot an
+    unrelated process that inherited the pid.
     """
     if IS_WINDOWS:
         try:
