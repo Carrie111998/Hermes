@@ -81,6 +81,58 @@ class TestReapSupervisedGateway:
         assert 555 in killed_pids
 
 
+class TestSupervisorSurvivesPoolChurn:
+    """Regression for the multi-profile Desktop pool-churn trigger (issue #83683).
+
+    Reported by TheVisher: the Desktop app can stay open while normal per-profile
+    backend-pool rotation repeatedly starts fresh ``HERMES_DESKTOP=1`` serve
+    backends. Each start calls ``_reap_unsupervised_gateway_orphans()``, so a
+    launchd-supervised gateway gets reaped on every churn unless the supervisor
+    guard holds. Assert that repeated reap calls against a live launchd-managed
+    gateway never signal it and never write a planned-stop marker, and that the
+    gateway PID survives unchanged.
+    """
+
+    def test_launchd_gateway_survives_repeated_churn(self, monkeypatch):
+        # Force the real launchd detection path (do NOT stub
+        # _gateway_has_active_supervisor): macOS + a loaded+running plist.
+        monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway, "is_windows", lambda: False)
+        monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: _FakePath(True))
+        monkeypatch.setattr(gateway, "_probe_launchd_service_running", lambda: True)
+
+        live_gw_pid = 4242
+        monkeypatch.setattr(gateway, "find_gateway_pids", lambda **k: [live_gw_pid])
+        monkeypatch.setattr(gateway_status, "get_running_pid", lambda: None)
+
+        killed = []
+        monkeypatch.setattr("os.kill", lambda pid, sig: killed.append((pid, sig)))
+        markers = []
+        monkeypatch.setattr(
+            gateway_status, "write_planned_stop_marker", lambda *a, **k: markers.append(a) or True
+        )
+        monkeypatch.setattr(gateway_status, "_pid_exists", lambda pid: False)
+        monkeypatch.setattr("time.sleep", lambda *_a, **_k: None)
+
+        clock = [0.0]
+        def fake_monotonic():
+            clock[0] += 100.0
+            return clock[0]
+        monkeypatch.setattr("time.monotonic", fake_monotonic)
+
+        # Simulate backend-pool churn: the Desktop recreates the serve backend
+        # for this profile several times (LRU eviction + reopen).
+        for _ in range(5):
+            assert gateway._reap_unsupervised_gateway_orphans() is False
+
+        # The launchd-managed gateway must survive every churn untouched.
+        assert killed == []
+        assert markers == []
+        # And the supervised PID is still reported live (unchanged).
+        assert gateway.find_gateway_pids() == [live_gw_pid]
+
+
 class TestGatewayHasActiveSupervisor:
     def test_systemd_running(self, monkeypatch):
         monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
