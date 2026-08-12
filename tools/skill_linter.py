@@ -22,8 +22,8 @@ destroy the feature" posture):
   ``skill_manage`` create path, and a contributor running it locally all share
   one implementation.
 * Reuses ``agent.skill_utils`` helpers rather than re-parsing frontmatter, so
-  BOM handling / platform matching / the 60-char prompt budget stay in one
-  place.
+  BOM handling / platform matching / the prompt description budget
+  (``SKILL_PROMPT_DESC_LIMIT``) stay in one place.
 """
 
 from __future__ import annotations
