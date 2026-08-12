@@ -22,9 +22,10 @@ Coverage:
 """
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -479,3 +480,51 @@ async def test_alias_hook_rewrite_strips_leading_slash_from_command_name():
         f"alias-rewrite target must fold into /model <alias> form, "
         f"got event_arg.text={event_arg.text!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_estop_pause_interaction_with_model_alias():
+    """Verify emergency stop (`hermes pause`) interaction with model aliases:
+    1. /model sonnet and /sonnet are both allowed through while paused (recognized command);
+    2. Regular non-command messages are blocked by estop notice;
+    3. Unknown slash commands (/unknown_alias_123) are blocked by estop notice;
+    4. Internal events bypass estop pause completely.
+    """
+    runner = _make_runner(platform_extra={})
+
+    with patch("agent.estop.paused_reply", return_value="⏸ Paused by estop"):
+        # 1a. /model sonnet -> recognized command "model" -> allowed
+        res_model = await runner._handle_message(
+            _make_event("/model sonnet", _make_source(user_id="anyone"))
+        )
+        assert res_model != "⏸ Paused by estop"
+        runner._handle_model_command.assert_awaited()
+
+        runner._handle_model_command.reset_mock()
+
+        # 1b. /sonnet -> canonicalized to /model sonnet -> recognized command "model" -> allowed identically
+        res_alias = await runner._handle_message(
+            _make_event("/sonnet", _make_source(user_id="anyone"))
+        )
+        assert res_alias != "⏸ Paused by estop"
+        runner._handle_model_command.assert_awaited_once()
+
+        runner._handle_model_command.reset_mock()
+
+        # 2. Regular non-command message -> blocked by estop notice
+        res_text = await runner._handle_message(
+            _make_event("hello world", _make_source(user_id="anyone"))
+        )
+        assert res_text == "⏸ Paused by estop"
+
+        # 3. Unknown slash command -> not canonicalized, not recognized -> blocked by estop
+        res_unknown = await runner._handle_message(
+            _make_event("/unknown_command_xyz123", _make_source(user_id="anyone"))
+        )
+        assert res_unknown == "⏸ Paused by estop"
+
+        # 4. Internal event -> event.internal=True -> bypasses estop pause completely
+        internal_event = _make_event("hello internal", _make_source(user_id="anyone"))
+        internal_event.internal = True
+        res_internal = await runner._handle_message(internal_event)
+        assert res_internal != "⏸ Paused by estop"
