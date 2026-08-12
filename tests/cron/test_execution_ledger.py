@@ -181,38 +181,65 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
     env["HERMES_HOME"] = str(home)
     env["PYTHONPATH"] = str(repo)
 
-    create = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "from cron.executions import create_execution, mark_execution_running; "
-            "r=create_execution('restart-job', source='builtin'); "
-            "mark_execution_running(r['id']); print(r['id'])",
-        ],
-        cwd=repo,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-    execution_id = create.stdout.strip()
+    def _run_child(label: str, code: str) -> subprocess.CompletedProcess:
+        """Run a helper interpreter, keeping its output attached to failures.
 
-    recover = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import json; from cron.executions import recover_interrupted_executions, list_executions; "
-            "print(recover_interrupted_executions()); "
-            "print(json.dumps(list_executions(job_id='restart-job'))) ",
-        ],
-        cwd=repo,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=True,
+        Deliberately not ``check=True``: CalledProcessError renders as
+        "Command ... returned non-zero exit status N" and does NOT print the
+        child's stderr, so a child that dies under load reports a bare exit
+        code and the run that produced it is gone. This test only fails
+        intermittently (once in the 2026-08-12 nightly gate at 12 workers, not
+        reproducible on demand), so the one run that catches it must carry
+        enough to name the cause.
+        """
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=repo,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        assert proc.returncode == 0, (
+            f"{label} child exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+        return proc
+
+    create = _run_child(
+        "create",
+        "from cron.executions import create_execution, mark_execution_running; "
+        "r=create_execution('restart-job', source='builtin'); "
+        "mark_execution_running(r['id']); print(r['id'])",
+    )
+    # One line only. Anything else on stdout (a warning, a log line routed to
+    # stdout) would silently become the "execution id" and misattribute the
+    # later id comparison to the wrong defect.
+    create_lines = create.stdout.strip().splitlines()
+    assert len(create_lines) == 1, (
+        "create child wrote more than the execution id to stdout\n"
+        f"--- stdout ---\n{create.stdout}\n--- stderr ---\n{create.stderr}"
+    )
+    execution_id = create_lines[0]
+
+    recover = _run_child(
+        "recover",
+        "import json; from cron.executions import recover_interrupted_executions, list_executions; "
+        "print(recover_interrupted_executions()); "
+        "print(json.dumps(list_executions(job_id='restart-job'))) ",
     )
     lines = recover.stdout.strip().splitlines()
-    assert lines[0] == "1"
+    # A 0 here means the recovering process decided the owner was still alive.
+    # The owner is definitively dead (subprocess.run waited for it), and a
+    # recycled PID is rejected by the centisecond-resolution
+    # process_started_at comparison -- so 0 means _owner_is_live() took its
+    # fail-safe "could not probe liveness" branch, which now logs to the
+    # child's stderr. Print both streams so that branch names itself.
+    assert lines[0] == "1", (
+        f"expected exactly 1 recovered execution, got {lines[0]!r}. "
+        "A 0 means _owner_is_live() could not prove the owner dead - check "
+        "stderr for its fail-safe warning.\n"
+        f"--- stdout ---\n{recover.stdout}\n--- stderr ---\n{recover.stderr}"
+    )
     records = json.loads(lines[1])
     assert len(records) == 1
     assert records[0]["id"] == execution_id

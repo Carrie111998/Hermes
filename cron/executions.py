@@ -8,12 +8,15 @@ proved gone. Terminal states are immutable.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
@@ -81,7 +84,22 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
         if not _pid_exists(pid):
             return False
     except Exception:
-        return True  # fail safe: inability to prove death must not rewrite state
+        # Fail safe: inability to prove death must not rewrite state. Keep that
+        # behaviour -- but say so. Silently returning True makes the caller
+        # skip recovery, so an interrupted attempt keeps a stale 'running' row
+        # forever and jobs.json never learns the run ended, with nothing
+        # anywhere recording why. This is also the ONLY branch that can make
+        # recover_interrupted_executions() return 0 for a genuinely dead owner
+        # (a recycled PID is rejected by the process_started_at comparison
+        # below, which is centisecond-resolution), so it is the first thing to
+        # look for when that count is unexpectedly 0.
+        logger.warning(
+            "Could not probe liveness of pid %s; treating its execution as "
+            "still owned and skipping recovery (fail-safe).",
+            pid,
+            exc_info=True,
+        )
+        return True
     if started_at is None:
         return pid == os.getpid()
     current = _process_start_time(pid)
