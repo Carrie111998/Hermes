@@ -6,7 +6,7 @@ import path from 'node:path'
 
 import { afterEach, test } from 'vitest'
 
-import { gitFor, repoStatus, resolveRenamePath, reviewPush } from './git-review-ops'
+import { branchBase, gitFor, repoStatus, resolveRenamePath, reviewPush } from './git-review-ops'
 
 const tempDirs: string[] = []
 
@@ -187,4 +187,60 @@ test('reviewPush with an upstream still pushes to that upstream', async () => {
     execFileSync('git', ['rev-parse', 'feature/x'], { cwd: fork, encoding: 'utf8' }).trim(),
     execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim()
   )
+}, 120_000)
+
+// --- diff base ---------------------------------------------------------------
+// branchBase picks the ref the review diff is computed against. Hardcoding
+// `origin/...` is wrong in a fork, where `origin` is the upstream project and
+// its merge-base sits thousands of commits back -- the diff then shows the whole
+// fork delta instead of the branch's work. The trunk's CONFIGURED upstream names
+// this repo's own lineage. (Deliberately not HEAD's own @{u}: on a feature branch
+// that is the branch's own tip, i.e. an empty diff.)
+
+function makeForkedRepo() {
+  const upstream = makeBare('upstream')
+  const fork = makeBare('fork')
+  const dir = makeRepo()
+  const run = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' }).trim()
+
+  run('branch', '-M', 'main')
+  run('remote', 'add', 'origin', upstream)
+  run('remote', 'add', 'fork', fork)
+
+  // origin/main stops at the first commit; the fork's trunk carries a second.
+  run('push', '-q', 'origin', 'main')
+  const atOrigin = run('rev-parse', 'HEAD')
+
+  fs.writeFileSync(path.join(dir, 'tracked.txt'), 'fork-only\n')
+  run('commit', '-qam', 'fork-only commit')
+  run('push', '-q', 'fork', 'main')
+  const atFork = run('rev-parse', 'HEAD')
+
+  run('fetch', '-q', 'origin')
+  run('fetch', '-q', 'fork')
+  run('checkout', '-q', '-b', 'feature/x')
+  fs.writeFileSync(path.join(dir, 'tracked.txt'), 'feature work\n')
+  run('commit', '-qam', 'feature work')
+
+  return { atFork, atOrigin, dir, run }
+}
+
+test('branchBase prefers the trunk configured upstream over origin/main', async () => {
+  const { atFork, atOrigin, dir, run } = makeForkedRepo()
+
+  run('config', 'branch.main.remote', 'fork')
+  run('config', 'branch.main.merge', 'refs/heads/main')
+
+  const base = await branchBase(gitFor(dir, 'git'))
+
+  assert.equal(base, atFork, 'diff base should follow the fork trunk')
+  assert.notEqual(base, atOrigin, 'diff base fell back to the upstream project')
+}, 120_000)
+
+test('branchBase still falls back to origin/main when the trunk has no upstream', async () => {
+  const { atOrigin, dir } = makeForkedRepo()
+
+  const base = await branchBase(gitFor(dir, 'git'))
+
+  assert.equal(base, atOrigin)
 }, 120_000)

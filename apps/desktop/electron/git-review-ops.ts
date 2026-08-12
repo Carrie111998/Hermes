@@ -154,6 +154,26 @@ async function fillUntrackedCounts(cwd, files) {
 async function branchBase(git) {
   const candidates = []
 
+  // The trunk's CONFIGURED upstream names this repo's own lineage, so prefer it
+  // over a hardcoded `origin/...`: in a fork checkout `origin` is often the
+  // UPSTREAM project, whose merge-base sits thousands of commits back and makes
+  // the review diff show the whole fork delta instead of the branch's work.
+  // Deliberately NOT HEAD's own @{upstream} -- on a feature branch that is the
+  // branch's own tip, i.e. an empty diff.
+  for (const trunk of ['main', 'master']) {
+    try {
+      const upstream = (
+        await git.revparse(['--abbrev-ref', '--symbolic-full-name', `${trunk}@{upstream}`])
+      ).trim()
+
+      if (upstream) {
+        candidates.push(upstream)
+      }
+    } catch {
+      // No such local branch, or it tracks nothing.
+    }
+  }
+
   try {
     const head = (await git.revparse(['--abbrev-ref', 'origin/HEAD'])).trim()
 
