@@ -330,6 +330,20 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         endpoint = str(disco.get("revocation_endpoint") or "").strip()
         if not endpoint:
             return None
+        # Same transport policy as the issuer: never ship a refresh token to
+        # a non-HTTPS (or non-loopback) revocation endpoint — a
+        # misconfigured or compromised discovery doc would otherwise leak the
+        # token in cleartext. Best-effort: a rejected endpoint is logged and
+        # skipped (logout still clears the client-side cookie). (#84750)
+        try:
+            endpoint = _require_https_or_loopback(endpoint, field="revocation_endpoint")
+        except ProviderError:
+            logger.warning(
+                "self-hosted OIDC: revocation_endpoint %r rejected (non-HTTPS); "
+                "skipping token revocation",
+                endpoint,
+            )
+            return None
         data = {
             "token": refresh_token,
             "token_type_hint": "refresh_token",
@@ -348,6 +362,9 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
                 data=data,
                 headers=headers,
                 timeout=_TOKEN_ENDPOINT_TIMEOUT_SEC,
+                # Explicit: the token must never be re-sent to a redirect
+                # target chosen by the endpoint.
+                follow_redirects=False,
             )
         except Exception as exc:  # noqa: BLE001 — best-effort
             logger.debug("self-hosted OIDC: revoke failed (ignored): %s", exc)

@@ -727,3 +727,65 @@ class TestPluginRegister:
         registered = ctx.register_dashboard_auth_provider.call_args.args[0]
         assert registered._client_secret == "cfg-secret"
 
+
+
+class TestRevokeSessionTransport:
+    """SEC-10 regression (#84750): the refresh token must never be shipped
+    to a non-HTTPS (or non-loopback) revocation endpoint, and redirects must
+    not be followed."""
+
+    @staticmethod
+    def _provider():
+        return oidc_plugin.SelfHostedOIDCProvider(
+            issuer=_ISSUER, client_id=_CLIENT_ID
+        )
+
+    @staticmethod
+    def _fake_post(calls):
+        def _post(*a, **k):
+            calls.append((a, k))
+            return MagicMock(spec=httpx.Response)
+        return _post
+
+    def test_revoke_posts_to_https_endpoint(self, monkeypatch):
+        p = self._provider()
+        calls = []
+        monkeypatch.setattr(oidc_plugin.httpx, "post", self._fake_post(calls))
+        monkeypatch.setattr(
+            p, "_get_discovery",
+            lambda: {"revocation_endpoint": f"{_ISSUER}/revoke",
+                     "token_endpoint": f"{_ISSUER}/token"},
+        )
+        p.revoke_session(refresh_token="rt-secret")
+        assert len(calls) == 1
+        args, kwargs = calls[0]
+        url = args[0]
+        assert url == f"{_ISSUER}/revoke"
+        assert kwargs["data"]["token"] == "rt-secret"
+        assert kwargs["follow_redirects"] is False
+
+    def test_revoke_skips_non_https_endpoint(self, monkeypatch):
+        p = self._provider()
+        calls = []
+        monkeypatch.setattr(oidc_plugin.httpx, "post", self._fake_post(calls))
+        monkeypatch.setattr(
+            p, "_get_discovery",
+            lambda: {"revocation_endpoint": "http://evil.example.com/revoke",
+                     "token_endpoint": f"{_ISSUER}/token"},
+        )
+        p.revoke_session(refresh_token="rt-secret")
+        assert calls == [], (
+            "refresh token must not be sent to a non-HTTPS revocation endpoint"
+        )
+
+    def test_revoke_allows_loopback_http(self, monkeypatch):
+        p = self._provider()
+        calls = []
+        monkeypatch.setattr(oidc_plugin.httpx, "post", self._fake_post(calls))
+        monkeypatch.setattr(
+            p, "_get_discovery",
+            lambda: {"revocation_endpoint": "http://127.0.0.1:9999/revoke",
+                     "token_endpoint": f"{_ISSUER}/token"},
+        )
+        p.revoke_session(refresh_token="rt-secret")
+        assert len(calls) == 1
