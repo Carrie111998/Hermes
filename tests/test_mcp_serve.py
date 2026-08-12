@@ -1148,6 +1148,12 @@ class TestEventBridgePollE2E:
         _create_test_db(db_path, session_id, [
             {"role": "user", "content": "Hello", "timestamp": "2026-03-29T15:00:01"},
         ])
+        monkeypatch.setattr(mcp_serve, "_state_db_path", lambda: db_path)
+        monkeypatch.setattr(mcp_serve, "_load_sessions_index", lambda: sessions_data)
+        # Freeze the poll-gate mtime. sqlite3.connect in get_messages can
+        # bump state.db mtime (WAL/header) and would otherwise reopen the gate.
+        frozen = mcp_serve._state_db_mtime_ns(db_path) or 1
+        monkeypatch.setattr(mcp_serve, "_state_db_mtime_ns", lambda _p: frozen)
 
         class TestDB:
             def __init__(self):
@@ -1294,7 +1300,7 @@ class TestEventBridgePollE2E:
         # Bridge has never seen this db state (mtime differs) and has an
         # empty cached index — exactly the state after a new conversation's
         # first write.
-        bridge._state_db_mtime = 0.0
+        bridge._state_db_mtime = 0
         assert bridge._cached_sessions_index == {}
 
         bridge._poll_once(DB())

@@ -349,7 +349,7 @@ class EventBridge:
         # In-memory approval tracking (populated from events)
         self._pending_approvals: Dict[str, dict] = {}
         # mtime cache — skip expensive work when state.db hasn't changed
-        self._state_db_mtime: float = 0.0
+        self._state_db_mtime: int = 0
         self._cached_sessions_index: dict = {}
 
     def start(self):
