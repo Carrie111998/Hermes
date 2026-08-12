@@ -201,7 +201,7 @@ def _model_consumes_thought_signature(model: Any) -> bool:
     ``extra_content`` from earlier in a mixed-provider session.
     """
     m = str(model or "").lower()
-    return "gemini" in m or "gemma" in m
+    return "gemini" in m
 
 
 class ChatCompletionsTransport(ProviderTransport):

@@ -776,3 +776,37 @@ class TestPromptCacheKeyCapability:
             provider_profile=profile,
         )
         assert "prompt_cache_key" not in kwargs
+
+
+def test_model_consumes_thought_signature_family_gating():
+    """Only Gemini-family models may replay the thought_signature."""
+    from agent.transports.chat_completions import _model_consumes_thought_signature
+
+    # Gemini-family → must keep the signature.
+    assert _model_consumes_thought_signature("google/gemini-2.5-pro") is True
+    assert _model_consumes_thought_signature("gemini-3-pro-preview") is True
+    # Gemma is a distinct family — it must NOT inherit the Gemini signature.
+    assert _model_consumes_thought_signature("google/gemma-3-27b-it") is False
+    assert _model_consumes_thought_signature("gemma-4") is False
+    # Unrelated strict providers strip it.
+    assert _model_consumes_thought_signature("mistral-large") is False
+    assert _model_consumes_thought_signature("") is False
+
+
+def test_gemma_strips_stale_thought_signature(transport):
+    msgs = [
+        {
+            "role": "assistant",
+            "content": "ok",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "extra_content": {"google": {"thought_signature": "SIG"}},
+                    "function": {"name": "t", "arguments": "{}"},
+                }
+            ],
+        },
+    ]
+    result = transport.convert_messages(msgs, model="google/gemma-3-27b-it")
+    assert "extra_content" not in result[0]["tool_calls"][0]
