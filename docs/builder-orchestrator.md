@@ -54,7 +54,16 @@ Activation verifies the proposal hash and pinned repository again, writes a
 cycle-specific contract and path manifest into the clean governance repository,
 commits those artifacts, creates the isolated linked worktree, and atomically
 registers the cycle in the owner-only runtime configuration. It does not start a
-builder. Restart the adapter after activation, then use `start`.
+builder. Reload and verify the supervised adapter after activation:
+
+```console
+hermes orchestrate restart
+```
+
+The restart is graceful and uses the already-loaded macOS launch agent. It does
+not reconstruct or print the adapter secret. Readiness succeeds only when the
+replacement process reports the exact registered-cycle configuration
+fingerprint, then the job can be started.
 
 Start one registered job:
 

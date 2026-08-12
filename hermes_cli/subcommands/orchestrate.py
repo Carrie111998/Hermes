@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import re
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 
@@ -45,6 +50,16 @@ def build_orchestrate_parser(subparsers, *, cmd_orchestrate):
         "activate", help="Bind a reviewed proposal and create its isolated worktree"
     )
     activate.add_argument("proposal", help="Owner-only proposal JSON from prepare")
+
+    restart = actions.add_parser(
+        "restart", help="Gracefully reload the supervised adapter configuration"
+    )
+    restart.add_argument(
+        "--label", default="ai.hermes.builder-adapter", help="macOS launch-agent label"
+    )
+    restart.add_argument(
+        "--timeout", type=float, default=30.0, help="Seconds to wait for verified readiness"
+    )
 
     start = actions.add_parser("start", help="Start one registered implementation job")
     start.add_argument("cycle_id")
@@ -94,6 +109,83 @@ def _print_result(result: dict, *, raw: bool = False) -> None:
         print(f"Attempts: {result['attempt_count']}")
     for error in result.get("errors", []):
         print(f"Error: {error.get('code')}: {error.get('message')}")
+
+
+def _restart_launch_agent(args, settings, client) -> dict:
+    from plugins.builder_adapter.errors import AdapterError
+
+    if sys.platform != "darwin":
+        raise AdapterError(
+            "PROVIDER_UNAVAILABLE", "adapter restart is supported only on macOS"
+        )
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", args.label):
+        raise AdapterError("INVALID_REQUEST", "invalid launch-agent label")
+    if args.timeout <= 0 or args.timeout > 120:
+        raise AdapterError("INVALID_REQUEST", "restart timeout must be 1-120 seconds")
+
+    target = f"gui/{os.getuid()}/{args.label}"
+    previous_process_id = None
+    try:
+        previous_process_id = client.health().get("process_id")
+    except AdapterError:
+        pass
+    try:
+        inspected = subprocess.run(
+            ["/bin/launchctl", "print", target],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if inspected.returncode != 0:
+            raise AdapterError(
+                "PROVIDER_UNAVAILABLE", "builder adapter launch agent is not loaded"
+            )
+        signalled = subprocess.run(
+            ["/bin/launchctl", "kill", "SIGTERM", target],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AdapterError(
+            "PROVIDER_UNAVAILABLE", "could not ask launchd to restart the adapter"
+        ) from exc
+    if signalled.returncode != 0:
+        raise AdapterError(
+            "PROVIDER_UNAVAILABLE", "launchd rejected the adapter restart request"
+        )
+
+    expected_registry = hashlib.sha256(
+        json.dumps(
+            settings.cycle_registry,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    deadline = time.monotonic() + args.timeout
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            health = client.health()
+            if (
+                health.get("operational") is True
+                and health.get("cycle_registry_sha256") == expected_registry
+                and isinstance(health.get("process_id"), int)
+                and health.get("process_id") != previous_process_id
+            ):
+                return health
+        except AdapterError as error:
+            last_error = error
+        time.sleep(0.2)
+    raise AdapterError(
+        "PROVIDER_UNAVAILABLE",
+        "adapter did not reload the current registered-cycle configuration",
+        retryable=True,
+    ) from last_error
 
 
 def run_operator_command(args) -> int:
@@ -162,6 +254,14 @@ def run_operator_command(args) -> int:
             print(f"Governance commit: {result['governance_commit']}")
             print(f"Worktree: {result['worktree_path']}")
             print("Adapter restart required before start.")
+            return 0
+
+        if args.orchestrate_action == "restart":
+            settings, client = _client(args, authenticated=False)
+            result = _restart_launch_agent(args, settings, client)
+            print("Adapter: restarted and configuration verified")
+            print(f"Process: {result['process_id']}")
+            print(f"Registered jobs: {result['registered_cycles']}")
             return 0
 
         settings, client = _client(args)

@@ -123,7 +123,12 @@ class BuilderAdapterService:
             return web.json_response(
                 {
                     "capability_id": "hermes.builder_dispatch.v1",
-                    "operational": False,
+                    "operational": True,
+                    "process_id": os.getpid(),
+                    "registered_cycles": len(self.adapter.cycle_registry),
+                    "cycle_registry_sha256": canonical_sha256(
+                        self.adapter.cycle_registry
+                    ),
                 }
             )
 

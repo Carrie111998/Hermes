@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+import json
 import os
 import time
 import tempfile
@@ -24,6 +25,8 @@ from plugins.builder_adapter.store import DispatchStore
 
 
 class Adapter:
+    cycle_registry = {}
+
     def dispatch(self, principal, payload):
         return {"principal": principal, "dispatch_id": payload["dispatch_id"]}
 
@@ -43,6 +46,29 @@ def _headers(secret, payload):
         "X-Hermes-Key-Id": "test-key",
         "X-Hermes-Signature": signature,
     }
+
+
+@pytest.mark.asyncio
+async def test_health_proves_loaded_cycle_registry():
+    adapter = Adapter()
+    adapter.cycle_registry = {"CYCLE_ONE": {"revision": 1}}
+    service = BuilderAdapterService(adapter, object(), peer_resolver=lambda _: (0, 0))
+    app = service.application()
+    route = next(
+        item
+        for item in app.router.routes()
+        if item.method == "GET" and item.resource.canonical == "/v1/health"
+    )
+
+    response = await route.handler(None)
+    payload = json.loads(response.body)
+
+    assert payload["operational"] is True
+    assert payload["process_id"] == os.getpid()
+    assert payload["registered_cycles"] == 1
+    assert payload["cycle_registry_sha256"] == canonical_sha256(
+        adapter.cycle_registry
+    )
 
 
 @pytest.mark.asyncio
