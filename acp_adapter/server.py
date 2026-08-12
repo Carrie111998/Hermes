@@ -2032,21 +2032,23 @@ class HermesACPAgent(acp.Agent):
             state.is_running = False
             state.current_prompt_text = ""
 
-        if not cancelled:
-            while True:
-                with state.runtime_lock:
-                    if not state.queued_prompts:
-                        break
-                    next_prompt = state.queued_prompts.pop(0)
-                if conn:
-                    await conn.session_update(
-                        session_id,
-                        acp.update_user_message_text(next_prompt),
-                    )
-                await self.prompt(
-                    prompt=[TextContentBlock(type="text", text=next_prompt)],
-                    session_id=session_id,
+        while True:
+            with state.runtime_lock:
+                if (
+                    state.cancel_event
+                    and state.cancel_event.is_set()
+                ) or not state.queued_prompts:
+                    break
+                next_prompt = state.queued_prompts.pop(0)
+            if conn:
+                await conn.session_update(
+                    session_id,
+                    acp.update_user_message_text(next_prompt),
                 )
+            await self.prompt(
+                prompt=[TextContentBlock(type="text", text=next_prompt)],
+                session_id=session_id,
+            )
 
         usage = None
         if any(result.get(key) is not None for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
