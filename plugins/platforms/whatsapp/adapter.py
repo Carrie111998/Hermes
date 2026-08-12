@@ -539,7 +539,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         
         This launches the Node.js bridge process and waits for it to be ready.
         """
-        if not check_whatsapp_requirements():
+        # Resolve and validate Node once per connection attempt. Re-running
+        # the probe immediately before spawning can select a different
+        # runtime or fail after an earlier successful probe.
+        node_command = _resolve_node_command()
+        if not node_command:
             logger.warning("[%s] Node.js not found. WhatsApp requires Node.js.", self.name)
             self._set_fatal_error(
                 "whatsapp_node_missing",
@@ -547,6 +551,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 retryable=False,
             )
             return False
+        node_argv, node_env = node_command
         
         bridge_path = Path(self._bridge_script)
         if not bridge_path.exists():
@@ -749,13 +754,6 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             bridge_env["HERMES_AUDIO_CACHE_DIR"] = str(_get_audio_dir())
             bridge_env["HERMES_DOCUMENT_CACHE_DIR"] = str(_get_doc_dir())
 
-            node_command = _resolve_node_command()
-            if not node_command:
-                logger.warning(
-                    "[%s] Node.js not found. WhatsApp requires Node.js.", self.name
-                )
-                return False
-            node_argv, node_env = node_command
             bridge_env.update(node_env)
 
             self._bridge_process = subprocess.Popen(
