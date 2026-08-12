@@ -18708,6 +18708,14 @@ def main(
             sys.exit(1)
         try:
             query, single_query_images = _collect_query_images(query, image)
+            single_query_display_query = query
+            if isinstance(query, str) and query.lstrip().lower().startswith("/learn"):
+                # Keep single-query parity with interactive, TUI, and gateway
+                # entrypoints. The display keeps the user's raw command while
+                # the agent receives the checkpoint-aware prompt.
+                from agent.learn_entrypoint import normalize_learn_query
+
+                query = normalize_learn_query(query)
             # Kanban workers spawn with ``hermes chat -q "work kanban task <id>"``;
             # the actual task description lives in the task body. Mirror the
             # gateway/CLI behaviour for inbound images by scanning the body for
@@ -18915,7 +18923,9 @@ def main(
                 # above was already banner-free; this brings the human-
                 # facing single-query path in line so all non-interactive
                 # invocations are fast.
-                _query_label = query or ("[image attached]" if single_query_images else "")
+                _query_label = single_query_display_query or (
+                    "[image attached]" if single_query_images else ""
+                )
                 if _query_label:
                     cli.console.print(f"[bold blue]Query:[/] {_query_label}")
                 # Surface security advisories before the agent runs — short
