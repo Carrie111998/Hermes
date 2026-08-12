@@ -439,9 +439,11 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
     (``us.``/``eu.``/``apac.``/...) and try two candidate slugs against the
     floor:
 
-    * the segment after the provider namespace (``claude-opus-4-6-v1:0``) —
-      matches Anthropic-style slugs whose floor key excludes the provider
-      (``claude-opus-4``); and
+    * the segment after the provider namespace — split on the **first** dot
+      so ``anthropic.claude-sonnet-4.6`` → ``claude-sonnet-4.6`` (not just
+      ``6`` as ``rsplit(".", 1)[1]`` would give); this is the key that matches
+      Anthropic-style floor entries like ``claude-opus-4`` or
+      ``claude-sonnet-4.6``; and
     * the region-stripped id with the provider dot rewritten to a dash
       (``deepseek-r1-v1:0``) — matches provider-qualified floor keys
       (``deepseek-r1``).
@@ -475,7 +477,7 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
             break
     base_candidates = [name]
     if "." in name:
-        base_candidates.append(name.rsplit(".", 1)[1])   # claude-opus-4-6-v1:0
+        base_candidates.append(name.split(".", 1)[1])   # claude-sonnet-4.6 (strip provider namespace)
         base_candidates.append(name.replace(".", "-", 1))  # deepseek-r1-v1:0
     candidates: list[str] = []
     for cand in base_candidates:
