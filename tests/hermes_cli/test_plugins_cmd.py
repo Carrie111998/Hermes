@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -262,10 +263,17 @@ class TestCmdInstall:
 class TestCmdUpdate:
     """Test the update command."""
 
+    @patch("hermes_cli.plugin_integrity.record_plugin_entrypoint")
     @patch("hermes_cli.plugins_cmd._sanitize_plugin_name")
     @patch("hermes_cli.plugins_cmd._plugins_dir")
     @patch("hermes_cli.plugins_cmd.subprocess.run")
-    def test_update_git_pull_success(self, mock_run, mock_plugins_dir, mock_sanitize):
+    def test_update_git_pull_success(
+        self,
+        mock_run,
+        mock_plugins_dir,
+        mock_sanitize,
+        mock_record_integrity,
+    ):
         from hermes_cli.plugins_cmd import cmd_update
 
         mock_plugins_dir_val = MagicMock()
@@ -282,6 +290,7 @@ class TestCmdUpdate:
         cmd_update("test-plugin")
 
         mock_run.assert_called_once()
+        mock_record_integrity.assert_called_once_with("test-plugin", mock_target)
 
     @patch("hermes_cli.plugins_cmd._sanitize_plugin_name")
     @patch("hermes_cli.plugins_cmd._plugins_dir")
@@ -587,6 +596,7 @@ class TestSubdirInstallE2E:
         plugins_dir = tmp_path / "installed"
         plugins_dir.mkdir()
         monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
 
         identifier = f"file://{repo_root}#my-plugin"
         target, manifest, name = pc._install_plugin_core(identifier, force=False)
@@ -602,6 +612,11 @@ class TestSubdirInstallE2E:
         # ...and the repo-root noise is NOT.
         assert not (target / "README.md").exists()
         assert not (target / "tests").exists()
+        from hermes_cli.plugin_integrity import verified_entrypoint_bytes
+
+        assert verified_entrypoint_bytes("my-plugin", target) == (
+            target / "__init__.py"
+        ).read_bytes()
 
     def test_missing_subdir_raises(self, tmp_path, monkeypatch):
         if shutil.which("git") is None:
@@ -683,3 +698,103 @@ def test_portable_manifest_is_visible_to_plugin_cli(tmp_path):
         "Portable test plugin",
         "portable.test",
     )
+
+
+def _write_dashboard_native_plugin(home: Path, name: str = "guarded") -> Path:
+    plugin = home / "plugins" / name
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.yaml").write_text(
+        f"name: {name}\nversion: 1.0.0\n",
+        encoding="utf-8",
+    )
+    (plugin / "__init__.py").write_text("VALUE = 'old'\n", encoding="utf-8")
+    (plugin / ".git").mkdir()
+    return plugin
+
+
+def test_dashboard_enable_records_git_user_plugin_integrity(tmp_path, monkeypatch):
+    from hermes_cli import plugins_cmd as pc
+    from hermes_cli.plugin_integrity import verified_entrypoint_bytes
+
+    home = tmp_path / "home"
+    plugin = _write_dashboard_native_plugin(home)
+    (home / "config.yaml").write_text(
+        "_config_version: 35\nplugins:\n  enabled: []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(pc, "_toggle_plugin_toolset", lambda *args, **kwargs: None)
+
+    result = pc.dashboard_set_agent_plugin_enabled("guarded", enabled=True)
+
+    assert result == {"ok": True, "name": "guarded", "unchanged": False}
+    assert verified_entrypoint_bytes("guarded", plugin) == (
+        plugin / "__init__.py"
+    ).read_bytes()
+
+
+def test_composite_fallback_records_newly_enabled_plugin_integrity(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import plugins_cmd as pc
+    from hermes_cli.plugin_integrity import verified_entrypoint_bytes
+
+    home = tmp_path / "home"
+    plugin = _write_dashboard_native_plugin(home)
+    (home / "config.yaml").write_text(
+        "_config_version: 35\nplugins:\n  enabled: []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    answers = iter(["1", ""])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+
+    pc._run_composite_fallback(
+        ["guarded"], ["guarded"], set(), set(), [], MagicMock()
+    )
+
+    assert verified_entrypoint_bytes("guarded", plugin) == (
+        plugin / "__init__.py"
+    ).read_bytes()
+
+
+def test_dashboard_update_refreshes_plugin_integrity(tmp_path, monkeypatch):
+    from hermes_cli import plugins_cmd as pc
+    from hermes_cli.plugin_integrity import (
+        record_plugin_entrypoint,
+        verified_entrypoint_bytes,
+    )
+
+    home = tmp_path / "home"
+    plugin = _write_dashboard_native_plugin(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    record_plugin_entrypoint("guarded", plugin)
+
+    def _pull(target):
+        (target / "__init__.py").write_text("VALUE = 'new'\n", encoding="utf-8")
+        return True, "Updated"
+
+    monkeypatch.setattr(pc, "_git_pull_plugin_dir", _pull)
+
+    result = pc.dashboard_update_user_plugin("guarded")
+
+    assert result["ok"] is True
+    assert verified_entrypoint_bytes("guarded", plugin) == (
+        plugin / "__init__.py"
+    ).read_bytes()
+
+
+def test_dashboard_remove_clears_plugin_integrity(tmp_path, monkeypatch):
+    from hermes_cli import plugins_cmd as pc
+    from hermes_cli.plugin_integrity import evidence_path, record_plugin_entrypoint
+
+    home = tmp_path / "home"
+    plugin = _write_dashboard_native_plugin(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    record_plugin_entrypoint("guarded", plugin)
+
+    result = pc.dashboard_remove_user_plugin("guarded")
+
+    assert result == {"ok": True, "name": "guarded"}
+    assert not plugin.exists()
+    assert json.loads(evidence_path().read_text(encoding="utf-8"))["plugins"] == []
