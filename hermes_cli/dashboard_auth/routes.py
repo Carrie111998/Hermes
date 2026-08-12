@@ -713,8 +713,10 @@ async def auth_password_login(request: Request, body: _PasswordLoginBody):
         raise HTTPException(status_code=404, detail="Unknown provider")
 
     try:
-        session = p.complete_password_login(
-            username=body.username, password=body.password
+        session = await asyncio.to_thread(
+            p.complete_password_login,
+            username=body.username,
+            password=body.password,
         )
     except InvalidCredentialsError:
         audit_log(
@@ -771,7 +773,7 @@ async def auth_logout(request: Request):
         # logged but never raised.
         for provider in list_providers():
             try:
-                provider.revoke_session(refresh_token=rt)
+                await asyncio.to_thread(provider.revoke_session, refresh_token=rt)
             except Exception as e:  # noqa: BLE001 — best-effort
                 _log.warning(
                     "dashboard-auth: revoke on %r failed: %s",
@@ -942,7 +944,9 @@ async def auth_native_refresh(request: Request, body: _NativeRefreshBody):
     unreachable: str | None = None
     for provider in providers:
         try:
-            session = provider.refresh_session(refresh_token=body.refresh_token)
+            session = await asyncio.to_thread(
+                provider.refresh_session, refresh_token=body.refresh_token
+            )
         except RefreshExpiredError:
             continue
         except ProviderError as e:
