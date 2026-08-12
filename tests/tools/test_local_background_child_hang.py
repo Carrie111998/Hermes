@@ -9,6 +9,14 @@ of the backgrounded service (indefinitely for a uvicorn server).
 
 The fix switches ``_drain()`` to select()-based non-blocking reads and
 stops draining shortly after bash exits even if the pipe hasn't EOF'd.
+
+On Windows — where ``select()`` only works on sockets — the drain polls
+``PeekNamedPipe`` (hermes_cli._subprocess_compat.windows_pipe_readable_bytes)
+with the same stop-after-exit semantics, and ``_kill_process`` takes the
+whole process tree (``taskkill /T /F``) instead of ``proc.terminate()``,
+so a timed-out foreground child can't outlive the kill holding the
+inherited pipe write-end.  This file guards both mechanisms and runs on
+every platform.
 """
 import json
 import os
@@ -19,24 +27,43 @@ import pytest
 
 from tools.environments.local import LocalEnvironment
 
-# The #8340 fix this file guards is select()-based non-blocking drain —
-# select() on pipe fds is POSIX-only, and the Windows drain still does
-# blocking os.read.  Now that bash resolution prefers real Git Bash on
-# Windows (instead of the WSL launcher, which made these commands fail
-# fast with mangled C:\ paths), the guarded scenario genuinely hangs
-# there: a backgrounded child inherits the pipe write-end and the drain
-# never sees EOF, so the first test stalls until pytest-timeout aborts
-# the whole session.  Skip on Windows; the regression guard is for the
-# POSIX mechanism.
-pytestmark = pytest.mark.skipif(
-    os.name == "nt",
-    reason="select()-based drain under test is POSIX-only; Windows blocking "
-    "drain hangs on backgrounded children (pre-existing limitation)",
-)
-
-
 def _pkill(pattern: str) -> None:
+    """Best-effort kill of every process whose command line contains *pattern*."""
+    if os.name == "nt":
+        # No pkill on Windows; match command lines via CIM.  The PowerShell
+        # process's own command line contains *pattern* — exclude it by PID.
+        ps = (
+            "Get-CimInstance Win32_Process | Where-Object "
+            f"{{ $_.ProcessId -ne $PID -and $_.CommandLine -like '*{pattern}*' }}"
+            " | ForEach-Object "
+            "{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+        )
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True)
+        return
     subprocess.run(f"pkill -9 -f {pattern!r} 2>/dev/null", shell=True)
+
+
+def _proc_running(pattern: str) -> bool:
+    """True when any live process's command line contains *pattern*.
+
+    POSIX uses argv-form ``pgrep -f`` (no ``shell=True`` — the ``sh -c``
+    wrapper's own command line would contain *pattern* and always match).
+    Windows matches CIM command lines, excluding the probe's own PID.
+    """
+    if os.name == "nt":
+        ps = (
+            "Get-CimInstance Win32_Process | Where-Object "
+            f"{{ $_.ProcessId -ne $PID -and $_.CommandLine -like '*{pattern}*' }}"
+            " | Select-Object -First 1 -ExpandProperty ProcessId"
+        )
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True,
+            text=True,
+        )
+        return bool(res.stdout.strip())
+    res = subprocess.run(["pgrep", "-f", pattern], capture_output=True)
+    return res.returncode == 0
 
 
 @pytest.fixture
@@ -180,6 +207,38 @@ class TestBackgroundChildDoesNotHang:
         assert elapsed < 10.0
         assert result["returncode"] == 124
         assert "timed out" in result["output"].lower()
+
+    def test_timeout_kill_does_not_orphan_children(self, local_env):
+        """A timed-out foreground child must die with bash (tree kill).
+
+        On POSIX, ``_kill_process`` signals the whole ``setsid`` process
+        group, so bash's children have always died with it.  On Windows,
+        ``proc.terminate()`` is ``TerminateProcess`` on bash.exe alone —
+        the foreground child survived as an orphan, kept running the very
+        workload the timeout was meant to stop, and held the inherited
+        stdout-pipe write-end open.  ``_kill_process`` must take the whole
+        tree (``taskkill /T /F``) instead.
+        """
+        marker = "hermes_8340_tree_kill"
+        cmd = f'python3 -c "import time; time.sleep(45); {marker} = 1"'
+        try:
+            t0 = time.monotonic()
+            result = local_env.execute(cmd, timeout=2)
+            elapsed = time.monotonic() - t0
+
+            assert elapsed < 6.0
+            assert result["returncode"] == 124
+            # Give the kill a short window to settle, then require the
+            # whole tree dead — no survivor may outlive execute().
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and _proc_running(marker):
+                time.sleep(0.25)
+            assert not _proc_running(marker), (
+                "foreground child survived the timeout kill — "
+                "_kill_process did not take the process tree"
+            )
+        finally:
+            _pkill(marker)
 
     def test_utf8_output_decoded_correctly(self, local_env):
         """Multibyte UTF-8 chunks must decode cleanly under select-based reads."""

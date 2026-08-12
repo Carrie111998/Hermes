@@ -32,6 +32,27 @@ from tools.checkpoint_manager import (
 )
 
 
+# Nearly every test here drives real ``git`` subprocesses, so the whole module
+# is spawn-bound rather than compute-bound.  The suite-wide --timeout=30
+# (pyproject.toml) is calibrated for in-process tests; it is not survivable
+# here on a contended host, where a single spawn costs seconds rather than
+# milliseconds.  Measured 2026-08-11 alongside 8+ concurrent pytest sweeps:
+# a bare ``git --version`` took 2.75s, so even _init_store's six config
+# spawns (~22s) straddled the 30s default and killed test_creates_git_store.
+# Because --timeout-method=thread ``os._exit``es the whole pytest process, one
+# such overrun aborts an entire tests/tools sweep -- so this is a sweep-integrity
+# guard, not just a per-test allowance.  TestRealPruning overrides this with a
+# larger budget; see its docstring for the per-spawn calibration data.
+#
+# Sized from a measured full-file run on that loaded host (80 passed in 46:14):
+# the slowest test outside TestRealPruning was
+# TestListCheckpoints::test_multiple_checkpoints_ordered at 157.5s, with a long
+# tail of 86-143s siblings.  300s keeps ~1.9x margin over that worst case; 180s
+# would have left only 13%, which is not a margin on a host whose spawn cost is
+# itself the variable being absorbed.
+pytestmark = pytest.mark.timeout(300)
+
+
 # =========================================================================
 # Fixtures
 # =========================================================================
@@ -293,16 +314,39 @@ class TestListCheckpoints:
 # Pruning: max_snapshots actually enforced (v2 fix)
 # =========================================================================
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(600)
 class TestRealPruning:
     """Real snapshot+prune cycles — dozens of git spawns per test.
 
     Windows 2026-06-11: a git spawn costs 0.2-0.4s under redirected stdio,
     so these tests are spawn-bound (test_max_snapshots_trims_history ran
     ~30s pre-fix and straddled the suite-wide --timeout=30, whose thread
-    method kills the whole session).  The class-level timeout(120) keeps a
-    documented margin; the spawn-budget test below pins the fix so the
-    budget can't silently regress.
+    method kills the whole session).  The spawn-budget test below pins the
+    spawn COUNT so the fix can't silently regress.
+
+    The wall-clock budget, though, is not a property of this code — it is a
+    property of the host, and the variable to size against is MEASURED PER-SPAWN
+    COST, not any single host metric:
+
+        quiet host     (2026-06-11, post-fix): ~0.26s/spawn ->  18.35s
+        contended host (2026-08-11, measured):  ~3.6s/spawn -> 255.9s
+
+    Do NOT read commit-charge percentage as the predictor — it is a contributor,
+    not the signal.  A 2026-06-11 run of this whole file finished 80 tests in
+    72.3s at 97.2% commit; the 2026-08-11 run took 2774.6s at 97.5% commit.
+    Near-identical commit, 38x the wall clock.  What differed was concurrency:
+    the slow run overlapped 8+ other pytest sweeps.  To judge this file, time a
+    bare ``git --version`` (2.746s on the slow host, sub-0.5s when quiet).
+
+    Same 71 spawns, same code, 14x the wall clock — a bare ``git --version``
+    alone cost 2.75s on the 08-11 host.  The old timeout(120) sat between
+    those two points, so the test passed on an idle host and blew up on a
+    loaded one.  Because the suite runs --timeout-method=thread, which
+    ``os._exit``es the WHOLE pytest process rather than failing one test,
+    that overrun aborted an entire tests/tools sweep at 12% (2026-08-11).
+    timeout(600) clears the measured loaded-host cost with ~2.3x margin
+    while staying bounded; individual git calls are independently capped by
+    checkpoint_manager._GIT_TIMEOUT (30s), so a real hang still terminates.
     """
 
     def test_max_snapshots_trims_history(self, work_dir, checkpoint_base, monkeypatch):
