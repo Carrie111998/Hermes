@@ -12,6 +12,26 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageType
 
 
+@pytest.fixture(autouse=True)
+def _restore_matrix_device_id_env():
+    """Snapshot and restore MATRIX_DEVICE_ID in os.environ across tests.
+
+    save_env_value() writes to os.environ as well as .env (mirroring the
+    real startup path), so a test that resolves/persists a device ID leaks
+    that value into os.environ — which get_env_value() prefers over the
+    .env file — and can break a later test. Snapshot before, restore after.
+    """
+    import os
+
+    prev = os.environ.get("MATRIX_DEVICE_ID")
+    yield
+    if prev is None:
+        os.environ.pop("MATRIX_DEVICE_ID", None)
+    else:
+        os.environ["MATRIX_DEVICE_ID"] = prev
+
+
+
 def _make_fake_mautrix():
     """Create a lightweight set of fake ``mautrix`` modules.
 
@@ -1207,7 +1227,127 @@ class TestMatrixPasswordLoginDeviceId:
     """MATRIX_DEVICE_ID should be passed to mautrix Client even with password login."""
 
     @pytest.mark.asyncio
-    async def test_password_login_uses_device_id(self):
+    async def test_password_login_generates_stable_device_id_when_unset(
+        self, monkeypatch, tmp_path
+    ):
+        """Password login with no MATRIX_DEVICE_ID must not mint a new device.
+
+        Before this fix, ``client.login(device_id=None)`` made the homeserver
+        auto-generate a fresh device on every restart, which accumulated
+        toward the hard device limit. When no device ID is configured, the
+        adapter now generates + persists a stable one and passes it to login.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        # Ensure no leaked value from a prior test shadows the unset case.
+        monkeypatch.delenv("MATRIX_DEVICE_ID", raising=False)
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "user_id": "@bot:example.org",
+                "password": "secret",
+                # NOTE: no device_id — the fallback must generate one.
+            },
+        )
+        adapter = MatrixAdapter(config)
+        assert adapter._device_id == ""  # nothing configured
+
+        fake_mautrix_mods = _make_fake_mautrix()
+
+        mock_client = MagicMock()
+        mock_client.mxid = "@bot:example.org"
+        mock_client.device_id = None
+        mock_client.state_store = MagicMock()
+        mock_client.sync_store = MagicMock()
+        mock_client.crypto = None
+        mock_client.login = AsyncMock(
+            return_value=MagicMock(device_id="GENERATED", access_token="tok")
+        )
+        mock_client.sync = AsyncMock(return_value={"rooms": {"join": {}}})
+        mock_client.add_event_handler = MagicMock()
+        mock_client.api = MagicMock()
+        mock_client.api.token = ""
+        mock_client.api.session = MagicMock()
+        mock_client.api.session.close = AsyncMock()
+
+        fake_mautrix_mods["mautrix.client"].Client = MagicMock(return_value=mock_client)
+
+        with patch.dict("sys.modules", fake_mautrix_mods):
+            with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
+                with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                    assert await adapter.connect() is True
+
+        # A non-empty device ID was resolved and passed to login.
+        mock_client.login.assert_awaited_once()
+        passed_device_id = mock_client.login.call_args.kwargs.get("device_id")
+        assert passed_device_id and len(passed_device_id) == 10
+        assert passed_device_id.isalnum()  # [A-Za-z0-9], like Element/Synapse IDs
+        # And it was persisted to the profile .env so restarts reuse it.
+        env_content = (tmp_path / ".env").read_text()
+        assert f"MATRIX_DEVICE_ID={passed_device_id}" in env_content
+
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_password_login_generated_device_id_is_stable_across_restarts(
+        self, monkeypatch, tmp_path
+    ):
+        """The persisted device ID is reused, not regenerated, on later logins."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        # Simulate a fresh process on restart: the var lives in .env, not
+        # os.environ. (save_env_value also sets os.environ, so without this
+        # a prior test's generated value would shadow the persisted file.)
+        monkeypatch.delenv("MATRIX_DEVICE_ID", raising=False)
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        # Simulate a prior run that persisted a device ID.
+        (tmp_path / ".env").write_text("MATRIX_DEVICE_ID=PREVIOUS_STABLE\n")
+
+        config = PlatformConfig(
+            enabled=True,
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "user_id": "@bot:example.org",
+                "password": "secret",
+            },
+        )
+        adapter = MatrixAdapter(config)
+
+        fake_mautrix_mods = _make_fake_mautrix()
+        mock_client = MagicMock()
+        mock_client.mxid = "@bot:example.org"
+        mock_client.device_id = None
+        mock_client.state_store = MagicMock()
+        mock_client.sync_store = MagicMock()
+        mock_client.crypto = None
+        mock_client.login = AsyncMock(
+            return_value=MagicMock(device_id="PREVIOUS_STABLE", access_token="tok")
+        )
+        mock_client.sync = AsyncMock(return_value={"rooms": {"join": {}}})
+        mock_client.add_event_handler = MagicMock()
+        mock_client.api = MagicMock()
+        mock_client.api.token = ""
+        mock_client.api.session = MagicMock()
+        mock_client.api.session.close = AsyncMock()
+        fake_mautrix_mods["mautrix.client"].Client = MagicMock(return_value=mock_client)
+
+        with patch.dict("sys.modules", fake_mautrix_mods):
+            with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
+                with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                    assert await adapter.connect() is True
+
+        passed_device_id = mock_client.login.call_args.kwargs.get("device_id")
+        assert passed_device_id == "PREVIOUS_STABLE"
+        # No new line appended — still exactly one entry.
+        assert (tmp_path / ".env").read_text().count("MATRIX_DEVICE_ID") == 1
+
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_password_login_uses_configured_device_id(self):
+        """A user-configured device ID is passed to login unchanged."""
         from plugins.platforms.matrix.adapter import MatrixAdapter
 
         config = PlatformConfig(
@@ -1229,7 +1369,9 @@ class TestMatrixPasswordLoginDeviceId:
         mock_client.state_store = MagicMock()
         mock_client.sync_store = MagicMock()
         mock_client.crypto = None
-        mock_client.login = AsyncMock(return_value=MagicMock(device_id="STABLE_PW_DEVICE", access_token="tok"))
+        mock_client.login = AsyncMock(
+            return_value=MagicMock(device_id="STABLE_PW_DEVICE", access_token="tok")
+        )
         mock_client.sync = AsyncMock(return_value={"rooms": {"join": {}}})
         mock_client.add_event_handler = MagicMock()
         mock_client.api = MagicMock()
@@ -1245,6 +1387,8 @@ class TestMatrixPasswordLoginDeviceId:
                     assert await adapter.connect() is True
 
         mock_client.login.assert_awaited_once()
+        passed_device_id = mock_client.login.call_args.kwargs.get("device_id")
+        assert passed_device_id == "STABLE_PW_DEVICE"
         assert adapter._device_id == "STABLE_PW_DEVICE"
 
         await adapter.disconnect()

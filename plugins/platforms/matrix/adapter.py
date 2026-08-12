@@ -1802,6 +1802,13 @@ class MatrixAdapter(BasePlatformAdapter):
                 await api.session.close()
                 return False
         elif self._password and self._user_id:
+            # Password login without a pinned device ID mints a fresh device
+            # on every restart (the homeserver auto-generates one when
+            # device_id is None), which accumulates toward the hard device
+            # limit. Resolve a stable device ID — user-configured wins;
+            # otherwise generate + persist one so restarts reuse it.
+            if not self._device_id:
+                self._device_id = _resolve_stable_device_id()
             try:
                 resp = await client.login(
                     identifier=self._user_id,
@@ -5226,6 +5233,39 @@ async def _standalone_send(
                 return {"error": "Matrix API timeout (30s)"}
     except Exception as e:
         return {"error": f"Matrix send failed: {e}"}
+
+
+def _generate_stable_device_id() -> str:
+    """Generate a stable, unique Matrix device ID for E2EE persistence.
+
+    A 10-char random value from ``[A-Za-z0-9]`` (the shape homeservers like
+    Synapse assign to real clients), unique per install. Persisted to
+    ``.env`` so password logins on later restarts reuse the same device
+    instead of minting a fresh one each time (which accumulates toward the
+    homeserver's hard device limit).
+    """
+    import secrets
+    import string
+
+    alphabet = string.ascii_uppercase + string.ascii_lowercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(10))
+
+
+def _resolve_stable_device_id() -> str:
+    """Return the stable device ID to use for password login, generating one if unset.
+
+    Reads ``MATRIX_DEVICE_ID`` and returns it when present (a user-supplied
+    value always wins). Otherwise generates a fresh stable ID and persists
+    it via ``save_env_value`` so subsequent restarts reuse the same device.
+    """
+    from hermes_cli.config import get_env_value, save_env_value
+
+    existing = get_env_value("MATRIX_DEVICE_ID")
+    if existing:
+        return existing
+    device_id = _generate_stable_device_id()
+    save_env_value("MATRIX_DEVICE_ID", device_id)
+    return device_id
 
 
 def interactive_setup() -> None:
