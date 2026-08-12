@@ -2434,6 +2434,11 @@ DEFAULT_CONFIG = {
     # See tools/tool_search.py for full design notes and the
     # openclaw-tool-search-report PDF in this PR for the rationale.
     "tools": {
+        # Tool names to strip from the model-visible schema entirely
+        # (`tools.hidden: [name, ...]`). Hidden tools are neither advertised
+        # nor dispatchable in the session — schema-level filtering, so the
+        # model never sees or hallucinates calls to them.
+        "hidden": [],
         "tool_search": {
             # Tiered disclosure: any deferrable (MCP/plugin) tool activates
             # the bridge; the listing then scales with catalog size.

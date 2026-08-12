@@ -302,6 +302,22 @@ def _clear_tool_defs_cache() -> None:
     _tool_defs_cache.clear()
 
 
+def _get_hidden_tools() -> frozenset:
+    """Return tool names the user hides via config ``tools.hidden``.
+
+    Schema-level filtering: hidden tools are stripped before the model-visible
+    tool list is assembled, so they are neither advertised nor callable.
+    Fail-open: any config read error yields an empty set.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
+        hidden = (cfg.get("tools") or {}).get("hidden") or []
+        return frozenset(str(t) for t in hidden if isinstance(t, str) and t)
+    except Exception:
+        return frozenset()
+
+
 def get_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
@@ -479,6 +495,13 @@ def _compute_tool_definitions(
     # all check the tool registry for plugin-provided toolsets.  No bypass
     # needed; plugins respect enabled_toolsets / disabled_toolsets like any
     # other toolset.
+
+    # User-configured hidden tools (`tools.hidden` in config.yaml): strip
+    # before schema assembly so the model never sees their schemas, and so
+    # they are never offered for dispatch.
+    hidden_tools = _get_hidden_tools()
+    if hidden_tools:
+        tools_to_include.difference_update(hidden_tools)
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
