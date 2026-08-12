@@ -1189,6 +1189,43 @@ class TestMigrationWriteInvariant:
 class TestSaveConfigPartialWritePreservation:
     """Regression for #62723: partial migration writes must not drop unrelated sections."""
 
+    def test_default_save_preserves_extra_root_keys(self, tmp_path):
+        preserved = {
+            "multiplex_profiles": True,
+            "approvals": {"mode": "off", "cron_mode": "approve"},
+            "x_adapter_95_unknown": {"nested": ["keep", {"exact": 7}]},
+        }
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump({**preserved, "timezone": "UTC"}, sort_keys=False),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            save_config({"timezone": "Asia/Bangkok"})
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert raw["timezone"] == "Asia/Bangkok"
+        preserved_after = {key: raw[key] for key in preserved}
+        assert yaml.safe_dump(preserved_after, sort_keys=False).encode() == yaml.safe_dump(
+            preserved, sort_keys=False
+        ).encode()
+
+    def test_full_replace_deletes_omitted_root_keys(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "multiplex_profiles: true\napprovals:\n  mode: off\ntimezone: UTC\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            save_config({"timezone": "Asia/Bangkok"}, full_replace=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert raw["timezone"] == "Asia/Bangkok"
+        assert "multiplex_profiles" not in raw
+        assert "approvals" not in raw
+
     def test_merge_existing_preserves_platforms_on_partial_write(self, tmp_path):
         body = """_config_version: 30
 model:

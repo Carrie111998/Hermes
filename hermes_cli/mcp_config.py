@@ -113,7 +113,7 @@ def _remove_mcp_server(name: str) -> bool:
     del servers[name]
     if not servers:
         config.pop("mcp_servers", None)
-    save_config(config)
+    save_config(config, removed_root_keys={"mcp_servers"} if not servers else None)
     return True
 
 
@@ -146,7 +146,7 @@ def _replace_mcp_servers(servers: Dict[str, dict]) -> Tuple[bool, List[str]]:
         config["mcp_servers"] = dict(servers)
     else:
         config.pop("mcp_servers", None)
-    save_config(config)
+    save_config(config, removed_root_keys={"mcp_servers"} if not servers else None)
     return True, []
 
 

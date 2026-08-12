@@ -153,7 +153,7 @@ def _remove_custom(name: str) -> None:
         cfg.pop("mcp_servers", None)
     else:
         cfg["mcp_servers"] = servers
-    save_config(cfg)
+    save_config(cfg, removed_root_keys={"mcp_servers"} if not servers else None)
     print(color(f"  ✓ Removed '{name}'", Colors.GREEN))
 
 

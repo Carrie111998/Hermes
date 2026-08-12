@@ -819,7 +819,7 @@ def uninstall_entry(name: str, *, purge_install_dir: bool = True) -> bool:
             cfg.pop("mcp_servers", None)
         else:
             cfg["mcp_servers"] = servers
-        save_config(cfg)
+        save_config(cfg, removed_root_keys={"mcp_servers"} if not servers else None)
         removed = True
 
     if purge_install_dir:

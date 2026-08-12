@@ -1840,10 +1840,25 @@ class TestConfigRoundTrip:
         self.client = TestClient(app)
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
+    def test_raw_editor_replaces_the_whole_file(self):
+        from hermes_cli import config as config_mod
 
+        config_path = config_mod.get_config_path()
+        config_path.write_text(
+            "multiplex_profiles: true\napprovals:\n  mode: off\ntimezone: UTC\n",
+            encoding="utf-8",
+        )
 
+        response = self.client.put(
+            "/api/config/raw",
+            json={"yaml_text": "timezone: Asia/Bangkok\n"},
+        )
 
-
+        assert response.status_code == 200
+        persisted = config_mod.read_raw_config()
+        assert persisted["timezone"] == "Asia/Bangkok"
+        assert "multiplex_profiles" not in persisted
+        assert "approvals" not in persisted
 
     def test_round_trip_preserves_schema_invisible_nested_keys(self):
         """Nested keys that aren't in CONFIG_SCHEMA must also survive a
