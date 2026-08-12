@@ -763,6 +763,80 @@ class GatewaySlashCommandsMixin:
             or _clean_str(getattr(channel_override, "provider", ""))
         )
         has_session_route_override = bool(session_override) or has_channel_route_override
+        needs_runtime_resolution = (
+            (
+                not has_live_agent
+                and has_session_route_override
+            )
+            or (has_live_agent and (not model_name or not provider_name))
+        )
+        if needs_runtime_resolution:
+            # For an incomplete live route with no session/channel override, the
+            # last actual gateway route (persisted ``gateway_runtime``) is more
+            # authoritative than the current global config the resolver falls
+            # back to.  Apply it BEFORE consulting the resolver so persisted
+            # runtime (#4) beats current config (#5) — the resolver fills below
+            # are guarded ``if not model_name``/``if not provider_name`` and so
+            # only contribute what persisted runtime did not already supply.
+            if has_live_agent and not has_session_route_override:
+                if not model_name:
+                    model_name = persisted_model
+                if not provider_name:
+                    provider_name = persisted_provider
+
+            resolve_runtime = getattr(self, "_resolve_session_agent_runtime", None)
+            if callable(resolve_runtime):
+                try:
+                    # ``/status`` is display-only: resolve the route for
+                    # presentation without mutating conversation/process state
+                    # (persisted ``/model`` override rehydration and the
+                    # ``last_resolved_model`` recovery cache).
+                    resolved_route = await asyncio.to_thread(
+                        resolve_runtime,
+                        source=source,
+                        session_key=session_key,
+                        user_config=user_config,
+                        persist=False,
+                    )
+                    resolved_model = (
+                        resolved_route[0]
+                        if isinstance(resolved_route, tuple) and resolved_route
+                        else ""
+                    )
+                    runtime_kwargs = (
+                        resolved_route[1]
+                        if isinstance(resolved_route, tuple) and len(resolved_route) > 1
+                        else {}
+                    )
+                    if not model_name and _clean_str(resolved_model):
+                        model_name = _clean_str(resolved_model)
+                    if isinstance(runtime_kwargs, dict):
+                        resolved_provider = _clean_str(
+                            runtime_kwargs.get("provider")
+                            or runtime_kwargs.get("requested_provider")
+                        )
+                        if not provider_name and resolved_provider:
+                            provider_name = resolved_provider
+                except Exception:
+                    pass
+
+            if not model_name:
+                try:
+                    from hermes_cli.model_switch import resolve_effective_model
+
+                    model_name = resolve_effective_model(
+                        session_override,
+                        channel_override,
+                        _resolve_gateway_model(user_config),
+                    )
+                except Exception:
+                    model_name = _clean_str(model_cfg.get("default"))
+            if not provider_name:
+                provider_name = _clean_str(session_override.get("provider"))
+            if not provider_name and channel_override is not None:
+                provider_name = _clean_str(getattr(channel_override, "provider", ""))
+            if not provider_name:
+                provider_name = _clean_str(model_cfg.get("provider"))
 
         # ``billing_provider`` is intentionally first-accounted attribution,
         # while ``gateway_runtime`` is synchronized after each completed turn
