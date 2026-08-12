@@ -423,6 +423,10 @@ def recover_pending_to_db(
         own_db = True
 
     recovered = 0
+    # Sessions whose spool replay already failed this pass.  Ordering is a
+    # per-session property, so one unhealthy session must not hold back the
+    # others.
+    blocked_sessions = set()
     for path, payload in flush_files:
         try:
             if payload is None:
@@ -448,9 +452,28 @@ def recover_pending_to_db(
                         path,
                     )
                     continue
-                session_db.append_message(
-                    **_transcript_append_kwargs(spooled_sid, message, payload)
-                )
+                if spooled_sid in blocked_sessions:
+                    # An older message for this session could not be replayed.
+                    # Writing this one now would give it a lower row id than
+                    # the message it follows, permanently inverting the
+                    # transcript, so leave it for the next start.
+                    continue
+                try:
+                    session_db.append_message(
+                        **_transcript_append_kwargs(spooled_sid, message, payload)
+                    )
+                except Exception as exc:
+                    # Same contract as drain_transcript_spool: stop this
+                    # session's replay on the first failure and keep the
+                    # remaining spool files for the next attempt.
+                    blocked_sessions.add(spooled_sid)
+                    logger.warning(
+                        "Replay of spooled transcript message %s for %s failed; "
+                        "keeping it and any later spooled message for that "
+                        "session for the next start: %s",
+                        path, spooled_sid, exc,
+                    )
+                    continue
                 recovered += 1
                 path.unlink(missing_ok=True)
                 continue
