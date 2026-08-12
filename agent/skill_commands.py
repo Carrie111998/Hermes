@@ -623,7 +623,7 @@ def build_skill_invocation_message(
     # Track active usage for Curator lifecycle management (#17782)
     try:
         from tools.skill_usage import bump_use
-        bump_use(skill_name)
+        bump_use(skill_name, task_id=task_id)
     except Exception:
         pass  # Non-critical — skill invocation proceeds regardless
 
@@ -731,7 +731,7 @@ def build_stacked_skill_invocation_message(
         # Track active usage for Curator lifecycle management (#17782)
         try:
             from tools.skill_usage import bump_use
-            bump_use(skill_name)
+            bump_use(skill_name, task_id=task_id)
         except Exception:
             pass  # Non-critical
 
@@ -818,7 +818,7 @@ def build_preloaded_skills_prompt(
         # Track active usage for Curator lifecycle management (#17782)
         try:
             from tools.skill_usage import bump_use
-            bump_use(skill_name)
+            bump_use(skill_name, task_id=task_id)
         except Exception:
             pass  # Non-critical
 
