@@ -4475,6 +4475,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # populated only while `_in_stream_table` is True.
         self._stream_table_buf: list[str] = []
         self._in_stream_table = False
+        # Fenced-code buffer.  Streamed lines inside ``` / ~~~ fences are
+        # held here and stripped as ONE block on close, so the emphasis
+        # regexes never see code bodies — per-line stripping ate literal
+        # asterisks in code (see #84377 / PR #84502).  Mirrors the
+        # table-block buffering above.
+        self._stream_fence_buf: list[str] = []
+        self._stream_in_fence = False
         self._pending_edit_snapshots = {}
         self._last_input_mode_recovery = 0.0
         self._input_mode_recovery_notice_shown = False
@@ -7048,6 +7055,39 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         while "\n" in self._stream_buf:
             line, self._stream_buf = self._stream_buf.split("\n", 1)
 
+            # Fenced-code blocks: buffer until the closing fence, then
+            # strip the WHOLE block at once.  Per-line stripping lets the
+            # emphasis regexes eat literal asterisks inside code (see
+            # #84377 / PR #84502) because a lone body line is not
+            # recognised as code.
+            _fm = re.match(r"^\s*(`{3,}|~{3,})", line)
+            if _fm is not None:
+                _marker = _fm.group(1)
+                _trailing = line[_fm.end():]
+                if not getattr(self, "_stream_in_fence", False):
+                    # Opening fence (info string, if any, is kept by the
+                    # block-level stripper on close).
+                    self._stream_in_fence = True
+                    self._stream_fence_buf = [line]
+                elif _marker[0] == self._stream_fence_buf[0].lstrip()[0] and not _trailing.strip():
+                    # Closing fence: strip and emit the whole block.
+                    self._stream_fence_buf.append(line)
+                    joined = "\n".join(self._stream_fence_buf)
+                    self._stream_in_fence = False
+                    self._stream_fence_buf = []
+                    if self.final_response_markdown == "strip":
+                        joined = _strip_markdown_syntax(joined)
+                    for ln in joined.split("\n"):
+                        _emit_one(ln)
+                else:
+                    # Different fence char or trailing content on a fence
+                    # line: CommonMark treats it as body content.
+                    self._stream_fence_buf.append(line)
+                continue
+            if getattr(self, "_stream_in_fence", False):
+                self._stream_fence_buf.append(line)
+                continue
+
             # Hold table-shaped lines in a side-buffer so we can re-pad
             # the whole block once it ends.  Streaming line-by-line, we
             # cannot re-align mid-table without reflowing already-printed
@@ -7100,6 +7140,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def _flush_stream(self) -> None:
         """Emit any remaining partial line from the stream buffer and close the box."""
+        # If the stream ended inside a fenced-code block, flush the
+        # buffered block now (body stays protected from the emphasis
+        # regexes — matches the unterminated-fence handling in
+        # _strip_markdown_syntax).
+        if getattr(self, "_stream_in_fence", False):
+            # Fold any trailing partial line into the block so it is
+            # stripped as code, not per-line (which would eat literal
+            # asterisks in an unterminated fence).
+            _fence_buf = getattr(self, "_stream_fence_buf", [])
+            if self._stream_buf:
+                _fence_buf.append(self._stream_buf)
+                self._stream_buf = ""
+            joined = "\n".join(_fence_buf)
+            self._stream_in_fence = False
+            self._stream_fence_buf = []
+            if self.final_response_markdown == "strip":
+                joined = _strip_markdown_syntax(joined)
+            _tc = getattr(self, "_stream_text_ansi", "")
+            for ln in joined.split("\n"):
+                _cprint(f"{_STREAM_PAD}{_tc}{ln}{_RST}" if _tc else f"{_STREAM_PAD}{ln}")
+
         # If we're still inside a "reasoning block" at end-of-stream, it was
         # a false positive — the model mentioned a tag like <think> in prose
         # but never closed it.  Recover the buffered content as regular text.
@@ -7163,6 +7224,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._deferred_content = ""
         self._stream_table_buf = []
         self._in_stream_table = False
+        self._stream_fence_buf = []
+        self._stream_in_fence = False
 
     def _slow_command_status(self, command: str) -> str:
         """Return a user-facing status message for slower slash commands."""
