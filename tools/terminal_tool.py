@@ -1355,12 +1355,6 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     ``_active_environments``.
 
     The top-level agent passes ``task_id=None`` and lands on ``"default"``.
-    Local sessions keep their raw task IDs because each ``LocalEnvironment``
-    owns a persistent shell snapshot. Sharing that snapshot lets one session
-    (notably a ``delegate_task`` child) export variables into another session.
-    Local filesystem and installed-package state is host-global already, so
-    separate shell snapshots do not lose the useful shared state.
-
     Container-backed ``delegate_task`` children pass their own subagent ID so
     file-state tracking, the active-subagents registry, and TUI events stay
     distinct per child, but deliberately collapse back to ``"default"`` here
@@ -1389,11 +1383,24 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     if task_id and _has_isolation_overrides(task_id):
         return task_id
     _ensure_terminal_env_bridged()
-    if task_id and os.getenv("TERMINAL_ENV", "local") == "local":
-        return task_id
     if task_id and _docker_session_isolation_enabled():
         return _resolve_container_alias(task_id)
     return "default"
+
+
+def _resolve_terminal_environment_task_id(
+    task_id: Optional[str], env_type: str
+) -> str:
+    """Return the cache key for a terminal environment instance.
+
+    Container/sandbox keying remains owned by
+    :func:`_resolve_container_task_id`. Local environments are different:
+    each instance owns a persistent shell snapshot, so task/session IDs need
+    distinct instances even though their filesystem is shared by the host.
+    """
+    if env_type == "local" and task_id:
+        return task_id
+    return _resolve_container_task_id(task_id)
 
 
 def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
@@ -2593,7 +2600,7 @@ def terminal_tool(
         # task_ids collapse back to "default" so the top-level agent and
         # every delegate_task child share one container; only task_ids with
         # a registered env override (RL benchmarks) get isolated sandboxes.
-        effective_task_id = _resolve_container_task_id(task_id)
+        effective_task_id = _resolve_terminal_environment_task_id(task_id, env_type)
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config. ``resolve_task_overrides``
