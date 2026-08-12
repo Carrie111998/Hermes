@@ -9,6 +9,22 @@ import pytest
 
 import hermes_cli.doctor as doctor_mod
 
+# Importing this module also warms ``run_doctor``'s two heaviest lazy imports
+# at collection time, which is what keeps the tests below under the repo's 30s
+# ``--timeout`` cap. See ``conftest_doctor_externals`` for the measurements.
+from tests.hermes_cli.conftest_doctor_externals import (  # noqa: E402
+    stub_doctor_externals,
+)
+
+
+@pytest.fixture(autouse=True)
+def _stub_doctor_externals(monkeypatch):
+    """Keep ``run_doctor`` off ``install_doctor.probe`` / ``gh auth status`` /
+    ``agent-browser --version`` -- ~31s of host subprocesses per call that none
+    of these tests assert on. See ``conftest_doctor_externals`` for the
+    measurements and the rationale."""
+    stub_doctor_externals(monkeypatch)
+
 
 def _setup_doctor_env(monkeypatch, tmp_path, venv_name="venv"):
     """Create a minimal HERMES_HOME + PROJECT_ROOT for doctor tests."""
