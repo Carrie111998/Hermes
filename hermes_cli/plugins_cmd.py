@@ -1982,18 +1982,32 @@ def _toolsets_used_outside_plugin(name: str, candidates: set[str]) -> set[str]:
 
         manager = get_plugin_manager()
         owned_tools: set[str] = set()
+        module_prefixes: set[str] = set()
         for key, loaded in manager._plugins.items():
             if key == name or loaded.manifest.name == name:
                 owned_tools.update(loaded.tools_registered)
+                module_name = getattr(loaded.module, "__name__", "")
+                if module_name:
+                    module_prefixes.add(module_name)
                 break
 
         shared: set[str] = set()
         for toolset_key in candidates:
-            if any(
-                tool_name not in owned_tools
-                for tool_name in registry.get_tool_names_for_toolset(toolset_key)
-            ):
-                shared.add(toolset_key)
+            for tool_name in registry.get_tool_names_for_toolset(toolset_key):
+                entry = registry.get_entry(tool_name)
+                handler_module = getattr(entry.handler, "__module__", "") if entry else ""
+                owned_by_target = (
+                    tool_name in owned_tools
+                    and bool(module_prefixes)
+                    and any(
+                        handler_module == prefix
+                        or handler_module.startswith(f"{prefix}.")
+                        for prefix in module_prefixes
+                    )
+                )
+                if not owned_by_target:
+                    shared.add(toolset_key)
+                    break
         return shared
     except Exception:
         # Fail closed: if ownership cannot be established, keep the toolset

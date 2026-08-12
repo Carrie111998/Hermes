@@ -263,6 +263,39 @@ class TestEnableDisableNested:
         assert config["platform_toolsets"]["cli"] == ["web", "shared"]
         mock_save.assert_called_once_with(config)
 
+    @patch("tools.registry.registry.get_entry")
+    @patch("tools.registry.registry.get_tool_names_for_toolset")
+    @patch("hermes_cli.plugins.get_plugin_manager")
+    def test_overridden_same_name_is_owned_by_later_plugin(
+        self, mock_manager, mock_tool_names, mock_entry,
+    ):
+        from types import SimpleNamespace
+
+        from hermes_cli.plugins_cmd import _toolsets_used_outside_plugin
+
+        def later_handler():
+            return None
+
+        later_handler.__module__ = "hermes_plugins.later"
+        earlier = SimpleNamespace(
+            manifest=SimpleNamespace(name="earlier"),
+            module=SimpleNamespace(__name__="hermes_plugins.earlier"),
+            tools_registered=["shared_name"],
+        )
+        later = SimpleNamespace(
+            manifest=SimpleNamespace(name="later"),
+            module=SimpleNamespace(__name__="hermes_plugins.later"),
+            tools_registered=[],
+        )
+        mock_manager.return_value._plugins = {
+            "earlier": earlier,
+            "later": later,
+        }
+        mock_tool_names.return_value = ["shared_name"]
+        mock_entry.return_value = SimpleNamespace(handler=later_handler)
+
+        assert _toolsets_used_outside_plugin("earlier", {"shared"}) == {"shared"}
+
     @patch("hermes_cli.plugins_cmd._resolve_tool_override_grant")
     @patch("hermes_cli.plugins_cmd._toggle_plugin_toolset")
     @patch("hermes_cli.plugins_cmd._save_disabled_set")
