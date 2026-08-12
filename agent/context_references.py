@@ -288,7 +288,18 @@ def _expand_file_reference(
         # so it can read/convert/view the file itself.
         return None, _binary_reference_block(ref, path)
 
-    text = path.read_text(encoding="utf-8")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        # The file IS text — it passed _is_binary_file — just not UTF-8. Locale
+        # encoded exports (GB18030, Shift_JIS, Big5, cp125x) come out of banking,
+        # accounting and older enterprise tooling routinely. Inlining would mean
+        # guessing the encoding, and guessing is not safe here: cp125x decodes
+        # almost any byte sequence without raising, so a fallback chain would
+        # silently inline mojibake while claiming success. Hand the model the
+        # same actionable block binary files get instead — the file is on disk
+        # and its tools can read it with an explicit encoding.
+        return None, _undecodable_text_reference_block(ref, path, exc)
     if ref.line_start is not None:
         lines = text.splitlines()
         start_idx = max(ref.line_start - 1, 0)
@@ -591,6 +602,33 @@ def _binary_reference_block(ref: ContextReference, path: Path) -> str:
         f"It is available on disk at `{_agent_visible_path(path)}`. Use your tools to work with it "
         f"(read or convert it, extract its text, or view/render it as needed); "
         f"do not tell the user the file type is unsupported."
+    )
+
+
+def _undecodable_text_reference_block(
+    ref: ContextReference, path: Path, exc: UnicodeDecodeError
+) -> str:
+    """Actionable block for a text file that is not UTF-8.
+
+    Same contract as :func:`_binary_reference_block`: the reference cannot be
+    inlined, but the file is on disk and the agent's own tools can read it — so
+    say what is wrong, where it is, and what to do, rather than returning a raw
+    codec error the model can only give up on.
+    """
+    try:
+        size = format_bytes(path.stat().st_size)
+    except OSError:
+        size = "unknown size"
+    try:
+        offending = f"byte 0x{exc.object[exc.start]:02x} at position {exc.start}"
+    except (IndexError, TypeError):  # pragma: no cover - defensive
+        offending = "an undecodable byte"
+    return (
+        f"📄 {ref.raw} ({size}) — text file, but not UTF-8 ({offending}), so it was "
+        f"not inlined. It is available on disk at `{_agent_visible_path(path)}`. Read it "
+        f"with your tools using an explicit encoding — a locale encoding such as gb18030, "
+        f"shift_jis, big5, or cp1252 is likely — and say which one you used; "
+        f"do not tell the user the file is unsupported."
     )
 
 

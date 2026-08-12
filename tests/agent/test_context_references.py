@@ -301,3 +301,43 @@ def test_format_reference_value_round_trips_through_the_parser(value):
 
     assert match is not None
     assert match.group("value").strip("`\"'") == value
+
+
+def test_non_utf8_text_file_is_not_dropped_from_context(tmp_path: Path, monkeypatch):
+    """A locale-encoded text file must reach the model as something actionable.
+
+    Regression test for #84206. `_is_binary_file` classifies a GB18030 CSV as
+    text — correctly: `text/csv` mime, no NUL bytes — so it fell through to a
+    strict UTF-8 `read_text`, and the resulting UnicodeDecodeError surfaced as a
+    bare warning. The file was on disk and readable, but the model never learned
+    it existed.
+
+    GB18030 is only the reproducible case; the same holds for Shift_JIS, Big5,
+    or any cp125x export from banking/accounting tooling.
+
+    Uses `.txt` rather than the issue's `.csv` on purpose: `mimetypes` consults
+    the Windows registry, where `.csv` resolves to `application/vnd.ms-excel`,
+    so `_is_binary_file` short-circuits to the binary block and the decode is
+    never reached. `.txt` is `text/plain` on every platform, so this exercises
+    the real path everywhere instead of passing vacuously on Windows.
+    """
+    from agent.context_references import preprocess_context_references
+
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    sample = tmp_path / "gb18030-sample.txt"
+    sample.write_bytes("交易时间,商户,金额\n2026-08-11,测试商户,19.80\n".encode("gb18030"))
+
+    result = preprocess_context_references(
+        f"Please summarize this CSV @file:{sample}",
+        cwd=tmp_path,
+        context_length=100_000,
+    )
+
+    assert result.expanded
+    # It must not degrade into a raw codec error the model can do nothing with.
+    assert not any("codec can't decode" in warning for warning in result.warnings), (
+        result.warnings
+    )
+    # It must be told the file is text-but-not-UTF-8, and where to find it.
+    assert "not utf-8" in result.message.lower()
+    assert str(sample) in result.message
