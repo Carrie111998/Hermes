@@ -294,6 +294,50 @@ function shellSsh() {
   }
 }
 
+function psFallbackSsh(line?: string) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-ps-fallback-'))
+
+  const sitecustomize = `
+import builtins, os, subprocess
+real_open = builtins.open
+def fallback_open(name, *args, **kwargs):
+    if isinstance(name, str) and name.startswith('/proc/') and name.endswith('/cmdline'):
+        raise OSError('forced ps fallback')
+    return real_open(name, *args, **kwargs)
+builtins.open = fallback_open
+def fallback_check_output(*args, **kwargs):
+    if os.environ.get('HERMES_TEST_PS_ERROR'):
+        raise subprocess.CalledProcessError(1, args[0])
+    return os.environ['HERMES_TEST_PS_LINE']
+subprocess.check_output = fallback_check_output
+`
+
+  fs.writeFileSync(path.join(dir, 'sitecustomize.py'), sitecustomize)
+
+  return {
+    exec(cmd: string) {
+      return new Promise<string>((resolve, reject) => {
+        execFile(
+          '/bin/sh',
+          ['-c', cmd],
+          {
+            encoding: 'utf8',
+            env: {
+              ...process.env,
+              PYTHONPATH: dir,
+              ...(line === undefined ? { HERMES_TEST_PS_ERROR: '1' } : { HERMES_TEST_PS_LINE: line })
+            }
+          },
+          (error, stdout) => (error ? reject(error) : resolve(String(stdout)))
+        )
+      })
+    },
+    cleanup() {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+}
+
 // Launch a live process through an install.sh-style exec wrapper. The wrapper
 // `exec`s the venv entrypoint, so the shell is replaced IN PLACE (same pid) and
 // the kernel rewrites argv for the entrypoint's shebang. The launcher path we
@@ -349,7 +393,15 @@ function spawnDirectHermes(extraServeArgs: string[]) {
 // Poll until the exec has actually happened, so we probe the replaced argv.
 async function waitForServeArgv(pid: number, entrypoint: string) {
   for (let attempt = 0; attempt < 60; attempt++) {
-    const line = execFileSync('ps', ['-ww', '-o', 'command=', '-p', String(pid)], { encoding: 'utf8' })
+    let line = ''
+
+    try {
+      line = execFileSync('ps', ['-ww', '-o', 'command=', '-p', String(pid)], { encoding: 'utf8' })
+    } catch {
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      continue
+    }
 
     if (line.includes(entrypoint) && line.includes('serve')) {
       return line.trim()
@@ -439,6 +491,30 @@ test('pidIsOurDashboard rejects a malformed ownership ID without probing the pro
   const ssh = fakeSsh([])
   assert.equal(await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, '/x/hermes', 'not-hex'), false)
   assert.deepEqual(ssh.calls, [])
+})
+
+test('pidIsOurDashboard fails closed when the ps fallback cannot read a process', async () => {
+  const ssh = psFallbackSsh()
+
+  try {
+    assert.equal(await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, '/x/hermes', OWNERSHIP_ID), false)
+  } finally {
+    ssh.cleanup()
+  }
+})
+
+test('pidIsOurDashboard rejects a shell whose flattened ps line contains the ownership arguments', async () => {
+  const tokenFilePath = `${ownershipDirectory(OWNERSHIP_ID).replace(/^~/, os.homedir())}/${SPAWN_NONCE}.token`
+
+  const ssh = psFallbackSsh(
+    `/bin/sh -c /x/venv/bin/hermes serve --isolated --host 127.0.0.1 --port 0 --ssh-session-token-file ${tokenFilePath} --ssh-owner-nonce ${SPAWN_NONCE}`
+  )
+
+  try {
+    assert.equal(await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, '/x/.local/bin/hermes', OWNERSHIP_ID), false)
+  } finally {
+    ssh.cleanup()
+  }
 })
 
 test('cleanupStale kills ONLY a provably-ours pid, always drops the lockfile', async () => {

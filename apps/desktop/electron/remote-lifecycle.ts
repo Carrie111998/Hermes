@@ -389,9 +389,13 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '', ownershi
       'try:\n' +
       ' raw=open(f"/proc/{pid}/cmdline","rb").read()\n' +
       ' args=[x.decode("utf-8","surrogateescape") for x in raw.split(b"\\0") if x]\n' +
+      ' argv_exact=True\n' +
       'except OSError:\n' +
-      ' line=subprocess.check_output(["ps","-ww","-o","command=","-p",str(pid)],text=True).strip()\n' +
-      ' args=shlex.split(line)\n' +
+      ' argv_exact=False\n' +
+      ' try:\n' +
+      '  line=subprocess.check_output(["ps","-ww","-o","command=","-p",str(pid)],text=True).strip()\n' +
+      '  args=shlex.split(line)\n' +
+      ' except (OSError,subprocess.SubprocessError,ValueError):args=[]\n' +
       'ok=False\n' +
       'try:\n' +
       ' serve=args.index("serve")\n' +
@@ -400,7 +404,7 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '', ownershi
       ' python_entry=len(args)>1 and args[1]==expected and os.path.basename(args[0]).startswith("python")\n' +
       ' executable_match=direct or python_entry\n' +
       ' wrapper_owned=False\n' +
-      ' if tokenfile:\n' +
+      ' if tokenfile and argv_exact:\n' +
       '  try:\n' +
       '   token=args.index("--ssh-session-token-file",serve+1)\n' +
       '   host=args.index("--host",serve+1)\n' +
