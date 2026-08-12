@@ -10,6 +10,8 @@ import ipaddress
 import json
 import logging
 import os
+import tempfile
+import threading
 import re
 import time
 from pathlib import Path
@@ -1417,6 +1419,39 @@ def _get_context_cache_path() -> Path:
     return get_hermes_home() / "context_length_cache.yaml"
 
 
+# Serializes read-modify-write of the persistent cache. Concurrent metadata
+# fetches (gateway multiplex) previously raced on `open(path, "w")`: two
+# writers could lose each other's updates or interleave a partial YAML dump.
+# (#84735)
+_context_cache_lock = threading.Lock()
+
+
+def _save_context_cache_atomic(cache: Dict[str, int]) -> None:
+    """Write the cache to a sibling temp file and atomically replace it.
+
+    ``open(path, "w")`` truncates in place: a crash mid-dump leaves a
+    corrupt/partial YAML that makes every subsequent load return {} and
+    re-probe providers. The replace is atomic on the same filesystem.
+    """
+    path = _get_context_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=".context_length_cache-",
+        suffix=".yaml.tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml.dump({"context_lengths": cache}, f, default_flow_style=False)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _load_context_cache() -> Dict[str, int]:
     """Load the model+provider -> context_length cache from disk."""
     path = _get_context_cache_path()
@@ -1448,18 +1483,16 @@ def save_context_length(model: str, base_url: str, length: int) -> None:
     different providers can have different limits.
     """
     key = _context_cache_key(model, base_url)
-    cache = _load_context_cache()
-    if cache.get(key) == length:
-        return  # already stored
-    cache[key] = length
-    path = _get_context_cache_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.dump({"context_lengths": cache}, f, default_flow_style=False)
-        logger.info("Cached context length %s -> %s tokens", key, f"{length:,}")
-    except Exception as e:
-        logger.debug("Failed to save context length cache: %s", e)
+    with _context_cache_lock:
+        cache = _load_context_cache()
+        if cache.get(key) == length:
+            return  # already stored
+        cache[key] = length
+        try:
+            _save_context_cache_atomic(cache)
+            logger.info("Cached context length %s -> %s tokens", key, f"{length:,}")
+        except Exception as e:
+            logger.debug("Failed to save context length cache: %s", e)
 
 
 def get_cached_context_length(model: str, base_url: str) -> Optional[int]:
@@ -1497,17 +1530,16 @@ def _invalidate_cached_context_length(model: str, base_url: str) -> None:
     # form, and the slashed legacy form — same set get_cached_context_length
     # consults, so a lookup can never resurrect a row invalidation missed.
     stale_keys = {key, f"{model}@{base_url}", f"{key}/"}
-    if not any(k in cache for k in stale_keys):
-        return
-    for k in stale_keys:
-        cache.pop(k, None)
-    path = _get_context_cache_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.dump({"context_lengths": cache}, f, default_flow_style=False)
-    except Exception as e:
-        logger.debug("Failed to invalidate context length cache entry %s: %s", key, e)
+    with _context_cache_lock:
+        cache = _load_context_cache()
+        if not any(k in cache for k in stale_keys):
+            return
+        for k in stale_keys:
+            cache.pop(k, None)
+        try:
+            _save_context_cache_atomic(cache)
+        except Exception as e:
+            logger.debug("Failed to invalidate context length cache entry %s: %s", key, e)
 
 
 def get_next_probe_tier(current_length: int) -> Optional[int]:

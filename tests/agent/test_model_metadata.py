@@ -1389,3 +1389,58 @@ class TestFallbackWarning:
             if r.levelno == logging.WARNING and "falling back" in r.getMessage()
         ]
         assert len(fallback_warnings) == 0
+
+
+# =========================================================================
+# Persistent context cache: atomic writes + write serialization
+# =========================================================================
+
+class TestContextCacheAtomicity:
+    """Regression for #84735: the persistent context-length cache was written
+    with open(path, "w") — no lock, no atomic replace — so concurrent writers
+    (gateway multiplex) lost each other's updates and a crash mid-dump left a
+    corrupt YAML."""
+
+    def test_concurrent_writes_lose_no_updates(self, tmp_path, monkeypatch):
+        import threading
+
+        import yaml
+
+        import agent.model_metadata as mm
+
+        cache_path = tmp_path / "context_length_cache.yaml"
+        monkeypatch.setattr(mm, "_get_context_cache_path", lambda: cache_path)
+
+        def _write(i):
+            mm.save_context_length(f"model-{i}", "http://x/v1", 1000 + i)
+
+        threads = [threading.Thread(target=_write, args=(i,)) for i in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+
+        cache = mm._load_context_cache()
+        assert len(cache) == 10, (
+            f"lost updates under concurrency: {len(cache)}/10 keys present"
+        )
+        for i in range(10):
+            assert cache[f"model-{i}@http://x/v1"] == 1000 + i
+
+        # Atomic replace: no staging leftovers, file parses cleanly.
+        leftovers = [p.name for p in tmp_path.iterdir() if ".context_length_cache-" in p.name]
+        assert leftovers == []
+        data = yaml.safe_load(cache_path.read_text(encoding="utf-8"))
+        assert set(data["context_lengths"]) == set(cache)
+
+    def test_invalidate_persists_remaining_entries(self, tmp_path, monkeypatch):
+        import agent.model_metadata as mm
+
+        cache_path = tmp_path / "context_length_cache.yaml"
+        monkeypatch.setattr(mm, "_get_context_cache_path", lambda: cache_path)
+        mm.save_context_length("keep", "http://x/v1", 1000)
+        mm.save_context_length("drop", "http://x/v1", 2000)
+        mm._invalidate_cached_context_length("drop", "http://x/v1")
+        cache = mm._load_context_cache()
+        assert "drop@http://x/v1" not in cache
+        assert cache["keep@http://x/v1"] == 1000
