@@ -3404,6 +3404,17 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                     user_config.pop("max_turns", None)
 
                 config = _deep_merge(config, user_config)
+                user_moa = user_config.get("moa")
+                if isinstance(user_moa, dict):
+                    from hermes_cli.moa_config import (
+                        unshadow_flat_moa_after_default_merge,
+                        user_wrote_flat_moa_without_presets,
+                    )
+
+                    if user_wrote_flat_moa_without_presets(user_moa):
+                        merged_moa = config.get("moa")
+                        if isinstance(merged_moa, dict):
+                            unshadow_flat_moa_after_default_merge(merged_moa)
             except Exception as e:
                 # Last-known-good fallback (port of openai/codex#31188's
                 # invariant: a parse failure in a policy/config file must not

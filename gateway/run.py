@@ -15734,6 +15734,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 execute=_do_reset,
             )
 
+        if canonical == "end":
+            # /end: rewrite the turn to a session-closeout prompt and fall
+            # through to normal agent processing. The session-closeout skill
+            # (loaded by the agent) handles worklog, memory, and summary.
+            event.text = (
+                "End this session. Run the standard session closeout procedure: "
+                "log meaningful work to the HQ worklog, update memory with any "
+                "new durable facts, and give me a session summary."
+            )
+            # fall through to agent processing
+
         if canonical == "topic":
             return await self._handle_topic_command(event)
         

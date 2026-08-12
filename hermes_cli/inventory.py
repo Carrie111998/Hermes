@@ -645,16 +645,9 @@ def _raw_config_has_enabled_moa_preset() -> bool:
                 return True
         return False
 
-    legacy_keys = {
-        "reference_models",
-        "aggregator",
-        "reference_temperature",
-        "aggregator_temperature",
-        "max_tokens",
-        "reference_max_tokens",
-        "fanout",
-    }
-    return any(key in moa for key in legacy_keys) and bool(moa.get("enabled", True))
+    from hermes_cli.moa_config import user_has_flat_moa_legacy_fields
+
+    return user_has_flat_moa_legacy_fields(moa)
 
 
 def _apply_picker_hints(rows: list[dict]) -> None:

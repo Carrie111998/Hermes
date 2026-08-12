@@ -24,6 +24,55 @@ DEFAULT_MOA_AGGREGATOR: dict[str, str] = {
 DEFAULT_MOA_REFERENCE_TIMEOUT: float | None = None
 
 
+
+DEFAULT_MOA_REFERENCE_TIMEOUT: float | None = None
+
+# Top-level ``moa`` keys that indicate a legacy flat (pre-preset) config shape.
+# Shared by load_config() unshadowing (#82726) and inventory explicit-MoA checks.
+MOA_FLAT_LEGACY_KEYS = frozenset(
+    {
+        "reference_models",
+        "aggregator",
+        "reference_temperature",
+        "aggregator_temperature",
+        "max_tokens",
+        "reference_max_tokens",
+        "fanout",
+    }
+)
+
+
+def user_has_flat_moa_legacy_fields(moa: Any) -> bool:
+    """Return True when *moa* looks like a legacy flat MoA block."""
+    if not isinstance(moa, dict):
+        return False
+    return any(key in moa for key in MOA_FLAT_LEGACY_KEYS) and bool(
+        moa.get("enabled", True)
+    )
+
+
+def user_wrote_flat_moa_without_presets(moa: Any) -> bool:
+    """Return True when the user's raw ``moa`` section is flat, not preset-based."""
+    if not isinstance(moa, dict):
+        return False
+    presets = moa.get("presets")
+    if isinstance(presets, dict) and presets:
+        return False
+    return user_has_flat_moa_legacy_fields(moa)
+
+
+def unshadow_flat_moa_after_default_merge(merged_moa: dict[str, Any]) -> None:
+    """Drop inherited ``presets`` so ``normalize_moa_config()`` can use flat fields.
+
+    ``load_config()`` deep-merges ``DEFAULT_CONFIG`` (which seeds
+    ``moa.presets.default``) before normalization. A user who only wrote legacy
+    flat fields therefore ends up with BOTH inherited presets and their flat
+    overrides; ``normalize_moa_config()`` sees presets and never reaches its
+    flat-compat branch (#82726).
+    """
+    merged_moa.pop("presets", None)
+
+
 def _default_reference_models() -> list[dict[str, Any]]:
     return [{**slot, "enabled": True} for slot in deepcopy(DEFAULT_MOA_REFERENCE_MODELS)]
 

@@ -10354,6 +10354,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             ) is None:
                 return True  # confirmation cancelled — command handled, keep REPL alive
             self.new_session(title=title)
+        elif canonical == "end":
+            # /end: inject a session-closeout prompt that triggers the
+            # session-closeout skill (worklog + memory + summary).
+            self._pending_input.put(
+                "End this session. Run the standard session closeout procedure: "
+                "log meaningful work to the HQ worklog, update memory with any "
+                "new durable facts, and give me a session summary."
+            )
         elif canonical == "resume":
             self._handle_resume_command(cmd_original)
         elif canonical == "sessions":

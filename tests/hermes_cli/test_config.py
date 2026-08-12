@@ -1410,6 +1410,108 @@ class TestProviderEnabledRuntimeGate:
             resolve_runtime_provider(requested="my-fork")
 
 
+class TestLoadConfigFlatMoa:
+    """Regression for #82726: flat ``moa`` fields must not be shadowed by defaults."""
+
+    def test_flat_moa_config_becomes_default_preset_via_load_config(self, tmp_path):
+        from hermes_cli.moa_config import resolve_moa_preset
+
+        yaml_text = """moa:
+  reference_models:
+    - provider: myprov
+      model: my-reference-a
+    - provider: myprov
+      model: my-reference-b
+  aggregator:
+    provider: myprov
+    model: my-aggregator
+"""
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            (tmp_path / "config.yaml").write_text(yaml_text, encoding="utf-8")
+            cfg = load_config()
+            preset = resolve_moa_preset(cfg.get("moa") or {})
+
+            refs = [f"{slot['provider']}/{slot['model']}" for slot in preset["reference_models"]]
+            agg = preset["aggregator"]
+            assert refs == ["myprov/my-reference-a", "myprov/my-reference-b"]
+            assert f"{agg['provider']}/{agg['model']}" == "myprov/my-aggregator"
+
+    def test_explicit_moa_presets_keep_builtin_models(self, tmp_path):
+        from hermes_cli.moa_config import DEFAULT_MOA_AGGREGATOR, DEFAULT_MOA_REFERENCE_MODELS, resolve_moa_preset
+
+        yaml_text = """moa:
+  presets:
+    custom:
+      reference_models:
+        - provider: custom-prov
+          model: custom-ref
+      aggregator:
+        provider: custom-prov
+        model: custom-agg
+  default_preset: custom
+"""
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            (tmp_path / "config.yaml").write_text(yaml_text, encoding="utf-8")
+            preset = resolve_moa_preset(load_config().get("moa") or {}, "custom")
+            assert preset["reference_models"][0]["model"] == "custom-ref"
+            assert preset["aggregator"]["model"] == "custom-agg"
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            (tmp_path / "config.yaml").write_text('model: ""\n', encoding="utf-8")
+            preset = resolve_moa_preset(load_config().get("moa") or {})
+            assert preset["reference_models"][0]["model"] == DEFAULT_MOA_REFERENCE_MODELS[0]["model"]
+            assert preset["aggregator"]["model"] == DEFAULT_MOA_AGGREGATOR["model"]
+
+    def test_flat_and_presets_together_keep_user_presets(self, tmp_path):
+        from hermes_cli.moa_config import resolve_moa_preset
+
+        yaml_text = """moa:
+  reference_models:
+    - provider: flat-prov
+      model: flat-ref
+  aggregator:
+    provider: flat-prov
+    model: flat-agg
+  presets:
+    named:
+      reference_models:
+        - provider: named-prov
+          model: named-ref
+      aggregator:
+        provider: named-prov
+        model: named-agg
+  default_preset: named
+"""
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            (tmp_path / "config.yaml").write_text(yaml_text, encoding="utf-8")
+            preset = resolve_moa_preset(load_config().get("moa") or {}, "named")
+            assert preset["reference_models"][0]["model"] == "named-ref"
+            assert preset["aggregator"]["model"] == "named-agg"
+
+    def test_flat_moa_with_enabled_false_keeps_inherited_presets(self, tmp_path):
+        """``enabled: false`` opts out of flat legacy detection — presets stay."""
+        from hermes_cli.moa_config import (
+            DEFAULT_MOA_AGGREGATOR,
+            DEFAULT_MOA_REFERENCE_MODELS,
+            resolve_moa_preset,
+        )
+
+        yaml_text = """moa:
+  enabled: false
+  reference_models:
+    - provider: myprov
+      model: my-reference-a
+  aggregator:
+    provider: myprov
+    model: my-aggregator
+"""
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            (tmp_path / "config.yaml").write_text(yaml_text, encoding="utf-8")
+            preset = resolve_moa_preset(load_config().get("moa") or {})
+            assert preset["reference_models"][0]["model"] == DEFAULT_MOA_REFERENCE_MODELS[0]["model"]
+            assert preset["aggregator"]["model"] == DEFAULT_MOA_AGGREGATOR["model"]
+
+
 # ---------------------------------------------------------------------------
 # DEFAULT_CONFIG must not carry a duplicate "kanban" key
 # ---------------------------------------------------------------------------
