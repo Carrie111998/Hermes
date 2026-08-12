@@ -407,6 +407,51 @@ test.runIf(process.platform !== 'win32')('pidIsOurDashboard does not trust a tex
   }
 })
 
+test.runIf(process.platform !== 'win32')('pidIsOurDashboard rejects a group-writable direct-wrapper entrypoint', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'hermes-ownership-direct-wrapper-'))
+  const entrypoint = join(directory, 'hermes-entrypoint')
+  const wrapperPath = join(directory, 'hermes')
+  let ownershipChecks = 0
+
+  try {
+    await writeFile(entrypoint, '')
+    await chmod(entrypoint, 0o755)
+    await writeFile(
+      wrapperPath,
+      [
+        '#!/usr/bin/env bash',
+        'unset PYTHONPATH',
+        'unset PYTHONHOME',
+        `exec "${entrypoint}" "$@"`
+      ].join('\n')
+    )
+    await chmod(wrapperPath, 0o700)
+
+    const ssh = {
+      async exec(command: string) {
+        if (command.includes('PROCESS_PATH=')) {
+          return (await execFile('/bin/sh', ['-c', command])).stdout
+        }
+
+        ownershipChecks += 1
+
+        return 'FOREIGN\n'
+      }
+    }
+
+    assert.equal(await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, wrapperPath), false)
+    assert.equal(ownershipChecks, 1)
+
+    await chmod(entrypoint, 0o775)
+    ownershipChecks = 0
+
+    assert.equal(await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, wrapperPath), false)
+    assert.equal(ownershipChecks, 0)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test.runIf(process.platform !== 'win32')('pidIsOurDashboard accepts a canonical wrapper using a uv-venv Python symlink', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'hermes-ownership-uv-venv-'))
   const venvPath = join(directory, '.venv')
