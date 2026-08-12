@@ -44,9 +44,6 @@ Example config::
                               # MCP over POST. Default: false.
       pipedream_google_sheets:
         auth: evaos_lease     # managed in-memory evaOS lease; no static URL
-        customer_id: customer-fixture
-        agent_runtime: hermes
-        agent_id: profile-agent
         app_slug: google_sheets
       searxng:
         url: "http://localhost:8000/sse"
@@ -1935,8 +1932,8 @@ class MCPServerTask:
         self._was_parked: bool = False
         self._auth_type: str = ""
         # Managed Pipedream credentials remain in this in-memory lease manager
-        # across transport reconnects. The broker secret is never retained
-        # here; the source rereads it only for a mint.
+        # across transport reconnects. Neither the broker secret nor provider
+        # grant is retained here; the source rereads them only for a mint.
         self._evaos_lease_manager: Optional[Any] = None
         self._evaos_lease_auth: Optional[Any] = None
         self._evaos_lease_warning_emitted = False
@@ -2001,7 +1998,7 @@ class MCPServerTask:
         if conflicting or config.get("ssl_verify") is False:
             raise EvaosLeaseError(
                 "managed MCP config may specify only root-configured "
-                "profile identity plus non-credential runtime options"
+                "app identity plus non-credential runtime options"
             )
         app_slug = config.get("app_slug")
         if (
@@ -2009,36 +2006,15 @@ class MCPServerTask:
             or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", app_slug) is None
         ):
             raise EvaosLeaseError("managed MCP app slug is invalid")
-        thin_keys = {"external_user_id", "account_id"} & set(config)
-        if thin_keys:
-            external_user_id = config.get("external_user_id")
-            account_id = config.get("account_id")
-            if (
-                not isinstance(external_user_id, str)
-                or re.fullmatch(r"acct_[A-Za-z0-9._:-]+_profile_[A-Za-z0-9._:-]+", external_user_id) is None
-                or not isinstance(account_id, str)
-                or re.fullmatch(r"apn_[A-Za-z0-9_-]+", account_id) is None
-            ):
-                raise EvaosLeaseError("managed MCP thin identity is invalid")
-            return
-        for key, pattern, label in (
-            ("customer_id", r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", "customer"),
-            ("agent_id", r"[A-Za-z0-9_-]{1,120}", "agent"),
-        ):
-            value = config.get(key)
-            if value is not None and (
-                not isinstance(value, str) or re.fullmatch(pattern, value) is None
-            ):
-                raise EvaosLeaseError(f"managed MCP {label} identity is invalid")
-        if config.get("agent_runtime") not in (None, "hermes"):
-            raise EvaosLeaseError("managed MCP agent runtime is invalid")
 
     def _warn_evaos_lease_failure(self, exc: Exception) -> None:
         if self._evaos_lease_warning_emitted:
             return
         self._evaos_lease_warning_emitted = True
-        logger.warning("MCP server '%s' profile '%s': managed Pipedream lease mint failed: %s",
-                       self.name, self.registration_home, exc)
+        logger.warning(
+            "MCP server '%s' profile '%s': managed Pipedream lease mint failed: %s",
+            self.name, Path(self.registration_home).name, exc,
+        )
 
     def _advertises_tools(self) -> bool:
         """Whether the server advertises the ``tools`` capability.
@@ -2891,8 +2867,8 @@ class MCPServerTask:
 
             if self._evaos_lease_manager is None:
                 source = EvaosLeaseSource(
-                    profile_key=self.registration_home, app_slug=config["app_slug"],
-                    **{k: config[k] for k in ("external_user_id", "account_id", "customer_id", "agent_runtime", "agent_id") if k in config},
+                    profile_key=self.registration_home,
+                    app_slug=config["app_slug"],
                 )
                 self._evaos_lease_manager = EvaosLeaseManager(
                     source=source, on_mint_failure=self._warn_evaos_lease_failure

@@ -1,14 +1,15 @@
-"""Managed evaOS authentication for native Pipedream MCP transports.
+"""Managed evaOS authentication for Pipedream MCP transports.
 
-The desktop runtime receives only a short-lived MCP token response.  The
-deployment broker secret and exact customer / Hermes agent / app identity come
-from root-owned service configuration.  They are never persisted in the
-manager, included in errors, or exposed to MCP tool/model surfaces.
+The desktop runtime receives only a short-lived MCP lease.  The deployment
+broker secret and profile-scoped per-app provider grant are read from
+root-owned files only while minting that lease.  They are never persisted in
+the manager, included in errors, or exposed to MCP tool/model surfaces.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import stat
@@ -23,6 +24,7 @@ import httpx
 
 _APP_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _ACCOUNT_ID_RE = re.compile(r"^apn_[A-Za-z0-9_-]+$")
+_GRANT_HANDLE_RE = re.compile(r"^[A-Za-z0-9._~:-]{16,512}$")
 _CREDENTIAL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _LEASE_ENDPOINT_PATH = "/functions/v1/desktop-runtime-session"
 _MCP_ORIGIN = ("https", "remote.mcp.pipedream.net")
@@ -46,12 +48,8 @@ class EvaosLeaseError(RuntimeError):
 class _LeaseSourceMaterial:
     endpoint: str
     broker_secret: str
+    provider_grant: str
     app_slug: str
-    external_user_id: Optional[str] = None
-    account_id: Optional[str] = None
-    customer_id: Optional[str] = None
-    agent_runtime: Optional[str] = None
-    agent_id: Optional[str] = None
 
 
 @dataclass(frozen=True, repr=False)
@@ -86,19 +84,21 @@ def _default_profile_resolver() -> str:
     return str(get_hermes_home().expanduser().resolve())
 
 
+def _reject_duplicate_pairs(pairs):
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError("duplicate provider grant key")
+    return result
+
+
 class EvaosLeaseSource:
-    """Resolve one profile's root-configured native Pipedream route."""
+    """Resolve the current profile's broker secret and selected app grant."""
 
     def __init__(
         self,
         *,
         profile_key: str,
         app_slug: str,
-        external_user_id: Optional[str] = None,
-        account_id: Optional[str] = None,
-        customer_id: Optional[str] = None,
-        agent_runtime: Optional[str] = None,
-        agent_id: Optional[str] = None,
         secret_reader: Optional[Callable[[str], Optional[str]]] = None,
         profile_resolver: Optional[Callable[[], str]] = None,
         root_uid: int = 0,
@@ -109,12 +109,7 @@ class EvaosLeaseSource:
         if not isinstance(app_slug, str) or not _APP_SLUG_RE.fullmatch(app_slug):
             raise EvaosLeaseError("managed MCP app slug is invalid")
         self._profile_key = profile_key
-        self._app_slug, self._external_user_id, self._account_id = (
-            app_slug, external_user_id, account_id
-        )
-        self._customer_id = customer_id
-        self._agent_runtime = agent_runtime
-        self._agent_id = agent_id
+        self._app_slug = app_slug
         self._secret_reader = secret_reader or _default_secret_reader
         self._profile_resolver = profile_resolver or _default_profile_resolver
         self._root_uid = root_uid
@@ -132,8 +127,7 @@ class EvaosLeaseSource:
     def __repr__(self) -> str:
         return (
             "EvaosLeaseSource("
-            f"profile_key={self._profile_key!r}, "
-            f"app_slug={self._app_slug!r}, thin={self._external_user_id is not None})"
+            f"profile_key={self._profile_key!r}, app_slug={self._app_slug!r})"
         )
 
     def _setting(self, name: str) -> str:
@@ -271,6 +265,30 @@ class EvaosLeaseSource:
             raise EvaosLeaseError("managed MCP broker secret file is malformed")
         return value
 
+    def _provider_grant(self) -> str:
+        raw = self._secure_file_text(
+            self._setting("PIPEDREAM_PROVIDER_GRANT_FILE"),
+            label="managed MCP provider grant file",
+        )
+        try:
+            grant_map = json.loads(raw, object_pairs_hook=_reject_duplicate_pairs)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise EvaosLeaseError("managed MCP provider grant map is malformed") from exc
+        if not isinstance(grant_map, dict) or not grant_map:
+            raise EvaosLeaseError("managed MCP provider grant map is malformed")
+        if any(
+            not isinstance(app_slug, str)
+            or not _APP_SLUG_RE.fullmatch(app_slug)
+            or not isinstance(handle, str)
+            or not _GRANT_HANDLE_RE.fullmatch(handle)
+            for app_slug, handle in grant_map.items()
+        ):
+            raise EvaosLeaseError("managed MCP provider grant map is malformed")
+        selected = grant_map.get(self._app_slug)
+        if selected is None:
+            raise EvaosLeaseError("managed MCP provider grant is unavailable")
+        return selected
+
     def read(self) -> _LeaseSourceMaterial:
         try:
             current_profile = self._profile_resolver()
@@ -279,9 +297,10 @@ class EvaosLeaseSource:
         if current_profile != self._profile_key:
             raise EvaosLeaseError("managed MCP profile authority changed")
         return _LeaseSourceMaterial(
-            self._endpoint(), self._broker_secret(), self._app_slug,
-            self._external_user_id, self._account_id, self._customer_id,
-            self._agent_runtime, self._agent_id,
+            endpoint=self._endpoint(),
+            broker_secret=self._broker_secret(),
+            provider_grant=self._provider_grant(),
+            app_slug=self._app_slug,
         )
 
 
@@ -365,31 +384,15 @@ class EvaosLeaseManager:
             return minted
 
     async def _mint(self, material: _LeaseSourceMaterial) -> EvaosMcpLease:
-        thin = material.external_user_id is not None and material.account_id is not None
-        if not thin and not all(
-            (material.customer_id, material.agent_runtime, material.agent_id)
-        ):
-            raise EvaosLeaseError("managed MCP profile-scoped configuration is incomplete")
         request_headers = {
             "Content-Type": "application/json",
             "X-Evaos-Desktop-Broker-Secret": material.broker_secret,
+            "X-Evaos-Provider-Grant": material.provider_grant,
         }
-        request_body = (
-            {
-                "action": "mint_connect_token",
-                "app_slug": material.app_slug,
-                "external_user_id": material.external_user_id,
-                "account_id": material.account_id,
-            }
-            if thin
-            else {
-                "action": "pipedream_mcp_lease",
-                "customer_id": material.customer_id,
-                "agent_runtime": material.agent_runtime,
-                "agent_id": material.agent_id,
-                "app_slug": material.app_slug,
-            }
-        )
+        request_body = {
+            "action": "pipedream_mcp_lease",
+            "app_slug": material.app_slug,
+        }
         try:
             response = await self._transport(
                 material.endpoint, request_headers, request_body
@@ -399,7 +402,7 @@ class EvaosLeaseManager:
         status_code = getattr(response, "status_code", None)
         if status_code != 200:
             if status_code == 401:
-                message = "managed MCP broker authentication was rejected"
+                message = "managed MCP broker or provider grant was rejected"
             elif status_code == 403:
                 message = "managed MCP profile authority is no longer valid"
             elif status_code == 400:
@@ -413,42 +416,11 @@ class EvaosLeaseManager:
             payload = response.json()
         except Exception as exc:
             raise EvaosLeaseError("managed MCP lease response is malformed") from exc
-        return self._parse_lease(
-            payload,
-            expected_app_slug=material.app_slug,
-            expected_external_user_id=material.external_user_id,
-            expected_account_id=material.account_id,
-        )
+        return self._parse_lease(payload, expected_app_slug=material.app_slug)
 
     def _parse_lease(
-        self,
-        payload: Any,
-        *,
-        expected_app_slug: str,
-        expected_external_user_id: Optional[str] = None,
-        expected_account_id: Optional[str] = None,
+        self, payload: Any, *, expected_app_slug: str
     ) -> EvaosMcpLease:
-        if isinstance(payload, dict) and set(payload) == {
-            "token", "expires_at", "project_id", "environment"
-        }:
-            thin_values = [payload.get(k) for k in ("token", "project_id", "environment")]
-            if (
-                expected_external_user_id is None
-                or expected_account_id is None
-                or not all(isinstance(v, str) and v.strip() and "\r" not in v and "\n" not in v for v in thin_values)
-            ):
-                raise EvaosLeaseError("managed MCP lease response is malformed")
-            payload = {
-                "mcp_url": "https://remote.mcp.pipedream.net/v3",
-                "headers": dict(zip(
-                    ("Authorization", "x-pd-project-id", "x-pd-environment",
-                     "x-pd-external-user-id", "x-pd-app-slug", "x-pd-account-id"),
-                    (f"Bearer {payload['token']}", payload["project_id"],
-                     payload["environment"], expected_external_user_id,
-                     expected_app_slug, expected_account_id),
-                )),
-                "expires_at": payload["expires_at"],
-            }
         if not isinstance(payload, dict) or set(payload) != {
             "mcp_url",
             "headers",
