@@ -140,9 +140,11 @@ class AcmeProfile(ProviderProfile):
         """Live catalog fetch. Default hits {models_url or base_url}/models with
         Bearer auth. Override for: custom auth (Anthropic), no REST endpoint
         (Bedrock → None), or public/unauthenticated catalogs (OpenRouter).
-        
-        Third-party plugins that override with a narrower signature (api_key/timeout only)
-        are auto-detected via signature inspection and called without base_url."""
+
+        Hermes inspects whether the override accepts base_url (or **kwargs)
+        before calling — single call; an internal TypeError is not masked.
+        Narrower third-party signatures (api_key/timeout only) are called
+        without base_url."""
         return super().fetch_models(api_key=api_key, base_url=base_url, timeout=timeout)
 ```
 

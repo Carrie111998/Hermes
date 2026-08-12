@@ -139,9 +139,11 @@ class AcmeProfile(ProviderProfile):
         """实时目录获取。默认使用 Bearer 认证访问 {models_url or base_url}/models。
         以下情况需覆盖：自定义认证（Anthropic）、无 REST 端点（Bedrock → None），
         或公开/无认证目录（OpenRouter）。
-        
-        使用较窄签名（仅 api_key/timeout）覆盖的第三方插件会通过签名检查自动检测，
-        并在调用时不传递 base_url。"""
+
+        Hermes 在调用前通过 inspect.signature 检查覆盖是否接受 base_url
+        （或 **kwargs）——只调用一次；合规实现内部抛出的 TypeError 不会被
+        重试或掩盖。较窄签名（仅 api_key/timeout）的第三方覆盖在调用时不传递
+        base_url。"""
         return super().fetch_models(api_key=api_key, base_url=base_url, timeout=timeout)
 ```
 
