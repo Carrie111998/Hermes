@@ -96,6 +96,7 @@ class AutomationBlueprint:
     slots: List[BlueprintSlot] = field(default_factory=list)
     deliver_default: str = "origin"
     skills: tuple = ()        # skills the job loads before running
+    script: Optional[str] = None  # optional cron-side data collection script
     tags: tuple = ()
 
 
@@ -127,11 +128,16 @@ CATALOG: List[AutomationBlueprint] = [
         schedule_template="{minute} {hour} * * *",
         prompt_template=(
             "Produce a concise morning briefing for the user: today's calendar "
-            "events, the local weather, and any urgent items. Keep it short and "
-            "scannable. If no data sources are connected, give a brief "
-            "good-morning with the date and offer to connect calendar/email."
+            "events, the weather data supplied by the pre-run section, and any "
+            "urgent items. Keep it short and scannable. Do not use terminal, "
+            "curl, or another network command to retrieve weather. If the "
+            "pre-run section says WEATHER_UNAVAILABLE, say weather is "
+            "unavailable and continue with the rest of the briefing. If no "
+            "data sources are connected, give a brief good-morning with the "
+            "date and offer to connect calendar/email."
         ),
         slots=[_TIME("08:00"), _DELIVER],
+        script="builtin:morning-brief-weather",
         tags=("daily", "briefing"),
     ),
     AutomationBlueprint(
@@ -708,6 +714,8 @@ def fill_blueprint(
     }
     if blueprint.skills:
         spec["skills"] = list(blueprint.skills)
+    if blueprint.script:
+        spec["script"] = blueprint.script
     if origin is not None:
         spec["origin"] = origin
     return spec

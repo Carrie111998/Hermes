@@ -1979,6 +1979,25 @@ _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 _RUN_CLAIM_HEARTBEAT_SECONDS = 60.0
 
 
+def _run_builtin_cron_script(script_path: str) -> Optional[tuple[bool, str]]:
+    """Run a vetted in-process cron data source when one is requested.
+
+    Built-ins are explicit allowlisted values, not arbitrary import paths. They
+    are used for data collection that must happen outside the agent/tool
+    approval loop while preserving the ordinary script output contract.
+    """
+
+    if script_path != "builtin:morning-brief-weather":
+        return None
+    try:
+        from cron.weather import fetch_morning_brief_weather
+
+        return True, fetch_morning_brief_weather()
+    except Exception:  # pragma: no cover - final fail-safe
+        logger.warning("Built-in morning weather collection failed", exc_info=True)
+        return True, "WEATHER_UNAVAILABLE: internal weather collector failed"
+
+
 def _get_script_timeout() -> int:
     """Resolve cron pre-run script timeout from module/env/config with a safe default."""
     if _SCRIPT_TIMEOUT != _DEFAULT_SCRIPT_TIMEOUT:
@@ -2043,6 +2062,10 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         (success, output) — on failure *output* contains the error message so the
         LLM can report the problem to the user.
     """
+    builtin_result = _run_builtin_cron_script(script_path)
+    if builtin_result is not None:
+        return builtin_result
+
     scripts_dir = _get_hermes_home() / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
     scripts_dir_resolved = scripts_dir.resolve()

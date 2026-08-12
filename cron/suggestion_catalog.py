@@ -49,15 +49,19 @@ CATALOG: List[CatalogEntry] = [
         job_spec={
             "prompt": (
                 "Produce a concise morning briefing for the user: today's "
-                "calendar events, the local weather, and any urgent items "
-                "(unread important email, due tasks). Keep it short and "
-                "scannable. If you have no connected data sources, give a brief "
-                "general good-morning with the date and offer to connect "
-                "calendar/email."
+                "calendar events, the weather data supplied by the pre-run "
+                "section, and any urgent items (unread important email, due "
+                "tasks). Keep it short and scannable. Do not use terminal, "
+                "curl, or another network command to retrieve weather. If the "
+                "pre-run section says WEATHER_UNAVAILABLE, say weather is "
+                "unavailable and continue. If you have no connected data "
+                "sources, give a brief general good-morning with the date and "
+                "offer to connect calendar/email."
             ),
             "schedule": "0 8 * * *",
             "name": "Daily briefing",
             "deliver": "origin",
+            "script": "builtin:morning-brief-weather",
         },
     ),
     CatalogEntry(
