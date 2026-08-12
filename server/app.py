@@ -17,6 +17,8 @@ from .auth import AuthService
 from .config import Settings
 from .crypto import CredentialCipher
 from .db import Database
+from .document_artifacts import DocumentArtifactRepository
+from .document_processing_service import DocumentProcessingService
 from .observability import configure_logging, install as install_observability, log
 from .outreach_service import OutreachService
 from .postgres import create_database
@@ -37,6 +39,13 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
     service = AuthService(database, settings)
     service.bootstrap_admin()
     run_service = AgentRunService(database, run_executor)
+    document_artifacts = DocumentArtifactRepository(database, settings.upload_dir)
+    document_processing = DocumentProcessingService(
+        document_artifacts,
+        workers=settings.document_workers,
+        timeout_seconds=settings.document_processing_timeout_seconds,
+        max_output_bytes=settings.document_output_max_bytes,
+    )
     chat_service = (ChatBridge(database, settings, run_service, agent_factory=chat_agent_factory)
                     if settings.chat_enabled else None)
     # Always constructed so tests and the CLI can drive tick() directly; only
@@ -57,6 +66,8 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         if chat_service:
             chat_service.shutdown()
         run_service.pool.shutdown(wait=False, cancel_futures=True)
+        # Before the database closes: an in-flight attempt still writes rows.
+        document_processing.shutdown()
         close = getattr(database, "close", None)
         if close:
             close()
@@ -80,6 +91,8 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         credential_key=settings.credential_key,
     )
     app.state.storage = create_storage(settings)
+    app.state.document_artifacts = document_artifacts
+    app.state.document_processing = document_processing
     app.state.lead_research = LeadResearchService(database)
     app.add_middleware(
         CORSMiddleware,

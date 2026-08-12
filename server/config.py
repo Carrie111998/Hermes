@@ -64,6 +64,12 @@ class Settings:
     digest_plan_hour: int = 8
     digest_report_hour: int = 18
     scheduler_interval_seconds: int = 300
+    # Local document processing. Behavior, not deployment wiring, so these live
+    # in config.yaml rather than the environment: an operator tunes them to the
+    # machine's cores and the size of the documents their tenants upload.
+    document_workers: int = 2
+    document_processing_timeout_seconds: int = 180
+    document_output_max_bytes: int = 50 * 1024 * 1024
 
     @classmethod
     def load(cls) -> "Settings":
@@ -109,4 +115,11 @@ class Settings:
             digest_plan_hour=min(23, max(0, int(cfg.get("digest_plan_hour", 8)))),
             digest_report_hour=min(23, max(0, int(cfg.get("digest_report_hour", 18)))),
             scheduler_interval_seconds=max(30, int(cfg.get("scheduler_interval_seconds", 300))),
+            document_workers=max(1, int(cfg.get("document_workers", 2))),
+            document_processing_timeout_seconds=max(
+                1, int(cfg.get("document_processing_timeout_seconds", 180))
+            ),
+            document_output_max_bytes=max(
+                1, int(cfg.get("document_output_max_bytes", 50 * 1024 * 1024))
+            ),
         )
