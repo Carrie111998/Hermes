@@ -4107,14 +4107,19 @@ def resolve_codex_runtime_credentials(
                 code=CODEX_RATE_LIMITED_CODE,
                 relogin_required=False,
             )
-        if read_error is not None:
+        if getattr(read_error, "code", None) == "codex_auth_missing":
+            imported = _recover_codex_tokens_from_cli("codex_auth_missing")
+            if imported:
+                data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
+        if data is None and read_error is not None:
             raise read_error
-        raise AuthError(
-            "No Codex credentials stored. Run `hermes auth` to authenticate.",
-            provider="openai-codex",
-            code="codex_auth_missing",
-            relogin_required=True,
-        )
+        if data is None:
+            raise AuthError(
+                "No Codex credentials stored. Run `hermes auth` to authenticate.",
+                provider="openai-codex",
+                code="codex_auth_missing",
+                relogin_required=True,
+            )
 
     tokens = dict(data["tokens"])
     access_token = str(tokens.get("access_token", "") or "").strip()

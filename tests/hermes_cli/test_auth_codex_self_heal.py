@@ -20,6 +20,30 @@ from hermes_cli.auth import AuthError, _refresh_codex_auth_tokens, resolve_codex
 STALE = {"access_token": "stale-access", "refresh_token": "stale-refresh"}
 
 
+def test_imports_codex_cli_credentials_when_hermes_auth_is_missing(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "auth.json").write_text(json.dumps({
+        "tokens": {
+            "access_token": "fresh-access",
+            "refresh_token": "fresh-refresh",
+        },
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    resolved = resolve_codex_runtime_credentials()
+
+    assert resolved["api_key"] == "fresh-access"
+    assert resolved["source"] == "hermes-auth-store"
+    stored = json.loads((hermes_home / "auth.json").read_text())
+    assert stored["providers"]["openai-codex"]["tokens"] == {
+        "access_token": "fresh-access",
+        "refresh_token": "fresh-refresh",
+    }
+
+
 def test_self_heals_on_stale_refresh_token(monkeypatch):
     """invalid_grant (relogin-required) → reimport from ~/.codex and persist it."""
     saved = {}
@@ -90,5 +114,4 @@ def test_self_heals_missing_singleton_access_token_from_codex_cli(tmp_path, monk
     tokens = stored["providers"]["openai-codex"]["tokens"]
     assert tokens["access_token"] == "fresh-access"
     assert tokens["refresh_token"] == "fresh-refresh"
-
 
