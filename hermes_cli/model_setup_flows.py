@@ -1522,7 +1522,19 @@ def _model_flow_named_custom(config, provider_info):
     saved_model = provider_info.get("model", "")
     provider_key = (provider_info.get("provider_key") or "").strip()
 
-    from hermes_cli.config import get_env_value
+    from hermes_cli.config import _env_ref_var_name, get_env_value
+
+    # An unresolved ``${VAR}`` / ``${env:VAR}`` config ref is a placeholder,
+    # not a credential: ``_expand_env_vars`` deliberately keeps the literal
+    # verbatim when the variable is not set, "so callers can detect them".
+    # This caller did not — the placeholder is truthy, so it was accepted as
+    # the key and sent as the bearer token, and it also shadowed the
+    # ``key_env`` fallback below. Resolve it through the same scope-aware
+    # reader instead, mirroring the ``${...}`` handling on the picker path in
+    # ``model_switch``.
+    if isinstance(api_key, str) and api_key.startswith("${") and api_key.endswith("}"):
+        ref_var = _env_ref_var_name(api_key[2:-1])
+        api_key = (get_env_value(ref_var) or "") if ref_var else ""
 
     # Resolve key from env var if api_key not set directly. Route the read
     # through ``get_env_value`` so it honours the per-profile secret scope:
