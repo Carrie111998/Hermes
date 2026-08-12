@@ -541,7 +541,13 @@ def load_cli_config() -> Dict[str, Any]:
             "seen": {},
         },
     }
-    
+    # Source the quota section from the shared DEFAULT_CONFIG (pure-data
+    # module, no import cycle) to prevent drift between the two defaults
+    # dicts.  A shallow copy is required because the merge below mutates
+    # nested sections in place.
+    from hermes_cli.config_defaults import DEFAULT_CONFIG as _DEFAULT_CONFIG
+    defaults["quota"] = dict(_DEFAULT_CONFIG.get("quota") or {})
+
     # Track whether the config file explicitly set terminal config.
     # When using defaults (no config file / no terminal section), we should NOT
     # overwrite env vars that were already set by .env -- only a user's config
