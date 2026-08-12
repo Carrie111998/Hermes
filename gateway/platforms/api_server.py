@@ -1427,6 +1427,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
+        # In-memory control objects are process-global; bind each one to the
+        # profile-local ledger that authorized its creation.
+        self._run_scopes: Dict[str, str] = {}
+        self._pending_run_ids: set[str] = set()
+        self._run_ledger_lock: Optional[asyncio.Lock] = None
+        self._run_status_lock = threading.RLock()
         # Stop is cooperative: the executor thread may outlive the HTTP request.
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
@@ -2088,6 +2094,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("POST", "/v1/runs", self._handle_runs),
+            ("GET", "/v1/runs", self._handle_lookup_run),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
@@ -3100,6 +3107,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        from gateway.run_ledger import RETENTION_SECONDS
+
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -3127,6 +3136,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
+                "run_idempotency": True,
+                "run_correlation_lookup": True,
+                "run_status_durable": True,
+                "run_stop_idempotent": True,
+                "run_status_retention_seconds": RETENTION_SECONDS,
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -3154,6 +3168,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
+                "run_lookup": {
+                    "method": "GET",
+                    "path": "/v1/runs",
+                    "correlation_header": "Idempotency-Key",
+                },
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
@@ -6369,20 +6388,130 @@ class APIServerAdapter(BasePlatformAdapter):
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
 
-    def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
+    @staticmethod
+    def _current_run_scope() -> str:
+        from hermes_constants import get_hermes_home
+
+        return str(get_hermes_home().resolve())
+
+    def _active_run_ids_for_scope(self) -> set[str]:
+        scope = self._current_run_scope()
+        return {
+            run_id
+            for run_id in self._run_scopes
+            if self._run_scopes.get(run_id) == scope
+            and (
+                run_id in self._active_run_agents
+                or run_id in self._pending_run_ids
+                or (
+                    run_id in self._active_run_tasks
+                    and not self._active_run_tasks[run_id].done()
+                )
+            )
+        }
+
+    def _update_run_status_memory(
+        self, run_id: str, status: str, **fields: Any
+    ) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
+        from gateway.run_ledger import transition_allowed
+
+        fields = dict(fields)
         now = time.time()
-        current = self._run_statuses.get(run_id, {})
-        current.update({
-            "object": "hermes.run",
-            "run_id": run_id,
-            "status": status,
-            "updated_at": now,
-        })
-        current.setdefault("created_at", fields.pop("created_at", now))
-        current.update(fields)
-        self._run_statuses[run_id] = current
+        with self._run_status_lock:
+            current = dict(self._run_statuses.get(run_id, {}))
+            if not transition_allowed(current.get("status"), status):
+                return current
+            current.update({
+                "object": "hermes.run",
+                "run_id": run_id,
+                "status": status,
+                "updated_at": now,
+            })
+            current.setdefault("created_at", fields.pop("created_at", now))
+            current.update(fields)
+            self._run_statuses[run_id] = current
+            return current
+
+    def _store_persisted_run_status(
+        self, run_id: str, persisted: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        from gateway.run_ledger import transition_allowed
+
+        with self._run_status_lock:
+            current = self._run_statuses.get(run_id, {})
+            if not transition_allowed(current.get("status"), persisted.get("status")):
+                return current
+            self._run_statuses[run_id] = persisted
+            return persisted
+
+    def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
+        """Persist status from worker callbacks without breaking execution."""
+        current = self._update_run_status_memory(run_id, status, **fields)
+        from gateway.run_ledger import update_run
+
+        try:
+            persisted = update_run(run_id, status, **fields)
+        except Exception:
+            logger.exception("[api_server] durable status update failed for %s", run_id)
+            return current
+        if persisted is not None:
+            stored = self._store_persisted_run_status(run_id, persisted)
+            # Stop is an acceptance receipt. Preserve that response snapshot
+            # when the executor races to a terminal state during persistence.
+            if status != "stopping" or current.get("status") != "stopping":
+                current = stored
         return current
+
+    async def _set_run_status_async(
+        self, run_id: str, status: str, **fields: Any
+    ) -> Dict[str, Any]:
+        """Persist status without blocking the aiohttp event loop."""
+        current = self._update_run_status_memory(run_id, status, **fields)
+        from gateway.run_ledger import update_run
+
+        try:
+            persisted = await asyncio.to_thread(update_run, run_id, status, **fields)
+        except Exception:
+            logger.exception("[api_server] durable status update failed for %s", run_id)
+            return current
+        if persisted is not None:
+            stored = self._store_persisted_run_status(run_id, persisted)
+            if status != "stopping" or current.get("status") != "stopping":
+                current = stored
+        return current
+
+    def _clear_run_memory(self, run_id: str) -> None:
+        task = self._active_run_tasks.get(run_id)
+        if task is not None and not task.done():
+            return
+        self._run_statuses.pop(run_id, None)
+        self._run_streams.pop(run_id, None)
+        self._run_streams_created.pop(run_id, None)
+        self._run_approval_sessions.pop(run_id, None)
+        self._stopping_run_ids.discard(run_id)
+        self._run_scopes.pop(run_id, None)
+        self._pending_run_ids.discard(run_id)
+
+    def _get_run_ledger_lock(self) -> asyncio.Lock:
+        if self._run_ledger_lock is None:
+            self._run_ledger_lock = asyncio.Lock()
+        return self._run_ledger_lock
+
+    async def _maintain_run_ledger_locked(self) -> None:
+        """Reconcile ownership while reservation is excluded."""
+        from gateway.run_ledger import purge_terminal_runs, recover_interrupted_runs
+
+        active = self._active_run_ids_for_scope()
+        recovered = await asyncio.to_thread(recover_interrupted_runs, active)
+        purged = await asyncio.to_thread(purge_terminal_runs)
+        for run_id in (*recovered, *purged):
+            self._clear_run_memory(run_id)
+
+    async def _maintain_run_ledger(self) -> None:
+        """Reconcile adapter ownership and enforce durable retention."""
+        async with self._get_run_ledger_lock():
+            await self._maintain_run_ledger_locked()
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
@@ -6564,6 +6693,32 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
+        idempotency_key = request.headers.get("Idempotency-Key", "").strip() or None
+        if idempotency_key is not None and len(idempotency_key) > 255:
+            return web.json_response(
+                _openai_error(
+                    "Idempotency-Key must be 255 characters or fewer.",
+                    code="invalid_idempotency_key",
+                ),
+                status=400,
+            )
+
+        fingerprint = None
+        if idempotency_key is not None:
+            fingerprint_payload = {
+                "body": body,
+                "gateway_session_key": gateway_session_key,
+            }
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    fingerprint_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
@@ -6573,9 +6728,60 @@ class APIServerAdapter(BasePlatformAdapter):
         # approval for one run must not unblock another run's dangerous command.
         approval_session_key = run_id
         ephemeral_system_prompt = instructions
+        try:
+            from gateway.run_ledger import (
+                IdempotencyConflictError,
+                reserve_run,
+            )
+
+            async with self._get_run_ledger_lock():
+                await self._maintain_run_ledger_locked()
+                durable_status, created = await asyncio.to_thread(
+                    reserve_run,
+                    run_id=run_id,
+                    idempotency_key=idempotency_key,
+                    request_fingerprint=fingerprint,
+                    data={
+                        "session_id": session_id,
+                        "model": body.get("model", self._model_name),
+                    },
+                )
+                if created:
+                    self._run_scopes[run_id] = self._current_run_scope()
+                    self._pending_run_ids.add(run_id)
+        except IdempotencyConflictError:
+            return web.json_response(
+                _openai_error(
+                    "Idempotency-Key was already used for a different run request.",
+                    code="idempotency_conflict",
+                ),
+                status=409,
+            )
+        except Exception:
+            logger.exception("[api_server] durable run reservation failed")
+            return web.json_response(
+                _openai_error(
+                    "Durable run storage is unavailable; no run was started.",
+                    err_type="server_error",
+                    code="run_storage_unavailable",
+                ),
+                status=503,
+            )
+
+        self._run_statuses[durable_status["run_id"]] = durable_status
+        response_headers = (
+            {"X-Hermes-Session-Key": gateway_session_key}
+            if gateway_session_key
+            else {}
+        )
+        if not created:
+            return web.json_response(
+                durable_status, status=202, headers=response_headers
+            )
+
+        created_at = float(durable_status["created_at"])
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
-        created_at = time.time()
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
@@ -6603,28 +6809,20 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-        self._set_run_status(
-            run_id,
-            "queued",
-            created_at=created_at,
-            session_id=session_id,
-            model=body.get("model", self._model_name),
-        )
-
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
         request_profile = _api_request_profile.get()
 
         async def _run_and_close():
             try:
-                self._set_run_status(run_id, "running")
+                await self._set_run_status_async(run_id, "running")
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",
                         "run_id": run_id,
                         "timestamp": time.time(),
                     })
-                    self._set_run_status(
+                    await self._set_run_status_async(
                         run_id,
                         "cancelled",
                         last_event="run.cancelled",
@@ -6749,7 +6947,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "run_id": run_id,
                         "timestamp": time.time(),
                     })
-                    self._set_run_status(
+                    await self._set_run_status_async(
                         run_id,
                         "cancelled",
                         last_event="run.cancelled",
@@ -6765,7 +6963,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "timestamp": time.time(),
                         "error": error_msg,
                     })
-                    self._set_run_status(
+                    await self._set_run_status_async(
                         run_id,
                         "failed",
                         error=error_msg,
@@ -6780,7 +6978,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "output": final_response,
                         "usage": usage,
                     })
-                    self._set_run_status(
+                    await self._set_run_status_async(
                         run_id,
                         "completed",
                         output=final_response,
@@ -6788,7 +6986,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.completed",
                     )
             except asyncio.CancelledError:
-                self._set_run_status(
+                await self._set_run_status_async(
                     run_id,
                     "cancelled",
                     last_event="run.cancelled",
@@ -6812,7 +7010,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 # except-Exception branch below.
                 logger.warning("Provider authentication failed for run=%s: %s", run_id, exc)
                 error_msg = f"⚠️ Provider authentication failed: {exc}"
-                self._set_run_status(
+                await self._set_run_status_async(
                     run_id,
                     "failed",
                     error=error_msg,
@@ -6829,7 +7027,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
-                self._set_run_status(
+                await self._set_run_status_async(
                     run_id,
                     "failed",
                     error=_redact_api_error_text(exc),
@@ -6869,6 +7067,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task
+        self._pending_run_ids.discard(run_id)
         try:
             self._background_tasks.add(task)
         except TypeError:
@@ -6876,14 +7075,51 @@ class APIServerAdapter(BasePlatformAdapter):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
 
-        response_headers = (
-            {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
-        )
-        return web.json_response(
-            {"run_id": run_id, "status": "started"},
-            status=202,
-            headers=response_headers,
-        )
+        response_status = dict(durable_status)
+        response_status["status"] = "started"
+        return web.json_response(response_status, status=202, headers=response_headers)
+
+    async def _handle_lookup_run(self, request: "web.Request") -> "web.Response":
+        """GET /v1/runs — resolve one run by its caller correlation key."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+        if not idempotency_key:
+            return web.json_response(
+                _openai_error(
+                    "Idempotency-Key is required for run lookup.",
+                    code="idempotency_key_required",
+                ),
+                status=400,
+            )
+        try:
+            from gateway.run_ledger import (
+                get_run_by_idempotency_key,
+            )
+
+            await self._maintain_run_ledger()
+            status = await asyncio.to_thread(
+                get_run_by_idempotency_key, idempotency_key
+            )
+        except Exception:
+            logger.exception("[api_server] durable run lookup failed")
+            return web.json_response(
+                _openai_error(
+                    "Durable run storage is unavailable.",
+                    err_type="server_error",
+                    code="run_storage_unavailable",
+                ),
+                status=503,
+            )
+        if status is None:
+            return web.json_response(
+                _openai_error("Run not found", code="run_not_found"),
+                status=404,
+            )
+        self._run_statuses[status["run_id"]] = status
+        return web.json_response(status)
 
     async def _handle_get_run(self, request: "web.Request") -> "web.Response":
         """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
@@ -6892,12 +7128,27 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
-        status = self._run_statuses.get(run_id)
+        try:
+            from gateway.run_ledger import get_run
+
+            await self._maintain_run_ledger()
+            status = await asyncio.to_thread(get_run, run_id)
+        except Exception:
+            logger.exception("[api_server] durable run status lookup failed")
+            return web.json_response(
+                _openai_error(
+                    "Durable run storage is unavailable.",
+                    err_type="server_error",
+                    code="run_storage_unavailable",
+                ),
+                status=503,
+            )
         if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
             )
+        self._run_statuses[run_id] = status
         return web.json_response(status)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
@@ -6907,6 +7158,26 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
+        try:
+            from gateway.run_ledger import get_run
+
+            await self._maintain_run_ledger()
+            durable_status = await asyncio.to_thread(get_run, run_id)
+        except Exception:
+            logger.exception("[api_server] durable run event lookup failed")
+            return web.json_response(
+                _openai_error(
+                    "Durable run storage is unavailable.",
+                    err_type="server_error",
+                    code="run_storage_unavailable",
+                ),
+                status=503,
+            )
+        if durable_status is None:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
 
         # Allow subscribing slightly before the run is registered (race condition window)
         for _ in range(20):
@@ -6959,7 +7230,21 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
-        status = self._run_statuses.get(run_id)
+        try:
+            from gateway.run_ledger import get_run
+
+            await self._maintain_run_ledger()
+            status = await asyncio.to_thread(get_run, run_id)
+        except Exception:
+            logger.exception("[api_server] durable run approval lookup failed")
+            return web.json_response(
+                _openai_error(
+                    "Durable run storage is unavailable.",
+                    err_type="server_error",
+                    code="run_storage_unavailable",
+                ),
+                status=503,
+            )
         if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
@@ -6984,7 +7269,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        approval_session_key = self._run_approval_sessions.get(run_id)
+        approval_session_key = None
+        if self._run_scopes.get(run_id) == self._current_run_scope():
+            approval_session_key = self._run_approval_sessions.get(run_id)
         if not approval_session_key:
             return web.json_response(
                 _openai_error(
@@ -7019,7 +7306,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
-        self._set_run_status(run_id, "running", last_event="approval.responded")
+        await self._set_run_status_async(
+            run_id, "running", last_event="approval.responded"
+        )
         q = self._run_streams.get(run_id)
         if q is not None:
             try:
@@ -7047,15 +7336,61 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
-        agent = self._active_run_agents.get(run_id)
-        task = self._active_run_tasks.get(run_id)
+        scope_matches = self._run_scopes.get(run_id) == self._current_run_scope()
+        agent = self._active_run_agents.get(run_id) if scope_matches else None
+        task = self._active_run_tasks.get(run_id) if scope_matches else None
+        try:
+            from gateway.run_ledger import (
+                TERMINAL_STATUSES,
+                get_run,
+            )
+
+            await self._maintain_run_ledger()
+            status = await asyncio.to_thread(get_run, run_id)
+        except Exception:
+            logger.exception("[api_server] durable run stop lookup failed")
+            if agent is None and task is None:
+                return web.json_response(
+                    _openai_error(
+                        "Durable run storage is unavailable.",
+                        err_type="server_error",
+                        code="run_storage_unavailable",
+                    ),
+                    status=503,
+                )
+            status = self._run_statuses.get(run_id) if scope_matches else None
+        if status is None:
+            if agent is None and task is None:
+                return web.json_response(
+                    _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                    status=404,
+                )
+            now = time.time()
+            status = {
+                "object": "hermes.run",
+                "run_id": run_id,
+                "status": "running",
+                "session_id": run_id,
+                "idempotency_key": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+        self._run_statuses[run_id] = status
+        if status.get("status") in TERMINAL_STATUSES:
+            return web.json_response(status)
 
         if agent is None and task is None:
-            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+            # Recovery classified the dead owner before this lookup. Return the
+            # exact durable state instead of hiding a known run behind 404.
+            return web.json_response(status)
 
-        self._set_run_status(run_id, "stopping", last_event="run.stopping")
+        if run_id in self._stopping_run_ids:
+            return web.json_response(status)
+
         self._stopping_run_ids.add(run_id)
 
+        # Safety action precedes fallible persistence: a broken ledger must
+        # never leave an executor running after an acknowledged stop request.
         if agent is not None:
             try:
                 request_hard_interrupt(agent, "Stop requested via API")
@@ -7070,7 +7405,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent, source="api_server_run_stop"
             )
 
-        return web.json_response({"run_id": run_id, "status": "stopping"})
+        status = await self._set_run_status_async(
+            run_id, "stopping", last_event="run.stopping"
+        )
+
+        return web.json_response(status)
 
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically expire transport buffers and terminal status records."""
@@ -7114,7 +7453,8 @@ class APIServerAdapter(BasePlatformAdapter):
         stale_statuses = [
             run_id
             for run_id, status in list(self._run_statuses.items())
-            if status.get("status") in {"completed", "failed", "cancelled"}
+            if status.get("status")
+            in {"completed", "failed", "cancelled", "interrupted"}
             and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL
         ]
         for run_id in stale_statuses:

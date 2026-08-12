@@ -608,6 +608,16 @@ class TestDisconnectedAgentReap:
 
         agent = MagicMock()
         _publish_turn_process_ownership(agent, "run-stop-sess")
+        from gateway.run_ledger import reserve_run, update_run
+
+        reserve_run(
+            run_id="run_x",
+            idempotency_key=None,
+            request_fingerprint=None,
+            data={"session_id": "run-stop-sess", "model": "test"},
+        )
+        update_run("run_x", "running")
+        adapter._run_scopes["run_x"] = adapter._current_run_scope()
         adapter._active_run_agents["run_x"] = agent
 
         request = MagicMock()
@@ -870,9 +880,19 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
+            assert data["features"]["run_idempotency"] is True
+            assert data["features"]["run_correlation_lookup"] is True
+            assert data["features"]["run_status_durable"] is True
+            assert data["features"]["run_stop_idempotent"] is True
+            assert data["features"]["run_status_retention_seconds"] == 86400
             assert data["features"]["model_options"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
+            assert data["endpoints"]["run_lookup"] == {
+                "method": "GET",
+                "path": "/v1/runs",
+                "correlation_header": "Idempotency-Key",
+            }
             assert data["endpoints"]["model_options"] == {"method": "GET", "path": "/api/model/options"}
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
@@ -2865,4 +2885,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-
