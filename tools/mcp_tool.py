@@ -3110,9 +3110,15 @@ class MCPServerTask:
                     # until the gateway hits EMFILE. Timing out here converts the
                     # hang into a normal failure, letting the ``finally`` reap the
                     # child. See #59349.
-                    connect_timeout = float(
-                        config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
-                    )
+                    #
+                    # A bare ``float()`` is not enough to make that bound real:
+                    # it accepts YAML's ``.inf``/``.nan`` silently, and an
+                    # ``.inf`` deadline never elapses — the child leaks exactly
+                    # as it did before the bound existed — while a ``.nan`` one
+                    # trips on an arbitrary loop wake-up. It also raises on a
+                    # non-numeric value instead of falling back. Use the same
+                    # sanitizer the discovery/probe bound is derived from.
+                    connect_timeout = _sanitized_connect_timeout(config)
                     self.initialize_result = await self._negotiate_session(
                         session, connect_timeout
                     )
