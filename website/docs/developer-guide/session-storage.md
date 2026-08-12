@@ -137,7 +137,32 @@ Two consequences are easy to miss:
 - **Verify with the strong integrity check.**
   `INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)`
   re-derives terms from the content table and so detects both orphaned index
-  rowids and stale text. The default `rank=0` form detects neither.
+  rowids and stale text. The default `rank=0` form detects neither — and
+  neither does anything else you might reach for: `PRAGMA integrity_check`
+  passes, message writes pass, and `search_messages` INNER JOINs `messages` on
+  the index rowid, so an orphan is filtered out of results rather than raising.
+  Affected messages go **silently missing from searches**; nothing looks broken.
+
+### Checking it from the CLI
+
+```bash
+hermes doctor --deep
+```
+
+Runs that check, and `--deep --fix` repairs what it finds with an in-place FTS
+`'rebuild'`. It is **not** part of a plain `hermes doctor`: rank=1 re-reads and
+re-tokenises every indexed row, measured at ~70s on a 4.9 GB `state.db` with
+576k messages. That cost is CPU-bound rather than I/O-bound, so it does not
+improve on a warm cache.
+
+The check is bounded (`HERMES_DOCTOR_FTS_PROBE_TIMEOUT`, default 300s) and gets
+its own budget rather than sharing the general `state.db` probe's — the two
+scale on different axes, and one shared deadline would let `PRAGMA
+integrity_check` consume it before the FTS check began. Running out of budget
+is reported as **unknown**, never as corruption, and never triggers `--fix`.
+
+For an unbounded check, `hermes sessions repair --check-only` runs the same
+verification with no time limit.
 
 The index is kept in sync via three triggers on `messages`. Removing an entry
 means handing FTS5 the **old** text through the `'delete'` command so it knows

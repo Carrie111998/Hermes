@@ -706,6 +706,12 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
         return None
 
 
+# FTS5 virtual tables that carry a message index. Module-level so the
+# health-probe helpers below and SessionDB agree on the set without one
+# importing the other's state.
+_FTS_INDEX_TABLES: Tuple[str, ...] = ("messages_fts", "messages_fts_trigram")
+
+
 class StateDbProbeTimeout(Exception):
     """A bounded :func:`_db_opens_cleanly` probe ran out of budget.
 
@@ -752,8 +758,117 @@ def _arm_probe_deadline(
     return timer.cancel, timed_out
 
 
-def _db_opens_cleanly(
+def _fts_integrity_check_sql(table: str) -> str:
+    """The rank=1 form of the FTS5 ``'integrity-check'`` command.
+
+    ``rank=1`` re-derives every term from the content source and compares it
+    to the index. ``rank=0`` (the default) only checks the index against
+    itself, which under external content detects neither of the two failure
+    modes that matter: an index rowid whose ``messages`` row is gone, and
+    index text that no longer matches the row it points at. Both are
+    invisible to ``search_messages`` — it INNER JOINs ``messages`` on the
+    index rowid, so an orphan is filtered out before ``snippet()`` sees it —
+    so this statement is the only probe that surfaces them.
+    """
+    return f"INSERT INTO {table}({table}, rank) VALUES('integrity-check', 1)"
+
+
+def _fts_indexes_present(conn: sqlite3.Connection) -> Tuple[str, ...]:
+    """Return the FTS index tables that are queryable on *conn*."""
+    present = []
+    for table in _FTS_INDEX_TABLES:
+        try:
+            conn.execute(f"SELECT 1 FROM {table} LIMIT 0")
+        except sqlite3.OperationalError:
+            continue
+        present.append(table)
+    return tuple(present)
+
+
+def _fts_integrity_reason(conn: sqlite3.Connection) -> Optional[str]:
+    """Run the rank=1 integrity-check on every present index.
+
+    Returns ``None`` when every index verifies, else a joined reason string.
+    Missing tables are skipped, so a database with no FTS index at all
+    returns ``None``.
+
+    Never converts an aborted statement into a reason: ``conn.interrupt()``
+    surfaces as ``OperationalError: interrupted``, which is a
+    ``DatabaseError`` and would otherwise be indistinguishable from real
+    damage. That exception is re-raised for the caller's deadline handling
+    to classify.
+    """
+    problems = []
+    for table in _fts_indexes_present(conn):
+        try:
+            conn.execute(_fts_integrity_check_sql(table))
+        except sqlite3.DatabaseError as exc:
+            if _is_interrupted_error(exc):
+                raise
+            problems.append(f"{table}: {exc}")
+    return "; ".join(problems) if problems else None
+
+
+def _is_interrupted_error(exc: BaseException) -> bool:
+    """True if *exc* is SQLite reporting an aborted statement.
+
+    ``sqlite3.Connection.interrupt`` raises ``OperationalError:
+    interrupted`` — verified against an FTS5 rank=1 integrity-check, which
+    aborts within ~3ms of the deadline on a 171 MB index. "We ran out of
+    time" must never be reported as "this index is corrupt".
+    """
+    return isinstance(exc, sqlite3.OperationalError) and "interrupted" in str(exc).lower()
+
+
+def check_state_db_fts_integrity(
     db_path: Path, *, timeout_seconds: Optional[float] = None
+) -> Optional[str]:
+    """Verify the FTS indexes of the database at *db_path*, on its own budget.
+
+    Returns ``None`` when every index verifies, else a reason string.
+
+    Deliberately a *separate* probe from :func:`_db_opens_cleanly` rather than
+    a stage inside it, because the two expensive checks scale differently on
+    the same file. This one is CPU-bound on tokenisation and measured ~70s on
+    the post-v32 production snapshot (4891 MB, 575,962 messages, 1.38 GB of
+    indexed text). ``PRAGMA integrity_check`` is I/O-bound and fragmentation-
+    sensitive: 116.8s on that compacted snapshot, but >12 minutes on the live
+    fragmented file — the hang that put a budget on the probe in the first
+    place.
+
+    Sharing one deadline would therefore let the page-by-page scan eat the
+    whole budget on exactly the databases that need checking, and the caller
+    would be told "unknown" about the one thing it asked for.
+
+    Raises:
+        StateDbProbeTimeout: the budget was exhausted. Not a corruption signal.
+    """
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    cancel_deadline: Optional[Callable[[], None]] = None
+    timed_out: Optional[threading.Event] = None
+    if timeout_seconds is not None:
+        cancel_deadline, timed_out = _arm_probe_deadline(conn, timeout_seconds)
+    try:
+        return _fts_integrity_reason(conn)
+    except sqlite3.DatabaseError as exc:
+        if timed_out is not None and timed_out.is_set():
+            raise StateDbProbeTimeout(
+                "the FTS integrity-check", float(timeout_seconds)
+            ) from exc
+        if _is_interrupted_error(exc):
+            raise
+        return str(exc)
+    finally:
+        if cancel_deadline is not None:
+            cancel_deadline()
+        conn.close()
+
+
+def _db_opens_cleanly(
+    db_path: Path,
+    *,
+    timeout_seconds: Optional[float] = None,
+    include_fts_integrity: bool = False,
 ) -> Optional[str]:
     """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
 
@@ -775,6 +890,13 @@ def _db_opens_cleanly(
             strategies on this result and must not trade thoroughness for
             latency. When a budget is set and exhausted, raises
             :class:`StateDbProbeTimeout` — never a reason string.
+        include_fts_integrity: also run the rank=1 FTS ``'integrity-check'``
+            (see :func:`_fts_integrity_reason`). Off by default because it
+            re-reads and re-tokenises every indexed row: measured at 12.6s on
+            a 171 MB index, and the production 5.1 GB state.db holds ~8x that
+            text. The repair paths call this function to decide whether to
+            escalate to a destructive strategy and must stay fast, so only
+            deliberate deep checks opt in.
 
     Raises:
         StateDbProbeTimeout: the budget was exhausted. Not a corruption signal.
@@ -842,9 +964,29 @@ def _db_opens_cleanly(
         problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
         if problems:
             return "; ".join(problems[:3])
+
+        # Deep check last — it is the most expensive statement in the probe
+        # and the only one that can detect an FTS index whose rowids no
+        # longer resolve to messages rows. Same ordering rationale as
+        # integrity_check: never let it starve a cheaper check.
+        if include_fts_integrity:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise StateDbProbeTimeout(
+                    "the FTS integrity-check", float(timeout_seconds)
+                )
+            try:
+                return _fts_integrity_reason(conn)
+            except sqlite3.DatabaseError as exc:
+                _raise_if_timed_out("the FTS integrity-check", exc)
+                raise
         return None
     except sqlite3.DatabaseError as exc:
         _raise_if_timed_out("the health probe", exc)
+        if _is_interrupted_error(exc):
+            # Aborted from outside our own watchdog (the timer never fired).
+            # Still not damage — refuse to report it as a corruption reason,
+            # which is what would escalate --fix to a destructive repair.
+            raise
         return str(exc)
     finally:
         if cancel_deadline is not None:
@@ -9959,8 +10101,9 @@ class SessionDB:
 
     # FTS5 virtual tables whose b-tree segments we merge on optimize. The
     # trigram table is created lazily / may be disabled, so we probe before
-    # touching it (see optimize_fts).
-    _FTS_TABLES = ("messages_fts", "messages_fts_trigram")
+    # touching it (see optimize_fts). Aliases the module-level tuple that the
+    # health-probe helpers use, so the two cannot drift apart.
+    _FTS_TABLES = _FTS_INDEX_TABLES
 
     def _fts_table_exists(self, name: str) -> bool:
         """True if an FTS5 virtual table is queryable in this DB."""
@@ -10036,7 +10179,9 @@ class SessionDB:
                     )
         return rebuilt
 
-    def check_fts_integrity(self) -> Dict[str, Optional[str]]:
+    def check_fts_integrity(
+        self, *, timeout_seconds: Optional[float] = None
+    ) -> Dict[str, Optional[str]]:
         """Validate each FTS index against its content, strictly.
 
         Returns ``{table: None}`` when the index is healthy and
@@ -10059,20 +10204,50 @@ class SessionDB:
 
         Note this is a write statement as far as SQLite is concerned; it cannot
         run on a read-only connection.
+
+        Args:
+            timeout_seconds: wall-clock budget for the whole check. ``None``
+                (the default) is unbounded. When a budget is given and
+                exhausted, the in-flight statement is aborted via
+                ``conn.interrupt()`` and :class:`StateDbProbeTimeout` is
+                raised — never a per-table reason. An aborted check has found
+                nothing, and "we ran out of time" reported as ``{table:
+                "interrupted"}`` would read as corruption and, on a caller
+                wired to auto-repair, provoke a needless full rebuild.
+
+        Raises:
+            StateDbProbeTimeout: the budget was exhausted. Not a corruption
+                signal.
         """
         results: Dict[str, Optional[str]] = {}
         with self._lock:
-            for tbl in self._FTS_TABLES:
-                if not self._fts_table_exists(tbl):
-                    continue
-                try:
-                    self._conn.execute(
-                        f"INSERT INTO {tbl}({tbl}, rank) VALUES('integrity-check', 1)"
-                    )
-                    results[tbl] = None
-                except sqlite3.DatabaseError as exc:
-                    results[tbl] = str(exc)
-                    logger.warning("FTS integrity-check failed for %s: %s", tbl, exc)
+            cancel_deadline: Optional[Callable[[], None]] = None
+            timed_out: Optional[threading.Event] = None
+            if timeout_seconds is not None:
+                cancel_deadline, timed_out = _arm_probe_deadline(
+                    self._conn, timeout_seconds
+                )
+            try:
+                for tbl in self._FTS_TABLES:
+                    if not self._fts_table_exists(tbl):
+                        continue
+                    try:
+                        self._conn.execute(_fts_integrity_check_sql(tbl))
+                        results[tbl] = None
+                    except sqlite3.DatabaseError as exc:
+                        if timed_out is not None and timed_out.is_set():
+                            raise StateDbProbeTimeout(
+                                f"the {tbl} integrity-check", float(timeout_seconds)
+                            ) from exc
+                        if _is_interrupted_error(exc):
+                            raise
+                        results[tbl] = str(exc)
+                        logger.warning(
+                            "FTS integrity-check failed for %s: %s", tbl, exc
+                        )
+            finally:
+                if cancel_deadline is not None:
+                    cancel_deadline()
         return results
 
     def vacuum(self) -> int:

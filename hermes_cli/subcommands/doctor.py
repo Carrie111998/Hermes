@@ -34,6 +34,15 @@ def build_doctor_parser(subparsers, *, cmd_doctor: Callable) -> None:
         ),
     )
     doctor_parser.add_argument(
+        "--deep",
+        action="store_true",
+        help=(
+            "Run the expensive state.db checks too (full-text index "
+            "verification). Re-reads every indexed message, so it takes "
+            "minutes on a multi-GB database; the default run skips it."
+        ),
+    )
+    doctor_parser.add_argument(
         "--ack",
         metavar="ADVISORY_ID",
         default=None,

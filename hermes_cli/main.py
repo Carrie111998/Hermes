@@ -14410,7 +14410,10 @@ def main():
             "Recover a state.db whose schema is malformed (e.g. 'table "
             "messages_fts already exists'), which makes Desktop/Dashboard show "
             "no sessions. A backup is made first; sessions and messages are "
-            "preserved and the FTS search index is rebuilt if needed."
+            "preserved and the FTS search index is rebuilt if needed. This is "
+            "the deep, unbounded check: unlike `hermes doctor` it also verifies "
+            "the full-text index against every message it claims to index, "
+            "which takes minutes on a multi-GB database."
         ),
     )
     sessions_repair.add_argument(
@@ -14469,7 +14472,17 @@ def main():
             if not db_path.exists():
                 print(f"No session database at {db_path} (nothing to repair).")
                 return
-            reason = _db_opens_cleanly(db_path)
+            # This is the deep, unbounded path `hermes doctor` points users at
+            # ("For the full check (no time limit)"), so it runs the FTS rank=1
+            # integrity-check that doctor skips by default. That check is the
+            # only one that surfaces an index rowid with no surviving messages
+            # row — searches inner-join it away rather than failing — and its
+            # repair is strategy #1 here, an in-place FTS 'rebuild'.
+            print(
+                f"Checking {db_path} (deep check — re-reads every indexed "
+                "message; this can take minutes on a large database)…"
+            )
+            reason = _db_opens_cleanly(db_path, include_fts_integrity=True)
             if reason is None:
                 print(f"✓ {db_path} opens cleanly — no repair needed.")
                 return

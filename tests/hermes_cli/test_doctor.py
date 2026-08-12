@@ -1821,7 +1821,7 @@ class TestStateDbProbeBudget:
         """Doctor must never call the probe unbounded — that is the hang."""
         seen = {}
 
-        def probe(path, *, timeout_seconds=None):
+        def probe(path, *, timeout_seconds=None, include_fts_integrity=False):
             seen["timeout_seconds"] = timeout_seconds
             return None
 
@@ -1837,7 +1837,7 @@ class TestStateDbProbeBudget:
     ):
         import hermes_state
 
-        def probe(path, *, timeout_seconds=None):
+        def probe(path, *, timeout_seconds=None, include_fts_integrity=False):
             raise hermes_state.StateDbProbeTimeout(
                 "PRAGMA integrity_check", float(timeout_seconds or 5)
             )
@@ -1864,7 +1864,7 @@ class TestStateDbProbeBudget:
         db.create_session(session_id="probe-budget-fix", source="cli")
         db.close()
 
-        def probe(path, *, timeout_seconds=None):
+        def probe(path, *, timeout_seconds=None, include_fts_integrity=False):
             raise hermes_state.StateDbProbeTimeout(
                 "PRAGMA integrity_check", float(timeout_seconds or 5)
             )
@@ -2128,4 +2128,162 @@ class TestNpmAuditIsOptIn:
             pytest.skip("no npm on PATH / no node_modules in this checkout")
         assert all(kwargs.get("on_demand") for _, kwargs in audited), (
             "an explicitly requested audit must get the budget that lets it finish"
+        )
+
+
+class TestStateDbDeepProbe:
+    """The FTS rank=1 integrity-check is opt-in, and bounded when it runs.
+
+    It is the only probe that detects an index rowid whose ``messages`` row is
+    gone (schema v32, external content) — but it re-reads every indexed row,
+    so on the 5.1 GB production state.db it is a minutes-long scan. Putting it
+    in the default run would recreate the documented `hermes doctor` hang.
+    """
+
+    def _run(self, monkeypatch, tmp_path, fts_probe, *, deep=False, fix=False):
+        import hermes_state
+
+        home = tmp_path / ".hermes"
+        home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        db = hermes_state.SessionDB(db_path=home / "state.db")
+        db.create_session(session_id="deep-probe-test", source="cli")
+        db.close()
+
+        # The general probe always passes here; these tests are about the FTS
+        # check that runs beside it.
+        monkeypatch.setattr(
+            hermes_state,
+            "_db_opens_cleanly",
+            lambda path, *, timeout_seconds=None, include_fts_integrity=False: None,
+        )
+        calls = []
+
+        def _probe(path, *, timeout_seconds=None):
+            calls.append(timeout_seconds)
+            return fts_probe(path, timeout_seconds=timeout_seconds)
+
+        monkeypatch.setattr(hermes_state, "check_state_db_fts_integrity", _probe)
+        rebuilt = []
+        monkeypatch.setattr(
+            hermes_state.SessionDB,
+            "rebuild_fts",
+            lambda self: rebuilt.append(1) or 1,
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            doctor_mod.run_doctor(Namespace(fix=fix, deep=deep))
+        return buf.getvalue(), calls, rebuilt
+
+    def test_default_run_does_not_run_the_fts_check(self, monkeypatch, tmp_path):
+        """The 70s check must not be on the path of every `hermes doctor`."""
+
+        def probe(path, *, timeout_seconds=None):
+            raise AssertionError("the FTS check ran without --deep")
+
+        out, calls, _ = self._run(monkeypatch, tmp_path, probe)
+
+        assert calls == []
+        # …and it says so, rather than letting a clean run imply full coverage.
+        assert "Full-text index verification was skipped" in out
+
+    def test_deep_run_runs_it_on_its_own_budget(self, monkeypatch, tmp_path):
+        def probe(path, *, timeout_seconds=None):
+            return None
+
+        out, calls, _ = self._run(monkeypatch, tmp_path, probe, deep=True)
+
+        assert len(calls) == 1
+        # Still bounded — --deep buys its own budget, not an unbounded scan.
+        assert calls[0] == doctor_mod._STATE_DB_FTS_PROBE_TIMEOUT_DEFAULT
+        assert calls[0] > doctor_mod._STATE_DB_PROBE_TIMEOUT_DEFAULT
+        assert "full-text index verifies against its content" in out
+        assert "Full-text index verification was skipped" not in out
+
+    def test_deep_timeout_is_unknown_not_corruption(self, monkeypatch, tmp_path):
+        """A deep check that runs out of budget must not accuse the index."""
+        import hermes_state
+
+        def probe(path, *, timeout_seconds=None):
+            raise hermes_state.StateDbProbeTimeout(
+                "the FTS integrity-check", float(timeout_seconds or 300)
+            )
+
+        out, _, rebuilt = self._run(
+            monkeypatch, tmp_path, probe, deep=True, fix=True
+        )
+
+        assert "full-text index check did not finish in budget" in out
+        assert "not a corruption report" in out
+        assert "does not match its content" not in out
+        assert rebuilt == [], "a probe timeout must never trigger a rebuild"
+        # Unknown is not healthy either. The first draft set the reason to None
+        # on timeout and fell straight into the clean branch, printing a green
+        # "verifies against its content" for a check that never finished.
+        assert "verifies against its content" not in out
+
+    def test_deep_run_reports_a_real_orphan(self, monkeypatch, tmp_path):
+        def probe(path, *, timeout_seconds=None):
+            return "messages_fts: database disk image is malformed"
+
+        out, _, rebuilt = self._run(monkeypatch, tmp_path, probe, deep=True)
+
+        assert "does not match its content" in out
+        assert "verifies against its content" not in out
+        assert rebuilt == [], "no --fix, no rebuild"
+
+    def test_deep_fix_rebuilds_the_index(self, monkeypatch, tmp_path):
+        """--fix repairs it in place; 'rebuild' is the documented recovery."""
+
+        def probe(path, *, timeout_seconds=None):
+            return "messages_fts: database disk image is malformed"
+
+        out, _, rebuilt = self._run(
+            monkeypatch, tmp_path, probe, deep=True, fix=True
+        )
+
+        assert rebuilt == [1]
+        assert "Rebuilt the state.db full-text index" in out
+
+    def test_fts_budget_is_env_overridable(self, monkeypatch):
+        default = doctor_mod._STATE_DB_FTS_PROBE_TIMEOUT_DEFAULT
+
+        monkeypatch.delenv(doctor_mod._STATE_DB_FTS_PROBE_TIMEOUT_ENV, raising=False)
+        assert doctor_mod._state_db_fts_probe_budget() == default
+
+        monkeypatch.setenv(doctor_mod._STATE_DB_FTS_PROBE_TIMEOUT_ENV, "45")
+        assert doctor_mod._state_db_fts_probe_budget() == 45.0
+
+        for bad in ("nonsense", "0", "-1", ""):
+            monkeypatch.setenv(doctor_mod._STATE_DB_FTS_PROBE_TIMEOUT_ENV, bad)
+            assert doctor_mod._state_db_fts_probe_budget() == default
+
+    def test_deep_flag_is_wired_into_the_cli(self):
+        """The flag doctor reads must be the flag the CLI accepts."""
+        import argparse
+
+        from hermes_cli.subcommands.doctor import build_doctor_parser
+
+        parser = argparse.ArgumentParser()
+        build_doctor_parser(
+            parser.add_subparsers(dest="command"), cmd_doctor=lambda args: None
+        )
+        assert parser.parse_args(["doctor"]).deep is False
+        assert parser.parse_args(["doctor", "--deep"]).deep is True
+        assert parser.parse_args(["doctor", "--deep", "--fix"]).fix is True
+
+    def test_fts_budget_is_independent_of_the_general_budget(self, monkeypatch):
+        """One knob must not silently retune the other.
+
+        They bound checks that differ by an order of magnitude on the same
+        file, so a 5s general budget must not clamp the FTS check.
+        """
+        monkeypatch.setenv(doctor_mod._STATE_DB_PROBE_TIMEOUT_ENV, "5")
+        monkeypatch.delenv(doctor_mod._STATE_DB_FTS_PROBE_TIMEOUT_ENV, raising=False)
+        assert doctor_mod._state_db_probe_budget() == 5.0
+        assert (
+            doctor_mod._state_db_fts_probe_budget()
+            == doctor_mod._STATE_DB_FTS_PROBE_TIMEOUT_DEFAULT
         )

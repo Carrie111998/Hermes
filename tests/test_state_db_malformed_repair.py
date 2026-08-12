@@ -452,6 +452,11 @@ def test_unbounded_probe_is_the_default_and_never_times_out(tmp_path):
 
     sig = inspect.signature(_db_opens_cleanly)
     assert sig.parameters["timeout_seconds"].default is None
+    # The FTS rank=1 check re-reads every indexed row. The repair paths call
+    # this to decide whether to escalate to a destructive strategy, so it must
+    # stay opt-in — both for their latency and because an orphaned rowid is
+    # not a reason to drop a schema.
+    assert sig.parameters["include_fts_integrity"].default is False
 
     db_path = tmp_path / "state.db"
     _build_healthy_db(db_path)
