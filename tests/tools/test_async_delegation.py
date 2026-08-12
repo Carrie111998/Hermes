@@ -175,6 +175,248 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert evt["delegation_id"] == res["delegation_id"]
 
 
+def test_single_timeout_partial_tail_survives_dispatch_to_notification():
+    """The real single-task transport must preserve timeout evidence.
+
+    Rendering a hand-built event is insufficient: dispatch_async_delegation()
+    normalizes the child result through _push_completion_event() before the
+    process notification formatter receives it.
+    """
+    safe_tail = [
+        {"tool": "terminal", "preview": "REDACTED_FINDING", "is_error": False}
+    ]
+
+    def runner():
+        return {
+            "status": "timeout",
+            "summary": None,
+            "error": "child timed out",
+            "api_calls": 2,
+            "duration_seconds": 3.0,
+            "partial": True,
+            "partial_output_tail": safe_tail,
+        }
+
+    res = ad.dispatch_async_delegation(
+        goal="research then time out",
+        context=None,
+        toolsets=["terminal"],
+        role="leaf",
+        model="test-model",
+        session_key="agent:main:cli:dm:local",
+        runner=runner,
+        max_async_children=3,
+    )
+    assert res["status"] == "dispatched"
+
+    evt = _drain_for(res["delegation_id"])
+    assert evt is not None
+    assert evt["status"] == "timeout"
+    assert evt["partial"] is True
+    assert evt["partial_output_tail"] == [
+        {"tool": "tool", "preview": "REDACTED_FINDING", "is_error": False}
+    ]
+
+    text = format_process_notification(evt)
+    assert text is not None
+    assert "Partial output (redacted):" in text
+    assert "REDACTED_FINDING" in text
+
+
+def test_single_timeout_malformed_partial_tail_keeps_legacy_event_schema():
+    """Malformed timeout evidence must not cross into the formatter."""
+
+    def runner():
+        return {
+            "status": "timeout",
+            "summary": None,
+            "error": "child timed out",
+            "partial": True,
+            "partial_output_tail": ["not-a-tail-entry"],
+        }
+
+    res = ad.dispatch_async_delegation(
+        goal="malformed timeout evidence",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="test-model",
+        session_key="agent:main:cli:dm:local",
+        runner=runner,
+        max_async_children=3,
+    )
+    evt = _drain_for(res["delegation_id"])
+
+    assert evt is not None
+    assert "partial" not in evt
+    assert "partial_output_tail" not in evt
+    text = format_process_notification(evt)
+    assert text is not None
+    assert "Partial output (redacted):" not in text
+
+
+def test_single_non_timeout_partial_tail_keeps_legacy_event_schema():
+    """Only timeout results may expose bounded partial evidence."""
+    safe_tail = [
+        {"tool": "terminal", "preview": "safe output", "is_error": False}
+    ]
+
+    def runner():
+        return {
+            "status": "completed",
+            "summary": "done",
+            "partial": True,
+            "partial_output_tail": safe_tail,
+        }
+
+    res = ad.dispatch_async_delegation(
+        goal="completed task with stray evidence",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="test-model",
+        session_key="agent:main:cli:dm:local",
+        runner=runner,
+        max_async_children=3,
+    )
+    evt = _drain_for(res["delegation_id"])
+
+    assert evt is not None
+    assert evt["status"] == "completed"
+    assert "partial" not in evt
+    assert "partial_output_tail" not in evt
+
+
+def test_single_timeout_transport_force_redacts_then_bounds_tail():
+    """Shape-valid runner output is still untrusted at the event boundary."""
+    secret = "sk-proj-" + "A" * 48
+    raw_preview = f"token={secret}\n" + "x" * 900
+    raw_tail = [
+        {
+            "tool": f"terminal-{secret}",
+            "preview": raw_preview,
+            "is_error": False,
+        }
+        for _ in range(10)
+    ]
+
+    def runner():
+        return {
+            "status": "timeout",
+            "summary": None,
+            "error": "child timed out",
+            "partial": True,
+            "partial_output_tail": raw_tail,
+        }
+
+    res = ad.dispatch_async_delegation(
+        goal="untrusted timeout evidence",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="test-model",
+        session_key="agent:main:cli:dm:local",
+        runner=runner,
+        max_async_children=3,
+    )
+    evt = _drain_for(res["delegation_id"])
+
+    assert evt is not None
+    transported = evt["partial_output_tail"]
+    assert len(transported) == 8
+    assert all(len(entry["preview"]) <= 600 for entry in transported)
+    assert all(
+        secret not in entry["preview"] for entry in transported
+    ), repr([entry["preview"][:100] for entry in transported])
+    assert all(
+        secret not in entry["tool"] for entry in transported
+    ), repr([entry["tool"] for entry in transported])
+    assert all(len(entry["tool"]) <= 120 for entry in transported)
+    assert all("token=***" in entry["preview"] for entry in transported)
+
+
+def test_single_timeout_transport_drops_tail_when_redaction_fails(monkeypatch):
+    """The transport boundary must fail closed if forced redaction raises."""
+    from agent import redact
+
+    def fail_redaction(_text, *, force=False):
+        assert force is True
+        raise RuntimeError("redactor unavailable")
+
+    monkeypatch.setattr(redact, "redact_sensitive_text", fail_redaction)
+
+    def runner():
+        return {
+            "status": "timeout",
+            "summary": None,
+            "error": "child timed out",
+            "partial": True,
+            "partial_output_tail": [
+                {"tool": "terminal", "preview": "raw secret", "is_error": False}
+            ],
+        }
+
+    res = ad.dispatch_async_delegation(
+        goal="redaction failure",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="test-model",
+        session_key="agent:main:cli:dm:local",
+        runner=runner,
+        max_async_children=3,
+    )
+    evt = _drain_for(res["delegation_id"])
+
+    assert evt is not None
+    assert "partial" not in evt
+    assert "partial_output_tail" not in evt
+
+
+def test_single_timeout_durable_result_drops_raw_partial_tail(tmp_path, monkeypatch):
+    """Durable status data must not retain the untrusted pre-sanitized tail."""
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    secret = "sk-proj-" + "B" * 48
+
+    def runner():
+        return {
+            "status": "timeout",
+            "summary": None,
+            "error": "child timed out",
+            "partial": True,
+            "partial_output_tail": [
+                {
+                    "tool": f"terminal-{secret}",
+                    "preview": f"token={secret}",
+                    "is_error": False,
+                }
+            ],
+        }
+
+    res = ad.dispatch_async_delegation(
+        goal="durable timeout evidence",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="test-model",
+        session_key="agent:main:cli:dm:local",
+        runner=runner,
+        max_async_children=3,
+    )
+    evt = _drain_for(res["delegation_id"])
+    durable = ad.get_durable_delegation(res["delegation_id"])
+
+    assert evt is not None
+    assert evt["partial_output_tail"] == [
+        {"tool": "tool", "preview": "token=***", "is_error": False}
+    ]
+    assert secret not in str(evt)
+    assert durable is not None
+    assert durable["result"]["status"] == "timeout"
+    assert "partial_output_tail" not in durable["result"]
+    assert secret not in str(durable)
+
+
 def test_rich_reinjection_block_is_self_contained():
     def runner():
         return {"status": "completed", "summary": "The answer is 42.",
