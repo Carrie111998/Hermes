@@ -33,6 +33,7 @@ Usage:
 import json
 import os
 import time
+import tempfile
 import yaml
 import logging
 import asyncio
@@ -54,6 +55,46 @@ from hermes_cli.env_loader import load_hermes_dotenv
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / ".env"
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
+
+
+def _reject_same_path(input_path: Path, output_path: Path) -> None:
+    """Refuse to write output over the input (identity check).
+
+    The compressor previously accepted ``--output`` equal to ``--input`` (or an
+    ``output_dir`` equal to the input dir), truncating the source JSONL. Resolve
+    both paths first so symlinks and relative aliases are caught too.
+    """
+    try:
+        same = input_path.resolve() == output_path.resolve()
+    except OSError:
+        same = os.path.abspath(str(input_path)) == os.path.abspath(str(output_path))
+    if same:
+        raise ValueError(
+            "refusing to overwrite input: "
+            f"output {output_path} resolves to input {input_path}"
+        )
+
+
+def _atomic_write_text(path: Path, write_fn) -> None:
+    """Write via a sibling temp file then ``os.replace`` (atomic, no truncation).
+
+    ``write_fn`` receives the open text file handle and writes the full content.
+    A crash mid-write leaves the previous file intact instead of a truncated one.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            write_fn(f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _effective_temperature_for_model(
@@ -1070,6 +1111,8 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
             input_dir: Input directory containing JSONL files
             output_dir: Output directory for compressed files
         """
+        # In-place output would overwrite the source JSONL files.
+        _reject_same_path(Path(input_dir), Path(output_dir))
         # Run the async version
         asyncio.run(self._process_directory_async(input_dir, output_dir))
     
@@ -1250,9 +1293,11 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                 if file_results[idx] is not None
             ]
             
-            with open(output_path, 'w', encoding='utf-8') as f:
+            def _write_entries(f):
                 for entry in sorted_entries:
                     f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+
+            _atomic_write_text(output_path, _write_entries)
         
         # Record end time
         self.aggregate_metrics.processing_end_time = datetime.now().isoformat()
@@ -1462,6 +1507,9 @@ def main(
             output_path = Path(output)
         else:
             output_path = input_path.parent / (input_path.stem + compression_config.output_suffix + ".jsonl")
+
+        # Never write output over the input (data loss).
+        _reject_same_path(input_path, output_path)
         
         # Load entries from the single file
         entries = []
@@ -1508,11 +1556,14 @@ def main(
             
             # Copy result to output path (merge all files in temp_output_dir)
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(output_path, 'w', encoding='utf-8') as out_f:
+
+            def _write_merged(f):
                 for jsonl_file in sorted(temp_output_dir.glob("*.jsonl")):
                     with open(jsonl_file, 'r', encoding='utf-8') as in_f:
                         for line in in_f:
-                            out_f.write(line)
+                            f.write(line)
+
+            _atomic_write_text(output_path, _write_merged)
             
             # Copy metrics file if it exists
             metrics_file = temp_output_dir / compression_config.metrics_output_file
@@ -1532,6 +1583,9 @@ def main(
             output_path = Path(output)
         else:
             output_path = input_path.parent / (input_path.name + compression_config.output_suffix)
+
+        # Directory output must never be the input directory (in-place overwrite).
+        _reject_same_path(input_path, output_path)
         
         # If sampling is requested for directory mode, we need to handle it differently
         if sample_percent is not None:
