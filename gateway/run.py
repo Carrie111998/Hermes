@@ -11951,10 +11951,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # turn so the agent kicks off the new chat.
         self._spawn_supervised(self._handoff_watcher, "handoff_watcher")
 
-        # Start background async-delegation watcher — drains completion events
-        # from delegate_task(background=true) subagents and injects each
-        # result back into its originating session as a new turn, covering the
-        # idle case where the subagent finishes with no agent turn running.
+        # Start the background completion-event watcher. It injects async
+        # delegation results and terminal watch-pattern events into their
+        # originating sessions while the gateway is idle.
         self._spawn_supervised(self._async_delegation_watcher, "async_delegation_watcher")
 
         # Start the scale-to-zero idle watcher ONLY when this instance is opted
@@ -23177,41 +23176,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             evt["thread_id"] = parsed["thread_id"]
 
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
-        """Drain async-delegation completions and inject them as new turns.
+        """Drain idle gateway events and inject them as new turns.
 
         Background subagents (``delegate_task(background=true)``) run on the
         async-delegation daemon executor — they have no per-process watcher
         task, so their completion events would only be seen by the post-turn
-        queue drain. This watcher covers the IDLE case: when a background
-        subagent finishes while no agent turn is running, its result still
-        re-enters the originating session promptly.
+        queue drain. Terminal watch-pattern events also need an idle consumer;
+        otherwise, they remain queued until the next foreground turn.
 
         Mirrors the CLI's idle ``process_loop`` drain. Stays silent when the
-        queue has nothing for us; ignores non-async event types (those are
-        handled by ``_run_process_watcher`` / the post-turn drain).
+        queue has nothing for us. Process completions remain owned by
+        ``_run_process_watcher`` tasks. Unknown event types are discarded so
+        they cannot cycle through this queue forever.
         """
         await asyncio.sleep(3)  # let platforms finish connecting
         from tools.process_registry import process_registry as _pr
         while self._running:
             try:
-                # Peek the queue for async-delegation events. We must NOT
-                # consume watch/completion events here (other drains own them),
-                # so requeue anything that isn't ours.
+                # Detach one queue snapshot before requeueing events owned by
+                # another consumer. This avoids consuming the same foreign
+                # event repeatedly in one iteration.
                 requeue = []
-                async_events = []
+                idle_events = []
                 while not _pr.completion_queue.empty():
                     try:
                         evt = _pr.completion_queue.get_nowait()
                     except Exception:
                         break
-                    if evt.get("type") == "async_delegation":
-                        async_events.append(evt)
-                    else:
+                    evt_type = evt.get("type", "completion")
+                    if evt_type in {
+                        "async_delegation", "watch_match", "watch_disabled",
+                    }:
+                        idle_events.append(evt)
+                    elif evt_type == "completion":
                         requeue.append(evt)
                 for evt in requeue:
                     _pr.completion_queue.put(evt)
-                for evt in async_events:
-                    self._enrich_async_delegation_routing(evt)
+                for evt in idle_events:
+                    if evt.get("type") == "async_delegation":
+                        self._enrich_async_delegation_routing(evt)
                     synth_text = _format_gateway_process_notification(evt)
                     if not synth_text:
                         continue
@@ -23221,9 +23224,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _pr.completion_queue.put(evt)
                     except Exception as e:
                         _pr.completion_queue.put(evt)
-                        logger.error("Async delegation injection error: %s", e)
+                        logger.error("Idle completion-event injection error: %s", e)
             except Exception as e:
-                logger.debug("Async delegation watcher error: %s", e)
+                logger.debug("Idle completion-event watcher error: %s", e)
             await asyncio.sleep(interval)
 
     async def _run_process_watcher(self, watcher: dict) -> None:
