@@ -133,14 +133,22 @@ def _mask_documented_markdown_literals(markdown: str) -> str:
     masked: list[str] = []
     in_documented_fence = False
     previous_line = ""
-    for line in markdown.splitlines(keepends=True):
+    lines = markdown.splitlines(keepends=True)
+    for index, line in enumerate(lines):
         stripped = line.lstrip()
         if stripped.startswith(("```", "~~~")):
             if in_documented_fence:
                 in_documented_fence = False
                 masked.append("\n" if line.endswith("\n") else "")
             else:
-                in_documented_fence = bool(_DOCUMENTATION_CUE_RE.search(previous_line))
+                marker = stripped[:3]
+                has_closing_fence = any(
+                    later.lstrip().startswith(marker) for later in lines[index + 1:]
+                )
+                in_documented_fence = (
+                    has_closing_fence
+                    and bool(_DOCUMENTATION_CUE_RE.search(previous_line))
+                )
                 masked.append("\n" if in_documented_fence and line.endswith("\n") else line)
             previous_line = line
             continue
