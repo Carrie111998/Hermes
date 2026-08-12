@@ -143,6 +143,63 @@ class TestRunJobScript:
                 except ProcessLookupError:
                     pass
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group contract")
+    @pytest.mark.live_system_guard_bypass
+    def test_timeout_allows_script_handler_to_clean_detached_child(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        pid_file = cron_env / "detached-child.pid"
+        script = cron_env / "scripts" / "nested_cleanup.py"
+        script.write_text(
+            textwrap.dedent(
+                f"""\
+                import os
+                import signal
+                import subprocess
+                import sys
+                import time
+
+                child = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                with open({str(pid_file)!r}, "w") as handle:
+                    handle.write(str(child.pid))
+
+                def cleanup(_signum, _frame):
+                    time.sleep(5.5)
+                    os.killpg(child.pid, signal.SIGKILL)
+                    child.wait()
+                    raise SystemExit(143)
+
+                signal.signal(signal.SIGTERM, cleanup)
+                while True:
+                    time.sleep(1)
+                """
+            )
+        )
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 1)
+
+        child_pid = None
+        try:
+            success, output = _run_job_script(str(script))
+            assert success is False
+            assert "timed out after 1s" in output
+            child_pid = int(pid_file.read_text().strip())
+            with pytest.raises(ProcessLookupError):
+                os.kill(child_pid, 0)
+        finally:
+            if child_pid is not None:
+                try:
+                    os.killpg(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
     def test_script_relative_path(self, cron_env):
         from cron.scheduler import _run_job_script
 

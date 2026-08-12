@@ -2318,7 +2318,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
-_SCRIPT_TERMINATE_GRACE_SECONDS = 5.0
+# Inner script runners may use their TERM handler to close a detached provider
+# group. Keep the scheduler's outer grace longer than those 5s handlers so it
+# does not kill the cleanup owner just before the descendant tree is reaped.
+_SCRIPT_TERMINATE_GRACE_SECONDS = 8.0
 _RUN_CLAIM_HEARTBEAT_SECONDS = 60.0
 
 
