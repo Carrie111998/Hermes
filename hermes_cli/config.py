@@ -4966,7 +4966,21 @@ def set_config_value(key: str, value: str, force: bool = False):
     # such as approvals.mode="off" must not become YAML booleans.  Unknown keys
     # retain the historical best-effort coercion behavior.
     coerced_value: Any = value
-    if not isinstance(_default_value_for_key(key), str):
+    # ``agent.verify_on_stop`` intentionally accepts the enum-like string
+    # ``auto`` plus explicit booleans. The default schema stores ``auto`` as a
+    # string, so generic schema coercion would otherwise serialize true/false
+    # as quoted strings and make scripted config writes misleading.
+    _boolean_override_keys = {"agent.verify_on_stop"}
+    if key.strip().lower() in _boolean_override_keys and value.lower() in {
+        "true",
+        "yes",
+        "on",
+        "false",
+        "no",
+        "off",
+    }:
+        coerced_value = value.lower() in {"true", "yes", "on"}
+    elif not isinstance(_default_value_for_key(key), str):
         if value.lower() in {'true', 'yes', 'on'}:
             coerced_value = True
         elif value.lower() in {'false', 'no', 'off'}:

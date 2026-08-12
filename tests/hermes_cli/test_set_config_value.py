@@ -121,6 +121,13 @@ class TestConfigYamlRouting:
         assert "vercel_runtime: python3.13" in config
         assert "TERMINAL_VERCEL_RUNTIME=python3.13" in env_content
 
+    def test_verify_on_stop_accepts_boolean_override_of_auto_default(self, _isolated_hermes_home):
+        set_config_value("agent.verify_on_stop", "true")
+        import yaml
+
+        config = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert config["agent"]["verify_on_stop"] is True
+
 
 # ---------------------------------------------------------------------------
 # Empty / falsy values — regression tests for #4277
