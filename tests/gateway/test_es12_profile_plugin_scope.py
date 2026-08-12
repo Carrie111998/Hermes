@@ -8,6 +8,7 @@ plugin registry and its own ``plugins/`` directory was never scanned.
 """
 
 from pathlib import Path
+import logging
 import sys
 import threading
 import time
@@ -225,6 +226,123 @@ def test_profiles_isolate_an_identical_directory_plugin_module(tmp_path):
     assert second.error is None
     assert managers[0].invoke_hook("transform_llm_output") == ["loaded"]
     assert managers[1].invoke_hook("transform_llm_output") == ["loaded"]
+
+
+def test_profiles_apply_import_time_tool_override_policy_independently(tmp_path):
+    """Each scoped module sees its allow-override policy during import."""
+    from agent.secret_scope import set_multiplex_active
+    from gateway.run import _profile_runtime_scope
+    from tools.registry import registry
+
+    target = "es12_import_time_override_target"
+    set_multiplex_active(False)
+    registry.register(
+        name=target,
+        toolset="terminal",
+        schema={"name": target, "parameters": {"type": "object"}},
+        handler=lambda args, **kwargs: "built-in",
+    )
+    set_multiplex_active(True)
+
+    shared = tmp_path / "shared_override_plugin"
+    shared.mkdir()
+    (shared / "plugin.yaml").write_text(
+        yaml.safe_dump({"name": "scoped_override", "version": "0.1.0"}),
+        encoding="utf-8",
+    )
+    (shared / "__init__.py").write_text(
+        "from tools.registry import registry\n"
+        "def _handler(args, **kwargs):\n"
+        "    return __name__\n"
+        "registry.register(\n"
+        f"    name={target!r},\n"
+        "    toolset='scoped_override',\n"
+        f"    schema={{'name': {target!r}, 'parameters': {{'type': 'object'}}}},\n"
+        "    handler=_handler,\n"
+        "    override=True,\n"
+        ")\n"
+        "def register(ctx):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    homes = [tmp_path / "profile_a", tmp_path / "profile_b"]
+    module_names = []
+    try:
+        for home in homes:
+            (home / "plugins").mkdir(parents=True)
+            (home / "plugins" / "scoped_override").symlink_to(
+                shared,
+                target_is_directory=True,
+            )
+            (home / "config.yaml").write_text(
+                yaml.safe_dump(
+                    {
+                        "plugins": {
+                            "enabled": ["scoped_override"],
+                            "entries": {
+                                "scoped_override": {
+                                    "allow_tool_override": True,
+                                }
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with _profile_runtime_scope(home):
+                plugins_mod.discover_plugins()
+                entry = registry.get_entry(target)
+                assert entry is not None
+                assert entry.toolset == "scoped_override"
+                module_names.append(entry.handler({}))
+
+        assert all(name.startswith("hermes_plugins.scope_") for name in module_names)
+        assert module_names[0] != module_names[1]
+    finally:
+        for home in homes:
+            registry.deregister(target, registration_home_override=str(home))
+        set_multiplex_active(False)
+        registry.deregister(target)
+        set_multiplex_active(True)
+
+
+def test_scoped_plugin_missing_pre_exec_policy_fails_loudly(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    """A lost scoped policy aborts import with profile and plugin identity."""
+    from gateway.run import _profile_runtime_scope
+    from tools.registry import registry
+
+    home = _make_profile(tmp_path / "profile_missing_policy", "missing_policy")
+    register_policy = registry.register_plugin_override_policy
+
+    def drop_scoped_policy(module_namespace, allowed):
+        if not module_namespace.startswith("hermes_plugins.scope_"):
+            register_policy(module_namespace, allowed)
+
+    monkeypatch.setattr(
+        registry,
+        "register_plugin_override_policy",
+        drop_scoped_policy,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        with _profile_runtime_scope(home):
+            plugins_mod.discover_plugins()
+            loaded = plugins_mod.get_plugin_manager()._plugins["missing_policy"]
+
+    assert loaded.enabled is False
+    assert "override policy missing before module execution" in (loaded.error or "")
+    records = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ]
+    assert any(str(home) in message for message in records)
+    assert any("missing_policy" in message for message in records)
 
 
 def test_profiles_do_not_reuse_a_partially_imported_identical_plugin(tmp_path):

@@ -1795,7 +1795,10 @@ class PluginManager:
         )
         try:
             if manifest.source in {"user", "project", "bundled"}:
-                module = self._load_directory_module(manifest)
+                module = self._load_directory_module(
+                    manifest,
+                    override_allowed=_override_allowed,
+                )
             else:
                 module = self._load_entrypoint_module(manifest)
 
@@ -1868,7 +1871,12 @@ class PluginManager:
             )
         self._plugins[manifest.key or manifest.name] = loaded
 
-    def _load_directory_module(self, manifest: PluginManifest) -> types.ModuleType:
+    def _load_directory_module(
+        self,
+        manifest: PluginManifest,
+        *,
+        override_allowed: bool,
+    ) -> types.ModuleType:
         """Import a directory-based plugin as ``hermes_plugins.<slug>``.
 
         The module slug is derived from ``manifest.key`` so category-namespaced
@@ -1906,6 +1914,20 @@ class PluginManager:
             scope_digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:12]
             slug = f"scope_{scope_digest}__{slug}"
         module_name = f"{_NS_PARENT}.{slug}"
+        if multiplex_active:
+            from tools.registry import registry as _registry
+
+            _registry.register_plugin_override_policy(
+                module_name,
+                override_allowed,
+            )
+            if not _registry.has_plugin_override_policy(module_name):
+                message = (
+                    "Plugin override policy missing before module execution: "
+                    f"profile={scope!r}, plugin={key!r}, module={module_name!r}"
+                )
+                logger.error(message)
+                raise RuntimeError(message)
         cached = sys.modules.get(module_name) if multiplex_active else None
         if cached is not None:
             cached_file = getattr(cached, "__file__", None)

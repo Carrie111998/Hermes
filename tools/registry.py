@@ -525,6 +525,11 @@ class ToolRegistry:
         with self._lock:
             self._plugin_override_policy[module_namespace] = bool(allowed)
 
+    def has_plugin_override_policy(self, module_namespace: str) -> bool:
+        """Return whether a plugin namespace has an explicit override policy."""
+        with self._lock:
+            return module_namespace in self._plugin_override_policy
+
     def _plugin_owner_of(self, handler: Callable) -> Optional[str]:
         """Return the plugin module namespace that defined *handler*, or None
         if it was not defined in a loaded plugin module.
