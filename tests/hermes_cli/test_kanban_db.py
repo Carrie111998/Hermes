@@ -4570,6 +4570,26 @@ def _head_sha(repo: Path) -> str:
     ).stdout.strip()
 
 
+def test_dependency_source_base_selects_required_parent_receipt(kanban_home, tmp_path):
+    repo = tmp_path / "dependency-source-base"
+    _init_git_repo(repo)
+
+
+    with kb.connect() as conn:
+        parent_id = kb.create_task(
+            conn, title="Parent", workspace_kind="worktree", workspace_path=str(repo),
+            source_commit_required=True,
+        )
+        parent = kb.claim_task(conn, parent_id)
+        assert parent is not None and parent.current_run_id is not None
+        (repo / "parent.txt").write_text("parent\n", encoding="utf-8")
+        assert kb.complete_task(conn, parent_id, expected_run_id=parent.current_run_id)
+        child_id = kb.create_task(conn, title="Child", parents=[parent_id])
+        child = kb.get_task(conn, child_id)
+        assert child is not None
+        assert kb._dependency_source_base(conn, child, repo) == _head_sha(repo)
+
+
 def test_complete_task_required_source_commits_before_terminal_update_and_persists_receipt(
     kanban_home, tmp_path
 ):

@@ -13181,6 +13181,62 @@ def _story_base_branch(
     return epic_branch_for(epic_id)
 
 
+def _dependency_source_base(
+    conn: sqlite3.Connection, task: Task, repo_root: Path
+) -> Optional[str]:
+    """Return the common source-receipt commit for a Default-board child."""
+    required: list[tuple[str, str]] = []
+    for parent_id in parent_ids(conn, task.id):
+        row = conn.execute(
+            "SELECT t.status, t.source_commit_required, r.metadata "
+            "FROM tasks t LEFT JOIN task_runs r ON r.id = ("
+            "SELECT id FROM task_runs WHERE task_id = t.id AND ended_at IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1) "
+            "WHERE t.id = ?",
+            (parent_id,),
+        ).fetchone()
+        if row is None or not row["source_commit_required"]:
+            continue
+        if row["status"] != "done":
+            raise RuntimeError(f"required source parent {parent_id} is not done")
+        try:
+            receipt = (json.loads(row["metadata"] or "{}").get(
+                "source_completion_receipt"
+            ))
+        except (TypeError, ValueError, AttributeError):
+            receipt = None
+        sha = receipt.get("commit_sha") if isinstance(receipt, dict) else None
+        if not isinstance(sha, str) or not sha.strip():
+            raise RuntimeError(f"required source parent {parent_id} has no completion receipt")
+        required.append((parent_id, sha.strip()))
+    if not required:
+        return None
+
+    resolved: list[tuple[str, str]] = []
+    for parent_id, sha in required:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", f"{sha}^{{commit}}"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        resolved_sha = (result.stdout or "").strip()
+        if result.returncode != 0 or len(resolved_sha) != 40:
+            raise RuntimeError(f"required source parent {parent_id} receipt is foreign or invalid")
+        resolved.append((parent_id, resolved_sha))
+    candidates = []
+    for candidate_id, candidate in resolved:
+        if all(
+            subprocess.run(
+                ["git", "-C", str(repo_root), "merge-base", "--is-ancestor", other, candidate],
+                capture_output=True, timeout=30, check=False,
+            ).returncode == 0
+            for _, other in resolved
+        ):
+            candidates.append(candidate)
+    if len(candidates) != 1:
+        raise RuntimeError("required source parent receipts diverge")
+    return candidates[0]
+
+
 #: Durable record of the exact commit an epic base branch was created at.
 #: Written to the epic's own event stream, so the base survives branch
 #: cleanup and re-cloning — local refs are not evidence of history.
@@ -13494,6 +13550,12 @@ def _resolve_worktree_workspace(
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if base_branch is None and conn is not None:
         base_branch = _story_base_branch(conn, task.id, board=board)
+        if base_branch is None and task.workspace_path and not _handoff_v2_enabled(
+            product_board_metadata(board)
+        ):
+            base_branch = _dependency_source_base(
+                conn, task, _git_toplevel(Path(task.workspace_path)) or Path(".")
+            )
     base = base_branch or "HEAD"
 
     def ensure_epic_base(repo_root: Path) -> None:
@@ -13532,6 +13594,13 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
+        if (
+            base_branch is None
+            and conn is not None
+            and not _handoff_v2_enabled(product_board_metadata(board))
+        ):
+            base_branch = _dependency_source_base(conn, task, repo_root)
+            base = base_branch or "HEAD"
         ensure_epic_base(repo_root)
         _materialize_worktree_with_dependencies(
             repo_root,
@@ -13590,6 +13659,13 @@ def _resolve_worktree_workspace(
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
+        if (
+            base_branch is None
+            and conn is not None
+            and not _handoff_v2_enabled(product_board_metadata(board))
+        ):
+            base_branch = _dependency_source_base(conn, task, repo_root)
+            base = base_branch or "HEAD"
         ensure_epic_base(repo_root)
         _materialize_worktree_with_dependencies(
             repo_root,
