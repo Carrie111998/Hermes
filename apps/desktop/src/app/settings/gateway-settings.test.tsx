@@ -6,6 +6,8 @@ import { GatewaySettings } from './gateway-settings'
 const getConnectionConfig = vi.fn()
 const saveConnectionConfig = vi.fn()
 
+// Keep the component import static so the suite's import phase, not a timed hook,
+// owns module loading under full-suite contention.
 vi.mock('@/store/profile', async () => {
   const { atom } = await import('nanostores')
 
