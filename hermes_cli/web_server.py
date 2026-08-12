@@ -1238,7 +1238,11 @@ def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, st
     from hermes_cli.config import get_compatible_custom_providers
     from hermes_cli.models import _KNOWN_PROVIDER_NAMES, normalize_provider
     from hermes_cli.model_normalize import normalize_model_for_provider
-    from hermes_cli.providers import resolve_custom_provider, resolve_user_provider
+    from hermes_cli.providers import (
+        canonicalize_provider_slug,
+        resolve_custom_provider,
+        resolve_user_provider,
+    )
 
     prov_in = (provider or "").strip()
     model_in = (model or "").strip()
@@ -1264,6 +1268,14 @@ def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, st
         return user_provider.id, model_in
     if custom_provider is not None:
         return custom_provider.id, model_in
+
+    # A namespaced slug that resolved to nothing is the BARE custom endpoint's
+    # UI row (``custom:custom`` — model.provider: custom + base_url, no
+    # declared entry). It must never be persisted verbatim: the credential
+    # resolver cannot load it and the next agent init dies with "Unknown
+    # provider 'custom:custom'". Collapse it to the bare provider id.
+    if prov_in.lower().startswith("custom:"):
+        return canonicalize_provider_slug(prov_in, cfg if isinstance(cfg, dict) else {}), model_in
 
     if canonical not in _KNOWN_PROVIDER_NAMES and "/" in model_in:
         # Vendor prefix posing as a provider (analytics fallback). Resolve
@@ -6553,6 +6565,15 @@ def _apply_model_assignment_sync(
     if not provider:
         raise HTTPException(status_code=400, detail="provider required for auxiliary")
 
+    # The main branch canonicalizes through _normalize_main_model_assignment;
+    # this branch wrote the caller's string verbatim, so a desktop row slug
+    # (``custom:custom``) landed in EVERY slot when no task was named — and,
+    # because it compares unequal to "custom", the block below also wrongly
+    # cleared each slot's base_url and credentials. Canonicalize first.
+    from hermes_cli.providers import canonicalize_provider_slug
+
+    provider = canonicalize_provider_slug(provider, cfg)
+
     targets = [task] if task else list(_AUX_TASK_SLOTS)
     for slot in targets:
         if slot not in _AUX_TASK_SLOTS:
@@ -7272,6 +7293,37 @@ async def validate_provider_credential(body: EnvVarUpdate, request: Request):
             return {"ok": True, "reachable": True, "message": "", "models": _parse_model_ids(resp)}
         except Exception:
             return {"ok": False, "reachable": False, "message": f"Could not reach {url}."}
+
+    # OPENAI_API_KEY doubles as the CUSTOM endpoint's credential: on a config
+    # whose model provider is custom (a vLLM / llama.cpp / any self-hosted
+    # OpenAI-compatible server), the key authenticates against model.base_url,
+    # not api.openai.com. The fixed-table probe below would send that key to
+    # OpenAI and report its 401 as "That API key was rejected" — a false
+    # rejection of a perfectly good key (2026-08-12, live). Probe the
+    # configured endpoint instead, with the same response contract.
+    if key == "OPENAI_API_KEY":
+        custom_base = ""
+        try:
+            with _profile_scope(body.profile):
+                cfg = load_config()
+            model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+            prov = str(model_cfg.get("provider", "") or "").strip().lower()
+            if prov == "custom" or prov.startswith("custom:"):
+                custom_base = str(model_cfg.get("base_url", "") or "").strip()
+        except Exception:
+            custom_base = ""
+        if custom_base:
+            url = custom_base.rstrip("/") + "/models"
+            try:
+                with httpx.Client(timeout=httpx.Timeout(10.0)) as client:
+                    resp = client.get(url, headers={"Authorization": f"Bearer {value}"})
+            except Exception:
+                return {"ok": False, "reachable": False, "message": f"Could not reach {url}."}
+            if resp.status_code in (401, 403):
+                return {"ok": False, "reachable": True, "message": "That API key was rejected. Double-check it and try again."}
+            if resp.status_code == 429 or resp.is_success:
+                return {"ok": True, "reachable": True, "message": ""}
+            return {"ok": False, "reachable": True, "message": f"Provider returned HTTP {resp.status_code} for this key."}
 
     probe = _CREDENTIAL_PROBES.get(key)
     if not probe:

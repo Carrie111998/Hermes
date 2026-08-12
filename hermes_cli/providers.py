@@ -658,6 +658,40 @@ def custom_provider_slug(display_name: str) -> str:
     return "custom:" + display_name.strip().lower().replace(" ", "-")
 
 
+def canonicalize_provider_slug(provider: str, config: Optional[Dict[str, Any]] = None) -> str:
+    """Collapse a UI provider slug into an id the credential resolver can load.
+
+    The pickers and the desktop settings hand around namespaced slugs
+    (``custom:<name>``). For endpoints declared under ``providers:`` or
+    ``custom_providers:`` those resolve to a durable id — but the BARE custom
+    endpoint (``model.provider: custom`` + base_url, the shape deployment
+    managers write) declares no entry, so its UI row slug (``custom:custom``)
+    resolves to nothing. Persisting that string verbatim bricks agent init
+    with "Unknown provider 'custom:custom'"; every write path must collapse
+    it to ``custom`` instead. Anything that is not a ``custom:*`` slug is
+    returned unchanged — this is a slug repair, not a general resolver.
+    """
+    raw = (provider or "").strip()
+    if not raw.lower().startswith("custom:"):
+        return raw
+
+    cfg = config if isinstance(config, dict) else {}
+    user_providers = cfg.get("providers")
+    if isinstance(user_providers, dict):
+        pdef = resolve_user_provider(raw.lower(), user_providers)
+        if pdef is not None:
+            return pdef.id
+    try:
+        from hermes_cli.config import get_compatible_custom_providers
+
+        pdef = resolve_custom_provider(raw, get_compatible_custom_providers(cfg))
+        if pdef is not None:
+            return pdef.id
+    except Exception:
+        pass
+    return "custom"
+
+
 def resolve_custom_provider(
     name: str,
     custom_providers: Optional[List[Dict[str, Any]]],

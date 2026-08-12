@@ -1811,7 +1811,15 @@ def resolve_provider(
 
     if normalized == "openrouter":
         return "openrouter"
-    if normalized == "custom":
+    if normalized == "custom" or normalized.startswith("custom:"):
+        # ``custom:<name>`` is the namespaced slug the pickers and the desktop
+        # settings write — for declared custom_providers entries AND for the
+        # bare custom endpoint, whose row slug ("custom:custom") matches no
+        # entry at all. Whichever it is, the credential family is the custom
+        # one (base_url + OPENAI_API_KEY / model.api_key); endpoint details
+        # resolve later through runtime_provider, which understands the
+        # namespace. Raising here bricked agent init on a config a settings
+        # UI wrote (2026-08-12, live).
         return "custom"
     if normalized in PROVIDER_REGISTRY:
         return normalized
