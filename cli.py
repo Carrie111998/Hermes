@@ -4637,7 +4637,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # don't auto-queue another continuation on top of a user-cancelled
         # turn (which would make Ctrl+C feel like it did nothing).
         self._last_turn_interrupted = False
-        self._should_exit = False
+        self._should_exit = threading.Event()
         # /exit --delete: when True, the current session's SQLite history and
         # on-disk transcripts are deleted during shutdown. Set by
         # process_command() when the user runs /exit --delete or /quit --delete.
@@ -7072,7 +7072,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if _looks_like_slash_command(text):
             try:
                 if not self.process_command(text):
-                    self._should_exit = True
+                    self._should_exit.set()
                     if app is not None and app.is_running:
                         app.exit()
             except Exception as exc:
@@ -15093,7 +15093,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # See constructor note. Mirrored here for the run() path that skips
         # the earlier __init__ branch.
         self._last_turn_interrupted = False
-        self._should_exit = False
+        self._should_exit.clear()
         self._last_ctrl_c_time = 0  # Track double Ctrl+C for force exit
 
         # Give plugin manager a CLI reference so plugins can inject messages
@@ -15314,7 +15314,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # can safely use prompt_toolkit terminal handoff helpers.
                 if self._should_handle_model_command_inline(text, has_images=has_images):
                     if not self.process_command(text):
-                        self._should_exit = True
+                        self._should_exit.set()
                         if event.app.is_running:
                             event.app.exit()
                     event.app.current_buffer.reset(append_to_history=True)
@@ -15910,7 +15910,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if self._agent_running and self.agent:
                 if now - self._last_ctrl_c_time < 2.0:
                     print("\n⚡ Force exiting...")
-                    self._should_exit = True
+                    self._should_exit.set()
                     event.app.exit()
                     return
                 
@@ -15924,7 +15924,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self._attached_images.clear()
                 event.app.invalidate()
             else:
-                self._should_exit = True
+                self._should_exit.set()
                 event.app.exit()
 
         # Ctrl+Shift+C: no binding needed. Terminal emulators (GNOME Terminal,
@@ -16000,7 +16000,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self._attached_images.clear()
                 event.app.invalidate()
             else:
-                self._should_exit = True
+                self._should_exit.set()
                 event.app.exit()
 
         @kb.add('c-d')
@@ -16017,7 +16017,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # Empty text but pending attachments — no-op, don't exit.
                 return
             else:
-                self._should_exit = True
+                self._should_exit.set()
                 event.app.exit()
 
         _modal_prompt_active = Condition(
@@ -17280,7 +17280,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         app._on_resize = _resize_clear_ghosts
 
         def spinner_loop():
-            while not self._should_exit:
+            while not self._should_exit.is_set():
                 if not self._app:
                     time.sleep(0.1)
                     continue
@@ -17300,7 +17300,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         
         # Background thread to process inputs and run agent
         def process_loop():
-            while not self._should_exit:
+            while not self._should_exit.is_set():
                 try:
                     # Check for pending input with timeout
                     try:
@@ -17392,7 +17392,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         _cprint(f"\n⚙️  {user_input}")
                         try:
                             if not self.process_command(user_input):
-                                self._should_exit = True
+                                self._should_exit.set()
                                 # Schedule app exit
                                 if app.is_running:
                                     app.exit()
@@ -17526,13 +17526,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # run_conversation() returns and cli-post-turn drain fires — a gap that
         # can be many minutes with reasoning_effort=max on long sessions.
         def _background_drain_loop() -> None:
-            import time as _time
-            while not self._should_exit:
+            import time as _time, logging as _logging
+            _log = _logging.getLogger("bg-drain")
+            while not self._should_exit.is_set():
                 _time.sleep(2)
                 try:
                     self._drain_process_notifications("cli-background-drain")
                 except Exception:
-                    pass
+                    _log.debug("background drain cycle failed", exc_info=True)
         _drain_thread = threading.Thread(
             target=_background_drain_loop, daemon=True, name="bg-drain"
         )
@@ -17771,7 +17772,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             else:
                 raise
         finally:
-            self._should_exit = True
+            self._should_exit.set()
             self._pet_stop_anim()
             # Immediate feedback: prompt_toolkit has just torn down the input
             # box + status bar, so without a line here the terminal sits

@@ -185,6 +185,11 @@ class ProcessRegistry:
         # for these — a blocking wait() or a full read_log() means the agent
         # has the output in hand and is acting on it this turn.
         self._completion_consumed: set = set()
+        # Lock guards _completion_consumed writes (add/discard). Reads via
+        # __contains__ are safe under the GIL since only one thread writes.
+        # Held during drain_notifications in case a future caller adds
+        # concurrent writes (e.g. background drain thread, cli.py bg-drain).
+        self._completion_consumed_lock = threading.Lock()
 
         # Track sessions the agent merely *observed* exited via poll().  poll()
         # is a read-only status check, so it does NOT mark _completion_consumed
@@ -1216,7 +1221,8 @@ class ProcessRegistry:
 
     def is_completion_consumed(self, session_id: str) -> bool:
         """Check if a completion notification was already consumed via wait/log."""
-        return session_id in self._completion_consumed
+        with self._completion_consumed_lock:
+            return session_id in self._completion_consumed
 
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop parked on this session should still be parked.
@@ -1267,8 +1273,9 @@ class ProcessRegistry:
         check only ``is_completion_consumed`` so a read-only poll never
         suppresses their autonomous delivery turn (#10156).
         """
-        return session_id in self._completion_consumed or (
-            skip_poll_observed and session_id in self._poll_observed
+        return (
+            session_id in self._completion_consumed
+            or (skip_poll_observed and session_id in self._poll_observed)
         )
 
     def drain_notifications(
