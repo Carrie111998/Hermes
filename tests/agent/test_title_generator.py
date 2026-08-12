@@ -134,7 +134,60 @@ class TestGenerateTitle:
         with patch("agent.title_generator.call_llm", return_value=mock_response):
             assert generate_title("the login button is broken") == "Fix login button"
 
+    def test_accepts_markdown_emphasis_prose_title(self):
+        """Leading * is legit prose emphasis — not a truncated fence."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "*Fix the login flow*"
 
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("the login button is broken") == "*Fix the login flow*"
+
+    def test_accepts_quoted_prose_title(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "'Quoted phrase'"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            # _clean_title strips matching outer quotes after extract.
+            assert generate_title("quote this") == "Quoted phrase"
+
+    def test_accepts_double_quoted_prose_title(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = '"Debug imports"'
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("debug imports") == "Debug imports"
+
+    def test_json_with_trailing_brace_chatter_still_extracts(self):
+        """Complete title object + trailing brace chatter must not look truncated."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = (
+            '{"title": "Fix login"} and chatter {step'
+        )
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("the login button is broken") == "Fix login"
+
+    def test_prose_with_braces_survives(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Use dict {key: value} carefully"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert (
+                generate_title("dict help") == "Use dict {key: value} carefully"
+            )
+
+    def test_rejects_unquoted_key_truncated_object(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = '{title: "Fix login"'
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("fix the login button") is None
 
     def test_invokes_failure_callback_on_exception(self):
         """failure_callback must fire so the user sees a warning (issue #15775)."""
