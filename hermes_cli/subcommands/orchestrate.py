@@ -25,6 +25,22 @@ def build_orchestrate_parser(subparsers, *, cmd_orchestrate):
     actions.add_parser("health", help="Check whether the local adapter is reachable")
     actions.add_parser("cycles", help="List jobs registered by the owner")
 
+    prepare = actions.add_parser(
+        "prepare", help="Create a reviewable job proposal without activating it"
+    )
+    prepare.add_argument("--repo", required=True, help="Clean source repository root")
+    prepare.add_argument("--repository-id", required=True)
+    prepare.add_argument("--cycle", required=True, dest="cycle_id")
+    prepare.add_argument("--contract", required=True, dest="contract_id")
+    prepare.add_argument("--goal", required=True)
+    prepare.add_argument("--accept", action="append", required=True, dest="acceptance")
+    prepare.add_argument("--allow", action="append", required=True, dest="allowed_paths")
+    prepare.add_argument("--branch", required=True, dest="planned_branch")
+    prepare.add_argument("--worktree", required=True, dest="planned_worktree")
+    prepare.add_argument("--output", help="Owner-only proposal JSON path")
+    prepare.add_argument("--max-runtime", type=int, default=1800)
+    prepare.add_argument("--heartbeat-timeout", type=int, default=180)
+
     start = actions.add_parser("start", help="Start one registered implementation job")
     start.add_argument("cycle_id")
     start.add_argument("--dispatch-id", help="Reuse a previously chosen UUID for idempotent recovery")
@@ -97,6 +113,40 @@ def run_operator_command(args) -> int:
                     f"{cycle_id}  repo={cycle.get('repository_id')}  "
                     f"revision={cycle.get('revision')}  branch={cycle.get('branch')}"
                 )
+            return 0
+
+        if args.orchestrate_action == "prepare":
+            from plugins.builder_adapter.preparation import (
+                inspect_repository,
+                prepare_bundle,
+                write_bundle,
+            )
+
+            settings, _ = _client(args, authenticated=False)
+            repository = inspect_repository(args.repo)
+            bundle = prepare_bundle(
+                cycle_id=args.cycle_id,
+                contract_id=args.contract_id,
+                repository_id=args.repository_id,
+                repository=repository,
+                goal=args.goal,
+                acceptance_criteria=args.acceptance,
+                allowed_paths=args.allowed_paths,
+                planned_branch=args.planned_branch,
+                planned_worktree=args.planned_worktree,
+                validation_profile_id=settings.validation_profile_id,
+                max_runtime_seconds=args.max_runtime,
+                heartbeat_timeout_seconds=args.heartbeat_timeout,
+                registered_remote=settings.repository_allowlist.get(args.repository_id),
+            )
+            output = args.output or (
+                f"~/.hermes/builder-jobs/pending/{args.cycle_id}.json"
+            )
+            destination = write_bundle(output, bundle)
+            print(f"Prepared: {destination}")
+            print(f"State: {bundle['activation_state']}")
+            print(f"Bundle SHA-256: {bundle['bundle_sha256']}")
+            print("No worktree was created and no builder was started.")
             return 0
 
         settings, client = _client(args)

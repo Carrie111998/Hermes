@@ -21,6 +21,29 @@ hermes orchestrate health
 hermes orchestrate cycles
 ```
 
+Prepare a new job proposal without activating or starting it:
+
+```console
+hermes orchestrate prepare \
+  --repo /absolute/path/to/repository \
+  --repository-id my-project \
+  --cycle FEATURE_EXAMPLE_001 \
+  --contract FEATURE-EXAMPLE-001 \
+  --goal "Add the requested behavior" \
+  --accept "Focused tests pass" \
+  --accept "Existing behavior remains compatible" \
+  --allow "src/example.py" \
+  --allow "tests/test_example.py" \
+  --branch "feat/example-001" \
+  --worktree "/absolute/new/worktree/path"
+```
+
+`prepare` inspects the clean repository, pins its current commit and canonical
+remote, rejects repository-wide write access, and writes an owner-only JSON
+proposal under `~/.hermes/builder-jobs/pending/`. It creates no worktree,
+changes no governance state, and starts no worker. The printed SHA-256 identifies
+the exact proposal submitted for governance review.
+
 Start one registered job:
 
 ```console

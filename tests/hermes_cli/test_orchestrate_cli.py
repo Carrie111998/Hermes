@@ -29,3 +29,22 @@ def test_orchestrate_status_requires_cycle():
     )
     assert args.dispatch_id == "dispatch-one"
     assert args.cycle_id == "CYCLE_ONE"
+
+
+def test_orchestrate_prepare_collects_repeated_scope_fields():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    build_orchestrate_parser(subparsers, cmd_orchestrate=_handler)
+    args = parser.parse_args(
+        [
+            "orchestrate", "prepare", "--repo", "/srv/project",
+            "--repository-id", "my-project", "--cycle", "FEATURE_EXAMPLE_001",
+            "--contract", "FEATURE-EXAMPLE-001", "--goal", "Build it",
+            "--accept", "Tests pass", "--allow", "src/example.py",
+            "--branch", "feat/example", "--worktree", "/srv/worktrees/example",
+        ]
+    )
+    assert args.acceptance == ["Tests pass"]
+    assert args.allowed_paths == ["src/example.py"]
