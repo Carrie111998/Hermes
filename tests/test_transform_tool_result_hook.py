@@ -132,6 +132,52 @@ def test_transform_tool_result_runs_after_post_tool_call(monkeypatch):
     ]
 
 
+def test_post_transform_result_emits_final_result(monkeypatch):
+    """When a transform rewrites the result, a distinct post_transform_result
+    observer fires with the FINAL result (so telemetry reflects the wire)."""
+    observed = []
+
+    def _hook(hook_name, **kw):
+        if hook_name == "post_tool_call":
+            observed.append(("post_tool_call", kw["result"]))
+        elif hook_name == "transform_tool_result":
+            observed.append(("transform_tool_result", kw["result"]))
+            return ['{"error": "rewritten-after-observer"}']
+        elif hook_name == "post_transform_result":
+            observed.append(("post_transform_result", kw["result"], kw["status"]))
+        return []
+
+    out = _run_handle_function_call(
+        monkeypatch,
+        dispatch_result='{"ok": true}',
+        invoke_hook=_hook,
+    )
+    assert out == '{"error": "rewritten-after-observer"}'
+    # The final observer sees the rewritten result and re-derives status=error.
+    assert observed == [
+        ("post_tool_call", '{"ok": true}'),
+        ("transform_tool_result", '{"ok": true}'),
+        ("post_transform_result", '{"error": "rewritten-after-observer"}', "error"),
+    ]
+
+
+def test_post_transform_result_not_emitted_when_unchanged(monkeypatch):
+    """No rewrite → no post_transform_result event (no noise)."""
+    observed = []
+
+    def _hook(hook_name, **kw):
+        observed.append(hook_name)
+        return []
+
+    out = _run_handle_function_call(
+        monkeypatch,
+        dispatch_result='{"ok": true}',
+        invoke_hook=_hook,
+    )
+    assert out == '{"ok": true}'
+    assert "post_transform_result" not in observed
+
+
 def test_transform_tool_result_integration_with_real_plugin(monkeypatch, tmp_path):
     """End-to-end: load a real plugin from HERMES_HOME and verify it rewrites results."""
     import yaml

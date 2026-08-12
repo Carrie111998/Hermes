@@ -1511,6 +1511,8 @@ def handle_function_call(
             middleware_trace=list(_tool_middleware_trace),
         )
 
+        _raw_result = result
+
         # Generic tool-result canonicalization seam: plugins receive the
         # final result string (JSON, usually) and may replace it by
         # returning a string from transform_tool_result. Runs after
@@ -1547,6 +1549,39 @@ def handle_function_call(
                         break
         except Exception as _hook_err:
             logger.debug("transform_tool_result hook error: %s", _hook_err)
+
+        # post_tool_call stays observational (raw result) — its ordering is a
+        # pinned contract (test_transform_tool_result_runs_after_post_tool_call).
+        # When a transform rewrites the result, emit a distinct final-result
+        # observer so telemetry reflects what the model actually receives
+        # instead of reporting success on a result that was rewritten to an error.
+        if result != _raw_result:
+            try:
+                from hermes_cli.lifecycle import has_hook as _has_final_hook, invoke_hook as _invoke_final_hook
+
+                if _has_final_hook("post_transform_result"):
+                    _fstatus, _ferr_type, _ferr_msg = _tool_result_observer_fields(
+                        function_name,
+                        result,
+                    )
+                    _invoke_final_hook(
+                        "post_transform_result",
+                        tool_name=function_name,
+                        args=function_args,
+                        result=result,
+                        task_id=task_id or "",
+                        session_id=session_id or "",
+                        tool_call_id=tool_call_id or "",
+                        turn_id=turn_id or "",
+                        api_request_id=api_request_id or "",
+                        duration_ms=duration_ms,
+                        status=_fstatus,
+                        error_type=_ferr_type,
+                        error_message=_ferr_msg,
+                        middleware_trace=list(_tool_middleware_trace),
+                    )
+            except Exception as _hook_err:
+                logger.debug("post_transform_result hook error: %s", _hook_err)
 
         return result
 
