@@ -113,6 +113,19 @@ fi
 if [ -n "${HERMES_RUN_SLOW_PET_TESTS:-}" ]; then
   CLEAN_ENV+=("HERMES_RUN_SLOW_PET_TESTS=$HERMES_RUN_SLOW_PET_TESTS")
 fi
+
+# run_tests_parallel.py documents these as working knobs, but `env -i`
+# strips anything not named here — so before this they were silently
+# inert through the wrapper and only worked on a direct `python
+# scripts/run_tests_parallel.py` call. Forward them so the documented
+# behaviour is the real behaviour.
+for _var in HERMES_TEST_WORKERS HERMES_TEST_PATHS HERMES_TEST_FILE_TIMEOUT \
+            HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE; do
+  eval "_val=\${$_var:-}"
+  if [ -n "$_val" ]; then
+    CLEAN_ENV+=("$_var=$_val")
+  fi
+done
 if [ -n "$EXTRA_PYTHONPATH" ]; then
   CLEAN_ENV+=("PYTHONPATH=$EXTRA_PYTHONPATH")
 fi

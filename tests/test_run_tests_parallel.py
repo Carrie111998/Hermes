@@ -561,3 +561,200 @@ def test_file_retry_does_not_launder_deterministic_failure(tmp_path: Path) -> No
     assert proc.returncode == 1, proc.stdout
     assert "deterministic regression" in proc.stdout
     assert "FLAKY file" not in proc.stdout
+
+
+# ── Host-saturation guards ──────────────────────────────────────────────
+# Regression cover for the 2026-08-12 dashboard-starvation incident: ~50
+# concurrent pytest subprocesses on a 12-core box drove commit charge to
+# exhaustion, and a Hermes dashboard startup thrashed for 29 minutes
+# without ever reaching its uvicorn bind. Three independent leaks let that
+# happen, and each gets a test here:
+#
+#   1. the default worker count was cpu_count*2 (24 here), not the
+#      cpu_count the module docstring advertised;
+#   2. nothing coordinated ACROSS invocations, so two concurrent runs
+#      stacked to ~48 workers;
+#   3. nothing consulted memory pressure before spawning, even though
+#      commit — not CPU — is what actually ran out.
+
+
+def test_default_worker_count_does_not_oversubscribe_cores() -> None:
+    """Default -j must never exceed the core count.
+
+    The box has 12 cores; the historical ``cpu_count * 2`` default put 24
+    pytest subprocesses in flight from a single invocation. Existing
+    evidence is that -j 24 oversubscribes this host and the failure tail
+    vanishes at -j 12.
+    """
+    cores = os.cpu_count() or 4
+    assert run_tests_parallel._default_worker_count() <= cores
+
+
+def test_default_worker_count_matches_documented_behaviour() -> None:
+    """The docstring promised os.cpu_count(); the code must actually do it."""
+    assert run_tests_parallel._default_worker_count() == (os.cpu_count() or 4)
+
+
+def test_global_slot_capacity_is_bounded_by_cores() -> None:
+    """The machine-global ceiling is the core count, not a multiple of it."""
+    assert run_tests_parallel._global_slot_capacity() <= (os.cpu_count() or 4)
+
+
+def test_global_slots_are_exclusive_across_processes(tmp_path: Path) -> None:
+    """A slot held by one PROCESS is unavailable to another.
+
+    This is the property that makes the limiter cross-invocation: a
+    thread-local semaphore would let two ``run_tests_parallel.py``
+    invocations each spawn a full complement of workers.
+    """
+    slot_dir = tmp_path / "slots"
+    # Hold the only slot in this process...
+    with run_tests_parallel._acquire_global_slot(1, slot_dir):
+        # ...and prove a separate process cannot also acquire it.
+        probe = textwrap.dedent(
+            f"""
+            import sys
+            sys.path.insert(0, {str(Path(run_tests_parallel.__file__).parent.parent)!r})
+            from scripts import run_tests_parallel as r
+            got = r._try_acquire_any_slot(1, {str(slot_dir)!r})
+            print("ACQUIRED" if got else "BLOCKED")
+            """
+        )
+        out = run_text_capture(
+            [sys.executable, "-c", probe], timeout=60
+        )
+        assert "BLOCKED" in out.stdout, out.stdout + out.stderr
+
+
+def test_slot_is_released_when_holder_dies(tmp_path: Path) -> None:
+    """Slots must be reclaimed by the OS when a holder dies uncleanly.
+
+    Without this the limiter would wedge the box permanently after any
+    crashed or Ctrl-C'd run — a worse failure than the one it prevents.
+    """
+    slot_dir = tmp_path / "slots"
+    grabber = textwrap.dedent(
+        f"""
+        import sys, time
+        sys.path.insert(0, {str(Path(run_tests_parallel.__file__).parent.parent)!r})
+        from scripts import run_tests_parallel as r
+        h = r._try_acquire_any_slot(1, {str(slot_dir)!r})
+        print("HELD", flush=True)
+        time.sleep(300)
+        """
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", grabber],
+        stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        assert "HELD" in proc.stdout.readline()
+        # Slot is taken while the holder lives.
+        assert run_tests_parallel._try_acquire_any_slot(1, slot_dir) is None
+    finally:
+        proc.kill()
+        proc.wait(timeout=30)
+
+    # Killed without any cleanup path running — the OS must have dropped
+    # the lock anyway. Poll briefly: Windows releases asynchronously.
+    deadline = time.monotonic() + 30
+    handle = None
+    while time.monotonic() < deadline:
+        handle = run_tests_parallel._try_acquire_any_slot(1, slot_dir)
+        if handle is not None:
+            break
+        time.sleep(0.1)
+    assert handle is not None, "slot leaked after holder was killed"
+    run_tests_parallel._release_slot(handle)
+
+
+def test_commit_gate_reports_available_headroom() -> None:
+    """The gate must read real commit headroom, not physical RAM.
+
+    The incident was commit exhaustion with physical RAM still free, so a
+    virtual_memory()-style reading would have shown nothing wrong.
+    """
+    avail = run_tests_parallel._available_commit_bytes()
+    assert avail is None or avail > 0
+
+
+def test_commit_gate_gives_up_rather_than_deadlocking() -> None:
+    """An unsatisfiable memory threshold must time-box, not hang forever.
+
+    If the box is genuinely out of commit for an unrelated reason, the
+    runner has to make progress and complain — blocking indefinitely would
+    turn a slow suite into a hung one.
+    """
+    started = time.monotonic()
+    # Demand more commit than any machine has, with a tiny deadline.
+    waited = run_tests_parallel._await_commit_headroom(
+        min_free_bytes=2**60, deadline_seconds=1.0
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed < 20, f"gate blocked {elapsed:.1f}s past its 1s deadline"
+    assert waited is False, "gate must report that headroom was never reached"
+
+
+def test_waiting_for_a_contended_slot_survives_multiple_poll_rounds(
+    tmp_path: Path,
+) -> None:
+    """The blocking wait must still be running after several poll cycles.
+
+    The contention path is the one that matters and the one least likely
+    to be exercised by a quick test: a limiter whose *acquire* path works
+    but whose *wait* path raises would pass a naive test and then blow up
+    only when two runs actually collide — the exact scenario it exists to
+    handle. Hold the only slot, let a waiter poll through many rounds,
+    then release and require a clean acquisition.
+    """
+    slot_dir = tmp_path / "slots"
+    acquired: list[bool] = []
+    failed: list[BaseException] = []
+
+    holder = run_tests_parallel._acquire_global_slot(1, slot_dir)
+    holder.__enter__()
+
+    def _waiter() -> None:
+        try:
+            with run_tests_parallel._acquire_global_slot(1, slot_dir):
+                acquired.append(True)
+        except BaseException as exc:  # noqa: BLE001 — recording for assert
+            failed.append(exc)
+
+    import threading
+
+    thread = threading.Thread(target=_waiter, daemon=True)
+    thread.start()
+    # Poll interval is 0.25s, so this is ~8 rounds through the wait loop.
+    time.sleep(2.0)
+    assert not failed, f"wait loop raised instead of waiting: {failed!r}"
+    assert not acquired, "waiter acquired a slot that was still held"
+
+    holder.__exit__(None, None, None)
+    thread.join(timeout=30)
+    assert not failed, f"wait loop raised after release: {failed!r}"
+    assert acquired == [True], "waiter never acquired the released slot"
+
+
+def test_unusable_slot_dir_degrades_to_unlimited_instead_of_spinning(
+    tmp_path: Path,
+) -> None:
+    """An unlockable slot directory must not wedge the runner.
+
+    'Cannot use slots at all' and 'every slot is busy' are different
+    conditions with opposite correct responses — proceed vs wait. Collapsing
+    them into a single ``None`` makes a read-only HOME (or any sandbox where
+    the directory cannot be created) spin forever instead of degrading to
+    the old unlimited behaviour, turning a graceful fallback into a hang.
+    """
+    # A regular file where the slot DIRECTORY should be — mkdir must fail.
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("", encoding="utf-8")
+    slot_dir = blocker / "slots"
+
+    started = time.monotonic()
+    with run_tests_parallel._acquire_global_slot(1, slot_dir):
+        pass
+    elapsed = time.monotonic() - started
+    assert elapsed < 10, f"spun {elapsed:.1f}s on an unusable slot dir"
