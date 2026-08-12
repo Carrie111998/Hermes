@@ -28,7 +28,7 @@ Hermes Agent works with any OpenAI-compatible API. Supported providers include:
 
 Set your provider with `hermes model` or by editing `~/.hermes/.env`. See the [Environment Variables](./environment-variables.md) reference for all provider keys.
 
-### Does it work on Windows/Android/Termux/my plataform??
+### Does it work on Windows/Android/Termux?
 See **[Platform Support](../getting-started/platform-support.md)** for the full platform availability matrix.
 
 ### I run Hermes in WSL2. What's the best way to control my normal Windows Chrome?
@@ -109,7 +109,7 @@ Yes. Import the `AIAgent` class and use Hermes programmatically:
 ```python
 from run_agent import AIAgent
 
-agent = AIAgent(model="anthropic/claude-opus-4.7")
+agent = AIAgent(model="anthropic/claude-opus-4.8")
 response = agent.chat("Explain quantum computing briefly")
 ```
 
@@ -284,7 +284,7 @@ Make sure the key matches the provider. An OpenAI key won't work with OpenRouter
 hermes model
 
 # Set a valid model
-hermes config set HERMES_MODEL anthropic/claude-opus-4.7
+hermes config set HERMES_MODEL anthropic/claude-opus-4.8
 
 # Or specify per-session
 hermes chat --model openrouter/meta-llama/llama-3.1-70b-instruct
@@ -342,6 +342,22 @@ providers:
 (Older configs use the legacy `custom_providers:` list — still supported and auto-migrated to `providers:`.)
 
 See [Context Length Detection](../integrations/providers.md#context-length-detection) for how auto-detection works and all override options.
+
+#### `x_search` returns `degraded: true` with no citations
+
+**Cause:** You used a narrowing filter (`allowed_x_handles`, `excluded_x_handles`, or a date range) and xAI's X index returned no matching posts. Grok still produced a synthesized answer from its own training data — treat it as unsourced.
+
+**Solution:** Check for a typo in the handle (strip the `@`), widen the date range, and retry. Some active accounts intermittently fail to surface in `x_search`; if you need an exact handle's timeline, use the `xurl` skill for direct X API reads. See [X (Twitter) Search](../user-guide/features/x-search.md#degraded-true--answer-with-no-citations).
+
+#### `x_search` tool doesn't appear in the schema
+
+**Cause:** Either the toolset is disabled or no xAI credentials are configured. The tool only registers when xAI credentials (SuperGrok / X Premium+ OAuth or `XAI_API_KEY`) are present.
+
+**Solution:** Run `hermes tools` and confirm **X (Twitter) Search** is enabled, then run `hermes auth add xai-oauth` (browser login) or set `XAI_API_KEY` in `~/.hermes/.env`. Restart the session so the tool registry re-reads. See [xAI Grok OAuth](../guides/xai-grok-oauth.md).
+
+#### xAI OAuth vs API key: which should I use?
+
+SuperGrok / X Premium+ OAuth (`hermes auth add xai-oauth`) is preferred — it runs against your subscription quota instead of paid API spend, and the same bearer token covers chat, TTS, image gen, video gen, and transcription. Use `XAI_API_KEY` if you're on the pay-per-token xAI API plan. When both are configured, OAuth wins. See [xAI Grok OAuth](../guides/xai-grok-oauth.md).
 
 ---
 
@@ -854,7 +870,7 @@ hermes config show | head -20
 hermes model
 
 # Or test with a known-good model
-hermes chat -q "hello" --model anthropic/claude-opus-4.7
+hermes chat -q "hello" --model anthropic/claude-opus-4.8
 ```
 
 If using OpenRouter, make sure your API key has credits. A 400 from OpenRouter often means the model requires a paid plan or the model ID has a typo.

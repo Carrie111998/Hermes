@@ -185,7 +185,7 @@ Outbound messages from the agent are delivered as **Home Assistant persistent no
 - **WebSocket** with 30-second heartbeat for real-time events
 - **Automatic reconnection** with backoff: 5s → 10s → 30s → 60s
 - **REST API** for outbound notifications (separate session to avoid WebSocket conflicts)
-- **Authorization** — HA events are always authorized (no user allowlist needed, since the `HASS_TOKEN` authenticates the connection)
+- **Authorization** — HA events are always authorized (no user allowlist needed, since the `HASS_TOKEN` authenticates the connection). **Note:** any Home Assistant user or automation that can trigger a service call (including `state_changed` events) can reach the Hermes agent, which has full terminal access — unlike other platforms, there is no per-user allowlist. Restrict `HASS_TOKEN` permissions to the minimum services your automations need, and treat the token as equivalent to agent shell access.
 
 ## Security
 

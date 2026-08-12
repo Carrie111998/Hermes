@@ -449,7 +449,15 @@ npm install
 ```
 
 :::info
-The `browser` toolset must be included in your config's `toolsets` list or enabled via `hermes config set toolsets '["hermes-cli", "browser"]'`.
+The `browser` toolset must be included in your config's `toolsets` list. Enable it with `hermes tools` (toggle **browser**) or add it to `toolsets:` in `config.yaml`:
+
+```yaml
+toolsets:
+  - hermes-cli
+  - browser
+```
+
+(Note: `hermes config set toolsets ...` writes scalar values only — use `hermes tools` or edit `config.yaml` for a list value.)
 :::
 
 ## Available Tools

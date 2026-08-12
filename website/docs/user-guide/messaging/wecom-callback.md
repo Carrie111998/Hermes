@@ -40,7 +40,7 @@ See also: [WeCom Bot](./wecom.md) for the bot-style integration.
 3. In the app settings, create a **Corp Secret**
 4. Note the **Agent ID** from the app's overview page
 5. Under **Receive Messages**, configure the callback URL:
-   - URL: `http://YOUR_PUBLIC_IP:8645/wecom/callback`
+   - URL: `https://YOUR_PUBLIC_IP:8645/wecom/callback` — **WeCom requires HTTPS** and rejects plain HTTP (see troubleshooting below). If you don't have a TLS endpoint yet, front the gateway with a reverse proxy or Cloudflare Tunnel that terminates TLS and forwards to port `8645`, then register that public HTTPS URL.
    - Token: Generate a random token (WeCom provides one)
    - EncodingAESKey: Generate a key (WeCom provides one)
 

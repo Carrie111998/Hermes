@@ -297,6 +297,16 @@ Each user runs the flow once, in their own DM with the bot:
    into chat as `/setup-files <PASTED_URL>`. The bot exchanges it for a
    refresh token.
 
+:::note Why this is safe to paste into chat
+The `code=...` value is a single-use OAuth authorization code, valid for
+seconds, scoped to `chat.messages.create`, and exchanged only by the bot that
+owns the OAuth client. It is **not** the refresh token — that never leaves the
+server. The only risk would be a third party racing you to exchange the code
+within its short lifetime; in practice the code is consumed by the bot on the
+very next message. If you're on a shared channel rather than a private DM,
+prefer running `/setup-files` in the user's own DM with the bot.
+:::
+
 The token lands at `~/.hermes/google_chat_user_tokens/<sanitized_email>.json`.
 Subsequent file requests in that user's DM use *their* token, so the bot
 uploads as them and the message lands in their space.

@@ -36,7 +36,7 @@ The simplest way to use Hermes is the `chat()` method — pass a message, get a 
 from run_agent import AIAgent
 
 agent = AIAgent(
-    model="anthropic/claude-sonnet-4.6",
+    model="anthropic/claude-sonnet-5",
     quiet_mode=True,
 )
 response = agent.chat("What is the capital of France?")
@@ -57,7 +57,7 @@ For more control over the conversation, use `run_conversation()` directly. It re
 
 ```python
 agent = AIAgent(
-    model="anthropic/claude-sonnet-4.6",
+    model="anthropic/claude-sonnet-5",
     quiet_mode=True,
 )
 
@@ -94,14 +94,14 @@ Control which toolsets the agent has access to using `enabled_toolsets` or `disa
 ```python
 # Only enable web tools (browsing, search)
 agent = AIAgent(
-    model="anthropic/claude-sonnet-4.6",
+    model="anthropic/claude-sonnet-5",
     enabled_toolsets=["web"],
     quiet_mode=True,
 )
 
 # Enable everything except terminal access
 agent = AIAgent(
-    model="anthropic/claude-sonnet-4.6",
+    model="anthropic/claude-sonnet-5",
     disabled_toolsets=["terminal"],
     quiet_mode=True,
 )
@@ -119,7 +119,7 @@ Maintain conversation state across multiple turns by passing the message history
 
 ```python
 agent = AIAgent(
-    model="anthropic/claude-sonnet-4.6",
+    model="anthropic/claude-sonnet-5",
     quiet_mode=True,
 )
 
@@ -145,7 +145,7 @@ Enable trajectory saving to capture conversations in ShareGPT format — useful 
 
 ```python
 agent = AIAgent(
-    model="anthropic/claude-sonnet-4.6",
+    model="anthropic/claude-sonnet-5",
     save_trajectories=True,
     quiet_mode=True,
 )

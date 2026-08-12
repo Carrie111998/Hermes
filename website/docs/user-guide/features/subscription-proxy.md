@@ -173,6 +173,10 @@ subscription. The proxy has no auth of its own — it accepts any bearer.
 Use a firewall, VPN, or reverse proxy with proper auth if you expose
 this beyond your trusted network.
 
+:::note Port 8645 is shared
+`8645` is also the default port for the [BlueBubbles webhook listener](/user-guide/messaging/bluebubbles) and the [WeCom callback adapter](/user-guide/messaging/wecom-callback). If you run more than one of these on the same host, override the ports: pass `--port <other>` here, set `BLUEBUBBLES_WEBHOOK_PORT`, or set `WECOM_CALLBACK_PORT`.
+:::
+
 ## Rate limits
 
 Your Portal tier's RPM/TPM limits apply across the whole proxy. The

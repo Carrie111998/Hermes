@@ -250,11 +250,12 @@ To go back to the default (no overlay), use `/personality none` — `default` an
 You can also define custom personalities in `~/.hermes/config.yaml`:
 
 ```yaml
-personalities:
-  helpful: "You are a helpful, friendly AI assistant."
-  kawaii: "You are a kawaii assistant! Use cute expressions..."
-  pirate: "Arrr! Ye be talkin' to Captain Hermes..."
-  # Add your own!
+agent:
+  personalities:
+    helpful: "You are a helpful, friendly AI assistant."
+    kawaii: "You are a kawaii assistant! Use cute expressions..."
+    pirate: "Arrr! Ye be talkin' to Captain Hermes..."
+    # Add your own!
 ```
 
 ## Multi-line Input

@@ -30,13 +30,16 @@ Run `hermes setup --portal` — one OAuth gets you a model provider and all four
 ## Managing Configuration
 
 ```bash
-hermes config              # View current configuration
+hermes config              # View current configuration (alias for `config show`)
+hermes config show         # Show current config values
 hermes config edit         # Open config.yaml in your editor
 hermes config get KEY      # Print a resolved value
 hermes config set KEY VAL  # Set a specific value
 hermes config unset KEY    # Remove a user-set value
 hermes config check        # Check for missing options (after updates)
 hermes config migrate      # Interactively add missing options
+hermes config path         # Print the config file path
+hermes config env-path     # Print the .env file path
 
 # Examples:
 hermes config get model
@@ -55,17 +58,19 @@ The `hermes config set` command automatically routes values to the right file �
 Settings are resolved in this order (highest priority first):
 
 1. **CLI arguments** — e.g., `hermes chat --model anthropic/claude-sonnet-4` (per-invocation override)
-2. **`~/.hermes/config.yaml`** — the primary config file for all non-secret settings
-3. **`~/.hermes/.env`** — fallback for env vars; **required** for secrets (API keys, tokens, passwords)
+2. **Environment variables** — including everything set in `~/.hermes/.env`; an env var overrides the same setting in `config.yaml`
+3. **`~/.hermes/config.yaml`** — the primary config file for structured, non-secret settings
 4. **Built-in defaults** — hardcoded safe defaults when nothing else is set
 
 :::info Rule of Thumb
-Secrets (API keys, bot tokens, passwords) go in `.env`. Everything else (model, terminal backend, compression settings, memory limits, toolsets) goes in `config.yaml`. When both are set, `config.yaml` wins for non-secret settings.
+Secrets (API keys, bot tokens, passwords) go in `.env`. Everything else (model, terminal backend, compression settings, memory limits, toolsets) goes in `config.yaml`. Because env vars override `config.yaml`, prefer `config.yaml` for structured settings and reserve `.env` for secrets and env-level toggles.
 :::
 
 :::tip Org deployments
 An administrator can pin specific config and secret values that a standard user
-cannot override, via a system-level managed directory. See
+cannot override, via a system-level managed directory. This is the **one place**
+that inverts the usual env-over-config rule — managed keys win over both the
+shell environment and user config. See
 [Managed Scope](/user-guide/managed-scope).
 :::
 
@@ -2149,6 +2154,24 @@ web:
 **Parallel search modes:** Set `PARALLEL_SEARCH_MODE` to control search behavior — `fast`, `one-shot`, or `agentic` (default: `agentic`).
 
 **Exa:** Set `EXA_API_KEY` in `~/.hermes/.env`. Supports `category` filtering (`company`, `research paper`, `news`, `people`, `personal site`, `pdf`) and domain/date filters.
+
+## X (Twitter) Search (`x_search`)
+
+The `x_search` tool searches X (Twitter) posts, profiles, and threads directly via xAI's built-in `x_search` tool on the Responses API. It's read-only public discovery — for posting or authenticated account actions use the `xurl` skill instead.
+
+Auto-enables when xAI credentials are present (SuperGrok / X Premium+ OAuth via `hermes auth add xai-oauth`, or `XAI_API_KEY` in `~/.hermes/.env`). OAuth wins when both are configured. See the [X Search feature page](/user-guide/features/x-search) for full docs.
+
+```yaml
+x_search:
+  # xAI model used for the Responses call (any Grok model with x_search access).
+  model: grok-4.5
+  # Optional reasoning effort: low, medium, high, or xhigh.
+  # reasoning_effort: low
+  # Request timeout in seconds (x_search can take 60–120s for complex queries).
+  timeout_seconds: 180
+  # Retries on 5xx / ReadTimeout / ConnectionError (1.5x backoff, capped 5s).
+  retries: 2
+```
 
 ## Browser
 

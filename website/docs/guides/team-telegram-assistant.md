@@ -355,9 +355,9 @@ partitions above 80%, containers that have restarted, or high memory usage.
 hermes cron list          # View all scheduled jobs
 hermes cron status        # Check if scheduler is running
 
-# From Telegram chat
-/cron list                # View jobs
-/cron remove <job_id>     # Remove a job
+# From Telegram chat (the /cron slash command is CLI-only — ask in plain words)
+"List my cron jobs"
+"Remove the job that sends the weekly report"
 ```
 
 :::warning

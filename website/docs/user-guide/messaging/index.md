@@ -149,6 +149,20 @@ hermes gateway setup        # Interactive setup for all messaging platforms
 
 This walks you through configuring each platform with arrow-key selection, shows which platforms are already configured, and offers to start/restart the gateway when done.
 
+### Send a message without the agent loop
+
+For shell scripts, cron jobs, CI hooks, and monitoring daemons, [`hermes send`](/reference/cli-commands#hermes-send) posts a one-shot message to any configured platform — no agent loop, no LLM:
+
+```bash
+hermes send --to telegram "Deploy finished"
+hermes send --to discord:#ops "Disk usage over 80%"
+echo "Backup done" | hermes send --to slack
+```
+
+### Slack app manifest
+
+To generate the Slack app manifest with every Hermes slash command registered as a native slash command (needed for full functionality on Slack), use [`hermes slack manifest`](/reference/cli-commands#hermes-slack) — see the [Slack setup](/user-guide/messaging/slack) page for how to consume it.
+
 ## Gateway Commands
 
 ```bash
@@ -323,8 +337,8 @@ Details:
 # Restrict to specific users (recommended):
 TELEGRAM_ALLOWED_USERS=123456789,987654321
 DISCORD_ALLOWED_USERS=123456789012345678
-SIGNAL_ALLOWED_USERS=+155****4567,+155****6543
-SMS_ALLOWED_USERS=+155****4567,+155****6543
+SIGNAL_ALLOWED_USERS=+15550123456,+15550987654
+SMS_ALLOWED_USERS=+15550123456,+15550987654
 EMAIL_ALLOWED_USERS=trusted@example.com,colleague@work.com
 MATTERMOST_ALLOWED_USERS=3uo8dkh1p7g1mfk49ear5fzs5c
 MATRIX_ALLOWED_USERS=@alice:matrix.org

@@ -71,9 +71,12 @@ Twilio needs to know where to send incoming messages. In the [Twilio Console](ht
    - **HTTP Method**: `POST`
 
 :::tip Exposing Your Webhook
-If you're running Hermes locally, use a tunnel to expose the webhook:
+If you're running Hermes locally, use a tunnel to expose the webhook. The webhook listener binds to `127.0.0.1` by default — **you must set `SMS_WEBHOOK_HOST=0.0.0.0`** (or an IP reachable from the tunnel) or Twilio can never reach it:
 
 ```bash
+# In ~/.hermes/.env
+SMS_WEBHOOK_HOST=0.0.0.0
+
 # Using cloudflared
 cloudflared tunnel --url http://localhost:8080
 
@@ -108,7 +111,7 @@ hermes gateway
 You should see:
 
 ```
-[sms] Twilio webhook server listening on 127.0.0.1:8080, from: +1555***4567
+[sms] Twilio webhook server listening on 127.0.0.1:8080, from: +15550123456
 ```
 
 If you see `Refusing to start: SMS_WEBHOOK_URL is required`, set `SMS_WEBHOOK_URL` to the public URL configured in your Twilio Console (see Step 3).
@@ -145,6 +148,16 @@ Text your Twilio number — Hermes will respond via SMS.
 ---
 
 ## Security
+
+### Cost warning
+
+Every agent reply is a paid Twilio message (per-message fees on top of your plan), and inbound texts are free to *receive* but each response costs money. A flood of inbound messages — or an agent that replies in a loop — can rack up real spend fast.
+
+Mitigations:
+
+- Set `SMS_ALLOWED_USERS` to the exact E.164 numbers allowed to chat; leave `SMS_ALLOW_ALL_USERS` unset.
+- Keep prompts that produce short replies, and avoid patterns that make the agent re-prompt (e.g. unclear tool failures that trigger retries).
+- Monitor your Twilio usage dashboard; consider a spend alert on your Twilio account.
 
 ### Webhook signature validation
 
