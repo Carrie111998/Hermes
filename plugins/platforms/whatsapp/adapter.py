@@ -1809,6 +1809,11 @@ async def _standalone_send(
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
     try:
         bridge_port = extra.get("bridge_port", 3000)
+        session_path = Path(extra.get(
+            "session_path",
+            get_hermes_dir("platforms/whatsapp/session", "whatsapp/session"),
+        ))
+        bridge_token = _load_or_create_bridge_token(session_path)
         normalized_chat_id = to_whatsapp_jid(chat_id)
         media = media_files or []
         text = message or ""
@@ -1816,7 +1821,9 @@ async def _standalone_send(
         # a caption is never silently repeated across a multi-file send.
         media_caption = caption if (caption and len(media) == 1) else None
         last_message_id = None
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(
+            headers=_bridge_auth_headers(bridge_token)
+        ) as session:
             # 1) Text first (skip the /send call when this chunk is media-only
             #    or when the text is delivered as the media caption instead).
             if text.strip() and not media_caption:
