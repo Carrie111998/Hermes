@@ -160,6 +160,15 @@ class TestResolveStorageDir:
     def test_defaults_to_storage_dir_without_env(self):
         assert _resolve_storage_dir(None) == STORAGE_DIR
 
+    def test_local_environment_uses_durable_hermes_artifact_dir(self):
+        class LocalEnvironment:  # noqa: N801 - mirrors the production class name
+            pass
+
+        env = LocalEnvironment()
+        with patch("tools.tool_result_storage.get_hermes_home") as home:
+            home.return_value = "/Users/test/.hermes"
+            assert _resolve_storage_dir(env) == "/Users/test/.hermes/artifacts/tool-results"
+
     def test_uses_env_temp_dir_when_available(self):
         env = MagicMock()
         env.get_temp_dir.return_value = "/data/data/com.termux/files/usr/tmp"
@@ -307,19 +316,21 @@ class TestMaybePersistToolResult:
         )
         assert "Truncated" in result
 
-    def test_read_file_never_persisted(self):
-        """read_file has threshold=inf, should never be persisted."""
+    def test_large_read_file_is_persisted_before_it_reaches_history(self):
+        """Diagnostic reads must not occupy the protected conversational tail."""
         env = MagicMock()
-        content = "x" * 200_000
+        env.execute.return_value = {"output": "", "returncode": 0}
+        content = "x" * 50_000
         result = maybe_persist_tool_result(
             content=content,
             tool_name="read_file",
             tool_use_id="tc_rf",
             env=env,
-            threshold=float("inf"),
         )
-        assert result == content
-        env.execute.assert_not_called()
+        assert PERSISTED_OUTPUT_TAG in result
+        assert "tc_rf.txt" in result
+        assert len(result) < 3_000
+        assert env.execute.call_args.kwargs["stdin_data"] == content
 
     def test_uses_registry_threshold_when_not_provided(self):
         """When threshold=None, looks up from registry."""

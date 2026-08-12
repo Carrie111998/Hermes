@@ -6,17 +6,23 @@ Per-tool resolution: pinned > config overrides > registry > default.
 from dataclasses import dataclass, field
 from typing import Dict
 
-# Tools whose thresholds must never be overridden.
-# read_file=inf prevents infinite persist->read->persist loops.
-PINNED_THRESHOLDS: Dict[str, float] = {
-    "read_file": float("inf"),
+# Diagnostic reads are evidence, not ordinary chat history. Preserve their full
+# output as an artifact while keeping a bounded receipt in the active context.
+# This is deliberately a narrow allowlist: instructions and mutation results
+# keep their existing budget unless their individual tool has a smaller cap.
+DIAGNOSTIC_RESULT_SIZE_CHARS: int = 12_000
+DEFAULT_DIAGNOSTIC_TOOL_OVERRIDES: Dict[str, int] = {
+    "read_file": DIAGNOSTIC_RESULT_SIZE_CHARS,
+    "terminal": DIAGNOSTIC_RESULT_SIZE_CHARS,
+    "search_files": DIAGNOSTIC_RESULT_SIZE_CHARS,
+    "browser_console": DIAGNOSTIC_RESULT_SIZE_CHARS,
 }
 
 # Defaults matching the current hardcoded values in tool_result_storage.py.
 # Kept here as the single source of truth; tool_result_storage.py imports these.
 DEFAULT_RESULT_SIZE_CHARS: int = 100_000
 DEFAULT_TURN_BUDGET_CHARS: int = 200_000
-DEFAULT_PREVIEW_SIZE_CHARS: int = 1_500
+DEFAULT_PREVIEW_SIZE_CHARS: int = 2_500
 
 
 @dataclass(frozen=True)
@@ -46,10 +52,10 @@ class BudgetConfig:
         equal 100K; for a scaled-down budget it prevents a per-tool registry
         value from re-inflating the cap past the model's window (#23767).
         """
-        if tool_name in PINNED_THRESHOLDS:
-            return PINNED_THRESHOLDS[tool_name]
         if tool_name in self.tool_overrides:
             return self.tool_overrides[tool_name]
+        if tool_name in DEFAULT_DIAGNOSTIC_TOOL_OVERRIDES:
+            return DEFAULT_DIAGNOSTIC_TOOL_OVERRIDES[tool_name]
         from tools.registry import registry
         registry_value = registry.get_max_result_size(tool_name, default=self.default_result_size)
         if registry_value == float("inf"):

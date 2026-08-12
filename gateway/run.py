@@ -86,6 +86,48 @@ _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
+
+def _record_hygiene_failure_cooldown(gateway: Any, session_id: str, cooldown_seconds: float) -> float:
+    """Persist a hygiene-compression failure cooldown across gateway restarts."""
+    deadline = time.time() + max(0.0, float(cooldown_seconds))
+    cooldowns = getattr(gateway, "_hygiene_compression_failure_cooldowns", None)
+    if cooldowns is None:
+        cooldowns = {}
+        gateway._hygiene_compression_failure_cooldowns = cooldowns
+    cooldowns[session_id] = deadline
+
+    session_db = getattr(gateway, "_session_db", None)
+    session_db = getattr(session_db, "_db", session_db)
+    recorder = getattr(session_db, "record_compression_failure_cooldown", None)
+    if callable(recorder) and session_id:
+        try:
+            recorder(session_id, deadline, "gateway hygiene compression failed")
+        except Exception:
+            logger.warning("failed to persist hygiene cooldown for session %s", session_id, exc_info=True)
+    return deadline
+
+
+def _get_hygiene_failure_cooldown(gateway: Any, session_id: str) -> float:
+    """Return the latest process-local or durable hygiene cooldown deadline."""
+    cooldowns = getattr(gateway, "_hygiene_compression_failure_cooldowns", {}) or {}
+    try:
+        deadline = float(cooldowns.get(session_id) or 0.0)
+    except (TypeError, ValueError):
+        deadline = 0.0
+
+    session_db = getattr(gateway, "_session_db", None)
+    session_db = getattr(session_db, "_db", session_db)
+    getter = getattr(session_db, "get_compression_failure_cooldown", None)
+    if callable(getter) and session_id:
+        try:
+            durable = getter(session_id)
+            if isinstance(durable, dict):
+                deadline = max(deadline, float(durable.get("cooldown_until") or 0.0))
+        except Exception:
+            logger.warning("failed to read hygiene cooldown for session %s", session_id, exc_info=True)
+    return deadline
+
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
@@ -13433,12 +13475,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
                 if _needs_compress:
-                    _cooldowns = getattr(self, "_hygiene_compression_failure_cooldowns", None)
-                    if _cooldowns is None:
-                        _cooldowns = {}
-                        self._hygiene_compression_failure_cooldowns = _cooldowns
                     _cooldown_key = session_entry.session_id
-                    _cooldown_until = float(_cooldowns.get(_cooldown_key) or 0.0)
+                    _cooldown_until = _get_hygiene_failure_cooldown(
+                        self, _cooldown_key
+                    )
                     if _cooldown_until > time.time():
                         logger.info(
                             "Session hygiene: skipping compression for %s; "
@@ -13556,8 +13596,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             except asyncio.TimeoutError:
                                                 _hyg_waited = time.monotonic() - _hyg_wait_started
                                                 _idle = _hyg_commit_fence.seconds_since_progress()
+                                                # A streamed progress tick and the event loop
+                                                # timeout race at small intervals. Allow a
+                                                # narrow scheduler margin while retaining the
+                                                # configured absolute ceiling against a
+                                                # degenerate trickle stream.
+                                                _idle_grace = min(
+                                                    1.0,
+                                                    max(0.05, _hyg_timeout_seconds),
+                                                )
                                                 if (
-                                                    _idle < _hyg_timeout_seconds
+                                                    _idle <= _hyg_timeout_seconds + _idle_grace
                                                     and _hyg_waited < _hyg_total_ceiling_seconds
                                                 ):
                                                     logger.info(
@@ -13594,9 +13643,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             )
                                             _hyg_cleanup_deferred = True
                                             if _hyg_failure_cooldown_seconds >= 0:
-                                                self._hygiene_compression_failure_cooldowns[
-                                                    session_entry.session_id
-                                                ] = time.time() + _hyg_failure_cooldown_seconds
+                                                _record_hygiene_failure_cooldown(
+                                                    self,
+                                                    session_entry.session_id,
+                                                    _hyg_failure_cooldown_seconds,
+                                                )
                                             logger.warning(
                                                 "Session hygiene compression for session %s "
                                                 "made no progress for %.1fs "
@@ -13739,9 +13790,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _comp = getattr(_hyg_agent, "context_compressor", None)
                                     if _comp is not None and getattr(_comp, "_last_compress_aborted", False):
                                         if _hyg_failure_cooldown_seconds >= 0:
-                                            self._hygiene_compression_failure_cooldowns[
-                                                session_entry.session_id
-                                            ] = time.time() + _hyg_failure_cooldown_seconds
+                                            _record_hygiene_failure_cooldown(
+                                                self,
+                                                session_entry.session_id,
+                                                _hyg_failure_cooldown_seconds,
+                                            )
                                         _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
                                         # Force-redact: provider exception text
                                         # may contain credentials; this message

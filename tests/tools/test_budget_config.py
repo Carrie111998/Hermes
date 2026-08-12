@@ -1,22 +1,20 @@
 """Unit tests for tools/budget_config.py.
 
-Covers default values, resolve_threshold() priority chain
-(pinned > tool_overrides > registry > default), immutability,
-and the PINNED_THRESHOLDS escape-hatch for read_file.
+Covers default values, diagnostic tool caps, resolve_threshold() priority chain
+(tool_overrides > diagnostic defaults > registry > default), and immutability.
 """
 
 import dataclasses
-import math
 from unittest.mock import patch
 
 import pytest
 
 from tools.budget_config import (
+    DEFAULT_DIAGNOSTIC_TOOL_OVERRIDES,
     DEFAULT_BUDGET,
     DEFAULT_PREVIEW_SIZE_CHARS,
     DEFAULT_RESULT_SIZE_CHARS,
     DEFAULT_TURN_BUDGET_CHARS,
-    PINNED_THRESHOLDS,
     BudgetConfig,
     budget_for_context_window,
 )
@@ -37,18 +35,17 @@ class TestModuleConstants:
         assert DEFAULT_TURN_BUDGET_CHARS == 200_000
 
     def test_default_preview_size(self):
-        assert DEFAULT_PREVIEW_SIZE_CHARS == 1_500
+        assert DEFAULT_PREVIEW_SIZE_CHARS == 2_500
 
 
-class TestPinnedThresholds:
-    """PINNED_THRESHOLDS – tools whose values must never be overridden."""
+class TestDiagnosticThresholds:
+    """Diagnostic output is persisted before it can bloat live context."""
 
-    def test_read_file_is_inf(self):
-        assert PINNED_THRESHOLDS["read_file"] == float("inf")
-        assert math.isinf(PINNED_THRESHOLDS["read_file"])
+    def test_read_file_has_bounded_default(self):
+        assert DEFAULT_DIAGNOSTIC_TOOL_OVERRIDES["read_file"] == 12_000
 
-    def test_pinned_is_not_empty(self):
-        assert len(PINNED_THRESHOLDS) >= 1
+    def test_diagnostic_defaults_are_not_empty(self):
+        assert DEFAULT_DIAGNOSTIC_TOOL_OVERRIDES
 
 
 # ---------------------------------------------------------------------------
@@ -136,13 +133,11 @@ class TestBudgetConfigCustom:
 
 
 class TestResolveThreshold:
-    """Priority: pinned > tool_overrides > registry > default."""
+    """Priority: tool overrides > diagnostic defaults > registry > default."""
 
-    def test_pinned_wins_over_override(self):
-        """Even if tool_overrides contains read_file, pinned value wins."""
+    def test_explicit_override_wins_over_diagnostic_default(self):
         cfg = BudgetConfig(tool_overrides={"read_file": 1})
-        result = cfg.resolve_threshold("read_file")
-        assert result == float("inf")
+        assert cfg.resolve_threshold("read_file") == 1
 
     def test_tool_override_wins_over_default(self):
         """tool_overrides should be returned before falling back to registry."""
@@ -171,10 +166,10 @@ class TestResolveThreshold:
             "unknown_tool", default=50_000
         )
 
-    def test_pinned_read_file_returns_inf(self):
-        """Canonical case: read_file must always return inf."""
+    def test_diagnostic_read_file_uses_bounded_default(self):
+        """Canonical case: large diagnostic reads are persisted."""
         cfg = BudgetConfig()
-        assert cfg.resolve_threshold("read_file") == float("inf")
+        assert cfg.resolve_threshold("read_file") == 12_000
 
     @patch("tools.registry.registry")
     def test_registry_value_capped_at_default(self, mock_registry):

@@ -29,6 +29,7 @@ import re
 import shlex
 import uuid
 
+from hermes_constants import get_hermes_home
 from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
     BudgetConfig,
@@ -46,7 +47,9 @@ _MAX_RESULT_FILENAME_STEM = 120
 
 
 def _resolve_storage_dir(env) -> str:
-    """Return the best temp-backed storage dir for this environment."""
+    """Return a writable result store, durable for local Hermes sessions."""
+    if env is not None and type(env).__name__ == "LocalEnvironment":
+        return os.path.join(str(get_hermes_home()), "artifacts", "tool-results")
     if env is not None:
         get_temp_dir = getattr(env, "get_temp_dir", None)
         if callable(get_temp_dir):
