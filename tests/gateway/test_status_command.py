@@ -543,6 +543,146 @@ async def test_status_command_prefers_persisted_runtime_over_billing_and_config(
 
 
 @pytest.mark.asyncio
+async def test_status_command_prefers_persisted_runtime_over_config_for_incomplete_live_agent(
+    monkeypatch,
+):
+    """#77521 (precedence): for an INCOMPLETE live route with no session/channel
+    override, the persisted ``gateway_runtime`` (the last route that actually
+    answered) must beat the current global-config default the resolver falls
+    back to.  The resolver here returns the global-config values (reproducing
+    the pre-fill defect); the render must still show the persisted route."""
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    runner._session_db._db.get_session.return_value = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "model": "billing-model",
+        "billing_provider": "billing-provider",
+        "model_config": json.dumps(
+            {
+                "gateway_runtime": {
+                    "model": "persisted-gw-model",
+                    "provider": "persisted-gw-provider",
+                }
+            }
+        ),
+    }
+    # Incomplete live route: both model and provider missing.
+    runner._running_agents[session_entry.session_key] = SimpleNamespace(
+        model="",
+        provider="",
+        context_compressor=SimpleNamespace(last_prompt_tokens=0, context_length=0),
+    )
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {
+            "model": {
+                "default": "configured-model",
+                "provider": "configured-provider",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "gateway.run._resolve_gateway_model",
+        lambda config: config["model"]["default"],
+    )
+    # The resolver pre-fills from current global config; persisted runtime must
+    # still win over it for the no-override incomplete-live path.
+    runner._resolve_session_agent_runtime = MagicMock(
+        return_value=("configured-model", {"provider": "configured-provider"})
+    )
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "**Model:** `persisted-gw-model` (persisted-gw-provider)" in result
+    assert "configured-model" not in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_does_not_mutate_session_state_on_display(monkeypatch):
+    """#77521 (no side effects): /status is display-only.  Exercising the REAL
+    resolver for an incomplete live route whose /model override is persisted in
+    the session store (but not yet in memory) must not rehydrate the override
+    into conversation state nor prime the ``last_resolved_model`` recovery
+    cache."""
+    session_key = build_session_key(_make_source())
+    session_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    # Override persisted on disk only — nothing in memory yet.
+    runner.session_store.get_model_override.return_value = {
+        "model": "override-model",
+        "provider": "override-provider",
+        "base_url": None,
+    }
+    runner._session_db._db.get_session.return_value = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "model": "billing-model",
+        "billing_provider": "billing-provider",
+    }
+    # Incomplete live route triggers runtime resolution via the REAL resolver.
+    runner._running_agents[session_key] = SimpleNamespace(
+        model="",
+        provider="",
+        context_compressor=SimpleNamespace(last_prompt_tokens=0, context_length=0),
+    )
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {"model": {"default": "configured-model", "provider": "configured-provider"}},
+    )
+    monkeypatch.setattr(
+        "gateway.run._resolve_gateway_model",
+        lambda config: config["model"]["default"],
+    )
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        lambda: {},
+    )
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+        lambda provider: {
+            "api_key": None,
+            "api_mode": None,
+            "credential_pool": None,
+            "base_url": None,
+        },
+    )
+
+    # Sanity: the real resolver is in play (not a MagicMock).
+    assert not isinstance(runner._resolve_session_agent_runtime, MagicMock)
+
+    await runner._handle_message(_make_event("/status"))
+
+    # The display-only render left no trace in session/process state.
+    peeked = runner._peek_session_state(session_key)
+    assert peeked is None or peeked.conversation.model_override is None
+    assert runner._session_state(session_key).conversation.last_resolved_model == ""
+    assert runner._session_state("*").conversation.last_resolved_model == ""
+
+
+@pytest.mark.asyncio
 async def test_status_command_ignores_malformed_persisted_runtime(monkeypatch):
     session_entry = SessionEntry(
         session_key=build_session_key(_make_source()),

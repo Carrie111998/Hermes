@@ -722,14 +722,32 @@ class GatewaySlashCommandsMixin:
             or (has_live_agent and (not model_name or not provider_name))
         )
         if needs_runtime_resolution:
+            # For an incomplete live route with no session/channel override, the
+            # last actual gateway route (persisted ``gateway_runtime``) is more
+            # authoritative than the current global config the resolver falls
+            # back to.  Apply it BEFORE consulting the resolver so persisted
+            # runtime (#4) beats current config (#5) — the resolver fills below
+            # are guarded ``if not model_name``/``if not provider_name`` and so
+            # only contribute what persisted runtime did not already supply.
+            if has_live_agent and not has_session_route_override:
+                if not model_name:
+                    model_name = persisted_model
+                if not provider_name:
+                    provider_name = persisted_provider
+
             resolve_runtime = getattr(self, "_resolve_session_agent_runtime", None)
             if callable(resolve_runtime):
                 try:
+                    # ``/status`` is display-only: resolve the route for
+                    # presentation without mutating conversation/process state
+                    # (persisted ``/model`` override rehydration and the
+                    # ``last_resolved_model`` recovery cache).
                     resolved_route = await asyncio.to_thread(
                         resolve_runtime,
                         source=source,
                         session_key=session_key,
                         user_config=user_config,
+                        persist=False,
                     )
                     resolved_model = (
                         resolved_route[0]
@@ -752,12 +770,6 @@ class GatewaySlashCommandsMixin:
                             provider_name = resolved_provider
                 except Exception:
                     pass
-
-            if has_live_agent and not has_session_route_override:
-                if not model_name:
-                    model_name = persisted_model
-                if not provider_name:
-                    provider_name = persisted_provider
 
             if not model_name:
                 try:
