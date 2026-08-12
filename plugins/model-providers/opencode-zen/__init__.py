@@ -79,7 +79,7 @@ class OpenCodeGoProfile(ProviderProfile):
         if _is_kimi_k2_model(model):
             # Kimi K2 on OpenCode Go uses Moonshot's native wire shape:
             # extra_body.thinking (binary toggle) + top-level reasoning_effort
-            # (low|medium|high). Mirrors the KimiProfile (api.moonshot.ai/v1).
+            # (low|high|max). Mirrors the KimiProfile (api.moonshot.ai/v1).
             if not isinstance(reasoning_config, dict):
                 # No config → leave server defaults alone.
                 return extra_body, top_level

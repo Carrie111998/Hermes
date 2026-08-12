@@ -75,21 +75,15 @@ class UpstageProfile(ProviderProfile):
         if reasoning_config.get("enabled") is False:
             return {}, top_level
 
-        # Map Hermes' effort vocabulary onto Solar's accepted set. max stays
-        # max (Solar's strongest). Unknown-but-enabled efforts collapse to
-        # high rather than silently downgrading to the low default.
+        # Map Hermes' effort vocabulary onto Solar's accepted set. Unknown
+        # efforts collapse to high rather than silently downgrading to low.
         effort = (reasoning_config.get("effort") or "").strip().lower()
         if not effort:
             top_level["reasoning_effort"] = _DEFAULT_REASONING_EFFORT
             return {}, top_level
-        mapped = {
-            "low": "low",
-            "high": "high",
-            "max": "max",
-        }.get(effort, "high")
-
-        if mapped:
-            top_level["reasoning_effort"] = mapped
+        if effort not in {"low", "high", "max"}:
+            effort = "high"
+        top_level["reasoning_effort"] = effort
         return {}, top_level
 
 

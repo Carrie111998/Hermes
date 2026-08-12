@@ -71,7 +71,7 @@ class DeepSeekProfile(ProviderProfile):
         if not enabled:
             return extra_body, top_level
 
-        # Effort mapping. Pass low/medium/high through; stronger levels → max.
+        # Effort mapping. Pass low/high through; max → max.
         # When no effort is set we omit reasoning_effort so DeepSeek applies
         # its server default (currently high).
         if isinstance(reasoning_config, dict):

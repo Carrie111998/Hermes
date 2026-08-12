@@ -146,21 +146,21 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     else is rejected rather than silently dropped — a typo'd level must
     not quietly hand the task back to the profile default.
     """
-    from hermes_constants import VALID_REASONING_EFFORTS, _EFFORT_ALIASES
+    from hermes_constants import VALID_REASONING_EFFORTS, parse_reasoning_effort
 
     value = str(effort or "").strip().lower()
     if not value:
         return None
-    if value == "none":
-        return value
-    # Map legacy effort names to the standardized set.
-    value = _EFFORT_ALIASES.get(value, value)
-    if value in VALID_REASONING_EFFORTS:
-        return value
-    allowed = ", ".join(("none", *VALID_REASONING_EFFORTS))
-    raise ValueError(
-        f"reasoning_effort must be one of {allowed}, got {effort!r}"
-    )
+    # parse_reasoning_effort handles alias mapping, "none", and validation.
+    parsed = parse_reasoning_effort(value)
+    if parsed is None:
+        allowed = ", ".join(("none", *VALID_REASONING_EFFORTS))
+        raise ValueError(
+            f"reasoning_effort must be one of {allowed}, got {effort!r}"
+        )
+    if parsed.get("enabled") is False:
+        return "none"
+    return parsed["effort"]
 
 
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
