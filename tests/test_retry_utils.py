@@ -208,3 +208,51 @@ class TestParseRetryAfterSeconds:
                 raise RuntimeError("boom")
 
         assert parse_retry_after_seconds(Explosive()) is None
+
+
+class TestCappedRetryAfterSeconds:
+    """The main retry loop's wrapper: clamp to [0, cap], honour HTTP-date.
+
+    Regression for #84738: the loop previously re-implemented the parse as
+    ``min(float(raw), 600)``, which (a) raised on HTTP-date values and fell
+    back to generic jitter instead of the provider's deadline, and (b) let a
+    negative value through (``min(-5, 600) == -5``), producing a negative
+    wait / immediate retry.
+    """
+
+    def test_numeric_within_cap_passthrough(self):
+        from agent.retry_utils import capped_retry_after_seconds
+        assert capped_retry_after_seconds("120") == 120.0
+
+    def test_numeric_above_cap_is_clamped(self):
+        from agent.retry_utils import capped_retry_after_seconds
+        assert capped_retry_after_seconds("9999") == 600.0
+        assert capped_retry_after_seconds("5000.5") == 600.0
+
+    def test_negative_is_clamped_to_zero_not_negative(self):
+        from agent.retry_utils import capped_retry_after_seconds
+        # Old inline code: min(float("-5"), 600) == -5 → negative wait.
+        assert capped_retry_after_seconds("-5") == 0.0
+        assert capped_retry_after_seconds(-1) == 0.0
+
+    def test_http_date_is_honoured(self):
+        from datetime import datetime, timedelta, timezone
+        from email.utils import format_datetime
+        from agent.retry_utils import capped_retry_after_seconds
+
+        future = datetime.now(timezone.utc) + timedelta(seconds=90)
+        seconds = capped_retry_after_seconds(
+            {"Retry-After": format_datetime(future, usegmt=True)}
+        )
+        # Old inline code raised ValueError on HTTP-date → header ignored.
+        assert seconds is not None and 80 <= seconds <= 91
+
+    def test_absent_or_invalid_returns_none(self):
+        from agent.retry_utils import capped_retry_after_seconds
+        assert capped_retry_after_seconds({}) is None
+        assert capped_retry_after_seconds({"Retry-After": "not-a-date"}) is None
+
+    def test_custom_cap(self):
+        from agent.retry_utils import capped_retry_after_seconds
+        assert capped_retry_after_seconds("30", cap=10.0) == 10.0
+        assert capped_retry_after_seconds("5", cap=10.0) == 5.0

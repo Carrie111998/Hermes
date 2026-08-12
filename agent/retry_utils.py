@@ -87,6 +87,29 @@ def parse_retry_after_seconds(value_or_headers: Any) -> Optional[float]:
     return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
 
 
+def capped_retry_after_seconds(
+    value_or_headers: Any,
+    cap: float = 600.0,
+) -> Optional[float]:
+    """Parse ``Retry-After`` into seconds, clamped to ``[0, cap]``.
+
+    Thin wrapper over :func:`parse_retry_after_seconds` for callers that need
+    an upper bound on the provider-requested wait (e.g. the main retry loop,
+    which caps at 600s per #26293). Negative or already-elapsed values parse
+    to ``0.0`` — never a negative delay, and an HTTP-date is honoured instead
+    of being ignored.
+
+    Returns ``None`` when the header is absent or unparseable, so callers can
+    fall back to their own backoff schedule.
+    """
+    seconds = parse_retry_after_seconds(value_or_headers)
+    if seconds is None:
+        return None
+    if cap is not None and cap >= 0:
+        return min(seconds, float(cap))
+    return seconds
+
+
 def jittered_backoff(
     attempt: int,
     *,
