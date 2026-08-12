@@ -3,16 +3,20 @@ import { useMemo, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { SegmentedControl } from '@/components/ui/segmented-control'
+import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n/context'
 import { AlertTriangle, Eye, Search, SlidersHorizontal } from '@/lib/icons'
+import { useTheme } from '@/themes/context'
 
 import { UsageSelect } from './controls'
+import { usageDarkStyle } from './dark-style'
 import {
   cacheRatio,
   formatCompact,
   formatCurrency,
   formatNumber,
   formatPercent,
+  meterEstimatedCost,
   routeTokens,
   uniqueValues
 } from './format'
@@ -47,7 +51,7 @@ function routeSortValue(route: UsageMeterRoute, sort: RouteSort): number {
   }
 
   if (sort === 'cache') {
-    return cacheRatio(route.cache_read_tokens, route.input_tokens)
+    return cacheRatio(route.cache_read_tokens, route.input_tokens) ?? 0
   }
 
   return routeTokens(route)
@@ -71,7 +75,9 @@ function routeCostTone(route: UsageMeterRoute): 'estimated' | 'included' | 'mixe
 
 export function RouteMatrix({ details, error, isFetching, onInspect, onScopeChange, scope }: RouteMatrixProps) {
   const { locale, t } = useI18n()
+  const { themeName } = useTheme()
   const u = t.usageDashboard
+  const darkStyle = useMemo(() => usageDarkStyle(themeName), [themeName])
   const [sort, setSort] = useState<RouteSort>('cost')
   const [query, setQuery] = useState('')
   const [provider, setProvider] = useState('all')
@@ -96,13 +102,13 @@ export function RouteMatrix({ details, error, isFetching, onInspect, onScopeChan
         (sum, route) => ({
           calls: sum.calls + route.calls,
           cost: sum.cost + route.estimated_cost_usd,
-          costKnownCalls: sum.costKnownCalls + route.priced_calls + route.included_calls,
+
           includedCalls: sum.includedCalls + route.included_calls,
           pricedCalls: sum.pricedCalls + route.priced_calls,
           tokens: sum.tokens + routeTokens(route),
           unpricedCalls: sum.unpricedCalls + route.unpriced_calls
         }),
-        { calls: 0, cost: 0, costKnownCalls: 0, includedCalls: 0, pricedCalls: 0, tokens: 0, unpricedCalls: 0 }
+        { calls: 0, cost: 0, includedCalls: 0, pricedCalls: 0, tokens: 0, unpricedCalls: 0 }
       ),
     [visibleRoutes]
   )
@@ -124,7 +130,7 @@ export function RouteMatrix({ details, error, isFetching, onInspect, onScopeChan
             </div>
           }
           description={u.routes.description}
-          eyebrow="ROUTE // MATRIX"
+          eyebrow={u.sections.routes}
           title={u.routes.title}
         />
 
@@ -188,7 +194,20 @@ export function RouteMatrix({ details, error, isFetching, onInspect, onScopeChan
           <span aria-hidden="true">//</span>
           <span>{u.routes.tokens(formatCompact(totals.tokens, locale))}</span>
           <span aria-hidden="true">//</span>
-          <span>{u.routes.cost(formatCurrency(totals.costKnownCalls > 0 ? totals.cost : null, locale))}</span>
+          <span>
+            {u.routes.cost(
+              formatCurrency(
+                meterEstimatedCost({
+                  calls: totals.calls,
+                  estimated_cost_usd: totals.cost,
+                  included_calls: totals.includedCalls,
+                  priced_calls: totals.pricedCalls,
+                  unpriced_calls: totals.unpricedCalls
+                }),
+                locale
+              )
+            )}
+          </span>
           <span aria-hidden="true">//</span>
           <span>{u.macro.pricingCoverage(totals.pricedCalls, totals.includedCalls, totals.unpricedCalls)}</span>
           {isFetching && <span className="ms-auto text-ui-green">{u.syncing}</span>}
@@ -220,9 +239,7 @@ export function RouteMatrix({ details, error, isFetching, onInspect, onScopeChan
                   return (
                     <tr className="hover:bg-hover" key={`${route.provider}:${route.model}:${route.api_mode}`}>
                       <td className="max-w-72 px-3 py-2.5">
-                        <p className="truncate font-medium text-foreground" title={route.model}>
-                          {route.model}
-                        </p>
+                        <p className="truncate font-medium text-foreground">{route.model}</p>
                         <p className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground">{route.provider}</p>
                       </td>
                       <td className="px-3 py-2.5 font-mono text-[10px] text-muted-foreground">
@@ -251,31 +268,36 @@ export function RouteMatrix({ details, error, isFetching, onInspect, onScopeChan
                       </td>
                       <td className="px-3 py-2.5 text-end">
                         <p className="font-mono tabular-nums text-foreground">
-                          {formatCurrency(tone === 'unavailable' ? null : route.estimated_cost_usd, locale)}
+                          {formatCurrency(meterEstimatedCost(route), locale)}
                         </p>
                         <p className="usage-status mt-0.5 font-mono text-[9px] uppercase" data-tone={tone}>
                           {u.costStatus[tone]}
                         </p>
                       </td>
                       <td className="px-2 py-2 text-end">
-                        <Button
-                          aria-label={u.routes.inspect(`${route.provider}/${route.model}`)}
-                          onClick={() =>
-                            onInspect({
-                              apiMode: route.api_mode,
-                              endTs: details?.end_ts ?? null,
-                              model: route.model,
-                              provider: route.provider,
-                              scope,
-                              startTs: details?.start_ts ?? null
-                            })
-                          }
-                          size="icon-xs"
-                          title={u.routes.inspect(`${route.provider}/${route.model}`)}
-                          variant="ghost"
+                        <Tip
+                          delayDuration={0}
+                          label={u.routes.inspect(`${route.provider}/${route.model}`)}
+                          style={darkStyle}
                         >
-                          <Eye className="size-3.5" />
-                        </Button>
+                          <Button
+                            aria-label={u.routes.inspect(`${route.provider}/${route.model}`)}
+                            onClick={() =>
+                              onInspect({
+                                apiMode: route.api_mode,
+                                endTs: details?.end_ts ?? null,
+                                model: route.model,
+                                provider: route.provider,
+                                scope,
+                                startTs: details?.start_ts ?? null
+                              })
+                            }
+                            size="icon-xs"
+                            variant="ghost"
+                          >
+                            <Eye className="size-3.5" />
+                          </Button>
+                        </Tip>
                       </td>
                     </tr>
                   )

@@ -1,63 +1,87 @@
 import type { CostStatus, UsageCostBucket, UsageOverviewResponse, UsageReport } from './types'
 
-const EMPTY_COST_BUCKET: UsageCostBucket = {
-  sessions: 0,
-  cost_usd: 0,
-  input_tokens: 0,
-  output_tokens: 0
-}
-
-function number(value: unknown): number {
+function numberOrZero(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0
 }
 
-function normalizeCostStatus(value: string, actualCost: number, hasPricing: boolean): CostStatus {
-  if (actualCost > 0) {return 'actual'}
+function numberOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
 
-  if (value === 'included') {return 'included'}
+function overviewMetric(value: unknown, empty: boolean): number | null {
+  return numberOrNull(value) ?? (empty ? 0 : null)
+}
 
-  if (value === 'estimated') {return 'estimated'}
+function normalizeCostStatus(value: string, hasPricing: boolean): CostStatus {
+  if (value === 'included') {
+    return 'included'
+  }
 
-  if (value === 'unpriced') {return 'unpriced'}
+  if (value === 'estimated') {
+    return 'estimated'
+  }
 
-  if (value === 'unknown') {return 'unknown'}
+  if (value === 'actual') {
+    return 'actual'
+  }
+
+  if (value === 'unpriced') {
+    return 'unpriced'
+  }
+
+  if (value === 'unknown') {
+    return 'unknown'
+  }
 
   return hasPricing ? 'estimated' : 'unknown'
 }
 
-function normalizeCostBucket(value: UsageCostBucket | undefined): UsageCostBucket {
-  if (!value) {return { ...EMPTY_COST_BUCKET }}
+function normalizeCostBucket(value: UsageCostBucket | undefined): UsageCostBucket | null {
+  if (!value) {
+    return null
+  }
+
+  const sessions = numberOrNull(value.sessions)
+  const cost = numberOrNull(value.cost_usd)
+  const input = numberOrNull(value.input_tokens)
+  const output = numberOrNull(value.output_tokens)
+
+  if (sessions == null || cost == null || input == null || output == null) {
+    return null
+  }
 
   return {
-    sessions: number(value.sessions),
-    cost_usd: number(value.cost_usd),
-    input_tokens: number(value.input_tokens),
-    output_tokens: number(value.output_tokens),
-    ...(value.at_market_cost_usd == null ? {} : { at_market_cost_usd: number(value.at_market_cost_usd) })
+    sessions,
+    cost_usd: cost,
+    input_tokens: input,
+    output_tokens: output,
+    ...(value.at_market_cost_usd == null ? {} : { at_market_cost_usd: numberOrZero(value.at_market_cost_usd) })
   }
 }
 
 export function normalizeUsageOverview(response: UsageOverviewResponse): UsageReport {
   const overview = response.overview ?? {}
+  const empty = Boolean(response.empty)
+  const rawModels = Array.isArray(response.models) ? response.models : null
 
-  const models = (response.models ?? []).map(model => {
-    const actualCost = number(model.actual_cost)
+  const models = (rawModels ?? []).map(model => {
     const hasPricing = Boolean(model.has_pricing)
-    const costStatus = normalizeCostStatus(model.cost_status, actualCost, hasPricing)
-    const estimatedCost = number(model.cost)
+    const costStatus = normalizeCostStatus(model.cost_status, hasPricing)
+    const estimatedCost = numberOrNull(model.cost)
+    const actualCost = numberOrNull(model.actual_cost)
 
     return {
       model: model.model || 'unknown',
-      sessions: number(model.sessions),
-      api_calls: number(model.api_calls),
-      input_tokens: number(model.input_tokens),
-      output_tokens: number(model.output_tokens),
-      cache_read_tokens: number(model.cache_read_tokens),
-      cache_write_tokens: number(model.cache_write_tokens),
-      reasoning_tokens: number(model.reasoning_tokens),
-      tool_calls: number(model.tool_calls),
-      cost: costStatus === 'unknown' || costStatus === 'unpriced' ? null : actualCost > 0 ? actualCost : estimatedCost,
-      actual_cost: actualCost,
+      sessions: numberOrZero(model.sessions),
+      api_calls: numberOrZero(model.api_calls),
+      input_tokens: numberOrZero(model.input_tokens),
+      output_tokens: numberOrZero(model.output_tokens),
+      cache_read_tokens: numberOrZero(model.cache_read_tokens),
+      cache_write_tokens: numberOrZero(model.cache_write_tokens),
+      reasoning_tokens: numberOrZero(model.reasoning_tokens),
+      tool_calls: numberOrZero(model.tool_calls),
+      estimated_cost: costStatus === 'unknown' || costStatus === 'unpriced' ? null : estimatedCost,
+      actual_cost: actualCost != null && actualCost > 0 ? actualCost : null,
       cost_status: costStatus,
       has_pricing: hasPricing
     }
@@ -66,50 +90,50 @@ export function normalizeUsageOverview(response: UsageOverviewResponse): UsageRe
   const costBuckets = overview.cost_buckets
 
   return {
-    empty: Boolean(response.empty),
+    empty,
     generated_at:
       typeof response.generated_at === 'number' && Number.isFinite(response.generated_at)
         ? new Date(response.generated_at * 1000).toISOString()
         : null,
-    period_days: number(response.days),
+    period_days: numberOrZero(response.days),
     source: response.source_filter ?? null,
     days: (response.daily_series ?? []).map(day => ({
       date: day.date,
-      sessions: number(day.sessions),
-      input_tokens: number(day.input_tokens),
-      output_tokens: number(day.output_tokens),
-      cache_read_tokens: number(day.cache_read_tokens),
-      cache_write_tokens: number(day.cache_write_tokens),
-      cost: number(day.estimated_cost_usd)
+      sessions: numberOrZero(day.sessions),
+      input_tokens: numberOrZero(day.input_tokens),
+      output_tokens: numberOrZero(day.output_tokens),
+      cache_read_tokens: numberOrZero(day.cache_read_tokens),
+      cache_write_tokens: numberOrZero(day.cache_write_tokens),
+      cost: numberOrZero(day.estimated_cost_usd)
     })),
     models,
     platforms: (response.platforms ?? []).map(platform => ({
       platform: platform.platform || 'unknown',
-      sessions: number(platform.sessions),
-      total_tokens: number(platform.total_tokens)
+      sessions: numberOrZero(platform.sessions),
+      total_tokens: numberOrZero(platform.total_tokens)
     })),
     activity: (response.activity?.by_hour ?? []).map(entry => ({
-      hour: number(entry.hour),
-      sessions: number(entry.count)
+      hour: numberOrZero(entry.hour),
+      sessions: numberOrZero(entry.count)
     })),
     top_sessions: response.top_sessions ?? [],
-    tools: (response.tools ?? []).map(tool => ({ name: tool.tool || 'unknown', count: number(tool.count) })),
+    tools: (response.tools ?? []).map(tool => ({ name: tool.tool || 'unknown', count: numberOrZero(tool.count) })),
     skills: (response.skills?.top_skills ?? []).map(skill => ({
       name: skill.skill || 'unknown',
-      count: number(skill.total_count)
+      count: numberOrZero(skill.total_count)
     })),
     totals: {
-      sessions: number(overview.total_sessions),
-      api_calls: models.reduce((sum, model) => sum + model.api_calls, 0),
-      input_tokens: number(overview.total_input_tokens),
-      output_tokens: number(overview.total_output_tokens),
-      cache_read_tokens: number(overview.total_cache_read_tokens),
-      cache_write_tokens: number(overview.total_cache_write_tokens),
-      total_tokens: number(overview.total_tokens),
-      cost: number(overview.estimated_cost),
-      actual_cost: number(overview.actual_cost),
-      tool_calls: number(overview.total_tool_calls),
-      skill_calls: number(response.skills?.summary?.total_skill_actions),
+      sessions: overviewMetric(overview.total_sessions, empty),
+      api_calls: rawModels == null ? null : models.reduce((sum, model) => sum + model.api_calls, 0),
+      input_tokens: overviewMetric(overview.total_input_tokens, empty),
+      output_tokens: overviewMetric(overview.total_output_tokens, empty),
+      cache_read_tokens: overviewMetric(overview.total_cache_read_tokens, empty),
+      cache_write_tokens: overviewMetric(overview.total_cache_write_tokens, empty),
+      total_tokens: overviewMetric(overview.total_tokens, empty),
+      cost: numberOrNull(overview.estimated_cost),
+      actual_cost: numberOrNull(overview.actual_cost),
+      tool_calls: overviewMetric(overview.total_tool_calls, empty),
+      skill_calls: overviewMetric(response.skills?.summary?.total_skill_actions, empty),
       cost_buckets: {
         estimated: normalizeCostBucket(costBuckets?.estimated),
         included: normalizeCostBucket(costBuckets?.included),

@@ -113,9 +113,10 @@ export const usageOverviewFixture: UsageOverviewResponse = {
     }))
   },
   top_sessions: [
-    { label: 'Usage dashboard review', session_id: '20260811_141049_aa11bb', value: '614K tokens', date: '2026-08-11' },
-    { label: 'Accounting contract audit', session_id: '20260811_161955_bb22cc', value: '$8.42', date: '2026-08-11' },
-    { label: 'Graph gate inspection', session_id: '20260810_202511_cc33dd', value: '311K tokens', date: '2026-08-10' }
+    { label: 'Longest session', session_id: '20260811_141049_aa11bb', value: '2h 14m', date: 'Aug 11' },
+    { label: 'Most messages', session_id: '20260811_161955_bb22cc', value: '311 msgs', date: 'Aug 11' },
+    { label: 'Most tokens', session_id: '20260810_202511_cc33dd', value: '614,000 tokens', date: 'Aug 10' },
+    { label: 'Most tool calls', session_id: '20260810_192211_dd44ee', value: '87 calls', date: 'Aug 10' }
   ],
   daily_series: Array.from({ length: 30 }, (_, index) => {
     const date = new Date(Date.UTC(2026, 6, 13 + index))
@@ -141,9 +142,9 @@ const allTimeSummary = {
   cache_write_tokens: 121_000,
   reasoning_tokens: 73_000,
   estimated_cost_usd: 34.87,
-  unpriced_calls: 8,
+  unpriced_calls: 9,
   included_calls: 7,
-  priced_calls: 87,
+  priced_calls: 86,
   cache_hit_rate: 0.4569,
   has_unpriced: true
 }
@@ -194,9 +195,9 @@ const allTimeRoutes = [
     cache_write_tokens: 0,
     reasoning_tokens: 4_000,
     estimated_cost_usd: 0,
-    unpriced_calls: 8,
+    unpriced_calls: 9,
     included_calls: 0,
-    priced_calls: 1,
+    priced_calls: 0,
     cache_hit_rate: 0.1587,
     has_unpriced: true
   }

@@ -98,9 +98,7 @@ function EventDisclosure({
       >
         <ChevronRight className={cn('size-3.5 text-muted-foreground transition-transform', expanded && 'rotate-90')} />
         <div className="min-w-0">
-          <p className="truncate text-xs font-medium text-foreground" title={`${event.provider}/${event.model}`}>
-            {event.model || u.unknown}
-          </p>
+          <p className="truncate text-xs font-medium text-foreground">{event.model || u.unknown}</p>
           <p className="mt-0.5 truncate font-mono text-[9px] text-muted-foreground">
             {event.provider || u.unknown} · {event.api_mode || u.unknown}
           </p>
@@ -250,7 +248,7 @@ export function LedgerDeck({
             </div>
           }
           description={u.ledger.description}
-          eyebrow="CALL // LEDGER"
+          eyebrow={u.sections.ledger}
           title={u.ledger.title}
         />
 

@@ -23,6 +23,10 @@ export type UsageDashboardTranslations = {
   deckAria: string
   decks: Record<'overview' | 'routes' | 'ledger', string>
   deckHints: Record<'overview' | 'routes' | 'ledger', string>
+  sections: Record<
+    'burn' | 'token' | 'model' | 'cost' | 'platform' | 'sessions' | 'workload' | 'routes' | 'ledger',
+    string
+  >
   macro: {
     marketCost: string
     rangeEstimate: (days: number) => string
@@ -56,6 +60,7 @@ export type UsageDashboardTranslations = {
     cacheWrite: string
     output: string
     reasoning: string
+    reasoningShare: (share: string) => string
     tokensShort: string
   }
   cost: {
@@ -70,6 +75,7 @@ export type UsageDashboardTranslations = {
     cacheSavings: string
     calls: (count: string) => string
     rangeComparison: (cost: string, days: number) => string
+    estimatedValue: (cost: string) => string
   }
   models: {
     title: string
@@ -115,6 +121,16 @@ export type UsageDashboardTranslations = {
     title: string
     description: string
     empty: string
+    labels: Record<'longest' | 'messages' | 'tokens' | 'tools', string>
+    messages: (count: string) => string
+    tokens: (count: string) => string
+    calls: (count: string) => string
+    duration: {
+      seconds: (count: string) => string
+      minutes: (count: string) => string
+      hours: (count: string) => string
+      days: (count: string) => string
+    }
   }
   workload: {
     title: string

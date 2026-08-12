@@ -29,6 +29,17 @@ export const usageDashboardEn: UsageDashboardTranslations = {
     routes: 'provider × model × API mode',
     ledger: 'latest captured calls · full token vector'
   },
+  sections: {
+    burn: '01 // BURN FIELD',
+    token: '02 // TOKEN TOPOLOGY',
+    model: '03 // MODEL STACK',
+    cost: 'COST // TRUTH LAYER',
+    platform: 'SOURCE // TRAFFIC',
+    sessions: 'HOT // SESSIONS',
+    workload: 'WORKLOAD // SIGNALS',
+    routes: 'ROUTE // MATRIX',
+    ledger: 'CALL // LEDGER'
+  },
   macro: {
     marketCost: 'Market equiv.',
     rangeEstimate: days => `${days}d session estimate`,
@@ -62,6 +73,7 @@ export const usageDashboardEn: UsageDashboardTranslations = {
     cacheWrite: 'Cache write',
     output: 'Output',
     reasoning: 'Reasoning',
+    reasoningShare: share => `${share} of output`,
     tokensShort: 'tokens'
   },
   cost: {
@@ -77,7 +89,8 @@ export const usageDashboardEn: UsageDashboardTranslations = {
     cacheSavings: 'estimated cache savings',
     calls: count => `${count} calls`,
     rangeComparison: (cost, days) =>
-      `${days}d session market-equivalent: ${cost}. This is a separate scope, not added to the captured total.`
+      `${days}d session market-equivalent: ${cost}. This is a separate scope, not added to the captured total.`,
+    estimatedValue: cost => `estimate ${cost}`
   },
   models: {
     title: 'Model pressure stack',
@@ -130,7 +143,22 @@ export const usageDashboardEn: UsageDashboardTranslations = {
   sessions: {
     title: 'Session hotspots',
     description: 'The heaviest session records in the selected range.',
-    empty: 'No session hotspots in this range.'
+    empty: 'No session hotspots in this range.',
+    labels: {
+      longest: 'Longest session',
+      messages: 'Most messages',
+      tokens: 'Most tokens',
+      tools: 'Most tool calls'
+    },
+    messages: count => `${count} messages`,
+    tokens: count => `${count} tokens`,
+    calls: count => `${count} calls`,
+    duration: {
+      seconds: count => `${count}s`,
+      minutes: count => `${count}m`,
+      hours: count => `${count}h`,
+      days: count => `${count}d`
+    }
   },
   workload: {
     title: 'Workload signals',

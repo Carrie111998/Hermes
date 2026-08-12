@@ -16,6 +16,7 @@ import {
   formatNumber,
   formatPercent,
   formatShortDate,
+  meterEstimatedCost,
   modelTokens,
   reportReasoningTokens
 } from './format'
@@ -68,7 +69,7 @@ export function MacroStrip({ meter, meterUnavailable, report }: MacroStripProps)
   const { locale, t } = useI18n()
   const u = t.usageDashboard
   const sessionCacheRatio = cacheRatio(report.totals.cache_read_tokens, report.totals.input_tokens)
-  const capturedCost = meter?.estimated_cost_usd ?? null
+  const capturedCost = meter ? meterEstimatedCost(meter) : null
 
   return (
     <dl className="grid grid-cols-2 border-y border-border bg-card/20 sm:grid-cols-3 xl:grid-cols-6">
@@ -279,21 +280,29 @@ function TokenTopology({ report }: { report: UsageReport }) {
   const u = t.usageDashboard
   const darkStyle = useMemo(() => usageDarkStyle(themeName), [themeName])
 
-  const items = [
+  const canonicalItems = [
     { label: u.token.input, tone: 'input', value: report.totals.input_tokens },
     { label: u.token.cacheRead, tone: 'cache-read', value: report.totals.cache_read_tokens },
     { label: u.token.cacheWrite, tone: 'cache-write', value: report.totals.cache_write_tokens },
-    { label: u.token.output, tone: 'output', value: report.totals.output_tokens },
-    { label: u.token.reasoning, tone: 'reasoning', value: reportReasoningTokens(report) }
+    { label: u.token.output, tone: 'output', value: report.totals.output_tokens }
   ]
 
-  const topologyTotal = items.reduce((sum, item) => sum + item.value, 0)
+  const canonicalTotal = report.totals.total_tokens
+  const reasoningItem = { label: u.token.reasoning, tone: 'reasoning', value: reportReasoningTokens(report) }
+
+  const canonicalShare = (value: number | null) =>
+    value != null && canonicalTotal != null && canonicalTotal > 0 ? value / canonicalTotal : null
+
+  const reasoningShare =
+    report.totals.output_tokens != null && report.totals.output_tokens > 0
+      ? reasoningItem.value / report.totals.output_tokens
+      : null
 
   return (
     <div>
       <div className="flex h-3 w-full overflow-hidden border border-border bg-background">
-        {items.map(item => {
-          const label = `${item.label}: ${formatNumber(item.value, locale)} (${formatPercent(topologyTotal > 0 ? item.value / topologyTotal : 0, locale)})`
+        {canonicalItems.map(item => {
+          const label = `${item.label}: ${formatNumber(item.value, locale)} (${formatPercent(canonicalShare(item.value), locale)})`
 
           return (
             <Tip delayDuration={0} key={item.tone} label={label} style={darkStyle}>
@@ -302,7 +311,7 @@ function TokenTopology({ report }: { report: UsageReport }) {
                 className="usage-token-segment h-full"
                 data-tone={item.tone}
                 role="img"
-                style={{ width: `${topologyTotal > 0 ? (item.value / topologyTotal) * 100 : 0}%` }}
+                style={{ width: `${(canonicalShare(item.value) ?? 0) * 100}%` }}
                 tabIndex={0}
               />
             </Tip>
@@ -310,15 +319,17 @@ function TokenTopology({ report }: { report: UsageReport }) {
         })}
       </div>
       <div className="mt-4 space-y-3">
-        {items.map(item => (
+        {[...canonicalItems, reasoningItem].map(item => (
           <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-3" key={item.tone}>
             <div className="flex min-w-0 items-center gap-2">
               <span className="usage-token-segment size-2 shrink-0" data-tone={item.tone} />
               <span className="truncate text-xs text-foreground">{item.label}</span>
             </div>
             <span className="font-mono text-xs tabular-nums text-foreground">{formatCompact(item.value, locale)}</span>
-            <span className="w-10 text-end font-mono text-[10px] tabular-nums text-muted-foreground">
-              {formatPercent(topologyTotal > 0 ? item.value / topologyTotal : 0, locale)}
+            <span className="w-24 text-end font-mono text-[10px] tabular-nums text-muted-foreground">
+              {item.tone === 'reasoning'
+                ? u.token.reasoningShare(formatPercent(reasoningShare, locale))
+                : formatPercent(canonicalShare(item.value), locale)}
             </span>
           </div>
         ))}
@@ -348,13 +359,13 @@ function CostTruth({ meter, meterUnavailable, report }: MacroStripProps) {
       calls: meter.priced_calls,
       label: u.cost.estimated,
       tone: 'estimated' as const,
-      value: meter.estimated_cost_usd
+      value: meter.priced_calls > 0 ? meter.estimated_cost_usd : null
     },
     {
       calls: meter.included_calls,
       label: u.cost.included,
       tone: 'included' as const,
-      value: 0
+      value: meter.included_calls > 0 ? 0 : null
     },
     {
       calls: meter.unpriced_calls,
@@ -369,13 +380,13 @@ function CostTruth({ meter, meterUnavailable, report }: MacroStripProps) {
       <div className="mb-4 flex items-baseline justify-between border-b border-border pb-3">
         <div>
           <p className="font-mono text-2xl font-semibold tabular-nums text-foreground">
-            {formatCurrency(meter.estimated_cost_usd, locale)}
+            {formatCurrency(meterEstimatedCost(meter), locale)}
           </p>
           <p className="text-[11px] text-muted-foreground">{u.cost.capturedAllTime}</p>
         </div>
         <div className="text-end">
           <p className="font-mono text-sm tabular-nums text-ui-cyan">
-            {formatCurrency(report.totals.actual_cost > 0 ? report.totals.actual_cost : null, locale)}
+            {formatCurrency((report.totals.actual_cost ?? 0) > 0 ? report.totals.actual_cost : null, locale)}
           </p>
           <p className="text-[10px] text-muted-foreground">{u.cost.actual}</p>
         </div>
@@ -407,7 +418,7 @@ function CostTruth({ meter, meterUnavailable, report }: MacroStripProps) {
 
 function modelSortValue(model: ModelUsage, sort: RouteSort): number {
   if (sort === 'cost') {
-    return model.cost ?? -1
+    return model.actual_cost ?? model.estimated_cost ?? -1
   }
 
   if (sort === 'calls') {
@@ -415,7 +426,7 @@ function modelSortValue(model: ModelUsage, sort: RouteSort): number {
   }
 
   if (sort === 'cache') {
-    return cacheRatio(model.cache_read_tokens, model.input_tokens)
+    return cacheRatio(model.cache_read_tokens, model.input_tokens) ?? 0
   }
 
   return modelTokens(model)
@@ -449,7 +460,7 @@ function ModelTable({ report }: { report: UsageReport }) {
           </div>
         }
         description={u.models.description}
-        eyebrow="03 // MODEL STACK"
+        eyebrow={u.sections.model}
         title={u.models.title}
       />
       {models.length ? (
@@ -470,9 +481,7 @@ function ModelTable({ report }: { report: UsageReport }) {
               {models.map(model => (
                 <tr className="hover:bg-hover" key={model.model}>
                   <td className="max-w-72 px-3 py-2.5">
-                    <p className="truncate font-medium text-foreground" title={model.model}>
-                      {model.model}
-                    </p>
+                    <p className="truncate font-medium text-foreground">{model.model}</p>
                     <p className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground">
                       {formatNumber(model.sessions, locale)} {u.macro.sessions}
                     </p>
@@ -496,19 +505,28 @@ function ModelTable({ report }: { report: UsageReport }) {
                     {formatCompact(model.reasoning_tokens, locale)}
                   </td>
                   <td className="px-3 py-2.5 text-end">
-                    <p className="font-mono tabular-nums text-foreground">{formatCurrency(model.cost, locale)}</p>
+                    <p className="font-mono tabular-nums text-foreground">
+                      {formatCurrency(model.actual_cost ?? model.estimated_cost, locale)}
+                    </p>
                     <p
                       className="usage-status mt-0.5 font-mono text-[9px] uppercase"
                       data-tone={
-                        model.cost_status === 'actual'
+                        model.actual_cost != null || model.cost_status === 'actual'
                           ? 'actual'
                           : model.cost_status === 'estimated'
                             ? 'estimated'
                             : 'unavailable'
                       }
                     >
-                      {u.costStatus[model.cost_status] ?? model.cost_status}
+                      {model.actual_cost != null
+                        ? u.costStatus.actual
+                        : (u.costStatus[model.cost_status] ?? model.cost_status)}
                     </p>
+                    {model.actual_cost != null && model.estimated_cost != null && (
+                      <p className="mt-0.5 font-mono text-[9px] tabular-nums text-muted-foreground">
+                        {u.cost.estimatedValue(formatCurrency(model.estimated_cost, locale))}
+                      </p>
+                    )}
                   </td>
                 </tr>
               ))}
@@ -608,6 +626,74 @@ function SessionHotspots({ report }: { report: UsageReport }) {
   const { locale, t } = useI18n()
   const u = t.usageDashboard
 
+  const localizedLabel = (label: string) => {
+    if (label === 'Longest session') {
+      return u.sessions.labels.longest
+    }
+
+    if (label === 'Most messages') {
+      return u.sessions.labels.messages
+    }
+
+    if (label === 'Most tokens') {
+      return u.sessions.labels.tokens
+    }
+
+    if (label === 'Most tool calls') {
+      return u.sessions.labels.tools
+    }
+
+    return label
+  }
+
+  const localizedValue = (label: string, value: string) => {
+    const numeric = Number(value.split(' ')[0].replaceAll(',', ''))
+
+    if (Number.isFinite(numeric)) {
+      const count = formatNumber(numeric, locale)
+
+      if (label === 'Most messages') {
+        return u.sessions.messages(count)
+      }
+
+      if (label === 'Most tokens') {
+        return u.sessions.tokens(count)
+      }
+
+      if (label === 'Most tool calls') {
+        return u.sessions.calls(count)
+      }
+    }
+
+    if (label === 'Longest session') {
+      const matches = [...value.matchAll(/(\d+(?:\.\d+)?)([smhd])/g)]
+
+      if (matches.length && matches.map(match => match[0]).join('') === value.replaceAll(' ', '')) {
+        return matches
+          .map(match => {
+            const count = formatNumber(Number(match[1]), locale)
+
+            if (match[2] === 's') {
+              return u.sessions.duration.seconds(count)
+            }
+
+            if (match[2] === 'm') {
+              return u.sessions.duration.minutes(count)
+            }
+
+            if (match[2] === 'h') {
+              return u.sessions.duration.hours(count)
+            }
+
+            return u.sessions.duration.days(count)
+          })
+          .join(' ')
+      }
+    }
+
+    return value
+  }
+
   if (!report.top_sessions.length) {
     return <p className="text-xs text-muted-foreground">{u.sessions.empty}</p>
   }
@@ -617,14 +703,16 @@ function SessionHotspots({ report }: { report: UsageReport }) {
       {report.top_sessions.slice(0, 5).map(session => (
         <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-4 py-2.5" key={session.session_id}>
           <div className="min-w-0">
-            <p className="truncate text-xs font-medium text-foreground" title={session.label}>
-              {session.label}
-            </p>
+            <p className="truncate text-xs font-medium text-foreground">{localizedLabel(session.label)}</p>
             <p className="mt-0.5 truncate font-mono text-[9px] text-muted-foreground">{session.session_id}</p>
           </div>
           <div className="text-end">
-            <p className="font-mono text-xs tabular-nums text-foreground">{session.value}</p>
-            <p className="font-mono text-[9px] tabular-nums text-muted-foreground">{session.date}</p>
+            <p className="font-mono text-xs tabular-nums text-foreground">
+              {localizedValue(session.label, session.value)}
+            </p>
+            <p className="font-mono text-[9px] tabular-nums text-muted-foreground">
+              {formatShortDate(session.date, locale)}
+            </p>
           </div>
         </div>
       ))}
@@ -698,14 +786,14 @@ export function OverviewDeck({ meter, meterUnavailable, metric, onMetricChange, 
               </div>
             }
             description={u.chart.description}
-            eyebrow="01 // BURN FIELD"
+            eyebrow={u.sections.burn}
             title={u.chart.title}
           />
           <BurnChart metric={metric} report={report} />
         </section>
 
         <section className="usage-rail border-y border-border py-3">
-          <SectionHeader description={u.token.description} eyebrow="02 // TOKEN TOPOLOGY" title={u.token.title} />
+          <SectionHeader description={u.token.description} eyebrow={u.sections.token} title={u.token.title} />
           <TokenTopology report={report} />
           <div className="mt-4 border-t border-border pt-3">
             <div className="mb-2 flex items-center gap-2">
@@ -721,11 +809,11 @@ export function OverviewDeck({ meter, meterUnavailable, metric, onMetricChange, 
 
       <div className="grid gap-6 lg:grid-cols-2">
         <section className="usage-rail border-y border-border py-3">
-          <SectionHeader description={u.cost.description} eyebrow="COST // TRUTH LAYER" title={u.cost.title} />
+          <SectionHeader description={u.cost.description} eyebrow={u.sections.cost} title={u.cost.title} />
           <CostTruth meter={meter} meterUnavailable={meterUnavailable} report={report} />
         </section>
         <section className="usage-rail border-y border-border py-3">
-          <SectionHeader description={u.platform.description} eyebrow="SOURCE // TRAFFIC" title={u.platform.title} />
+          <SectionHeader description={u.platform.description} eyebrow={u.sections.platform} title={u.platform.title} />
           <PlatformBars platforms={report.platforms} />
         </section>
       </div>
@@ -734,11 +822,11 @@ export function OverviewDeck({ meter, meterUnavailable, metric, onMetricChange, 
 
       <div className="grid gap-6 lg:grid-cols-2">
         <section className="usage-rail border-y border-border py-3">
-          <SectionHeader description={u.sessions.description} eyebrow="HOT // SESSIONS" title={u.sessions.title} />
+          <SectionHeader description={u.sessions.description} eyebrow={u.sections.sessions} title={u.sessions.title} />
           <SessionHotspots report={report} />
         </section>
         <section className="usage-rail border-y border-border py-3">
-          <SectionHeader description={u.workload.description} eyebrow="WORKLOAD // SIGNALS" title={u.workload.title} />
+          <SectionHeader description={u.workload.description} eyebrow={u.sections.workload} title={u.workload.title} />
           <WorkloadSignals report={report} />
         </section>
       </div>

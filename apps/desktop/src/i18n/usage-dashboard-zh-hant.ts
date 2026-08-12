@@ -22,6 +22,17 @@ export const usageDashboardZhHant: UsageDashboardTranslations = {
     routes: '提供方 × 模型 × API 模式',
     ledger: '最新呼叫 · 完整詞元向量'
   },
+  sections: {
+    burn: '01 // 消耗圖譜',
+    token: '02 // 詞元拓撲',
+    model: '03 // 模型堆疊',
+    cost: '成本 // 真值層',
+    platform: '來源 // 流量',
+    sessions: '熱點 // 工作階段',
+    workload: '工作負載 // 訊號',
+    routes: '路由 // 矩陣',
+    ledger: '呼叫 // 帳本'
+  },
   macro: {
     marketCost: '市場等值成本',
     rangeEstimate: days => `${days} 天工作階段估算`,
@@ -55,6 +66,7 @@ export const usageDashboardZhHant: UsageDashboardTranslations = {
     cacheWrite: '快取寫入',
     output: '輸出',
     reasoning: '推理',
+    reasoningShare: share => `占輸出 ${share}`,
     tokensShort: '詞元'
   },
   cost: {
@@ -68,7 +80,8 @@ export const usageDashboardZhHant: UsageDashboardTranslations = {
     capturedAllTime: '全域已擷取估算',
     cacheSavings: '預估快取節省',
     calls: count => `${count} 次呼叫`,
-    rangeComparison: (cost, days) => `${days} 天工作階段市場等值為 ${cost}。這是不同範圍，不會加到已擷取總額。`
+    rangeComparison: (cost, days) => `${days} 天工作階段市場等值為 ${cost}。這是不同範圍，不會加到已擷取總額。`,
+    estimatedValue: cost => `估算 ${cost}`
   },
   models: {
     title: '模型壓力堆疊',
@@ -115,7 +128,17 @@ export const usageDashboardZhHant: UsageDashboardTranslations = {
   sessions: {
     title: '高負載工作階段',
     description: '所選時間範圍內用量最高的工作階段記錄。',
-    empty: '此時間範圍內沒有高負載工作階段。'
+    empty: '此時間範圍內沒有高負載工作階段。',
+    labels: { longest: '最長工作階段', messages: '最多訊息', tokens: '最多詞元', tools: '最多工具呼叫' },
+    messages: count => `${count} 則訊息`,
+    tokens: count => `${count} 個詞元`,
+    calls: count => `${count} 次呼叫`,
+    duration: {
+      seconds: count => `${count} 秒`,
+      minutes: count => `${count} 分鐘`,
+      hours: count => `${count} 小時`,
+      days: count => `${count} 天`
+    }
   },
   workload: {
     title: '工作負載訊號',

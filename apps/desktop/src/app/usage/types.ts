@@ -9,21 +9,21 @@ export type UsageCostBucket = {
 }
 
 export type UsageTotals = {
-  sessions: number
-  api_calls: number
-  input_tokens: number
-  output_tokens: number
-  cache_read_tokens: number
-  cache_write_tokens: number
-  total_tokens: number
-  cost: number
-  actual_cost: number
-  tool_calls: number
-  skill_calls: number
+  sessions: number | null
+  api_calls: number | null
+  input_tokens: number | null
+  output_tokens: number | null
+  cache_read_tokens: number | null
+  cache_write_tokens: number | null
+  total_tokens: number | null
+  cost: number | null
+  actual_cost: number | null
+  tool_calls: number | null
+  skill_calls: number | null
   cost_buckets: {
-    estimated: UsageCostBucket
-    included: UsageCostBucket
-    unknown: UsageCostBucket
+    estimated: UsageCostBucket | null
+    included: UsageCostBucket | null
+    unknown: UsageCostBucket | null
   }
 }
 
@@ -47,8 +47,8 @@ export type ModelUsage = {
   cache_write_tokens: number
   reasoning_tokens: number
   tool_calls: number
-  cost: number | null
-  actual_cost: number
+  estimated_cost: number | null
+  actual_cost: number | null
   cost_status: CostStatus
   has_pricing: boolean
 }

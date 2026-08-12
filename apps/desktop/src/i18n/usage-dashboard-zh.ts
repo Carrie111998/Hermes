@@ -22,6 +22,17 @@ export const usageDashboardZh: UsageDashboardTranslations = {
     routes: '提供商 × 模型 × API 模式',
     ledger: '最新调用 · 完整词元向量'
   },
+  sections: {
+    burn: '01 // 消耗图谱',
+    token: '02 // 词元拓扑',
+    model: '03 // 模型栈',
+    cost: '成本 // 真值层',
+    platform: '来源 // 流量',
+    sessions: '热点 // 会话',
+    workload: '工作负载 // 信号',
+    routes: '路由 // 矩阵',
+    ledger: '调用 // 账本'
+  },
   macro: {
     marketCost: '市场等值成本',
     rangeEstimate: days => `${days} 天会话估算`,
@@ -55,6 +66,7 @@ export const usageDashboardZh: UsageDashboardTranslations = {
     cacheWrite: '缓存写入',
     output: '输出',
     reasoning: '推理',
+    reasoningShare: share => `占输出 ${share}`,
     tokensShort: '词元'
   },
   cost: {
@@ -68,7 +80,8 @@ export const usageDashboardZh: UsageDashboardTranslations = {
     capturedAllTime: '全局已捕获估算',
     cacheSavings: '预计缓存节省',
     calls: count => `${count} 次调用`,
-    rangeComparison: (cost, days) => `${days} 天会话市场等值为 ${cost}。这是不同范围，不会叠加到已捕获总额。`
+    rangeComparison: (cost, days) => `${days} 天会话市场等值为 ${cost}。这是不同范围，不会叠加到已捕获总额。`,
+    estimatedValue: cost => `估算 ${cost}`
   },
   models: {
     title: '模型压力栈',
@@ -115,7 +128,17 @@ export const usageDashboardZh: UsageDashboardTranslations = {
   sessions: {
     title: '高负载会话',
     description: '所选时间范围内用量最高的会话记录。',
-    empty: '此时间范围内没有高负载会话。'
+    empty: '此时间范围内没有高负载会话。',
+    labels: { longest: '最长会话', messages: '最多消息', tokens: '最多词元', tools: '最多工具调用' },
+    messages: count => `${count} 条消息`,
+    tokens: count => `${count} 个词元`,
+    calls: count => `${count} 次调用`,
+    duration: {
+      seconds: count => `${count} 秒`,
+      minutes: count => `${count} 分钟`,
+      hours: count => `${count} 小时`,
+      days: count => `${count} 天`
+    }
   },
   workload: {
     title: '工作负载信号',

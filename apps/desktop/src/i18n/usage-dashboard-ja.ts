@@ -22,6 +22,17 @@ export const usageDashboardJa: UsageDashboardTranslations = {
     routes: 'プロバイダー × モデル × API モード',
     ledger: '最新の捕捉コール · 完全なトークン内訳'
   },
+  sections: {
+    burn: '01 // 消費フィールド',
+    token: '02 // トークン構成',
+    model: '03 // モデルスタック',
+    cost: 'コスト // 根拠レイヤー',
+    platform: 'ソース // トラフィック',
+    sessions: '高負荷 // セッション',
+    workload: 'ワークロード // 信号',
+    routes: 'ルート // マトリクス',
+    ledger: 'コール // 台帳'
+  },
   macro: {
     marketCost: '市場換算コスト',
     rangeEstimate: days => `${days}日間のセッション推定`,
@@ -56,6 +67,7 @@ export const usageDashboardJa: UsageDashboardTranslations = {
     cacheWrite: 'キャッシュ書込',
     output: '出力',
     reasoning: '推論',
+    reasoningShare: share => `出力の ${share}`,
     tokensShort: 'トークン'
   },
   cost: {
@@ -70,7 +82,8 @@ export const usageDashboardJa: UsageDashboardTranslations = {
     cacheSavings: '推定キャッシュ節約額',
     calls: count => `${count} コール`,
     rangeComparison: (cost, days) =>
-      `${days}日間のセッション市場換算は ${cost}。捕捉合計とは別の範囲で、加算されません。`
+      `${days}日間のセッション市場換算は ${cost}。捕捉合計とは別の範囲で、加算されません。`,
+    estimatedValue: cost => `推定 ${cost}`
   },
   models: {
     title: 'モデル負荷スタック',
@@ -117,7 +130,22 @@ export const usageDashboardJa: UsageDashboardTranslations = {
   sessions: {
     title: '高負荷セッション',
     description: '選択期間で最も使用量の多いセッション記録です。',
-    empty: 'この期間の高負荷セッションはありません。'
+    empty: 'この期間の高負荷セッションはありません。',
+    labels: {
+      longest: '最長セッション',
+      messages: '最多メッセージ',
+      tokens: '最多トークン',
+      tools: '最多ツールコール'
+    },
+    messages: count => `${count} メッセージ`,
+    tokens: count => `${count} トークン`,
+    calls: count => `${count} コール`,
+    duration: {
+      seconds: count => `${count}秒`,
+      minutes: count => `${count}分`,
+      hours: count => `${count}時間`,
+      days: count => `${count}日`
+    }
   },
   workload: {
     title: 'ワークロード信号',

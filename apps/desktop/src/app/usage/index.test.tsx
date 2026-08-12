@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
@@ -68,6 +68,23 @@ afterEach(() => {
 })
 
 describe('UsageView', () => {
+  it('uses accessible labels and themed tips instead of native title attributes across every deck', async () => {
+    renderUsage()
+
+    const usageDeck = await screen.findByRole('heading', { name: 'Usage deck' })
+    const renderedSurface = usageDeck.ownerDocument.body
+
+    expect(renderedSurface.querySelector('[title]')).toBeNull()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Routes' }))
+    await screen.findByRole('heading', { name: 'Route matrix' })
+    expect(renderedSurface.querySelector('[title]')).toBeNull()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Call ledger' }))
+    await screen.findByRole('heading', { name: 'Captured call ledger' })
+    expect(renderedSurface.querySelector('[title]')).toBeNull()
+  })
+
   it('loads all telemetry surfaces and renders macro plus cost-truth data', async () => {
     renderUsage()
 
@@ -75,8 +92,11 @@ describe('UsageView', () => {
     expect(await screen.findByText('1.7M')).toBeTruthy()
     expect(screen.getAllByText('$32.11').length).toBeGreaterThan(0)
     expect(screen.getAllByText('$34.87').length).toBeGreaterThan(0)
+    expect(screen.getByText('estimate $11.37')).toBeTruthy()
     expect(screen.getByText('Session provider actual')).toBeTruthy()
     expect(screen.getByText('Price unavailable')).toBeTruthy()
+    expect(screen.getByText('18% of output')).toBeTruthy()
+    expect(screen.queryByLabelText(/Reasoning:/)).toBeNull()
 
     await waitFor(() => {
       expect(gatewayMock).toHaveBeenCalledWith('usage.overview', { days: 30 })
@@ -167,6 +187,95 @@ describe('UsageView', () => {
     expect(await screen.findByText('No daily activity in this range.')).toBeTruthy()
     expect(screen.getByText('No model traffic in this range.')).toBeTruthy()
     expect(screen.getByText('No platform traffic in this range.')).toBeTruthy()
+    expect(within(screen.getByText('Market equiv.').closest('div')!).getByText('—')).toBeTruthy()
+  })
+
+  it('renders absent non-empty overview metrics as unavailable rather than zero', async () => {
+    gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) => {
+      if (method === 'usage.overview') {
+        return Promise.resolve({ ...usageOverviewFixture, empty: false, overview: {} })
+      }
+
+      return Promise.resolve(responseFor(method, params))
+    })
+
+    renderUsage()
+
+    const marketCostLabel = await screen.findByText('Market equiv.')
+
+    expect(within(marketCostLabel.closest('div')!).getByText('—')).toBeTruthy()
+    expect(within(screen.getByText('Token volume').closest('div')!).getByText('—')).toBeTruthy()
+  })
+
+  it('does not fabricate a captured zero when every metered call is unpriced', async () => {
+    gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) => {
+      if (method === 'usage.meter.summary') {
+        return Promise.resolve({
+          ...usageMeterSummaryFixture,
+          all_time: {
+            ...usageMeterSummaryFixture.all_time,
+            summary: {
+              ...usageMeterSummaryFixture.all_time.summary,
+              calls: 9,
+              estimated_cost_usd: 0,
+              has_unpriced: true,
+              included_calls: 0,
+              priced_calls: 0,
+              unpriced_calls: 9
+            }
+          }
+        })
+      }
+
+      return Promise.resolve(responseFor(method, params))
+    })
+
+    renderUsage()
+
+    const capturedCostLabel = await screen.findByText('Captured estimate')
+
+    expect(within(capturedCostLabel.closest('div')!).getByText('—')).toBeTruthy()
+  })
+
+  it('renders an all-unpriced route cost as unavailable', async () => {
+    renderUsage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Routes' }))
+
+    const row = (await screen.findByText('unpriced-lab-model')).closest('tr')
+    expect(row).toBeTruthy()
+    expect(within(row!).getByText('—')).toBeTruthy()
+    expect(within(row!).getByText('unavailable')).toBeTruthy()
+  })
+
+  it('renders an included plus unpriced route cost as unavailable', async () => {
+    gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) => {
+      if (method === 'usage.meter.details') {
+        return Promise.resolve({
+          ...usageMeterDetailsFixture,
+          routes: [
+            {
+              ...usageMeterDetailsFixture.routes[0],
+              calls: 4,
+              estimated_cost_usd: 0,
+              included_calls: 2,
+              model: 'mixed-route',
+              priced_calls: 0,
+              unpriced_calls: 2
+            }
+          ]
+        })
+      }
+
+      return Promise.resolve(responseFor(method, params))
+    })
+
+    renderUsage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Routes' }))
+
+    const row = (await screen.findByText('mixed-route')).closest('tr')
+    expect(row).toBeTruthy()
+    expect(within(row!).getByText('—')).toBeTruthy()
+    expect(within(row!).getByText('mixed')).toBeTruthy()
   })
 
   it('labels month route drilldown as a bounded recent-event window', async () => {

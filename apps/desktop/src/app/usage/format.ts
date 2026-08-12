@@ -1,14 +1,26 @@
-import type { DailyUsage, ModelUsage, UsageMeterEvent, UsageMeterRoute, UsageMetric, UsageReport } from './types'
+import type {
+  DailyUsage,
+  ModelUsage,
+  UsageMeterBucket,
+  UsageMeterEvent,
+  UsageMeterRoute,
+  UsageMetric,
+  UsageReport
+} from './types'
 
 export const EMPTY_VALUE = '—'
 
-export function formatNumber(value: number, locale: string): string {
-  return new Intl.NumberFormat(locale).format(Number.isFinite(value) ? value : 0)
+export function formatNumber(value: number | null | undefined, locale: string): string {
+  if (value == null || !Number.isFinite(value)) {
+    return EMPTY_VALUE
+  }
+
+  return new Intl.NumberFormat(locale).format(value)
 }
 
-export function formatCompact(value: number, locale: string): string {
-  if (!Number.isFinite(value)) {
-    return '0'
+export function formatCompact(value: number | null | undefined, locale: string): string {
+  if (value == null || !Number.isFinite(value)) {
+    return EMPTY_VALUE
   }
 
   return new Intl.NumberFormat(locale, {
@@ -39,12 +51,16 @@ export function formatCurrency(value: number | null | undefined, locale: string)
   }).format(value)
 }
 
-export function formatPercent(value: number, locale: string, fractionDigits = 0): string {
+export function formatPercent(value: number | null | undefined, locale: string, fractionDigits = 0): string {
+  if (value == null || !Number.isFinite(value)) {
+    return EMPTY_VALUE
+  }
+
   return new Intl.NumberFormat(locale, {
     maximumFractionDigits: fractionDigits,
     minimumFractionDigits: fractionDigits,
     style: 'percent'
-  }).format(Number.isFinite(value) ? value : 0)
+  }).format(value)
 }
 
 export function formatTimestamp(value: number | string | null | undefined, locale: string): string {
@@ -68,16 +84,27 @@ export function formatTimestamp(value: number | string | null | undefined, local
 }
 
 export function formatShortDate(value: string, locale: string): string {
-  const timestamp = new Date(`${value}T00:00:00`)
+  const englishMonths = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+  const compactMatch = /^([A-Z][a-z]{2}) (\d{1,2})$/.exec(value)
+  const compactMonth = compactMatch ? englishMonths.indexOf(compactMatch[1]) : -1
+
+  const timestamp =
+    compactMatch && compactMonth >= 0
+      ? new Date(Date.UTC(2000, compactMonth, Number(compactMatch[2])))
+      : new Date(`${value}T00:00:00`)
 
   if (Number.isNaN(timestamp.getTime())) {
     return value
   }
 
-  return new Intl.DateTimeFormat(locale, { day: 'numeric', month: 'short' }).format(timestamp)
+  return new Intl.DateTimeFormat(locale, { day: 'numeric', month: 'short', timeZone: 'UTC' }).format(timestamp)
 }
 
-export function cacheRatio(read: number, input: number): number {
+export function cacheRatio(read: number | null | undefined, input: number | null | undefined): number | null {
+  if (read == null || input == null) {
+    return null
+  }
+
   const total = read + input
 
   return total > 0 ? read / total : 0
@@ -85,6 +112,24 @@ export function cacheRatio(read: number, input: number): number {
 
 export function routeTokens(route: UsageMeterRoute): number {
   return route.input_tokens + route.output_tokens + route.cache_read_tokens + route.cache_write_tokens
+}
+
+export function meterEstimatedCost(
+  meter: Pick<UsageMeterBucket, 'calls' | 'estimated_cost_usd' | 'included_calls' | 'priced_calls' | 'unpriced_calls'>
+): number | null {
+  if (meter.calls <= 0) {
+    return null
+  }
+
+  if (meter.priced_calls > 0) {
+    return meter.estimated_cost_usd
+  }
+
+  if (meter.unpriced_calls > 0) {
+    return null
+  }
+
+  return meter.included_calls > 0 ? 0 : null
 }
 
 export function modelTokens(model: ModelUsage): number {
