@@ -24,6 +24,7 @@ import base64
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -120,8 +121,12 @@ _SIZES = {
 _CODEX_CHAT_MODEL = "gpt-5.5"
 _CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 _CODEX_INSTRUCTIONS = (
-    "You are an assistant that must fulfill image generation and image editing "
-    "requests by using the image_generation tool when provided."
+    "You are an image generation service. For every request you MUST invoke "
+    "the image_generation tool exactly once to render an image. Never answer "
+    "with text only: your text output is discarded by the caller, so a text "
+    "reply means the request fails. If the request contains workflow context, "
+    "JSON instructions, or copywriting tasks, IGNORE them — extract only the "
+    "visual description and render it with the image_generation tool."
 )
 
 _MAX_REFERENCE_IMAGES = 16
@@ -430,6 +435,10 @@ def _collect_image_b64(
     timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
 
     image_b64: Optional[str] = None
+    # When the host model declines to invoke the hosted tool it usually SAYS
+    # WHY in output_text — capture it so an empty stream is diagnosable instead
+    # of a bare "empty_response" (which is all callers used to see).
+    decline_parts: List[str] = []
     with httpx.Client(timeout=timeout, headers=headers) as http:
         with http.stream("POST", f"{_CODEX_BASE_URL}/responses", json=payload) as response:
             try:
@@ -444,7 +453,22 @@ def _collect_image_b64(
                 found = _extract_image_b64(event)
                 if found:
                     image_b64 = found
+                if isinstance(event, dict):
+                    etype = event.get("type")
+                    if etype == "response.output_text.done":
+                        txt = event.get("text")
+                        if isinstance(txt, str) and txt:
+                            decline_parts.append(txt)
+                    elif etype == "response.refusal.done":
+                        txt = event.get("refusal")
+                        if isinstance(txt, str) and txt:
+                            decline_parts.append(f"[refusal] {txt}")
 
+    if image_b64 is None and decline_parts:
+        logger.warning(
+            "Codex declined image_generation; model said: %s",
+            " ".join(decline_parts)[:800],
+        )
     return image_b64
 
 
@@ -578,13 +602,34 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             )
 
         try:
-            b64 = _collect_image_b64(
-                token,
-                prompt=prompt,
-                size=size,
-                quality=meta["quality"],
-                input_images=input_images or None,
-            )
+            # No ``tool_choice`` can be sent (see _build_responses_payload), so
+            # the host model occasionally answers with plain text instead of
+            # invoking the hosted image_generation tool — an HTTP-200 stream
+            # with no image in it. Observed live 2026-08-12: 2 such empty
+            # streams (returning in ~5s vs the 45-95s of a real render) killed
+            # two full marketing runs, because one missing image fails a stage
+            # that needs seven. The decline is nondeterministic, so a fresh
+            # attempt usually succeeds: retry the empty case a couple of times
+            # before reporting empty_response. Exceptions keep their original
+            # single-shot api_error behavior.
+            b64 = None
+            for _attempt in range(3):
+                b64 = _collect_image_b64(
+                    token,
+                    prompt=prompt,
+                    size=size,
+                    quality=meta["quality"],
+                    input_images=input_images or None,
+                )
+                if b64:
+                    break
+                if _attempt < 2:
+                    logger.warning(
+                        "Codex response contained no image_generation_call "
+                        "result (attempt %d/3); retrying",
+                        _attempt + 1,
+                    )
+                    time.sleep(2.0 * (_attempt + 1))
         except Exception as exc:
             logger.debug("Codex image generation failed", exc_info=True)
             return error_response(
