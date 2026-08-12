@@ -159,7 +159,28 @@ def test_gateway_injection_passes_host_owned_plugin_identity(tmp_path, monkeypat
     assert result is True
     injector.assert_called_once_with(
         session_key="agent:main:telegram:dm:42",
+        expected_session_id=None,
         content="[system] wake up",
+        plugin_id="notify-plugin",
+    )
+
+
+def test_gateway_injection_forwards_optional_expected_session_id(tmp_path, monkeypatch):
+    _write_plugin_config(tmp_path, monkeypatch, {"allow_gateway_injection": True})
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+
+    assert context.inject_message(
+        "wake up",
+        session_key="agent:main:telegram:dm:42",
+        expected_session_id="session-42",
+    ) is True
+
+    injector.assert_called_once_with(
+        session_key="agent:main:telegram:dm:42",
+        expected_session_id="session-42",
+        content="wake up",
         plugin_id="notify-plugin",
     )
 

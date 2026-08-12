@@ -527,6 +527,7 @@ class PluginContext:
         role: str = "user",
         *,
         session_key: str | None = None,
+        expected_session_id: str | None = None,
     ) -> bool:
         """Inject a message into a CLI or gateway conversation.
 
@@ -538,6 +539,8 @@ class PluginContext:
 
         Gateway injection requires an existing ``session_key`` and an explicit
         ``plugins.entries.<plugin_id>.allow_gateway_injection`` config grant.
+        When ``expected_session_id`` is supplied, the gateway rejects the
+        request if that route has rotated to another physical transcript.
         A ``True`` return means the live gateway accepted the request for
         asynchronous dispatch, not that platform delivery has completed.
 
@@ -579,6 +582,7 @@ class PluginContext:
             return bool(
                 self._manager.inject_gateway_message(
                     session_key=session_key,
+                    expected_session_id=expected_session_id,
                     content=msg,
                     plugin_id=plugin_id,
                 )

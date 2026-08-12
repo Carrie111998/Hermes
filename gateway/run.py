@@ -17058,6 +17058,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         *,
         session_key: str,
+        expected_session_id: str | None = None,
         content: str,
         plugin_id: str,
     ) -> bool:
@@ -17068,6 +17069,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         coro = self._dispatch_plugin_message_injection(
             session_key=session_key,
+            expected_session_id=expected_session_id,
             content=content,
             plugin_id=plugin_id,
         )
@@ -17126,6 +17128,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         *,
         session_key: str,
+        expected_session_id: str | None = None,
         content: str,
         plugin_id: str,
     ) -> bool:
@@ -17135,6 +17138,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         entry = await self.async_session_store.lookup_by_session_key(session_key)
         if entry is None or entry.origin is None:
+            return False
+        if expected_session_id is not None and entry.session_id != expected_session_id:
+            logger.info(
+                "Plugin message injection rejected after session rotation: "
+                "plugin=%s session=%s expected_session_id=%s current_session_id=%s",
+                plugin_id,
+                session_key,
+                expected_session_id,
+                entry.session_id,
+            )
             return False
         if not getattr(self, "_running", False) or getattr(self, "_draining", False):
             return False

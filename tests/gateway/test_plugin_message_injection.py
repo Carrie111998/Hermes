@@ -206,6 +206,26 @@ async def test_dispatch_rejects_unroutable_session(entry, with_adapter):
 
 
 @pytest.mark.asyncio
+async def test_dispatch_rejects_expected_session_after_route_rotation():
+    """A delayed plugin turn must never cross /new or /reset onto the new session."""
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    entry = _entry()
+    entry.session_id = "rotated-session"
+    runner = _runner(entry, adapter)
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key,
+        expected_session_id="session-42",
+        content="wake up",
+        plugin_id="notify-plugin",
+    )
+
+    assert accepted is False
+    adapter.handle_message.assert_not_awaited()
+    runner._is_user_authorized.assert_not_called()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("raises", [False, True])
 async def test_dispatch_rechecks_current_authorization(raises):
     adapter = SimpleNamespace(handle_message=AsyncMock())
@@ -350,10 +370,11 @@ async def test_scheduler_submits_dispatch_on_live_gateway_loop():
 
     await asyncio.sleep(0)
     runner._dispatch_plugin_message_injection.assert_awaited_once_with(
-        session_key="agent:main:telegram:dm:42",
-        content="wake up",
-        plugin_id="notify-plugin",
-    )
+            session_key="agent:main:telegram:dm:42",
+            expected_session_id=None,
+            content="wake up",
+            plugin_id="notify-plugin",
+        )
 
 
 @pytest.mark.asyncio
