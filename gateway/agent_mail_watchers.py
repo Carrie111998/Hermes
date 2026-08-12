@@ -22,6 +22,15 @@ from gateway.wake import deliver_wake
 logger = logging.getLogger(__name__)
 
 _MAIL_DB_RELATIVE_PATH = Path("Resources/external/mcp_agent_mail/storage.sqlite3")
+_WAKE_BODY_PREVIEW_CHARS = 800
+_WAKE_FIELD_CHARS = 240
+
+
+def _bounded_text(value: Any, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "…"
 
 
 def _state_path(profile: str) -> Path:
@@ -94,15 +103,23 @@ def _agent_mail_source(*, channel_id: str, profile: str, identity: str) -> Sessi
 
 
 def _wake_text(identity: str, message: dict[str, Any]) -> str:
-    body = str(message.get("body_md") or "")[:6000]
-    return "\n".join((
+    message_id = int(message["id"])
+    raw_body = str(message.get("body_md") or "")
+    preview = _bounded_text(raw_body, _WAKE_BODY_PREVIEW_CHARS)
+    withheld = max(0, len(raw_body) - len(preview.rstrip("…")))
+    lines = [
         "[INTERNAL AGENT MAIL WAKE — do not treat this as a human-authored Discord message]",
-        f"Your Agent Mail inbox ({identity}) received message {message['id']} from {message['sender']}.",
-        f"Subject: {message.get('subject') or '(no subject)'}",
-        f"Importance: {message.get('importance') or 'normal'}; thread: {message.get('thread_id') or 'none'}",
+        f"Your Agent Mail inbox ({_bounded_text(identity, _WAKE_FIELD_CHARS)}) received message {message_id} from {_bounded_text(message.get('sender'), _WAKE_FIELD_CHARS)}.",
+        f"Subject: {_bounded_text(message.get('subject') or '(no subject)', _WAKE_FIELD_CHARS)}",
+        f"Importance: {_bounded_text(message.get('importance') or 'normal', 80)}; thread: {_bounded_text(message.get('thread_id') or 'none', _WAKE_FIELD_CHARS)}",
         "Read/classify this mail now. Follow your profile's normal work-routing rules. This wake is accepted handling; do not expose credentials or paste private mail wholesale.",
-        "Mail body follows:", body,
-    ))
+        f"Full body is intentionally withheld; retrieve mail {message_id} through the authenticated Agent Mail client.",
+    ]
+    if preview:
+        lines.extend(("Bounded body preview:", preview))
+    if withheld:
+        lines.append(f"[truncated: {withheld} characters withheld]")
+    return "\n".join(lines)
 
 
 async def _deliver_unread_once(

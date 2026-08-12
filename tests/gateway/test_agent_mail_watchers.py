@@ -52,14 +52,17 @@ def test_only_explicit_internal_control_plane_events_suppress_public_delivery():
 
 
 def test_agent_mail_wake_is_internal_and_bounded():
+    body = "x" * 7000
     text = _wake_text(
         "SilverLens",
-        {"id": 42, "sender": "IronPaw", "subject": "test", "importance": "normal", "thread_id": None, "body_md": "x" * 7000},
+        {"id": 42, "sender": "IronPaw", "subject": "test", "importance": "normal", "thread_id": None, "body_md": body},
     )
     assert text.startswith("[INTERNAL AGENT MAIL WAKE")
     assert "SilverLens" in text
     assert "message 42" in text
-    assert len(text) < 6800
+    assert "Full body is intentionally withheld; retrieve mail 42 through the authenticated Agent Mail client." in text
+    assert "[truncated: 6200 characters withheld]" in text
+    assert len(text) < 1400
 
 
 def test_adapter_failure_does_not_advance_delivery_cursor():
