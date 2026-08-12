@@ -546,6 +546,35 @@ class TestDailySeriesAndCostBuckets:
         # Allow floating-point reconciliation to the cent.
         assert abs(sum(d["estimated_cost_usd"] for d in s) - o["estimated_cost"]) < 0.01
 
+    def test_daily_series_excludes_the_leading_partial_day_from_overview_totals(self, db):
+        """Overview and daily buckets share one exact calendar-day window."""
+        from datetime import datetime, timedelta
+
+        days = 30
+        now = time.time()
+        oldest_bucket = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days - 1)
+        rolling_cutoff = now - days * 86400
+        leading_partial_day = (rolling_cutoff + oldest_bucket.timestamp()) / 2
+
+        assert rolling_cutoff < leading_partial_day < oldest_bucket.timestamp()
+
+        db.create_session(session_id="inside", source="cli", model="gpt-4o", user_id="u1")
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = 'inside'", (now - 86400,))
+        db.update_token_counts("inside", input_tokens=10_000, output_tokens=2_000)
+
+        db.create_session(session_id="partial", source="cli", model="gpt-4o", user_id="u1")
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = 'partial'", (leading_partial_day,))
+        db.update_token_counts("partial", input_tokens=50_000, output_tokens=5_000)
+        db._conn.commit()
+
+        report = InsightsEngine(db).generate(days=days)
+        series = report["daily_series"]
+        overview = report["overview"]
+
+        assert overview["total_sessions"] == 1
+        assert sum(day["sessions"] for day in series) == overview["total_sessions"]
+        assert sum(day["input_tokens"] for day in series) == overview["total_input_tokens"] == 10_000
+
     def test_daily_series_empty_days_present(self, populated_db):
         """Inactive days in the window are present with zero counts (heatmap axis)."""
         engine = InsightsEngine(populated_db)

@@ -20,7 +20,7 @@ import json
 import sqlite3
 import time
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
@@ -144,7 +144,8 @@ class InsightsEngine:
         Returns:
             Dict with all computed insights
         """
-        cutoff = time.time() - (days * 86400)
+        window_end = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        cutoff = (window_end - timedelta(days=days - 1)).timestamp()
 
         # Token/cost totals may still sit on the SessionDB's async
         # accounting queue; drain so the report reflects exact counters.
@@ -179,7 +180,7 @@ class InsightsEngine:
                 },
                 "activity": {},
                 "top_sessions": [],
-                "daily_series": self._compute_daily_series(sessions, days),
+                "daily_series": self._compute_daily_series(sessions, days, window_end),
             }
 
         # Compute insights
@@ -190,7 +191,7 @@ class InsightsEngine:
         skills = self._compute_skill_breakdown(skill_usage)
         activity = self._compute_activity_patterns(sessions)
         top_sessions = self._compute_top_sessions(sessions)
-        daily_series = self._compute_daily_series(sessions, days)
+        daily_series = self._compute_daily_series(sessions, days, window_end)
 
         return {
             "days": days,
@@ -889,7 +890,12 @@ class InsightsEngine:
             "max_streak": max_streak,
         }
 
-    def _compute_daily_series(self, sessions: List[Dict], days: int) -> List[Dict]:
+    def _compute_daily_series(
+        self,
+        sessions: List[Dict],
+        days: int,
+        window_end: Optional[datetime] = None,
+    ) -> List[Dict]:
         """Aggregate sessions into per-calendar-day token/cost buckets.
 
         Returns exactly ``days`` entries — one per calendar day ending today,
@@ -899,10 +905,8 @@ class InsightsEngine:
         exactly with the overview totals: each session is bucketed into the
         calendar day of its ``started_at``.
         """
-        from datetime import datetime, timedelta
-
         # Seed the full window with zero buckets (oldest → today).
-        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        today = window_end or datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         series = []
         for offset in range(days - 1, -1, -1):
             day = today - timedelta(days=offset)
