@@ -97,6 +97,48 @@ export function installZoomReassertOnWindowEvents(win, reassert, platform = proc
   }
 }
 
+// A display's metrics changing — an RDP reconnect re-initializing the session's
+// virtual display, docking/undocking a laptop, or a monitor's scale factor
+// changing under a stationary window — makes Chromium drop webContents zoom back
+// to its 100% baseline, but fires NONE of the window events above when the
+// window geometry is unchanged (#84274). `screen.on('display-metrics-changed')`
+// is the signal that actually corresponds to what Chromium reacts to, and it
+// fires even when the app is not the focused window at reconnect time.
+export const ZOOM_DISPLAY_METRICS_REASSERT_DELAY_MS = 200
+
+/**
+ * Re-apply the persisted zoom to every zoom-enabled window whenever a display's
+ * metrics change or a display is added. Debounced at the trailing edge because a
+ * reconnect can emit a burst of metric changes. Returns a disposer that clears
+ * the pending timer and detaches both listeners — call it when the last
+ * zoom-enabled window closes so the subscription doesn't outlive its windows.
+ *
+ * *screen* is Electron's ``screen`` module (injected so this is unit-testable
+ * without booting the app); *reassertAllWindows* re-applies the persisted level
+ * to the live zoom-enabled windows.
+ */
+export function installZoomReassertOnDisplayMetrics(screen, reassertAllWindows, delayMs = ZOOM_DISPLAY_METRICS_REASSERT_DELAY_MS) {
+  if (!screen?.on) {
+    return () => {}
+  }
+
+  let timer
+
+  const onChange = () => {
+    clearTimeout(timer)
+    timer = setTimeout(reassertAllWindows, delayMs)
+  }
+
+  screen.on('display-metrics-changed', onChange)
+  screen.on('display-added', onChange)
+
+  return () => {
+    clearTimeout(timer)
+    screen.removeListener?.('display-metrics-changed', onChange)
+    screen.removeListener?.('display-added', onChange)
+  }
+}
+
 /**
  * Zoom-wiring decision per window kind. Chat windows (main + session + the HUD)
  * keep global UI zoom; the pet overlay and the Quick Entry composer opt out

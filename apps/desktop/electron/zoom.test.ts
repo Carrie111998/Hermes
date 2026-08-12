@@ -12,8 +12,10 @@ import {
   applyZoomLevel,
   clampZoomLevel,
   DEFAULT_ZOOM_LEVEL,
+  installZoomReassertOnDisplayMetrics,
   installZoomReassertOnWindowEvents,
   percentToZoomLevel,
+  ZOOM_DISPLAY_METRICS_REASSERT_DELAY_MS,
   ZOOM_RESIZE_REASSERT_DELAY_MS,
   ZOOM_STEP,
   ZOOM_STORAGE_KEY,
@@ -21,6 +23,65 @@ import {
   zoomReassertWindowEvents,
   zoomWiringForWindowKind
 } from './zoom'
+
+const makeFakeScreen = () => {
+  const handlers = new Map<string, () => void>()
+
+  return {
+    handlers,
+    on(event: string, listener: () => void) {
+      handlers.set(event, listener)
+    },
+    removeListener(event: string) {
+      handlers.delete(event)
+    }
+  }
+}
+
+test('installZoomReassertOnDisplayMetrics re-applies zoom on a debounced display-metrics change', () => {
+  vi.useFakeTimers()
+
+  try {
+    const screen = makeFakeScreen()
+    let calls = 0
+
+    const dispose = installZoomReassertOnDisplayMetrics(screen, () => {
+      calls += 1
+    })
+
+    assert.deepEqual([...screen.handlers.keys()], ['display-metrics-changed', 'display-added'])
+
+    // A reconnect can emit a burst of metric changes — coalesce to one reassert.
+    screen.handlers.get('display-metrics-changed')!()
+    screen.handlers.get('display-metrics-changed')!()
+    assert.equal(calls, 0)
+    vi.advanceTimersByTime(ZOOM_DISPLAY_METRICS_REASSERT_DELAY_MS)
+    assert.equal(calls, 1)
+
+    // display-added (a new virtual display on reconnect) also reasserts.
+    screen.handlers.get('display-added')!()
+    vi.advanceTimersByTime(ZOOM_DISPLAY_METRICS_REASSERT_DELAY_MS)
+    assert.equal(calls, 2)
+
+    // The disposer detaches both listeners and cancels any pending reassert.
+    screen.handlers.get('display-metrics-changed')!()
+    dispose()
+    vi.advanceTimersByTime(ZOOM_DISPLAY_METRICS_REASSERT_DELAY_MS)
+    assert.equal(calls, 2)
+    assert.equal(screen.handlers.size, 0)
+  } finally {
+    vi.useRealTimers()
+  }
+})
+
+test('installZoomReassertOnDisplayMetrics is inert without a screen event emitter', () => {
+  const dispose = installZoomReassertOnDisplayMetrics(null, () => {
+    throw new Error('should not be called')
+  })
+
+  assert.equal(typeof dispose, 'function')
+  dispose()
+})
 
 test('storage key stays stable so persisted zoom survives upgrades', () => {
   assert.equal(ZOOM_STORAGE_KEY, 'hermes:desktop:zoomLevel')
