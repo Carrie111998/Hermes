@@ -1620,10 +1620,28 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[D
         base_ref, base_label = "HEAD", "HEAD (local — worktree_sync disabled)"
 
     # Create the worktree
+    #
+    # run_text_capture + 300s, not capture_output=True + 30s: `git worktree add`
+    # is NOT a leaf. git's add_worktree() spawns a child `git checkout`/`reset`
+    # to populate the new tree, and that child is the slow part — ~7300 files
+    # here. On Windows it inherits the capture pipe handles, so if the budget
+    # fires while it is still writing, subprocess.run kills only the outer git
+    # and then blocks re-draining a pipe the checkout still holds open. (A
+    # post-checkout hook, which this repo does not currently install, would be a
+    # second such grandchild.)
+    #
+    # 30s was never survivable: this operation has been measured here outliving
+    # a 120s ceiling, with the checkout already reporting
+    # "Updating files: 100% (7296/7296), done." and work still in flight. So the
+    # old budget fired essentially every time, which on Windows meant the hang
+    # rather than the clean failure the code below is written to handle.
+    from hermes_cli._subprocess_compat import run_text_capture
+
+    _WORKTREE_ADD_TIMEOUT = 300
     try:
-        result = subprocess.run(
+        result = run_text_capture(
             ["git", "worktree", "add", str(wt_path), "-b", branch_name, base_ref],
-            capture_output=True, text=True, timeout=30, cwd=repo_root,
+            timeout=_WORKTREE_ADD_TIMEOUT, cwd=repo_root,
         )
         if result.returncode != 0:
             # If branching from the resolved remote ref failed for any reason
@@ -1635,9 +1653,10 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[D
                     base_ref, result.stderr.strip(),
                 )
                 base_ref, base_label = "HEAD", "HEAD (fallback — remote base failed)"
-                result = subprocess.run(
+                # Same grandchild and same budget as the first attempt above.
+                result = run_text_capture(
                     ["git", "worktree", "add", str(wt_path), "-b", branch_name, base_ref],
-                    capture_output=True, text=True, timeout=30, cwd=repo_root,
+                    timeout=_WORKTREE_ADD_TIMEOUT, cwd=repo_root,
                 )
             if result.returncode != 0:
                 print(f"\033[31m✗ Failed to create worktree: {result.stderr.strip()}\033[0m")

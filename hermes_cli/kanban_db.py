@@ -5752,13 +5752,17 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
             str(target), "HEAD",
         ]
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
+    # run_text_capture + 300s, not capture_output=True + 60s: `git worktree add`
+    # is not a leaf — git's add_worktree() spawns a child `git checkout`/`reset`
+    # to populate the tree (~7300 files here), and on Windows that grandchild
+    # inherits the capture pipe handles. If the budget fires mid-checkout,
+    # subprocess.run kills only the outer git and blocks re-draining a pipe the
+    # checkout still holds open. This operation has been measured here outliving
+    # a 120s ceiling, so 60s fired routinely — and on Windows that meant a hang
+    # instead of the RuntimeError below.
+    from hermes_cli._subprocess_compat import run_text_capture
+
+    result = run_text_capture(cmd, timeout=300)
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(

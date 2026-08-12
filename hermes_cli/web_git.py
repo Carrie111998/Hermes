@@ -31,7 +31,12 @@ _TRUNK_BRANCHES = ("main", "master")
 
 def _git(cwd: str, args: list[str], *, timeout: int = _GIT_TIMEOUT) -> tuple[int, str, str]:
     """Run ``git`` in ``cwd``. Returns (returncode, stdout, stderr); never raises
-    on a non-zero exit (callers decide what an error means)."""
+    on a non-zero exit (callers decide what an error means).
+
+    For LEAF git commands only — plumbing and queries that spawn nothing. Ops
+    that fork a child (``worktree add``, ``fetch``) must use :func:`_git_forking`
+    instead; see the note there.
+    """
     try:
         proc = subprocess.run(
             ["git", *args],
@@ -43,6 +48,41 @@ def _git(cwd: str, args: list[str], *, timeout: int = _GIT_TIMEOUT) -> tuple[int
     except (OSError, subprocess.SubprocessError):
         return 1, "", "git invocation failed"
     return proc.returncode, proc.stdout, proc.stderr
+
+
+# `git worktree add` populates the new tree with a child `git checkout`/`reset`,
+# and a full checkout of this repo was measured at 84.8s (7329 files) — nearly
+# 3x the 30s _GIT_TIMEOUT that used to guard it, so the budget fired on every
+# call. `git fetch` likewise forks the transport (git-remote-https) and, on
+# Windows, a credential helper. Either way the child inherits the capture pipe
+# handles and holds the write end open, so subprocess.run kills only the outer
+# git and then blocks re-draining a pipe that can never reach EOF.
+_GIT_FORKING_TIMEOUT = 300
+
+
+def _git_forking(cwd: str, args: list[str], *, timeout: int = _GIT_FORKING_TIMEOUT) -> tuple[int, str, str]:
+    """:func:`_git` for the git commands that fork a child process.
+
+    Captures into temp files rather than pipes so the grandchild cannot defeat
+    the timeout, and carries a budget sized for a real checkout. Kept separate
+    from :func:`_git` deliberately: the helper costs an extra process spawn per
+    call on Windows, which is not worth paying on the many leaf `status`/`log`/
+    `rev-parse` calls this module makes.
+    """
+    from hermes_cli._subprocess_compat import run_text_capture
+
+    try:
+        proc = run_text_capture(["git", *args], cwd=cwd, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return 1, "", "git invocation failed"
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def _git_forking_ok(cwd: str, args: list[str]) -> None:
+    """:func:`_git_ok` for forking git commands."""
+    code, _, err = _git_forking(cwd, args)
+    if code != 0:
+        raise RuntimeError(err.strip() or f"git {' '.join(args)} failed")
 
 
 def _git_out(cwd: str, args: list[str]) -> str:
@@ -658,7 +698,7 @@ def worktree_add(cwd: str, options: dict) -> dict:
             _git_ok(root, ["switch", existing])
             return {"path": root, "branch": existing, "repoRoot": root}
         target = _unique_dir(os.path.join(root, ".worktrees", _slugify(existing)))
-        _git_ok(root, ["worktree", "add", target, existing])
+        _git_forking_ok(root, ["worktree", "add", target, existing])
         return {"path": target, "branch": existing, "repoRoot": root}
 
     slug = _slugify(options.get("name") or f"work-{os.urandom(4).hex()}")
@@ -673,12 +713,12 @@ def worktree_add(cwd: str, options: dict) -> dict:
         # exists, or raise a clear error below if the ref is entirely missing.
         if base.startswith("origin/"):
             remote_branch = base[len("origin/"):]
-            _git(root, ["fetch", "origin", remote_branch])
+            _git_forking(root, ["fetch", "origin", remote_branch])
         args.append(base)
-    code, _, err = _git(root, args)
+    code, _, err = _git_forking(root, args)
     if code != 0:
         if "already exists" in (err or "").lower():
-            _git_ok(root, ["worktree", "add", target, branch])
+            _git_forking_ok(root, ["worktree", "add", target, branch])
         else:
             raise RuntimeError(err.strip() or "git worktree add failed")
     return {"path": target, "branch": branch, "repoRoot": root}

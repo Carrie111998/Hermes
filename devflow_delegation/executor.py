@@ -196,9 +196,15 @@ def _create_worktree(checkout_path: Path, worktree_base: Path, branch: str, base
     worktree_path = worktree_base / branch
     if worktree_path.exists():
         raise ExecutorError(f"worktree path already exists: {worktree_path}")
+    # 300s, not 45s: `git worktree add` populates the tree with a child
+    # `git checkout`/`reset`, and a full checkout of this repo was MEASURED at
+    # 84.8s (7329 files) — so 45s failed every invocation on a repo this size.
+    # The capture side is already safe (_run_checked uses run_text_capture, so
+    # the checkout grandchild cannot defeat the budget); only the budget itself
+    # was wrong, which made this a clean-but-certain failure rather than a hang.
     _run_checked(
         ["git", "worktree", "add", str(worktree_path), "-b", branch, base_branch],
-        cwd=checkout_path, timeout_seconds=45, label="git worktree add",
+        cwd=checkout_path, timeout_seconds=300, label="git worktree add",
     )
     try:
         _run_checked(
