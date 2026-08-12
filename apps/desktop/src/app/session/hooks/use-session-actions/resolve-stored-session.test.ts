@@ -275,6 +275,55 @@ describe('resolveStoredSession profile ownership', () => {
     expect(mockGetSession).not.toHaveBeenCalled()
   })
 
+  it('does not treat an untitled empty unknown row as the legacy title shadow', async () => {
+    // The observed legacy damage is a title-generation stub: source=unknown,
+    // message_count=0, and a persisted title. An untitled auxiliary/accounting
+    // row is ambiguous and must not be retargeted to a same-id session owned by
+    // another profile.
+    const ambiguous = session({
+      id: 's1',
+      message_count: 0,
+      profile: 'meta',
+      source: 'unknown',
+      title: null
+    })
+
+    $sessions.set([ambiguous])
+    mockGetSession.mockResolvedValueOnce(
+      session({
+        id: 's1',
+        message_count: 4,
+        profile: 'default',
+        source: 'desktop',
+        title: 'Different conversation'
+      })
+    )
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved).toBe(ambiguous)
+    expect(mockGetSession).not.toHaveBeenCalled()
+  })
+
+  it('keeps a titled known-source zero-message draft from cache without probing', async () => {
+    // `/title` before the first prompt intentionally creates desktop/0 or
+    // tui/0 rows. A title alone does not make a row a legacy shadow.
+    const draft = session({
+      id: 's1',
+      message_count: 0,
+      profile: 'meta',
+      source: 'desktop',
+      title: 'Planned conversation'
+    })
+
+    $sessions.set([draft])
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved).toBe(draft)
+    expect(mockGetSession).not.toHaveBeenCalled()
+  })
+
   it('does not treat omitted message_count as the legacy empty shadow', async () => {
     // Only message_count === 0 is the damaged shape; undefined must keep the
     // direct cache short-circuit even under multi-profile.

@@ -844,13 +844,13 @@ function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
 
 /**
  * Legacy cross-profile damage can leave the same session id on the active
- * profile as `source=unknown` with `message_count=0` (often still titled)
+ * profile as `source=unknown` with `message_count=0` and a persisted title
  * while another profile owns the real message-bearing desktop row. Treat only
  * that exact shape as a deferred fallback so resume can keep probing for a
  * materialized twin; omitted/undefined counts are not the legacy shadow.
  */
 function isLegacyEmptyUnknownShadow(session: SessionInfo): boolean {
-  return session.source === 'unknown' && session.message_count === 0
+  return session.source === 'unknown' && session.message_count === 0 && Boolean(session.title?.trim())
 }
 
 /**
