@@ -327,7 +327,15 @@ class RelayRuntime:
                 except Exception as exc:
                     failures.append(f"session scope close failed: {exc}")
         try:
-            self.relay.subscribers.flush()
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop is not None and loop.is_running():
+                loop.create_task(self.relay.subscribers.flush_async())
+            else:
+                self.relay.subscribers.flush()
         except Exception as exc:
             failures.append(f"subscriber flush failed: {exc}")
         with self._sessions_lock:
