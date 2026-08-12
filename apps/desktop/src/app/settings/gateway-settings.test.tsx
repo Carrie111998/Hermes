@@ -1,8 +1,11 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { atom } from 'nanostores'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { ComponentType } from 'react'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ProfileInfo } from '@/types/hermes'
+
+let GatewaySettings: ComponentType
 
 const getConnectionConfig = vi.fn()
 const saveConnectionConfig = vi.fn()
@@ -12,6 +15,10 @@ vi.mock('@/store/profile', () => ({
   $profiles: profiles,
   refreshActiveProfile: vi.fn()
 }))
+
+beforeAll(async () => {
+  ;({ GatewaySettings } = await import('./gateway-settings'))
+}, 60_000)
 
 const localConnection = {
   cloudOrg: '',
@@ -60,8 +67,6 @@ afterEach(() => {
 
 describe('GatewaySettings', () => {
   it('labels local mode as default inheritance for a named profile', async () => {
-    const { GatewaySettings } = await import('./gateway-settings')
-
     render(<GatewaySettings />)
     expect(await screen.findByText('Local gateway')).toBeTruthy()
     expect(
@@ -95,8 +100,6 @@ describe('GatewaySettings', () => {
         : localConnection
     )
     saveConnectionConfig.mockReturnValue(new Promise(() => {}))
-    const { GatewaySettings } = await import('./gateway-settings')
-
     render(<GatewaySettings />)
     fireEvent.click(await screen.findByRole('button', { name: 'work' }))
 

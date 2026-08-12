@@ -614,7 +614,7 @@ class InsightsEngine:
         })
         reconciled = []
 
-        def append_row(raw: Dict[str, Any], *, residual: bool = False) -> None:
+        def append_row(raw: Dict[str, Any], *, residual: bool = False) -> Dict[str, Any]:
             session = session_by_id[raw["session_id"]]
             auxiliary = bool(raw.get("task"))
             model = raw.get("model") or (
@@ -644,7 +644,7 @@ class InsightsEngine:
                     base_url=base_url,
                 )
             session = session_by_id[raw["session_id"]]
-            reconciled.append({
+            normalized = {
                 "session_id": raw["session_id"],
                 "source": session.get("source") or "unknown",
                 "started_at": session.get("started_at"),
@@ -683,18 +683,20 @@ class InsightsEngine:
                 ),
                 "has_pricing": has_known_pricing(model, provider, base_url),
                 "residual": residual,
-            })
+            }
+            reconciled.append(normalized)
+            return normalized
 
         for row in usage_rows:
-            append_row(row)
+            normalized = append_row(row)
             aggregate = totals[row["session_id"]]
             for key in (
                 "input_tokens", "output_tokens", "cache_read_tokens",
                 "cache_write_tokens", "reasoning_tokens", "api_call_count",
             ):
                 aggregate[key] += row.get(key) or 0
-            aggregate["estimated_cost_usd"] += row.get("estimated_cost_usd") or 0.0
-            aggregate["actual_cost_usd"] += row.get("actual_cost_usd") or 0.0
+            aggregate["estimated_cost_usd"] += normalized["estimated_cost_usd"]
+            aggregate["actual_cost_usd"] += normalized["actual_cost_usd"]
 
         for session in sessions:
             aggregate = totals[session["id"]]

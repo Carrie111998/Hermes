@@ -122,12 +122,12 @@ export function meterEstimatedCost(
     return null
   }
 
-  if (meter.priced_calls > 0) {
-    return meter.estimated_cost_usd
-  }
-
   if (meter.unpriced_calls > 0) {
     return null
+  }
+
+  if (meter.priced_calls > 0) {
+    return meter.estimated_cost_usd
   }
 
   return meter.included_calls > 0 ? 0 : null

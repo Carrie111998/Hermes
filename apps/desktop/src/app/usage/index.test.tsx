@@ -439,6 +439,37 @@ describe('UsageView', () => {
     expect(within(row!).getByText('mixed')).toBeTruthy()
   })
 
+  it('renders a priced plus unpriced route cost as unavailable', async () => {
+    gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) => {
+      if (method === 'usage.meter.details') {
+        return Promise.resolve({
+          ...usageMeterDetailsFixture,
+          routes: [
+            {
+              ...usageMeterDetailsFixture.routes[0],
+              calls: 4,
+              estimated_cost_usd: 1.25,
+              included_calls: 0,
+              model: 'partial-priced-route',
+              priced_calls: 2,
+              unpriced_calls: 2
+            }
+          ]
+        })
+      }
+
+      return Promise.resolve(responseFor(method, params))
+    })
+
+    renderUsage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Routes' }))
+
+    const row = (await screen.findByText('partial-priced-route')).closest('tr')
+    expect(row).toBeTruthy()
+    expect(within(row!).getByText('—')).toBeTruthy()
+    expect(within(row!).getByText('mixed')).toBeTruthy()
+  })
+
   it('labels month route drilldown as a bounded recent-event window', async () => {
     renderUsage()
     fireEvent.click(await screen.findByRole('button', { name: 'Routes' }))
