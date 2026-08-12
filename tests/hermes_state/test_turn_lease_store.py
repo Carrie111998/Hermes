@@ -71,26 +71,71 @@ def test_blank_session_or_holder_never_acquires(state):
     assert state.try_acquire_turn_lease("s1", "") is False
 
 
-def test_concurrent_acquire_grants_exactly_one_winner(state):
-    """The invariant the whole feature rests on, under real thread contention."""
+def test_concurrent_acquire_grants_exactly_one_winner(tmp_path):
+    """The invariant the whole feature rests on, raced at the SQLite layer.
+
+    Each thread opens its OWN ``SessionDB`` on the same file. That detail is
+    the test: ``_execute_write`` wraps its whole BEGIN IMMEDIATE transaction in
+    ``self._lock``, a *per-instance* ``threading.Lock`` (hermes_state.py:2543,
+    3311). Racing 8 threads through one shared instance would prove only that
+    that mutex works — the writers would be ordered in Python and never
+    contend in SQLite at all. Separate instances mean separate locks and
+    separate connections, which is the shape of the case this table exists
+    for: two OS processes sharing one state.db.
+    """
+    db_path = tmp_path / "state.db"
+    SessionDB(db_path).close()  # create the schema once, up front
+
     winners = []
-    lock = threading.Lock()
+    guard = threading.Lock()
     start = threading.Barrier(8)
 
     def contend(i):
-        start.wait()
-        if state.try_acquire_turn_lease("shared", f"holder:{i}", ttl_seconds=60):
-            with lock:
-                winners.append(f"holder:{i}")
+        db = SessionDB(db_path)
+        try:
+            start.wait()
+            if db.try_acquire_turn_lease("shared", f"holder:{i}", ttl_seconds=60):
+                with guard:
+                    winners.append(f"holder:{i}")
+        finally:
+            db.close()
 
     threads = [threading.Thread(target=contend, args=(i,)) for i in range(8)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=30)
+        t.join(timeout=60)
 
     assert len(winners) == 1, f"expected exactly one winner, got {winners}"
-    assert state.get_turn_lease_holder("shared") == winners[0]
+
+    verify = SessionDB(db_path)
+    try:
+        assert verify.get_turn_lease_holder("shared") == winners[0]
+    finally:
+        verify.close()
+
+
+def test_second_process_sees_the_first_holders_lease(tmp_path):
+    """A lease taken on one connection is visible/blocking on another.
+
+    The cross-process contract in one assertion: without shared visibility
+    through the DB row, the CLI-continuity pair behind #64934 would each
+    believe they hold the session.
+    """
+    db_path = tmp_path / "state.db"
+    cli = SessionDB(db_path)
+    gateway = SessionDB(db_path)
+    try:
+        assert cli.try_acquire_turn_lease("s1", "cli:1", ttl_seconds=60) is True
+        # Different instance, different connection, different lock:
+        assert gateway.try_acquire_turn_lease("s1", "gw:2", ttl_seconds=60) is False
+        assert gateway.get_turn_lease_holder("s1") == "cli:1"
+
+        cli.release_turn_lease("s1", "cli:1")
+        assert gateway.try_acquire_turn_lease("s1", "gw:2", ttl_seconds=60) is True
+    finally:
+        cli.close()
+        gateway.close()
 
 
 # ---------------------------------------------------------------------------
