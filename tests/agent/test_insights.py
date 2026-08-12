@@ -608,7 +608,7 @@ class TestDailySeriesAndCostBuckets:
         """subscription-included usage shows token load + at-market cost."""
         now = time.time()
         db.create_session(session_id="inc1", source="cli",
-                          model="gpt-5.5", user_id="u1")
+                          model="gpt-5.6-sol", user_id="u1")
         db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = 'inc1'", (now - 86400,))
         db.end_session("inc1", end_reason="user_exit")
         db.update_token_counts("inc1", input_tokens=1_000_000, output_tokens=500_000)
@@ -622,7 +622,30 @@ class TestDailySeriesAndCostBuckets:
         inc = report["overview"]["cost_buckets"]["included"]
         assert inc["sessions"] == 1
         assert inc["input_tokens"] == 1_000_000
-        # At-market comparison uses the same pricing table; openai-codex
-        # route prices at $0/$0 (subscription-included), so at_market_cost_usd
-        # exists and is finite (0.0 is valid — the route IS the plan).
-        assert "at_market_cost_usd" in inc
+        # Billing remains included ($0), while the comparison uses the same
+        # model's direct OpenAI list price: $5/M input + $30/M output.
+        assert inc["cost_usd"] == 0.0
+        assert inc["at_market_cost_usd"] == pytest.approx(20.0)
+
+    def test_included_bucket_market_comparison_is_unknown_without_public_price(self, db):
+        """A plan-only SKU must not fabricate a zero-dollar market value."""
+        now = time.time()
+        db.create_session(session_id="inc-unknown", source="cli",
+                          model="codex-plan-only-model", user_id="u1")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ?, billing_provider='openai-codex', "
+            "billing_mode='subscription_included' WHERE id='inc-unknown'",
+            (now - 86400,),
+        )
+        db.update_token_counts(
+            "inc-unknown", input_tokens=1_000, output_tokens=500,
+            model="codex-plan-only-model", billing_provider="openai-codex",
+            billing_mode="subscription_included", cost_status="included",
+        )
+        db._conn.commit()
+
+        included = InsightsEngine(db).generate(days=30)["overview"]["cost_buckets"]["included"]
+
+        assert included["sessions"] == 1
+        assert included["cost_usd"] == 0.0
+        assert included["at_market_cost_usd"] is None

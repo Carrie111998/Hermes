@@ -67,4 +67,44 @@ describe('normalizeUsageOverview', () => {
       sessions: 1
     })
   })
+
+  it('does not collapse missing or malformed market-equivalent evidence to zero', () => {
+    const omitted = normalizeUsageOverview({
+      ...usageOverviewFixture,
+      overview: {
+        ...usageOverviewFixture.overview,
+        cost_buckets: {
+          estimated: usageOverviewFixture.overview.cost_buckets!.estimated,
+          included: {
+            sessions: 1,
+            cost_usd: 0,
+            input_tokens: 1_000,
+            output_tokens: 500
+          },
+          unknown: usageOverviewFixture.overview.cost_buckets!.unknown
+        }
+      }
+    })
+
+    const malformed = normalizeUsageOverview({
+      ...usageOverviewFixture,
+      overview: {
+        ...usageOverviewFixture.overview,
+        cost_buckets: {
+          estimated: usageOverviewFixture.overview.cost_buckets!.estimated,
+          included: {
+            sessions: 1,
+            cost_usd: 0,
+            input_tokens: 1_000,
+            output_tokens: 500,
+            at_market_cost_usd: Number.NaN
+          },
+          unknown: usageOverviewFixture.overview.cost_buckets!.unknown
+        }
+      }
+    })
+
+    expect(omitted.totals.cost_buckets.included?.at_market_cost_usd).toBeUndefined()
+    expect(malformed.totals.cost_buckets.included?.at_market_cost_usd).toBeNull()
+  })
 })

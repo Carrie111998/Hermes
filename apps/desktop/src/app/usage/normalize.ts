@@ -55,7 +55,9 @@ function normalizeCostBucket(value: UsageCostBucket | undefined): UsageCostBucke
     cost_usd: cost,
     input_tokens: input,
     output_tokens: output,
-    ...(value.at_market_cost_usd == null ? {} : { at_market_cost_usd: numberOrZero(value.at_market_cost_usd) })
+    ...(value.at_market_cost_usd === undefined
+      ? {}
+      : { at_market_cost_usd: numberOrNull(value.at_market_cost_usd) })
   }
 }
 

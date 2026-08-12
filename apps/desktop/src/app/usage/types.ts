@@ -5,7 +5,7 @@ export type UsageCostBucket = {
   cost_usd: number
   input_tokens: number
   output_tokens: number
-  at_market_cost_usd?: number
+  at_market_cost_usd?: number | null
 }
 
 export type UsageTotals = {

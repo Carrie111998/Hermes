@@ -21,14 +21,13 @@ import sqlite3
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
-from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from agent.usage_pricing import (
     CanonicalUsage,
+    estimate_market_equivalent_cost,
     estimate_usage_cost,
     format_duration_compact,
-    get_pricing_entry,
     has_known_pricing,
 )
 
@@ -74,35 +73,27 @@ def _estimate_cost(
     return float(result.amount_usd or 0.0), result.status
 
 
-def _estimate_at_market_cost(session: Dict[str, Any]) -> float:
-    """List-price cost for a session's token load, ignoring route discounts.
+def _estimate_at_market_cost(session: Dict[str, Any]) -> Optional[float]:
+    """Published list-price comparison for an included session's token load.
 
-    Used for the ``included`` cost bucket: subscription-included routes
-    (Codex, Copilot, …) price at $0 through ``estimate_usage_cost``, which
-    is honest billing but hides what the same load would cost at published
-    list prices. This re-derives the cost from the raw pricing entry so the
-    comparison stays on the same pricing table the rest of the engine uses.
-    Returns 0.0 when the route has no list-price entry (pure plan pricing).
+    The original route remains authoritative for billed cost. This comparison
+    deliberately resolves a separate public-price route; an included OAuth
+    route's zero-price entry proves inclusion, not market value. Unknown public
+    pricing remains unavailable rather than becoming a fabricated ``0.0``.
     """
-    model = session.get("model") or ""
-    entry = get_pricing_entry(
-        model,
+    usage = CanonicalUsage(
+        input_tokens=session.get("input_tokens") or 0,
+        output_tokens=session.get("output_tokens") or 0,
+        cache_read_tokens=session.get("cache_read_tokens") or 0,
+        cache_write_tokens=session.get("cache_write_tokens") or 0,
+    )
+    result = estimate_market_equivalent_cost(
+        session.get("model") or "",
+        usage,
         provider=session.get("billing_provider"),
         base_url=session.get("billing_base_url"),
     )
-    if entry is None:
-        return 0.0
-    one_m = Decimal(1_000_000)
-    amount = Decimal(0)
-    if entry.input_cost_per_million is not None:
-        amount += Decimal(session.get("input_tokens") or 0) * entry.input_cost_per_million / one_m
-    if entry.output_cost_per_million is not None:
-        amount += Decimal(session.get("output_tokens") or 0) * entry.output_cost_per_million / one_m
-    if entry.cache_read_cost_per_million is not None:
-        amount += Decimal(session.get("cache_read_tokens") or 0) * entry.cache_read_cost_per_million / one_m
-    if entry.cache_write_cost_per_million is not None:
-        amount += Decimal(session.get("cache_write_tokens") or 0) * entry.cache_write_cost_per_million / one_m
-    return float(amount)
+    return None if result.amount_usd is None else float(result.amount_usd)
 
 
 
@@ -504,9 +495,14 @@ class InsightsEngine:
             bucket["output_tokens"] += sum(row["output_tokens"] for row in rows)
             if status == "included":
                 included_cost_sessions += 1
-                bucket["at_market_cost_usd"] += sum(
-                    _estimate_at_market_cost(row) for row in rows
-                )
+                market_values = [_estimate_at_market_cost(row) for row in rows]
+                if (
+                    bucket["at_market_cost_usd"] is None
+                    or any(value is None for value in market_values)
+                ):
+                    bucket["at_market_cost_usd"] = None
+                else:
+                    bucket["at_market_cost_usd"] += sum(market_values)
             elif status == "unknown":
                 unknown_cost_sessions += 1
 
