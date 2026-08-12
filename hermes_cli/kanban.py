@@ -1685,6 +1685,11 @@ def _cmd_show(args: argparse.Namespace) -> int:
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        # Compute graph context here while conn is still open; the
+        # diagnostics block below runs after the with-block has closed
+        # the connection (connect_closing closes on exit), so calling
+        # task_graph_context(conn, ...) there would hit a closed DB.
+        graph = kb.task_graph_context(conn, args.task_id)
 
     if getattr(args, "json", False):
         payload = {
@@ -1763,7 +1768,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     # comments / runs.
     from hermes_cli import kanban_diagnostics as kd
     diags = kd.compute_task_diagnostics(
-        task, events, runs, graph=kb.task_graph_context(conn, task.id)
+        task, events, runs, graph=graph
     )
     if diags:
         sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}

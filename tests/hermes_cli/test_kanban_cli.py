@@ -57,6 +57,30 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_run_slash_show_renders_without_closed_db_crash(kanban_home):
+    """Human-readable `show` must not crash with 'Cannot operate on a
+    closed database'. Regression for use-after-close: _cmd_show computed
+    task_graph_context() after the connect_closing() with-block had
+    already closed the connection (issue: CLI-only path, --json returned
+    before the diagnostics block)."""
+    import re
+    from hermes_cli import kanban_db as kb
+
+    out1 = kc.run_slash("create 'regression show task' --assignee patch")
+    m = re.search(r"(t_[a-f0-9]+)", out1)
+    assert m
+    tid = m.group(1)
+
+    # Human-readable path (no --json) previously hit the closed-DB crash
+    # in the diagnostics block. run_slash catches exceptions and prints
+    # them as an "error:" line, so assert no error surfaces and the task
+    # header + status still render.
+    out = kc.run_slash(f"show {tid}")
+    assert "Cannot operate on a closed database" not in out, out
+    assert "regression show task" in out, out
+    assert "ready" in out.lower(), out
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")
