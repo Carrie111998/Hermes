@@ -18,21 +18,24 @@ import hermes_cli.gateway as gateway_cli
 from hermes_cli import doctor as doctor_mod
 from hermes_cli.doctor import _has_provider_env_config
 
-# ``run_doctor`` imports ``model_tools`` lazily, and importing it runs
+# NOTE: this module deliberately does NOT `import model_tools`.
+#
+# ``run_doctor`` imports it lazily, and importing it runs
 # ``discover_builtin_tools()`` -- the whole builtin tool registry, which
 # transitively pulls in asyncio/websockets/openai and constructs the
 # module-scope ``tools.process_registry.ProcessRegistry`` singleton. Cold on
-# Windows that single import measures ~66s (`python -X importtime -c "import
-# model_tools"`), and warm it is still ~13s.
+# Windows that single import measures ~66s; warm it is ~13s, and it accounted
+# for ~20s of this file's ~31s collection time.
 #
-# It is a session-shared cost, but a lazy import inside ``run_doctor`` charges
-# all of it to whichever test happens to call ``run_doctor`` first -- which
-# pushed that one test past the repo's 30s `--timeout` cap whenever this file
-# is run on its own. Importing it here moves the cost into module collection,
-# which pytest-timeout does not cover, so no single test is billed for it.
-# Ten other test modules already import model_tools at module scope for the
-# same reason.
-import model_tools  # noqa: F401,E402
+# It used to be imported here at module scope, so that a lazy import inside
+# ``run_doctor`` could not charge the whole session-shared cost to whichever
+# test called ``run_doctor`` first (that alone blew the 30s per-test cap).
+# ``_stub_doctor_externals`` now puts a stub in ``sys.modules`` instead, so the
+# real module is never imported at all and nothing pays for it. That matters
+# for the OTHER cap: ``scripts/run_tests_parallel.py`` enforces a 300s
+# wall-clock budget per FILE, and unlike pytest-timeout it does count
+# collection -- so for that budget, moving cost into collection is not a fix,
+# only removing it is.
 
 
 def _fake_install_probe(names, entrypoints, python=None, env=None):
@@ -89,7 +92,24 @@ def _stub_doctor_externals(request, monkeypatch):
 
     Classes that deliberately exercise the real gh probe opt out by setting
     ``exercises_real_gh_probe = True`` (see ``TestGitHubTokenCheck``).
+
+    It also stubs ``model_tools`` in ``sys.modules``. ``run_doctor`` only wants
+    ``check_tool_availability``/``TOOLSET_REQUIREMENTS`` from it, behind a
+    ``try/except`` that degrades to "Could not check tool availability", and no
+    test here asserts on the real registry's contents -- the ~20 tests that
+    already care install their own stub, which still wins because a test's own
+    ``monkeypatch`` runs after this fixture. Stubbing it for everyone keeps the
+    real module out of the process entirely.
     """
+    monkeypatch.setitem(
+        sys.modules,
+        "model_tools",
+        types.SimpleNamespace(
+            check_tool_availability=lambda *a, **kw: ([], []),
+            TOOLSET_REQUIREMENTS={},
+        ),
+    )
+
     from hermes_cli import install_doctor as _install_doctor
 
     _real_section_lines = _install_doctor.doctor_section_lines
