@@ -452,6 +452,153 @@ def test_analyze_flags_finder_not_stale_when_it_lists_every_missing_name():
     assert "pip install -e . --no-deps" not in text
 
 
+class TestReinstallCommandIsDetectedNotHardcoded:
+    """The remedy must name a command that RUNS on the box that printed it.
+
+    Regression for 2026-08-12: doctor prescribed a bare
+    ``pip install -e . --no-deps`` on a uv-created ``.venv``. uv does not
+    install pip into the environments it builds, so the prescribed command
+    died on "No module named pip" — a remediation that cannot be executed.
+    Hardcoding the uv form instead would be the same defect mirrored onto
+    every pip-based venv, so the form is detected.
+    """
+
+    def test_pip_form_when_the_interpreter_has_pip(self, monkeypatch):
+        from hermes_cli import install_doctor
+
+        monkeypatch.setattr(install_doctor, "_pip_is_importable", lambda: True)
+        monkeypatch.setattr(install_doctor.sys, "executable", "/venv/bin/python")
+
+        assert install_doctor.reinstall_command() == (
+            "/venv/bin/python -m pip install -e . --no-deps"
+        )
+
+    def test_uv_form_with_explicit_python_when_pip_is_missing(self, monkeypatch):
+        from hermes_cli import install_doctor
+
+        monkeypatch.setattr(install_doctor, "_pip_is_importable", lambda: False)
+        monkeypatch.setattr(install_doctor.shutil, "which", lambda name: "/usr/bin/uv")
+        monkeypatch.setattr(install_doctor.sys, "executable", "/agent-src/.venv/bin/python")
+
+        cmd = install_doctor.reinstall_command()
+
+        assert cmd == (
+            "/usr/bin/uv pip install -e . --no-deps "
+            "--python /agent-src/.venv/bin/python"
+        )
+        # --python is not optional: without it uv resolves an environment
+        # from the cwd, which need not be the one that owns the install.
+        assert "--python /agent-src/.venv/bin/python" in cmd
+
+    def test_never_falls_back_to_a_bare_pip_on_path(self, monkeypatch):
+        """A bare `pip` is the scoop/MSIX interpreter's pip on Windows.
+
+        Running it would install into an entirely different environment,
+        which is worse than failing loudly.
+        """
+        from hermes_cli import install_doctor
+
+        monkeypatch.setattr(install_doctor, "_pip_is_importable", lambda: False)
+        monkeypatch.setattr(install_doctor.shutil, "which", lambda name: None)
+
+        cmd = install_doctor.reinstall_command()
+
+        assert not cmd.startswith("pip ")
+        assert cmd.startswith("uv pip install -e .")
+
+    def test_windows_paths_with_spaces_stay_copy_pasteable(self, monkeypatch):
+        from hermes_cli import install_doctor
+
+        monkeypatch.setattr(install_doctor, "_pip_is_importable", lambda: True)
+        monkeypatch.setattr(
+            install_doctor.sys, "executable", r"C:\Program Files\Python\python.exe"
+        )
+
+        assert install_doctor.reinstall_command() == (
+            r'"C:\Program Files\Python\python.exe" -m pip install -e . --no-deps'
+        )
+
+    def test_remedy_block_carries_the_uv_command_and_its_two_traps(self, monkeypatch):
+        from hermes_cli import install_doctor
+
+        monkeypatch.setattr(install_doctor, "_pip_is_importable", lambda: False)
+        monkeypatch.setattr(install_doctor.shutil, "which", lambda name: "/usr/bin/uv")
+        monkeypatch.setattr(install_doctor.sys, "executable", "/agent-src/.venv/bin/python")
+
+        text = "\n".join(
+            install_doctor.remedy_lines(_install_root_with({}, root=Path("/agent-src")))
+        )
+
+        assert "uv pip install -e . --no-deps --python /agent-src/.venv/bin/python" in text
+        assert "`--python` is NOT optional" in text
+        assert "bare `pip` from PATH" in text
+
+    def test_remedy_block_omits_the_uv_traps_on_a_pip_environment(self, monkeypatch):
+        from hermes_cli import install_doctor
+
+        monkeypatch.setattr(install_doctor, "_pip_is_importable", lambda: True)
+
+        text = "\n".join(install_doctor.remedy_lines(_install_root_with({})))
+
+        assert "-m pip install -e . --no-deps" in text
+        assert "--python" not in text
+        assert "no pip" not in text
+
+    def test_remedy_offers_ensurepip_when_neither_pip_nor_uv_exists(self, monkeypatch):
+        from hermes_cli import install_doctor
+
+        monkeypatch.setattr(install_doctor, "_pip_is_importable", lambda: False)
+        monkeypatch.setattr(install_doctor.shutil, "which", lambda name: None)
+
+        text = "\n".join(install_doctor.remedy_lines(_install_root_with({})))
+
+        assert "uv is not on PATH here" in text
+        assert "-m ensurepip" in text
+
+    def test_doctor_one_liner_follows_the_same_detection(self, monkeypatch, tmp_path):
+        """The summary line and the full remedy must not prescribe different tools."""
+        from hermes_cli import install_doctor
+
+        monkeypatch.setattr(install_doctor, "_pip_is_importable", lambda: False)
+        monkeypatch.setattr(install_doctor.shutil, "which", lambda name: "/usr/bin/uv")
+        monkeypatch.setattr(install_doctor.sys, "executable", "/agent-src/.venv/bin/python")
+
+        root_dir = tmp_path / "agent-src"
+        root_dir.mkdir()
+        (root_dir / "pyproject.toml").write_text(
+            '[tool.setuptools.packages.find]\ninclude = ["events", "jobflow_dispatch"]\n',
+            encoding="utf-8",
+        )
+        root = install_doctor.InstallRoot(
+            path=root_dir, provenance="test", mapping={"events": "x"}
+        )
+
+        def fake_probe(names, entrypoints, python=None):
+            return _probe_result(["events"], ["jobflow_dispatch"])
+
+        _rows, remediation = install_doctor.doctor_section_lines(
+            probe_fn=fake_probe, root=root
+        )
+
+        assert remediation is not None
+        assert (
+            "uv pip install -e . --no-deps --python /agent-src/.venv/bin/python"
+            in remediation
+        )
+        assert "run `pip install" not in remediation
+
+    def test_pip_probe_degrades_to_false_rather_than_raising(self, monkeypatch):
+        """A mangled .pth can make find_spec raise; that is 'no pip', not a crash."""
+        from hermes_cli import install_doctor
+
+        def boom(name):
+            raise ValueError("__spec__ is None")
+
+        monkeypatch.setattr(install_doctor.importlib.util, "find_spec", boom)
+
+        assert install_doctor._pip_is_importable() is False
+
+
 def test_remedy_lines_defaults_to_reinstall_when_stale_is_undetermined():
     """No mapping was parseable -> finder_is_stale is None -> reinstall is still the default."""
     from hermes_cli.install_doctor import analyze, remedy_lines
@@ -532,7 +679,16 @@ def test_doctor_section_lines_remediation_is_a_short_one_liner_when_stale(tmp_pa
     ~14 terminal lines among one-line neighbours. The remediation must stay
     a short, actionable one-liner that names the concrete next action and
     points at the standalone tool for the full text.
+
+    The bound is on the PROSE, not the raw length: the line embeds the
+    install root and — since the remedy became environment-detected — a
+    command carrying absolute interpreter/uv paths. Those are load-bearing
+    but arbitrarily long, so a raw cap would fail on a deep tmp_path while
+    saying nothing about the defect this guards. The backticked command and
+    the root path are excluded; everything else is the prose that collapsed.
     """
+    import re
+
     from hermes_cli.install_doctor import InstallRoot, doctor_section_lines
 
     root_dir = tmp_path / "agent-src"
@@ -550,7 +706,8 @@ def test_doctor_section_lines_remediation_is_a_short_one_liner_when_stale(tmp_pa
     rows, remediation = doctor_section_lines(probe_fn=fake_probe, root=root)
 
     assert remediation is not None
-    assert len(remediation) < 250
+    prose = re.sub(r"`[^`]*`", "``", remediation).replace(str(root_dir), "")
+    assert len(prose) < 250, remediation
     assert "pip install -e . --no-deps" in remediation
     assert "install_doctor" in remediation
 
