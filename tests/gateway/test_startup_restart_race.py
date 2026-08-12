@@ -20,12 +20,21 @@ from gateway.restart import (
 # It was 2s, which is a performance assertion whether or not it was meant as
 # one: on 2026-08-12 the nightly gate's 12-worker lane took
 # test_startup_aborts_when_restart_begins_during_platform_connect past it and
-# the file went red on correct code. Sized at 30s — far above any plausible
-# dilation, and still under the gate's 60s per-test cap so this fires first.
-# That ordering matters: pytest-timeout's thread method kills the whole
-# process, so letting it win would drop every other result in this file and
-# report the run as "no tests ran" rather than naming one slow await.
-STARTUP_DEADLOCK_GUARD_S = 30
+# the file went red on correct code. Sized far above any plausible dilation,
+# but BELOW the per-test cap so this fires first. That ordering matters:
+# pytest-timeout's thread method kills the whole process, so letting it win
+# would drop every other result in this file and report the run as "no tests
+# ran" rather than naming one slow await.
+#
+# There are TWO caps and the tighter one governs. This was 30s, justified
+# against "the gate's 60s cap" — the gate does pass an explicit --timeout=60,
+# but pyproject.toml addopts carry --timeout=30, which is what a plain
+# `python -m pytest tests/gateway/test_startup_restart_race.py` gets. At 30 the
+# guard TIED with pytest-timeout there, so the ordering above held under the
+# gate and inverted for anyone debugging locally — losing the whole file to
+# "no tests ran" exactly when a real hang is being investigated. 20s wins in
+# both regimes. Keep it under the SMALLER of addopts and any caller override.
+STARTUP_DEADLOCK_GUARD_S = 20
 
 
 class StartupRaceAdapter(BasePlatformAdapter):
