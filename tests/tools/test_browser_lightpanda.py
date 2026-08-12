@@ -5,6 +5,7 @@ import os
 from unittest.mock import MagicMock, patch
 
 import pytest
+from PIL import Image
 
 
 # ---------------------------------------------------------------------------
@@ -248,13 +249,113 @@ class TestLightpandaFallbackWarning:
         assert response["browser_engine_fallback"]["to"] == "chrome"
         bt._last_active_session_key.pop("warn-test", None)
 
+    def test_browser_navigate_surfaces_auto_snapshot_fallback_warning(self):
+        import json
+        import tools.browser_tool as bt
+
+        snapshot_result = bt._annotate_lightpanda_fallback(
+            {"success": True, "data": {"snapshot": "- heading \"Fallback OK\" [ref=e1]", "refs": {"e1": {}}}},
+            "Lightpanda returned an empty/too-short snapshot; retried with Chrome.",
+        )
+
+        with patch("tools.browser_tool._is_local_backend", return_value=True), \
+             patch("tools.browser_tool._get_cloud_provider", return_value=None), \
+             patch("tools.browser_tool._get_session_info", return_value={
+                 "session_name": "test", "_first_nav": False, "features": {"local": True, "proxies": True}
+             }), \
+             patch("tools.browser_tool._run_browser_command", side_effect=[
+                 {"success": True, "data": {"title": "Fallback OK", "url": "https://example.com/"}},
+                 snapshot_result,
+             ]):
+            response = json.loads(bt.browser_navigate("https://example.com", task_id="warn-test2"))
+
+        assert response["success"] is True
+        assert response["browser_engine"] == "chrome"
+        assert "Lightpanda fallback" in response["fallback_warning"]
+        assert response["element_count"] == 1
+        bt._last_active_session_key.pop("warn-test2", None)
+
+    def test_failed_fallback_warning_is_preserved_on_click_error(self):
+        import json
+        import tools.browser_tool as bt
+
+        result = bt._annotate_lightpanda_fallback(
+            {"success": False, "error": "Chrome fallback failed"},
+            "Lightpanda 'click' failed (timeout); retried with Chrome.",
+        )
+        bt._last_active_session_key["warn-test3"] = "warn-test3"
+        with patch("tools.browser_tool._run_browser_command", return_value=result):
+            response = json.loads(bt.browser_click("@e1", task_id="warn-test3"))
+
+        assert response["success"] is False
+        assert "Lightpanda fallback" in response["fallback_warning"]
+        assert response["browser_engine"] == "chrome"
+        bt._last_active_session_key.pop("warn-test3", None)
+
+
+    def test_browser_vision_lightpanda_uses_chrome_capture_and_normal_call_llm_shape(self, tmp_path):
+        import json
+        import tools.browser_tool as bt
+
+        chrome_shot = tmp_path / "chrome.png"
+        Image.new("RGB", (16, 16), color="white").save(chrome_shot, format="PNG")
+
+        class _Msg:
+            content = "Example Domain screenshot"
+
+        class _Choice:
+            message = _Msg()
+
+        class _Response:
+            choices = [_Choice()]
+
+        captured_kwargs = {}
+
+        def fake_call_llm(**kwargs):
+            captured_kwargs.update(kwargs)
+            return _Response()
+
+        with patch("tools.browser_tool._get_browser_engine", return_value="lightpanda"), \
+             patch("tools.browser_tool._should_inject_engine", return_value=True), \
+             patch("tools.browser_tool._chrome_fallback_screenshot", return_value={
+                 "success": True, "data": {"path": str(chrome_shot)}
+             }), \
+             patch("hermes_constants.get_hermes_dir", return_value=tmp_path), \
+             patch("tools.browser_tool.call_llm", side_effect=fake_call_llm):
+            response = json.loads(bt.browser_vision("what is this?", task_id="vision-test"))
+
+        assert response["success"] is True
+        assert response["analysis"] == "Example Domain screenshot"
+        assert response["browser_engine"] == "chrome"
+        assert "Lightpanda fallback" in response["fallback_warning"]
+        assert "messages" in captured_kwargs
+        assert "images" not in captured_kwargs
+        assert captured_kwargs["task"] == "vision"
+
+
+    def test_browser_get_images_preserves_fallback_warning(self):
+        import json
+        import tools.browser_tool as bt
+
+        result = bt._annotate_lightpanda_fallback(
+            {"success": True, "data": {"result": "[]"}},
+            "Lightpanda 'eval' failed (timeout); retried with Chrome.",
+        )
+        bt._last_active_session_key["warn-images"] = "warn-images"
+        with patch("tools.browser_tool._run_browser_command", return_value=result):
+            response = json.loads(bt.browser_get_images(task_id="warn-images"))
+
+        assert response["success"] is True
+        assert response["browser_engine"] == "chrome"
+        assert "Lightpanda fallback" in response["fallback_warning"]
+        bt._last_active_session_key.pop("warn-images", None)
 
     def test_browser_vision_lightpanda_response_has_structured_fallback(self, tmp_path):
         import json
         import tools.browser_tool as bt
 
         chrome_shot = tmp_path / "chrome-structured.png"
-        chrome_shot.write_bytes(b"\x89PNG" + b"0" * 128)
+        Image.new("RGB", (16, 16), color="white").save(chrome_shot, format="PNG")
 
         class _Msg:
             content = "Example Domain screenshot"

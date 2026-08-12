@@ -4945,8 +4945,11 @@ def set_config_value(key: str, value: str, force: bool = False):
     user_config = {}
     if config_path.exists():
         try:
+            from ruamel.yaml import YAML
+
+            yaml_rt = YAML(typ="rt")
             with open(config_path, encoding="utf-8") as f:
-                user_config = fast_safe_load(f) or {}
+                user_config = yaml_rt.load(f) or {}
         except Exception as exc:
             print(
                 f"✗ Cannot parse {config_path}: {exc}\n"
@@ -4966,7 +4969,15 @@ def set_config_value(key: str, value: str, force: bool = False):
     # such as approvals.mode="off" must not become YAML booleans.  Unknown keys
     # retain the historical best-effort coercion behavior.
     coerced_value: Any = value
-    if not isinstance(_default_value_for_key(key), str):
+    # ``agent.verify_on_stop`` is tri-state: the default string sentinel
+    # ``auto`` plus explicit boolean overrides.  Treating every value as a
+    # string because the default is ``auto`` writes ``"true"``/``"false"``
+    # instead of the documented YAML booleans.
+    if key == "agent.verify_on_stop" and value.lower() in {
+        "true", "yes", "on", "false", "no", "off"
+    }:
+        coerced_value = value.lower() in {"true", "yes", "on"}
+    elif not isinstance(_default_value_for_key(key), str):
         if value.lower() in {'true', 'yes', 'on'}:
             coerced_value = True
         elif value.lower() in {'false', 'no', 'off'}:
@@ -4977,6 +4988,13 @@ def set_config_value(key: str, value: str, force: bool = False):
             coerced_value = float(value)
 
     value = coerced_value
+    # Simple mapping paths can use the surgical round-trip writer below. Paths
+    # that navigate a list, or require a structural normalization, must persist
+    # the reconciled full document instead.
+    _requires_full_document_write = any(
+        segment.isdigit() for segment in key.split(".")
+    )
+
     # Normalize a scalar ``model`` key before writing sub-keys so that
     # ``hermes config set model.provider openai`` doesn't silently
     # destroy the model id when ``model`` is a bare string shorthand
@@ -4987,6 +5005,7 @@ def set_config_value(key: str, value: str, force: bool = False):
         _model_val = user_config.get("model")
         if isinstance(_model_val, str) and _model_val:
             user_config["model"] = {"default": _model_val}
+            _requires_full_document_write = True
     # Guard against #74995: a single-segment key that names an existing
     # mapping would silently overwrite the entire section with a scalar
     # (e.g. ``hermes config set model gpt-5.6-sol`` when model already
@@ -5053,11 +5072,19 @@ def set_config_value(key: str, value: str, force: bool = False):
     if _alias_norm in ("model.api_base", "api_base"):
         user_config = _normalize_root_model_keys(user_config)
         key = "model.base_url"
+        _requires_full_document_write = True
         print("  (note: 'api_base' is an alias — saved as model.base_url)")
-    # Write only user config back (not the full merged defaults)
+    # Write only user config back (not the full merged defaults), while
+    # preserving comments, ordering, quoting, and unrelated user-edited bytes.
     ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
+    if _requires_full_document_write:
+        from utils import atomic_roundtrip_yaml_save
+
+        atomic_roundtrip_yaml_save(config_path, user_config)
+    else:
+        from utils import atomic_roundtrip_yaml_update
+
+        atomic_roundtrip_yaml_update(config_path, key, value)
     
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.

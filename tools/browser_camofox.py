@@ -31,6 +31,7 @@ import logging
 import os
 import threading
 import uuid
+from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
@@ -837,6 +838,7 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
 
 
 def camofox_vision(question: str, annotate: bool = False,
+                   full_page: bool = False,
                    task_id: Optional[str] = None) -> str:
     """Take a screenshot and analyze it with vision AI via Camofox."""
     try:
@@ -851,7 +853,10 @@ def camofox_vision(question: str, annotate: bool = False,
         # Get screenshot as binary PNG
         resp = _get_raw(
             f"/tabs/{session['tab_id']}/screenshot",
-            params={"userId": session["user_id"]},
+            params={
+                "userId": session["user_id"],
+                "fullPage": "true" if full_page else "false",
+            },
         )
 
         # Save screenshot to cache
@@ -863,8 +868,24 @@ def camofox_vision(question: str, annotate: bool = False,
         with open(screenshot_path, "wb") as f:
             f.write(resp.content)
 
-        # Encode for vision LLM
-        img_b64 = base64.b64encode(resp.content).decode("utf-8")
+        # Bound and independently validate the model-bound image. The original
+        # screenshot remains on disk even if safe attachment is impossible.
+        from tools.vision_tools import _bounded_browser_screenshot_data_url
+
+        image_data_url = _bounded_browser_screenshot_data_url(
+            Path(screenshot_path), mime_type="image/png"
+        )
+        if image_data_url is None:
+            return json.dumps({
+                "success": False,
+                "code": "browser_vision_attachment_unbounded",
+                "error": (
+                    "Screenshot was retained locally but could not be bounded "
+                    "safely for model context. Use the screenshot_path locally "
+                    "or capture a smaller viewport."
+                ),
+                "screenshot_path": screenshot_path,
+            })
 
         # Also get annotated snapshot if requested
         annotation_context = ""
@@ -909,7 +930,7 @@ def camofox_vision(question: str, annotate: bool = False,
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": f"data:image/png;base64,{img_b64}",
+                            "url": image_data_url,
                         },
                     },
                 ],

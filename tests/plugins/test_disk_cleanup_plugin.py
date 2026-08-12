@@ -15,6 +15,7 @@ Covers the bundled plugin at ``plugins/disk-cleanup/``:
 import importlib
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -114,6 +115,40 @@ class TestGuessCategory:
         p.write_text("x")
         # Even though it matches test_* pattern, logs/ is excluded.
         assert dg.guess_category(p) is None
+
+    def test_mcp_server_tests_are_durable_source(self, _isolate_env):
+        dg = _load_lib()
+        p = _isolate_env / "mcp-servers" / "cmux" / "test_cmux_mcp.py"
+        p.parent.mkdir(parents=True)
+        p.write_text("x")
+        assert dg.guess_category(p) is None
+
+    def test_profile_tests_are_durable_source(self, _isolate_env):
+        dg = _load_lib()
+        p = _isolate_env / "profiles" / "bot" / "src" / "test_router.py"
+        p.parent.mkdir(parents=True)
+        p.write_text("x")
+        assert dg.guess_category(p) is None
+
+    def test_tests_inside_git_checkout_are_durable_source(self, _isolate_env):
+        dg = _load_lib()
+        repo = _isolate_env / "workspace" / "project"
+        (repo / ".git").mkdir(parents=True)
+        p = repo / "tests" / "test_feature.py"
+        p.parent.mkdir()
+        p.write_text("x")
+        assert dg.guess_category(p) is None
+
+    def test_tests_inside_tmp_hermes_git_checkout_are_durable_source(self, _isolate_env):
+        dg = _load_lib()
+        with tempfile.TemporaryDirectory(prefix="hermes-cleanup-git-", dir="/tmp") as root:
+            repo = Path(root) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            p = repo / "tests" / "test_feature.py"
+            p.parent.mkdir()
+            p.write_text("x")
+            assert dg.is_safe_path(p) is True
+            assert dg.guess_category(p) is None
 
     def test_cron_subtree_categorised(self, _isolate_env):
         dg = _load_lib()
@@ -223,6 +258,53 @@ class TestStaleCronEntryMigration:
         summary = dg.quick()
         assert summary["deleted"] == 1, "valid old cron-output should be deleted"
         assert not run_md.exists()
+
+
+class TestStaleDurableTestMigration:
+    def test_quick_preserves_stale_mcp_server_test_entry(self, _isolate_env):
+        dg = _load_lib()
+        test_file = _isolate_env / "mcp-servers" / "cmux" / "test_cmux_mcp.py"
+        test_file.parent.mkdir(parents=True)
+        test_file.write_text("durable")
+
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True)
+        tracked_file.write_text(json.dumps([{
+            "path": str(test_file),
+            "category": "test",
+            "timestamp": "2025-01-01T00:00:00+00:00",
+            "size": test_file.stat().st_size,
+        }]))
+
+        summary = dg.quick()
+        assert summary["deleted"] == 0
+        assert test_file.read_text() == "durable"
+        assert json.loads(tracked_file.read_text()) == []
+
+    def test_quick_preserves_stale_tmp_git_test_entry(self, _isolate_env):
+        dg = _load_lib()
+        with tempfile.TemporaryDirectory(prefix="hermes-cleanup-git-", dir="/tmp") as root:
+            repo = Path(root) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            test_file = repo / "tests" / "test_feature.py"
+            test_file.parent.mkdir()
+            test_file.write_text("durable")
+
+            tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+            tracked_file.parent.mkdir(parents=True)
+            tracked_file.write_text(json.dumps([{
+                "path": str(test_file),
+                "category": "test",
+                "timestamp": "2025-01-01T00:00:00+00:00",
+                "size": test_file.stat().st_size,
+            }]))
+
+            _, auto = dg.dry_run()
+            assert auto == []
+            summary = dg.quick()
+            assert summary["deleted"] == 0
+            assert test_file.read_text() == "durable"
+            assert json.loads(tracked_file.read_text()) == []
 
 
 class TestTrackForgetQuick:

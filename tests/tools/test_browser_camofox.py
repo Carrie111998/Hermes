@@ -293,6 +293,10 @@ class TestCamofoxVisionConfig:
 
         with (
             patch("tools.browser_camofox.open", create=True) as mock_open,
+            patch(
+                "tools.vision_tools._bounded_browser_screenshot_data_url",
+                return_value="data:image/png;base64,dmFsaWQ=",
+            ),
             patch("agent.auxiliary_client.call_llm", return_value=mock_response) as mock_llm,
             patch("tools.browser_camofox.load_config", return_value={"auxiliary": {"vision": {"temperature": 1, "timeout": 45}}}),
         ):
@@ -325,6 +329,10 @@ class TestCamofoxVisionConfig:
 
         with (
             patch("tools.browser_camofox.open", create=True) as mock_open,
+            patch(
+                "tools.vision_tools._bounded_browser_screenshot_data_url",
+                return_value="data:image/png;base64,dmFsaWQ=",
+            ),
             patch("agent.auxiliary_client.call_llm", return_value=mock_response) as mock_llm,
             patch("tools.browser_camofox.load_config", return_value={"auxiliary": {"vision": {}}}),
         ):

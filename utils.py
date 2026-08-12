@@ -1,5 +1,6 @@
 """Shared utility functions for hermes-agent."""
 
+import difflib
 import errno
 import json
 import logging
@@ -7,6 +8,7 @@ import os
 import shutil
 import stat
 import tempfile
+from io import StringIO
 from pathlib import Path
 from typing import Any, Union
 from urllib.parse import urlparse
@@ -43,8 +45,8 @@ def _preserve_file_mode(path: Path) -> "int | None":
         return None
 
 
-def _preserve_file_owner(path: Path) -> "tuple[int, int] | None":
-    """Capture the owning uid/gid of *path* if the platform supports it."""
+def _current_file_owner(path: Path) -> "tuple[int, int] | None":
+    """Read the owning uid/gid of *path* if the platform supports it."""
     if os.name != "posix":
         return None
     try:
@@ -52,6 +54,36 @@ def _preserve_file_owner(path: Path) -> "tuple[int, int] | None":
     except OSError:
         return None
     return st.st_uid, st.st_gid
+
+
+def _preserve_file_owner(path: Path) -> "tuple[int, int] | None":
+    """Capture the owner that a completed atomic write must restore."""
+    return _current_file_owner(path)
+
+
+def _preown_file(
+    fd: int,
+    owner: "tuple[int, int] | None",
+    fallback_owner: "tuple[int, int] | None" = None,
+) -> bool:
+    if owner is None:
+        return True
+    if not hasattr(os, "fchown"):
+        return False
+    temp_stat = os.fstat(fd)
+    if (temp_stat.st_uid, temp_stat.st_gid) == owner:
+        return True
+    try:
+        os.fchown(fd, *owner)
+    except OSError:
+        temp_stat = os.fstat(fd)
+        temp_owner = (temp_stat.st_uid, temp_stat.st_gid)
+        if temp_owner == owner:
+            return True
+        if temp_owner != fallback_owner:
+            raise
+        return False
+    return True
 
 
 def _restore_file_owner(path: Path, owner: "tuple[int, int] | None") -> None:
@@ -413,6 +445,131 @@ def atomic_yaml_write(
         raise
 
 
+def _quote_yaml11_ambiguous_scalar(value: Any) -> Any:
+    """Keep ruamel YAML 1.2 output type-stable for PyYAML 1.1 readers."""
+    if isinstance(value, str):
+        try:
+            loaded = yaml.safe_load(value)
+        except yaml.YAMLError:
+            loaded = None
+        if isinstance(loaded, str) and loaded == value:
+            return value
+        from ruamel.yaml.scalarstring import DoubleQuotedScalarString
+
+        return DoubleQuotedScalarString(value)
+    return value
+
+
+def _safe_mapping_key(dst: Any, key: Any) -> Any:
+    """Replace an equal plain YAML key with its YAML-1.1-safe scalar object."""
+    safe_key = _quote_yaml11_ambiguous_scalar(key)
+    for index, existing_key in enumerate(dst):
+        if existing_key != safe_key:
+            continue
+        if type(existing_key) is type(safe_key):
+            return existing_key
+        existing_value = dst[existing_key]
+        comment = dst.ca.items.pop(existing_key, None)
+        del dst[existing_key]
+        dst.insert(index, safe_key, existing_value)
+        if comment is not None:
+            dst.ca.items[safe_key] = comment
+        return safe_key
+    return safe_key
+
+
+def _split_text_lines(text: str) -> list[tuple[str, str]]:
+    """Return each physical line with its exact line-ending bytes as text."""
+    result: list[tuple[str, str]] = []
+    for line in text.splitlines(keepends=True):
+        if line.endswith("\r\n"):
+            result.append((line[:-2], "\r\n"))
+        elif line.endswith(("\n", "\r")):
+            result.append((line[:-1], line[-1:]))
+        else:
+            result.append((line, ""))
+    return result
+
+
+def _render_roundtrip_yaml_bytes(
+    yaml_rt: Any,
+    data: Any,
+    source_text: str | None,
+) -> bytes:
+    """Render YAML while retaining each unchanged source line's terminator."""
+    rendered_stream = StringIO()
+    yaml_rt.dump(data, rendered_stream)
+    rendered = rendered_stream.getvalue()
+    if source_text is None:
+        return rendered.encode("utf-8")
+
+    has_bom = source_text.startswith("\ufeff")
+    if has_bom:
+        source_text = source_text[1:]
+    source_lines = _split_text_lines(source_text)
+    rendered_lines = _split_text_lines(rendered)
+    endings = [ending for _content, ending in source_lines if ending]
+    dominant = max(dict.fromkeys(endings), key=endings.count) if endings else "\n"
+    selected: list[str | None] = [None] * len(rendered_lines)
+    original_content: list[str | None] = [None] * len(rendered_lines)
+
+    def _identity(content: str) -> str:
+        stripped = content.lstrip(" ")
+        return stripped if stripped.startswith("- ") else content
+
+    def _head(content: str) -> str | None:
+        stripped = content.lstrip(" ").removeprefix("- ")
+        return stripped.split(":", 1)[0] if ":" in stripped else None
+
+    def _with_source_indent(source: str, rendered: str) -> str | None:
+        if _head(source) is None or _head(source) != _head(rendered):
+            return None
+        indent = source[: len(source) - len(source.lstrip(" "))]
+        return indent + rendered.lstrip(" ")
+
+    matcher = difflib.SequenceMatcher(
+        a=[_identity(content) for content, _ending in source_lines],
+        b=[_identity(content) for content, _ending in rendered_lines],
+        autojunk=False,
+    )
+    for tag, source_start, source_end, rendered_start, rendered_end in matcher.get_opcodes():
+        source_span = source_lines[source_start:source_end]
+        if tag == "equal":
+            for offset in range(rendered_end - rendered_start):
+                selected[rendered_start + offset] = source_span[offset][1]
+                original_content[rendered_start + offset] = source_span[offset][0]
+            continue
+        for offset in range(rendered_end - rendered_start):
+            rendered_index = rendered_start + offset
+            if source_span:
+                source_line = source_span[min(offset, len(source_span) - 1)]
+                ending = source_line[1]
+                original_content[rendered_index] = _with_source_indent(
+                    source_line[0], rendered_lines[rendered_index][0]
+                )
+            elif source_start > 0:
+                ending = source_lines[source_start - 1][1]
+            elif source_start < len(source_lines):
+                ending = source_lines[source_start][1]
+            else:
+                ending = dominant
+            selected[rendered_index] = ending
+
+    output: list[str] = []
+    for index, (content, _rendered_ending) in enumerate(rendered_lines):
+        ending = selected[index]
+        if ending is None:
+            ending = dominant
+        if not ending and index < len(rendered_lines) - 1:
+            ending = dominant
+        preserved_content = original_content[index]
+        if preserved_content is not None:
+            content = preserved_content
+        output.append(content + ending)
+    encoded = "".join(output).encode("utf-8")
+    return (b"\xef\xbb\xbf" + encoded) if has_bom else encoded
+
+
 def atomic_roundtrip_yaml_update(
     path: Union[str, Path],
     key_path: str,
@@ -437,9 +594,11 @@ def atomic_roundtrip_yaml_update(
     yaml_rt.default_flow_style = False
     yaml_rt.indent(mapping=2, sequence=4, offset=2)
 
+    source_text: str | None = None
     if path.exists():
-        with path.open("r", encoding="utf-8") as f:
-            config = yaml_rt.load(f) or CommentedMap()
+        source_text = path.read_bytes().decode("utf-8")
+        normalized_source = source_text.replace("\r\n", "\n").replace("\r", "\n")
+        config = yaml_rt.load(normalized_source) or CommentedMap()
     else:
         config = CommentedMap()
 
@@ -449,29 +608,42 @@ def atomic_roundtrip_yaml_update(
     current = config
     keys = key_path.split(".")
     for key in keys[:-1]:
-        next_value = current.get(key)
+        safe_key = _safe_mapping_key(current, key)
+        next_value = current.get(safe_key)
         if not isinstance(next_value, CommentedMap):
             next_value = CommentedMap()
-            current[key] = next_value
+            current[safe_key] = next_value
         current = next_value
-    current[keys[-1]] = value
+    final_key = _safe_mapping_key(current, keys[-1])
+    current[final_key] = _quote_yaml11_ambiguous_scalar(value)
 
     original_mode = _preserve_file_mode(path)
     original_owner = _preserve_file_owner(path)
+    fallback_owner = _current_file_owner(path)
     fd, tmp_path = tempfile.mkstemp(
         dir=str(path.parent),
         prefix=f".{path.stem}_",
         suffix=".tmp",
     )
+    owner_prepared = original_owner is None
+    mode_prepared = original_mode is None
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            yaml_rt.dump(config, f)
+        with os.fdopen(fd, "wb") as f:
+            owner_prepared = _preown_file(
+                f.fileno(), original_owner, fallback_owner
+            )
+            f.write(_render_roundtrip_yaml_bytes(yaml_rt, config, source_text))
             f.flush()
+            if original_mode is not None and hasattr(os, "fchmod"):
+                os.fchmod(f.fileno(), original_mode)
+                mode_prepared = True
             os.fsync(f.fileno())
         real_path = atomic_replace(tmp_path, path)
         real_path_obj = Path(real_path)
-        _restore_file_owner(real_path_obj, original_owner)
-        _restore_file_mode(real_path_obj, original_mode)
+        if not owner_prepared:
+            _restore_file_owner(real_path_obj, original_owner)
+        if not mode_prepared:
+            _restore_file_mode(real_path_obj, original_mode)
     except BaseException:
         try:
             os.unlink(tmp_path)
@@ -515,8 +687,6 @@ def atomic_roundtrip_yaml_save(
     """
     from ruamel.yaml import YAML
     from ruamel.yaml.comments import CommentedMap
-    from ruamel.yaml.scalarstring import DoubleQuotedScalarString
-
     from hermes_cli.config import require_readable_config_before_write
 
     path = Path(path)
@@ -529,9 +699,11 @@ def atomic_roundtrip_yaml_save(
     yaml_rt.default_flow_style = False
     yaml_rt.indent(mapping=2, sequence=4, offset=2)
 
+    source_text: str | None = None
     if path.exists():
-        with path.open("r", encoding="utf-8") as f:
-            existing = yaml_rt.load(f)
+        source_text = path.read_bytes().decode("utf-8")
+        normalized_source = source_text.replace("\r\n", "\n").replace("\r", "\n")
+        existing = yaml_rt.load(normalized_source)
         if not isinstance(existing, CommentedMap):
             existing = CommentedMap(existing or {})
     else:
@@ -546,26 +718,57 @@ def atomic_roundtrip_yaml_save(
     # `approvals.mode: off` silently round-trips back as `False` under
     # yaml.safe_load. Force-quote any new string value that YAML 1.1 would
     # otherwise misparse as bool/null.
-    _YAML11_AMBIGUOUS_WORDS = {
-        "y", "n", "yes", "no", "true", "false", "on", "off", "null", "~",
-    }
+    def _yaml11_safe_value(value: Any) -> Any:
+        if isinstance(value, list):
+            return [_yaml11_safe_value(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                _quote_yaml11_ambiguous_scalar(key): _yaml11_safe_value(item)
+                for key, item in value.items()
+            }
+        return _quote_yaml11_ambiguous_scalar(value)
 
-    def _quote_if_yaml11_ambiguous(value):
-        if isinstance(value, str) and value.lower() in _YAML11_AMBIGUOUS_WORDS:
-            return DoubleQuotedScalarString(value)
-        return value
+    def _same_yaml_value(left: Any, right: Any) -> bool:
+        if isinstance(left, bool) or isinstance(right, bool):
+            return isinstance(left, bool) and isinstance(right, bool) and left == right
+        if isinstance(left, str) and isinstance(right, str):
+            return left == right
+        if isinstance(left, int) and isinstance(right, int):
+            return left == right
+        if isinstance(left, float) and isinstance(right, float):
+            return left == right
+        return type(left) is type(right) and left == right
+
+    def _merge_sequence(dst: list, src: list) -> None:
+        for index, value in enumerate(src):
+            if index >= len(dst):
+                dst.append(_yaml11_safe_value(value))
+                continue
+            current = dst[index]
+            if isinstance(value, dict) and isinstance(current, CommentedMap):
+                _merge(current, value)
+            elif isinstance(value, list) and isinstance(current, list):
+                _merge_sequence(current, value)
+            elif not _same_yaml_value(current, value):
+                dst[index] = _yaml11_safe_value(value)
+        del dst[len(src) :]
 
     def _merge(dst: CommentedMap, src: dict) -> None:
         # Update / recurse into keys present in src.
         for key, value in src.items():
+            safe_key = _safe_mapping_key(dst, key)
+            current = dst.get(safe_key)
             if isinstance(value, dict):
-                current = dst.get(key)
                 if not isinstance(current, CommentedMap):
                     current = CommentedMap()
-                    dst[key] = current
+                    dst[safe_key] = current
                 _merge(current, value)
+            elif isinstance(value, list) and isinstance(current, list):
+                _merge_sequence(current, value)
             else:
-                dst[key] = _quote_if_yaml11_ambiguous(value)
+                if safe_key in dst and _same_yaml_value(current, value):
+                    continue
+                dst[safe_key] = _yaml11_safe_value(value)
         # Delete keys missing from src — preserves "explicit absence" semantics
         # of the old _save_cfg(cfg) pattern (e.g. cfg.pop("custom_prompt", None)
         # then _save_cfg must actually remove the key from disk).
@@ -576,20 +779,31 @@ def atomic_roundtrip_yaml_save(
 
     original_mode = _preserve_file_mode(path)
     original_owner = _preserve_file_owner(path)
+    fallback_owner = _current_file_owner(path)
     fd, tmp_path = tempfile.mkstemp(
         dir=str(path.parent),
         prefix=f".{path.stem}_",
         suffix=".tmp",
     )
+    owner_prepared = original_owner is None
+    mode_prepared = original_mode is None
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            yaml_rt.dump(existing, f)
+        with os.fdopen(fd, "wb") as f:
+            owner_prepared = _preown_file(
+                f.fileno(), original_owner, fallback_owner
+            )
+            f.write(_render_roundtrip_yaml_bytes(yaml_rt, existing, source_text))
             f.flush()
+            if original_mode is not None and hasattr(os, "fchmod"):
+                os.fchmod(f.fileno(), original_mode)
+                mode_prepared = True
             os.fsync(f.fileno())
         real_path = atomic_replace(tmp_path, path)
         real_path_obj = Path(real_path)
-        _restore_file_owner(real_path_obj, original_owner)
-        _restore_file_mode(real_path_obj, original_mode)
+        if not owner_prepared:
+            _restore_file_owner(real_path_obj, original_owner)
+        if not mode_prepared:
+            _restore_file_mode(real_path_obj, original_mode)
     except BaseException:
         try:
             os.unlink(tmp_path)

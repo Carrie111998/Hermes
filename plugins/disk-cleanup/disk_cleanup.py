@@ -158,6 +158,11 @@ _EMPTY_DIR_SWEEP_PRUNE_DIRS = frozenset({
     "site-packages", "__pycache__",
 })
 
+_AUTO_TRACK_PROTECTED_TOP_LEVEL = frozenset({
+    ".worktrees", "backups", "hermes-agent", "mcp-servers",
+    "optional-skills", "profiles",
+})
+
 
 # Paths under $HERMES_HOME that must NEVER be deleted by quick(),
 # regardless of what the stored category says.  This is a defense-in-depth
@@ -272,6 +277,10 @@ def dry_run() -> Tuple[List[Dict], List[Dict]]:
         cat = item["category"]
         size = item["size"]
 
+        # Re-validate stale test entries before presenting them as disposable.
+        if cat == "test" and guess_category(p) != "test":
+            continue
+
         # Re-validate stale "cron-output" entries (fixes #37721).
         if cat == "cron-output":
             re_cat = guess_category(p)
@@ -322,6 +331,12 @@ def quick() -> Dict[str, Any]:
             continue
 
         age = (now - datetime.fromisoformat(item["timestamp"])).days
+
+        # A path may have been tracked before it became durable source (or
+        # before a newer classifier learned to protect its source tree).
+        if cat == "test" and guess_category(p) != "test":
+            _log(f"SKIP stale test entry: {p} (now protected source)")
+            continue
 
         # ---- stale-state migration (fixes #37721) ----
         # Old tracked.json entries may carry a "cron-output" category for
@@ -564,12 +579,30 @@ _TEST_PATTERNS = ("test_", "tmp_")
 _TEST_SUFFIXES = (".test.py", ".test.js", ".test.ts", ".test.md")
 
 
+def _is_inside_git_checkout(path: Path) -> bool:
+    """Return True when *path* belongs to a Git checkout.
+
+    Ordinary repositories use a ``.git/`` directory; linked worktrees use a
+    ``.git`` file. Both are durable source and must never be auto-cleaned.
+    """
+    current = path if path.is_dir() else path.parent
+
+    while True:
+        if (current / ".git").exists():
+            return True
+        if current.parent == current:
+            return False
+        current = current.parent
+
+
 def guess_category(path: Path) -> Optional[str]:
     """Return a category label for *path*, or None if we shouldn't track it.
 
     Used by the ``post_tool_call`` hook to auto-track ephemeral files.
     """
     if not is_safe_path(path):
+        return None
+    if _is_inside_git_checkout(path.resolve()):
         return None
 
     # Skip the state dir itself, logs, memory files, sessions, config.
@@ -586,7 +619,7 @@ def guess_category(path: Path) -> Optional[str]:
             # tmp_* (#75403, also #32164, #37721).
             "patches", "projects", "skins", "themes", "contributors",
             "profiles", "backups", "optional-skills",
-        }:
+        } or top in _AUTO_TRACK_PROTECTED_TOP_LEVEL:
             return None
         if top == "cron" or top == "cronjobs":
             # Only files under the disposable ``output/`` subtree are

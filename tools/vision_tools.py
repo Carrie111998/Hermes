@@ -649,6 +649,11 @@ _EMBED_MAX_DIMENSION = 7900
 # rejects an image, we downscale to this target and retry once.
 _RESIZE_TARGET_BYTES = 5 * 1024 * 1024
 
+# Browser screenshots are retained in conversation tool results, so their
+# context budget must be substantially lower than the provider's upload cap.
+_BROWSER_SCREENSHOT_DATA_URL_LIMIT = 2 * 1024 * 1024
+_BROWSER_SCREENSHOT_MAX_DIMENSION = 4096
+
 
 def _is_image_size_error(error: Exception) -> bool:
     """Detect if an API error is related to image or payload size."""
@@ -950,6 +955,50 @@ def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
 
     # Shouldn't reach here, but fall back to full encode
     return data_url or _image_to_base64_data_url(image_path, mime_type=mime_type)
+
+
+def _bounded_browser_screenshot_data_url(
+    image_path: Path, mime_type: str = "image/png"
+) -> Optional[str]:
+    """Return a validated bounded screenshot data URL, or ``None``.
+
+    Resizing is best-effort, so callers must not trust its return value. This
+    helper independently verifies both the encoded byte budget and decoded
+    pixel dimensions and fails closed when decoding or validation is not
+    possible.
+    """
+    data_url = _image_to_base64_data_url(image_path, mime_type=mime_type)
+    if (
+        len(data_url) > _BROWSER_SCREENSHOT_DATA_URL_LIMIT
+        or _image_exceeds_dimension(image_path, _BROWSER_SCREENSHOT_MAX_DIMENSION)
+    ):
+        data_url = _resize_image_for_vision(
+            image_path,
+            mime_type=mime_type,
+            max_base64_bytes=_BROWSER_SCREENSHOT_DATA_URL_LIMIT,
+            max_dimension=_BROWSER_SCREENSHOT_MAX_DIMENSION,
+        )
+
+    if not isinstance(data_url, str) or len(data_url) > _BROWSER_SCREENSHOT_DATA_URL_LIMIT:
+        return None
+
+    try:
+        import io as _io
+        from PIL import Image as _PILImage
+
+        _header, encoded = data_url.split(",", 1)
+        if ";base64" not in _header:
+            return None
+        decoded = base64.b64decode(encoded, validate=True)
+        with _PILImage.open(_io.BytesIO(decoded)) as image:
+            if max(image.size) > _BROWSER_SCREENSHOT_MAX_DIMENSION:
+                return None
+            image.verify()
+    except Exception as exc:
+        logger.warning("Browser screenshot bound validation failed: %s", exc)
+        return None
+
+    return data_url
 
 
 # ---------------------------------------------------------------------------

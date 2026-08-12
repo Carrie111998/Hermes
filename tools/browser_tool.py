@@ -2094,7 +2094,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_vision",
-        "description": "Take a screenshot of the current page so you can inspect it visually. Use this when you need to understand what the page looks like - especially for CAPTCHAs, visual verification challenges, complex layouts, or cases where the text snapshot misses important visual information. When your active model has native vision, the screenshot is attached to your context directly and you inspect it on the next turn; otherwise Hermes falls back to an auxiliary vision model and returns a text analysis. Includes a screenshot_path that you can share with the user by including MEDIA:<screenshot_path> in your response. Requires browser_navigate to be called first.",
+        "description": "Take a bounded viewport screenshot of the current page so you can inspect it visually. Use full_page only when the entire document is essential; full-page captures can be large. When your active model has native vision, a size-bounded attachment is added to the next turn; otherwise Hermes uses the auxiliary vision model. Includes a screenshot_path for sharing via MEDIA:<screenshot_path>. Requires browser_navigate first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -2106,6 +2106,11 @@ BROWSER_TOOL_SCHEMAS = [
                     "type": "boolean",
                     "default": False,
                     "description": "If true, overlay numbered [N] labels on interactive elements. Each [N] maps to ref @eN for subsequent browser commands. Useful for QA and spatial reasoning about page layout."
+                },
+                "full_page": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "If true, capture the full document instead of the visible viewport. Large captures are downscaled before attachment."
                 }
             },
             "required": ["question"]
@@ -4203,7 +4208,12 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
-def browser_vision(question: str, annotate: bool = False, task_id: Optional[str] = None) -> Union[str, Dict[str, Any]]:
+def browser_vision(
+    question: str,
+    annotate: bool = False,
+    full_page: bool = False,
+    task_id: Optional[str] = None,
+) -> Union[str, Dict[str, Any]]:
     """
     Take a screenshot of the current page for visual inspection.
 
@@ -4220,6 +4230,9 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     Args:
         question: What you want to know about the page visually
         annotate: If True, overlay numbered [N] labels on interactive elements
+        full_page: If True, capture the full document; otherwise capture only
+            the visible viewport. Oversized captures are downscaled before they
+            are attached to model context.
         task_id: Task identifier for session isolation
 
     Returns:
@@ -4228,7 +4241,12 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     """
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_vision
-        return camofox_vision(question, annotate, task_id)
+        return camofox_vision(
+            question,
+            annotate=annotate,
+            full_page=full_page,
+            task_id=task_id,
+        )
 
     import base64
     import uuid as uuid_mod
@@ -4281,6 +4299,8 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         screenshot_args = []
         if annotate:
             screenshot_args.append("--annotate")
+        if full_page:
+            screenshot_args.append("--full")
         fb_result = _chrome_fallback_screenshot(
             effective_task_id, screenshot_args, _get_command_timeout(),
         )
@@ -4336,7 +4356,8 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
             screenshot_args = []
             if annotate:
                 screenshot_args.append("--annotate")
-            screenshot_args.append("--full")
+            if full_page:
+                screenshot_args.append("--full")
             screenshot_args.append(str(screenshot_path))
             result = _run_browser_command(
                 effective_task_id,
@@ -4375,10 +4396,27 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                 ),
             }, ensure_ascii=False)
 
-        # Convert screenshot to base64 at full resolution.
+        # Keep the original screenshot on disk for user sharing, but bound the
+        # model attachment proactively. Waiting for a provider size rejection
+        # is too late for native-vision routes: a multi-megabyte full-page PNG
+        # would already be retained in the next request and every retry.
         _screenshot_bytes = screenshot_path.read_bytes()
-        _screenshot_b64 = base64.b64encode(_screenshot_bytes).decode("ascii")
-        data_url = f"data:image/png;base64,{_screenshot_b64}"
+        from tools.vision_tools import _bounded_browser_screenshot_data_url
+
+        data_url = _bounded_browser_screenshot_data_url(
+            screenshot_path, mime_type="image/png"
+        )
+        if data_url is None:
+            return json.dumps({
+                "success": False,
+                "code": "browser_vision_attachment_unbounded",
+                "error": (
+                    "Screenshot was retained locally but could not be bounded "
+                    "safely for model context. Use the screenshot_path locally "
+                    "or capture a smaller viewport."
+                ),
+                "screenshot_path": str(screenshot_path),
+            }, ensure_ascii=False)
 
         # Fast path: when native image routing is in effect for the active main
         # model, attach the screenshot directly instead of describing it through
@@ -5126,7 +5164,12 @@ registry.register(
     name="browser_vision",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_vision"],
-    handler=lambda args, **kw: browser_vision(question=args.get("question", ""), annotate=args.get("annotate", False), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_vision(
+        question=args.get("question", ""),
+        annotate=args.get("annotate", False),
+        full_page=args.get("full_page", False),
+        task_id=kw.get("task_id"),
+    ),
     check_fn=check_browser_vision_requirements,
     emoji="👁️",
 )
