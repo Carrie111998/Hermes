@@ -18,6 +18,14 @@ export function normalizeWhatsAppId(value) {
   return String(value).replace(':', '@');
 }
 
+export function formatEditableMessage(message, {
+  prefix = true,
+  formatOutgoingMessage,
+} = {}) {
+  if (prefix === false) return message;
+  return formatOutgoingMessage(message);
+}
+
 export function getMessageContent(msg) {
   const content = msg?.message || {};
   if (content.ephemeralMessage?.message) return content.ephemeralMessage.message;

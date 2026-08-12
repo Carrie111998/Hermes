@@ -41,6 +41,7 @@ import {
   buildTextSendPayload,
   createBoundedMessageStore,
   extractBridgeEvent,
+  formatEditableMessage,
   inboundReadReceiptKeys,
   inferMediaType,
   mediaPayloadForFile,
@@ -882,14 +883,18 @@ app.post('/edit', async (req, res) => {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
 
-  const { chatId, messageId, message } = req.body;
+  const { chatId, messageId, message, prefix = true } = req.body;
   if (!chatId || !messageId || !message) {
     return res.status(400).json({ error: 'chatId, messageId, and message are required' });
   }
 
   try {
     const key = { id: messageId, fromMe: true, remoteJid: chatId };
-    const chunks = splitLongMessage(formatOutgoingMessage(message));
+    const outgoing = formatEditableMessage(message, {
+      prefix,
+      formatOutgoingMessage,
+    });
+    const chunks = splitLongMessage(outgoing);
     const messageIds = [];
 
     await sendWithTimeout(chatId, { text: chunks[0], edit: key });

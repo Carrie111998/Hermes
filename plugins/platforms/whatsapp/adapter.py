@@ -1014,6 +1014,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         content: str,
         *,
         finalize: bool = False,
+        prefix: bool = True,
     ) -> SendResult:
         """Edit a previously sent message via the WhatsApp bridge."""
         if not self._running or not self._http_session:
@@ -1029,6 +1030,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     "chatId": to_whatsapp_jid(chat_id),
                     "messageId": message_id,
                     "message": content,
+                    "prefix": prefix,
                 },
                 timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:

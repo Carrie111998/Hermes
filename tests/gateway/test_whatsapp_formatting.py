@@ -77,6 +77,29 @@ class _AsyncCM:
         return False
 
 
+@pytest.mark.asyncio
+async def test_edit_message_can_explicitly_disable_bridge_prefix():
+    adapter = _make_adapter()
+    resp = MagicMock(status=200)
+    adapter._http_session.post = MagicMock(return_value=_AsyncCM(resp))
+
+    result = await adapter.edit_message(
+        "customer-chat",
+        "owner-command",
+        "Le envío las fotos disponibles.",
+        prefix=False,
+    )
+
+    assert result.success
+    payload = adapter._http_session.post.call_args.kwargs["json"]
+    assert payload == {
+        "chatId": "customer-chat",
+        "messageId": "owner-command",
+        "message": "Le envío las fotos disponibles.",
+        "prefix": False,
+    }
+
+
 # ---------------------------------------------------------------------------
 # format_message tests
 # ---------------------------------------------------------------------------

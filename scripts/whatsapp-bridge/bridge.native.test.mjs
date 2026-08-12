@@ -18,11 +18,31 @@ import {
   createBoundedMessageStore,
   appendMediaFailureNote,
   extractBridgeEvent,
+  formatEditableMessage,
   inboundReadReceiptKeys,
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
+
+// -- editable text prefix control ------------------------------------------
+{
+  const formatter = (message) => `Hermes header\n${message}`;
+  assert.equal(
+    formatEditableMessage('customer-safe text', {
+      prefix: false,
+      formatOutgoingMessage: formatter,
+    }),
+    'customer-safe text',
+  );
+  assert.equal(
+    formatEditableMessage('normal reply', {
+      formatOutgoingMessage: formatter,
+    }),
+    'Hermes header\nnormal reply',
+  );
+  console.log('  ✓ edit prefix opt-out preserves customer-safe text');
+}
 
 // -- inbound read receipts ------------------------------------------------
 {
