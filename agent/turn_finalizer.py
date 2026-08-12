@@ -833,6 +833,14 @@ def persist_completed_text_turn(
     from agent.conversation_loop import logger
 
     messages.append(final_msg)
+    # Make the completed answer durable before leaving the loop —
+    # a session torn down before finalize_turn's _persist_session
+    # otherwise loses a reply the user already saw (#81641). Same
+    # contract as the tool-call exit (#49045) and the verify exits
+    # above; _DB_PERSISTED_MARKER keeps _persist_session idempotent.
+    # Unlike the tool-call exit, failure must NOT abort the turn:
+    # no side effect follows and _persist_session retries the write.
+    # Full incident narrative: tests/run_agent/test_81641_*.py.
     try:
         agent._flush_messages_to_session_db(messages, conversation_history)
     except Exception:
