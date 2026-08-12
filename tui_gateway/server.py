@@ -6038,14 +6038,20 @@ def _prompt_text(value) -> str:
 
 
 def _apply_personality_to_session(
-    sid: str, session: dict, new_prompt: str, personality: str = ""
+    sid: str,
+    session: dict,
+    new_prompt: str,
+    personality: str = "",
+    *,
+    preserve_baseline: bool = False,
 ) -> tuple[bool, dict | None]:
     """Apply a personality change to an existing session without resetting history.
 
-    Updates the agent's ephemeral system prompt in-place so the new personality
-    takes effect on the next turn.  The cached base system prompt is left intact
-    (ephemeral_system_prompt is appended at API-call time, not baked into the
-    cache), which preserves prompt-cache hits.
+    In replacement mode, updates the agent's ephemeral system prompt in-place so
+    the new personality takes effect on the next turn. In overlay mode, the
+    producer-owned baseline remains intact and the pre-LLM hook owns delivery.
+    The cached base system prompt is left intact in both modes, which preserves
+    prompt-cache hits.
 
     Also injects a system-role marker into the conversation history so the model
     knows to pivot its style from this point forward (without this, LLMs tend to
@@ -6060,7 +6066,8 @@ def _apply_personality_to_session(
 
     agent = session.get("agent")
     if agent:
-        agent.ephemeral_system_prompt = new_prompt or None
+        if not preserve_baseline:
+            agent.ephemeral_system_prompt = new_prompt or None
         # Inject a pivot marker into history so the model sees the change point.
         # This prevents it from pattern-matching its prior style.
         if new_prompt:
@@ -11514,12 +11521,20 @@ def _(rid, params: dict) -> dict:
                 # Personality text is an in-session overlay. Persistence goes
                 # through hermes_cli.personality (single owner) and never
                 # touches the user-owned global system prompt.
-                from hermes_cli.personality import persist_personality
+                from hermes_cli.personality import (
+                    persist_personality,
+                    personality_selection_mode,
+                )
 
-                persist_personality(pname)
+                if not persist_personality(pname):
+                    raise RuntimeError("config write failed")
                 nv = str(value or "none")
                 history_reset, info = _apply_personality_to_session(
-                    sid_key, session, new_prompt, pname
+                    sid_key,
+                    session,
+                    new_prompt,
+                    pname,
+                    preserve_baseline=personality_selection_mode(cfg) == "overlay",
                 )
             else:
                 _write_config_key(f"display.{key}", value)
@@ -12949,14 +12964,25 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             result = _apply_model_switch(sid, session, arg)
             return result.get("warning", "")
         elif name == "personality" and arg and agent:
-            pname, new_prompt = _validate_personality(arg, _load_cfg())
+            cfg = _load_cfg()
+            pname, new_prompt = _validate_personality(arg, cfg)
             # Persist through the single owner so this surface can never
             # drift from the others (the old TUI slash path applied the
             # overlay in-session but skipped persistence entirely).
-            from hermes_cli.personality import persist_personality
+            from hermes_cli.personality import (
+                persist_personality,
+                personality_selection_mode,
+            )
 
-            persist_personality(pname)
-            _apply_personality_to_session(sid, session, new_prompt, pname)
+            if not persist_personality(pname):
+                return "personality change failed: config write failed"
+            _apply_personality_to_session(
+                sid,
+                session,
+                new_prompt,
+                pname,
+                preserve_baseline=personality_selection_mode(cfg) == "overlay",
+            )
         elif name == "prompt" and agent:
             cfg = _load_cfg()
             new_prompt = _prompt_text((cfg.get("agent") or {}).get("system_prompt", ""))

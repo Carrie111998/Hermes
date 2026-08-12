@@ -7639,6 +7639,127 @@ def test_config_set_personality_preserves_history_and_returns_info(monkeypatch):
     assert not any(path == "agent.system_prompt" for path, _ in writes)
 
 
+def test_config_set_personality_overlay_preserves_producer_baseline(monkeypatch):
+    baseline = "<live-card0>baseline truth</live-card0>"
+    agent = types.SimpleNamespace(
+        ephemeral_system_prompt=baseline, _cached_system_prompt="old"
+    )
+    session = _session(agent=agent, history=[], history_version=0)
+    server._sessions["sid"] = session
+    cfg = {
+        "agent": {
+            "personality_selection_mode": "overlay",
+            "personalities": {"helpful": "You are helpful."},
+        }
+    }
+    monkeypatch.setattr(server, "_load_cfg_raw", lambda: cfg)
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_emit", lambda *_args: None)
+    import hermes_cli.personality as personality_mod
+
+    monkeypatch.setattr(personality_mod, "persist_personality", lambda _name: True)
+
+    response = server.handle_request(
+        {
+            "id": "1",
+            "method": "config.set",
+            "params": {"session_id": "sid", "key": "personality", "value": "helpful"},
+        }
+    )
+
+    assert "error" not in response
+    assert agent.ephemeral_system_prompt == baseline
+    assert session["personality"] == "helpful"
+
+
+def test_config_set_personality_persistence_failure_mutates_nothing(monkeypatch):
+    baseline = "<live-card0>baseline truth</live-card0>"
+    agent = types.SimpleNamespace(
+        ephemeral_system_prompt=baseline, _cached_system_prompt="old"
+    )
+    history = [{"role": "user", "content": "hi"}]
+    session = _session(agent=agent, history=list(history), history_version=4)
+    server._sessions["sid"] = session
+    cfg = {
+        "agent": {
+            "personality_selection_mode": "overlay",
+            "personalities": {"helpful": "You are helpful."},
+        }
+    }
+    monkeypatch.setattr(server, "_load_cfg_raw", lambda: cfg)
+    import hermes_cli.personality as personality_mod
+
+    monkeypatch.setattr(personality_mod, "persist_personality", lambda _name: False)
+
+    response = server.handle_request(
+        {
+            "id": "1",
+            "method": "config.set",
+            "params": {"session_id": "sid", "key": "personality", "value": "helpful"},
+        }
+    )
+
+    assert "error" in response
+    assert agent.ephemeral_system_prompt == baseline
+    assert session["history"] == history
+    assert session["history_version"] == 4
+    assert session.get("personality") is None
+
+
+def test_tui_slash_personality_overlay_preserves_producer_baseline(monkeypatch):
+    baseline = "<live-card0>baseline truth</live-card0>"
+    agent = types.SimpleNamespace(
+        ephemeral_system_prompt=baseline, _cached_system_prompt="old"
+    )
+    session = _session(agent=agent, history=[], history_version=0)
+    cfg = {
+        "agent": {
+            "personality_selection_mode": "overlay",
+            "personalities": {"helpful": "You are helpful."},
+        }
+    }
+    monkeypatch.setattr(server, "_load_cfg", lambda: cfg)
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_emit", lambda *_args: None)
+    import hermes_cli.personality as personality_mod
+
+    monkeypatch.setattr(personality_mod, "persist_personality", lambda _name: True)
+
+    server._mirror_slash_side_effects("sid", session, "/personality helpful")
+
+    assert agent.ephemeral_system_prompt == baseline
+    assert session["personality"] == "helpful"
+
+
+def test_tui_slash_personality_persistence_failure_mutates_nothing(monkeypatch):
+    baseline = "<live-card0>baseline truth</live-card0>"
+    agent = types.SimpleNamespace(
+        ephemeral_system_prompt=baseline, _cached_system_prompt="old"
+    )
+    history = [{"role": "user", "content": "hi"}]
+    session = _session(agent=agent, history=list(history), history_version=4)
+    cfg = {
+        "agent": {
+            "personality_selection_mode": "overlay",
+            "personalities": {"helpful": "You are helpful."},
+        }
+    }
+    monkeypatch.setattr(server, "_load_cfg", lambda: cfg)
+    import hermes_cli.personality as personality_mod
+
+    monkeypatch.setattr(personality_mod, "persist_personality", lambda _name: False)
+
+    output = server._mirror_slash_side_effects(
+        "sid", session, "/personality helpful"
+    )
+
+    assert "failed" in str(output).lower()
+    assert agent.ephemeral_system_prompt == baseline
+    assert session["history"] == history
+    assert session["history_version"] == 4
+    assert session.get("personality") is None
+
+
 def test_compress_session_history_passes_force():
     """_compress_session_history is manual-only (session.compress RPC, slash
     compress/compact, slash-worker mirror) — it must bypass the
