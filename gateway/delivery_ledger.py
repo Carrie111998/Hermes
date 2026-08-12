@@ -222,6 +222,55 @@ def record_obligation(
     _prune()
 
 
+def record_delivered_obligation(
+    *,
+    obligation_id: str,
+    session_key: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    content: str,
+    platform_message_id: Optional[str],
+) -> None:
+    """Durably record a final that a streaming/edit path already published.
+
+    Unlike the normal path, a streamed final has no pre-send ledger checkpoint:
+    the platform publication is owned by the stream consumer.  Once its final
+    bubble is confirmed, write the same delivered record with the actual final
+    bubble ID so forensic attribution remains exact.
+    """
+    now = time.time()
+    pid, started = _owner_stamp()
+    if not platform_message_id:
+        logger.warning(
+            "Delivered streamed obligation %s without a returned platform message ID; "
+            "final attribution is unavailable",
+            obligation_id,
+        )
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO delivery_obligations
+               (obligation_id, session_key, platform, chat_id, thread_id,
+                content, state, attempts, created_at, updated_at,
+                owner_pid, owner_started_at, platform_message_id)
+               VALUES (?, ?, ?, ?, ?, ?, 'delivered', 0, ?, ?, ?, ?, ?)""",
+            (
+                obligation_id,
+                session_key,
+                platform,
+                str(chat_id),
+                str(thread_id) if thread_id else None,
+                content,
+                now,
+                now,
+                pid,
+                started,
+                str(platform_message_id) if platform_message_id else None,
+            ),
+        )
+    _prune()
+
+
 def mark_attempting(obligation_id: str) -> None:
     _update_state(obligation_id, "attempting")
 
@@ -234,7 +283,17 @@ def mark_delivered_with_platform_id(
     obligation_id: str,
     platform_message_id: Optional[str],
 ) -> None:
-    """Mark an obligation delivered and persist the platform message ID."""
+    """Mark an obligation delivered and persist the platform message ID.
+
+    A successful adapter result without an ID is still a confirmed delivery,
+    but its exact public bubble cannot be attributed after the fact.
+    """
+    if not platform_message_id:
+        logger.warning(
+            "Delivered obligation %s without a returned platform message ID; "
+            "final attribution is unavailable",
+            obligation_id,
+        )
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """UPDATE delivery_obligations

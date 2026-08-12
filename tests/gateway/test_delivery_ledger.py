@@ -41,12 +41,13 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
 def _row(oid):
     with dl._connect() as conn:
         r = conn.execute(
-            """SELECT state, attempts, owner_pid, content
+            """SELECT state, attempts, owner_pid, content, platform_message_id
                FROM delivery_obligations WHERE obligation_id=?""",
             (oid,),
         ).fetchone()
     return None if r is None else {
         "state": r[0], "attempts": r[1], "owner_pid": r[2], "content": r[3],
+        "platform_message_id": r[4],
     }
 
 
@@ -84,6 +85,32 @@ class TestStateMachine:
             ).fetchone()
         assert row[0] == "delivered"
         assert row[1] == "discord-msg-999"
+
+    def test_record_streamed_final_persists_actual_final_message_id(self):
+        dl.record_delivered_obligation(
+            obligation_id="ob-streamed-final",
+            session_key="agent:main:discord:channel:C1",
+            platform="discord",
+            chat_id="C1",
+            thread_id=None,
+            content="streamed final answer",
+            platform_message_id="discord-final-333",
+        )
+        row = _row("ob-streamed-final")
+        assert row is not None
+        assert row["state"] == "delivered"
+        assert row["platform_message_id"] == "discord-final-333"
+
+    def test_mark_delivered_without_platform_id_warns_about_unattributed_final(self, caplog):
+        _record(oid="ob-no-platform-id")
+        dl.mark_attempting("ob-no-platform-id")
+        with caplog.at_level("WARNING", logger="gateway.delivery_ledger"):
+            dl.mark_delivered_with_platform_id("ob-no-platform-id", None)
+        row = _row("ob-no-platform-id")
+        assert row is not None
+        assert row["state"] == "delivered"
+        assert row["platform_message_id"] is None
+        assert "without a returned platform message ID" in caplog.text
 
     def test_mark_delivered_backward_compat(self):
         _record(oid="ob-backcompat")
@@ -235,7 +262,11 @@ class TestGatewayRedeliverySweep:
     def _adapter(success=True):
         adapter = MagicMock()
         adapter.send = AsyncMock(
-            return_value=MagicMock(success=success, error="" if success else "nope")
+            return_value=MagicMock(
+                success=success,
+                error="" if success else "nope",
+                message_id="slack-recovered-777" if success else None,
+            )
         )
         return adapter
 
@@ -253,6 +284,7 @@ class TestGatewayRedeliverySweep:
         assert sent["content"] == "the final answer"  # no marker
         assert sent["metadata"] == {"thread_id": "171.001"}
         assert _row("ob-1")["state"] == "delivered"
+        assert _row("ob-1")["platform_message_id"] == "slack-recovered-777"
         runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
             "agent:main:slack:channel:C1"
         )

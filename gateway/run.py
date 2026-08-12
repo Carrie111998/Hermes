@@ -7598,7 +7598,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from gateway.delivery_ledger import (
                 RECOVERED_MARKER,
                 ledger_enabled,
-                mark_delivered,
+                mark_delivered_with_platform_id,
                 mark_failed,
                 sweep_recoverable,
             )
@@ -7655,7 +7655,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 result = None
             try:
                 if result is not None and getattr(result, "success", False):
-                    mark_delivered(row["obligation_id"])
+                    mark_delivered_with_platform_id(
+                        row["obligation_id"],
+                        str(getattr(result, "message_id", None) or "") or None,
+                    )
                     redelivered += 1
                     logger.info(
                         "Redelivered recovered final response to %s:%s "
@@ -22995,8 +22998,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return False
             return False
 
+        def _record_streamed_final_attribution(
+            consumer,
+            final_text: str,
+        ) -> None:
+            """Store the actual last stream bubble after confirmed publication."""
+            if not (consumer and final_text and session_key and source):
+                return
+            try:
+                from gateway.delivery_ledger import (
+                    compute_obligation_id,
+                    ledger_enabled,
+                    record_delivered_obligation,
+                )
+
+                if not ledger_enabled():
+                    return
+                platform_message_id = getattr(consumer, "message_id", None)
+                if platform_message_id == "__no_edit__":
+                    platform_message_id = None
+                obligation_id = compute_obligation_id(
+                    session_key,
+                    str(event_message_id or ""),
+                    final_text,
+                )
+                record_delivered_obligation(
+                    obligation_id=obligation_id,
+                    session_key=session_key,
+                    platform=str(getattr(source.platform, "value", source.platform)),
+                    chat_id=str(source.chat_id),
+                    thread_id=getattr(source, "thread_id", None),
+                    content=final_text,
+                    platform_message_id=(
+                        str(platform_message_id) if platform_message_id else None
+                    ),
+                )
+            except Exception:
+                logger.debug("streamed final delivery ledger write failed", exc_info=True)
+
         try:
-            # Run in thread pool to not block.  Use an *inactivity*-based
             # timeout instead of a wall-clock limit: the agent can run for
             # hours if it's actively calling tools / receiving stream tokens,
             # but a hung API call or stuck tool with no activity for the
@@ -23636,19 +23676,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _content_delivered,
                 )
                 response["already_sent"] = True
+                _record_streamed_final_attribution(_sc, _final)
             elif not _is_empty_sentinel and _transformed and _sc is not None:
                 # Plugin hooks transformed the response after streaming — edit the
                 # existing streamed message instead of sending a duplicate.
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
+                        _edit_result = await _sc.adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
                         )
+                        if not getattr(_edit_result, "success", False):
+                            raise RuntimeError(
+                                "streamed final transformation edit was not confirmed"
+                            )
                         response["already_sent"] = True
+                        _record_streamed_final_attribution(
+                            _sc, response["final_response"]
+                        )
                         logger.info(
                             "Edited streamed message %s for session %s to include plugin-transformed content.",
                             _sc_msg_id, session_key or "?",
