@@ -14434,3 +14434,8 @@ for _m in (
 ):
     _m.register(sys.modules[__name__])
 del _m
+
+# Helpers that rebind-bound handlers resolve by name against THIS namespace
+# (see method_ctx.py): prompt.submit calls _reopen_if_finalized
+# (#liveness-stale-end).
+_reopen_if_finalized = _methods_prompt._reopen_if_finalized
