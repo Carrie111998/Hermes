@@ -56,6 +56,13 @@ from typing import Dict, List, Tuple
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
 
+# Exported into every per-file pytest subprocess. Its ABSENCE is how
+# tests/conftest.py detects a direct multi-file `pytest ...` invocation, which
+# shares one interpreter and therefore surfaces cross-file module-level state
+# leakage that never occurs under this runner. Keep in sync with
+# ``PER_FILE_ISOLATION_ENV`` in tests/conftest.py.
+PER_FILE_ISOLATION_ENV = "HERMES_TEST_PER_FILE_ISOLATION"
+
 # Directories to skip during discovery — these suites require real
 # external services (a model gateway, a docker daemon with a prebuilt
 # image, etc.) and are run in their own dedicated CI jobs:
@@ -331,7 +338,12 @@ def _run_one_file_once(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
-            env=os.environ,
+            # Mark the child as running under per-file isolation. tests/conftest.py
+            # uses the absence of this marker to warn when someone invokes pytest
+            # directly across MULTIPLE test files, where cross-file module-level
+            # state leaks and produces failures that CI (which always runs one
+            # file per process) never sees. See SCA-4692.
+            env={**os.environ, PER_FILE_ISOLATION_ENV: "1"},
             # POSIX: place the child at the head of its own process group so
             # _kill_tree can SIGKILL the group atomically.
             # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;

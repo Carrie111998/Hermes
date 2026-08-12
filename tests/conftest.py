@@ -86,6 +86,63 @@ HERMES_HOME_AT_CONFTEST_IMPORT = os.environ.get("HERMES_HOME", "")
 # isolation (too slow at ~17k tests).
 #
 # See ``scripts/run_tests_parallel.py`` for the runner.
+#
+# ── Direct multi-file invocation warning (SCA-4692) ────────────────────────
+#
+# Because the isolation lives in the RUNNER and not in this conftest, a plain
+# ``pytest tests/<dir>`` still "works" — it just silently runs every file in
+# ONE interpreter, where module-level state leaks across files. On
+# ``tests/hermes_cli`` that produced 141 failures on a clean main, none of
+# which reproduce per-file and none of which CI can ever see. Someone
+# validating an unrelated change reads that as a real red and burns an hour
+# subtracting it.
+#
+# The runner exports PER_FILE_ISOLATION_ENV into each child. Its absence,
+# combined with a selection spanning more than one test file, means the run
+# is order-coupled and its failures are not CI signal. Say so loudly rather
+# than letting the operator discover it by bisection.
+#
+# A single-file direct run (``pytest tests/foo.py``) is explicitly fine and
+# stays silent — that matches the per-file boundary the runner enforces.
+
+PER_FILE_ISOLATION_ENV = "HERMES_TEST_PER_FILE_ISOLATION"
+
+_MULTI_FILE_WARNING = (
+    "Direct multi-file pytest invocation: {n} test files share ONE interpreter.\n"
+    "Module-level state leaks between files here, so failures may be ordering\n"
+    "artifacts that do NOT reproduce per-file and that CI never sees (CI runs\n"
+    "one file per subprocess). This is not a trustworthy red/green signal.\n"
+    "\n"
+    "For a CI-parity result use the canonical runner:\n"
+    "    scripts/run_tests.sh {paths}\n"
+    "\n"
+    "Single-file runs (pytest tests/foo.py) are unaffected and stay silent."
+)
+
+
+def _warn_on_direct_multi_file_run(config, items):
+    """Warn when pytest was invoked directly across multiple test files.
+
+    Called from the single ``pytest_collection_modifyitems`` hook below — this
+    module must not define that hook twice, or the later definition silently
+    shadows the earlier one.
+    """
+    if os.environ.get(PER_FILE_ISOLATION_ENV):
+        return
+    files = {getattr(item, "location", (None,))[0] for item in items}
+    files.discard(None)
+    if len(files) < 2:
+        return
+
+    paths = " ".join(config.args) if config.args else "tests/"
+    message = _MULTI_FILE_WARNING.format(n=len(files), paths=paths)
+
+    reporter = config.pluginmanager.getplugin("terminalreporter")
+    if reporter is None:  # -p no:terminal, or an embedding harness
+        return
+    reporter.write_sep("=", "CROSS-FILE STATE LEAKAGE WARNING", red=True, bold=True)
+    reporter.write_line(message)
+    reporter.write_sep("=", "", red=True, bold=True)
 
 
 # ── Credential env-var filter ──────────────────────────────────────────────
@@ -993,7 +1050,12 @@ def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
     Cheaper and more honest than each test hand-rolling a version check: the
     reason string names the actual linked version so the skip is diagnosable
     rather than mysterious.
+
+    Also carries the SCA-4692 direct-multi-file-invocation warning, so this
+    module keeps exactly one ``pytest_collection_modifyitems`` definition.
     """
+    _warn_on_direct_multi_file_run(config, items)
+
     if _wal_is_usable():
         return
 
