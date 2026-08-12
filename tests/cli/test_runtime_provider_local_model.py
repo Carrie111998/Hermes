@@ -1,5 +1,6 @@
 import json
 
+import pytest
 import requests
 
 from hermes_cli.runtime_provider import (
@@ -58,4 +59,17 @@ def test_auto_detect_local_model_drops_oversized_response(monkeypatch):
     assert _auto_detect_local_model("http://localhost:1234/v1") == ""
     assert captured["url"] == "http://localhost:1234/v1/models"
     assert captured["kwargs"]["stream"] is True
+    assert response.closed is True
+
+
+@pytest.mark.parametrize("body", [b"{", b"[]"])
+def test_auto_detect_local_model_drops_invalid_json_shapes(monkeypatch, body):
+    response = _FakeResponse([body])
+
+    def fake_get(_url, **_kwargs):
+        return response
+
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    assert _auto_detect_local_model("http://localhost:1234/v1") == ""
     assert response.closed is True
