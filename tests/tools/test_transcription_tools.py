@@ -1098,6 +1098,35 @@ class TestLocalBaseUrlNoApiKey:
 
 
 class TestOpenAIAudioGatewayPreference:
+    def test_gateway_preference_uses_the_loaded_stt_config(self):
+        from tools.transcription_tools import _resolve_openai_audio_client_config
+
+        managed = MagicMock(
+            nous_user_token="managed-token",
+            gateway_origin="https://openai-audio-gateway.nousresearch.com",
+        )
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={
+                "stt": {
+                    "use_gateway": True,
+                    "openai": {"api_key": "direct-config-key"},
+                }
+            },
+        ) as config_loader, patch(
+            "tools.transcription_tools.resolve_openai_audio_api_key",
+            return_value="direct-env-key",
+        ) as direct_resolver, patch(
+            "tools.transcription_tools.resolve_managed_tool_gateway",
+            return_value=managed,
+        ):
+            api_key, base_url = _resolve_openai_audio_client_config()
+
+        assert api_key == "managed-token"
+        assert base_url == "https://openai-audio-gateway.nousresearch.com/v1"
+        config_loader.assert_called_once_with()
+        direct_resolver.assert_not_called()
+
     @pytest.mark.parametrize(
         ("openai_config", "direct_api_key"),
         [
@@ -1123,9 +1152,6 @@ class TestOpenAIAudioGatewayPreference:
             "tools.transcription_tools.resolve_openai_audio_api_key",
             return_value=direct_api_key,
         ) as direct_resolver, patch(
-            "tools.transcription_tools.prefers_gateway",
-            return_value=True,
-        ), patch(
             "tools.transcription_tools.resolve_managed_tool_gateway",
             return_value=managed,
         ):
@@ -1169,9 +1195,6 @@ class TestOpenAIAudioGatewayPreference:
         with patch(
             "tools.transcription_tools._load_stt_config",
             return_value={"use_gateway": True},
-        ), patch(
-            "tools.transcription_tools.prefers_gateway",
-            return_value=True,
         ), patch(
             "tools.transcription_tools.resolve_openai_audio_api_key",
             return_value="direct-env-key",

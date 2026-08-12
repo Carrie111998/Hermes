@@ -48,7 +48,6 @@ from tools.managed_tool_gateway import resolve_managed_tool_gateway
 from tools.tool_backend_helpers import (
     managed_nous_tools_enabled,
     nous_tool_gateway_unavailable_message,
-    prefers_gateway,
     resolve_openai_audio_api_key,
 )
 
@@ -2961,7 +2960,7 @@ def _resolve_openai_audio_client_config() -> tuple[str, str]:
     openai_cfg = stt_config.get("openai") or {}
     cfg_api_key = openai_cfg.get("api_key", "")
     cfg_base_url = openai_cfg.get("base_url", "")
-    prefer_managed = prefers_gateway("stt")
+    prefer_managed = is_truthy_value(stt_config.get("use_gateway"), default=False)
     if cfg_api_key and not prefer_managed:
         return cfg_api_key, (cfg_base_url or OPENAI_BASE_URL)
 
