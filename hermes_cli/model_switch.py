@@ -45,7 +45,7 @@ from agent.models_dev import (
     get_model_info,
     list_provider_models,
 )
-from utils import base_url_hostname
+from utils import base_url_origin
 
 # Providers whose picker model list should NOT be capped by max_models.
 # OpenCode Zen / Go are aggregators whose full catalogs (70+ models each) must
@@ -492,6 +492,29 @@ def direct_alias_api_key(alias: DirectAlias) -> str:
     if raw:
         return raw
     return _scoped_key_env((alias.key_env or "").strip())
+
+
+# Hosts where plaintext HTTP is not a downgrade — a local server has no
+# network hop to intercept.
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+
+
+def _may_reuse_session_credential(session_base_url: str, alias_base_url: str) -> bool:
+    """Whether the session's key may follow a switch to *alias_base_url*.
+
+    Same hostname is NOT sufficient to authorise handing a bearer secret to a
+    new URL. ``http://h`` and ``https://h:8443`` are different origins and
+    different trust boundaries, so an alias that keeps the hostname but drops
+    the scheme would otherwise put a live session credential on the wire in
+    the clear. Require an identical (scheme, host, port), and refuse plaintext
+    outside loopback.
+    """
+    session = base_url_origin(session_base_url)
+    alias = base_url_origin(alias_base_url)
+    if not session[1] or session != alias:
+        return False
+    scheme, hostname, _ = alias
+    return scheme == "https" or hostname in _LOOPBACK_HOSTS
 
 
 # ---------------------------------------------------------------------------
@@ -1833,20 +1856,29 @@ def switch_model(
                 api_key = _alias_key
             else:
                 try:
+                    # Resolve as bare `custom` REGARDLESS of the alias's
+                    # provider label. A label like `anthropic` would otherwise
+                    # reach that provider's own resolver, which selects
+                    # ANTHROPIC_API_KEY from the environment while keeping the
+                    # alias's unrelated base_url — handing a built-in
+                    # provider's bearer secret to a third-party host. The bare
+                    # `custom` path is host-gated (#28660), so an authoritative
+                    # URL still resolves its vendor key (api.anthropic.com →
+                    # ANTHROPIC_API_KEY via the host-derived fallback) while a
+                    # non-authoritative one resolves none. An alias that needs
+                    # a specific key states it with api_key/key_env above.
                     _alias_runtime = resolve_runtime_provider(
-                        requested=_da.provider or "custom",
+                        requested="custom",
                         explicit_base_url=_da.base_url,
                         target_model=new_model,
                     )
                 except Exception:
                     _alias_runtime = {}
                 # The already-resolved key is reusable only when the alias
-                # points at the SAME host it was resolved for (an alias that
-                # just pins a model on the provider already in use). Across
-                # hosts it is the leak, so it is dropped, not carried.
-                _same_host = bool(base_url) and (
-                    base_url_hostname(base_url) == base_url_hostname(_da.base_url)
-                )
+                # points at the SAME ORIGIN it was resolved for (an alias that
+                # just pins a model on the endpoint already in use). Across
+                # origins it is the leak, so it is dropped, not carried.
+                _same_host = _may_reuse_session_credential(base_url, _da.base_url)
                 base_url = _alias_runtime.get("base_url", "") or _da.base_url
                 # The resolver reports "no key found" with the
                 # `no-key-required` placeholder rather than "". Normalise it

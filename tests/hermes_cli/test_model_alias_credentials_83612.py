@@ -293,6 +293,144 @@ class TestBuiltinProviderKeysDoNotLeak:
         assert probed["api_key"] != secret
 
 
+class TestProviderLabelCannotSelectAKeyForAnArbitraryHost:
+    """A direct alias's `provider:` label must not route credential resolution.
+
+    With a base_url but no declared credential, a label like `anthropic` used
+    to reach that provider's own resolver, which picks ANTHROPIC_API_KEY out
+    of the environment while keeping the alias's unrelated base_url — a
+    built-in provider's bearer secret handed to a third-party host. The alias
+    endpoint is resolved as bare `custom` instead, which is host-gated.
+    """
+
+    def _switch(self, monkeypatch, alias, session_provider="openrouter",
+                session_base_url="https://openrouter.ai/api/v1"):
+        cfg = {
+            "model": {"default": "m", "provider": session_provider},
+            "model_aliases": {"theta": alias},
+        }
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda *a, **k: cfg)
+        monkeypatch.setattr("hermes_cli.runtime_provider.load_config", lambda *a, **k: cfg)
+        probed = {}
+
+        def _fake_validate(model_name, prov, *, api_key=None, base_url=None, api_mode=None):
+            probed["api_key"] = api_key
+            return {"accepted": True, "persist": True, "recognized": True, "message": ""}
+
+        monkeypatch.setattr("hermes_cli.models.validate_requested_model", _fake_validate)
+        import hermes_cli.model_switch as ms
+
+        monkeypatch.setattr(ms, "DIRECT_ALIASES", {})
+        result = ms.switch_model(
+            raw_input="theta", current_provider=session_provider, current_model="m",
+            current_base_url=session_base_url, current_api_key="sk-session",
+        )
+        return result, probed
+
+    @pytest.mark.parametrize("provider, env_var", [
+        ("anthropic", "ANTHROPIC_API_KEY"),
+        ("openai", "OPENAI_API_KEY"),
+        ("openrouter", "OPENROUTER_API_KEY"),
+    ])
+    def test_builtin_label_does_not_pull_that_providers_key_to_a_foreign_host(
+        self, monkeypatch, provider, env_var
+    ):
+        secret = f"sk-{provider}-SECRET"
+        monkeypatch.setenv(env_var, secret)
+        result, probed = self._switch(
+            monkeypatch,
+            {"model": "c", "provider": provider, "base_url": "https://evil.test/v1"},
+        )
+        # Either the switch resolves no key for the foreign host, or it fails
+        # outright — never the built-in provider's secret.
+        assert result.api_key != secret
+        assert probed.get("api_key") != secret
+
+    def test_authoritative_host_still_resolves_its_vendor_key(self, monkeypatch):
+        """Host gating is the point, not a blanket refusal: an alias whose URL
+        IS authoritative for the vendor still authenticates."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-anthropic-SECRET")
+        result, _ = self._switch(
+            monkeypatch,
+            {"model": "c", "provider": "anthropic",
+             "base_url": "https://api.anthropic.com/v1"},
+        )
+        assert result.api_key == "sk-anthropic-SECRET"
+
+
+class TestSessionCredentialIsScopedToTheOrigin:
+    """Reusing the session key across a scheme or port change is a downgrade.
+
+    The override compared hostnames only, so an alias could keep the host and
+    move an HTTPS session to `http://` (or another port) while the live
+    credential followed it onto the new, untrusted origin.
+    """
+
+    def _switch(self, monkeypatch, alias_base_url, session_base_url):
+        cfg = {
+            "model": {"default": "m", "provider": "my-endpoint"},
+            "model_aliases": {"theta": {
+                "model": "m2", "provider": "custom", "base_url": alias_base_url}},
+        }
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda *a, **k: cfg)
+        monkeypatch.setattr("hermes_cli.runtime_provider.load_config", lambda *a, **k: cfg)
+        monkeypatch.setattr(
+            "hermes_cli.models.validate_requested_model",
+            lambda *a, **k: {"accepted": True, "persist": True,
+                             "recognized": True, "message": ""},
+        )
+        import hermes_cli.model_switch as ms
+
+        monkeypatch.setattr(ms, "DIRECT_ALIASES", {})
+        return ms.switch_model(
+            raw_input="theta", current_provider="my-endpoint", current_model="m",
+            current_base_url=session_base_url, current_api_key="sk-SESSION-SECRET",
+        )
+
+    @pytest.mark.parametrize("alias_url, session_url, why", [
+        ("http://api.example.com/v1", "https://api.example.com/v1", "https->http"),
+        ("https://api.example.com:8443/v1", "https://api.example.com/v1", "port change"),
+        ("http://api.example.com:8080/v1", "https://api.example.com/v1", "scheme+port"),
+        ("https://other.example.com/v1", "https://api.example.com/v1", "cross-host"),
+    ])
+    def test_origin_change_drops_the_session_credential(
+        self, monkeypatch, alias_url, session_url, why
+    ):
+        assert self._switch(monkeypatch, alias_url, session_url).api_key != "sk-SESSION-SECRET"
+
+    @pytest.mark.parametrize("url", [
+        "https://api.example.com/v1",
+        "http://127.0.0.1:11434/v1",   # loopback plaintext is not a downgrade
+        "http://localhost:8080/v1",
+    ])
+    def test_same_origin_keeps_the_session_credential(self, monkeypatch, url):
+        assert self._switch(monkeypatch, url, url).api_key == "sk-SESSION-SECRET"
+
+    def test_default_port_and_explicit_port_are_the_same_origin(self, monkeypatch):
+        result = self._switch(
+            monkeypatch, "https://api.example.com:443/v1", "https://api.example.com/v1"
+        )
+        assert result.api_key == "sk-SESSION-SECRET"
+
+
+class TestBaseUrlOrigin:
+    """The origin helper the reuse decision is built on."""
+
+    @pytest.mark.parametrize("url, expected", [
+        ("https://h/v1", ("https", "h", 443)),
+        ("https://h:443/v1", ("https", "h", 443)),
+        ("http://h/v1", ("http", "h", 80)),
+        ("https://h:8443/v1", ("https", "h", 8443)),
+        ("https://H./v1", ("https", "h", 443)),
+        ("", ("", "", 0)),
+        ("https://h:99999/v1", ("", "", 0)),
+    ])
+    def test_origin_normalisation(self, url, expected):
+        from utils import base_url_origin
+
+        assert base_url_origin(url) == expected
+
+
 # ---------------------------------------------------------------------------
 # Host gating in the direct-alias runtime branch
 # ---------------------------------------------------------------------------
