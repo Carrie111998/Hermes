@@ -16,62 +16,6 @@ method = _registry.method
 _profile_scoped = _registry.profile_scoped
 
 
-def _scan_discovered_repos_remote(conn, policy: dict) -> None:
-    """Backend-side disk scan of the discovery policy roots.
-
-    The desktop's native repo scan only runs on the local filesystem. On a
-    remote gateway connection the host must scan its own disk so repos with
-    zero Hermes sessions still appear in the sidebar (#81723). Mirrors the
-    desktop's behavior: walk each root (bounded depth), find `.git`
-    directories, record (root, label) pairs into the discovery cache.
-
-    Best-effort: any failure logs and leaves the cache untouched — the
-    session-derived repos from `_discover_repos_payload` still surface.
-    """
-    import logging
-    import os
-
-    logger = logging.getLogger(__name__)
-    from hermes_cli import projects_db as pdb
-
-    roots = policy.get("roots") or []
-    excludes = policy.get("exclude_paths") or []
-    pairs: list[tuple[str, str | None]] = []
-    seen: set[str] = set()
-
-    def _is_excluded(path: str) -> bool:
-        return any(path == ex or path.startswith(ex.rstrip("/\\") + os.sep) for ex in excludes if ex)
-
-    for root in roots:
-        try:
-            for dirpath, dirnames, _filenames in os.walk(root):
-                if _is_excluded(dirpath):
-                    dirnames[:] = []
-                    continue
-                # Skip hidden dirs (e.g. .hermes) and node_modules at depth.
-                dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in ("node_modules",)]
-                if ".git" in dirnames:
-                    repo_root = dirpath
-                    if repo_root not in seen:
-                        seen.add(repo_root)
-                        pairs.append((repo_root, os.path.basename(repo_root)))
-                    dirnames[:] = []
-                if len(pairs) >= 500:
-                    break
-        except Exception:
-            logger.debug("discover_repos scan failed for root %s", root, exc_info=True)
-        if len(pairs) >= 500:
-            break
-
-    if pairs:
-        try:
-            pdb.record_discovered_repos(
-                conn, pairs, replace=True, policy_key=_repo_discovery_policy_key(policy)
-            )
-        except Exception:
-            logger.debug("discover_repos cache write failed", exc_info=True)
-
-
 @method("projects.discover_repos")
 def _(rid, params: dict) -> dict:
     """Repos for the desktop overview: scanned-from-disk (cached) ∪ session-derived."""

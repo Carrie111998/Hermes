@@ -277,6 +277,94 @@ def test_scan_time_is_not_treated_as_session_activity(tmp_path):
     assert active["last_active"] > idle["last_active"]
 
 
+def test_remote_scan_failure_merges_instead_of_replacing_cache(tmp_path, monkeypatch):
+    """A backend scan that can't fully walk its roots must NOT wipe the cache.
+
+    `projects.discover_repos` with `scan:true` asks the remote host to scan its
+    own discovery roots. When one root fails to walk, the scan result is not the
+    authoritative full universe — the previously cached repos must survive so a
+    failed remote refresh can't blank the sidebar back to the silent, empty
+    state of #81723 (regression for MEDIUM: `replace=True` was wiping on every
+    call regardless of success).
+    """
+    from hermes_cli import projects_db as pdb
+    import tui_gateway.server as server
+
+    def _git_repo(path):
+        repo = path
+        repo.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        return str(repo)
+
+    # A cached repo the partial scan never visits, parked OUTSIDE the scan roots.
+    seed = _git_repo(tmp_path / "elsewhere" / "seed-repo")
+    with pdb.connect_closing() as conn:
+        pdb.record_discovered_repos(conn, [(seed, "seed-repo")])
+        seeded = [r["root"] for r in pdb.list_discovered_repos(conn)]
+    assert seed in seeded
+
+    good = _git_repo(tmp_path / "good-repo")
+
+    # Force one root to fail to walk: the scan becomes non-authoritative, so it
+    # must merge into the cache, never wipe it.
+    real_walk = os.walk
+    bad_root = str(tmp_path / "unwalkable")
+
+    def _flaky_walk(top, *a, **k):
+        if top == bad_root:
+            raise OSError("boom")
+        yield from real_walk(top, *a, **k)
+
+    monkeypatch.setattr(server.os, "walk", _flaky_walk)
+
+    policy = {"enabled": True, "roots": [good, bad_root], "exclude_paths": []}
+
+    with pdb.connect_closing() as conn:
+        authoritative = server._scan_discovered_repos_remote(conn, policy)
+        joined = [r["root"] for r in pdb.list_discovered_repos(conn)]
+
+    # The scan found the good repo and merged it, but the failed root means the
+    # result is not authoritative, so it must NOT have replaced the cache.
+    assert not authoritative
+    assert good in joined
+    # The seeded repo that the partial scan never saw is still cached.
+    assert seed in joined
+
+
+def test_remote_scan_full_authoritative_replaces_cache(tmp_path):
+    """Only a fully-walked scan may replace the stale cache."""
+    from hermes_cli import projects_db as pdb
+    import tui_gateway.server as server
+
+    def _git_repo(path):
+        repo = path
+        repo.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        return str(repo)
+
+    # Park the stale repo OUTSIDE the scan root so the authoritative scan no
+    # longer sees it, and the fresh repo inside the root it walks.
+    stale = _git_repo(tmp_path / "outside" / "stale-repo")
+    scandir = tmp_path / "scandir"
+    scandir.mkdir()
+    fresh = _git_repo(scandir / "fresh-repo")
+
+    with pdb.connect_closing() as conn:
+        pdb.record_discovered_repos(conn, [(stale, "stale-repo")])
+
+    policy = {"enabled": True, "roots": [str(scandir)], "exclude_paths": []}
+
+    with pdb.connect_closing() as conn:
+        authoritative = server._scan_discovered_repos_remote(conn, policy)
+        joined = [r["root"] for r in pdb.list_discovered_repos(conn)]
+
+    assert authoritative
+    assert fresh in joined
+    # A full, authoritative scan replaced the stale cache: the old repo the
+    # scan no longer saw is gone from the authoritative set.
+    assert stale not in joined
+
+
 def test_terminal_session_persists_its_launch_cwd():
     """A terminal session's cwd IS its workspace, so the row must record it.
 

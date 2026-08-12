@@ -458,6 +458,7 @@ describe('repository discovery policy', () => {
         : { accepted: false, repos: [] }
     )
     gatewayWith(request)
+    $projectTree.set([{ id: 'seed', name: 'seed', folders: [], lanes: [] } as SidebarProjectTree])
 
     await scanAndRecordRepos(true)
 
@@ -474,6 +475,65 @@ describe('repository discovery policy', () => {
       'projects.tree',
       expect.objectContaining({ preview_limit: expect.any(Number) })
     )
+    // A successful scan refreshes the tree (here to the empty list the mock
+    // tree returns), so a later discover-repos call replaces it instead of
+    // keeping the stale seed.
+    expect($projectTree.get()).toEqual([])
+  })
+
+  it('surfaces a reject from remote discover_repos without clearing the sidebar', async () => {
+    // Backend error (RPC `error` frame) rejects the request — the sidebar must
+    // keep its last known list and flag the failure, not go silently blank.
+    isDesktopFsRemoteMode.mockReturnValue(true)
+    desktopGit.mockReturnValue({ scanRepos: vi.fn() } as never)
+    const request = vi.fn(async (method: string) => {
+      if (method === 'projects.discover_repos') {
+        throw new Error('discover_repos failed')
+      }
+      if (method === 'projects.tree') {
+        return { active_id: null, projects: [], scoped_session_ids: [] }
+      }
+      return { accepted: false, repos: [] }
+    })
+    gatewayWith(request)
+    $projectTree.set([{ id: 'seed', name: 'seed', folders: [], lanes: [] } as SidebarProjectTree])
+
+    await scanAndRecordRepos(true)
+
+    // The tree refresh must NOT run against a failed remote scan ...
+    expect(request).not.toHaveBeenCalledWith(
+      'projects.tree',
+      expect.objectContaining({ preview_limit: expect.any(Number) })
+    )
+    // ... the cached tree is preserved ...
+    expect($projectTree.get()).toEqual([
+      { id: 'seed', name: 'seed', folders: [] as never[], lanes: [] }
+    ])
+  })
+
+  it('does not treat an error-shaped discover_repos response as a successful refresh', async () => {
+    // A resolved-but-error-shaped body (`{accepted:false}` / no `repos`) must
+    // be treated as a failure: keep the old list rather than refreshing into
+    // the silent, empty sidebar of #81723.
+    isDesktopFsRemoteMode.mockReturnValue(true)
+    desktopGit.mockReturnValue({ scanRepos: vi.fn() } as never)
+    const request = vi.fn(async (method: string) =>
+      method === 'projects.tree'
+        ? { active_id: null, projects: [], scoped_session_ids: [] }
+        : { accepted: false }
+    )
+    gatewayWith(request)
+    $projectTree.set([{ id: 'seed', name: 'seed', folders: [], lanes: [] } as SidebarProjectTree])
+
+    await scanAndRecordRepos(true)
+
+    expect(request).not.toHaveBeenCalledWith(
+      'projects.tree',
+      expect.objectContaining({ preview_limit: expect.any(Number) })
+    )
+    expect($projectTree.get()).toEqual([
+      { id: 'seed', name: 'seed', folders: [] as never[], lanes: [] }
+    ])
   })
 })
 
