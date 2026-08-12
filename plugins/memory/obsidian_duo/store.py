@@ -280,6 +280,17 @@ class SqliteMemoryStore:
             created_at=row["created_at"], updated_at=row["updated_at"],
         )
 
+    def find_active_by_content(self, content: str, memory_type: str) -> list[MemoryRecord]:
+        """Find exact active managed memories, excluding external notes."""
+        rows = self.connection().execute(
+            """SELECT memory_id FROM memories
+               WHERE status='active' AND scope != 'external'
+                 AND memory_type=? AND content=?
+               ORDER BY memory_id""",
+            (memory_type, content),
+        ).fetchall()
+        return [record for row in rows if (record := self.get_memory(row["memory_id"])) is not None]
+
     def insert_evidence(self, record: EvidenceRecord) -> None:
         assert_safe_to_persist(record.content)
         assert_safe_value((record.evidence_id, record.kind, record.source, record.session_id))

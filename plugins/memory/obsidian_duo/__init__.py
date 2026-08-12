@@ -17,6 +17,11 @@ from .contracts import (
     RetrievalRequest,
     Verification,
 )
+from agent.memory_provenance import (
+    EXPLICIT_FORGET,
+    EXPLICIT_REMEMBER,
+    EXPLICIT_UPDATE,
+)
 from .inference import MemoryInference
 from .policy import MemoryPolicy
 from .retrieval import MemoryRetriever
@@ -136,7 +141,12 @@ class ObsidianDuoMemoryProvider(MemoryProvider):
     def on_memory_write(self, action, target, content, metadata=None) -> None:
         if self._broker:
             metadata = dict(metadata or {})
-            authority = Authority.USER if metadata.get("write_origin") == "user" else Authority.AGENT
+            intent = str(metadata.get("user_memory_intent") or "none")
+            host_confirmed = (
+                metadata.get("host_confirmed_user_memory") is True
+                and intent in {EXPLICIT_REMEMBER, EXPLICIT_UPDATE, EXPLICIT_FORGET}
+            )
+            authority = Authority.USER if host_confirmed else Authority.AGENT
             verification = Verification.USER_CONFIRMED if authority is Authority.USER else Verification.UNVERIFIED
             requested_type = str(metadata.get("memory_type") or "").strip().lower()
             if requested_type not in ObsidianVault.MEMORY_TYPE_FOLDERS:
@@ -148,13 +158,40 @@ class ObsidianDuoMemoryProvider(MemoryProvider):
                 "mission_id": metadata.get("mission_id", ""),
                 "agent_id": metadata.get("agent_id", ""),
             }
+            candidate_metadata = {**metadata, **provenance, "event_kind": "builtin_memory_write"}
+            if host_confirmed and intent in {EXPLICIT_UPDATE, EXPLICIT_FORGET}:
+                candidate_metadata["event_kind"] = "user_correction"
+
+            old_text = str(metadata.get("old_text") or "")
+            if host_confirmed and action == "replace":
+                matches = self._broker.find_active_by_content(old_text, requested_type) if old_text else []
+                if len(matches) == 1:
+                    candidate_metadata["contradicts"] = matches[0].memory_id
+                else:
+                    candidate_metadata["event_kind"] = "user_correction_pending"
+                    candidate_metadata["pending_reason"] = (
+                        "no unique exact active memory matched old_text"
+                    )
+                    host_confirmed = False
+            if host_confirmed and action == "remove":
+                matches = self._broker.find_active_by_content(old_text, requested_type) if old_text else []
+                if len(matches) == 1:
+                    self._broker.archive_memory(matches[0].memory_id, reason="explicit user forget")
+                    return
+                candidate_metadata["event_kind"] = "user_correction_pending"
+                candidate_metadata["pending_reason"] = (
+                    "no unique exact active memory matched old_text"
+                )
+                host_confirmed = False
+
+            pending_content = content or old_text
             self._broker.propose(MemoryCandidate(
-                content=content,
+                content=pending_content,
                 memory_type=requested_type,
                 authority=authority,
                 verification=verification,
-                metadata={**metadata, **provenance, "event_kind": "builtin_memory_write"},
-            ), host_confirmed=authority is Authority.USER)
+                metadata=candidate_metadata,
+            ), host_confirmed=host_confirmed)
 
     def on_delegation(self, task: str, result: str, **kwargs) -> None:
         if self._broker:

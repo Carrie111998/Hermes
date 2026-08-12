@@ -79,8 +79,9 @@ class MemoryPolicy:
     def merge_or_conflict(self, existing: list[MemoryRecord], candidate: MemoryCandidate) -> CandidateDecision:
         contradicted_id = str(candidate.metadata.get("contradicts") or "")
         match = next((record for record in existing if record.memory_id == contradicted_id), None)
-        if match is not None and match.importance > 0.5:
+        if match is not None:
             if candidate.authority is Authority.USER or candidate.metadata.get("event_kind") == EventKind.USER_CORRECTION.value:
                 return CandidateDecision("supersede", memory_id=match.memory_id, reason="higher-authority user correction")
-            return CandidateDecision("conflict", memory_id=match.memory_id, reason="important memory contradiction")
+            if match.importance > 0.5:
+                return CandidateDecision("conflict", memory_id=match.memory_id, reason="important memory contradiction")
         return self.evaluate(candidate)

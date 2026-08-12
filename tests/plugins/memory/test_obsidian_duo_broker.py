@@ -375,6 +375,46 @@ def test_user_correction_supersedes_existing_memory(tmp_path):
     assert broker.store.get_memory(decision.memory_id).content == "Use the red theme"
 
 
+def test_user_correction_marks_old_managed_note_superseded(tmp_path):
+    broker = make_broker(tmp_path)
+    broker.start()
+    old = MemoryRecord(
+        "mem_old", "Use the blue theme", "preference", "global",
+        importance=0.0, authority=Authority.AGENT,
+    )
+    broker.store.upsert_memory(old, "test setup")
+    old_note = broker.vault.write_managed_note(old)
+    broker.vault.scan_managed_changes(broker.store)
+
+    decision = broker.propose(MemoryCandidate(
+        "Use the red theme", memory_type="preference",
+        authority=Authority.USER, verification=Verification.USER_CONFIRMED,
+        metadata={"event_kind": "user_correction", "contradicts": "mem_old"},
+    ), host_confirmed=True)
+
+    assert decision.action == "promote"
+    assert broker.vault.parse_note(old_note).metadata["status"] == "superseded"
+
+
+def test_archive_preserves_note_body_and_removes_active_truth(tmp_path):
+    broker = make_broker(tmp_path)
+    broker.start()
+    old = MemoryRecord("mem_old", "Forget this exact fact", "fact", "global", authority=Authority.USER)
+    broker.store.upsert_memory(old, "test setup")
+    old_note = broker.vault.write_managed_note(old)
+    broker.vault.scan_managed_changes(broker.store)
+
+    decision = broker.archive_memory("mem_old")
+
+    assert decision.action == "archive"
+    assert broker.store.get_memory("mem_old").status.value == "archived"
+    assert broker.vault.parse_note(old_note).body == old.content
+    assert broker.vault.parse_note(old_note).metadata["status"] == "archived"
+    assert broker.store.connection().execute(
+        "SELECT COUNT(*) FROM memories WHERE content=''"
+    ).fetchone()[0] == 0
+
+
 def test_manual_edit_becomes_user_authority_without_rewriting_note(tmp_path):
     broker = make_broker(tmp_path)
     broker.start()

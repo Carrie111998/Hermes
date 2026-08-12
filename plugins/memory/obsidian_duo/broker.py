@@ -245,8 +245,20 @@ class EmbeddedMemoryBroker:
             if decision.action == "supersede" and decision.memory_id:
                 old = self.store.get_memory(decision.memory_id)
                 if old is not None:
+                    old_path = self.vault._managed_path(old)
+                    superseded_old = replace(old, status=MemoryStatus.SUPERSEDED)
+                    if old_path.exists():
+                        self.vault.write_managed_note(superseded_old)
+                        old_stat = old_path.stat()
+                        self.store.set_note_index(
+                            str(old_path),
+                            old.memory_id,
+                            old_stat.st_mtime_ns,
+                            old_stat.st_size,
+                            self.vault._hash(old_path),
+                        )
                     self.store.upsert_memory(
-                        replace(old, status=MemoryStatus.SUPERSEDED),
+                        superseded_old,
                         "superseded by user correction",
                     )
                     self.store.record_relationship(
@@ -269,6 +281,37 @@ class EmbeddedMemoryBroker:
         if decision.action == "stage":
             self.store.stage_candidate(candidate)
         return decision
+
+    def find_active_by_content(self, content: str, memory_type: str) -> list[MemoryRecord]:
+        return self.store.find_active_by_content(content, memory_type)
+
+    def archive_memory(self, memory_id: str, *, reason: str = "user forget") -> CandidateDecision:
+        """Archive one identified managed memory while preserving its history."""
+        old = self.store.get_memory(memory_id)
+        if old is None or old.status is not MemoryStatus.ACTIVE:
+            return CandidateDecision("not_found", memory_id=memory_id, reason="active memory not found")
+
+        archived = replace(
+            old,
+            status=MemoryStatus.ARCHIVED,
+            authority=Authority.USER,
+            verification=Verification.USER_CONFIRMED,
+        )
+        txn_id = new_id("txn")
+        path = self.vault._managed_path(old)
+        payload = {"memory_id": memory_id, "path": str(path), "reason": reason}
+        self.store.record_journal(txn_id, "archive", "prepared", payload)
+        if path.exists():
+            self.vault.write_managed_note(archived)
+            stat = path.stat()
+            payload.update({"content_hash": self.vault._hash(path), "mtime_ns": stat.st_mtime_ns, "size": stat.st_size})
+        self.store.upsert_memory(archived, reason)
+        if path.exists():
+            self.store.set_note_index(
+                str(path), memory_id, payload["mtime_ns"], payload["size"], payload["content_hash"]
+            )
+        self.store.record_journal(txn_id, "archive", "committed", payload)
+        return CandidateDecision("archive", memory_id=memory_id, reason=reason)
 
     def flush(self, reason: str, timeout: float) -> bool:
         deadline = time.monotonic() + max(0.0, timeout)
