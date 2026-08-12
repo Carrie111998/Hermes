@@ -182,3 +182,67 @@ def test_branch_base_still_falls_back_to_origin_without_a_trunk_upstream(tmp_pat
     _at_fork, at_origin, repo = _forked_repo(tmp_path)
 
     assert web_git._branch_base(str(repo)) == at_origin
+
+
+# --- longer resolution chain --------------------------------------------------
+# Ported from a sibling session that fixed the same defect independently. Its
+# chain consults more explicit user config before giving up, and validates
+# configured values against the real remote list -- git happily stores a URL in
+# `branch.<b>.remote`, and passing that through as if it were a remote NAME is
+# how a "resolved" remote silently becomes an unintended push target.
+
+
+def test_push_honours_branch_remote_when_push_remote_is_unset(tmp_path):
+    upstream = _bare(tmp_path, "upstream.git")
+    fork = _bare(tmp_path, "fork.git")
+    repo = _work_repo(tmp_path)
+    _git(repo, "remote", "add", "origin", str(upstream))
+    _git(repo, "remote", "add", "fork", str(fork))
+    _git(repo, "config", "branch.feature/x.remote", "fork")
+
+    web_git.review_push(str(repo))
+
+    assert _has_branch(fork, "feature/x")
+    assert not _has_branch(upstream, "feature/x")
+
+
+def test_push_falls_back_to_the_trunk_branch_remote(tmp_path):
+    """agent-src's real shape: the feature branch has no config, but main does."""
+    upstream = _bare(tmp_path, "upstream.git")
+    fork = _bare(tmp_path, "fork.git")
+    repo = _work_repo(tmp_path)
+    _git(repo, "remote", "add", "origin", str(upstream))
+    _git(repo, "remote", "add", "fork", str(fork))
+    _git(repo, "config", "branch.main.remote", "fork")
+
+    web_git.review_push(str(repo))
+
+    assert _has_branch(fork, "feature/x")
+    assert not _has_branch(upstream, "feature/x")
+
+
+def test_push_ignores_a_configured_value_that_is_not_a_remote_name(tmp_path):
+    """A URL in the config must not be passed through as if it were a remote."""
+    upstream = _bare(tmp_path, "upstream.git")
+    fork = _bare(tmp_path, "fork.git")
+    repo = _work_repo(tmp_path)
+    _git(repo, "remote", "add", "origin", str(upstream))
+    _git(repo, "remote", "add", "fork", str(fork))
+    _git(repo, "config", "branch.feature/x.pushRemote", str(upstream))
+
+    with pytest.raises(RuntimeError):
+        web_git.review_push(str(repo))
+
+    assert not _has_branch(upstream, "feature/x"), "pushed to a raw URL from config"
+    assert not _has_branch(fork, "feature/x")
+
+
+def test_branch_base_uses_the_resolved_remote_when_the_trunk_has_no_upstream(tmp_path):
+    """branch.main.remote alone (no .merge) still beats the origin/* fallback."""
+    at_fork, at_origin, repo = _forked_repo(tmp_path)
+    _git(repo, "config", "branch.main.remote", "fork")
+
+    base = web_git._branch_base(str(repo))
+
+    assert base == at_fork, "diff base ignored the configured trunk remote"
+    assert base != at_origin

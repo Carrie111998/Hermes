@@ -244,3 +244,65 @@ test('branchBase still falls back to origin/main when the trunk has no upstream'
 
   assert.equal(base, atOrigin)
 }, 120_000)
+
+// --- longer resolution chain -------------------------------------------------
+// Ported from a sibling session that fixed the same defect independently: consult
+// more explicit user config before giving up, and validate configured values
+// against the real remote list. git happily stores a URL in `branch.<b>.remote`,
+// and passing that through as a remote NAME is how a "resolved" remote silently
+// becomes an unintended push target.
+
+test('reviewPush honours branch.<b>.remote when pushRemote is unset', async () => {
+  const upstream = makeBare('upstream')
+  const fork = makeBare('fork')
+  const dir = makeBranchRepo()
+
+  execFileSync('git', ['remote', 'add', 'origin', upstream], { cwd: dir })
+  execFileSync('git', ['remote', 'add', 'fork', fork], { cwd: dir })
+  execFileSync('git', ['config', 'branch.feature/x.remote', 'fork'], { cwd: dir })
+
+  await reviewPush(dir, 'git')
+
+  assert.equal(hasBranch(fork, 'feature/x'), true)
+  assert.equal(hasBranch(upstream, 'feature/x'), false)
+}, 120_000)
+
+test('reviewPush falls back to the trunk branch remote', async () => {
+  const upstream = makeBare('upstream')
+  const fork = makeBare('fork')
+  const dir = makeBranchRepo()
+
+  execFileSync('git', ['remote', 'add', 'origin', upstream], { cwd: dir })
+  execFileSync('git', ['remote', 'add', 'fork', fork], { cwd: dir })
+  execFileSync('git', ['config', 'branch.main.remote', 'fork'], { cwd: dir })
+
+  await reviewPush(dir, 'git')
+
+  assert.equal(hasBranch(fork, 'feature/x'), true)
+  assert.equal(hasBranch(upstream, 'feature/x'), false)
+}, 120_000)
+
+test('reviewPush ignores a configured value that is not a remote name', async () => {
+  const upstream = makeBare('upstream')
+  const fork = makeBare('fork')
+  const dir = makeBranchRepo()
+
+  execFileSync('git', ['remote', 'add', 'origin', upstream], { cwd: dir })
+  execFileSync('git', ['remote', 'add', 'fork', fork], { cwd: dir })
+  execFileSync('git', ['config', 'branch.feature/x.pushRemote', upstream], { cwd: dir })
+
+  await assert.rejects(() => reviewPush(dir, 'git'))
+  assert.equal(hasBranch(upstream, 'feature/x'), false, 'pushed to a raw URL from config')
+  assert.equal(hasBranch(fork, 'feature/x'), false)
+}, 120_000)
+
+test('branchBase uses the resolved remote when the trunk has no upstream', async () => {
+  const { atFork, atOrigin, dir, run } = makeForkedRepo()
+
+  run('config', 'branch.main.remote', 'fork')
+
+  const base = await branchBase(gitFor(dir, 'git'))
+
+  assert.equal(base, atFork, 'diff base ignored the configured trunk remote')
+  assert.notEqual(base, atOrigin)
+}, 120_000)

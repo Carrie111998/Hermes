@@ -16,6 +16,9 @@ const COMMIT_CONTEXT_DIFF_MAX_CHARS = 120_000
 const COMMIT_CONTEXT_UNTRACKED_MAX = 80
 const UNTRACKED_LINE_COUNT_CONCURRENCY = 16
 const UNTRACKED_LINE_COUNT_MAX_BYTES = 1024 * 1024
+// Branch names that stand in for "this repo's own lineage" when a feature branch
+// carries no remote config of its own. Mirrors _TRUNK_BRANCHES in web_git.py.
+const TRUNK_BRANCHES = ['main', 'master']
 
 // GUI-launched Electron apps on macOS inherit only a minimal PATH (no
 // /opt/homebrew/bin or /usr/local/bin), so `gh` — and the `git` gh shells out
@@ -160,7 +163,7 @@ async function branchBase(git) {
   // the review diff show the whole fork delta instead of the branch's work.
   // Deliberately NOT HEAD's own @{upstream} -- on a feature branch that is the
   // branch's own tip, i.e. an empty diff.
-  for (const trunk of ['main', 'master']) {
+  for (const trunk of TRUNK_BRANCHES) {
     try {
       const upstream = (
         await git.revparse(['--abbrev-ref', '--symbolic-full-name', `${trunk}@{upstream}`])
@@ -172,6 +175,18 @@ async function branchBase(git) {
     } catch {
       // No such local branch, or it tracks nothing.
     }
+  }
+
+  // No trunk upstream configured? The resolved remote still beats `origin`.
+  try {
+    const branch = (await git.revparse(['--abbrev-ref', 'HEAD'])).trim()
+    const remote = await resolvePushRemote(git, branch)
+
+    if (remote) {
+      candidates.push(`${remote}/HEAD`, `${remote}/main`, `${remote}/master`)
+    }
+  } catch {
+    // Detached HEAD, or no resolvable remote; the fallbacks below still apply.
   }
 
   try {
@@ -471,19 +486,28 @@ async function reviewRevParse(repoPath, ref, gitBin) {
 // there. Follows git's own precedence, then accepts a lone remote as
 // unambiguous; anything else is the user's decision, not ours.
 async function resolvePushRemote(git, branch) {
-  for (const key of [`branch.${branch}.pushRemote`, 'remote.pushDefault']) {
+  const remotes = (await git.raw(['remote'])).split(/\s+/).filter(Boolean)
+  const keys = [
+    `branch.${branch}.pushRemote`,
+    'remote.pushDefault',
+    `branch.${branch}.remote`,
+    ...TRUNK_BRANCHES.map(trunk => `branch.${trunk}.remote`)
+  ]
+
+  for (const key of keys) {
     try {
       const configured = (await git.raw(['config', '--get', key])).trim()
 
-      if (configured) {
+      // Validated against the real remote list: git will happily store a URL in
+      // `branch.<name>.remote`, and passing that through as if it were a remote
+      // NAME is how a "resolved" remote becomes an unintended push target.
+      if (configured && remotes.includes(configured)) {
         return configured
       }
     } catch {
       // An unset key exits 1; try the next candidate.
     }
   }
-
-  const remotes = (await git.raw(['remote'])).split(/\s+/).filter(Boolean)
 
   return remotes.length === 1 ? remotes[0] : null
 }

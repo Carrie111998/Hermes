@@ -134,6 +134,11 @@ def _branch_base(cwd: str) -> str | None:
         ).strip()
         if upstream:
             candidates.append(upstream)
+    # No trunk upstream configured? The resolved remote still beats ``origin``.
+    branch = _git_out(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]).strip()
+    remote = _resolve_push_remote(cwd, branch)
+    if remote:
+        candidates += [f"{remote}/HEAD", f"{remote}/main", f"{remote}/master"]
     head = _git_out(cwd, ["rev-parse", "--abbrev-ref", "origin/HEAD"]).strip()
     if head:
         candidates.append(head)
@@ -387,18 +392,33 @@ def review_commit(cwd: str, message: str, push: bool) -> dict:
 def _resolve_push_remote(cwd: str, branch: str) -> str | None:
     """The remote a push of ``branch`` should target, or ``None`` when ambiguous.
 
+    Consults git's own precedence first, then the branch's own remote, then the
+    trunk branches' -- the config that names this repo's own lineage, which is
+    what makes a fork checkout resolve without the user configuring every branch.
+
+    Every candidate is validated against the real remote list. git will happily
+    store a URL in ``branch.<name>.remote``, and passing that through as if it
+    were a remote NAME is how a "resolved" remote becomes an unintended push
+    target.
+
     Deliberately does NOT fall back to ``origin``. In a fork checkout ``origin``
     is often the UPSTREAM project (``~/.hermes/agent-src`` is exactly that), so
     guessing it publishes private work to a public repo and pins the branch's
-    tracking there. Follows git's own precedence, then accepts a lone remote as
-    unambiguous; anything else is the caller's decision, not ours.
+    tracking there. A lone remote is unambiguous; anything else is the caller's
+    decision, not ours.
     """
-    for key in (f"branch.{branch}.pushRemote", "remote.pushDefault"):
+    names = _git_out(cwd, ["remote"]).split()
+    keys = [
+        f"branch.{branch}.pushRemote",
+        "remote.pushDefault",
+        f"branch.{branch}.remote",
+        *(f"branch.{trunk}.remote" for trunk in _TRUNK_BRANCHES),
+    ]
+    for key in keys:
         configured = _git_out(cwd, ["config", "--get", key]).strip()
-        if configured:
+        if configured and configured in names:
             return configured
-    remotes = _git_out(cwd, ["remote"]).split()
-    return remotes[0] if len(remotes) == 1 else None
+    return names[0] if len(names) == 1 else None
 
 
 def _review_push(cwd: str) -> None:
