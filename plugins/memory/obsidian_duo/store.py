@@ -156,6 +156,15 @@ class SqliteMemoryStore:
                     content_hash TEXT NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS external_catalog (
+                    path TEXT PRIMARY KEY,
+                    mtime_ns INTEGER NOT NULL,
+                    size INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL DEFAULT '',
+                    memory_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE TABLE IF NOT EXISTS journal (
                     txn_id TEXT PRIMARY KEY,
                     operation TEXT NOT NULL,
@@ -353,6 +362,48 @@ class SqliteMemoryStore:
                 mtime_ns=excluded.mtime_ns,size=excluded.size,content_hash=excluded.content_hash,
                 updated_at=CURRENT_TIMESTAMP""",
                 (path, memory_id, mtime_ns, size, content_hash),
+            )
+
+    def external_catalog_rows(self) -> list[sqlite3.Row]:
+        return self.connection().execute(
+            "SELECT path,mtime_ns,size,content_hash,memory_id,status FROM external_catalog ORDER BY path"
+        ).fetchall()
+
+    def upsert_external_catalog(self, path: str, mtime_ns: int, size: int, *, status: str = "pending", memory_id: str = "", content_hash: str = "") -> None:
+        with self.connection():
+            self.connection().execute(
+                """INSERT INTO external_catalog(path,mtime_ns,size,content_hash,memory_id,status)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET
+                mtime_ns=excluded.mtime_ns,size=excluded.size,content_hash=excluded.content_hash,
+                memory_id=CASE WHEN excluded.memory_id != '' THEN excluded.memory_id ELSE external_catalog.memory_id END,
+                status=excluded.status,updated_at=CURRENT_TIMESTAMP""",
+                (path, mtime_ns, size, content_hash, memory_id, status),
+            )
+
+    def delete_external_catalog(self, path: str) -> None:
+        row = self.connection().execute(
+            "SELECT memory_id FROM external_catalog WHERE path=?", (path,)
+        ).fetchone()
+        with self.connection():
+            self.connection().execute("DELETE FROM external_catalog WHERE path=?", (path,))
+            self.connection().execute("DELETE FROM external_index WHERE path=?", (path,))
+            if row and row["memory_id"]:
+                self.connection().execute("DELETE FROM memory_fts WHERE memory_id=?", (row["memory_id"],))
+                self.connection().execute("DELETE FROM memories WHERE memory_id=?", (row["memory_id"],))
+
+    def set_external_catalog_indexed(self, path: str, memory_id: str, mtime_ns: int, size: int, content_hash: str) -> None:
+        self.upsert_external_catalog(
+            path, mtime_ns, size, status="indexed", memory_id=memory_id, content_hash=content_hash,
+        )
+
+    def get_schema_value(self, key: str, default: str = "") -> str:
+        row = self.connection().execute("SELECT value FROM schema_meta WHERE key=?", (key,)).fetchone()
+        return str(row["value"]) if row is not None else default
+
+    def set_schema_value(self, key: str, value: str) -> None:
+        with self.connection():
+            self.connection().execute(
+                "INSERT OR REPLACE INTO schema_meta(key,value) VALUES(?,?)", (key, value)
             )
 
     def metrics_increment(self, name: str, value: int = 1) -> None:

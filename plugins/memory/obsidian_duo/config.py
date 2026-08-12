@@ -24,6 +24,8 @@ class ObsidianDuoConfig:
     recall_max_memories: int = 12
     recall_max_tokens: int = 5000
     managed_scan_min_interval_seconds: float = 5.0
+    external_catalog_refresh_seconds: float = 300.0
+    external_index_batch_size: int = 32
 
     def __post_init__(self) -> None:
         if self.index_mode not in {"lazy", "managed_first"}:
@@ -38,8 +40,10 @@ class ObsidianDuoConfig:
             raise ValueError("vault_path and managed_folder are required")
         if self.queue_maxsize <= 0 or self.recall_max_memories <= 0 or self.recall_max_tokens <= 0:
             raise ValueError("queue and recall bounds must be positive")
-        if self.sync_debounce_seconds < 0 or self.managed_scan_min_interval_seconds < 0:
+        if self.sync_debounce_seconds < 0 or self.managed_scan_min_interval_seconds < 0 or self.external_catalog_refresh_seconds < 0:
             raise ValueError("intervals cannot be negative")
+        if self.external_index_batch_size <= 0:
+            raise ValueError("external_index_batch_size must be positive")
         self.sync_command = tuple(self.sync_command)
 
     @classmethod

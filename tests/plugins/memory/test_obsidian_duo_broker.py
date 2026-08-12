@@ -68,6 +68,28 @@ def test_broker_starts_worker_lazily_and_flushes(tmp_path):
     broker.shutdown(5)
 
 
+def test_normal_retrieval_does_not_rebuild_external_catalogue_each_query(tmp_path, monkeypatch):
+    broker = make_broker(tmp_path)
+    notes = broker.vault.vault_path / "Notes"
+    notes.mkdir(parents=True)
+    for index in range(100):
+        (notes / f"note-{index:03d}.md").write_text(f"ordinary note {index}", encoding="utf-8")
+    calls = []
+    original = broker.vault.catalog_external_markdown_paths
+
+    def counted_catalogue():
+        calls.append(1)
+        yield from original()
+
+    monkeypatch.setattr(broker.vault, "catalog_external_markdown_paths", counted_catalogue)
+    broker.start()
+    for _ in range(10):
+        broker.retrieve(RetrievalRequest("phrase that is absent", max_memories=2))
+
+    assert len(calls) == 1
+    broker.shutdown(5)
+
+
 def test_session_completion_consolidates_retained_events_without_turn_llm(tmp_path):
     broker = make_broker(tmp_path)
     broker.start()

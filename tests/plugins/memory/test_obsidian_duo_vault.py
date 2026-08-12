@@ -106,3 +106,75 @@ def test_full_rebuild_ignores_internal_directories_and_redacts_external_secrets(
     hits = store.search_fts('"API_KEY"', 4)
     assert hits
     assert "sk-proj-1234567890abcdefghijklmnop" not in hits[0].body
+
+
+def test_external_catalogue_is_not_rebuilt_for_each_index_batch(tmp_path, monkeypatch):
+    vault = ObsidianVault(tmp_path / "Vault", "Hermes Memory")
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    store.initialize()
+    notes = vault.vault_path / "Notes"
+    notes.mkdir(parents=True)
+    for index in range(100):
+        (notes / f"note-{index:03d}.md").write_text(f"content {index}", encoding="utf-8")
+
+    calls = []
+    original = vault.catalog_external_markdown_paths
+
+    def counted_catalogue():
+        calls.append(1)
+        yield from original()
+
+    monkeypatch.setattr(vault, "catalog_external_markdown_paths", counted_catalogue)
+    vault.refresh_external_catalog(store)
+    for _ in range(10):
+        vault.index_external_paths(store, limit=10)
+
+    assert len(calls) == 1
+    assert store.connection().execute("SELECT COUNT(*) FROM external_index").fetchone()[0] == 100
+
+
+def test_external_index_cursor_progresses_to_different_notes(tmp_path):
+    vault = ObsidianVault(tmp_path / "Vault", "Hermes Memory")
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    store.initialize()
+    notes = vault.vault_path / "Notes"
+    notes.mkdir(parents=True)
+    for index in range(20):
+        (notes / f"note-{index:03d}.md").write_text(f"content {index}", encoding="utf-8")
+
+    vault.refresh_external_catalog(store)
+    vault.index_external_paths(store, limit=10)
+    first = {
+        row["path"] for row in store.connection().execute("SELECT path FROM external_index").fetchall()
+    }
+    vault.index_external_paths(store, limit=10)
+    second = {
+        row["path"] for row in store.connection().execute("SELECT path FROM external_index").fetchall()
+    } - first
+
+    assert len(first) == 10
+    assert len(second) == 10
+    assert first.isdisjoint(second)
+
+
+def test_external_catalogue_refresh_adds_and_removes_derived_state(tmp_path):
+    vault = ObsidianVault(tmp_path / "Vault", "Hermes Memory")
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    store.initialize()
+    notes = vault.vault_path / "Notes"
+    notes.mkdir(parents=True)
+    original = notes / "original.md"
+    original.write_text("original content", encoding="utf-8")
+
+    vault.refresh_external_catalog(store)
+    vault.index_external_paths(store, limit=10)
+    assert store.connection().execute("SELECT COUNT(*) FROM external_index").fetchone()[0] == 1
+    original.unlink()
+    replacement = notes / "replacement.md"
+    replacement.write_text("replacement content", encoding="utf-8")
+
+    vault.refresh_external_catalog(store)
+
+    assert store.connection().execute("SELECT COUNT(*) FROM external_catalog").fetchone()[0] == 1
+    assert store.connection().execute("SELECT COUNT(*) FROM external_index").fetchone()[0] == 0
+    assert store.connection().execute("SELECT COUNT(*) FROM memories WHERE memory_id LIKE 'external_%'").fetchone()[0] == 0

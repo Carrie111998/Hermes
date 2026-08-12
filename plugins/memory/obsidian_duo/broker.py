@@ -53,13 +53,15 @@ class EmbeddedMemoryBroker:
         self._event_buffers: dict[str, list[MemoryEvent]] = {}
         self._event_buffer_lock = threading.Lock()
         self._last_managed_scan = 0.0
+        self._last_external_catalog_refresh = 0.0
 
     def start(self) -> None:
         self.store.initialize()
         self.vault.ensure_managed_structure()
         self.recover()
         if self.config.index_mode in {"lazy", "managed_first"}:
-            self.vault.index_external_paths(self.store, limit=32)
+            self.vault.refresh_external_catalog(self.store)
+            self._last_external_catalog_refresh = time.monotonic()
         self._state = "READY"
 
     def _ensure_worker(self) -> None:
@@ -166,9 +168,22 @@ class EmbeddedMemoryBroker:
             self.vault.scan_managed_changes(self.store)
             self.process_manual_changes()
             self._last_managed_scan = now
-        if self.config.index_mode in {"lazy", "managed_first"}:
-            self.vault.index_external_paths(self.store, limit=32, query=request.query)
-        return self.retriever.retrieve(request)
+        if self.config.index_mode not in {"lazy", "managed_first"}:
+            return self.retriever.retrieve(request)
+        now = time.monotonic()
+        if now - self._last_external_catalog_refresh >= self.config.external_catalog_refresh_seconds:
+            self.vault.refresh_external_catalog(self.store)
+            self._last_external_catalog_refresh = now
+        packet = self.retriever.retrieve(request)
+        if packet.memories:
+            return packet
+        if self.vault.index_external_paths(
+            self.store,
+            limit=self.config.external_index_batch_size,
+            query=request.query,
+        ):
+            return self.retriever.retrieve(request)
+        return packet
 
     def propose(self, candidate: MemoryCandidate, *, host_confirmed: bool = False, auto_promote: bool = False) -> CandidateDecision:
         try:

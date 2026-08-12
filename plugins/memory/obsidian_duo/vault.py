@@ -254,10 +254,13 @@ class ObsidianVault:
             with store.connection():
                 store.connection().execute("DELETE FROM note_index")
                 store.connection().execute("DELETE FROM external_index")
+                store.connection().execute("DELETE FROM external_catalog")
+                store.set_schema_value("external_index_cursor", "")
                 store.connection().execute("DELETE FROM memory_fts WHERE memory_id LIKE 'external_%'")
                 store.connection().execute("DELETE FROM memories WHERE memory_id LIKE 'external_%'")
         result = self.scan_managed_changes(store)
-        external_paths, external_reparsed = self.index_external_paths(
+        external_paths = self.refresh_external_catalog(store)
+        external_reparsed = self.index_external_paths(
             store,
             limit=None if full else 32,
         )
@@ -267,39 +270,74 @@ class ObsidianVault:
             malformed=len(result.malformed_paths),
         )
 
+    def refresh_external_catalog(self, store: SqliteMemoryStore) -> tuple[Path, ...]:
+        """Refresh the derived path catalogue without parsing external notes."""
+        current = {}
+        for path in self.catalog_external_markdown_paths() or ():
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            current[str(path)] = (path, stat.st_mtime_ns, stat.st_size)
+
+        existing = {row["path"]: row for row in store.external_catalog_rows()}
+        for path in set(existing) - set(current):
+            store.delete_external_catalog(path)
+        for path_text, (path, mtime_ns, size) in current.items():
+            previous = existing.get(path_text)
+            if previous is None or previous["mtime_ns"] != mtime_ns or previous["size"] != size:
+                store.upsert_external_catalog(
+                    path_text,
+                    mtime_ns,
+                    size,
+                    status="pending",
+                    memory_id=previous["memory_id"] if previous is not None else "",
+                    content_hash="",
+                )
+        return tuple(path for path, _, _ in current.values())
+
     def index_external_paths(self, store: SqliteMemoryStore, *, limit: int | None = 32, query: str = ""):
-        """Incrementally index a bounded set of read-only external Markdown notes."""
-        external_paths = tuple(self.catalog_external_markdown_paths() or ())
+        """Index at most ``limit`` pending external notes from the derived catalogue."""
+        rows = store.external_catalog_rows()
         query_tokens = set(re.findall(r"[\w-]+", query.lower()))
-        ranked = sorted(
-            external_paths,
-            key=lambda path: (
-                -sum(token in str(path).lower() for token in query_tokens),
-                str(path).lower(),
-            ),
+        pending = [row for row in rows if row["status"] != "indexed"]
+        matches = [row for row in pending if any(token in row["path"].lower() for token in query_tokens)]
+        pending_by_path = {row["path"]: row for row in pending}
+        cursor = store.get_schema_value("external_index_cursor")
+        remainder = sorted(
+            (row for row in pending if row["path"] not in {match["path"] for match in matches}),
+            key=lambda row: row["path"],
         )
+        after_cursor = [row for row in remainder if not cursor or row["path"] > cursor]
+        before_cursor = [row for row in remainder if cursor and row["path"] <= cursor]
+        ranked = matches + after_cursor + before_cursor
         if limit is not None:
             ranked = ranked[:max(0, limit)]
         external_reparsed = 0
-        for path in ranked:
-            stat = path.stat()
-            previous = store.connection().execute(
-                "SELECT memory_id,mtime_ns,size,content_hash FROM external_index WHERE path=?",
-                (str(path),),
-            ).fetchone()
-            if previous and previous["mtime_ns"] == stat.st_mtime_ns and previous["size"] == stat.st_size:
+        last_path = cursor
+        for row in ranked:
+            path = Path(row["path"])
+            if not path.is_file():
+                store.delete_external_catalog(row["path"])
                 continue
+            stat = path.stat()
+            if row["mtime_ns"] != stat.st_mtime_ns or row["size"] != stat.st_size:
+                store.upsert_external_catalog(row["path"], stat.st_mtime_ns, stat.st_size, status="pending", memory_id=row["memory_id"])
+            last_path = row["path"]
             content_hash = self._hash(path)
-            if previous and previous["content_hash"] == content_hash:
-                store.set_external_index(str(path), previous["memory_id"], stat.st_mtime_ns, stat.st_size, content_hash)
+            if row["content_hash"] and row["content_hash"] == content_hash and row["memory_id"]:
+                store.set_external_catalog_indexed(row["path"], row["memory_id"], stat.st_mtime_ns, stat.st_size, content_hash)
                 continue
             content = redact_secrets(path.read_text(encoding="utf-8")[:12000])
-            memory_id = "external_" + hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:24]
+            memory_id = row["memory_id"] or "external_" + hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:24]
             store.upsert_memory(MemoryRecord(
                 memory_id, content, "fact", "external", authority=Authority.SOURCE,
                 verification=Verification.SOURCE_SUPPORTED,
                 relationships=(f"source_path:{path}",),
             ), "external markdown index")
             store.set_external_index(str(path), memory_id, stat.st_mtime_ns, stat.st_size, content_hash)
+            store.set_external_catalog_indexed(row["path"], memory_id, stat.st_mtime_ns, stat.st_size, content_hash)
             external_reparsed += 1
-        return external_paths, external_reparsed
+        if ranked:
+            store.set_schema_value("external_index_cursor", last_path)
+        return external_reparsed
