@@ -312,7 +312,7 @@ def split_for_line(text: str, max_chars: int = LINE_SAFE_BUBBLE_CHARS) -> List[s
         if chunks:
             tail = chunks[-1]
             chunks[-1] = _line_truncate_utf16(
-                tail,
+                tail + LINE_ELLIPSIS,
                 max_chars,
                 ellipsis=LINE_ELLIPSIS,
             )

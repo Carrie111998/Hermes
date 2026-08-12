@@ -181,6 +181,7 @@ class TestMarkdownAndChunking:
         chunks = split_for_line(text, max_chars=10)
         assert len(chunks) <= 5
         assert all(utf16_len(chunk) <= 10 for chunk in chunks)
+        assert chunks[-1].endswith("…")
 
 
 # ---------------------------------------------------------------------------
