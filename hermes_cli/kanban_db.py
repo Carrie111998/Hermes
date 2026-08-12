@@ -4057,6 +4057,94 @@ def _append_event(
     )
 
 
+def _record_decompose_rejection(
+    conn: sqlite3.Connection,
+    task_id: str,
+    detail: str,
+) -> bool:
+    """Record a bounded graph-rejection event without changing task state.
+
+    Validation happens before the decomposition write transaction. Re-check
+    the root in this small transaction so a concurrent status change cannot
+    create an audit event for a task that is no longer eligible for fan-out.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None or row["status"] != "triage":
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "decompose_rejected",
+            {
+                "rejection_class": "invalid_dependency_graph",
+                "detail": str(detail)[:500],
+            },
+        )
+    return True
+
+
+def _validate_decomposition_parents(
+    children: list[dict],
+) -> tuple[tuple[int, ...], ...]:
+    """Validate and freeze sibling dependency indices.
+
+    A missing ``parents`` key means no dependencies. Once the key is present,
+    its value must be an explicit list of integer indices. The returned tuple
+    is the only representation consumed by cycle detection and link creation,
+    preventing those paths from applying different coercion rules.
+    """
+    parents_by_child: list[tuple[int, ...]] = []
+    for idx, child in enumerate(children):
+        parents = child["parents"] if "parents" in child else []
+        if not isinstance(parents, list):
+            raise ValueError(f"child[{idx}].parents must be a list")
+
+        validated: list[int] = []
+        for parent in parents:
+            if isinstance(parent, bool) or not isinstance(parent, int):
+                raise ValueError(
+                    f"child[{idx}].parents contains a non-integer index "
+                    "(not a valid index into children)"
+                )
+            if parent < 0 or parent >= len(children):
+                raise ValueError(
+                    f"child[{idx}].parents[{parent}] is not a valid index "
+                    "into children"
+                )
+            if parent == idx:
+                raise ValueError(f"child[{idx}] cannot list itself as a parent")
+            validated.append(parent)
+
+        parents_by_child.append(tuple(validated))
+
+    # Detect cycles using the exact immutable representation that link
+    # creation will consume. Duplicate edges retain the existing INSERT OR
+    # IGNORE behavior and therefore do not change the public contract here.
+    in_degree = [0] * len(children)
+    adjacency: list[list[int]] = [[] for _ in children]
+    for child_idx, parents in enumerate(parents_by_child):
+        for parent_idx in parents:
+            adjacency[parent_idx].append(child_idx)
+            in_degree[child_idx] += 1
+
+    queue = [idx for idx, degree in enumerate(in_degree) if degree == 0]
+    seen = 0
+    while queue:
+        node = queue.pop()
+        seen += 1
+        for neighbor in adjacency[node]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+    if seen != len(children):
+        raise ValueError("cyclic dependency detected in decomposed children list")
+
+    return tuple(parents_by_child)
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6939,14 +7027,13 @@ def decompose_triage_task(
         }
 
     Returns the list of created child task ids (in input order) on
-    success. Returns ``None`` when:
-      - The root task does not exist
-      - The root task is not in ``triage``
-      - A cycle would result (caller built a bad graph)
+    success. Returns ``None`` when the root task does not exist or is no
+    longer in ``triage``. Invalid dependency graphs raise ``ValueError``
+    after recording a bounded ``decompose_rejected`` event when the root
+    remains in ``triage``; no child or link rows are written on rejection.
 
-    Validation of titles/assignees happens inside the same write_txn as
-    the inserts so a malformed entry aborts the whole decomposition
-    cleanly (no orphan children).
+    Validation happens before the decomposition write transaction, while
+    every valid child/link/root mutation remains atomic in one transaction.
     """
     if not children:
         return None
@@ -6961,39 +7048,12 @@ def decompose_triage_task(
         title = child.get("title")
         if not isinstance(title, str) or not title.strip():
             raise ValueError(f"child[{idx}].title is required")
-        parents_idx = child.get("parents") or []
-        if not isinstance(parents_idx, list):
-            raise ValueError(f"child[{idx}].parents must be a list")
-        for p in parents_idx:
-            if not isinstance(p, int) or p < 0 or p >= len(children):
-                raise ValueError(
-                    f"child[{idx}].parents[{p}] is not a valid index into children"
-                )
-            if p == idx:
-                raise ValueError(f"child[{idx}] cannot list itself as a parent")
 
-    # Detect cycles in the sibling parent graph (Kahn's topological sort).
-    # link_tasks() calls _would_cycle() for every new edge; here we check
-    # the entire sibling graph before touching the DB.  A cycle silently
-    # deadlocks every involved child in 'todo' because recompute_ready()
-    # can never promote them.
-    _in_deg = [0] * len(children)
-    _adj: list[list[int]] = [[] for _ in range(len(children))]
-    for _i, _c in enumerate(children):
-        for _p in (_c.get("parents") or []):
-            _adj[_p].append(_i)
-            _in_deg[_i] += 1
-    _queue = [_i for _i in range(len(children)) if _in_deg[_i] == 0]
-    _seen = 0
-    while _queue:
-        _node = _queue.pop()
-        _seen += 1
-        for _nb in _adj[_node]:
-            _in_deg[_nb] -= 1
-            if _in_deg[_nb] == 0:
-                _queue.append(_nb)
-    if _seen != len(children):
-        raise ValueError("cyclic dependency detected in decomposed children list")
+    try:
+        parents_by_child = _validate_decomposition_parents(children)
+    except ValueError as exc:
+        _record_decompose_rejection(conn, task_id, str(exc))
+        raise
 
     # We do the full decomposition in a SINGLE write_txn so it's
     # atomic: either every child is created AND the root flips to
@@ -7077,8 +7137,8 @@ def decompose_triage_task(
             child_ids.append(new_id)
 
         # Link children to their sibling parents (within the decomposed graph).
-        for idx, child in enumerate(children):
-            for p_idx in child.get("parents") or []:
+        for idx, parent_indices in enumerate(parents_by_child):
+            for p_idx in parent_indices:
                 parent_id = child_ids[p_idx]
                 child_id = child_ids[idx]
                 conn.execute(

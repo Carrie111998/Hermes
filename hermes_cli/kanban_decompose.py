@@ -417,16 +417,16 @@ def decompose_task(
                 "routing to default_assignee %r",
                 task_id, idx, assignee, default_assignee,
             )
-        parents = entry.get("parents") or []
-        if not isinstance(parents, list):
-            parents = []
-        # Clean parent indices: drop non-int and out-of-range.
-        clean_parents = [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx]
+        # Preserve the supplied graph shape. The DB boundary is the single
+        # source of truth for dependency validation; silently repairing an
+        # LLM-produced graph can remove prerequisites and change execution
+        # semantics.
+        parents = entry["parents"] if "parents" in entry else []
         children.append({
             "title": title.strip()[:200],
             "body": body.strip(),
             "assignee": chosen,
-            "parents": clean_parents,
+            "parents": parents,
         })
 
     try:

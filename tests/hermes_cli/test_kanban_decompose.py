@@ -113,6 +113,40 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     assert c1.assignee == "engineer"
 
 
+def test_decompose_preserves_supplied_invalid_parent_for_db_rejection(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship a feature", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "tasks": [
+            {"title": "research", "parents": None},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "DB rejected graph" in outcome.reason
+    with kb.connect() as conn:
+        root = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        child_count = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE id != ?", (tid,)
+        ).fetchone()[0]
+    assert root.status == "triage"
+    assert child_count == 0
+    assert [event.kind for event in events].count("decompose_rejected") == 1
+
+
 def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="route me safely", triage=True)
