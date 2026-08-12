@@ -849,7 +849,7 @@ check_node() {
     fi
 
     if command -v node &> /dev/null; then
-        log_warn "Node.js $(node --version) is too old (Hermes requires Node >=26) — installing Hermes-managed Node $NODE_VERSION..."
+        log_warn "Node.js $(node --version) is unsupported (Hermes requires Node 22.22+, 24, or 26+) — installing Hermes-managed Node $NODE_VERSION..."
     elif [ "$DISTRO" = "termux" ]; then
         log_info "Node.js not found — installing Node.js via pkg..."
     else
