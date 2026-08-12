@@ -1825,7 +1825,33 @@ def _image_source_from_openai_url(url: str) -> Dict[str, str]:
     return {"type": "url", "url": url}
 
 
-def _convert_content_part_to_anthropic(part: Any) -> Optional[Dict[str, Any]]:
+def _video_source_from_openai_url(url: str) -> Dict[str, str]:
+    """Convert an OpenAI-style video URL/data URL into a video source."""
+    url = str(url or "").strip()
+    if not url:
+        return {"type": "url", "url": ""}
+
+    if url.startswith("data:"):
+        header, _, data = url.partition(",")
+        media_type = "video/mp4"
+        if header.startswith("data:"):
+            mime_part = header[len("data:"):].split(";", 1)[0].strip()
+            if mime_part.startswith("video/"):
+                media_type = mime_part
+        return {
+            "type": "base64",
+            "media_type": media_type,
+            "data": data,
+        }
+
+    return {"type": "url", "url": url}
+
+
+def _convert_content_part_to_anthropic(
+    part: Any,
+    *,
+    convert_video: bool = False,
+) -> Optional[Dict[str, Any]]:
     """Convert a single OpenAI-style content part to Anthropic format."""
     if part is None:
         return None
@@ -1851,6 +1877,10 @@ def _convert_content_part_to_anthropic(part: Any) -> Optional[Dict[str, Any]]:
         image_value = part.get("image_url", {})
         url = image_value.get("url", "") if isinstance(image_value, dict) else str(image_value or "")
         block = {"type": "image", "source": _image_source_from_openai_url(url)}
+    elif ptype == "video_url" and convert_video:
+        video_value = part.get("video_url", {})
+        url = video_value.get("url", "") if isinstance(video_value, dict) else str(video_value or "")
+        block = {"type": "video", "source": _video_source_from_openai_url(url)}
     else:
         block = dict(part)
 
@@ -1931,14 +1961,14 @@ def _extract_preserved_thinking_blocks(message: Dict[str, Any]) -> List[Dict[str
     return preserved
 
 
-def _convert_content_to_anthropic(content: Any) -> Any:
+def _convert_content_to_anthropic(content: Any, *, convert_video: bool = False) -> Any:
     """Convert OpenAI-style multimodal content arrays to Anthropic blocks."""
     if not isinstance(content, list):
         return content
 
     converted = []
     for part in content:
-        block = _convert_content_part_to_anthropic(part)
+        block = _convert_content_part_to_anthropic(part, convert_video=convert_video)
         if block is not None:
             converted.append(block)
     return converted
@@ -2337,10 +2367,13 @@ def _convert_tool_message_to_result(
         result.append({"role": "user", "content": [tool_result]})
 
 
-def _convert_user_message(content: Any) -> Dict[str, Any]:
+def _convert_user_message(content: Any, *, convert_video: bool = False) -> Dict[str, Any]:
     """Validate and convert a user message to anthropic format."""
     if isinstance(content, list):
-        converted_blocks = _convert_content_to_anthropic(content)
+        converted_blocks = _convert_content_to_anthropic(
+            content,
+            convert_video=convert_video,
+        )
         kept_blocks = _fix_blank_text_blocks_in_list(
             converted_blocks,
             placeholder_text="(empty message)",
@@ -2785,6 +2818,7 @@ def convert_messages_to_anthropic(
     """
     system = None
     result: List[Dict[str, Any]] = []
+    convert_video = _is_minimax_anthropic_endpoint(base_url)
 
     for m in messages:
         role = m.get("role", "user")
@@ -2815,7 +2849,7 @@ def convert_messages_to_anthropic(
             continue
 
         # Regular user message
-        result.append(_convert_user_message(content))
+        result.append(_convert_user_message(content, convert_video=convert_video))
 
     _strip_orphaned_tool_blocks(result)
     result = _merge_consecutive_roles(result)

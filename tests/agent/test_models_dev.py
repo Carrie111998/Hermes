@@ -358,6 +358,17 @@ CAPS_REGISTRY = {
             },
         },
     },
+    "minimax": {
+        "id": "minimax",
+        "models": {
+            "multimodal-agent": {
+                "id": "multimodal-agent",
+                "tool_call": True,
+                "modalities": {"input": ["text", "image", "video"]},
+                "limit": {"context": 128000, "output": 8192},
+            },
+        },
+    },
 }
 
 
@@ -370,6 +381,15 @@ class TestGetModelCapabilities:
             caps = get_model_capabilities("anthropic", "claude-sonnet-4")
         assert caps is not None
         assert caps.supports_vision is True
+
+    def test_input_modalities_preserved_for_capability_checks(self):
+        with patch("agent.models_dev.fetch_models_dev", return_value=CAPS_REGISTRY):
+            caps = get_model_capabilities("minimax", "multimodal-agent")
+
+        assert caps is not None
+        assert caps.input_modalities == ("text", "image", "video")
+        assert caps.supports_vision is True
+        assert caps.supports_video is True
 
 
 
@@ -389,4 +409,3 @@ class TestGetModelCapabilities:
             caps = get_model_capabilities("gemini", "weird-model")
         assert caps is not None
         assert caps.supports_vision is False
-
