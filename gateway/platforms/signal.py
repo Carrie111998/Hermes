@@ -44,7 +44,7 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.helpers import redact_phone
 from gateway.platforms.media_cache import DEFAULT_EXT_TO_MIME, mime_for_ext
-from gateway.session import neutralize_untrusted_inline_text
+from gateway.session import SessionSource, neutralize_untrusted_inline_text
 from tools.audio_container import CONTAINER_TO_EXT, sniff_container
 from gateway.platforms.signal_format import markdown_to_signal
 from gateway.platforms.signal_rate_limit import (
@@ -296,11 +296,7 @@ class SignalAdapter(BasePlatformAdapter):
         # Optional passive group context. When require_mention drops ordinary
         # group chatter, retain a small in-memory window for the next addressed
         # turn without dispatching the agent.
-        _observe_cfg = extra.get("observe_unmentioned_group_messages")
-        if _observe_cfg is None:
-            _observe_cfg = os.getenv(
-                "SIGNAL_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "false"
-            )
+        _observe_cfg = extra.get("observe_unmentioned_group_messages", False)
         self.observe_unmentioned_group_messages = (
             str(_observe_cfg).strip().lower() in {"true", "1", "yes", "on"}
         )
@@ -553,21 +549,36 @@ class SignalAdapter(BasePlatformAdapter):
     # Message Handling
     # ------------------------------------------------------------------
 
-    def _signal_sender_is_authorized(self, sender: str, chat_id: str) -> bool:
-        """Use the gateway auth chain, with the adapter allowlist as fallback."""
-        authorized = self._is_sender_authorized(sender, "group", chat_id)
+    def _signal_source_is_authorized(self, source: SessionSource) -> bool:
+        """Authorize passive context against the source's resolved profile."""
+        if getattr(source, "profile_route_rejected", False) is True:
+            return False
+
+        runner = getattr(self, "gateway_runner", None)
+        if runner is not None:
+            try:
+                return bool(runner._is_user_authorized(source))
+            except Exception:
+                logger.warning(
+                    "Signal: routed passive-context authorization failed; denying",
+                    exc_info=True,
+                )
+                return False
+
+        authorized = self._is_sender_authorized(
+            source.user_id, source.chat_type, source.chat_id
+        )
         if authorized is not None:
             return authorized
         if self._authorization_check is not None:
             return False
-        return "*" in self.dm_allow_from or sender in self.dm_allow_from
+        return "*" in self.dm_allow_from or source.user_id in self.dm_allow_from
 
     def _observe_unmentioned_group_text(
         self,
         *,
         group_id: str,
-        chat_id: str,
-        sender: str,
+        source: SessionSource,
         sender_name: str,
         text: str,
         message_id: Any,
@@ -578,12 +589,12 @@ class SignalAdapter(BasePlatformAdapter):
             return
         content = content[:SIGNAL_OBSERVED_MESSAGE_MAX_CHARS]
         display_name = neutralize_untrusted_inline_text(
-            sender_name or redact_phone(sender)
+            sender_name or redact_phone(source.user_id or "")
         ) or "unknown"
-        if not self._signal_sender_is_authorized(sender, chat_id):
+        if not self._signal_source_is_authorized(source):
             return
         line = f"[{display_name}] {content}"
-        key = f"{sender}:{message_id}" if message_id else ""
+        key = f"{source.user_id}:{message_id}" if message_id else ""
 
         entries = self._observed_group_context.get(group_id)
         if entries is None:
@@ -705,6 +716,19 @@ class SignalAdapter(BasePlatformAdapter):
         if text and mentions:
             text = _render_mentions(text, mentions)
 
+        # Resolve profile routing before passive-context authorization. A
+        # default adapter may serve chats routed to another profile, whose
+        # pairing store and allowlist must remain isolated.
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=group_info.get("groupName") if group_info else sender_name,
+            chat_type=chat_type,
+            user_id=sender,
+            user_name=sender_name or sender,
+            user_id_alt=sender_uuid if sender_uuid else None,
+            chat_id_alt=group_id if is_group else None,
+        )
+
         # Mention filter: in groups, only process messages that @mention the bot account
         if is_group and self.require_mention:
             account_norm = self._account_normalized
@@ -720,8 +744,7 @@ class SignalAdapter(BasePlatformAdapter):
                 if self.observe_unmentioned_group_messages:
                     self._observe_unmentioned_group_text(
                         group_id=group_id,
-                        chat_id=chat_id,
-                        sender=sender,
+                        source=source,
                         sender_name=sender_name,
                         text=text,
                         message_id=envelope_data.get("timestamp"),
@@ -799,17 +822,6 @@ class SignalAdapter(BasePlatformAdapter):
             )
             return
 
-        # Build session source
-        source = self.build_source(
-            chat_id=chat_id,
-            chat_name=group_info.get("groupName") if group_info else sender_name,
-            chat_type=chat_type,
-            user_id=sender,
-            user_name=sender_name or sender,
-            user_id_alt=sender_uuid if sender_uuid else None,
-            chat_id_alt=group_id if is_group else None,
-        )
-
         observed_context = None
         if (
             is_group
@@ -820,7 +832,7 @@ class SignalAdapter(BasePlatformAdapter):
             # The normal gateway authorization still runs in the handler. This
             # early check prevents an unauthorized addressed message from
             # consuming the group's context window before that gate rejects it.
-            if not self._signal_sender_is_authorized(sender, chat_id):
+            if not self._signal_source_is_authorized(source):
                 logger.debug(
                     "Signal: ignoring observed-context trigger from unauthorized sender %s",
                     redact_phone(sender),

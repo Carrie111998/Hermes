@@ -98,10 +98,10 @@ class TestSignalAdapterInit:
         assert adapter.account == "+15551234567"
         assert "group123" in adapter.group_allow_from
 
-    def test_passive_group_context_reads_env_string(self, monkeypatch):
-        monkeypatch.setenv("SIGNAL_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "true")
-
-        adapter = _make_signal_adapter(monkeypatch)
+    def test_passive_group_context_reads_config_bool(self, monkeypatch):
+        adapter = _make_signal_adapter(
+            monkeypatch, observe_unmentioned_group_messages=True
+        )
 
         assert adapter.observe_unmentioned_group_messages is True
 
@@ -151,9 +151,6 @@ class TestSignalPassiveGroupContext:
 
     @pytest.mark.asyncio
     async def test_default_mode_still_drops_unmentioned_text(self, monkeypatch):
-        monkeypatch.delenv(
-            "SIGNAL_OBSERVE_UNMENTIONED_GROUP_MESSAGES", raising=False
-        )
         adapter = _make_signal_adapter(
             monkeypatch,
             group_allowed="group-a",
@@ -165,6 +162,92 @@ class TestSignalPassiveGroupContext:
 
         adapter.handle_message.assert_not_awaited()
         assert not adapter._observed_group_context
+
+    @pytest.mark.asyncio
+    async def test_routed_profile_auth_prevents_cross_profile_context_leak(
+        self, monkeypatch
+    ):
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig()
+        runner.config.platforms[Platform.SIGNAL] = PlatformConfig(
+            enabled=True,
+            extra={
+                "http_url": "http://localhost:8080",
+                "account": "+15551234567",
+                "require_mention": True,
+                "observe_unmentioned_group_messages": True,
+            },
+        )
+        adapter = runner._create_adapter(
+            Platform.SIGNAL,
+            runner.config.platforms[Platform.SIGNAL],
+        )
+        assert adapter is not None
+        adapter.group_allow_from = {"group-a"}
+        adapter.handle_message = AsyncMock()
+        runner.adapters = {Platform.SIGNAL: adapter}
+        runner._profile_adapters = {}
+        default_store = MagicMock()
+        default_store.is_approved.side_effect = (
+            lambda _platform, user_id: user_id == "+15550001111"
+        )
+        profile_store = MagicMock()
+        profile_store.is_approved.side_effect = (
+            lambda _platform, user_id: user_id == "+15550002222"
+        )
+        runner.pairing_store = default_store
+        runner.pairing_stores = {
+            "default": default_store,
+            "profile-b": profile_store,
+        }
+        runner._profile_name_for_source = lambda _source: "profile-b"
+        assert adapter.gateway_runner is runner
+
+        with patch.dict("os.environ", {}, clear=True):
+            await adapter._handle_envelope(
+                self._group_envelope("private default context")
+            )
+            await adapter._handle_envelope(
+                self._group_envelope(
+                    "summarize",
+                    sender="+15550002222",
+                    sender_name="Bob",
+                    timestamp=1001,
+                    mentioned=True,
+                )
+            )
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.profile == "profile-b"
+        assert event.channel_context is None
+        assert not adapter._observed_group_context
+        default_store.is_approved.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejected_profile_route_preserves_buffer_and_does_not_dispatch(
+        self, monkeypatch
+    ):
+        from gateway.profile_routing import ProfileRouteRejected
+
+        adapter = self._adapter(monkeypatch, auth=lambda *_args: True)
+        await adapter._handle_envelope(self._group_envelope("kept context"))
+        before = list(adapter._observed_group_context["group-a"])
+
+        runner = MagicMock()
+        runner._profile_name_for_source.side_effect = ProfileRouteRejected(
+            "unserved"
+        )
+        adapter.gateway_runner = runner
+        await adapter._handle_envelope(
+            self._group_envelope("summarize", timestamp=1001, mentioned=True)
+        )
+
+        adapter.handle_message.assert_not_awaited()
+        assert list(adapter._observed_group_context["group-a"]) == before
+        runner._is_user_authorized.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_unmentioned_text_is_buffered_without_dispatch(self, monkeypatch):

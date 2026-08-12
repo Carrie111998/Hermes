@@ -108,9 +108,15 @@ SIGNAL_ALLOWED_USERS=+1234567890,+0987654321    # Comma-separated E.164 numbers 
 
 # Optional
 SIGNAL_GROUP_ALLOWED_USERS=groupId1,groupId2     # Enable groups (omit to disable, * for all)
-SIGNAL_REQUIRE_MENTION=true                      # Only respond when explicitly mentioned
-SIGNAL_OBSERVE_UNMENTIONED_GROUP_MESSAGES=true  # Include recent group chatter as context
 SIGNAL_HOME_CHANNEL=+1234567890                  # Default delivery target for cron jobs
+```
+
+Behavior settings belong in `~/.hermes/config.yaml`:
+
+```yaml
+signal:
+  require_mention: true
+  observe_unmentioned_group_messages: true
 ```
 
 Then start the gateway:
@@ -145,11 +151,10 @@ Group access is controlled by the `SIGNAL_GROUP_ALLOWED_USERS` env var:
 
 ### Passive group context
 
-When `SIGNAL_REQUIRE_MENTION=true`, Hermes normally drops unmentioned group
-messages. Set `SIGNAL_OBSERVE_UNMENTIONED_GROUP_MESSAGES=true` (or the equivalent
-`signal.observe_unmentioned_group_messages: true` in `config.yaml`) to keep up
-to 50 recent text messages per allowed group as background context for the next
-message that explicitly mentions the bot.
+When `signal.require_mention: true`, Hermes normally drops unmentioned group
+messages. Set `signal.observe_unmentioned_group_messages: true` in
+`config.yaml` to keep up to 50 recent text messages per allowed group as
+background context for the next message that explicitly mentions the bot.
 
 Observed messages never start an agent turn, typing indicator, tool call, or
 reaction. The pending buffer is memory-only, isolated per group, consumed by
@@ -271,7 +276,5 @@ The adapter monitors the SSE connection and automatically reconnects if:
 | `SIGNAL_ACCOUNT` | Yes | — | Bot phone number (E.164) |
 | `SIGNAL_ALLOWED_USERS` | No | — | Comma-separated phone numbers/UUIDs |
 | `SIGNAL_GROUP_ALLOWED_USERS` | No | — | Group IDs to monitor, or `*` for all (omit to disable groups) |
-| `SIGNAL_REQUIRE_MENTION` | No | `false` | Require an explicit mention before responding in groups |
-| `SIGNAL_OBSERVE_UNMENTIONED_GROUP_MESSAGES` | No | `false` | Buffer recent unmentioned group text for the next addressed turn |
 | `SIGNAL_ALLOW_ALL_USERS` | No | `false` | Allow any user to interact (skip allowlist) |
 | `SIGNAL_HOME_CHANNEL` | No | — | Default delivery target for cron jobs |
