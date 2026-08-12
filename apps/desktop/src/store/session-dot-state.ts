@@ -15,6 +15,12 @@
  *
  * The inputs are all reference-stable across stream deltas, so this recomputes
  * on status edges rather than per token.
+ *
+ * Unread has TWO sources, both claiming the same state: the runtime marker
+ * (a turn finished in the background while this window wasn't looking at it,
+ * $unreadFinishedSessionIds — transient) and the backend's derived read-state
+ * watermark (row.unread — persists across restarts and is visible to every
+ * surface). The write side of the persisted flag lives in session-unread.ts.
  */
 
 import { computed } from 'nanostores'
@@ -24,6 +30,7 @@ import { stableRecord } from '@/lib/stable-array'
 import { $backgroundRunningSessionIds } from './composer-status'
 import { $sessions, $unreadFinishedSessionIds, lineageAliases } from './session'
 import { $attentionSessionIds, $draftSessionIds, $stalledSessionIds, $workingSessionIds } from './session-states'
+import { $unreadWriteGuard, UNREAD_WRITE_GUARD_MS } from './session-unread'
 
 export type SessionDotState = 'background' | 'draft' | 'idle' | 'needs-input' | 'stalled' | 'unread' | 'working'
 
@@ -65,9 +72,10 @@ export const $sessionDotStateById = computed(
     $backgroundRunningSessionIds,
     $unreadFinishedSessionIds,
     $draftSessionIds,
-    $sessions
+    $sessions,
+    $unreadWriteGuard
   ],
-  (attention, working, stalled, background, unread, draft, sessions) => {
+  (attention, working, stalled, background, unread, draft, sessions, unreadWriteGuard) => {
     const next: Record<string, SessionDotState> = {}
 
     const claim = (ids: readonly string[], state: SessionDotState) => {
@@ -86,6 +94,28 @@ export const $sessionDotStateById = computed(
     // the first thing that does happen speaks over it.
     claim(draft, 'draft')
     claim(unread, 'unread')
+
+    // Persisted read state (backend watermark): a row marked unread keeps the
+    // same emerald dot a background finish would paint, and survives
+    // restarts. Same tier as the runtime marker — both mean "there is
+    // something here you haven't opened". A list page that predates one of
+    // our own writes is fenced out by the write guard: keep OUR value until a
+    // page confirms it or the guard expires.
+    const persistedUnread: string[] = []
+    for (const s of sessions) {
+      const entry = unreadWriteGuard.get(s.id)
+      if (entry && Date.now() - entry.at < UNREAD_WRITE_GUARD_MS) {
+        if (entry.value) {
+          persistedUnread.push(s.id)
+        }
+        continue
+      }
+      if (s.unread === true) {
+        persistedUnread.push(s.id)
+      }
+    }
+    claim(persistedUnread, 'unread')
+
     claim(background, 'background')
     claim(working, 'working')
 

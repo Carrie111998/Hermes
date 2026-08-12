@@ -94,8 +94,12 @@ interface SessionActions {
   sessionId: string
   title: string
   pinned?: boolean
+  /** Backend-derived read state — drives the Mark as unread/read label. */
+  unread?: boolean
   profile?: string
   onPin?: () => void
+  /** Toggle the persisted read-state watermark for this row. */
+  onToggleUnread?: () => void
   onBranch?: () => void
   onArchive?: () => void
   onDelete?: () => void
@@ -176,8 +180,10 @@ function useSessionActions({
   sessionId,
   title,
   pinned = false,
+  unread = false,
   profile,
   onPin,
+  onToggleUnread,
   onBranch,
   onArchive,
   onDelete,
@@ -250,6 +256,17 @@ function useSessionActions({
       onSelect: () => {
         triggerHaptic('selection')
         onPin?.()
+      }
+    }),
+    spec({
+      disabled: !onToggleUnread,
+      // Closed envelope = unread, open envelope = read (codicon has mail and
+      // mail-read, but no mail-unread glyph — verified against the font css).
+      icon: unread ? 'mail-read' : 'mail',
+      label: unread ? r.markRead : r.markUnread,
+      onSelect: () => {
+        triggerHaptic('selection')
+        onToggleUnread?.()
       }
     })
   ]
