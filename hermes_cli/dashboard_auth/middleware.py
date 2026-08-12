@@ -428,7 +428,9 @@ async def gated_auth_middleware(
         unreachable_provider: str | None = None
         for provider in _ordered_session_providers(provider_hint):
             try:
-                session = provider.verify_session(access_token=at)
+                session = await asyncio.to_thread(
+                    provider.verify_session, access_token=at
+                )
             except ProviderError as e:
                 _log.warning(
                     "dashboard-auth: provider %r unreachable during verify: %s",
