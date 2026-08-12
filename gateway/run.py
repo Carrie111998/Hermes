@@ -9117,7 +9117,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source = event.source
         if getattr(source, "profile_route_rejected", False) is True:
             return True
-        if getattr(self.config, "multiplex_profiles", False) is True:
+        if (
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+            is True
+        ):
             try:
                 profile_home = self._resolve_profile_home_for_source(source)
             except Exception:
@@ -14135,7 +14138,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Run authorization under the runtime scope selected by *source*."""
         if getattr(source, "profile_route_rejected", False) is True:
             return False
-        if getattr(self.config, "multiplex_profiles", False) is not True:
+        if (
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+            is not True
+        ):
             return self._is_user_authorized(source)
         try:
             profile_home = self._resolve_profile_home_for_source(source)
