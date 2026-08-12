@@ -280,6 +280,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
             const nextTitle = (result.title ?? requestedTitle).trim()
             const suffix = result.pending ? ti('session.titleQueuedSuffix') : ''
+            patchUiState({ sessionTitle: nextTitle })
             sys(ti('session.titleSet', { title: nextTitle, suffix }))
           })
           .catch((err: unknown) => {

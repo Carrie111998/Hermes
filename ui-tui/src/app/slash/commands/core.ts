@@ -328,6 +328,7 @@ export const coreCommands: SlashCommand[] = [
           ctx.guarded<SessionTitleResponse>(r => {
             const next = (r?.title ?? title).trim()
             const suffix = r?.pending ? translate(ctx.ui.locale, 'session.titleQueuedSuffix') : ''
+            patchUiState({ sessionTitle: next })
             ctx.transcript.sys(translate(ctx.ui.locale, 'sys.titleSet', { title: next, suffix }))
           })
         )
@@ -507,9 +508,7 @@ export const coreCommands: SlashCommand[] = [
   {
     name: 'paste',
     run: (arg, ctx) =>
-      arg
-        ? ctx.transcript.sys(translate(ctx.ui.locale, 'sys.usagePaste'))
-        : ctx.composer.attachClipboardImage()
+      arg ? ctx.transcript.sys(translate(ctx.ui.locale, 'sys.usagePaste')) : ctx.composer.attachClipboardImage()
   },
 
   {

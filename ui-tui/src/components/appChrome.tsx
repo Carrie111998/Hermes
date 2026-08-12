@@ -519,6 +519,7 @@ export function StatusRuleView({
   bgCount,
   lastTurnEndedAt,
   liveSessionCount,
+  sessionTitle,
   sessionStartedAt,
   turnStartedAt,
   voiceRecording,
@@ -594,7 +595,8 @@ export function StatusRuleView({
     stringWidth(modelText) +
     (ctxLabel ? stringWidth(' │ ') + stringWidth(ctxLabel) : 0)
 
-  const { leftWidth, rightWidth, separatorWidth } = statusRuleWidths(cols, cwdLabel, essentialWidth)
+  const rightLabel = sessionTitle ? ` ${sessionTitle} ` : cwdLabel
+  const { leftWidth, rightWidth, separatorWidth } = statusRuleWidths(cols, rightLabel, essentialWidth)
 
   // Whole-segment progressive disclosure for the tail: a segment renders only
   // if it fits in the space left after the pinned essentials. Idle background
@@ -801,8 +803,8 @@ export function StatusRuleView({
         <>
           <Text color={t.color.border}>{separatorWidth >= 3 ? ' ─ ' : ' '}</Text>
           <Box flexShrink={0} width={rightWidth}>
-            <Text color={t.color.label} wrap="truncate-end">
-              {cwdLabel}
+            <Text bold={!!sessionTitle} color={sessionTitle ? t.color.accent : t.color.label} wrap="truncate-end">
+              {rightLabel}
             </Text>
           </Box>
         </>
@@ -922,6 +924,7 @@ interface StatusRuleProps {
   indicatorStyle?: IndicatorStyle
   notice?: Notice | null
   sessionStartedAt?: null | number
+  sessionTitle?: string
   status: string
   statusColor: string
   t: Theme

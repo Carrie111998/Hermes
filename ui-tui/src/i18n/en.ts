@@ -303,6 +303,7 @@ const catalog = {
   'submission.shellExit': 'exit {code}',
   'transcript.moaReference': '◇ Reference{position} — {label}',
   'transcript.modelChanged': 'model changed',
+  'transcript.personalityChanged': 'personality changed',
   'transcript.resumedInterruptedTurn': 'resumed interrupted turn',
   'transcript.backgroundAgentWorkFinished': 'background agent work finished',
   'transcript.backgroundAgentFinished': '{count} background agent finished',

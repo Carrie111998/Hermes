@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { isUsableClipboardText, readClipboardText, writeClipboardText } from '../lib/clipboard.js'
 
-const POWERSHELL_READ_CLIPBOARD = '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard -Raw'
+const POWERSHELL_READ_CLIPBOARD =
+  '[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes((Get-Clipboard -Raw)))'
 
 describe('readClipboardText', () => {
   it('reads text from pbpaste on macOS', async () => {
@@ -17,7 +18,8 @@ describe('readClipboardText', () => {
   })
 
   it('reads text from PowerShell on Windows', async () => {
-    const run = vi.fn().mockResolvedValue({ stdout: 'from windows\r\n' })
+    const b64 = Buffer.from('from windows\r\n', 'utf8').toString('base64')
+    const run = vi.fn().mockResolvedValue({ stdout: b64 })
 
     await expect(readClipboardText('win32', run)).resolves.toBe('from windows\r\n')
     expect(run).toHaveBeenCalledWith(
@@ -28,7 +30,8 @@ describe('readClipboardText', () => {
   })
 
   it('tries powershell.exe first on WSL', async () => {
-    const run = vi.fn().mockResolvedValue({ stdout: 'from wsl\n' })
+    const b64 = Buffer.from('from wsl\n', 'utf8').toString('base64')
+    const run = vi.fn().mockResolvedValue({ stdout: b64 })
 
     await expect(readClipboardText('linux', run, { WSL_INTEROP: '/tmp/socket' } as NodeJS.ProcessEnv)).resolves.toBe(
       'from wsl\n'
@@ -83,6 +86,16 @@ describe('readClipboardText', () => {
       readClipboardText('linux', run, { WAYLAND_DISPLAY: 'wayland-1' } as NodeJS.ProcessEnv)
     ).resolves.toBeNull()
   })
+
+  it('preserves CJK text via base64 decoding from PowerShell on WSL', async () => {
+    const cjkText = '你好世界，测试中文 🎉'
+    const b64 = Buffer.from(cjkText, 'utf8').toString('base64')
+    const run = vi.fn().mockResolvedValue({ stdout: b64 })
+
+    await expect(readClipboardText('linux', run, { WSL_INTEROP: '/tmp/socket' } as NodeJS.ProcessEnv)).resolves.toBe(
+      cjkText
+    )
+  })
 })
 
 describe('isUsableClipboardText', () => {
@@ -111,6 +124,7 @@ describe('writeClipboardText', () => {
 
         return child
       }),
+      unref: vi.fn(),
       stdin: { end: vi.fn() }
     }
 
@@ -131,6 +145,7 @@ describe('writeClipboardText', () => {
 
         return child
       }),
+      unref: vi.fn(),
       stdin
     }
 
@@ -154,6 +169,7 @@ describe('writeClipboardText', () => {
 
         return child
       }),
+      unref: vi.fn(),
       stdin: { end: vi.fn() }
     }
 
@@ -173,6 +189,7 @@ describe('writeClipboardText', () => {
 
         return child
       }),
+      unref: vi.fn(),
       stdin
     }
 
@@ -203,6 +220,7 @@ describe('writeClipboardText', () => {
 
         return child
       }),
+      unref: vi.fn(),
       stdin
     }
 
@@ -228,6 +246,7 @@ describe('writeClipboardText', () => {
 
         return child
       }),
+      unref: vi.fn(),
       stdin
     }
 
@@ -250,6 +269,7 @@ describe('writeClipboardText', () => {
 
         return child
       }),
+      unref: vi.fn(),
       stdin
     }
 
@@ -284,6 +304,7 @@ describe('writeClipboardText', () => {
 
         return child
       }),
+      unref: vi.fn(),
       stdin
     }
 
@@ -321,6 +342,7 @@ describe('writeClipboardText', () => {
 
         return child
       }),
+      unref: vi.fn(),
       stdin
     }
 
@@ -347,6 +369,7 @@ describe('writeClipboardText', () => {
 
         return child
       }),
+      unref: vi.fn(),
       stdin
     }
 

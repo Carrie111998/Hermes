@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 
 import type { CompletionItem } from '../app/interfaces.js'
+import { rankSlashItems } from '../app/slash/fuzzyScore.js'
 import { inlineSlashTrigger, looksLikeSlashCommand } from '../domain/slash.js'
 import type { GatewayClient } from '../gatewayClient.js'
 import type { CompletionResponse, GatewayCompletionItem } from '../gatewayTypes.js'
@@ -10,7 +11,9 @@ import { listWidgetApps, widgetHelp } from '../sdk/registry.js'
 
 /** Client-side widget apps live in the TUI's registry, not the gateway — so
  *  `/` completions merge their title/metadata here. Registry-driven: a new
- *  app surfaces automatically, no hardcoded lists on either side. */
+ *  app surfaces automatically, no hardcoded lists on either side. Matching is
+ *  description-aware (ported from grok-cli's slash menu): `/timer` surfaces a
+ *  widget whose help text mentions timers, not just id-prefix hits. */
 export function mergeWidgetAppItems(
   input: string,
   items: CompletionItem[],
@@ -21,8 +24,7 @@ export function mergeWidgetAppItems(
     return items
   }
 
-  const local = listWidgetApps()
-    .filter(app => `/${app.id}`.startsWith(input.toLowerCase()))
+  const local = rankSlashItems(listWidgetApps(), input, app => ({ description: app.help, id: app.id }))
     .filter(app => !items.some(item => item.text === `/${app.id}`))
     .map(app => ({ display: `/${app.id}`, meta: widgetHelp(app, locale), text: `/${app.id}` }))
 

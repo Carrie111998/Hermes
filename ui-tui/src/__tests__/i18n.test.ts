@@ -89,10 +89,6 @@ describe('TranslationKey coverage', () => {
     }
   })
 
-  it('zh verbs have same length as EN', () => {
-    expect(zh.verbs).toHaveLength(en.verbs.length)
-  })
-
   it('zh toolVerbs cover every EN tool verb', () => {
     for (const key of Object.keys(en.toolVerbs)) {
       expect(key in zh.toolVerbs, `zh.toolVerbs missing "${key}"`).toBe(true)

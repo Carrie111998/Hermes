@@ -300,6 +300,7 @@ const catalog: Record<TranslationKey, string> = {
   'submission.shellExit': '退出码 {code}',
   'transcript.moaReference': '◇ 参考模型 {position} · {label}',
   'transcript.modelChanged': '模型已更换',
+  'transcript.personalityChanged': '个性已更换',
   'transcript.resumedInterruptedTurn': '已恢复中断的轮次',
   'transcript.backgroundAgentWorkFinished': '后台 Agent 工作已完成',
   'transcript.backgroundAgentFinished': '{count} 个后台 Agent 已完成',
