@@ -10943,6 +10943,15 @@ def complete_task(
             )
             if status.returncode == 0 and status.stdout:
                 raise _SourceCommitError("source_forbidden_dirty")
+            if status.returncode == 0:
+                candidate = subprocess.run(
+                    ["git", "-C", str(repo_root), "rev-parse", "HEAD^{commit}"],
+                    capture_output=True, text=True, timeout=30, check=False,
+                )
+                candidate_sha = (candidate.stdout or "").strip()
+                if candidate.returncode == 0 and len(candidate_sha) == 40:
+                    metadata = dict(metadata or {})
+                    metadata["candidate_sha"] = candidate_sha
     if source_commit_required:
         source_run_id = (
             int(expected_run_id)
@@ -13186,9 +13195,10 @@ def _dependency_source_base(
 ) -> Optional[str]:
     """Return the common source-receipt commit for a Default-board child."""
     required: list[tuple[str, str]] = []
+    candidates_from_forbidden: list[tuple[str, str]] = []
     for parent_id in parent_ids(conn, task.id):
         row = conn.execute(
-            "SELECT t.status, t.source_commit_required, r.metadata "
+            "SELECT t.status, t.source_commit_required, t.source_commit_forbidden, r.metadata "
             "FROM tasks t LEFT JOIN task_runs r ON r.id = ("
             "SELECT id FROM task_runs WHERE task_id = t.id AND ended_at IS NOT NULL "
             "AND outcome = 'completed' "
@@ -13196,7 +13206,7 @@ def _dependency_source_base(
             "WHERE t.id = ?",
             (parent_id,),
         ).fetchone()
-        if row is None or not row["source_commit_required"]:
+        if row is None or not (row["source_commit_required"] or row["source_commit_forbidden"]):
             continue
         if row["status"] != "done":
             raise RuntimeError(f"required source parent {parent_id} is not done")
@@ -13206,22 +13216,31 @@ def _dependency_source_base(
             ))
         except (TypeError, ValueError, AttributeError):
             receipt = None
+        if row["source_commit_forbidden"]:
+            try:
+                sha = (json.loads(row["metadata"] or "{}").get("candidate_sha"))
+            except (TypeError, ValueError, AttributeError):
+                sha = None
+            if isinstance(sha, str) and sha.strip():
+                candidates_from_forbidden.append((parent_id, sha.strip()))
+            continue
         sha = receipt.get("commit_sha") if isinstance(receipt, dict) else None
         if not isinstance(sha, str) or not sha.strip():
             raise RuntimeError(f"required source parent {parent_id} has no completion receipt")
         required.append((parent_id, sha.strip()))
-    if not required:
+    evidence = required + candidates_from_forbidden
+    if not evidence:
         return None
 
     resolved: list[tuple[str, str]] = []
-    for parent_id, sha in required:
+    for parent_id, sha in evidence:
         result = subprocess.run(
             ["git", "-C", str(repo_root), "rev-parse", f"{sha}^{{commit}}"],
             capture_output=True, text=True, timeout=30, check=False,
         )
         resolved_sha = (result.stdout or "").strip()
         if result.returncode != 0 or len(resolved_sha) != 40:
-            raise RuntimeError(f"required source parent {parent_id} receipt is foreign or invalid")
+            raise RuntimeError(f"source parent {parent_id} evidence is foreign or invalid")
         resolved.append((parent_id, resolved_sha))
     resolved_shas = list(dict.fromkeys(sha for _, sha in resolved))
     candidates = []

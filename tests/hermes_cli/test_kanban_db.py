@@ -4822,6 +4822,50 @@ def test_complete_task_required_source_commits_before_terminal_update_and_persis
     ).stdout == ""
 
 
+def test_default_board_forbidden_dependency_chain_forwards_candidate_sha(
+    kanban_home, tmp_path
+):
+    board = "default"
+    repo = tmp_path / "default-source-three-card-repo"
+    _init_git_repo(repo)
+    with kb.connect(board=board) as conn:
+        developer_id = kb.create_task(conn, title="Developer", board=board,
+            assignee="developer", workspace_kind="worktree", workspace_path=str(repo),
+            source_commit_required=True)
+        developer = kb.get_task(conn, developer_id)
+        assert developer is not None
+        developer_ws, _ = kb._resolve_worktree_workspace(developer, board=board, conn=conn)
+        conn.execute("UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(developer_ws), developer_id))
+        (developer_ws / "feature.txt").write_text("candidate\n", encoding="utf-8")
+        claimed = kb.claim_task(conn, developer_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.complete_task(conn, developer_id, expected_run_id=claimed.current_run_id)
+        developer_sha = _head_sha(developer_ws)
+        tester_id = kb.create_task(conn, title="Tester", board=board, assignee="tester",
+            parents=[developer_id], workspace_kind="worktree", workspace_path=str(repo),
+            source_commit_forbidden=True)
+        tester = kb.get_task(conn, tester_id)
+        assert tester is not None and tester.status == "ready"
+        tester_ws, _ = kb._resolve_worktree_workspace(tester, board=board, conn=conn)
+        conn.execute("UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(tester_ws), tester_id))
+        assert _head_sha(tester_ws) == developer_sha
+        tester_claimed = kb.claim_task(conn, tester_id)
+        assert tester_claimed is not None and tester_claimed.current_run_id is not None
+        assert kb.complete_task(conn, tester_id, metadata={"candidate_sha": "caller-value"},
+            expected_run_id=tester_claimed.current_run_id)
+        tester_run = kb.get_run(conn, tester_claimed.current_run_id)
+        assert tester_run is not None and tester_run.metadata["candidate_sha"] == developer_sha
+        reviewer_id = kb.create_task(conn, title="Reviewer", board=board, assignee="reviewer",
+            parents=[tester_id], workspace_kind="worktree", workspace_path=str(repo),
+            source_commit_forbidden=True)
+        reviewer = kb.get_task(conn, reviewer_id)
+        assert reviewer is not None and reviewer.status == "ready"
+        reviewer_ws, _ = kb._resolve_worktree_workspace(reviewer, board=board, conn=conn)
+        conn.execute("UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(reviewer_ws), reviewer_id))
+        assert _head_sha(reviewer_ws) == developer_sha
+        assert (reviewer_ws / "feature.txt").read_text(encoding="utf-8") == "candidate\n"
+
+
 def test_complete_task_adopts_the_one_exact_commit_after_crash_before_receipt(
     kanban_home, tmp_path, monkeypatch
 ):
