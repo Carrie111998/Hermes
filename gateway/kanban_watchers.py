@@ -666,9 +666,13 @@ class GatewayKanbanWatchersMixin:
                                 wake_handoff = (
                                     lines[0][:200] if lines else summary[:200]
                                 )
-                            msg = (
-                                f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
-                                f" — {title}{handoff}"
+                            msg = t(
+                                "gateway.kanban_review_requested",
+                                board_tag=board_tag,
+                                tag=tag,
+                                task_id=sub["task_id"],
+                                title=title,
+                                handoff=handoff,
                             )
                         elif kind == "changes_requested":
                             payload = ev.payload or {}
