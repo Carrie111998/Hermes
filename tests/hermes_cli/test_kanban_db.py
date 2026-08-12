@@ -10530,6 +10530,35 @@ def _v2_product_board_with_repo(name: str, repo: Path) -> None:
     meta_path.write_text(json.dumps(meta), encoding="utf-8")
 
 
+def _configure_candidate_verification(
+    board: str, repo: Path, *, command: tuple[str, ...] = ("python", "-c", "print('ok')")
+) -> kb.RepositoryContract:
+    meta_path = kb.board_metadata_path(board)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["repository"] = {
+        "base_ref": "refs/heads/main",
+        "target_branch": "main",
+        "verification_profiles": {
+            name: {
+                "commands": [
+                    {"argv": list(command), "workdir": ".", "timeout_seconds": 5}
+                ]
+            }
+            for name in ("story_integration", "epic_release")
+        },
+        "ci_observation": {"provider": "test", "required_workflows": ["CI"]},
+        "boundary_evidence": {
+            "test_globs": [],
+            "fixture_globs": [],
+            "generated_paths": [],
+        },
+    }
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    contract = kb.repository_contract_for_board(board, repo_root=repo)
+    assert contract is not None
+    return contract
+
+
 def _make_epic_branch(repo: Path, epic_branch: str, *, from_branch: str = "main") -> str:
     """Branch ``epic_branch`` off ``from_branch`` and add a unique commit.
     Returns the new commit sha. Leaves ``from_branch`` checked out."""
@@ -10746,6 +10775,222 @@ def test_build_merge_candidate_missing_configured_profile_is_not_legacy_fallback
     assert exc_info.value.verification_result is not None
     assert exc_info.value.verification_result.status == "configuration_error"
     assert _git_output(repo, "rev-parse", "main") == pre_sha
+
+
+def test_merge_epic_preserves_explicit_injected_candidate_verification(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-merge-injected-verification"
+    _v2_product_board_with_repo(board, repo)
+    _configure_candidate_verification(
+        board, repo, command=("python", "-c", "raise SystemExit(9)")
+    )
+    epic, children = _make_epic_with_children(board, n_children=1)
+    with kb.connect(board=board) as conn:
+        _set_task_status(conn, children[0], "done")
+    _make_epic_branch(repo, kb.epic_branch_for(epic))
+    injected = unittest.mock.Mock(return_value=True)
+
+    with kb.connect(board=board) as conn:
+        result = kb.merge_epic_to_main(
+            conn, epic, board=board, candidate_verify_fn=injected
+        )
+
+    assert result == "merged"
+    injected.assert_called_once()
+
+
+def _verification_run_fixture(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-verification-reuse"
+    _v2_product_board_with_repo(board, repo)
+    count_file = tmp_path / "verification-count.txt"
+    command = (
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; p=Path({str(count_file)!r}); "
+        "p.write_text(p.read_text() + 'x' if p.exists() else 'x')",
+    )
+    contract = _configure_candidate_verification(board, repo, command=command)
+    candidate_sha = _git_output(repo, "rev-parse", "HEAD")
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(conn, title="Story", board=board)
+    return repo, board, task_id, contract, candidate_sha, count_file
+
+
+def _run_reusable_verification(conn, fixture):
+    repo, _board, task_id, contract, candidate_sha, _count_file = fixture
+    return kb._run_or_reuse_configured_verification(
+        conn,
+        task_id=task_id,
+        candidate_path=repo,
+        source_sha=candidate_sha,
+        candidate_sha=candidate_sha,
+        contract=contract,
+        profile_name="story_integration",
+        gate_kind="story_integration",
+    )
+
+
+def test_exact_repository_verification_receipt_skips_command(
+    kanban_home, tmp_path, monkeypatch
+):
+    fixture = _verification_run_fixture(kanban_home, tmp_path, monkeypatch)
+    _repo, board, task_id, _contract, _candidate_sha, count_file = fixture
+
+    with kb.connect(board=board) as conn:
+        first = _run_reusable_verification(conn, fixture)
+        second = _run_reusable_verification(conn, fixture)
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='repository_verification'",
+            (task_id,),
+        ).fetchone()[0]
+
+    assert first.status == second.status == "passed"
+    assert first.reused is False
+    assert second.reused is True
+    assert second.steps == first.steps
+    assert count_file.read_text(encoding="utf-8") == "x"
+    assert event_count == 1
+
+
+def test_configured_verification_reuses_receipt_after_connection_crash_boundary(
+    kanban_home, tmp_path, monkeypatch
+):
+    fixture = _verification_run_fixture(kanban_home, tmp_path, monkeypatch)
+    _repo, board, _task_id, _contract, _candidate_sha, count_file = fixture
+
+    with kb.connect(board=board) as conn:
+        first = _run_reusable_verification(conn, fixture)
+    with kb.connect(board=board) as conn:
+        recovered = _run_reusable_verification(conn, fixture)
+
+    assert first.reused is False
+    assert recovered.reused is True
+    assert count_file.read_text(encoding="utf-8") == "x"
+
+
+def test_verified_candidate_crash_reuses_persisted_receipt(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-verification-crash-reuse"
+    _v2_product_board_with_repo(board, repo)
+    count_file = tmp_path / "verification-count.txt"
+    _configure_candidate_verification(
+        board,
+        repo,
+        command=(
+            sys.executable,
+            "-c",
+            f"from pathlib import Path; p=Path({str(count_file)!r}); "
+            "p.write_text(p.read_text() + 'x' if p.exists() else 'x')",
+        ),
+    )
+    epic, children = _make_epic_with_children(board, n_children=1)
+    with kb.connect(board=board) as conn:
+        _set_task_status(conn, children[0], "done")
+    _make_epic_branch(repo, kb.epic_branch_for(epic))
+    monkeypatch.setenv("GIT_AUTHOR_DATE", "2001-01-01T00:00:00+00:00")
+    monkeypatch.setenv("GIT_COMMITTER_DATE", "2001-01-01T00:00:00+00:00")
+    apply = unittest.mock.Mock(side_effect=[False, True])
+    monkeypatch.setattr(kb, "_fast_forward_target", apply)
+
+    with kb.connect(board=board) as conn:
+        first = kb.merge_epic_to_main(conn, epic, board=board)
+        second = kb.merge_epic_to_main(conn, epic, board=board)
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='repository_verification'",
+            (epic,),
+        ).fetchone()[0]
+
+    assert first == "verify_failed"
+    assert second == "merged"
+    assert apply.call_count == 2
+    assert count_file.read_text(encoding="utf-8") == "x"
+    assert event_count == 1
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "candidate_sha",
+        "contract_digest",
+        "command_set_digest",
+        "runtime_toolchain_digest",
+        "generated_policy_digest",
+        "gate_kind",
+        "executor_policy",
+        "key_digest",
+        "result_digest",
+        "foreign_scope",
+        "foreign_subject",
+        "foreign_task",
+        "malformed_json",
+        "failed_result",
+        "missing_receipt",
+    ],
+)
+def test_configured_verification_rejects_key_result_and_foreign_receipts(
+    kanban_home, tmp_path, monkeypatch, tamper
+):
+    fixture = _verification_run_fixture(kanban_home, tmp_path, monkeypatch)
+    _repo, board, task_id, _contract, _candidate_sha, count_file = fixture
+
+    with kb.connect(board=board) as conn:
+        first = _run_reusable_verification(conn, fixture)
+        row = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? AND kind='repository_verification'",
+            (task_id,),
+        ).fetchone()
+        payload = json.loads(row["payload"])
+        if tamper == "foreign_task":
+            foreign = kb.create_task(conn, title="Foreign", board=board)
+            conn.execute("UPDATE task_events SET task_id=? WHERE id=?", (foreign, row["id"]))
+        elif tamper == "malformed_json":
+            conn.execute("UPDATE task_events SET payload='{' WHERE id=?", (row["id"],))
+        elif tamper == "failed_result":
+            payload["status"] = "failed"
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row["id"])
+            )
+        elif tamper == "missing_receipt":
+            payload.pop("receipt")
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row["id"])
+            )
+        elif tamper == "foreign_scope":
+            payload["scope"] = "epic_release"
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row["id"])
+            )
+        elif tamper == "foreign_subject":
+            payload["subject_id"] = "foreign-story"
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row["id"])
+            )
+        elif tamper == "result_digest":
+            payload["receipt"]["result_digest"] = "0" * 64
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row["id"])
+            )
+        else:
+            key_name = "digest" if tamper == "key_digest" else tamper
+            payload["receipt"]["key"][key_name] = "0" * 64
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row["id"])
+            )
+        conn.commit()
+
+        rerun = _run_reusable_verification(conn, fixture)
+
+    assert first.reused is False
+    assert rerun.reused is False
+    assert count_file.read_text(encoding="utf-8") == "xx"
 
 
 def test_merge_epic_records_configured_profile_failure_as_attention_required(

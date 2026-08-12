@@ -86,7 +86,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Tuple
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
@@ -100,6 +100,8 @@ from hermes_cli.kanban_repository import (
     RefreshResult,
     VerificationProfile,
     VerificationResult,
+    VerificationStepResult,
+    build_verification_receipt_key,
     build_verification_receipt,
     inspect_evidence_workspace,
     load_repository_contract,
@@ -13702,6 +13704,66 @@ def _verification_needs_attention(result: Optional[VerificationResult]) -> bool:
     }
 
 
+def _run_or_reuse_configured_verification(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    candidate_path: Path,
+    source_sha: str,
+    candidate_sha: str,
+    contract: RepositoryContract,
+    profile_name: str,
+    gate_kind: str,
+) -> VerificationResult:
+    profile = contract.verification.get(profile_name)
+    expected_key = build_verification_receipt_key(
+        profile, candidate_path, candidate_sha=candidate_sha,
+        contract_digest=contract.digest,
+        generated_policy_digest=contract.generated_policy_digest,
+        gate_kind=gate_kind, profile_name=profile_name,
+    )
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC",
+        (task_id, "repository_verification"),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else None
+        except (TypeError, ValueError):
+            payload = None
+        if not isinstance(payload, dict):
+            continue
+        receipt = verification_receipt_from_payload(payload)
+        if (receipt is None or receipt.key.digest != expected_key.digest
+                or payload.get("scope") != gate_kind
+                or payload.get("subject_id") != task_id
+                or payload.get("status") != "passed"):
+            continue
+        steps = tuple(
+            VerificationStepResult(
+                argv=tuple(step["argv"]), workdir=PurePosixPath(step["workdir"]),
+                status=step["status"], returncode=step["returncode"],
+                duration_seconds=step["duration_seconds"],
+                stdout_tail=step["stdout_tail"], stderr_tail=step["stderr_tail"],
+                error=step["error"],
+            ) for step in payload.get("steps", []) if isinstance(step, dict)
+        )
+        return VerificationResult(
+            status="passed", source_sha=source_sha, candidate_sha=candidate_sha,
+            contract_digest=contract.digest, profile=profile_name, steps=steps,
+            key=expected_key, error=None, reused=True,
+        )
+    result = run_verification(
+        profile, candidate_path, source_sha=source_sha, candidate_sha=candidate_sha,
+        contract_digest=contract.digest, scope=gate_kind, subject_id=task_id,
+        profile_name=profile_name, generated_policy_digest=contract.generated_policy_digest,
+    )
+    with write_txn(conn):
+        _append_event(conn, task_id, "repository_verification",
+                      _verification_result_payload(result, scope=gate_kind, subject_id=task_id))
+    return result
+
+
 def _integration_git(
     cwd: Path, args: list[str], *, timeout: int = 120
 ) -> subprocess.CompletedProcess[str]:
@@ -13766,6 +13828,7 @@ def _build_verified_merge_candidate(
     verification_subject_id: str = "",
     verification_profile_name: Optional[str] = None,
     verification_generated_policy_digest: str = "",
+    configured_verification_fn: Optional[Callable[[Path, str, str], VerificationResult]] = None,
 ) -> IntegrationCandidate:
     repo_root = repo_root.resolve()
     target_worktree = _checked_out_branch_worktree(repo_root, target_branch)
@@ -13837,7 +13900,11 @@ def _build_verified_merge_candidate(
         )
 
     verification_result: Optional[VerificationResult] = None
-    if verification_contract_digest is not None:
+    if configured_verification_fn is not None:
+        configured_result = configured_verification_fn(scratch, approved_source_sha, candidate_sha)
+        verification_result = configured_result
+        verified = configured_result.status == "passed"
+    elif verification_contract_digest is not None and candidate_verify_fn is None:
         configured_result = run_verification(
             verification_profile,
             scratch,
@@ -14212,6 +14279,13 @@ def merge_epic_to_main(
             verification_generated_policy_digest=(
                 contract.generated_policy_digest if contract is not None else ""
             ),
+            configured_verification_fn=(
+                lambda path, source, candidate: _run_or_reuse_configured_verification(
+                    conn, task_id=epic_id, candidate_path=path, source_sha=source,
+                    candidate_sha=candidate, contract=contract,
+                    profile_name="epic_release", gate_kind="epic_release"
+                )
+            ) if contract is not None and candidate_verify_fn is None else None,
         )
         if before_apply_fn is not None and not before_apply_fn():
             return "ownership_conflict"
@@ -14224,7 +14298,7 @@ def merge_epic_to_main(
 
         try:
             with write_txn(conn):
-                if candidate.verification_result is not None:
+                if candidate.verification_result is not None and not candidate.verification_result.reused:
                     _append_event(
                         conn,
                         epic_id,
@@ -14597,6 +14671,16 @@ def integrate_story_to_epic(
                         verification_generated_policy_digest=(
                             contract.generated_policy_digest if contract is not None else ""
                         ),
+                        configured_verification_fn=(
+                            lambda path, source, candidate: _run_or_reuse_configured_verification(
+                                conn, task_id=story_id, candidate_path=path, source_sha=source,
+                                candidate_sha=candidate, contract=contract,
+                                profile_name="story_integration", gate_kind="story_integration"
+                            )
+                        ) if (
+                            contract is not None
+                            and candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
+                        ) else None,
                     )
                 finally:
                     if reviewed_source_ref is not None:
@@ -14650,7 +14734,7 @@ def integrate_story_to_epic(
                     return "attention_required"
                 return "conflict" if "merge conflict" in str(exc) else "verify_failed"
 
-            if candidate.verification_result is not None:
+            if candidate.verification_result is not None and not candidate.verification_result.reused:
                 with write_txn(conn):
                     _append_event(
                         conn,
@@ -14910,6 +14994,13 @@ def _merge_standalone_story_to_main(
             verification_generated_policy_digest=(
                 contract.generated_policy_digest if contract is not None else ""
             ),
+            configured_verification_fn=(
+                lambda path, source, candidate: _run_or_reuse_configured_verification(
+                    conn, task_id=story_id, candidate_path=path, source_sha=source,
+                    candidate_sha=candidate, contract=contract,
+                    profile_name="story_integration", gate_kind="story_integration"
+                )
+            ) if contract is not None and candidate_verify_fn is None else None,
         )
         if before_apply_fn is not None and not before_apply_fn():
             return "ownership_conflict"
@@ -14922,7 +15013,7 @@ def _merge_standalone_story_to_main(
 
         try:
             with write_txn(conn):
-                if candidate.verification_result is not None:
+                if candidate.verification_result is not None and not candidate.verification_result.reused:
                     _append_event(
                         conn,
                         story_id,
