@@ -128,6 +128,49 @@ def test_oneshot_invocation_allows_both_sinks_for_exact_true(monkeypatch, tmp_pa
 
 
 @pytest.mark.parametrize(
+    ("config", "expected_policy", "expected_blocked"),
+    [
+        (None, False, True),
+        ("approvals:\n  oneshot_yolo: false\n", False, True),
+        ("approvals:\n  oneshot_yolo: true\n", True, False),
+    ],
+    ids=["missing", "false", "exact-true"],
+)
+def test_oneshot_policy_controls_destructive_computer_use(
+    monkeypatch, tmp_path, config, expected_policy, expected_blocked
+):
+    home = tmp_path / "hermes-home"
+    _write_config(home, config)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_IGNORE_USER_CONFIG", raising=False)
+    monkeypatch.delenv("HERMES_SAFE_MODE", raising=False)
+
+    from hermes_cli.oneshot_policy import (
+        configure_oneshot_approval_policy,
+        current_oneshot_yolo_policy,
+        reset_oneshot_approval_policy,
+    )
+    from tools.computer_use import tool as computer_use
+
+    computer_use.set_approval_callback(None)
+    policy_token = configure_oneshot_approval_policy()
+    assert policy_token is not None
+    try:
+        assert current_oneshot_yolo_policy() is expected_policy
+        result = computer_use._request_approval("click", {}, "one-shot-test")
+    finally:
+        reset_oneshot_approval_policy(policy_token)
+
+    if expected_blocked:
+        assert result is not None
+        payload = json.loads(result)
+        assert payload["action"] == "click"
+        assert "one-shot mode" in payload["error"]
+    else:
+        assert result is None
+
+
+@pytest.mark.parametrize(
     "suppress_user_config",
     ["HERMES_IGNORE_USER_CONFIG", "HERMES_SAFE_MODE"],
     ids=["ignore-user-config", "safe-mode"],

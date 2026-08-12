@@ -524,6 +524,21 @@ def _request_approval(action: str, args: Dict[str, Any],
     operation. State is keyed on session_id so concurrent runs don't leak
     unlocks into one another.
     """
+    from hermes_cli.oneshot_policy import current_oneshot_yolo_policy
+
+    oneshot_yolo = current_oneshot_yolo_policy()
+    if oneshot_yolo is True:
+        return None
+    if oneshot_yolo is False:
+        return json.dumps({
+            "error": (
+                "blocked: computer_use requires approval, but one-shot mode "
+                "has no approval surface. Set approvals.oneshot_yolo: true "
+                "only for a trusted invocation."
+            ),
+            "action": action,
+        })
+
     is_foreground = args.get("delivery_mode") == "foreground"
     scope_key = (action, "foreground" if is_foreground else "background")
     with _approval_lock:
