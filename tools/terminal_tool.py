@@ -817,6 +817,7 @@ def _sudo_nopasswd_works() -> bool:
             stderr=subprocess.DEVNULL,
             timeout=3,
             check=False,
+            **_windows_hide_kwargs(),
         )
         return probe.returncode == 0
     except Exception:

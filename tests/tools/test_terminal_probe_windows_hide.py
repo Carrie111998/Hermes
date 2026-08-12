@@ -108,3 +108,55 @@ def test_docker_probe_silent_on_posix(monkeypatch):
     # No creationflags on POSIX — this is the contract that lets the
     # call site splat the wrapper unconditionally.
     assert "creationflags" not in captured["kwargs"]
+
+
+def test_sudo_probe_passes_creationflags_on_windows(monkeypatch):
+    """_sudo_nopasswd_works() is re-probed on every sudo-gated command on the
+    local backend, so its ``sudo -n true`` probe is on the interactive hot
+    path. On Windows it must forward ``creationflags`` to ``subprocess.run``
+    so the probe doesn't flash a console window.
+    """
+    from tools.terminal_tool import _sudo_nopasswd_works
+
+    sentinel_flag = 0x08000000
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    fake_module = type(sys)("fake_subprocess_compat")
+    fake_module.windows_hide_flags = lambda: sentinel_flag  # type: ignore[attr-defined]
+    # _windows_hide_kwargs() lazy-imports hermes_cli._subprocess_compat inside
+    # the function body; swap it in sys.modules for the duration of the call.
+    monkeypatch.setitem(sys.modules, "hermes_cli._subprocess_compat", fake_module)
+
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert _sudo_nopasswd_works() is True
+    assert "creationflags" in captured["kwargs"]
+    assert captured["kwargs"]["creationflags"] == sentinel_flag
+
+
+def test_sudo_probe_silent_on_posix(monkeypatch):
+    """On POSIX the sudo probe contributes no kwargs, so the subprocess
+    call shape matches the previous (broken) call exactly."""
+    from tools.terminal_tool import _sudo_nopasswd_works
+
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert _sudo_nopasswd_works() is True
+    # No creationflags on POSIX — same wrapper contract as the probes.
+    assert "creationflags" not in captured["kwargs"]
