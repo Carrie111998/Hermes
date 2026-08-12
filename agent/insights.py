@@ -629,7 +629,8 @@ class InsightsEngine:
             stored = raw.get("estimated_cost_usd")
             status = raw.get("cost_status")
             if stored is not None and (
-                status or raw.get("cost_source") or float(stored) > 0
+                raw.get("_estimated_cost_reconciled")
+                or status or raw.get("cost_source") or float(stored) > 0
             ):
                 estimated = float(stored)
                 status = status or "estimated"
@@ -700,6 +701,7 @@ class InsightsEngine:
 
         for session in sessions:
             aggregate = totals[session["id"]]
+            session_estimated_cost = float(session.get("estimated_cost_usd") or 0.0)
             residual = {
                 **session,
                 "session_id": session["id"],
@@ -709,7 +711,13 @@ class InsightsEngine:
                 "cache_write_tokens": max(0, (session.get("cache_write_tokens") or 0) - aggregate["cache_write_tokens"]),
                 "reasoning_tokens": 0,
                 "api_call_count": max(0, (session.get("api_call_count") or 0) - aggregate["api_call_count"]),
-                "estimated_cost_usd": max(0.0, float(session.get("estimated_cost_usd") or 0.0) - aggregate["estimated_cost_usd"]),
+                "estimated_cost_usd": max(
+                    0.0, session_estimated_cost - aggregate["estimated_cost_usd"]
+                ),
+                # A positive session aggregate is authoritative reconciliation
+                # evidence even when the more-specific model rows exceed it and
+                # clamp the residual to zero. Do not re-price leftover tokens.
+                "_estimated_cost_reconciled": session_estimated_cost > 0,
                 "actual_cost_usd": max(0.0, float(session.get("actual_cost_usd") or 0.0) - aggregate["actual_cost_usd"]),
             }
             if not usage_rows or any(

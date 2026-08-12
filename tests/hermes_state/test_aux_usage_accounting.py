@@ -367,6 +367,36 @@ class TestInsightsAuxTotals:
         assert sum(model["cost"] for model in report["models"]) == pytest.approx(10.0)
         assert sum(day["estimated_cost_usd"] for day in report["daily_series"]) == pytest.approx(10.0)
 
+    def test_model_cost_above_stale_session_total_does_not_reprice_zero_residual(self, db):
+        """A clamped zero residual is reconciliation evidence, not missing cost."""
+        from agent.insights import InsightsEngine
+
+        db.create_session("stale-total", source="cli")
+        db.update_token_counts(
+            "stale-total",
+            model="gpt-4o",
+            billing_provider="openai",
+            input_tokens=250_000,
+            estimated_cost_usd=12.5,
+            api_call_count=1,
+        )
+        db.update_token_counts(
+            "stale-total",
+            model="gpt-4o",
+            billing_provider="openai",
+            input_tokens=1_000_000,
+            estimated_cost_usd=10.0,
+            api_call_count=2,
+            absolute=True,
+        )
+        db.flush_token_counts()
+
+        report = InsightsEngine(db).generate(days=30)
+
+        assert report["overview"]["estimated_cost"] == pytest.approx(12.5)
+        assert sum(model["cost"] for model in report["models"]) == pytest.approx(12.5)
+        assert sum(day["estimated_cost_usd"] for day in report["daily_series"]) == pytest.approx(12.5)
+
     def test_mixed_included_and_estimated_session_keeps_complete_market_value(self, db):
         """A priced aux row must not hide the included main route's list value."""
         from agent.insights import InsightsEngine
