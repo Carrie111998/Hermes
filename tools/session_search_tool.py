@@ -2,7 +2,7 @@
 """
 Session Search Tool - Long-Term Conversation Recall
 
-Single-shape tool with three calling modes (inferred from args, no explicit
+Single-shape tool with four calling modes (inferred from args, no explicit
 mode parameter):
 
   1. DISCOVERY — pass ``query``. Runs FTS5, dedupes hits by session lineage,
