@@ -75,6 +75,20 @@ def test_catalog_placeholders_match_english(lang: str):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "value",
+    ["fa", "fa-IR", "persian", "farsi", "فارسی"],
+)
+def test_persian_language_aliases_normalize_to_fa(value: str):
+    """Persian names and the Iran locale tag must select the fa catalog."""
+    assert i18n._normalize_lang(value) == "fa"
+
+
+def test_persian_catalog_translates_gateway_copy():
+    """Selecting Persian must return Persian rather than the English fallback."""
+    assert i18n.t("gateway.goal_cleared", lang="fa") == "✓ هدف پاک شد."
+
+
 
 
 
@@ -138,5 +152,4 @@ def test_locales_dir_env_override_ignored_when_missing(tmp_path, monkeypatch):
     assert result != tmp_path / "does-not-exist"
     # In a source checkout this is the repo-root locales dir.
     assert result.name == "locales"
-
 

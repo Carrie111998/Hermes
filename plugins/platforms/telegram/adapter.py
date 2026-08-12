@@ -969,7 +969,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     normalized_chat_type = "forum" if thread_id is not None else "group"
 
                 source = SessionSource(
-                    platform=Platform.TELEGRAM,
+                    platform=self.platform,
                     chat_id=str(chat_id or normalized_user_id),
                     chat_type=normalized_chat_type,
                     user_id=normalized_user_id,
@@ -1046,7 +1046,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 thread_id = str(thread_id_raw)
 
         return SessionSource(
-            platform=Platform.TELEGRAM,
+            platform=self.platform,
             chat_id=chat_id or "",
             chat_type=chat_type,
             user_id=user_id,
@@ -1085,7 +1085,7 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 return (
                     behavior_fn(
-                        Platform.TELEGRAM,
+                        self.platform,
                         profile=getattr(source, "profile", None),
                     )
                     == "pair"
@@ -1450,6 +1450,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if isinstance(configured, str):
             configured = configured.split(",")
         return parse_fallback_ip_env(",".join(str(v) for v in configured) if configured else None)
+
+    def _proxy_url(self, target_hosts: list[str]) -> Optional[str]:
+        """Resolve the Telegram-specific proxy for the supplied targets."""
+        return resolve_proxy_url("TELEGRAM_PROXY", target_hosts=target_hosts)
 
     @staticmethod
     def _looks_like_polling_conflict(error: Exception) -> bool:
@@ -3679,6 +3683,10 @@ class TelegramAdapter(BasePlatformAdapter):
             if self._post_connect_task is asyncio.current_task():
                 self._post_connect_task = None
 
+    def _webhook_url(self) -> str:
+        """Return the Telegram webhook URL, or an empty string for polling."""
+        return os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Telegram via polling or webhook.
 
@@ -3823,9 +3831,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     kwargs["limits"] = _pool_limits
                 return kwargs
 
-            disable_fallback = (os.getenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "").strip().lower() in {"1", "true", "yes", "on"})
-            fallback_ips = self._fallback_ips()
-            if not fallback_ips:
+            disable_fallback = self._coerce_bool_extra(
+                "disable_fallback_ips", False
+            ) or (
+                os.getenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "")
+                .strip()
+                .lower()
+                in {"1", "true", "yes", "on"}
+            )
+            fallback_ips = [] if disable_fallback else self._fallback_ips()
+            if not fallback_ips and not disable_fallback:
                 logger.warning("[%s] Discovering Telegram API fallback IPs via DNS-over-HTTPS…", self.name)
                 fallback_ips = await discover_fallback_ips()
                 logger.info(
@@ -3835,7 +3850,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
 
             proxy_targets = ["api.telegram.org", *fallback_ips]
-            proxy_url = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=proxy_targets)
+            proxy_url = self._proxy_url(proxy_targets)
             if fallback_ips and not proxy_url and not disable_fallback:
                 logger.info(
                     "[%s] Telegram fallback IPs active: %s",
@@ -4049,7 +4064,7 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._app.start()
 
             # Decide between webhook and polling mode
-            webhook_url = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
+            webhook_url = self._webhook_url()
 
             if webhook_url:
                 # ── Webhook mode ─────────────────────────────────────
