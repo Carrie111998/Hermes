@@ -4169,11 +4169,74 @@ def test_file_attach_uses_in_workspace_file_without_copying(monkeypatch, tmp_pat
 
         assert resp["result"]["attached"] is True
         assert resp["result"]["uploaded"] is False
-        assert resp["result"]["ref_text"] == "@file:data/exam.csv"
         # No copy: nothing staged under desktop-attachments.
         assert not (workspace / ".hermes" / "desktop-attachments").exists()
+        # The original stays exactly where it was; only the ref handed to the
+        # agent points at the readable form a CSV needs.
+        assert resp["result"]["original_path"] == str(source)
+        assert resp["result"]["ref_text"].endswith(".md")
     finally:
         server._sessions.pop("sid", None)
+
+
+def _attach_document(monkeypatch, tmp_path, name, payload):
+    """Attach `payload` as `name` through file.attach with an isolated profile."""
+    import agent.document_artifacts as store_module
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    store_module.reset_store_cache()
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    source = tmp_path / name
+    source.write_bytes(payload)
+    fake_cli = types.ModuleType("cli")
+    fake_cli._detect_file_drop = lambda raw: None
+    fake_cli._split_path_input = lambda raw: (raw, "")
+    fake_cli._resolve_attachment_path = lambda raw: source
+
+    server._sessions["sid"] = _session(cwd=str(workspace))
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+    try:
+        return server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {"session_id": "sid", "path": str(source)},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+        store_module.reset_store_cache()
+
+
+def test_file_attach_returns_processed_reference(monkeypatch, tmp_path):
+    response = _attach_document(monkeypatch, tmp_path, "catalog.csv", b"name\nWidget\n")
+    assert response["result"]["processing_status"] == "ready"
+    assert response["result"]["original_path"].endswith("catalog.csv")
+    assert response["result"]["processed_path"].endswith(".md")
+    assert response["result"]["ref_text"].endswith(".md")
+
+
+def test_file_attach_keeps_the_original_when_nothing_is_processed(monkeypatch, tmp_path):
+    """An image has no readable form — the existing behavior must be untouched."""
+    response = _attach_document(
+        monkeypatch, tmp_path, "photo.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    )
+    result = response["result"]
+    assert result["attached"] is True
+    assert result["ref_text"].endswith("photo.png")
+    assert result.get("processed_path") is None
+    assert "processing_status" not in result or result["processing_status"] != "ready"
+
+
+def test_file_attach_reports_a_product_safe_message_on_failure(monkeypatch, tmp_path):
+    response = _attach_document(monkeypatch, tmp_path, "broken.pdf", b"%PDF-1.4 not really")
+    result = response["result"]
+    assert result["ref_text"].endswith("broken.pdf"), "falls back to the original ref"
+    message = (result.get("message") or "").lower()
+    for forbidden in ("anydoc", "converter", "conversion", "ocr", "markdown"):
+        assert forbidden not in message
 
 
 def test_file_attach_errors_when_unresolvable_and_no_bytes(monkeypatch, tmp_path):
@@ -4204,7 +4267,12 @@ def test_file_attach_errors_when_unresolvable_and_no_bytes(monkeypatch, tmp_path
 
 
 def test_file_attach_quotes_ref_with_spaces(monkeypatch, tmp_path):
-    """Staged names with spaces must be backtick-quoted so the @file: ref parses."""
+    """Staged names with spaces must be backtick-quoted so the @file: ref parses.
+
+    Uses a .txt, which is already readable and therefore keeps its staged path —
+    a format that gets a readable sidecar would be referenced by that sidecar's
+    (space-free) path instead and would not exercise quoting at all.
+    """
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     fake_cli = types.ModuleType("cli")
@@ -4222,14 +4290,14 @@ def test_file_attach_quotes_ref_with_spaces(monkeypatch, tmp_path):
                 "method": "file.attach",
                 "params": {
                     "session_id": "sid",
-                    "name": "my exam schedule.csv",
-                    "data_url": "data:text/csv;base64,YSxiCg==",
+                    "name": "my exam schedule.txt",
+                    "data_url": "data:text/plain;base64,YSxiCg==",
                 },
             }
         )
 
         assert resp["result"]["attached"] is True
-        assert resp["result"]["ref_text"] == "@file:`.hermes/desktop-attachments/my exam schedule.csv`"
+        assert resp["result"]["ref_text"] == "@file:`.hermes/desktop-attachments/my exam schedule.txt`"
     finally:
         server._sessions.pop("sid", None)
 

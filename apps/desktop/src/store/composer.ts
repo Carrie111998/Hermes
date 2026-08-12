@@ -12,9 +12,10 @@ export interface ComposerAttachment {
   path?: string
   attachedSessionId?: string
   /** Set while the file/image bytes are being staged into the session
-   * workspace (remote upload or local stage), and 'error' if that failed.
+   * workspace (remote upload or local stage), 'processing' while the gateway
+   * prepares a document so the agent can read it, and 'error' if that failed.
    * Drives the spinner / error state on the composer attachment card. */
-  uploadState?: 'uploading' | 'error'
+  uploadState?: 'uploading' | 'processing' | 'error'
 }
 
 export const $composerDraft = atom('')

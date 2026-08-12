@@ -1684,6 +1684,7 @@ export const en: Translations = {
     previewLabel: label => `Preview ${label}`,
     couldNotPreview: label => `Could not preview ${label}`,
     removeAttachment: label => `Remove ${label}`,
+    attachmentProcessing: 'Processing',
     dictating: 'Dictating',
     preparingAudio: 'Preparing audio',
     speakingResponse: 'Speaking response',

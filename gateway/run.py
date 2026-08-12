@@ -2022,18 +2022,47 @@ def _build_media_placeholder(event) -> str:
     return "\n".join(parts)
 
 
-def _build_document_context_note(display_name: str, agent_path: str, mtype: str) -> str:
+def _processed_document_path(original_path: str) -> str:
+    """Agent-visible path of a cached document's readable form, if any.
+
+    A pure lookup keyed on the original's content — it never ingests, so a
+    document that was cached before this feature existed simply has no sidecar
+    and falls through to the existing extract-it-yourself note.
+    """
+    try:
+        from pathlib import Path as _Path
+
+        from agent.document_artifacts import get_store
+
+        sidecar = get_store().processed_path_for(_Path(original_path))
+        return to_agent_visible_cache_path(str(sidecar)) if sidecar else ""
+    except Exception:
+        return ""
+
+
+def _build_document_context_note(
+    display_name: str, agent_path: str, mtype: str, processed_path: str = ""
+) -> str:
     """Context note prepended to a user turn when they attach a document.
 
     Text documents (``text/*``) have their content inlined upstream by the
     platform adapter, so the note just confirms that and records the path.
 
-    Binary documents (PDF, DOCX, XLSX, …) cannot be inlined as text. The note
-    must tell the agent to *extract* the text itself before answering — earlier
-    wording ("Ask the user what they'd like you to do with it") steered the
-    model into punting back to the user, which is why attached PDFs/DOCX looked
-    "unreadable" to the agent even though it has the tools to read them.
+    Binary documents (PDF, DOCX, XLSX, …) cannot be inlined as text. When a
+    readable form was prepared, the note points the agent straight at it and
+    keeps the original's name, so the user still sees "contract.pdf". Without
+    one, the note must tell the agent to *extract* the text itself before
+    answering — earlier wording ("Ask the user what they'd like you to do with
+    it") steered the model into punting back to the user, which is why attached
+    PDFs/DOCX looked "unreadable" to the agent even though it has the tools to
+    read them.
     """
+    if processed_path and not mtype.startswith("text/"):
+        return (
+            f"[The user sent a document: '{display_name}'. A readable version of it "
+            f"is saved at: {processed_path}. Read that file to answer questions about "
+            f"it. The file the user sent is also saved at: {agent_path}.]"
+        )
     if mtype.startswith("text/"):
         return (
             f"[The user sent a text document: '{display_name}'. "
@@ -10346,7 +10375,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # cache directories are auto-mounted at /root/.hermes/cache/* by get_cache_directory_mounts().
                 agent_path = to_agent_visible_cache_path(path)
 
-                context_note = _build_document_context_note(display_name, agent_path, mtype)
+                # The sidecar was produced when the bytes were cached; this is
+                # a lookup on the already-stored original, not new work.
+                processed_path = _processed_document_path(path)
+
+                context_note = _build_document_context_note(
+                    display_name, agent_path, mtype, processed_path
+                )
                 message_text = f"{context_note}\n\n{message_text}"
 
         # Discord: surface the triggering message id per-turn on the user

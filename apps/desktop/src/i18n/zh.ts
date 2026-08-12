@@ -1860,6 +1860,7 @@ export const zh: Translations = {
     previewLabel: label => `预览 ${label}`,
     couldNotPreview: label => `无法预览 ${label}`,
     removeAttachment: label => `移除 ${label}`,
+    attachmentProcessing: '处理中',
     dictating: '听写中',
     preparingAudio: '正在准备音频',
     speakingResponse: '正在朗读回复',

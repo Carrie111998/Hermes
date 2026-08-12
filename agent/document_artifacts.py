@@ -23,7 +23,7 @@ from pathlib import Path
 
 from hermes_constants import get_hermes_home
 
-from .document_processing import ProcessingDisposition, is_processable_document, process_document
+from .document_processing import ANYDOC_EXTENSIONS, ProcessingDisposition, process_document
 
 __all__ = [
     "ProfileDocument",
@@ -147,11 +147,14 @@ class ProfileDocumentArtifactStore:
     ) -> ProfileDocument | None:
         """Store a document and produce its Markdown form.
 
-        Returns ``None`` for files with no useful Markdown form (images, audio,
-        archives) — those keep their existing attachment behavior untouched.
+        Returns ``None`` when there is nothing to gain: images, audio, and
+        archives have no Markdown form, and plain text / Markdown / JSON are
+        already readable — copying those into a cache would only move the agent
+        off the real workspace path it can edit. Only formats that genuinely
+        need decoding are ingested.
         """
         path = Path(path)
-        if not is_processable_document(path.name):
+        if path.suffix.lower() not in ANYDOC_EXTENSIONS:
             return None
         try:
             content = path.read_bytes()

@@ -33,9 +33,16 @@ function AttachmentPill({ attachment, onRemove }: { attachment: ComposerAttachme
   const Icon = { folder: FolderOpen, url: Link, image: ImageIcon, file: FileText, terminal: Terminal }[attachment.kind]
   const cwd = useStore($currentCwd)
   const isUploading = attachment.uploadState === 'uploading'
+  const isProcessing = attachment.uploadState === 'processing'
   const hasUploadError = attachment.uploadState === 'error'
   const canPreview = attachment.kind !== 'folder' && attachment.kind !== 'terminal' && !isUploading
-  const detail = attachment.detail && attachment.detail !== attachment.label ? attachment.detail : undefined
+  // The file is already staged while it is processing, so the pill shows its
+  // state instead of whatever detail it carried. Never names the machinery.
+  const detail = isProcessing
+    ? c.attachmentProcessing
+    : attachment.detail && attachment.detail !== attachment.label
+      ? attachment.detail
+      : undefined
 
   async function openPreview() {
     if (!canPreview) {
@@ -80,7 +87,7 @@ function AttachmentPill({ attachment, onRemove }: { attachment: ComposerAttachme
     <Tip label={attachment.path || attachment.detail || attachment.label}>
       <div className="group/attachment relative min-w-0 shrink-0">
         <button
-          aria-busy={isUploading || undefined}
+          aria-busy={isUploading || isProcessing || undefined}
           aria-label={canPreview ? c.previewLabel(attachment.label) : attachment.label}
           className={cn(
             'flex max-w-56 items-center gap-2 rounded-2xl border bg-background/50 px-2 py-1.5 text-left shadow-[inset_0_1px_0_rgba(255,255,255,0.18)] transition-colors disabled:cursor-default',
@@ -103,7 +110,7 @@ function AttachmentPill({ attachment, onRemove }: { attachment: ComposerAttachme
             ) : (
               <Icon className="size-3.5" />
             )}
-            {isUploading && (
+            {(isUploading || isProcessing) && (
               <span className="absolute inset-0 grid place-items-center bg-background/60 backdrop-blur-[1px]">
                 <Loader2 className="size-3.5 animate-spin text-foreground/75" />
               </span>

@@ -39,6 +39,15 @@ export interface FileAttachResponse {
   // True when bytes/host file were copied into the session workspace.
   uploaded?: boolean
   name?: string
+  // Gateway-side path of the file exactly as the user sent it. Always set for
+  // a successful attach; the composer keeps showing this one.
+  original_path?: string
+  // Set only for documents the gateway had to prepare before the agent could
+  // read them: 'ready' | 'processing' | 'needs_attention' | 'failed'. Absent
+  // for files that need no preparation (images, text, arbitrary binaries).
+  processing_status?: string
+  // Present when processing_status is 'ready'; ref_text already points here.
+  processed_path?: string
 }
 
 export interface SlashExecResponse {

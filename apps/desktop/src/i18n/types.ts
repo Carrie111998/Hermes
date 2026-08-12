@@ -1383,6 +1383,9 @@ export interface Translations {
     previewLabel: (label: string) => string
     couldNotPreview: (label: string) => string
     removeAttachment: (label: string) => string
+  /** Attachment pill state while the gateway prepares a document so the agent
+   * can read it. Product-safe: never names the machinery. */
+  attachmentProcessing: string
     dictating: string
     preparingAudio: string
     speakingResponse: string

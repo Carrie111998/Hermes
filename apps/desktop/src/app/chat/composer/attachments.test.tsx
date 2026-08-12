@@ -66,4 +66,35 @@ describe('AttachmentList', () => {
 
     expect(screen.getByText('valid.txt')).toBeDefined()
   })
+
+  it('shows a product-safe Processing state while a document is prepared', () => {
+    const attachment: ComposerAttachment = {
+      ...makeAttachment('a', 'contract.pdf'),
+      uploadState: 'processing'
+    }
+
+    renderWithI18n(<AttachmentList attachments={[attachment]} />)
+
+    // The user keeps seeing the file they attached...
+    expect(screen.getByText('contract.pdf')).toBeDefined()
+    // ...plus a state label that never names the machinery.
+    expect(screen.getByText('Processing')).toBeDefined()
+    for (const term of ['Anydoc', 'conversion', 'converter', 'OCR', 'Markdown']) {
+      expect(document.body.textContent).not.toContain(term)
+    }
+  })
+
+  it('keeps showing the original label once processing is done', () => {
+    const attachment: ComposerAttachment = {
+      ...makeAttachment('a', 'contract.pdf'),
+      refText: '@file:.hermes/cache/documents/pdoc_1/derived/content.md'
+    }
+
+    renderWithI18n(<AttachmentList attachments={[attachment]} />)
+
+    expect(screen.getByText('contract.pdf')).toBeDefined()
+    expect(screen.queryByText('Processing')).toBeNull()
+    // The rewritten ref is plumbing — it must not surface as the pill's label.
+    expect(screen.queryByText(/content\.md/)).toBeNull()
+  })
 })

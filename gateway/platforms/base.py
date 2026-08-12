@@ -1599,10 +1599,25 @@ class CachedMedia:
     media_type: str           # MIME type recorded on the MessageEvent
     kind: str                 # "image" | "video" | "audio" | "document"
     display_name: str         # human-readable name for transcript notes
+    # Set only for documents that needed decoding (PDF, DOCX, XLSX, …). The
+    # original at `path` is never replaced — this is the readable form beside
+    # it, and `processing_status` is product-safe copy for the other outcomes.
+    document_id: Optional[str] = None
+    processed_path: Optional[str] = None
+    processing_status: Optional[str] = None
 
     def context_note(self) -> str:
         """One-line transcript annotation pointing the agent at the file."""
         return f"[{self.kind} '{self.display_name}' saved at: {self.path}]"
+
+    def agent_path(self) -> str:
+        """The path the agent should actually read.
+
+        The readable sidecar when one exists, otherwise the original. Callers
+        keep using ``display_name`` for anything the user sees, so a PDF is
+        still "contract.pdf" in the transcript.
+        """
+        return self.processed_path or self.path
 
 
 def _resolve_media_ext(filename: str, mime_type: str) -> str:
@@ -1688,7 +1703,34 @@ def cache_media_bytes(
         out_mime = SUPPORTED_DOCUMENT_TYPES[ext]
     else:
         out_mime = mime if mime else "application/octet-stream"
-    return CachedMedia(to_agent_visible_cache_path(path), out_mime, "document", display or fallback_name)
+    cached = CachedMedia(
+        to_agent_visible_cache_path(path), out_mime, "document", display or fallback_name
+    )
+    _attach_processed_sidecar(cached, Path(path))
+    return cached
+
+
+def _attach_processed_sidecar(cached: "CachedMedia", original: Path) -> None:
+    """Give a cached document its readable form, if it has one.
+
+    Best-effort by design: a messaging attachment must still reach the agent
+    when preparation fails, just without a sidecar. Formats that are already
+    readable (or have no text at all) are left completely alone.
+    """
+    try:
+        from agent.document_artifacts import get_store
+
+        store = get_store()
+        record = store.ingest(original, origin="messaging")
+        if record is None:
+            return
+        settled = store.wait_until_settled(record.id, timeout=20) or record
+        cached.document_id = settled.id
+        cached.processing_status = settled.status
+        if settled.status == "ready" and settled.processed_path:
+            cached.processed_path = settled.processed_path
+    except Exception:
+        return
 
 
 class MessageType(Enum):

@@ -9539,19 +9539,63 @@ def _(rid, params: dict) -> dict:
             session, raw_path=raw, data_url=data_url, name=name
         )
         ref_path = _attachment_ref_path(session, stored_path)
-        return _ok(
-            rid,
-            {
-                "attached": True,
-                "name": stored_path.name,
-                "path": str(stored_path),
-                "ref_path": ref_path,
-                "ref_text": f"@file:{_format_ref_value(ref_path)}",
-                "uploaded": uploaded,
-            },
-        )
+        result = {
+            "attached": True,
+            "name": stored_path.name,
+            "path": str(stored_path),
+            "original_path": str(stored_path),
+            "ref_path": ref_path,
+            "ref_text": f"@file:{_format_ref_value(ref_path)}",
+            "uploaded": uploaded,
+        }
+        return _ok(rid, {**result, **_document_attachment_fields(session, stored_path)})
     except Exception as e:
         return _err(rid, 5028, str(e))
+
+
+# How long file.attach waits for a document to become readable before handing
+# back the original. Long enough for ordinary office files, short enough that a
+# pathological one doesn't hold the composer.
+_ATTACHMENT_PROCESSING_TIMEOUT = 20.0
+
+
+def _document_attachment_fields(session: dict, stored_path: Path) -> dict:
+    """Processing status, and the processed ref when one is ready.
+
+    The user keeps seeing the file they attached — only the ref the agent
+    receives points at the readable form. Files with no readable form (images,
+    audio, archives) return nothing here, so their behavior is unchanged.
+    """
+    try:
+        from agent.document_artifacts import get_store
+
+        store = get_store()
+        record = store.ingest(
+            stored_path, session_id=str(session.get("id") or ""), origin="desktop"
+        )
+        if record is None:
+            return {}
+        settled = store.wait_until_settled(
+            record.id, timeout=_ATTACHMENT_PROCESSING_TIMEOUT
+        ) or record
+    except Exception:
+        # An attachment must never fail because preparation did.
+        return {}
+
+    if settled.status != "ready" or not settled.processed_path:
+        return {
+            "processing_status": settled.status,
+            "message": settled.status_detail or "",
+        }
+
+    processed = Path(settled.processed_path)
+    ref_path = _attachment_ref_path(session, processed)
+    return {
+        "processing_status": "ready",
+        "processed_path": str(processed),
+        "ref_path": ref_path,
+        "ref_text": f"@file:{_format_ref_value(ref_path)}",
+    }
 
 
 @method("image.detach")

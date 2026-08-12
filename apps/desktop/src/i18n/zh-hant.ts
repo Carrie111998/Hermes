@@ -1609,6 +1609,7 @@ export const zhHant = defineLocale({
     previewLabel: label => `預覽 ${label}`,
     couldNotPreview: label => `無法預覽 ${label}`,
     removeAttachment: label => `移除 ${label}`,
+    attachmentProcessing: '處理中',
     dictating: '聽寫中',
     preparingAudio: '正在準備音訊',
     speakingResponse: '正在朗讀回覆',

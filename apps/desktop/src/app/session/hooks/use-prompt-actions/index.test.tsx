@@ -889,6 +889,94 @@ describe('usePromptActions file attachment sync', () => {
     })
   })
 
+  it('submits the processed ref for a document the gateway prepared', async () => {
+    // A PDF the agent can't read as text: the gateway prepares a readable form
+    // and hands back a ref pointing at it. The submitted text must carry that
+    // ref, while the composer keeps showing the file the user attached.
+    $connection.set({ mode: 'remote' } as never)
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileDataUrl: vi.fn(async () => 'data:application/pdf;base64,JVBERi0=') }
+    })
+
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      if (method === 'file.attach') {
+        return {
+          attached: true,
+          path: '/remote/work/.hermes/desktop-attachments/contract.pdf',
+          original_path: '/remote/work/.hermes/desktop-attachments/contract.pdf',
+          processed_path: '/remote/.hermes/cache/documents/pdoc_1/derived/content.md',
+          processing_status: 'ready',
+          ref_text: '@file:/remote/.hermes/cache/documents/pdoc_1/derived/content.md',
+          uploaded: true
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    const pdf: ComposerAttachment = {
+      id: 'file:contract.pdf',
+      kind: 'file',
+      label: 'contract.pdf',
+      path: '/Users/alice/Downloads/contract.pdf'
+    }
+
+    expect(await handle!.submitText('summarize this', { attachments: [pdf] })).toBe(true)
+    expect(calls[1]?.params).toEqual({
+      session_id: RUNTIME_SESSION_ID,
+      text: '@file:/remote/.hermes/cache/documents/pdoc_1/derived/content.md\n\nsummarize this'
+    })
+  })
+
+  it('marks an attachment Processing while the gateway is still preparing it', async () => {
+    $connection.set({ mode: 'remote' } as never)
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileDataUrl: vi.fn(async () => 'data:application/pdf;base64,JVBERi0=') }
+    })
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'file.attach') {
+        return {
+          attached: true,
+          original_path: '/remote/work/.hermes/desktop-attachments/contract.pdf',
+          processing_status: 'processing',
+          ref_text: '@file:.hermes/desktop-attachments/contract.pdf',
+          uploaded: true
+        } as never
+      }
+
+      return {} as never
+    })
+
+    const attachment: ComposerAttachment = {
+      id: 'file:contract.pdf',
+      kind: 'file',
+      label: 'contract.pdf',
+      path: '/Users/alice/Downloads/contract.pdf'
+    }
+
+    const synced = await uploadComposerAttachment(attachment, {
+      remote: true,
+      requestGateway: requestGateway as never,
+      sessionId: RUNTIME_SESSION_ID
+    })
+
+    expect(synced.uploadState).toBe('processing')
+    // The user's own file is what the pill keeps showing.
+    expect(synced.label).toBe('contract.pdf')
+    expect(synced.path).toBe('/Users/alice/Downloads/contract.pdf')
+  })
+
   it('passes a path-less @file: ref straight through (no path = nothing to upload)', async () => {
     // Submit-layer contract: only attachments that carry a `path` are upload
     // candidates. A path-less ref (an @-mention/context ref or pasted text)

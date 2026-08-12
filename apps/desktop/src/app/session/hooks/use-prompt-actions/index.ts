@@ -144,11 +144,14 @@ export async function uploadComposerAttachment(
     throw new Error(result.message || `Could not attach ${label}`)
   }
 
+  // `label` and `path` are deliberately left alone: the user keeps seeing the
+  // file they dropped. Only `refText` changes, and only when the gateway
+  // prepared a form the agent can actually read.
   return {
     ...attachment,
     attachedSessionId: sessionId,
     refText: result.ref_text,
-    uploadState: undefined
+    uploadState: result.processing_status === 'processing' ? 'processing' : undefined
   }
 }
 
