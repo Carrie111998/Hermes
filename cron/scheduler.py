@@ -4415,7 +4415,10 @@ def _run_job_impl(
             _session_db = SessionDB()
     except concurrent.futures.TimeoutError:
         logger.error(
-            "Job '%s': SessionDB init did not return within %.0fs — proceeding "
+            # %g, not %.0f: 0 is this function's sentinel for UNLIMITED, so
+            # rounding a sub-second bound down to "0s" tells the operator the
+            # opposite of what happened (observed live 2026-08-11 at 0.2s).
+            "Job '%s': SessionDB init did not return within %gs — proceeding "
             "without a session store for this run instead of blocking it "
             "forever",
             job.get("id", "?"), _session_db_timeout,
@@ -5084,7 +5087,10 @@ def _run_job_impl(
             _iter_max = _activity.get("max_iterations", 0)
 
             logger.error(
-                "Job '%s' exceeded wall-clock limit %.0fs (elapsed %.0fs) "
+                # %g, not %.0f: HERMES_CRON_HARD_TIMEOUT uses 0 for UNLIMITED,
+                # so a sub-second limit rounded to "0s" reads as "no limit was
+                # set" at the moment the limit fired.
+                "Job '%s' exceeded wall-clock limit %gs (elapsed %gs) "
                 "| last_activity=%s | iteration=%s/%s | tool=%s",
                 job_name, _cron_hard_limit, _wc_elapsed,
                 _last_desc, _iter_n, _iter_max,
@@ -5094,7 +5100,7 @@ def _run_job_impl(
                 agent.interrupt("Cron job timed out (wall-clock)")
             raise TimeoutError(
                 f"Cron job '{job_name}' exceeded wall-clock limit "
-                f"{int(_cron_hard_limit)}s (elapsed {int(_wc_elapsed)}s) "
+                f"{_cron_hard_limit:g}s (elapsed {_wc_elapsed:g}s) "
                 f"— last activity: {_last_desc}"
             )
 
@@ -5113,7 +5119,9 @@ def _run_job_impl(
             _iter_max = _activity.get("max_iterations", 0)
 
             logger.error(
-                "Job '%s' idle for %.0fs (inactivity limit %.0fs) "
+                # %g, not %.0f — same sentinel hazard as the wall-clock branch
+                # above (HERMES_CRON_TIMEOUT documents 0 = unlimited).
+                "Job '%s' idle for %gs (inactivity limit %gs) "
                 "| last_activity=%s | iteration=%s/%s | tool=%s",
                 job_name, _secs_ago, _cron_inactivity_limit,
                 _last_desc, _iter_n, _iter_max,
@@ -5123,7 +5131,7 @@ def _run_job_impl(
                 agent.interrupt("Cron job timed out (inactivity)")
             raise TimeoutError(
                 f"Cron job '{job_name}' idle for "
-                f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
+                f"{_secs_ago:g}s (limit {_cron_inactivity_limit:g}s) "
                 f"— last activity: {_last_desc}"
             )
 
