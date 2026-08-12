@@ -20,6 +20,7 @@ from agent.conversation_compression import (
     _ensure_compressed_has_user_turn,
     compress_context,
 )
+from agent.terminal_continuation import CONTINUATION_NUDGE
 from hermes_state import SessionDB
 from tools.todo_tool import TODO_INJECTION_HEADER
 
@@ -270,9 +271,13 @@ def test_real_task_wins_over_trailing_max_iterations_nudge(compressor):
             id="codex_incomplete_nudge",
         ),
         pytest.param(
+            CONTINUATION_NUDGE,
+            id="codex_ack_continuation_nudge",
+        ),
+        pytest.param(
             "[System: Continue now. Execute the required tool calls and only "
             "send your final answer after completing the task.]",
-            id="codex_ack_continuation_nudge",
+            id="codex_ack_continuation_nudge_legacy",
         ),
         pytest.param(
             "Your previous turn indicated a tool call but none was "

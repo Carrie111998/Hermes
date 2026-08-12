@@ -3480,105 +3480,115 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
 
 
+_WORKSPACE_MARKERS = (
+    "directory",
+    "current directory",
+    "folder",
+    "repo",
+    "repository",
+    "codebase",
+    "workspace",
+    "project files",
+    "local files",
+    "filesystem",
+    "file system",
+    "path",
+)
+
+
+def classify_codex_terminal(
+    agent,
+    user_message: Any,
+    assistant_content: str,
+    messages: List[Dict[str, Any]],
+    *,
+    require_workspace: bool = True,
+    terminal_completed: bool = True,
+    finish_reason: Optional[str] = "stop",
+    continuation_attempts: int = 0,
+    interrupted: bool = False,
+    transport_error: bool = False,
+    pending_background: bool = False,
+):
+    """Build current-turn facts and return the shared continuation reason."""
+    from agent.codex_responses_adapter import _summarize_user_message_for_log
+    from agent.conversation_compression import _is_real_user_message
+    from agent.terminal_continuation import (
+        CONTINUATION_NUDGE,
+        LEGACY_CONTINUATION_NUDGE,
+        ContinuationFacts,
+        classify_terminal_continuation,
+        count_substantive_tools,
+    )
+
+    current_turn_start = max(
+        (
+            idx
+            for idx, msg in enumerate(messages)
+            if (
+                isinstance(msg, dict)
+                and _is_real_user_message(msg)
+                and not msg.get("_terminal_continuation_scaffold")
+                and msg.get("content")
+                not in (CONTINUATION_NUDGE, LEGACY_CONTINUATION_NUDGE)
+            )
+        ),
+        default=-1,
+    )
+    current_turn_messages = messages[current_turn_start + 1 :]
+    assistant_text = agent._strip_think_blocks(assistant_content or "").strip()
+    user_text = _summarize_user_message_for_log(user_message).strip()
+    scope_text = f"{user_text} {assistant_text}".lower()
+    workspace_scoped = (
+        not require_workspace
+        or any(marker in scope_text for marker in _WORKSPACE_MARKERS)
+        or "~/" in scope_text
+        or bool(re.search(r"(?:^|\s)/(?:[a-z0-9_.-]+/)*[a-z0-9_.-]+", scope_text))
+        or bool(re.search(r"\b[a-z]:\\", scope_text))
+    )
+
+    return classify_terminal_continuation(
+        ContinuationFacts(
+            runtime=str(getattr(agent, "api_mode", "") or ""),
+            terminal_completed=terminal_completed,
+            finish_reason=finish_reason,
+            substantive_tool_count=count_substantive_tools(current_turn_messages),
+            assistant_text=assistant_text,
+            user_text=user_text,
+            workspace_scoped=workspace_scoped,
+            continuation_attempts=continuation_attempts,
+            interrupted=interrupted,
+            transport_error=transport_error,
+            pending_background=pending_background,
+            allow_non_codex=not require_workspace,
+        )
+    )
+
+
 def looks_like_codex_intermediate_ack(
     agent,
     user_message: Any,
     assistant_content: str,
     messages: List[Dict[str, Any]],
     require_workspace: bool = True,
+    continuation_attempts: int = 0,
 ) -> bool:
-    """Detect a planning/ack message that should continue instead of ending the turn.
+    """Compatibility bool for callers that do not need the reason value.
 
-    ``require_workspace`` (default True) keeps the original codex-coding scope:
-    the ack must reference a filesystem/repo workspace. The conversation loop
-    passes ``require_workspace=False`` when the user has explicitly opted into
-    intent-ack continuation for all api_modes (``agent.intent_ack_continuation``
-    is ``true`` or a model-list), so general autonomous workflows ("I'll run a
-    health check on the server", "I'll start the deployment") — which carry a
-    future-ack and an action verb but no filesystem reference — are caught too.
-    The future-ack + short-content + no-prior-tools + action-verb requirements
-    always apply, which is what keeps conversational "I'll help you brainstorm"
-    replies from tripping it.
+    ``continuation_attempts`` must be supplied by any caller using this as a
+    retry gate. Runtime loops should prefer :func:`classify_codex_terminal` so
+    they can distinguish exhaustion and emit the durable pause notice.
     """
-    if any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages):
-        return False
+    from agent.terminal_continuation import ContinuationReason
 
-    assistant_text = agent._strip_think_blocks(assistant_content or "").strip().lower()
-    if not assistant_text:
-        return False
-    if len(assistant_text) > 1200:
-        return False
-
-    has_future_ack = bool(
-        re.search(r"\b(i['’]ll|i will|let me|i can do that|i can help with that)\b", assistant_text)
-    )
-    if not has_future_ack:
-        return False
-
-    action_markers = (
-        "look into",
-        "look at",
-        "inspect",
-        "scan",
-        "check",
-        "analyz",
-        "review",
-        "explore",
-        "read",
-        "open",
-        "run",
-        "test",
-        "fix",
-        "debug",
-        "search",
-        "find",
-        "walkthrough",
-        "report back",
-        "summarize",
-    )
-    workspace_markers = (
-        "directory",
-        "current directory",
-        "current dir",
-        "cwd",
-        "repo",
-        "repository",
-        "codebase",
-        "project",
-        "folder",
-        "filesystem",
-        "file tree",
-        "files",
-        "path",
-    )
-
-    assistant_mentions_action = any(marker in assistant_text for marker in action_markers)
-    if not assistant_mentions_action:
-        return False
-
-    # Opted-in (all-api_mode) path: a future-ack + action verb + no prior tool
-    # call is enough — the user asked us to keep going when the model only
-    # announces intent, regardless of whether a filesystem is involved.
-    if not require_workspace:
-        return True
-
-    # ``user_message`` is typed ``str`` but can arrive as an OpenAI-style
-    # multi-part content list (``[{type:"text",...}, {type:"image_url",...}]``)
-    # for vision requests routed through the OpenAI-compat API server. A
-    # truthy list survives ``(user_message or "")`` and then ``.strip()``
-    # raises ``AttributeError`` — flatten to text first.
-    from agent.codex_responses_adapter import _summarize_user_message_for_log
-
-    user_text = _summarize_user_message_for_log(user_message).strip().lower()
-    user_targets_workspace = (
-        any(marker in user_text for marker in workspace_markers)
-        or "~/" in user_text
-        or "/" in user_text
-    )
-    assistant_targets_workspace = any(
-        marker in assistant_text for marker in workspace_markers
-    )
-    return user_targets_workspace or assistant_targets_workspace
+    return classify_codex_terminal(
+        agent,
+        user_message,
+        assistant_content,
+        messages,
+        require_workspace=require_workspace,
+        continuation_attempts=continuation_attempts,
+    ) not in {ContinuationReason.NONE, ContinuationReason.BUDGET_EXHAUSTED}
 
 
 def intent_ack_continuation_mode(agent) -> str:
@@ -3586,9 +3596,9 @@ def intent_ack_continuation_mode(agent) -> str:
 
     Returns one of:
       * ``"off"``        — never continue.
-      * ``"codex_only"`` — historical scope: continue only on the
-        ``codex_responses`` api_mode, and only for codebase/workspace acks
-        (``require_workspace=True``).
+      * ``"codex_only"`` — conservative automatic scope: continue only on
+        ``codex_responses`` or ``codex_app_server``, and only for
+        codebase/workspace turns (``require_workspace=True``).
       * ``"all"``        — user opted in for every api_mode; continue on any
         future-ack + action verb (``require_workspace=False``).
 
@@ -3607,16 +3617,20 @@ def intent_ack_continuation_mode(agent) -> str:
         model_lower = (agent.model or "").lower()
         return "all" if any(p.lower() in model_lower for p in mode if isinstance(p, str)) else "off"
     # "auto" or any unrecognised value — historical codex-only behavior.
-    return "codex_only" if agent.api_mode == "codex_responses" else "off"
+    return (
+        "codex_only"
+        if agent.api_mode in {"codex_responses", "codex_app_server"}
+        else "off"
+    )
 
 
 def intent_ack_continuation_enabled(agent) -> bool:
     """Whether intent-ack continuation should fire at all for this turn.
 
-    The ``codex_ack_continuations < 2`` per-turn cap and the
-    ``looks_like_codex_intermediate_ack`` detector are applied by the caller;
-    this only decides the on/off gate. Callers that also need to know whether
-    the workspace requirement applies should use ``intent_ack_continuation_mode``
+    The shared classifier applies the two-recovery per-turn cap and the
+    terminal/safety evidence gates; this helper only decides the configured
+    runtime scope. Callers that also need to know whether the workspace
+    requirement applies should use ``intent_ack_continuation_mode``
     directly (``"codex_only"`` ⇒ require_workspace=True, ``"all"`` ⇒ False).
     """
     return intent_ack_continuation_mode(agent) != "off"

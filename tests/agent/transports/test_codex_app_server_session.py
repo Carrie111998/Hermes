@@ -279,6 +279,46 @@ class TestRunTurn:
         ]
 
 
+    def test_stale_completion_on_same_thread_does_not_complete_active_turn(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={
+                "id": "turn-stale-001",
+                "status": "completed",
+                "error": None,
+            },
+        )
+        client.queue_notification(
+            "item/completed",
+            threadId="thread-fake-001",
+            turnId="turn-fake-001",
+            item={
+                "type": "agentMessage",
+                "id": "active-message",
+                "text": "active turn complete",
+            },
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={
+                "id": "turn-fake-001",
+                "status": "completed",
+                "error": None,
+            },
+        )
+
+        result = make_session(client).run_turn("continue", turn_timeout=2.0)
+
+        assert result.turn_id == "turn-fake-001"
+        assert result.native_completed is True
+        assert result.final_text == "active turn complete"
+        assert result.projected_messages == [
+            {"role": "assistant", "content": "active turn complete"}
+        ]
+
 
     def test_tool_iteration_counter_ticks(self):
         client = FakeClient()
@@ -704,6 +744,26 @@ class TestSessionRetirement:
 
 
 
+    def test_native_interrupted_status_is_not_native_completion(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "partial"},
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "interrupted", "error": None},
+        )
+        result = make_session(client).run_turn("hi", turn_timeout=1.0)
+
+        assert result.final_text == "partial"
+        assert result.interrupted is False
+        assert result.native_completed is False
+
+
     def test_final_agent_message_without_turn_completed_is_recovered(self):
         """A completed assistant item is still a usable terminal response when
         codex omits turn/completed and then goes quiet.
@@ -722,6 +782,7 @@ class TestSessionRetirement:
             notification_poll_timeout=0.01,
         )
         assert r.final_text == "done"
+        assert r.native_completed is False
         assert r.interrupted is False
         assert r.error is None
         assert r.should_retire is False
@@ -795,6 +856,7 @@ class TestSessionRetirement:
         # Should NOT be a retirement case.
         assert r.tool_iterations == 1
         assert r.final_text == "tool finished"
+        assert r.native_completed is True
         assert r.should_retire is False
         assert r.interrupted is False
 

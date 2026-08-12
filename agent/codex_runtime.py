@@ -23,6 +23,11 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.terminal_continuation import (
+    BUDGET_EXHAUSTED_NOTICE,
+    CONTINUATION_NUDGE,
+    ContinuationReason,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -753,9 +758,186 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    codex_turns = []
+    native_turn_attempts = 0
+    next_input = user_message
+    fallback_candidate_text = None
+    retry_exception = None
+
+    def _apply_pause_notice(completed_turn) -> None:
+        candidate_text = completed_turn.final_text
+        completed_turn.final_text = (
+            f"{candidate_text.rstrip()}\n\n{BUDGET_EXHAUSTED_NOTICE}"
+        )
+        for projected in reversed(completed_turn.projected_messages):
+            if (
+                isinstance(projected, dict)
+                and projected.get("role") == "assistant"
+                and not projected.get("tool_calls")
+                and projected.get("content") == candidate_text
+            ):
+                projected["content"] = completed_turn.final_text
+                break
+        else:
+            completed_turn.projected_messages.append(
+                {"role": "assistant", "content": completed_turn.final_text}
+            )
+
+    def _merged_projections(completed_turns):
+        return [
+            projected
+            for completed_turn in completed_turns
+            for projected in completed_turn.projected_messages
+            if not (
+                isinstance(projected, dict)
+                and projected.get("role") == "user"
+                and projected.get("content") == CONTINUATION_NUDGE
+            )
+        ]
+
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        for continuation_attempt in range(3):
+            native_turn_attempts += 1
+            current_turn = agent._codex_session.run_turn(user_input=next_input)
+            codex_turns.append(current_turn)
+
+            # A user stop can race with native turn/completed after the session
+            # has built TurnResult but before this wrapper decides to recover.
+            if getattr(agent, "_interrupt_requested", False):
+                current_turn.interrupted = True
+                if fallback_candidate_text and not current_turn.final_text:
+                    current_turn.final_text = fallback_candidate_text
+                    current_turn.projected_messages.append(
+                        {"role": "assistant", "content": fallback_candidate_text}
+                    )
+                break
+
+            if (
+                current_turn.interrupted
+                or current_turn.error is not None
+                or getattr(current_turn, "should_retire", False)
+                or not current_turn.final_text
+            ):
+                if fallback_candidate_text and not current_turn.final_text:
+                    current_turn.final_text = fallback_candidate_text
+                    current_turn.projected_messages.append(
+                        {"role": "assistant", "content": fallback_candidate_text}
+                    )
+                break
+
+            from agent.agent_runtime_helpers import (
+                classify_codex_terminal,
+                intent_ack_continuation_mode,
+            )
+
+            ack_mode = intent_ack_continuation_mode(agent)
+            projected_so_far = [
+                projected
+                for completed_turn in codex_turns
+                for projected in completed_turn.projected_messages
+            ]
+            continuation_reason = (
+                classify_codex_terminal(
+                    agent,
+                    user_message=user_message,
+                    assistant_content=current_turn.final_text,
+                    messages=[*messages, *projected_so_far],
+                    require_workspace=(ack_mode == "codex_only"),
+                    terminal_completed=bool(
+                        getattr(current_turn, "native_completed", False)
+                    ),
+                    finish_reason="completed",
+                    continuation_attempts=continuation_attempt,
+                    interrupted=current_turn.interrupted,
+                    transport_error=current_turn.error is not None,
+                )
+                if ack_mode != "off" and agent.valid_tool_names
+                else ContinuationReason.NONE
+            )
+            if continuation_reason is ContinuationReason.NONE:
+                break
+            if continuation_reason is ContinuationReason.BUDGET_EXHAUSTED:
+                _apply_pause_notice(current_turn)
+                break
+
+            # The app-server path bypasses the outer conversation loop's
+            # iteration accounting. This secondary budget therefore caps only
+            # native recovery turns; the initial native turn is counted by
+            # `native_turn_attempts` above but does not consume this budget.
+            iteration_budget = getattr(agent, "iteration_budget", None)
+            if iteration_budget is not None and not iteration_budget.consume():
+                _apply_pause_notice(current_turn)
+                break
+
+            # Keep real tool events, but discard the premature assistant
+            # candidate from Hermes' durable/projected transcript. The native
+            # Codex thread remains append-only and receives the nudge below.
+            removed_candidate = False
+            retained_projected = []
+            for projected in reversed(current_turn.projected_messages):
+                if (
+                    not removed_candidate
+                    and isinstance(projected, dict)
+                    and projected.get("role") == "assistant"
+                    and not projected.get("tool_calls")
+                    and projected.get("content") == current_turn.final_text
+                ):
+                    removed_candidate = True
+                    continue
+                retained_projected.append(projected)
+            current_turn.projected_messages = list(reversed(retained_projected))
+            if not removed_candidate:
+                refund = getattr(iteration_budget, "refund", None)
+                if callable(refund):
+                    refund()
+                logger.warning(
+                    "codex app-server false-stop candidate was not projected; "
+                    "skipping automatic continuation"
+                )
+                break
+            fallback_candidate_text = current_turn.final_text
+
+            logger.info(
+                "codex app-server false stop detected (%s); continuing (%d/2)",
+                continuation_reason.value,
+                continuation_attempt + 1,
+            )
+            try:
+                agent._touch_activity(
+                    "codex app-server false stop; continuing"
+                )
+            except Exception:
+                pass
+            next_input = CONTINUATION_NUDGE
+
+        final_turn = codex_turns[-1]
+        turn = SimpleNamespace(
+            final_text=final_turn.final_text,
+            projected_messages=_merged_projections(codex_turns),
+            tool_iterations=sum(
+                completed_turn.tool_iterations for completed_turn in codex_turns
+            ),
+            interrupted=final_turn.interrupted,
+            native_completed=getattr(final_turn, "native_completed", False),
+            error=final_turn.error,
+            turn_id=final_turn.turn_id,
+            thread_id=final_turn.thread_id,
+            token_usage_last=getattr(final_turn, "token_usage_last", None),
+            token_usage_total=getattr(final_turn, "token_usage_total", None),
+            model_context_window=getattr(
+                final_turn, "model_context_window", None
+            ),
+            compacted=any(
+                getattr(completed_turn, "compacted", False)
+                for completed_turn in codex_turns
+            ),
+            should_retire=any(
+                getattr(completed_turn, "should_retire", False)
+                for completed_turn in codex_turns
+            ),
+        )
     except Exception as exc:
+        retry_exception = exc
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
         # respawns from scratch instead of reusing a dead client.
@@ -764,33 +946,77 @@ def run_codex_app_server_turn(
         except Exception:
             pass
         agent._codex_session = None
-        _user_interrupted = bool(
-            getattr(agent, "_interrupt_requested", False)
+        if not codex_turns:
+            _record_codex_app_server_usage(
+                agent, SimpleNamespace(token_usage_last=None)
+            )
+            _user_interrupted = bool(
+                getattr(agent, "_interrupt_requested", False)
+            )
+            _interrupt_message = (
+                getattr(agent, "_interrupt_message", None)
+                if _user_interrupted
+                else None
+            )
+            if _user_interrupted:
+                agent.clear_interrupt()
+            return {
+                "final_response": (
+                    f"Codex app-server turn failed: {exc}. "
+                    "Fall back to default runtime with `/codex-runtime auto`."
+                ),
+                "messages": messages,
+                "api_calls": native_turn_attempts,
+                "completed": False,
+                "partial": True,
+                "interrupted": _user_interrupted,
+                **(
+                    {"interrupt_message": _interrupt_message}
+                    if _interrupt_message
+                    else {}
+                ),
+                "error": str(exc),
+            }
+
+        # A retry exception happened after at least one native turn completed.
+        # Preserve those turns through the normal persistence/accounting path
+        # and terminate with the latest removed checkpoint plus an explicit
+        # failure notice.
+        final_turn = codex_turns[-1]
+        checkpoint = fallback_candidate_text or final_turn.final_text
+        failure_notice = (
+            f"PAUSED — Codex app-server continuation failed: {exc}. "
+            "Fall back to the default runtime with `/codex-runtime auto`."
         )
-        _interrupt_message = (
-            getattr(agent, "_interrupt_message", None)
-            if _user_interrupted
-            else None
+        failure_text = (
+            f"{checkpoint.rstrip()}\n\n{failure_notice}"
+            if checkpoint
+            else failure_notice
         )
-        if _user_interrupted:
-            agent.clear_interrupt()
-        return {
-            "final_response": (
-                f"Codex app-server turn failed: {exc}. "
-                f"Fall back to default runtime with `/codex-runtime auto`."
+        projected_messages = _merged_projections(codex_turns)
+        projected_messages.append({"role": "assistant", "content": failure_text})
+        turn = SimpleNamespace(
+            final_text=failure_text,
+            projected_messages=projected_messages,
+            tool_iterations=sum(
+                completed_turn.tool_iterations for completed_turn in codex_turns
             ),
-            "messages": messages,
-            "api_calls": 0,
-            "completed": False,
-            "partial": True,
-            "interrupted": _user_interrupted,
-            **(
-                {"interrupt_message": _interrupt_message}
-                if _interrupt_message
-                else {}
+            interrupted=bool(getattr(agent, "_interrupt_requested", False)),
+            native_completed=False,
+            error=str(retry_exception),
+            turn_id=final_turn.turn_id,
+            thread_id=final_turn.thread_id,
+            token_usage_last=getattr(final_turn, "token_usage_last", None),
+            token_usage_total=getattr(final_turn, "token_usage_total", None),
+            model_context_window=getattr(
+                final_turn, "model_context_window", None
             ),
-            "error": str(exc),
-        }
+            compacted=any(
+                getattr(completed_turn, "compacted", False)
+                for completed_turn in codex_turns
+            ),
+            should_retire=True,
+        )
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its
     # interrupt handoff/cleanup so a hard stop cannot poison the next turn and a
@@ -873,9 +1099,15 @@ def run_codex_app_server_turn(
     agent._iters_since_skill = (
         getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
     )
-    _record_codex_app_server_compaction(agent, turn)
-    usage_result = _record_codex_app_server_usage(agent, turn)
-    api_calls = 1
+    usage_result = {}
+    for completed_turn in codex_turns:
+        _record_codex_app_server_compaction(agent, completed_turn)
+        usage_result = _record_codex_app_server_usage(agent, completed_turn)
+    for _ in range(len(codex_turns), native_turn_attempts):
+        _record_codex_app_server_usage(
+            agent, SimpleNamespace(token_usage_last=None)
+        )
+    api_calls = native_turn_attempts
 
     # Now check the skill nudge AFTER iters were incremented — same
     # pattern the chat_completions path uses (line ~15432).
@@ -907,6 +1139,7 @@ def run_codex_app_server_turn(
     if (
         turn.final_text
         and not turn.interrupted
+        and turn.error is None
         and (should_review_memory or should_review_skills)
     ):
         try:

@@ -251,6 +251,8 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # drive the bounded retry. Persisting them would replay the internal
     # retry instruction as user-authored context on resume.
     "_dropped_toolcall_nudge",
+    # false-stop recovery pair: premature assistant candidate + user nudge
+    "_terminal_continuation_scaffold",
 )
 
 
@@ -1758,11 +1760,17 @@ class AIAgent:
         assistant_content: str,
         messages: List[Dict[str, Any]],
         require_workspace: bool = True,
+        continuation_attempts: int = 0,
     ) -> bool:
         """Forwarder — see ``agent.agent_runtime_helpers.looks_like_codex_intermediate_ack``."""
         from agent.agent_runtime_helpers import looks_like_codex_intermediate_ack
         return looks_like_codex_intermediate_ack(
-            self, user_message, assistant_content, messages, require_workspace
+            self,
+            user_message,
+            assistant_content,
+            messages,
+            require_workspace,
+            continuation_attempts,
         )
 
     def _extract_reasoning(self, assistant_message) -> Optional[str]:
@@ -6344,7 +6352,7 @@ class AIAgent:
 
     def _emit_interim_assistant_message(
         self, assistant_msg: Dict[str, Any]
-    ) -> None:
+    ) -> bool:
         """Surface a real mid-turn assistant commentary message to the UI layer.
 
         Does NOT set ``_response_was_previewed`` — that flag means "the final
@@ -6357,7 +6365,7 @@ class AIAgent:
         """
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None or not isinstance(assistant_msg, dict):
-            return
+            return False
         commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
         undelivered_parts: List[str] = []
         pending_keys: set[str] = set()
@@ -6381,7 +6389,7 @@ class AIAgent:
             or visible == "(empty)"
             or self._interim_text_was_delivered(visible)
         ):
-            return
+            return False
         already_streamed = self._interim_content_was_streamed(visible)
         try:
             cb(visible, already_streamed=already_streamed)
@@ -6390,8 +6398,10 @@ class AIAgent:
                     self._record_delivered_interim_text(part)
             else:
                 self._record_delivered_interim_text(visible)
+            return True
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
+            return False
 
     def _ensure_stream_writer_state(self) -> None:
         """Lazily create the single-writer guard fields (#65991).

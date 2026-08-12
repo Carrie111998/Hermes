@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from agent.turn_finalizer import finalize_turn
 
 
@@ -126,6 +128,309 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert result["messages"][-1] == {"role": "assistant", "content": "Done."}
     assert agent.persisted_messages is not None
     assert agent.persisted_messages[-1] == {"role": "assistant", "content": "Done."}
+
+
+def test_nonterminal_retry_exit_restores_latest_continuation_checkpoint(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent._response_was_previewed = False
+    checkpoint = "I'm now fixing the remaining tests."
+    messages = [
+        {"role": "user", "content": "finish the work"},
+        {
+            "role": "assistant",
+            "content": checkpoint,
+            "_terminal_continuation_scaffold": True,
+        },
+        {
+            "role": "user",
+            "content": "continue",
+            "_terminal_continuation_scaffold": True,
+        },
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response=None,
+        api_call_count=2,
+        interrupted=False,
+        failed=True,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="finish the work",
+        original_user_message="finish the work",
+        _should_review_memory=False,
+        _turn_exit_reason="empty_response_exhausted",
+    )
+
+    assert result["completed"] is False
+    assert result["response_previewed"] is False
+    assert result["final_response"] == checkpoint
+    assert result["messages"][-1] == {"role": "assistant", "content": checkpoint}
+    assert agent.persisted_messages is not None
+    assert agent.persisted_messages[-1] == {"role": "assistant", "content": checkpoint}
+    assert not any(
+        message.get("_terminal_continuation_scaffold")
+        for message in result["messages"]
+        if isinstance(message, dict)
+    )
+
+
+def test_restored_checkpoint_preserves_proven_interim_delivery(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent._response_was_previewed = False
+    checkpoint = "I'm now fixing the remaining tests."
+    messages = [
+        {"role": "user", "content": "finish the work"},
+        {
+            "role": "assistant",
+            "content": checkpoint,
+            "_terminal_continuation_scaffold": True,
+            "_terminal_continuation_previewed": True,
+        },
+        {
+            "role": "user",
+            "content": "continue",
+            "_terminal_continuation_scaffold": True,
+        },
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response=None,
+        api_call_count=2,
+        interrupted=False,
+        failed=True,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="finish the work",
+        original_user_message="finish the work",
+        _should_review_memory=False,
+        _turn_exit_reason="empty_response_exhausted",
+    )
+
+    assert result["final_response"] == checkpoint
+    assert result["response_previewed"] is True
+    assert result["messages"][-1] == {"role": "assistant", "content": checkpoint}
+
+
+@pytest.mark.parametrize(
+    "sentinel",
+    [
+        "(empty)",
+        (
+            "⚠️ The model produced only internal reasoning and no final answer, "
+            "despite retries. Its last reasoning, which may contain the answer:\n\n"
+            "I should continue."
+        ),
+    ],
+)
+def test_no_answer_sentinel_restores_latest_continuation_checkpoint(
+    monkeypatch, sentinel
+):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent._response_was_previewed = False
+    checkpoint = "I'm now fixing the remaining tests."
+    messages = [
+        {"role": "user", "content": "finish the work"},
+        {
+            "role": "assistant",
+            "content": checkpoint,
+            "_terminal_continuation_scaffold": True,
+        },
+        {
+            "role": "user",
+            "content": "continue",
+            "_terminal_continuation_scaffold": True,
+        },
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response=sentinel,
+        api_call_count=2,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="finish the work",
+        original_user_message="finish the work",
+        _should_review_memory=False,
+        _turn_exit_reason="empty_response_exhausted",
+    )
+
+    assert result["final_response"] == checkpoint
+    assert result["response_previewed"] is False
+    assert result["messages"][-1] == {"role": "assistant", "content": checkpoint}
+    assert agent.persisted_messages is not None
+    assert agent.persisted_messages[-1] == {
+        "role": "assistant",
+        "content": checkpoint,
+    }
+
+
+def test_restored_checkpoint_follows_trailing_terminal_sentinel_cleanup(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent._response_was_previewed = False
+
+    def drop_trailing_scaffolding(messages):
+        while messages and messages[-1].get("_empty_terminal_sentinel"):
+            messages.pop()
+
+    agent._drop_trailing_empty_response_scaffolding = drop_trailing_scaffolding
+    checkpoint = "I'm now fixing the remaining tests."
+    messages = [
+        {"role": "user", "content": "finish the work"},
+        {
+            "role": "assistant",
+            "content": checkpoint,
+            "_terminal_continuation_scaffold": True,
+        },
+        {
+            "role": "user",
+            "content": "continue",
+            "_terminal_continuation_scaffold": True,
+        },
+        {
+            "role": "assistant",
+            "content": "(empty)",
+            "_empty_terminal_sentinel": True,
+        },
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="(empty)",
+        api_call_count=2,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="finish the work",
+        original_user_message="finish the work",
+        _should_review_memory=False,
+        _turn_exit_reason="empty_response_exhausted",
+    )
+
+    assert result["final_response"] == checkpoint
+    assert result["messages"] == [
+        {"role": "user", "content": "finish the work"},
+        {"role": "assistant", "content": checkpoint},
+    ]
+    assert agent.persisted_messages == result["messages"]
+    assert not any(
+        message.get("_empty_terminal_sentinel")
+        for message in result["messages"]
+    )
+
+
+def test_interrupted_restored_checkpoint_closes_user_tail_after_cleanup(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent._response_was_previewed = False
+    checkpoint = "I'm now fixing the remaining tests."
+    messages = [
+        {"role": "user", "content": "finish the work"},
+        {
+            "role": "assistant",
+            "content": checkpoint,
+            "_terminal_continuation_scaffold": True,
+        },
+        {
+            "role": "user",
+            "content": "continue",
+            "_terminal_continuation_scaffold": True,
+        },
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response=None,
+        api_call_count=2,
+        interrupted=True,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="finish the work",
+        original_user_message="finish the work",
+        _should_review_memory=False,
+        _turn_exit_reason="interrupted",
+    )
+
+    assert result["final_response"] == checkpoint
+    assert result["messages"] == [
+        {"role": "user", "content": "finish the work"},
+        {"role": "assistant", "content": checkpoint},
+    ]
+    assert agent.persisted_messages == result["messages"]
+
+
+@pytest.mark.parametrize(
+    ("failed", "interrupted"),
+    [(True, False), (False, True)],
+)
+def test_newer_recovery_text_wins_over_stale_checkpoint(
+    monkeypatch, failed, interrupted
+):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent._response_was_previewed = False
+    checkpoint = "I'm now fixing the remaining tests."
+    newer = "The recovery completed a newer partial result."
+    messages = [
+        {"role": "user", "content": "finish the work"},
+        {
+            "role": "assistant",
+            "content": checkpoint,
+            "_terminal_continuation_scaffold": True,
+            "_terminal_continuation_previewed": True,
+        },
+        {
+            "role": "user",
+            "content": "continue",
+            "_terminal_continuation_scaffold": True,
+        },
+        {"role": "assistant", "content": newer},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response=newer,
+        api_call_count=2,
+        interrupted=interrupted,
+        failed=failed,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="finish the work",
+        original_user_message="finish the work",
+        _should_review_memory=False,
+        _turn_exit_reason="interrupted" if interrupted else "recovery_failed",
+    )
+
+    assert result["final_response"] == newer
+    assert result["response_previewed"] is False
+    assert result["messages"][-1] == {"role": "assistant", "content": newer}
+    assert not any(
+        message.get("_terminal_continuation_scaffold")
+        for message in result["messages"]
+        if isinstance(message, dict)
+    )
+    assert all(message.get("content") != checkpoint for message in result["messages"])
 
 
 def test_final_response_fills_pure_tool_call_tail(monkeypatch):
