@@ -6926,7 +6926,7 @@ class BasePlatformAdapter(ABC):
                 # treated conservatively while its liveness is unknown.
                 active += 1
         return active
-    
+
     async def cancel_background_tasks(self) -> None:
         """Cancel any in-flight background message-processing tasks.
 

@@ -185,6 +185,27 @@ async def test_request_restart_waits_for_final_delivery_after_agent_finishes():
         await delivery_task
 
 
+def test_active_messaging_work_count_bridges_runner_and_adapter_lifetimes():
+    """One turn remains one work unit across runner/adapter ownership."""
+    runner, adapter = make_restart_runner()
+    session_key = "agent:main:telegram:dm:123"
+    runner._running_agents[session_key] = MagicMock()
+    owner_task = MagicMock()
+    owner_task.done.return_value = False
+    adapter._session_tasks[session_key] = owner_task
+
+    # During agent execution both registries describe the same turn.
+    assert runner._active_messaging_work_count() == 1
+
+    # After the handler returns, adapter-owned final delivery keeps it live.
+    del runner._running_agents[session_key]
+    assert runner._active_messaging_work_count() == 1
+
+    # A completed owner retained for stale-guard reconciliation is not work.
+    owner_task.done.return_value = True
+    assert runner._active_messaging_work_count() == 0
+
+
 @pytest.mark.asyncio
 async def test_request_restart_after_turn_timeout_zero_enters_stop_immediately():
     """restart_after_turn_timeout=0 preserves legacy immediate drain."""
@@ -415,5 +436,4 @@ async def test_drain_suppress_skips_home_channel_keeps_session_ping(tmp_path, mo
     assert "999" in sent_chat_ids
     assert "home-42" not in sent_chat_ids
     assert "shutting down" in adapter.sent[0]
-
 
