@@ -60,7 +60,7 @@ def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         url,
         json=payload,
         timeout=60,
-        headers={"X-Client-Source": "hermes-agent"},
+        headers={"X-Client-Name": "hermes-agent"},
     )
     response.raise_for_status()
     return response.json()
