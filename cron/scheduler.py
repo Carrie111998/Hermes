@@ -3227,6 +3227,54 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
     return None
 
 
+def _record_no_agent_run_session(job: dict, doc: str) -> None:
+    """Record a script-only cron run as a lightweight session (desktop run history).
+
+    Agent runs create ``cron_{job_id}_{timestamp}`` sessions through run_agent;
+    no_agent runs short-circuit before any agent machinery, so they never
+    produce a session row and the desktop run-history list (SessionDB
+    ``list_cron_job_runs`` — an id-prefix scan over ``source='cron'``) shows
+    "no runs yet" even though executions.db recorded the run. Write a minimal
+    row here — session + one user-role message carrying the run doc — so the
+    run list, preview and open-run paths work identically for script jobs.
+
+    Deliberately tiny and fully fault-tolerant: this must never affect the
+    script's own result or delivery. Failures degrade to a debug log.
+    """
+    job_id = job.get("id") or ""
+    if not job_id:
+        return
+    try:
+        from hermes_state import SessionDB
+
+        session_db = SessionDB()
+    except Exception as e:
+        logger.debug("Job '%s': no_agent run session store unavailable: %s", job_id, e)
+        return
+    try:
+        session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+        session_db.create_session(session_id, "cron")
+        if doc:
+            session_db.append_message(
+                session_id, "user", doc, timestamp=time.time()
+            )
+        job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+        title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
+        _set_cron_session_title(
+            session_db,
+            session_id,
+            f"{title_base} · {_hermes_now().strftime('%b %d %H:%M')}",
+        )
+        session_db.end_session(session_id, "cron_complete")
+    except Exception as e:
+        logger.debug("Job '%s': failed to record no_agent run session: %s", job_id, e)
+    finally:
+        try:
+            session_db.close()
+        except Exception:
+            pass
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
@@ -3293,6 +3341,7 @@ def run_job(
         if not script_path:
             err = "no_agent=True but no script is set for this job"
             logger.error("Job '%s': %s", job_id, err)
+            _record_no_agent_run_session(job, err)
             return False, "", "", err
 
         # Apply workdir if configured — lets scripts use predictable relative
@@ -3336,6 +3385,7 @@ def run_job(
                 f"**Status:** script failed\n\n"
                 f"{output}\n"
             )
+            _record_no_agent_run_session(job, doc)
             return False, doc, alert, output
 
         # Honour the wakeAgent gate as a silent signal — `wakeAgent: false`
@@ -3351,6 +3401,7 @@ def run_job(
                 f"**Mode:** no_agent (script)\n"
                 f"**Status:** silent (wakeAgent=false)\n"
             )
+            _record_no_agent_run_session(job, silent_doc)
             return True, silent_doc, SILENT_MARKER, None
 
         if not output.strip():
@@ -3362,6 +3413,7 @@ def run_job(
                 f"**Mode:** no_agent (script)\n"
                 f"**Status:** silent (empty output)\n"
             )
+            _record_no_agent_run_session(job, silent_doc)
             return True, silent_doc, SILENT_MARKER, None
 
         doc = (
@@ -3372,6 +3424,7 @@ def run_job(
             f"---\n\n"
             f"{output}\n"
         )
+        _record_no_agent_run_session(job, doc)
         return True, doc, output, None
 
     # ---------------------------------------------------------------

@@ -150,6 +150,48 @@ def test_run_job_script_path_traversal_still_blocked(hermes_env):
     assert "Blocked" in output or "outside" in output
 
 
+def test_run_job_no_agent_records_run_session(hermes_env):
+    """Script-only runs must leave a desktop-visible run session.
+
+    Regression for the desktop run-history list: agent runs create
+    ``cron_{job_id}_{timestamp}`` sessions (SessionDB.list_cron_job_runs),
+    but the no_agent short-circuit never wrote one — so script jobs always
+    showed "no runs yet" in the desktop cron sidebar even though
+    executions.db recorded every tick. The short-circuit now records a
+    lightweight session carrying the run doc.
+    """
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+    from hermes_state import SessionDB
+
+    script_path = hermes_env / "scripts" / "report.sh"
+    script_path.write_text("#!/bin/bash\necho 'sync ok'\n")
+
+    job = create_job(
+        prompt=None, schedule="every 5m", script="report.sh", no_agent=True, deliver="local"
+    )
+    success, doc, final_response, error = run_job(job)
+    assert success is True
+    assert error is None
+
+    db = SessionDB()
+    try:
+        runs = db.list_cron_job_runs(job["id"], limit=5)
+        assert len(runs) == 1
+        assert runs[0]["id"].startswith(f"cron_{job['id']}_")
+        assert runs[0]["source"] == "cron"
+        # preview is the shaped (truncated) head of the stored run doc
+        assert (runs[0].get("preview") or "").startswith("# Cron Job:")
+        # the full run doc is persisted as the session's user message
+        rows = db._conn.execute(
+            "SELECT content FROM messages WHERE session_id = ?",
+            (runs[0]["id"],),
+        ).fetchall()
+        assert any("sync ok" in (row[0] or "") for row in rows)
+    finally:
+        db.close()
+
+
 def test_run_job_script_nul_path_fails_cleanly(hermes_env):
     """Sibling of the lifecycle-guard ingestion fix: a NUL-bearing script
     value can survive to fire time (the creation-time guard treats it as
