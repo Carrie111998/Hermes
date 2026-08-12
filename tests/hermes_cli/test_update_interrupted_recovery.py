@@ -105,3 +105,54 @@ def sys_executable_path():
     return sys.executable
 
 
+def _make_live_venv(tmp_path, name):
+    """Create a fake venv layout under tmp_path (bin/ on POSIX, Scripts/ on Windows)."""
+    import platform
+
+    bin_dir = tmp_path / name / ("Scripts" if platform.system() == "Windows" else "bin")
+    bin_dir.mkdir(parents=True)
+    py = bin_dir / ("python.exe" if platform.system() == "Windows" else "python")
+    py.write_bytes(b"")
+    return py
+
+
+def test_default_venv_install_target_points_at_live_dot_venv(tmp_path, monkeypatch):
+    """#84647: install/repair must target the live venv (.venv), not a hardcoded `venv`."""
+    monkeypatch.setattr(m, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("hermes_cli.managed_uv.ensure_uv", lambda: "/fake/uv")
+    monkeypatch.setattr(m, "_is_termux_env", lambda *a, **k: False)
+
+    # uv-default / dev layout: only .venv exists
+    _make_live_venv(tmp_path, ".venv")
+    prefix, env = m._default_venv_install_target()
+    assert prefix == ["/fake/uv", "pip"]
+    assert env is not None
+    assert env["VIRTUAL_ENV"] == str(tmp_path / ".venv")
+
+    # Managed layout: `venv` wins when it actually holds an interpreter.
+    _make_live_venv(tmp_path, "venv")
+    _, env = m._default_venv_install_target()
+    assert env["VIRTUAL_ENV"] == str(tmp_path / "venv")
+
+
+def test_lazy_refresh_recovery_targets_live_dot_venv(tmp_path, monkeypatch):
+    """#84647: lazy-refresh recovery must repair the .venv install, not a phantom venv."""
+    monkeypatch.setattr(m, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("hermes_cli.managed_uv.ensure_uv", lambda: "/fake/uv")
+    monkeypatch.setattr(m, "_is_termux_env", lambda *a, **k: False)
+    _make_live_venv(tmp_path, ".venv")
+
+    seen = {}
+
+    def fake_repair(prefix, *, env=None):
+        seen["env"] = env
+        return "healthy"
+
+    monkeypatch.setattr(m, "_repair_venv_via_import_probes", fake_repair)
+    monkeypatch.setattr(m, "_clear_lazy_refresh_incomplete_marker", lambda: None)
+
+    m._recover_lazy_refresh_marker_locked()
+    assert seen["env"] is not None
+    assert seen["env"]["VIRTUAL_ENV"] == str(tmp_path / ".venv")
+
+
