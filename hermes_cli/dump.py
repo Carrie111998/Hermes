@@ -156,8 +156,7 @@ def _count_skills(hermes_home: Path) -> int:
 
 def _count_mcp_servers(config: dict) -> int:
     """Count configured MCP servers."""
-    mcp = config.get("mcp", {})
-    servers = mcp.get("servers", {})
+    servers = config.get("mcp_servers") or {}
     return len(servers)
 
 
