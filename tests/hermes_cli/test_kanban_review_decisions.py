@@ -1,6 +1,7 @@
 """Tests for resolve_review — the DB path backing Discord review buttons."""
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -175,5 +176,135 @@ def test_resolve_review_task_not_found(kanban_home):
         assert kb.resolve_review(
             conn, "t_nonexistent", run_id, decision="approve", actor="42"
         ) == (False, "task_not_found")
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Expiry rollback tests
+# ---------------------------------------------------------------------------
+
+REVIEW_EXPIRY_SECONDS = 86400  # 24 hours — matches the production default
+
+
+def test_release_expired_reviews_rejects_stale_review(kanban_home):
+    """A review older than REVIEW_EXPIRY_SECONDS is auto-rejected."""
+    conn, task_id, run_id = _create_review_task()
+    try:
+        # Backdate the review_requested event to simulate expiry
+        stale_ts = int(time.time()) - REVIEW_EXPIRY_SECONDS - 3600
+        conn.execute(
+            "UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'review_requested'",
+            (stale_ts, task_id),
+        )
+        conn.commit()
+
+        # Call release_expired_reviews
+        expired_count = kb.release_expired_reviews(
+            conn, expiry_seconds=REVIEW_EXPIRY_SECONDS,
+        )
+        assert expired_count == 1, f"Expected 1 expired review, got {expired_count}"
+
+        # Verify task was rejected
+        status = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()[0]
+        assert status in ("todo", "ready"), f"Expected todo/ready, got {status}"
+
+        # Verify decision was recorded
+        row = conn.execute(
+            "SELECT decision, actor, reason FROM kanban_review_decisions WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        assert row is not None, "No review decision recorded"
+        assert row["decision"] == "reject"
+        assert row["actor"] == "system"
+        assert "expired" in row["reason"].lower()
+
+        # Verify review_rejected event emitted
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_rejected' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert event is not None
+        payload = json.loads(event["payload"] or "{}")
+        assert payload.get("review_decision") == "reject"
+        assert payload.get("actor") == "system"
+    finally:
+        conn.close()
+
+
+def test_release_expired_reviews_leaves_fresh_review_alone(kanban_home):
+    """A review within the expiry window is NOT auto-rejected."""
+    conn, task_id, run_id = _create_review_task()
+    try:
+        # Review is fresh (just created) — should not expire
+        expired_count = kb.release_expired_reviews(
+            conn, expiry_seconds=REVIEW_EXPIRY_SECONDS,
+        )
+        assert expired_count == 0, f"Expected 0 expired, got {expired_count}"
+
+        # Verify task is still in review
+        status = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()[0]
+        assert status == "review", f"Expected review, got {status}"
+    finally:
+        conn.close()
+
+
+def test_release_expired_reviews_already_decided_not_double_counted(kanban_home):
+    """An already-decided review is not counted as expired."""
+    conn, task_id, run_id = _create_review_task()
+    try:
+        # Approve the review first
+        kb.resolve_review(conn, task_id, run_id, decision="approve", actor="42")
+
+        # Backdate the review_requested event
+        stale_ts = int(time.time()) - REVIEW_EXPIRY_SECONDS - 3600
+        conn.execute(
+            "UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'review_requested'",
+            (stale_ts, task_id),
+        )
+        conn.commit()
+
+        # Call release_expired_reviews — should find 0 (already done)
+        expired_count = kb.release_expired_reviews(
+            conn, expiry_seconds=REVIEW_EXPIRY_SECONDS,
+        )
+        assert expired_count == 0, f"Expected 0, got {expired_count}"
+    finally:
+        conn.close()
+
+
+def test_release_expired_reviews_multiple_stale(kanban_home):
+    """Multiple expired reviews are all auto-rejected."""
+    conn = kb.connect()
+    try:
+        task_ids = []
+        for i in range(3):
+            tid = kb.create_task(conn, title=f"review {i}", assignee="worker")
+            kb.request_review(conn, tid, summary=f"done {i}", reviewer="reviewer", force=True)
+            task_ids.append(tid)
+
+        # Backdate all three
+        stale_ts = int(time.time()) - REVIEW_EXPIRY_SECONDS - 3600
+        for tid in task_ids:
+            conn.execute(
+                "UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'review_requested'",
+                (stale_ts, tid),
+            )
+        conn.commit()
+
+        expired_count = kb.release_expired_reviews(
+            conn, expiry_seconds=REVIEW_EXPIRY_SECONDS,
+        )
+        assert expired_count == 3, f"Expected 3 expired, got {expired_count}"
+
+        for tid in task_ids:
+            status = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (tid,),
+            ).fetchone()[0]
+            assert status in ("todo", "ready"), f"Task {tid} still in {status}"
     finally:
         conn.close()

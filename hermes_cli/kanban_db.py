@@ -6407,6 +6407,87 @@ def resolve_review(
     return True, decision
 
 
+def release_expired_reviews(
+    conn: sqlite3.Connection,
+    *,
+    expiry_seconds: int = 86400,  # 24 hours
+) -> int:
+    """Reject every review that has been sitting idle past the expiry window.
+
+    A review is expired when the task status is ``review``, the latest
+    ``review_requested`` event ``created_at`` is older than
+    ``now - expiry_seconds``, and there is no existing entry in
+    ``kanban_review_decisions`` for the task (covering the case where a
+    human resolved it between our read and write). Each expired review
+    is rejected as actor ``system`` with a timestamped reason, the task
+    is routed back to ``todo``/``ready`` (parent-gated), and a
+    ``review_rejected`` event is emitted.
+
+    Returns the count of reviews that were expired by this call.
+    """
+    expiry_seconds = int(expiry_seconds)
+    if expiry_seconds < 1:
+        raise ValueError("expiry_seconds must be >= 1")
+    now = int(time.time())
+    cutoff = now - expiry_seconds
+    rejected = 0
+    with write_txn(conn):
+        rows = conn.execute(
+            """SELECT t.id, t.current_run_id, e.id AS event_id, e.run_id
+               FROM tasks t
+               JOIN task_events e ON e.task_id = t.id
+               WHERE t.status = 'review'
+                 AND e.kind = 'review_requested'
+                 AND e.created_at < ?
+                 AND e.id = (
+                     SELECT MAX(id) FROM task_events
+                     WHERE task_id = t.id AND kind = 'review_requested'
+                 )
+               ORDER BY t.id""",
+            (cutoff,),
+        ).fetchall()
+        for row in rows:
+            task_id = row["id"]
+            run_id = row["run_id"] if row["run_id"] is not None else 0
+            # Re-check: skip if already decided (another concurrent call
+            # may have resolved it between our SELECT and here).
+            already = conn.execute(
+                "SELECT 1 FROM kanban_review_decisions WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if already is not None:
+                continue
+            try:
+                conn.execute(
+                    """INSERT INTO kanban_review_decisions
+                       (task_id, run_id, decision, actor, reason, created_at)
+                       VALUES (?, ?, 'reject', 'system', ?, ?)""",
+                    (task_id, run_id, _expiry_reason(now, cutoff), now),
+                )
+            except sqlite3.IntegrityError:
+                continue  # already decided concurrently
+            new_status = _landing_status_after_parents(conn, task_id)
+            conn.execute(
+                "UPDATE tasks SET status = ?, current_run_id = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = 'review'",
+                (new_status, task_id),
+            )
+            _append_event(conn, task_id, "review_rejected", {
+                "review_decision": "reject",
+                "actor": "system",
+                "reason": _expiry_reason(now, cutoff),
+            }, run_id=run_id)
+            rejected += 1
+    return rejected
+
+
+def _expiry_reason(now: int, cutoff: int) -> str:
+    """Human-readable reason string for an expired review."""
+    hours = round((now - cutoff) / 3600, 1)
+    return f"Review expired: unreviewed for {hours} hours"
+
+
 def request_changes(
     conn: sqlite3.Connection,
     task_id: str,
