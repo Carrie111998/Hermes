@@ -14,6 +14,16 @@ from events.schema import EventType
 from events.subscribers.mailbox_translator import MailboxTranslator
 from events.subscribers.tracker_intent_applier import TrackerIntentApplierSubscriber
 
+# Tests that must observe the poll loop's FIRST tick. That tick runs every
+# subscriber's poll plus the tick-zero health probes before it reaches the
+# timer-driven work these tests watch for, so its cost scales with how loaded
+# the host is — measured past 20s during the 2026-06-11 commit-charge incident
+# and again under the nightly gate's 24 concurrent workers, which is more than
+# the suite-wide per-test cap allows. The wait-until loops below still bound
+# each test; this marker only stops the shared cap from cutting them off
+# mid-wait and reporting a real regression that isn't there.
+first_tick_bound = pytest.mark.timeout(180)
+
 
 SCHEDULE = [8, 13, 18]
 
@@ -138,6 +148,7 @@ def test_poll_loop_survives_unexpected_exception_in_body():
         gi.shutdown()
 
 
+@first_tick_bound
 def test_poll_loop_flushes_telegram_notifier_batches():
     """The LOW-priority batch flush must be driven from the poll loop's timer,
     not only from inside ``TelegramNotifier.handle()``.
@@ -169,7 +180,7 @@ def test_poll_loop_flushes_telegram_notifier_batches():
         # take far longer than 2s (observed >20s under the 2026-06-11
         # commit-charge incident). The regression being guarded is "the
         # flush is driven by the poll timer at all", not "within 2s".
-        deadline = time.monotonic() + 20.0
+        deadline = time.monotonic() + 120.0
         while not flush_mock.called and time.monotonic() < deadline:
             time.sleep(0.1)
 
@@ -182,6 +193,7 @@ def test_poll_loop_flushes_telegram_notifier_batches():
         gi.shutdown()
 
 
+@first_tick_bound
 def test_poll_loop_writes_heartbeat_file():
     """The poll loop must write a heartbeat file so external watchers can
     detect gateway death.
@@ -207,7 +219,7 @@ def test_poll_loop_writes_heartbeat_file():
         # >20s under the 2026-06-11 commit-charge incident).  The guarded
         # behaviour is "the poll timer writes the heartbeat at all", not
         # "within 2.5s".
-        deadline = time.monotonic() + 20.0
+        deadline = time.monotonic() + 120.0
         while not (
             heartbeat.exists() and heartbeat.stat().st_mtime > prev_mtime
         ) and time.monotonic() < deadline:

@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
 
-from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli._subprocess_compat import run_text_capture, windows_hide_flags
 from utils import is_truthy_value
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
 from tools.tool_backend_helpers import (
@@ -1252,11 +1252,23 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
             )
             # User-provided templates (env var) may contain shell syntax; auto-detected commands are safe for list mode.
             use_shell = bool(os.getenv(LOCAL_STT_COMMAND_ENV, "").strip())
-            if use_shell:
-                subprocess.run(command, shell=True, check=True, capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
-            else:
-                subprocess.run(shlex.split(command), check=True, capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
-            
+            # run_text_capture, not subprocess.run: whisper shells out to
+            # ffmpeg, so even the list form spawns a grandchild that inherits
+            # the capture pipes and holds their write end open — which makes
+            # `timeout` unenforceable on Windows. With shell=True the
+            # grandchild is guaranteed rather than likely, cmd.exe being the
+            # direct child. Temp-file capture keeps the 300s bound. The helper
+            # supplies CREATE_NO_WINDOW itself, so windows_hide_flags() goes.
+            completed = run_text_capture(
+                command if use_shell else shlex.split(command),
+                shell=use_shell,
+                timeout=300,
+            )
+            # The helper has no `check=` and never raises CalledProcessError;
+            # re-raise it here so the handler below still surfaces the STT
+            # command's own stderr rather than a bare non-zero exit.
+            completed.check_returncode()
+
 
             txt_files = sorted(Path(output_dir).glob("*.txt"))
             if not txt_files:

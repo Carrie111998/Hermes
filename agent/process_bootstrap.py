@@ -142,6 +142,21 @@ def _get_proxy_for_base_url(base_url: Optional[str]) -> Optional[str]:
     return proxy
 
 
+# Process-wide stock TLS context, built lazily on first use. See the rationale
+# at the `verify is True` branch in build_keepalive_http_client.
+_DEFAULT_SSL_CONTEXT: Any = None
+
+
+def _default_ssl_context() -> Any:
+    """Return the shared default-verification SSL context (built once)."""
+    global _DEFAULT_SSL_CONTEXT  # noqa: PLW0603 — process-wide lazy singleton
+    if _DEFAULT_SSL_CONTEXT is None:
+        import httpx
+
+        _DEFAULT_SSL_CONTEXT = httpx.create_ssl_context()
+    return _DEFAULT_SSL_CONTEXT
+
+
 def build_keepalive_http_client(
     base_url: str = "",
     *,
@@ -171,6 +186,24 @@ def build_keepalive_http_client(
     """
     try:
         import httpx
+
+        # httpx builds a fresh SSL context for every `verify=True`, and this
+        # function asks for three of them per client (both no-proxy mounts plus
+        # the client itself). Each one re-parses certifi's ~150-cert bundle:
+        # measured at 1.4-2.5s apiece on a Windows dev box, so ~5-7s of pure
+        # TLS setup per auxiliary client, paid again on every construction.
+        # That is what made a single AIAgent() spend minutes in tool-registry
+        # probing and blew the nightly gate's per-test timeout.
+        #
+        # `verify=True` means "the stock default context" by definition, so one
+        # process-wide instance is exactly equivalent — an SSLContext is
+        # designed to be shared across connections, which is already how a
+        # single httpx client reuses one. Deliberately narrow: anything else
+        # (False, a custom SSLContext, a CA path from per-provider ssl_ca_cert
+        # or HERMES_CA_BUNDLE) is forwarded untouched, so no custom-CA or
+        # verification-disabling behaviour changes.
+        if verify is True:
+            verify = _default_ssl_context()
 
         proxy = _get_proxy_for_base_url(base_url)
 

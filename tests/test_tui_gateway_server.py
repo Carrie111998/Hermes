@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
+from hermes_cli import _subprocess_compat
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli.active_sessions import active_session_registry_snapshot
 from hermes_cli.browser_connect import ChromeDebugLaunch
@@ -6247,11 +6248,15 @@ def test_command_dispatch_exec_nonzero_surfaces_error(monkeypatch):
         "_load_cfg",
         lambda: {"quick_commands": {"boom": {"type": "exec", "command": "boom"}}},
     )
+    # Seam is ``run_text_capture``, not ``subprocess.run``: quick commands are
+    # shell=True, so under subprocess.run a grandchild inheriting the capture
+    # pipes made ``timeout`` unenforceable on Windows. Stubbing the old seam
+    # here silently ran the REAL command instead of the stub.
     monkeypatch.setattr(
-        server.subprocess,
-        "run",
-        lambda *args, **kwargs: types.SimpleNamespace(
-            returncode=1, stdout="", stderr="failed"
+        _subprocess_compat,
+        "run_text_capture",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=("boom",), returncode=1, stdout="", stderr="failed"
         ),
     )
 
@@ -6261,6 +6266,78 @@ def test_command_dispatch_exec_nonzero_surfaces_error(monkeypatch):
 
     assert "error" in resp
     assert "failed" in resp["error"]["message"]
+
+
+def test_command_dispatch_exec_timeout_does_not_escape(monkeypatch):
+    """A timed-out quick command must return an error, not raise.
+
+    ``command.dispatch`` is NOT in ``_LONG_HANDLERS``, so it runs inline on the
+    main stdin loop where the pool's ``except Exception`` net does not apply —
+    an escaping ``TimeoutExpired`` takes the gateway down. The path had no
+    handler because on Windows the pipe-based call could never time out here in
+    the first place; making the bound real makes this reachable.
+    """
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"quick_commands": {"slow": {"type": "exec", "command": "slow"}}},
+    )
+
+    def _timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired("slow", 30)
+
+    monkeypatch.setattr(_subprocess_compat, "run_text_capture", _timeout)
+
+    resp = server.handle_request(
+        {"id": "1", "method": "command.dispatch", "params": {"name": "slow"}}
+    )
+
+    assert resp["error"]["code"] == 5002
+    assert "timed out" in resp["error"]["message"]
+
+
+def test_shell_exec_uses_the_file_backed_capture_helper(monkeypatch):
+    """``shell.exec`` runs arbitrary user shell commands — the worst case.
+
+    With shell=True the real command is ALWAYS a grandchild of cmd.exe holding
+    the capture pipe's write end open, so ``subprocess.run``'s ``timeout`` is
+    unenforceable on Windows. Assert the handler goes through the file-backed
+    helper and that the command reaches it unshelled/unsplit (a string, since
+    ``shell=True`` takes a command string, not an argv list).
+    """
+    seen = {}
+
+    def _fake(command, **kwargs):
+        seen["command"] = command
+        seen["kwargs"] = kwargs
+        return subprocess.CompletedProcess(
+            args=(command,), returncode=0, stdout="out", stderr=""
+        )
+
+    monkeypatch.setattr(_subprocess_compat, "run_text_capture", _fake)
+
+    resp = server.handle_request(
+        {"id": "1", "method": "shell.exec", "params": {"command": "echo hi"}}
+    )
+
+    assert resp["result"]["stdout"] == "out"
+    assert seen["command"] == "echo hi"
+    assert seen["kwargs"]["shell"] is True
+    assert seen["kwargs"]["timeout"] == 30
+
+
+def test_shell_exec_timeout_returns_error(monkeypatch):
+    def _timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired("sleep", 30)
+
+    monkeypatch.setattr(_subprocess_compat, "run_text_capture", _timeout)
+
+    resp = server.handle_request(
+        {"id": "1", "method": "shell.exec", "params": {"command": "sleep 999"}}
+    )
+
+    assert resp["error"]["code"] == 5002
+    assert "timed out" in resp["error"]["message"]
 
 
 def test_plugins_list_surfaces_loader_error(monkeypatch):

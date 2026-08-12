@@ -1,6 +1,7 @@
 """Tests for hermes_cli.gateway."""
 
 import argparse
+import json
 import os
 import signal
 import subprocess
@@ -342,6 +343,127 @@ def test_run_gateway_replace_skips_existing_process_preflight(monkeypatch):
     gateway.run_gateway(replace=True)
 
     assert calls == [(True, 0)]
+
+
+def _read_exit_diag_records():
+    """Parse the per-test HERMES_HOME copy of ``logs/gateway-exit-diag.log``."""
+    from hermes_constants import get_hermes_home
+
+    path = get_hermes_home() / "logs" / "gateway-exit-diag.log"
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def test_gateway_start_diag_precedes_expensive_init(monkeypatch):
+    """``gateway.start`` must be logged before the gateway.run import.
+
+    Importing ``gateway.run`` costs ~23s (plugin discovery + model_tools) and
+    is followed by EventBus/subscriber startup. Emitting the double-spawn
+    diagnostic after that work left a ~58s window in which a losing racer
+    could die unrecorded, so the ordering is a regression-worthy invariant.
+
+    The fake ``gateway.run`` deliberately omits ``start_gateway`` and supplies
+    a module-level ``__getattr__`` (PEP 562) instead, so the ``from
+    gateway.run import start_gateway`` line itself lands in ``order``.
+    """
+    order = []
+
+    module = ModuleType("gateway.run")
+
+    def _module_getattr(name):
+        if name == "start_gateway":
+            order.append("import:gateway.run.start_gateway")
+
+            def fake_start_gateway(*, replace, verbosity):
+                return object()
+
+            return fake_start_gateway
+        raise AttributeError(name)
+
+    module.__getattr__ = _module_getattr
+    monkeypatch.setitem(sys.modules, "gateway.run", module)
+
+    real_diag = gateway._gateway_exit_diag
+
+    def spy_diag(tag, **extra):
+        order.append(f"diag:{tag}")
+        real_diag(tag, **extra)
+
+    monkeypatch.setattr(gateway, "_gateway_exit_diag", spy_diag)
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+    monkeypatch.setattr(
+        gateway, "refresh_systemd_unit_if_needed", lambda system=False: False
+    )
+    monkeypatch.setattr(
+        gateway,
+        "get_gateway_runtime_snapshot",
+        lambda *a, **k: gateway.GatewayRuntimeSnapshot(manager="manual process"),
+    )
+    monkeypatch.setattr(gateway.asyncio, "run", lambda coro: True)
+
+    gateway.run_gateway(replace=True)
+
+    assert "diag:gateway.start" in order
+    assert "import:gateway.run.start_gateway" in order
+    assert order.index("diag:gateway.start") < order.index(
+        "import:gateway.run.start_gateway"
+    ), f"gateway.start must be written before the expensive init step: {order}"
+
+
+def test_gateway_start_diag_written_before_duplicate_process_guard(monkeypatch, capsys):
+    """A losing double-spawn racer must leave a record even though it exits.
+
+    ``_guard_existing_gateway_process_conflict()`` sys.exit(1)s when another
+    gateway owns the profile. That abort used to happen before the
+    ``gateway.start`` write, so the duplicate process — the exact thing this
+    log exists to catch — vanished without a trace (PID 54392, 2026-08-10).
+    """
+    _clear_supervisor_markers(monkeypatch)
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+    monkeypatch.setattr(
+        gateway,
+        "get_gateway_runtime_snapshot",
+        lambda *a, **k: gateway.GatewayRuntimeSnapshot(manager="manual process"),
+    )
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 17907)
+
+    with pytest.raises(SystemExit) as exc_info:
+        gateway.run_gateway()
+
+    assert exc_info.value.code == 1
+    assert "Another gateway instance is already running" in capsys.readouterr().out
+
+    starts = [r for r in _read_exit_diag_records() if r["tag"] == "gateway.start"]
+    assert len(starts) == 1, starts
+    record = starts[0]
+    assert record["pid"] == os.getpid()
+    assert record["argv"] == sys.argv
+    assert record["replace"] is False
+    # Fields that used to force the record to wait for setup.
+    assert "stdin_is_tty" in record
+    assert "absorb_windows_console_controls" in record
+
+
+def test_gateway_start_diag_respects_opt_out(monkeypatch):
+    monkeypatch.setenv("HERMES_GATEWAY_EXIT_DIAG", "0")
+    _clear_supervisor_markers(monkeypatch)
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+    monkeypatch.setattr(
+        gateway,
+        "get_gateway_runtime_snapshot",
+        lambda *a, **k: gateway.GatewayRuntimeSnapshot(manager="manual process"),
+    )
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 17907)
+
+    with pytest.raises(SystemExit):
+        gateway.run_gateway()
+
+    assert _read_exit_diag_records() == []
 
 
 def test_s6_runtime_snapshot_reports_supervised_service(monkeypatch, tmp_path):

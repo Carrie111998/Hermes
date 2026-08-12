@@ -181,7 +181,7 @@ def _arrange_startup_fallback(monkeypatch, tmp_path, running_pids):
         return startup_entry
 
     monkeypatch.setattr(gateway_windows, "_install_startup_entry", fake_install_startup_entry)
-    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path: calls.append(("spawn", path)) or 12345)
+    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None, **_kw: calls.append(("spawn", path)) or 12345)
     monkeypatch.setattr(gateway_windows, "_report_gateway_start", lambda via: calls.append(("report_start", via)))
     monkeypatch.setattr(gateway_windows, "_print_next_steps", lambda: calls.append(("next_steps", None)))
     monkeypatch.setattr(gateway, "find_gateway_pids", lambda: running_pids)
@@ -402,7 +402,7 @@ def test_install_scheduled_task_success_start_now_uses_direct_spawn_not_task_run
     )
     monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
     monkeypatch.setattr(gateway_windows, "_exec_schtasks", lambda args: calls.append(("schtasks", tuple(args))) or (0, "", ""))
-    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None: calls.append(("spawn", path)) or 12345)
+    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None, **_kw: calls.append(("spawn", path)) or 12345)
     monkeypatch.setattr(gateway_windows, "_report_gateway_start", lambda via: calls.append(("report_start", via)))
     monkeypatch.setattr(gateway_windows, "_print_next_steps", lambda: calls.append(("next_steps", None)))
 
@@ -431,7 +431,7 @@ def test_install_scheduled_task_success_does_not_auto_start(monkeypatch, tmp_pat
         lambda task_name, script_path: (True, "Created Scheduled Task 'Hermes_Gateway_alice'"),
     )
     monkeypatch.setattr(gateway_windows, "_exec_schtasks", lambda args: calls.append(("schtasks", tuple(args))) or (0, "", ""))
-    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None: calls.append(("spawn", path)) or 12345)
+    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None, **_kw: calls.append(("spawn", path)) or 12345)
     monkeypatch.setattr(gateway_windows, "_report_gateway_start", lambda via: calls.append(("report_start", via)))
     monkeypatch.setattr(gateway_windows, "_print_next_steps", lambda: calls.append(("next_steps", None)))
 
@@ -470,7 +470,7 @@ def test_install_access_denied_launches_elevated_install_before_startup_fallback
     )
     monkeypatch.setattr(setup, "prompt_yes_no", lambda prompt, default=True: calls.append(("prompt", prompt, default)) or True)
     monkeypatch.setattr(gateway_windows, "_install_startup_entry", lambda path: calls.append(("install_startup", path)) or path)
-    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None: calls.append(("spawn", path)) or 12345)
+    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None, **_kw: calls.append(("spawn", path)) or 12345)
 
     gateway_windows.install(force=True)
 
@@ -524,7 +524,7 @@ def test_install_start_now_without_login_autostart_never_escalates(monkeypatch, 
     monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
     monkeypatch.setattr(gateway_windows, "_prompt_install_choices", lambda *args, **kwargs: (True, False))
     monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
-    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None: calls.append(("spawn", path)) or 12345)
+    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None, **_kw: calls.append(("spawn", path)) or 12345)
     monkeypatch.setattr(gateway_windows, "_report_gateway_start", lambda via: calls.append(("report_start", via)))
     monkeypatch.setattr(gateway_windows, "_install_scheduled_task", lambda *args, **kwargs: calls.append(("install_task", args)) or (True, "should not happen"))
     monkeypatch.setattr(gateway_windows, "_launch_elevated_install", lambda *args, **kwargs: calls.append(("elevate", args, kwargs)) or True)
@@ -546,7 +546,7 @@ def test_start_noops_when_gateway_already_running(monkeypatch, capsys):
     monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [27128])
     monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: calls.append("task_check") or True)
     monkeypatch.setattr(gateway_windows, "_exec_schtasks", lambda args: calls.append(("schtasks", tuple(args))) or (0, "", ""))
-    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None: calls.append(("spawn", path)) or 12345)
+    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None, **_kw: calls.append(("spawn", path)) or 12345)
 
     gateway_windows.start()
 
@@ -580,7 +580,7 @@ def test_restart_relaunches_manual_gateway_without_persistence(monkeypatch):
     monkeypatch.setattr(
         gateway_windows,
         "_spawn_detached",
-        lambda: calls.append("spawn") or 12345,
+        lambda *_a, **_kw: calls.append("spawn") or 12345,
     )
     monkeypatch.setattr(
         gateway_windows,
@@ -669,12 +669,155 @@ def test_restart_does_not_spawn_on_top_of_a_concurrent_starter(monkeypatch, caps
     assert "not spawning a second one" in out
 
 
-def _arrange_windows_restart_fallthrough(monkeypatch, running_pids):
+def test_force_terminate_survives_a_taskkill_timeout(monkeypatch):
+    """A ``TimeoutExpired`` from the kill primitive must not abort the sweep.
+
+    ``subprocess.TimeoutExpired`` is a ``SubprocessError``, NOT an ``OSError``
+    — so the ``except OSError`` arm below it never caught this, and a slow kill
+    took the whole stop/restart chain down with it (2026-08-11 outage).
+    """
+    import subprocess
+
+    from gateway import status as status_mod
+
+    monkeypatch.setattr(status_mod, "_pid_exists", lambda pid: True)
+
+    def fake_terminate_pid(target_pid, force=False):
+        raise subprocess.TimeoutExpired(
+            ["taskkill", "/PID", str(target_pid), "/T", "/F"], 10
+        )
+
+    monkeypatch.setattr(status_mod, "terminate_pid", fake_terminate_pid)
+
+    # Must not propagate; the sweep reports it killed nothing it could confirm.
+    killed = gateway_windows._force_terminate_known_gateway_pids([47264])
+
+    assert killed == 0
+
+
+def test_restart_still_spawns_when_stop_raises(monkeypatch, capsys):
+    """THE regression: a failing ``stop()`` must never skip the relaunch.
+
+    2026-08-11 ~12:00Z — ``taskkill`` exceeded its 10s cap on a loaded box
+    (87.8% commit, six concurrent pytest runs). The kill SUCCEEDED, PID 47264
+    died, and the ``TimeoutExpired`` then propagated out of ``stop()`` and out
+    of ``restart()`` before ``_launch_detached_gateway()`` ran. :8642 was left
+    with no listener for ~5 minutes until a manual relaunch.
+
+    A slow-but-successful kill must leave a running gateway behind.
+    """
+    import subprocess
+
+    calls = []
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+
+    def boom():
+        calls.append("stop")
+        raise subprocess.TimeoutExpired(["taskkill", "/PID", "47264", "/T", "/F"], 10)
+
+    monkeypatch.setattr(gateway_windows, "stop", boom)
+    # The kill landed: nothing is alive afterwards.
+    monkeypatch.setattr(gateway_windows, "_wait_for_gateway_absent", lambda **_kw: True)
+    monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
+    monkeypatch.setattr(gateway_windows.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_launch_detached_gateway",
+        lambda **_kw: calls.append("launch"),
+    )
+    monkeypatch.setattr(
+        gateway_windows, "_wait_for_gateway_ready", lambda **_kw: [4242]
+    )
+
+    gateway_windows.restart()
+
+    assert calls == ["stop", "launch"], (
+        f"restart() must relaunch even when stop() raises (calls={calls})"
+    )
+
+
+def test_restart_reports_the_stop_error_when_the_relaunch_fails(monkeypatch):
+    """Swallowing the stop error is only acceptable if a gateway comes back.
+
+    If the relaunch also fails we are genuinely down, so the original stop
+    failure must not be lost — it is the most useful diagnostic.
+    """
+    import subprocess
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+
+    original = subprocess.TimeoutExpired(["taskkill", "/PID", "47264", "/T", "/F"], 10)
+
+    def boom():
+        raise original
+
+    monkeypatch.setattr(gateway_windows, "stop", boom)
+    monkeypatch.setattr(gateway_windows, "_wait_for_gateway_absent", lambda **_kw: True)
+    monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
+    monkeypatch.setattr(gateway_windows.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(gateway_windows, "_launch_detached_gateway", lambda **_kw: None)
+    # Nothing came up.
+    monkeypatch.setattr(gateway_windows, "_wait_for_gateway_ready", lambda **_kw: [])
+
+    with pytest.raises(RuntimeError) as excinfo:
+        gateway_windows.restart()
+
+    assert excinfo.value.__cause__ is original, (
+        "the stop-phase failure must be chained onto the restart failure"
+    )
+
+
+def test_restart_does_not_spawn_a_duplicate_when_stop_raises_and_pid_survives(
+    monkeypatch,
+):
+    """Resilience must not become recklessness.
+
+    When ``stop()`` fails AND the old gateway is genuinely still alive, the
+    pre-existing refusal to start a second gateway on :8642 still applies.
+    """
+    import subprocess
+
+    calls = []
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+
+    def boom():
+        raise subprocess.TimeoutExpired(["taskkill", "/PID", "47264", "/T", "/F"], 10)
+
+    monkeypatch.setattr(gateway_windows, "stop", boom)
+    # The old gateway refuses to die.
+    monkeypatch.setattr(gateway_windows, "_wait_for_gateway_absent", lambda **_kw: False)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_force_terminate_known_gateway_pids",
+        lambda pids: calls.append("force") or 0,
+    )
+    monkeypatch.setattr(gateway_windows, "_collect_gateway_stop_pids", lambda *_a: [47264])
+    monkeypatch.setattr(gateway_windows.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_launch_detached_gateway",
+        lambda **_kw: calls.append("launch"),
+    )
+
+    with pytest.raises(RuntimeError, match="refusing to start a duplicate"):
+        gateway_windows.restart()
+
+    assert "launch" not in calls, (
+        f"must not spawn on top of a surviving gateway (calls={calls})"
+    )
+
+
+def _arrange_windows_restart_fallthrough(monkeypatch, running_pids, exc=None):
     """Drive ``_gateway_command_inner('restart')`` down the Windows branch.
 
     ``gateway_windows.restart()`` raises, so the generic recovery path below it
     is reachable. Everything that path could use to tear down / relaunch a
     gateway is stubbed to record instead of act.
+
+    ``exc`` overrides the exception ``restart()`` raises so the caller can
+    verify which failure types the recovery arm actually catches.
     """
     calls = []
 
@@ -687,7 +830,7 @@ def _arrange_windows_restart_fallthrough(monkeypatch, running_pids):
 
     def _boom():
         calls.append("windows_restart")
-        raise RuntimeError(
+        raise exc or RuntimeError(
             "Gateway restart did not produce a running gateway process."
         )
 
@@ -734,6 +877,52 @@ def test_windows_restart_failure_does_not_tear_down_a_live_gateway(monkeypatch):
     assert calls == ["windows_restart"], (
         "a live gateway must be left alone after gateway_windows.restart() raises"
     )
+
+
+def test_windows_restart_subprocess_timeout_reaches_the_recovery_arm(monkeypatch):
+    """A ``TimeoutExpired`` escaping restart() must not bypass recovery.
+
+    The recovery arm caught ``(CalledProcessError, RuntimeError, OSError)``.
+    ``TimeoutExpired`` is a *sibling* of ``CalledProcessError`` under
+    ``SubprocessError`` — not a subclass — so it sailed past this handler too,
+    which is why the 2026-08-11 outage was not caught by the existing net.
+    """
+    import subprocess
+
+    calls = _arrange_windows_restart_fallthrough(
+        monkeypatch,
+        running_pids=[],
+        exc=subprocess.TimeoutExpired(["taskkill", "/PID", "47264", "/T", "/F"], 10),
+    )
+
+    gateway._gateway_command_inner(
+        SimpleNamespace(gateway_command="restart", all=False, system=False, detached=None)
+    )
+
+    assert calls == [
+        "windows_restart",
+        "stop_profile_gateway",
+        "wait_exit",
+        "cleanup_state_files",
+        "launch_detached",
+    ]
+
+
+def test_windows_restart_timeout_leaves_a_surviving_gateway_alone(monkeypatch):
+    """The survivor check must also apply to a subprocess timeout."""
+    import subprocess
+
+    calls = _arrange_windows_restart_fallthrough(
+        monkeypatch,
+        running_pids=[10588],
+        exc=subprocess.TimeoutExpired(["taskkill", "/PID", "47264", "/T", "/F"], 10),
+    )
+
+    gateway._gateway_command_inner(
+        SimpleNamespace(gateway_command="restart", all=False, system=False, detached=None)
+    )
+
+    assert calls == ["windows_restart"]
 
 
 def test_windows_restart_failure_still_recovers_when_nothing_is_running(monkeypatch):
@@ -1108,3 +1297,73 @@ def test_drain_helper_still_waits_if_marker_write_fails(monkeypatch):
 
     # Returns True because _pid_exists immediately says "gone".
     assert gateway_windows._drain_gateway_pid(pid, drain_timeout=5.0) is True
+
+
+# ── spawn label -> boot_reason round trip ────────────────────────────────────
+#
+# tests/hermes_cli/test_gateway_start_diag_attribution.py already pins that
+# `start()` passes "cli:start" and `restart()` passes "cli:restart" by stubbing
+# `_spawn_detached`. That leaves the seam untested: the label is only worth
+# anything if it survives the real spawn into the child env AND is read back as
+# the `boot_reason` an operator sees in ~/.hermes/events/audit.jsonl. Stubbing
+# either end would let the two halves drift apart while both files stayed green.
+
+
+@pytest.mark.parametrize(
+    "entry, expected_boot_reason",
+    [
+        ("start", "cli:start"),
+        ("restart", "cli:restart"),
+    ],
+)
+def test_cli_entrypoint_label_survives_into_boot_reason(
+    monkeypatch, tmp_path, entry, expected_boot_reason
+):
+    """A restart must be distinguishable from a plain start in the audit trail.
+
+    Drives the real `_spawn_detached` (only `Popen` is faked) so the assertion
+    covers the actual env hand-off, then evaluates `_detect_boot_reason` under
+    exactly the environment the child would have inherited.
+    """
+    import sys as _sys
+
+    from gateway.run import GatewayRunner
+    from hermes_cli import gateway_diag
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_report_gateway_start", lambda via: None)
+    monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
+    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: True)
+    monkeypatch.setattr(gateway_windows, "is_startup_entry_installed", lambda: False)
+    monkeypatch.setattr(gateway_windows, "stop", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_wait_for_gateway_absent", lambda **k: True)
+    monkeypatch.setattr(gateway_windows, "_wait_for_gateway_ready", lambda **k: True)
+    monkeypatch.setattr(gateway_windows.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_build_gateway_argv",
+        lambda: (["pythonw.exe", "-m", "hermes_cli.main", "gateway", "run"], str(tmp_path), {}),
+    )
+    monkeypatch.setattr(gateway_windows, "windows_detach_flags", lambda: 0)
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: tmp_path)
+
+    captured: dict[str, dict] = {}
+
+    class _FakePopen:
+        pid = 4242
+
+        def __init__(self, argv, **kwargs):
+            captured["env"] = kwargs["env"]
+
+    monkeypatch.setattr(gateway_windows.subprocess, "Popen", _FakePopen)
+
+    getattr(gateway_windows, entry)()
+
+    # The producer half: the child really was handed the label.
+    child_env = captured["env"]
+    assert child_env[gateway_diag.SPAWN_SITE_ENV] == expected_boot_reason
+
+    # The consumer half: that child classifies its own boot from the label.
+    monkeypatch.setattr(_sys, "argv", ["hermes", "gateway", "run"])
+    monkeypatch.setenv(gateway_diag.SPAWN_SITE_ENV, child_env[gateway_diag.SPAWN_SITE_ENV])
+    assert GatewayRunner._detect_boot_reason(None) == expected_boot_reason

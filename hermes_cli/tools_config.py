@@ -669,6 +669,43 @@ def _cua_driver_env() -> dict:
         return dict(os.environ)
 
 
+def _run_install(
+    argv: List[str],
+    *,
+    timeout: int,
+    capture_output: bool,
+    env: Optional[dict] = None,
+) -> subprocess.CompletedProcess:
+    """Run one installer argv, honouring ``timeout`` on Windows.
+
+    ``capture_output=True`` routes through ``run_text_capture``, which captures
+    into temp files rather than pipes. Installers spawn grandchildren as a
+    matter of course — ``uv`` and ``pip`` fork a build backend (setuptools,
+    maturin, cmake) for any sdist in the resolved dependency set — and on
+    Windows a grandchild inherits the capture pipe handles and holds their
+    write end open, so ``timeout`` never fires: ``subprocess.run`` kills only
+    the direct child, then blocks re-draining a pipe that can no longer reach
+    EOF. A wedged build backend would hang the post-setup hook indefinitely.
+
+    ``capture_output=False`` means live installer output with no redirection at
+    all (the verbose cua-driver install). There are no pipes to wedge on, so
+    plain ``subprocess.run`` is already bounded — and that path must keep
+    ``streams_to_console=True`` so its output isn't hidden into an invisible
+    console.
+
+    Returns a :class:`subprocess.CompletedProcess` either way, so callers can
+    keep reading ``.returncode`` / ``.stdout`` / ``.stderr`` unchanged.
+    """
+    if capture_output:
+        from hermes_cli._subprocess_compat import run_text_capture
+
+        return run_text_capture(argv, timeout=timeout, env=env)
+    return subprocess.run(
+        argv, timeout=timeout, env=env,
+        creationflags=_post_setup_no_window_flags(streams_to_console=True),
+    )
+
+
 def _pip_install(
     args: List[str],
     *,
@@ -697,13 +734,9 @@ def _pip_install(
     uv_bin = shutil.which("uv")
     if uv_bin:
         try:
-            result = subprocess.run(
+            result = _run_install(
                 [uv_bin, "pip", "install", *args],
-                capture_output=capture_output, text=True, timeout=timeout,
-                env=uv_env,
-                creationflags=_post_setup_no_window_flags(
-                    streams_to_console=not capture_output
-                ),
+                timeout=timeout, capture_output=capture_output, env=uv_env,
             )
             if result.returncode == 0:
                 return result
@@ -715,18 +748,25 @@ def _pip_install(
     pip_cmd = [sys.executable, "-m", "pip"]
     try:
         # Probe for pip; bootstrap via ensurepip if missing (uv venv lacks it).
+        # DEVNULL, not capture_output=True: only the returncode is read here.
+        # `python -m pip --version` is a leaf, but a discarded capture is a
+        # pipe we gain nothing from and that a grandchild could wedge.
         probe = subprocess.run(
             pip_cmd + ["--version"],
-            capture_output=True, text=True, timeout=15,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
             creationflags=_post_setup_no_window_flags(),
         )
         if probe.returncode != 0:
             raise FileNotFoundError("pip not in venv")
     except (subprocess.TimeoutExpired, FileNotFoundError):
         try:
+            # DEVNULL, not capture_output=True: nothing reads the output —
+            # the failure path below stringifies the exception, and
+            # CalledProcessError renders the cmd and returncode, not stdout.
             subprocess.run(
                 [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
-                capture_output=True, text=True, timeout=120, check=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=120, check=True,
                 creationflags=_post_setup_no_window_flags(),
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
@@ -736,12 +776,9 @@ def _pip_install(
                 stderr=f"pip not available and ensurepip failed: {e}",
             )
 
-    return subprocess.run(
+    return _run_install(
         pip_cmd + ["install", *args],
-        capture_output=capture_output, text=True, timeout=timeout,
-        creationflags=_post_setup_no_window_flags(
-            streams_to_console=not capture_output
-        ),
+        timeout=timeout, capture_output=capture_output,
     )
 
 
@@ -1312,10 +1349,20 @@ def _run_post_setup(post_setup_key: str):
             else [npx_bin, "-y", "agent-browser", "install", "--with-deps"]
         )
         try:
-            result = subprocess.run(
+            # run_text_capture, not capture_output=True: both branches of
+            # install_cmd are batch shims on Windows (agent-browser.cmd, or
+            # npx.cmd), so cmd.exe is the direct child and node is a
+            # grandchild, which then spawns the ~170MB Chromium downloader.
+            # Grandchildren inherit the capture pipe handles and hold the write
+            # end open, so the pipe never reaches EOF and subprocess.run's 600s
+            # never fires — it kills cmd.exe and blocks re-draining. The helper
+            # applies CREATE_NO_WINDOW itself, which is all
+            # _post_setup_no_window_flags() yields for a redirected child.
+            from hermes_cli._subprocess_compat import run_text_capture
+
+            result = run_text_capture(
                 install_cmd,
-                capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=600,
-                creationflags=_post_setup_no_window_flags(),
+                cwd=str(PROJECT_ROOT), timeout=600,
             )
             if result.returncode == 0:
                 _print_success("    Chromium installed")

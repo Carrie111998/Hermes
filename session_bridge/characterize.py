@@ -3579,14 +3579,17 @@ def _all_schema_strings(value: Any) -> set[str]:
 
 def _cli_version(args: list[str]) -> str | None:
     try:
-        completed = subprocess.run(
+        # run_text_capture, not capture_output=True: the only callers pass
+        # `claude --version` / `codex --version`, and both CLIs are installed
+        # through npm, so on Windows they resolve to .cmd batch shims — cmd.exe
+        # is the direct child and node.exe is already a grandchild. The
+        # grandchild inherits the capture pipe handles and holds the write end
+        # open, so the pipe never reaches EOF and the 15s never fires.
+        from hermes_cli._subprocess_compat import run_text_capture
+
+        completed = run_text_capture(
             args,
-            capture_output=True,
-            text=True,
             timeout=15.0,
-            stdin=subprocess.DEVNULL,
-            shell=False,
-            check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None

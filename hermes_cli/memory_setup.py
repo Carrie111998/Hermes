@@ -147,8 +147,18 @@ def _install_dependencies(provider_name: str) -> None:
         install_cmd = dep.get("install", "")
         if check_cmd:
             try:
+                # DEVNULL, not capture_output=True: only the exit code is read
+                # (check=True inside a bare try/except), so the output is
+                # discarded anyway. ``check_cmd`` comes from plugin metadata —
+                # arbitrary argv, commonly an npm-installed CLI, which on
+                # Windows is a .cmd batch shim whose real process is a
+                # grandchild of cmd.exe. A grandchild inherits the capture pipe
+                # handles and holds the write end open, so the pipe never
+                # reaches EOF and the 5s never fires.
                 subprocess.run(
-                    shlex.split(check_cmd), check=True, capture_output=True, timeout=5
+                    shlex.split(check_cmd), check=True, timeout=5,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
                 )
             except Exception:
                 if install_cmd:

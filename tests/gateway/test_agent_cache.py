@@ -9,6 +9,7 @@ Verifies that the agent cache correctly:
 - Preserves frozen system prompt across turns
 """
 
+import os
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -382,6 +383,16 @@ class TestExtractCacheBustingConfig:
         assert parse_calls == [config_path]
 
         config_path.write_text("{\n  \"changed\": true\n}")
+        # Stamp an explicitly later mtime instead of trusting the write to
+        # produce one. Windows advances a file's last-write time on the
+        # ~15.6ms system tick, so a rewrite inside the same tick as the
+        # original leaves st_mtime_ns identical and the memo correctly reports
+        # a hit -- this test then failed about 1 run in 3, on a real property
+        # of the clock rather than anything about the memo. The invariant being
+        # pinned is "a file that changed is re-parsed", so make it changed.
+        bumped = config_path.stat().st_mtime_ns + 1_000_000_000
+        os.utime(config_path, ns=(bumped, bumped))
+
         third = GatewayRunner._extract_honcho_cache_busting_config()
 
         assert third == first

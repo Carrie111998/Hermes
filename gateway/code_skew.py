@@ -26,9 +26,15 @@ _boot_fingerprint: str | None = None
 def _fingerprint() -> str | None:
     """Current checkout fingerprint, reusing the CLI's git-rev reader.
 
-    ``hermes_cli.main`` is always already imported in a gateway process (it's
-    the entry point), so this import is free and avoids duplicating the
-    worktree-aware ref resolution.
+    Reusing the CLI's reader avoids duplicating its worktree-aware ref
+    resolution. The import is free because ``hermes_cli.main`` is already in
+    ``sys.modules`` by the time a gateway reaches here — but NOT simply because
+    it is the entry point. Under ``python -m hermes_cli.main`` runpy executes
+    that file as ``__main__`` and leaves ``sys.modules["hermes_cli.main"]``
+    empty; this very line was what re-executed its 15k-line body under a second
+    module object until main.py started publishing itself under its real name
+    (2026-08-11). Do not restore the "it's the entry point, so it's imported"
+    reasoning — the entry point is exactly the module that is not.
     """
     try:
         from hermes_cli.main import _read_git_revision_fingerprint

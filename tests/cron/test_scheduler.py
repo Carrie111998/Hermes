@@ -6191,15 +6191,22 @@ class TestPerJobSoftDeadline:
         sdir = sched._get_hermes_home() / "scripts"
         sdir.mkdir(parents=True, exist_ok=True)
         slow = sdir / "slow_gate_probe.py"
+        # Sleep far longer than the 120s global so the two outcomes are
+        # separated by minutes, not seconds. subprocess.run(timeout=...) kills
+        # the child, so the honoured-timeout path never actually waits it out.
         slow.write_text(
-            "import time\ntime.sleep(8)\nprint('done')\n", encoding="utf-8"
+            "import time\ntime.sleep(600)\nprint('done')\n", encoding="utf-8"
         )
         t0 = _t.monotonic()
         ok, out = sched._run_job_script("slow_gate_probe.py", timeout_s=1)
         elapsed = _t.monotonic() - t0
         assert ok is False
         assert "timed out after 1s" in out
-        assert elapsed < 6, "per-job timeout must override the 120s global"
+        # 60s, not 6s: the honoured 1s timeout returns in ~1s plus interpreter
+        # spawn, and spawn alone was measured at 6.6s on a box running the full
+        # parallel gate — enough to fail a 6s bound while the override worked
+        # perfectly. Falling back to the 120s global still fails this cleanly.
+        assert elapsed < 60, "per-job timeout must override the 120s global"
         # Invalid / non-positive overrides fall back to the global default
         # (probe a fast script so the global never actually elapses).
         fast = sdir / "fast_gate_probe.py"

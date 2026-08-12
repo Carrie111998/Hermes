@@ -10,6 +10,12 @@ from plugins.platforms.feishu.feishu_comment import (
     _ALLOWED_NOTICE_TYPES,
     _sanitize_comment_text,
 )
+from tests.gateway._feishu_sdk_warm import warm_feishu_sdk
+
+# Load the SDK here, at collection, rather than inside the first test that
+# reaches its deferred import — the per-test --timeout does not cover
+# collection. See the module docstring for the full rationale.
+warm_feishu_sdk()
 
 
 def _make_event(

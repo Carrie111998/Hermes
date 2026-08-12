@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import hermes_cli._subprocess_compat as _spc
 import tools.browser_tool as bt
 
 
@@ -16,9 +17,23 @@ def _reset_state():
     bt._cached_chromium_installed = None
 
 
+def _patch_spawn(monkeypatch, fake):
+    """Stub the spawn the Chromium auto-install actually makes.
+
+    It goes through ``run_text_capture``, not ``subprocess.run``: ``npx`` is a
+    batch shim on Windows, so cmd.exe is the direct child and the real
+    downloader is a grandchild that would inherit — and hold open — a capture
+    pipe, making the 600s timeout unenforceable. ``browser_tool`` imports the
+    helper inside the function, so the patch has to land on the defining
+    module rather than on a name bound in ``bt``.
+    """
+    monkeypatch.setattr(_spc, "run_text_capture", fake)
+
+
 def _no_subprocess(monkeypatch):
     calls = []
     monkeypatch.setattr(bt.subprocess, "run", lambda *a, **k: calls.append((a, k)))
+    _patch_spawn(monkeypatch, lambda *a, **k: calls.append((a, k)))
     return calls
 
 
@@ -51,7 +66,7 @@ class TestInstall:
             captured["cmd"] = cmd
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        monkeypatch.setattr(bt.subprocess, "run", fake_run)
+        _patch_spawn(monkeypatch, fake_run)
 
         assert bt._maybe_autoinstall_chromium() is True
         assert captured["cmd"] == ["/x/agent-browser", "install"]
@@ -66,8 +81,8 @@ class TestInstall:
         monkeypatch.setattr(bt.shutil, "which", lambda _: "/usr/bin/npx")
 
         captured = {}
-        monkeypatch.setattr(
-            bt.subprocess, "run",
+        _patch_spawn(
+            monkeypatch,
             lambda cmd, **kw: captured.update(cmd=cmd) or SimpleNamespace(returncode=0, stdout="", stderr=""),
         )
 
@@ -80,8 +95,12 @@ class TestInstall:
         monkeypatch.setattr("tools.lazy_deps._allow_lazy_installs", lambda: True)
         monkeypatch.setattr(bt, "_find_agent_browser", lambda: "/x/agent-browser")
         monkeypatch.setattr(bt, "_build_browser_env", lambda: {})
-        monkeypatch.setattr(
-            bt.subprocess, "run",
+        # Stubbed on the helper, not subprocess.run — otherwise the real
+        # run_text_capture spawns "/x/agent-browser", which does not exist, and
+        # the FileNotFoundError makes this assertion pass without ever
+        # exercising the non-zero-exit branch it names.
+        _patch_spawn(
+            monkeypatch,
             lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="boom"),
         )
         assert bt._maybe_autoinstall_chromium() is False
@@ -96,8 +115,8 @@ class TestOneShot:
         monkeypatch.setattr(bt, "_chromium_installed", lambda: True)
 
         runs = []
-        monkeypatch.setattr(
-            bt.subprocess, "run",
+        _patch_spawn(
+            monkeypatch,
             lambda *a, **k: runs.append(1) or SimpleNamespace(returncode=0, stdout="", stderr=""),
         )
 

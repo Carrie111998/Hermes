@@ -33,7 +33,7 @@ import signal
 import subprocess
 import sys
 import tempfile
-from typing import Mapping, Optional, Sequence
+from typing import IO, Mapping, Optional, Sequence
 
 __all__ = [
     "IS_WINDOWS",
@@ -340,7 +340,8 @@ def run_text_capture(
     timeout: float,
     cwd: str | os.PathLike | None = None,
     env: Mapping[str, str] | None = None,
-    stdin: int | None = subprocess.DEVNULL,
+    stdin: int | IO[bytes] | None = subprocess.DEVNULL,
+    input: str | None = None,  # noqa: A002 — mirrors subprocess.run's parameter name
     shell: bool = False,
     executable: str | os.PathLike | None = None,
 ) -> subprocess.CompletedProcess:
@@ -395,7 +396,10 @@ def run_text_capture(
     Returns a :class:`subprocess.CompletedProcess`; raises
     :class:`subprocess.TimeoutExpired` on timeout (same as ``subprocess.run``)
     so existing ``except (OSError, subprocess.TimeoutExpired)`` handlers keep
-    working. May raise ``OSError`` / ``FileNotFoundError`` at spawn, also like
+    working, with ``.output`` / ``.stderr`` carrying whatever the child wrote
+    before the deadline — callers that record timeout diagnostics (the DevFlow
+    validator logs how far a wedged ``pytest`` got) keep working unchanged.
+    May raise ``OSError`` / ``FileNotFoundError`` at spawn, also like
     ``subprocess.run``.
 
     ``cwd`` and ``env`` are passed straight through to :class:`subprocess.Popen`
@@ -411,6 +415,15 @@ def run_text_capture(
     daemon there is no terminal behind it at all. Every caller of this helper
     wants a non-interactive probe, so closing stdin is the right default; pass
     ``stdin=None`` to opt back into inheritance.
+
+    ``input`` mirrors ``subprocess.run(input=…)`` — the text is fed to the child
+    on stdin, which then hits EOF, so a child that reads its payload that way
+    (the shell hooks and the webhook route scripts both take their JSON on
+    stdin) sees exactly what it did before. It is staged in a **temp file**
+    rather than a pipe for the same reason stdout/stderr are: feeding a pipe
+    requires ``communicate()``'s writer thread, which is one more thread that
+    can park forever when a grandchild holds the other end of the capture.
+    A regular file needs no thread at all. Mutually exclusive with ``stdin``.
 
     ``shell=True`` runs ``argv`` (then a command *string*, not a list) through
     the platform shell, and is the case that needs this helper most: with a
@@ -434,7 +447,14 @@ def run_text_capture(
     # Binary temp files + an explicit decode rather than text=True: we own the
     # handles, so the decoding is ours to make deterministic (utf-8 with
     # replacement, \r\n normalized) instead of locale-dependent.
-    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f, \
+            tempfile.TemporaryFile() as in_f:
+        if input is not None:
+            if stdin != subprocess.DEVNULL:
+                raise ValueError("pass either 'input' or 'stdin', not both")
+            in_f.write(input.encode("utf-8"))
+            in_f.seek(0)
+            stdin = in_f
         proc = subprocess.Popen(
             # With shell=True the command is a string Popen hands to the shell
             # verbatim; list() would shred it into one argument per character.
@@ -454,7 +474,16 @@ def run_text_capture(
             # Best effort — we do NOT wait on the child again afterwards, so a
             # kill that fails costs us nothing but a lingering process.
             _tree_kill(proc)
-            raise subprocess.TimeoutExpired(proc.args, timeout)
+            # Partial output survives the timeout. Reading is safe even when a
+            # grandchild outlived the kill and is still writing: these are
+            # regular files, so the read returns whatever was flushed and
+            # CANNOT block. A pipe-based capture could not do this at all —
+            # that drain is the 10s-then-22.8s cost described above — so the
+            # file-backed design is what makes timeout diagnostics recoverable.
+            raise subprocess.TimeoutExpired(
+                proc.args, timeout,
+                output=_read_text(out_f), stderr=_read_text(err_f),
+            )
         return subprocess.CompletedProcess(
             proc.args, proc.returncode, _read_text(out_f), _read_text(err_f),
         )

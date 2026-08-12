@@ -9,9 +9,20 @@ sample_code_drift() unit tests below touch real git, against a throwaway
 tmp_path repo.
 """
 
+import shutil
 import subprocess
 
 import pytest
+
+# These tests shell out to real `git` — both the fixture setup and, in the
+# sample_code_drift() cases, the production probe itself. Process spawn is the
+# expensive and load-sensitive operation on this host, so a single git call can
+# outrun the suite-wide per-test cap: under the nightly gate's 24 concurrent
+# workers a `_git` inside sample_code_drift() blew 60s and pytest-timeout's
+# thread method then hard-exited the process, dropping the file's other 40+
+# results with it. The `repo` fixture already removes most of the spawns (see
+# _repo_template); this covers the ones that ARE the thing under test.
+pytestmark = pytest.mark.timeout(300)
 
 import events.producers.code_drift_monitor as drift_module
 
@@ -43,11 +54,24 @@ def _git(repo, *args):
     )
 
 
-@pytest.fixture
-def repo(tmp_path):
-    """Throwaway repo: two commits on main, HEAD detached at the first
-    (i.e. the deployed checkout LAGS main by 1 — the incident shape)."""
-    repo = tmp_path / "checkout"
+@pytest.fixture(scope="module")
+def _repo_template(tmp_path_factory):
+    """Build the throwaway repo ONCE per module; `repo` hands out copies.
+
+    Shape: two commits on main, HEAD detached at the first (i.e. the deployed
+    checkout LAGS main by 1 — the incident shape).
+
+    Why a template: building it costs six `git` subprocesses, and 21 tests take
+    the `repo` fixture. Process spawn is the expensive operation on Windows
+    (measured 3.30s to build vs 0.25s to copy the finished tree on an idle box)
+    and it is also the operation that dilates worst under the nightly gate's 24
+    concurrent workers — this file was the slowest in the suite and blew the
+    900s per-file cap there while finishing in 587s when run alone. Copying a
+    directory keeps each test's repo just as isolated and independently
+    mutable, without paying the spawns again.
+    """
+    base = tmp_path_factory.mktemp("drift-template")
+    repo = base / "checkout"
     repo.mkdir()
     _git(repo, "init", "-b", "main")
     (repo / "a.txt").write_text("one", encoding="utf-8")
@@ -58,6 +82,14 @@ def repo(tmp_path):
     _git(repo, "commit", "-m", "second landed fix")
     _git(repo, "checkout", "--detach", "HEAD~1")
     return repo
+
+
+@pytest.fixture
+def repo(tmp_path, _repo_template):
+    """A private, fully mutable copy of the template repo for one test."""
+    dest = tmp_path / "checkout"
+    shutil.copytree(_repo_template, dest)
+    return dest
 
 
 class TestSampleCodeDrift:

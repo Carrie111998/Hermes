@@ -4672,12 +4672,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             heartbeat-stale or pid-dead detection
           - "manual": operator ran ``hermes gateway run`` from a terminal
             (the most common today's restart-cluster pattern)
+          - the launcher's own spawn label ("cli:restart", "cli:start",
+            "windows-task-script", ...) when one was carried
 
         Heuristics are deliberately cheap; if any fail we fall back to
         "manual" rather than blocking startup.
+
+        The carried label outranks every heuristic below it because it is
+        evidence rather than inference: ``_spawn_detached`` stamps it into the
+        child env at the moment of the launch. Inference cannot replace it —
+        ``gateway start`` and ``gateway restart`` share one detached spawn
+        path, so both used to land in "manual", and the spawning parent exits
+        within seconds so a later ppid lookup reads DEAD. That ambiguity is
+        what made the 2026-08-11 eight-generation churn take hours to
+        attribute: every one of those boots logged ``boot_reason: "manual"``.
         """
         if "--replace" in sys.argv:
             return "replace"
+        # Ranked above the watchdog probes but below --replace: --replace is an
+        # explicit operator-chosen takeover mode that predates the stamp and
+        # already has consumers, and a restart never passes it.
+        try:
+            from hermes_cli.gateway_diag import carried_spawn_site
+            _site = carried_spawn_site()
+            if _site:
+                return _site
+        except Exception:
+            pass
         try:
             import psutil as _ps  # type: ignore
             _pp = _ps.Process(os.getppid())
@@ -4723,6 +4744,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
         return "manual"
+
+    def _build_boot_payload(self) -> Dict[str, Any]:
+        """Assemble the GATEWAY_STARTED payload written to audit.jsonl.
+
+        Extracted from ``_start`` so the fields an operator reconstructs a
+        restart cluster from are reachable by a test without standing up a
+        whole gateway. Best-effort throughout: a diagnostic must never be the
+        reason a gateway fails to boot.
+        """
+        payload: Dict[str, Any] = {
+            "argv": list(sys.argv),
+            "parent_pid": os.getppid(),
+            "boot_reason": self._detect_boot_reason(),
+            "platforms_connected": [p.value for p in self.adapters.keys()],
+        }
+        # The raw stamp, kept beside boot_reason rather than folded into it.
+        # The two answer different questions -- "which of our code paths
+        # launched this" vs "how should this boot be classified" -- and
+        # --replace outranks the stamp, so without this field a
+        # `gateway run --replace` spawned by a known call site would lose the
+        # attribution entirely. A null here is evidence in its own right: no
+        # launcher of ours stamped this process.
+        try:
+            from hermes_cli.gateway_diag import carried_spawn_site
+            payload["spawn_site"] = carried_spawn_site()
+        except Exception:
+            payload["spawn_site"] = None
+        try:
+            import psutil as _ps  # type: ignore
+            _pp = _ps.Process(os.getppid())
+            payload["parent_name"] = _pp.name()
+            payload["parent_cmdline"] = " ".join(_pp.cmdline())[:300]
+        except Exception:
+            pass
+        # Surface whether this boot followed a clean shutdown so consumers can
+        # distinguish operator-restart-after-Ctrl-C from crash-recovery without
+        # having to inspect the marker file themselves. ``_clean_marker
+        # .unlink()`` already happened earlier in _start (line ~2062) so we
+        # record a boolean we captured into self at that point.
+        payload["previous_clean_shutdown"] = getattr(
+            self, "_previous_shutdown_was_clean", False
+        )
+        return payload
 
     def _running_agent_count(self) -> int:
         return len(self._running_agents)
@@ -8423,29 +8487,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # raises (the helper internally swallows bus failures).
         try:
             from events.gateway_integration import emit_gateway_started
-            _boot_payload: Dict[str, Any] = {
-                "argv": list(sys.argv),
-                "parent_pid": os.getppid(),
-                "boot_reason": self._detect_boot_reason(),
-                "platforms_connected": [p.value for p in self.adapters.keys()],
-            }
-            try:
-                import psutil as _ps  # type: ignore
-                _pp = _ps.Process(os.getppid())
-                _boot_payload["parent_name"] = _pp.name()
-                _boot_payload["parent_cmdline"] = " ".join(_pp.cmdline())[:300]
-            except Exception:
-                pass
-            # Surface whether this boot followed a clean shutdown so
-            # consumers can distinguish operator-restart-after-Ctrl-C from
-            # crash-recovery without having to inspect the marker file
-            # themselves. ``_clean_marker.unlink()`` already happened
-            # earlier in _start (line ~2062) so we record a boolean we
-            # captured into self at that point.
-            _boot_payload["previous_clean_shutdown"] = getattr(
-                self, "_previous_shutdown_was_clean", False
-            )
-            emit_gateway_started(_boot_payload)
+            emit_gateway_started(self._build_boot_payload())
         except Exception:
             logger.debug("emit_gateway_started failed (non-fatal)", exc_info=True)
 
@@ -17882,10 +17924,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             path = resolve_config_path()
             try:
-                mtime_ns = path.stat().st_mtime_ns
+                stat = path.stat()
+                # Size participates in the key, not just mtime. Windows advances
+                # a file's last-write time on the ~15.6ms system tick, so a
+                # rewrite landing in the same tick as the previous one is
+                # invisible to an mtime-only key and the stale memo is served.
+                # That is a real (if narrow) staleness window in production and
+                # it made the memo's own test fail roughly 1 run in 3.
+                identity = (stat.st_mtime_ns, stat.st_size)
             except OSError:
-                mtime_ns = None
-            memo_key = (str(path), mtime_ns)
+                identity = None
+            memo_key = (str(path), identity)
             cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)
             if cached is not None:
                 return dict(cached)

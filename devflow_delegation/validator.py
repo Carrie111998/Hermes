@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import List, Sequence
 
 from devflow_delegation.allowlist import TargetConfig
+from hermes_cli._subprocess_compat import run_text_capture
 
 MAX_OUTPUT_CHARS = 12_000
 
@@ -100,9 +101,16 @@ def validate_worktree(
             ))
             return ValidationResult(False, tuple(results))
         try:
-            completed = subprocess.run(
-                list(argv), cwd=str(worktree_path), env=run_env, shell=False,
-                text=True, encoding="utf-8", errors="replace", capture_output=True,
+            # run_text_capture, not capture_output=True: `argv` is an
+            # allowlist-owned *build/test* command (pytest, npm test), so a
+            # grandchild is the norm rather than the exception. On Windows a
+            # grandchild inherits the capture pipes and holds their write end
+            # open, so `timeout` never fires — subprocess.run kills only the
+            # direct child, then blocks re-draining a pipe that can no longer
+            # reach EOF, and a wedged test command hangs the tick forever.
+            # Capturing into temp files removes the pipes entirely.
+            completed = run_text_capture(
+                list(argv), cwd=str(worktree_path), env=run_env,
                 timeout=target.command_timeout_seconds,
             )
         except subprocess.TimeoutExpired as exc:

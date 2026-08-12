@@ -39,6 +39,10 @@ import time
 from pathlib import Path
 from xml.sax.saxutils import escape
 
+from hermes_cli.gateway_diag import SPAWN_SITE_ENV as GATEWAY_SPAWN_SITE_ENV
+from hermes_cli.gateway_diag import (
+    SPAWN_SITE_UNSPECIFIED as GATEWAY_SPAWN_SITE_UNSPECIFIED,
+)
 from hermes_cli._subprocess_compat import (
     windows_detach_flags,
     windows_detach_flags_without_breakaway,
@@ -54,6 +58,20 @@ _FALLBACK_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 _ACCESS_DENIED_PATTERN = re.compile(r"(access is denied|acceso denegado)", re.IGNORECASE)
+
+# Spawn-site markers stamped into the gateway's environment so the child's own
+# gateway.start diag record names the path that launched it. Scheduled Task and
+# Startup-folder persistence both run the same gateway.vbs, so the dropper
+# stamps itself first and gateway.vbs only fills in the default when nothing
+# upstream claimed the launch.
+_SPAWN_SITE_TASK_SCRIPT = "windows-task-script"
+_SPAWN_SITE_STARTUP_FOLDER = "windows-startup-folder"
+# Used when a _spawn_detached() caller names no site; a stamped-but-unnamed
+# launch is still distinguishable from one that never went through us at all.
+# Defined in gateway_diag so the consumer that has to discount it
+# (``_detect_boot_reason``) and the producer that stamps it agree by import
+# rather than by two copies of the same string literal.
+_SPAWN_SITE_UNSPECIFIED = GATEWAY_SPAWN_SITE_UNSPECIFIED
 
 _TASK_NAME_DEFAULT = "Hermes_Gateway"
 _TASK_DESCRIPTION = "Hermes Agent Gateway - Messaging Platform Integration"
@@ -401,6 +419,7 @@ def _build_gateway_cmd_script(
     lines.append(f'set "HERMES_HOME={hermes_home}"')
     lines.append('set "PYTHONIOENCODING=utf-8"')
     lines.append('set "HERMES_GATEWAY_DETACHED=1"')
+    lines.append(f'set "{GATEWAY_SPAWN_SITE_ENV}={_SPAWN_SITE_TASK_SCRIPT}"')
     pythonw_path, venv_dir, extra_pythonpath = _resolve_detached_python(python_path)
     # VIRTUAL_ENV lets the gateway's own python detection find the venv
     # if someone imports hermes_constants-based logic during startup.
@@ -483,6 +502,12 @@ def _build_gateway_vbs_script(
         f"env.Item({_quote_vbs_string('HERMES_HOME')}) = {_quote_vbs_string(hermes_home)}",
         f"env.Item({_quote_vbs_string('PYTHONIOENCODING')}) = {_quote_vbs_string('utf-8')}",
         f"env.Item({_quote_vbs_string('HERMES_GATEWAY_DETACHED')}) = {_quote_vbs_string('1')}",
+        # Scheduled Task and the Startup-folder dropper both end up here, so only
+        # claim the launch when nothing upstream already did. Reading an unset
+        # PROCESS variable yields "", which is how we tell the two apart.
+        f"If Len(env.Item({_quote_vbs_string(GATEWAY_SPAWN_SITE_ENV)})) = 0 Then",
+        f"  env.Item({_quote_vbs_string(GATEWAY_SPAWN_SITE_ENV)}) = {_quote_vbs_string(_SPAWN_SITE_TASK_SCRIPT)}",
+        "End If",
         f"env.Item({_quote_vbs_string('VIRTUAL_ENV')}) = {_quote_vbs_string(_preserve_hermes_home_path(venv_dir))}",
         # Mirror the cmd wrapper's ``PYTHONPATH=<static>;%PYTHONPATH%``: chain onto
         # whatever PYTHONPATH the task environment already carries, at runtime.
@@ -514,11 +539,16 @@ def _build_startup_launcher(script_path: Path) -> str:
     lines = [
         f"' {_TASK_DESCRIPTION}",
         "Option Explicit",
-        "Dim fso, sh, target",
+        "Dim fso, sh, env, target",
         f"target = {_quote_vbs_string(target)}",
         'Set fso = CreateObject("Scripting.FileSystemObject")',
         "If Not fso.FileExists(target) Then WScript.Quit 0",
         'Set sh = CreateObject("WScript.Shell")',
+        # Claim the launch before chaining: gateway.vbs defers to whatever is
+        # already set, so this is what distinguishes a Startup-folder login item
+        # from the Scheduled Task in the child's gateway.start diag record.
+        'Set env = sh.Environment("PROCESS")',
+        f"env.Item({_quote_vbs_string(GATEWAY_SPAWN_SITE_ENV)}) = {_quote_vbs_string(_SPAWN_SITE_STARTUP_FOLDER)}",
         f"sh.Run {_quote_vbs_string(command)}, 0, False",
     ]
     return "\r\n".join(lines) + "\r\n"
@@ -880,7 +910,7 @@ def windowless_gateway_restart_spec(
     return new_argv, working_dir, env_overlay
 
 
-def _spawn_detached(script_path: Path | None = None) -> int:
+def _spawn_detached(script_path: Path | None = None, *, reason: str = _SPAWN_SITE_UNSPECIFIED) -> int:
     """Launch the gateway as a fully detached background process.
 
     We spawn ``pythonw.exe -m hermes_cli.main gateway run``
@@ -894,14 +924,22 @@ def _spawn_detached(script_path: Path | None = None) -> int:
     Arg ``script_path`` is accepted for API symmetry with older callers
     but ignored — we don't need it now that we go direct.
 
+    ``reason`` names the call site and is carried to the child in
+    ``HERMES_GATEWAY_SPAWN_SITE``, which the child echoes into its
+    ``gateway.start`` diag record. Detached gateways outlive their parents, so
+    attribution has to travel with the process rather than be reconstructed
+    from a parent that has since exited.
+
     Returns the spawned PID so callers can verify the process actually
     came up.
     """
     _assert_windows()
     argv, working_dir, env_overlay = _build_gateway_argv()
 
-    # Inherit PATH etc. from the current env, overlay our required vars.
-    env = {**os.environ, **env_overlay}
+    # Inherit PATH etc. from the current env, overlay our required vars. The
+    # spawn-site stamp goes last: os.environ may already carry the marker that
+    # launched *us*, and the child must report who launched *it*.
+    env = {**os.environ, **env_overlay, GATEWAY_SPAWN_SITE_ENV: reason or _SPAWN_SITE_UNSPECIFIED}
 
     # DETACHED_PROCESS        0x00000008  — no console attached to child
     # CREATE_NEW_PROCESS_GROUP 0x00000200 — child gets its own group, won't
@@ -1011,7 +1049,7 @@ def _install_startup_fallback(script_path: Path, start_now: bool, detail: str) -
     if running_pids:
         print(f"✓ Gateway already running (PID: {', '.join(map(str, running_pids))})")
     elif start_now:
-        pid = _spawn_detached()
+        pid = _spawn_detached(reason="install:startup-fallback")
         _report_gateway_start(f"direct spawn (PID {pid})")
     else:
         profile_arg = _profile_arg()
@@ -1044,7 +1082,7 @@ def install(
             if running_pids:
                 print(f"✓ Gateway already running (PID: {', '.join(map(str, running_pids))})")
             else:
-                pid = _spawn_detached()
+                pid = _spawn_detached(reason="install:no-login-autostart")
                 _report_gateway_start(f"direct spawn (PID {pid})")
         else:
             print("ℹ Gateway not started and no auto-start service installed.")
@@ -1087,7 +1125,7 @@ def install(
             if running_pids:
                 print(f"✓ Gateway already running (PID: {', '.join(map(str, running_pids))})")
             else:
-                pid = _spawn_detached()
+                pid = _spawn_detached(reason="install:scheduled-task")
                 _report_gateway_start(f"direct spawn (PID {pid})")
         else:
             print("ℹ Gateway not started now.")
@@ -1133,7 +1171,7 @@ def install(
         if running_pids:
             print(f"✓ Gateway already running (PID: {', '.join(map(str, running_pids))})")
         elif start_now:
-            pid = _spawn_detached()
+            pid = _spawn_detached(reason="install:startup-fallback-after-schtasks")
             _report_gateway_start(f"direct spawn (PID {pid})")
         else:
             profile_arg = _profile_arg()
@@ -1402,8 +1440,14 @@ def _print_deep_probes() -> None:
                     tag = event.get("tag", "?")
                     pid = event.get("pid", "?")
                     ts = event.get("ts", "?")
-                    healthy = tag in ("gateway.start",)
-                    print(f"  [6] {_mark(healthy):4s}  Last lifecycle event: tag={tag} pid={pid} ts={ts}")
+                    # `gateway.spawn` is written ~50s before `gateway.start`
+                    # (CLI imports + plugin discovery sit between them), so
+                    # seeing it last means "boot in progress", not a failure —
+                    # otherwise every check during a boot would read FAIL.
+                    booting = tag == "gateway.spawn"
+                    healthy = booting or tag in ("gateway.start",)
+                    suffix = "  (boot in progress)" if booting else ""
+                    print(f"  [6] {_mark(healthy):4s}  Last lifecycle event: tag={tag} pid={pid} ts={ts}{suffix}")
                 except Exception:
                     print(f"  [6] {_mark(False):4s}  Last lifecycle line not JSON: {last_event[:120]}")
             else:
@@ -1457,9 +1501,14 @@ def status(deep: bool = False) -> None:
         print("  hermes gateway install")
 
 
-def _launch_detached_gateway() -> None:
-    """Launch the gateway through the canonical detached Windows path."""
-    pid = _spawn_detached()
+def _launch_detached_gateway(*, reason: str) -> None:
+    """Launch the gateway through the canonical detached Windows path.
+
+    ``reason`` is required rather than defaulted: ``start`` and ``restart`` both
+    land here, and telling a cold start apart from a restart is precisely what
+    the diag log needs to do when two gateways appear at once.
+    """
+    pid = _spawn_detached(reason=reason)
     _report_gateway_start(f"direct spawn (PID {pid})")
 
 
@@ -1492,7 +1541,7 @@ def start() -> None:
     # Manual starts use the same console-less direct spawn path as restart()
     # and install --start-now. Scheduled Task / Startup entries are only login
     # persistence mechanisms.
-    _launch_detached_gateway()
+    _launch_detached_gateway(reason="cli:start")
 
 
 def _drain_gateway_pid(pid: int, drain_timeout: float) -> bool:
@@ -1567,6 +1616,17 @@ def _force_terminate_known_gateway_pids(pids: list[int]) -> int:
             continue
         except PermissionError:
             print(f"⚠ Permission denied to kill PID {pid}")
+        except subprocess.TimeoutExpired:
+            # Defence in depth: terminate_pid already converts an indeterminate
+            # taskkill timeout into a liveness check, but this arm must exist
+            # regardless. TimeoutExpired is a SubprocessError, NOT an OSError,
+            # so the handler below can never catch it — and letting it escape
+            # aborts stop() mid-sweep, skipping every remaining PID and taking
+            # restart() down with it (2026-08-11 outage).
+            print(
+                f"⚠ Kill of PID {pid} timed out; could not confirm it died "
+                "(continuing)"
+            )
         except OSError as exc:
             print(f"Failed to kill PID {pid}: {exc}")
     return killed
@@ -1661,10 +1721,26 @@ def restart() -> None:
     otherwise the replacement process could fail to bind the listening port or
     race the old process's shutdown. Fails loudly if the process can't be cleared
     or the relaunch doesn't produce a running gateway.
+
+    A failure inside ``stop()`` is deliberately NOT fatal here. By the time stop
+    raises, the old gateway is usually already dead -- so propagating leaves
+    :8642 with no listener and no replacement, which is strictly worse than any
+    error stop was trying to report. The error is carried forward and only
+    re-raised if the relaunch also fails to produce a running gateway. Liveness,
+    not the exit status of a kill, decides whether this restart succeeded.
     """
     _assert_windows()
 
-    stop()
+    stop_error: BaseException | None = None
+    try:
+        stop()
+    except Exception as exc:
+        # 2026-08-11: taskkill exceeded its timeout on a loaded box while the
+        # kill itself succeeded; the TimeoutExpired propagated out of stop()
+        # and restart() died before the spawn. Gateway was down ~5 minutes.
+        stop_error = exc
+        print(f"⚠ Gateway stop reported an error: {exc}")
+        print("  Continuing with the relaunch — a stopped gateway is the worse outcome.")
 
     if not _wait_for_gateway_absent(timeout_s=30.0):
         print("⚠ Gateway still present after stop; forcing termination before restart...")
@@ -1673,7 +1749,7 @@ def restart() -> None:
             raise RuntimeError(
                 "Gateway process still detected after force kill; refusing to "
                 "start a duplicate. Investigate stray PIDs before retrying."
-            )
+            ) from stop_error
 
     # Give Windows a moment to release the listening port.
     time.sleep(1.0)
@@ -1697,10 +1773,16 @@ def restart() -> None:
         )
         return
 
-    _launch_detached_gateway()
+    _launch_detached_gateway(reason="cli:restart")
 
     if not _wait_for_gateway_ready(timeout_s=15.0):
         raise RuntimeError(
             "Gateway restart did not produce a running gateway process. "
             "Check logs/gateway.log and run `hermes gateway status`."
+        ) from stop_error
+
+    if stop_error is not None:
+        print(
+            "✓ Gateway is running again despite the stop-phase error above "
+            "(the kill had already landed)"
         )

@@ -157,7 +157,16 @@ class TestGitBashExternalProgramProbe:
             calls.append((argv, kwargs))
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-        monkeypatch.setattr(local_mod.subprocess, "run", fake_run)
+        # Stubbed on the helper, not subprocess.run: the probe deliberately
+        # makes bash fork external MSYS programs, so those grandchildren would
+        # inherit and hold open a capture pipe — and the very failure this
+        # probe detects (a Git-for-Windows child that will not launch under
+        # Mandatory ASLR) is the case where the pipe never reaches EOF. It
+        # therefore runs through run_text_capture, imported inside the
+        # function, so the patch lands on the defining module.
+        import hermes_cli._subprocess_compat as _spc
+
+        monkeypatch.setattr(_spc, "run_text_capture", fake_run)
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
 
         assert local_mod._bash_starts(r"C:\Git\bin\bash.exe") is True

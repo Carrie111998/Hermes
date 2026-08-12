@@ -1,7 +1,11 @@
 """Tests for hermes events doctor CLI diagnostic."""
+import atexit
 import json
+import shutil
 import sqlite3
 import subprocess
+import tempfile
+from pathlib import Path
 
 from events.bus import EventBus
 from events.schema import EventType
@@ -111,32 +115,173 @@ def _git(repo, *args):
     )
 
 
-def _make_repo(tmp_path, name="repo"):
-    repo = tmp_path / name
+# ---------------------------------------------------------------------------
+# Git-spawn budget.
+#
+# ``TestCodeDrift`` builds a real git repo per test, and on Windows every
+# ``git`` spawn costs ~0.5s (``git init`` ~1.2s). At 16 spawns per test that
+# put 11 of the 12 tests at 22-43s against the repo's 30s ``--timeout`` cap
+# from pyproject -- and because ``--timeout-method=thread`` kills the
+# interpreter, the first one over took the other 17 tests in the file with it.
+# Measured with the cap lifted (``--timeout=600``): 23 passed in 402s, worst
+# test 42.85s.
+#
+# The helpers below keep the same repo shapes and the same assertions, and only
+# stop paying for spawns that produce information we can read off disk, or that
+# can be paid once for the whole module instead of once per test:
+#
+#   * repo creation  4 spawns -> 0   (copy a once-built template)
+#   * ``_commit``    3 spawns -> 2   (read HEAD instead of ``rev-parse``)
+#                      -> 1 after the first (``commit -a``, no separate add)
+#   * the whole per-test setup -> 0   (``_shape`` builds each distinct repo
+#                                      shape once at import; tests copy it)
+#
+# The probe under test (``sample_code_drift``, 5 spawns) is untouched -- that
+# is the behaviour these tests exist to cover, and it is now essentially all
+# that is left inside the timed window.
+#
+# The last step matters specifically because the cap is PER TEST. Building the
+# shapes at import does not reduce total work much -- it moves it into
+# collection, which pytest-timeout does not cover -- but that is exactly the
+# budget that was being blown. Per-test setup had to reach ~0 for the tests to
+# survive `run_tests_parallel -j 8`, where every spawn costs several seconds.
+# ---------------------------------------------------------------------------
+
+def _build_repo_template():
+    """One ``git init`` + identity config, copied per test.
+
+    A plain ``git init`` embeds no absolute paths, so copying the directory is
+    equivalent to re-running it. The identity is written straight into the
+    repo's own ``.git/config`` rather than through three ``git config`` spawns;
+    writing it into the repo (not HOME) keeps it independent of the conftest
+    ``_hermetic_environment`` fixture, which repoints HOME per test.
+    """
+    base = Path(tempfile.mkdtemp(prefix="events-doctor-git-template-"))
+    atexit.register(shutil.rmtree, base, True)
+    repo = base / "repo"
     repo.mkdir()
     assert _git(repo, "init", "-b", "main").returncode == 0
-    _git(repo, "config", "user.email", "t@test")
-    _git(repo, "config", "user.name", "t")
-    _git(repo, "config", "commit.gpgsign", "false")
+    config = repo / ".git" / "config"
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        + "[user]\n\temail = t@test\n\tname = t\n"
+        + "[commit]\n\tgpgsign = false\n",
+        encoding="utf-8",
+    )
     return repo
+
+
+# Built at import, NOT lazily on first use. `git init` is the single most
+# expensive spawn here (~1.2s idle, several seconds on a loaded box), and a
+# lazy build bills all of it to whichever test builds a repo first -- which is
+# exactly what kept `test_in_sync_detached_head_is_ok` over the cap under
+# parallel load after the other spawn cuts had landed. Module scope puts it in
+# collection, which pytest-timeout does not cover.
+_REPO_TEMPLATE = _build_repo_template()
+
+
+def _head_sha(repo):
+    """``git rev-parse HEAD`` without the spawn.
+
+    Falls back to the real command if HEAD is anything other than a loose ref
+    or a raw SHA, so a packed-refs repo cannot make this silently wrong.
+    """
+    head = (repo / ".git" / "HEAD").read_text(encoding="utf-8").strip()
+    if not head.startswith("ref: "):
+        return head
+    ref = repo / ".git" / head[len("ref: "):].strip()
+    if ref.is_file():
+        return ref.read_text(encoding="utf-8").strip()
+    return _git(repo, "rev-parse", "HEAD").stdout.strip()
 
 
 def _commit(repo, msg):
     f = repo / "f.txt"
-    f.write_text(f.read_text() + msg + "\n" if f.exists() else msg + "\n")
-    _git(repo, "add", "-A")
-    assert _git(repo, "commit", "-m", msg).returncode == 0
-    return _git(repo, "rev-parse", "HEAD").stdout.strip()
+    tracked = f.exists()
+    f.write_text(f.read_text() + msg + "\n" if tracked else msg + "\n")
+    if tracked:
+        # ``f.txt`` is the only file these tests ever touch, so once it is
+        # tracked ``commit -a`` covers it and the separate ``git add`` spawn
+        # is pure cost. The first commit still needs ``add`` -- ``-a`` does
+        # not stage a file git has never seen.
+        assert _git(repo, "commit", "-a", "-m", msg).returncode == 0
+    else:
+        _git(repo, "add", "-A")
+        assert _git(repo, "commit", "-m", msg).returncode == 0
+    return _head_sha(repo)
+
+
+# --- repo shapes, each built once at import and copied per test -------------
+#
+# A step is one of:
+#   ("commit", msg)   commit msg, recording its sha
+#   ("rename", name)  git branch -m main <name>
+#   ("detach", None)  git checkout --detach          (tip)
+#   ("detach", i)     git checkout --detach <sha i>  (i indexes recorded shas)
+#
+# Commit messages are part of the shape because some tests assert on them
+# (e.g. the missed-tip subject in the LAGS remediation line), so shapes are
+# only shared where every sharing test's assertions still hold.
+_SHAPE_SPECS = {
+    "in_sync": [("commit", "a"), ("commit", "b"), ("detach", None)],
+    "lagging": [("commit", "first fix"),
+                ("commit", "landed but not deployed"),
+                ("detach", 0)],
+    "ahead": [("commit", "a"), ("detach", None), ("commit", "unlanded work")],
+    "diverged": [("commit", "a"), ("commit", "b on main"),
+                 ("detach", 0), ("commit", "c detached")],
+    "one_commit_detached": [("commit", "a"), ("detach", None)],
+    "one_commit_on_main": [("commit", "a")],
+    "master_no_main": [("commit", "a"), ("rename", "master")],
+    "master_lagging": [("rename", "master"), ("commit", "first"),
+                       ("commit", "landed on master, never deployed"),
+                       ("detach", 0)],
+    "master_in_sync": [("rename", "master"), ("commit", "a"),
+                       ("detach", None)],
+}
+
+
+def _build_shape(steps):
+    base = Path(tempfile.mkdtemp(prefix="events-doctor-git-shape-"))
+    atexit.register(shutil.rmtree, base, True)
+    repo = base / "repo"
+    shutil.copytree(_REPO_TEMPLATE, repo)
+    shas = []
+    for kind, arg in steps:
+        if kind == "commit":
+            shas.append(_commit(repo, arg))
+        elif kind == "rename":
+            assert _git(repo, "branch", "-m", "main", arg).returncode == 0
+        elif kind == "detach":
+            target = ["--detach"] if arg is None else ["--detach", shas[arg]]
+            assert _git(repo, "checkout", *target).returncode == 0
+        else:  # pragma: no cover - guards a typo in _SHAPE_SPECS
+            raise AssertionError(f"unknown shape step {kind!r}")
+    return repo, shas
+
+
+_SHAPES = {name: _build_shape(steps) for name, steps in _SHAPE_SPECS.items()}
+
+
+def _shape(tmp_path, name):
+    """Copy a prebuilt shape into ``tmp_path``; returns ``(repo, shas)``.
+
+    The copy is a plain directory copy -- no git spawns -- so a test's setup
+    costs nothing against the 30s per-test cap. Each test still gets its own
+    private repo, so tests that mutate theirs (dirty trees, extra commits)
+    cannot affect any other.
+    """
+    src, shas = _SHAPES[name]
+    repo = tmp_path / "repo"
+    shutil.copytree(src, repo)
+    return repo, shas
 
 
 class TestCodeDrift:
     """Detached working tree vs landed `main` — the 07-20 stale-deploy trap."""
 
     def test_in_sync_detached_head_is_ok(self, tmp_path, capsys):
-        repo = _make_repo(tmp_path)
-        _commit(repo, "a")
-        _commit(repo, "b")
-        _git(repo, "checkout", "--detach")
+        repo, _ = _shape(tmp_path, "in_sync")
 
         issues = check_code_drift(repo_path=repo)
         out = capsys.readouterr().out
@@ -144,10 +289,7 @@ class TestCodeDrift:
         assert "[OK]" in out and "in sync" in out
 
     def test_lagging_head_warns_with_count_and_remediation(self, tmp_path, capsys):
-        repo = _make_repo(tmp_path)
-        sha_a = _commit(repo, "first fix")
-        _commit(repo, "landed but not deployed")
-        _git(repo, "checkout", "--detach", sha_a)
+        repo, _ = _shape(tmp_path, "lagging")
 
         issues = check_code_drift(repo_path=repo)
         out = capsys.readouterr().out
@@ -160,10 +302,7 @@ class TestCodeDrift:
         assert "restart the gateway" in out
 
     def test_ahead_head_warns_unlanded(self, tmp_path, capsys):
-        repo = _make_repo(tmp_path)
-        _commit(repo, "a")
-        _git(repo, "checkout", "--detach")
-        _commit(repo, "unlanded work")
+        repo, _ = _shape(tmp_path, "ahead")
 
         issues = check_code_drift(repo_path=repo)
         out = capsys.readouterr().out
@@ -172,11 +311,7 @@ class TestCodeDrift:
         assert "AHEAD" in out and "unlanded" in out.lower()
 
     def test_diverged_head_warns(self, tmp_path, capsys):
-        repo = _make_repo(tmp_path)
-        sha_a = _commit(repo, "a")
-        _commit(repo, "b on main")
-        _git(repo, "checkout", "--detach", sha_a)
-        _commit(repo, "c detached")
+        repo, _ = _shape(tmp_path, "diverged")
 
         issues = check_code_drift(repo_path=repo)
         out = capsys.readouterr().out
@@ -184,9 +319,7 @@ class TestCodeDrift:
         assert "[WARN]" in out and "DIVERGED" in out
 
     def test_dirty_tree_noted_but_not_counted(self, tmp_path, capsys):
-        repo = _make_repo(tmp_path)
-        _commit(repo, "a")
-        _git(repo, "checkout", "--detach")
+        repo, _ = _shape(tmp_path, "one_commit_detached")
         (repo / "scratch.txt").write_text("uncommitted")
 
         issues = check_code_drift(repo_path=repo)
@@ -211,9 +344,7 @@ class TestCodeDrift:
         `master`, no `main` branch) would have reported a clean bill of
         health forever instead of erroring.
         """
-        repo = _make_repo(tmp_path)
-        _commit(repo, "a")
-        _git(repo, "branch", "-m", "main", "master")   # no `main` ref left
+        repo, _ = _shape(tmp_path, "master_no_main")   # no `main` ref left
 
         issues = check_code_drift(repo_path=repo, trunk_ref="refs/heads/main")
         out = capsys.readouterr().out
@@ -230,11 +361,7 @@ class TestCodeDrift:
         Guards the other half of the fix — parameterising the ref must
         actually WORK, not merely stop erroring.
         """
-        repo = _make_repo(tmp_path)
-        _git(repo, "branch", "-m", "main", "master")
-        sha_a = _commit(repo, "first")
-        _commit(repo, "landed on master, never deployed")
-        _git(repo, "checkout", "--detach", sha_a)
+        repo, _ = _shape(tmp_path, "master_lagging")
 
         issues = check_code_drift(repo_path=repo, trunk_ref="refs/heads/master")
         out = capsys.readouterr().out
@@ -248,10 +375,7 @@ class TestCodeDrift:
         assert "ff-only main" not in out
 
     def test_master_trunk_repo_in_sync_is_ok(self, tmp_path, capsys):
-        repo = _make_repo(tmp_path)
-        _git(repo, "branch", "-m", "main", "master")
-        _commit(repo, "a")
-        _git(repo, "checkout", "--detach")
+        repo, _ = _shape(tmp_path, "master_in_sync")
 
         issues = check_code_drift(repo_path=repo, trunk_ref="refs/heads/master")
         out = capsys.readouterr().out
@@ -270,10 +394,8 @@ class TestCodeDrift:
         assert by_name["hermes"].path != by_name["agent-src"].path
 
     def test_check_never_mutates_repo(self, tmp_path):
-        repo = _make_repo(tmp_path)
-        sha_a = _commit(repo, "a")
-        _commit(repo, "b")
-        _git(repo, "checkout", "--detach", sha_a)
+        repo, shas = _shape(tmp_path, "lagging")
+        sha_a = shas[0]
         (repo / "scratch.txt").write_text("uncommitted")
 
         check_code_drift(repo_path=repo)
@@ -302,8 +424,7 @@ class TestCodeDrift:
         from events.producers.code_drift_monitor import DriftSample
         import hermes_cli.events_doctor as doctor
 
-        repo = _make_repo(tmp_path)
-        _commit(repo, "a")   # a REAL repo, genuinely in sync with main
+        repo, _ = _shape(tmp_path, "one_commit_on_main")   # REAL repo, in sync
 
         monkeypatch.setattr(doctor, "sample_code_drift", lambda *a, **k: DriftSample(
             state="behind", head="dead" * 10, trunk="beef" * 10,
@@ -339,8 +460,7 @@ class TestCodeDrift:
 
         monkeypatch.setattr(doctor, "sample_code_drift", _spy)
 
-        repo = _make_repo(tmp_path)
-        _commit(repo, "a")
+        repo, _ = _shape(tmp_path, "one_commit_on_main")
         check_code_drift(repo_path=repo)
 
         assert seen.get("executed_dirs") == (), (
@@ -394,10 +514,7 @@ class TestCodeDrift:
         assert "[agent-src]" in out and "[hermes]" in out
 
     def test_run_doctor_surfaces_drift_and_fails(self, tmp_path, monkeypatch, capsys):
-        repo = _make_repo(tmp_path)
-        sha_a = _commit(repo, "a")
-        _commit(repo, "landed fix")
-        _git(repo, "checkout", "--detach", sha_a)
+        repo, _ = _shape(tmp_path, "lagging")
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("HERMES_AGENT_SRC", str(repo))
         (tmp_path / "events").mkdir()

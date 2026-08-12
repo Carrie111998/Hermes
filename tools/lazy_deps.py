@@ -656,6 +656,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
 
     try:
         venv_root = Path(sys.executable).parent.parent
+        from hermes_cli._subprocess_compat import run_text_capture
         from tools.environments.local import hermes_subprocess_env
         uv_env = hermes_subprocess_env(inherit_credentials=False)
         uv_env["VIRTUAL_ENV"] = str(venv_root)
@@ -664,10 +665,17 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
         uv_bin = shutil.which("uv")
         if uv_bin:
             try:
-                r = subprocess.run(
+                # run_text_capture, not capture_output=True: uv forks a build
+                # backend (setuptools, maturin, cmake) for any sdist in the
+                # resolved set. On Windows that grandchild inherits the capture
+                # pipe handles and holds the write end open, so the pipe never
+                # reaches EOF — subprocess.run kills only uv at ``timeout`` and
+                # then blocks re-draining forever. A wedged build backend would
+                # hang whatever triggered the lazy install. Same reasoning as
+                # ``hermes_cli.tools_config._run_install``.
+                r = run_text_capture(
                     [uv_bin, "pip", "install", *target_args, *constraint_args, *specs],
-                    capture_output=True, text=True, timeout=timeout, env=uv_env,
-                    stdin=subprocess.DEVNULL,
+                    timeout=timeout, env=uv_env,
                 )
                 if r.returncode == 0:
                     if target is not None:
@@ -689,20 +697,32 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                 raise FileNotFoundError("pip not in venv")
         except (subprocess.TimeoutExpired, FileNotFoundError):
             try:
-                subprocess.run(
+                # run_text_capture, not capture_output=True: ensurepip does not
+                # install pip in-process — it re-invokes the interpreter, so
+                # pip is a grandchild here, and on Windows it inherits and
+                # holds open the capture pipe handles. Raised manually rather
+                # than via check=True, which run_text_capture does not take.
+                bootstrap = run_text_capture(
                     [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
-                    capture_output=True, text=True, timeout=120, check=True,
-                    stdin=subprocess.DEVNULL,
+                    timeout=120,
                 )
+                if bootstrap.returncode != 0:
+                    raise subprocess.CalledProcessError(
+                        bootstrap.returncode, bootstrap.args,
+                        bootstrap.stdout, bootstrap.stderr,
+                    )
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
                 return _InstallResult(False, "",
                                       f"pip not available and ensurepip failed: {e}")
 
         try:
-            r = subprocess.run(
+            # run_text_capture, not capture_output=True: same grandchild as the
+            # uv tier above — pip forks a build backend per sdist, and on
+            # Windows it inherits the capture pipe handles, so ``timeout``
+            # never fires.
+            r = run_text_capture(
                 pip_cmd + ["install", *target_args, *constraint_args, *specs],
-                capture_output=True, text=True, timeout=timeout,
-                stdin=subprocess.DEVNULL,
+                timeout=timeout,
             )
             if r.returncode == 0 and target is not None:
                 _activate_target_on_syspath(target)

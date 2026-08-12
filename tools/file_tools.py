@@ -26,6 +26,27 @@ logger = logging.getLogger(__name__)
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
 
 
+def _join_home(home: str, rest: str) -> str:
+    """Join *rest* onto *home* preserving *home*'s own separator convention.
+
+    ``get_subprocess_home()`` may return a POSIX path (``/opt/data/profiles/
+    <name>/home``) even when Hermes runs on a Windows host: profile/container
+    homes are consumed on the far side of a Docker/SSH boundary. ``os.path.join``
+    would splice a backslash in there, and the container branch of
+    ``_resolve_path_for_task`` hands the result to ``posixpath.normpath`` —
+    which does not treat ``\\`` as a separator — so ``~/scratch/file.txt`` would
+    reach Docker as a single component literally named ``home\\scratch``.
+    Choose the separator already used by *home* instead of the host's.
+    """
+    if "\\" in home:
+        sep = "\\"
+    elif "/" in home:
+        sep = "/"
+    else:
+        sep = os.sep
+    return home.rstrip("/\\") + sep + rest
+
+
 def _expand_tilde(path: str) -> str:
     """Expand ``~`` using the effective profile home when available.
 
@@ -44,7 +65,7 @@ def _expand_tilde(path: str) -> str:
     except Exception:
         home = None
     if home and (path == "~" or path.startswith("~/")):
-        return home if path == "~" else os.path.join(home, path[2:])
+        return home if path == "~" else _join_home(home, path[2:])
     return os.path.expanduser(path)
 
 
