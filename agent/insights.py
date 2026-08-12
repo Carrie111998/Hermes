@@ -673,7 +673,14 @@ class InsightsEngine:
                 ),
                 "cost_status": status,
                 "cost_source": raw.get("cost_source"),
-                "cost_bucket": status if status in {"estimated", "included"} else "unknown",
+                # Provider-actual is a presentation/availability state, while
+                # the comparison reducer still consumes the separately stored
+                # local estimate. Keep those contracts orthogonal.
+                "cost_bucket": (
+                    "estimated" if status == "actual"
+                    else status if status in {"estimated", "included"}
+                    else "unknown"
+                ),
                 "has_pricing": has_known_pricing(model, provider, base_url),
                 "residual": residual,
             })
@@ -743,7 +750,7 @@ class InsightsEngine:
             data["cost"] += row["estimated_cost_usd"]
             data["actual_cost"] += row["actual_cost_usd"]
             data["actual_cost_available"] |= row["actual_cost_available"]
-            data["statuses"].add(row["cost_bucket"])
+            data["statuses"].add(row["cost_status"])
             data["has_pricing"] |= row["has_pricing"]
 
         for session in sessions:
@@ -758,6 +765,7 @@ class InsightsEngine:
             entry["sessions"] = len(data["sessions"])
             entry["cost_status"] = (
                 "unknown" if "unknown" in statuses
+                else "actual" if "actual" in statuses
                 else "estimated" if "estimated" in statuses
                 else "included" if "included" in statuses
                 else "unknown"

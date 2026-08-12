@@ -48,13 +48,17 @@ def _usage_dict(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
-def _int_bucket(usage: Dict[str, Any], *keys: str) -> int:
+def _int_bucket(usage: Dict[str, Any], *keys: str) -> Optional[int]:
     for key in keys:
-        if key in usage and usage[key] is not None:
-            try:
-                return max(0, int(usage[key]))
-            except (TypeError, ValueError):
-                continue
+        if key not in usage:
+            continue
+        if usage[key] is None:
+            return None
+        try:
+            value = int(usage[key])
+        except (TypeError, ValueError):
+            return None
+        return value if value >= 0 else None
     return 0
 
 
@@ -108,16 +112,26 @@ def _price_event(
 def build_event_from_hook(**kwargs: Any) -> Optional[Dict[str, Any]]:
     """Return a ledger event dict, or None when there is nothing to record."""
     usage = _usage_dict(kwargs)
-    buckets = {
+    parsed_buckets = {
         "input_tokens": _int_bucket(usage, "input_tokens"),
         "output_tokens": _int_bucket(usage, "output_tokens"),
         "cache_read_tokens": _int_bucket(usage, "cache_read_tokens", "cached_tokens"),
         "cache_write_tokens": _int_bucket(usage, "cache_write_tokens"),
         "reasoning_tokens": _int_bucket(usage, "reasoning_tokens"),
     }
-    # Skip empty/no-usage callbacks so we do not invent zero-token rows.
-    if not any(buckets.values()) and not usage:
+    # A malformed bucket invalidates the event: pricing a partially invented
+    # vector would turn unavailable evidence into a false zero-token call.
+    if any(value is None for value in parsed_buckets.values()):
         return None
+    known_keys = {
+        "input_tokens", "output_tokens", "cache_read_tokens", "cached_tokens",
+        "cache_write_tokens", "reasoning_tokens",
+    }
+    if not any(key in usage for key in known_keys):
+        return None
+    # Explicit zeroes are valid producer evidence; absent/null/malformed fields
+    # have already failed closed above.
+    buckets = {key: int(value) for key, value in parsed_buckets.items()}
 
     model = str(kwargs.get("model") or kwargs.get("response_model") or "")
     provider = str(kwargs.get("provider") or "")

@@ -146,3 +146,13 @@ def test_skip_empty_usage_callback(meter_db: Path):
     mod = usage_meter_api._load()
     usage_meter_api.on_post_api_request(model="x", provider="y", usage=None)
     assert mod.meter_recent(limit=5)["events"] == []
+
+
+def test_skip_malformed_usage_callback(meter_db: Path):
+    mod = usage_meter_api._load()
+    usage_meter_api.on_post_api_request(
+        model="gpt-5.6-sol",
+        provider="openai",
+        usage={"input_tokens": "not-a-number"},
+    )
+    assert mod.meter_recent(limit=5)["events"] == []

@@ -804,7 +804,7 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
             icon: BarChart3,
             id: 'nav-usage',
             keywords: ['usage', 'cost', 'spend', 'tokens', 'billing', 'insights', 'meter'],
-            label: 'Usage',
+            label: cc.sections.usage,
             run: go(USAGE_ROUTE)
           },
           {

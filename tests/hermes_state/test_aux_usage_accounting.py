@@ -477,3 +477,31 @@ class TestInsightsAuxTotals:
         assert models["main-model"]["actual_cost_available"] is True
         assert models["aux-model"]["actual_cost_available"] is False
 
+    def test_actual_status_reconciles_as_known_market_cost(self, db):
+        """Provider-actual rows remain actual but do not become unknown coverage."""
+        from agent.insights import InsightsEngine
+
+        db.create_session("actual", source="cli")
+        db.update_token_counts(
+            "actual",
+            model="actual-model",
+            billing_provider="custom",
+            input_tokens=100,
+            output_tokens=10,
+            estimated_cost_usd=1.5,
+            actual_cost_usd=1.25,
+            cost_status="actual",
+            cost_source="provider",
+            api_call_count=1,
+        )
+        db.flush_token_counts()
+
+        report = InsightsEngine(db).generate(days=30)
+        overview = report["overview"]
+        models = {model["model"]: model for model in report["models"]}
+
+        assert models["actual-model"]["cost_status"] == "actual"
+        assert overview["unknown_cost_sessions"] == 0
+        assert overview["cost_buckets"]["estimated"]["sessions"] == 1
+        assert overview["cost_buckets"]["estimated"]["cost_usd"] == pytest.approx(1.5)
+
