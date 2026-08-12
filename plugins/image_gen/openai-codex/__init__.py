@@ -375,18 +375,19 @@ def _iter_sse_lines(response: Any):
 
         pending.extend(chunk)
         while True:
-            newline = pending.find(b"\n")
-            if newline < 0:
+            cr = pending.find(b"\r")
+            lf = pending.find(b"\n")
+            newline = min((pos for pos in (cr, lf) if pos >= 0), default=-1)
+            if newline < 0 or (newline == cr == len(pending) - 1):
                 break
+            separator_bytes = 2 if pending[newline : newline + 2] == b"\r\n" else 1
             line = bytes(pending[:newline])
-            del pending[: newline + 1]
-            if line.endswith(b"\r"):
-                line = line[:-1]
+            del pending[: newline + separator_bytes]
             if len(line) > _SSE_MAX_LINE_BYTES:
                 raise RuntimeError("Codex image SSE line exceeded size limit")
             yield line.decode("utf-8", errors="replace")
 
-        if len(pending) > _SSE_MAX_LINE_BYTES:
+        if len(pending) - int(pending.endswith(b"\r")) > _SSE_MAX_LINE_BYTES:
             raise RuntimeError("Codex image SSE line exceeded size limit")
 
     if pending:

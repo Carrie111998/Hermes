@@ -188,9 +188,8 @@ class TestGenerate:
         class _Response:
             def iter_bytes(self):
                 return iter([
-                    b"event: response.output_item.done\n",
-                    b'data: {"item": {"type": "image_generation_call", "result": "abc"}}\n',
-                    b"\n",
+                    b"event: response.output_item.done\r",
+                    b'data: {"item": {"type": "image_generation_call", "result": "abc"}}\r\r',
                 ])
 
         events = list(codex_plugin._iter_sse_json(_Response()))
@@ -203,9 +202,10 @@ class TestGenerate:
         class _Response:
             def iter_bytes(self):
                 return iter([
-                    b"event: response.output_item.done\n",
-                    b'data: {"item":\n',
-                    b'data: {"type": "image_generation_call", "result": "abc"}}\n\n',
+                    b"event: response.output_item.done\r",
+                    b'\ndata: {"item":\r',
+                    b'\ndata: {"type": "image_generation_call", "result": "abc"}}\r',
+                    b"\n\r\n",
                 ])
 
         events = list(codex_plugin._iter_sse_json(_Response()))
