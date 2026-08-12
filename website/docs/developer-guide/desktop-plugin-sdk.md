@@ -409,22 +409,22 @@ ctx.os.notify({
   body: 'Someone matched your signal',
   icon: '/abs/path/to/icon.png', // Electron Notification icon
   // Body click → focus Hermes + navigate. Same vocabulary as OS deep links:
-  activate: '/my-page?item=i1',
-  // or: activate: 'hermes://open/my-page?item=i1'
-  // or: activate: { path: '/my-page', params: { item: 'i1' } }
-  onActivate: () => focusLocalState('i1'), // optional renderer callback
+  activate: 'hermes://index-network/intent/1',
+  // or: activate: '/index-network/intent/1'
+  // or: activate: { path: '/index-network/intent/1' }
+  onActivate: () => focusLocalState('1'), // optional renderer callback
   actions: [
-    { id: 'open', label: 'Open', activate: '/my-page?item=i1' },
-    { id: 'dismiss', label: 'Dismiss', onAction: () => dismiss('i1') },
+    { id: 'open', label: 'Open', activate: 'hermes://index-network/intent/1' },
+    { id: 'dismiss', label: 'Dismiss', onAction: () => dismiss('1') },
   ],
 })
 ```
 
-`activate` is deeplink-compatible: a hash path and `hermes://open/<path>?…`
-resolve to the same in-app route (and `hermes://open/…` deep links from outside
-the app use that same resolver). Action buttons only render on signed macOS
-builds; elsewhere the body click still activates. Navigation only happens on
-user click — never from a background event alone.
+`activate` is deeplink-compatible: `hermes://index-network/intent/1` and the
+hash path `/index-network/intent/1` resolve to the same in-app route (and the
+same `hermes://…` URL works as an OS deep link). Action buttons only render on
+signed macOS builds; elsewhere the body click still activates. Navigation only
+happens on user click — never from a background event alone.
 
 The other doors (`openExternal`, `revealPath`, `writeClipboard`) resolve
 `false` instead of throwing when the capability isn't available (older desktop

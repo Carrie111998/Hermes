@@ -49,8 +49,8 @@ export interface PluginOs {
    *  Settings ▸ Notifications ▸ "Plugin notifications" and fires only while
    *  the user is away from Hermes — use `host.notify` for the in-app toast.
    *  Throttled per plugin; reserve it for genuinely notable events.
-   *  Supports `icon`, `activate` (hash path or `hermes://open/…`), action
-   *  buttons, and renderer `onActivate` / `onAction` callbacks. */
+   *  Supports `icon`, `activate` (e.g. `hermes://index-network/intent/1`),
+   *  action buttons, and renderer `onActivate` / `onAction` callbacks. */
   notify: (input: PluginNativeNotificationInput) => void
   /** Open a URL with the OS default handler (browser, mail client, custom
    *  schemes like `spotify:`). Resolves false when the shell can't. */

@@ -468,7 +468,7 @@ describe('useDesktopIntegrations', () => {
     })
   })
 
-  describe('notification activate + hermes://open deep links', () => {
+  describe('notification activate + plugin deep links', () => {
     it('navigates when a plugin notification activate payload arrives', () => {
       let activate: ((payload: { activate?: string }) => void) | undefined
       desktopWindow.hermesDesktop = {
@@ -481,11 +481,11 @@ describe('useDesktopIntegrations', () => {
       } as unknown as Window['hermesDesktop']
 
       render({ profileReady: true, sessions: [] })
-      activate?.({ activate: '/my-page?item=i1' })
-      expect(navigate).toHaveBeenCalledWith('/my-page?item=i1')
+      activate?.({ activate: '/index-network/intent/1' })
+      expect(navigate).toHaveBeenCalledWith('/index-network/intent/1')
     })
 
-    it('navigates hermes://open/… deep links through the same path vocabulary', () => {
+    it('navigates hermes://index-network/intent/1 deep links through the same path vocabulary', () => {
       let deepLink: ((payload: { kind: string; name: string; params: Record<string, string> }) => void) | undefined
       desktopWindow.hermesDesktop = {
         ...desktopWindow.hermesDesktop,
@@ -498,8 +498,8 @@ describe('useDesktopIntegrations', () => {
       } as unknown as Window['hermesDesktop']
 
       render({ profileReady: true, sessions: [] })
-      deepLink?.({ kind: 'open', name: 'my-page', params: { item: 'i1' } })
-      expect(navigate).toHaveBeenCalledWith('/my-page?item=i1')
+      deepLink?.({ kind: 'index-network', name: 'intent/1', params: {} })
+      expect(navigate).toHaveBeenCalledWith('/index-network/intent/1')
     })
   })
 })

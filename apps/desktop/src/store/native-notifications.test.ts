@@ -204,29 +204,30 @@ describe('dispatchPluginNativeNotification', () => {
   })
 
   it('forwards icon, resolved activate path, and action buttons (deeplink-compatible)', () => {
-    dispatchPluginNativeNotification('my-plugin', {
+    // Unique tag (throttle is per plugin id); activate still uses the plugin deep link.
+    dispatchPluginNativeNotification('index-network-alerts', {
       actions: [
-        { id: 'open', label: 'Open', activate: { path: '/my-page', params: { item: 'i1' } } },
-        { id: 'snooze', label: 'Snooze', onAction: () => undefined }
+        { id: 'open', label: 'Open', activate: 'hermes://index-network/intent/1' },
+        { id: 'dismiss', label: 'Dismiss', onAction: () => undefined }
       ],
-      activate: 'hermes://open/my-page?item=i1',
-      body: 'Ready',
-      icon: '/tmp/my-plugin.png',
-      title: 'Update'
+      activate: 'hermes://index-network/intent/1',
+      body: 'New match',
+      icon: '/tmp/index-network.png',
+      title: 'Opportunity'
     })
 
     expect(notify).toHaveBeenCalledWith(
       expect.objectContaining({
-        activate: '/my-page?item=i1',
+        activate: '/index-network/intent/1',
         actions: [
-          { activate: '/my-page?item=i1', id: 'open', text: 'Open' },
-          { activate: undefined, id: 'snooze', text: 'Snooze' }
+          { activate: '/index-network/intent/1', id: 'open', text: 'Open' },
+          { activate: undefined, id: 'dismiss', text: 'Dismiss' }
         ],
-        icon: '/tmp/my-plugin.png',
+        icon: '/tmp/index-network.png',
         kind: 'plugin',
-        notifyId: expect.stringMatching(/^my-plugin:/),
-        tag: 'my-plugin',
-        title: 'Update'
+        notifyId: expect.stringMatching(/^index-network-alerts:/),
+        tag: 'index-network-alerts',
+        title: 'Opportunity'
       })
     )
   })
@@ -235,19 +236,18 @@ describe('dispatchPluginNativeNotification', () => {
     const onActivate = vi.fn()
     const onAction = vi.fn()
 
-    // Distinct plugin id — throttle is per tag, and the previous case used my-plugin.
     dispatchPluginNativeNotification('handlers-plugin', {
-      activate: '/my-page',
+      activate: 'hermes://index-network/intent/1',
       onActivate,
-      actions: [{ id: 'snooze', label: 'Snooze', onAction }],
-      title: 'Update'
+      actions: [{ id: 'dismiss', label: 'Dismiss', onAction }],
+      title: 'Opportunity'
     })
 
     const payload = notify.mock.calls[0]?.[0] as { notifyId?: string }
     expect(payload.notifyId).toBeTruthy()
     invokePluginNotifyActivate(payload.notifyId)
     expect(onActivate).toHaveBeenCalledTimes(1)
-    expect(invokePluginNotifyAction(payload.notifyId, 'snooze')).toBe(true)
+    expect(invokePluginNotifyAction(payload.notifyId, 'dismiss')).toBe(true)
     expect(onAction).toHaveBeenCalledTimes(1)
   })
 })

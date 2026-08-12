@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react'
 
 import { closeActiveTab } from '@/app/chat/close-tab'
 import { openSession } from '@/app/open-session'
-import { pathFromOpenDeepLink } from '@/lib/hermes-open-target'
+import { pathFromHermesDeepLink } from '@/lib/hermes-open-target'
 import { storedSessionIdForNotification } from '@/lib/session-ids'
 import {
   clearPluginNotifyHandlers,
@@ -195,7 +195,7 @@ export function useDesktopIntegrations({
 
   // Plugin OS notification body/action → optional callback + navigate. Activation
   // is user-driven (click), so this is offer-not-hijack. Paths share the
-  // hermes://open/… vocabulary with deep links.
+  // hermes://index-network/intent/1 vocabulary with deep links.
   useEffect(() => {
     const unsubscribe = window.hermesDesktop?.onNotificationActivate?.(payload => {
       if (!payload) {
@@ -219,7 +219,8 @@ export function useDesktopIntegrations({
   }, [navigate])
 
   // hermes:// deep links:
-  //  - open/<path>?… → in-app navigate (same resolver as notification activate)
+  //  - <plugin>/<path>?… → in-app navigate (e.g. index-network/intent/1)
+  //  - open/<path>?… → in-app navigate (generic)
   //  - blueprint/<name>?… → reviewable /blueprint command in the composer
   useEffect(() => {
     const unsubscribe = window.hermesDesktop?.onDeepLink?.(payload => {
@@ -227,31 +228,31 @@ export function useDesktopIntegrations({
         return
       }
 
-      if (payload.kind === 'open' && payload.name) {
-        const path = pathFromOpenDeepLink(payload.name, payload.params || {})
-
-        if (path) {
-          navigate(path)
+      if (payload.kind === 'blueprint') {
+        if (!payload.name) {
+          return
         }
 
+        const slots = Object.entries(payload.params || {})
+          .map(([k, v]) => {
+            const sval = /\s/.test(v) ? `"${v.replace(/"/g, '\\"')}"` : v
+
+            return `${k}=${sval}`
+          })
+          .join(' ')
+
+        const command = `/blueprint ${payload.name}${slots ? ' ' + slots : ''}`
+        requestComposerInsert(command, { mode: 'block', target: 'main' })
+        requestComposerFocus('main')
+
         return
       }
 
-      if (payload.kind !== 'blueprint' || !payload.name) {
-        return
+      const path = pathFromHermesDeepLink(payload.kind, payload.name || '', payload.params || {})
+
+      if (path) {
+        navigate(path)
       }
-
-      const slots = Object.entries(payload.params || {})
-        .map(([k, v]) => {
-          const sval = /\s/.test(v) ? `"${v.replace(/"/g, '\\"')}"` : v
-
-          return `${k}=${sval}`
-        })
-        .join(' ')
-
-      const command = `/blueprint ${payload.name}${slots ? ' ' + slots : ''}`
-      requestComposerInsert(command, { mode: 'block', target: 'main' })
-      requestComposerFocus('main')
     })
 
     void window.hermesDesktop?.signalDeepLinkReady?.()

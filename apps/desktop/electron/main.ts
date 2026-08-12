@@ -11073,7 +11073,7 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
     }
 
     // Plugin / session-less activation — serializable path (+ optional notifyId
-    // for renderer callbacks). Same vocabulary as hermes://open/… deep links.
+    // for renderer callbacks). Same vocabulary as hermes://index-network/….
     if (payload?.activate || payload?.notifyId) {
       mainWindow.webContents.send('hermes:notification-activate', {
         activate: payload?.activate,
