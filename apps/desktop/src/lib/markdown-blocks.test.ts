@@ -132,8 +132,14 @@ describe('parseMarkdownIntoBlocksCached', () => {
 
   // 12 seeds × 500 growing prefixes is ~6000 full+cached lexes; it first trips
   // the pre-fix boundary at seed 11 / step 257, so the workload can't shrink
-  // without gutting the guard. The work is bounded but exceeds one test's 5s
+  // without gutting the guard. The work is bounded but exceeds one test's
   // default budget, so raise the timeout rather than weaken the coverage.
+  //
+  // The timeout is sized for a CONTENDED runner, not an idle one. Measured
+  // 2026-08-12: ~25s alone, but 35s — over the old 30s budget — under a full
+  // `--project ui` run (209 files, 10 jsdom workers), where it was the suite's
+  // only failure. A bare "Test timed out" here reads like a lexer regression,
+  // so the margin has to cover worker contention, not just the happy path.
   it('matches a full lex at every char-level streaming cut over noisy markdown (property fuzz)', () => {
     // Character-level append fuzz over the markdown control alphabet — the
     // harness that surfaced the setext-underline merge above. Growing a single
@@ -160,5 +166,5 @@ describe('parseMarkdownIntoBlocksCached', () => {
         expect(parseMarkdownIntoBlocksCached(text)).toEqual(parseMarkdownIntoBlocks(text))
       }
     }
-  }, 30_000)
+  }, 90_000)
 })
