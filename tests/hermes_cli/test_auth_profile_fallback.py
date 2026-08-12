@@ -148,6 +148,86 @@ def test_duplicate_auth_policy_keys_fail_closed(profile_env, config_text):
     assert not (profile_env["profile"] / "auth.json").exists()
 
 
+def test_managed_false_overrides_user_true_and_blocks_global_fallback(
+    profile_env, tmp_path, monkeypatch
+):
+    from hermes_cli import managed_scope
+    from hermes_cli.auth import (
+        get_provider_auth_state,
+        profile_global_auth_inheritance_enabled,
+        read_credential_pool,
+    )
+
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / "config.yaml").write_text(
+        "auth:\n  inherit_global: false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    managed_scope.invalidate_managed_cache()
+
+    _disable_global_auth_inheritance(profile_env["profile"], value=True)
+    _write(
+        profile_env["global"] / "auth.json",
+        _make_auth_store(
+            pool={
+                "openrouter": [
+                    _pool_entry(
+                        id="global-openrouter",
+                        access_token="synthetic-global",
+                    )
+                ],
+            },
+            providers={
+                "openrouter": {"api_key": "synthetic-global"},
+            },
+        ),
+    )
+
+    assert profile_global_auth_inheritance_enabled() is False
+    assert read_credential_pool("openrouter") == []
+    assert get_provider_auth_state("openrouter") is None
+    assert not (profile_env["profile"] / "auth.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("user_value", "managed_value", "expected"),
+    (
+        (None, False, False),
+        (False, True, True),
+        (True, "false", False),
+    ),
+)
+def test_managed_auth_policy_has_leaf_precedence(
+    profile_env,
+    tmp_path,
+    monkeypatch,
+    user_value,
+    managed_value,
+    expected,
+):
+    from hermes_cli import managed_scope
+    from hermes_cli.auth import profile_global_auth_inheritance_enabled
+
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    _write(
+        managed / "config.yaml",
+        {"auth": {"inherit_global": managed_value}},
+    )
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    managed_scope.invalidate_managed_cache()
+
+    if user_value is not None:
+        _disable_global_auth_inheritance(
+            profile_env["profile"],
+            value=user_value,
+        )
+
+    assert profile_global_auth_inheritance_enabled() is expected
+
+
 
 
 

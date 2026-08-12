@@ -1064,17 +1064,20 @@ def profile_global_auth_inheritance_enabled() -> bool:
     ``auth.inherit_global`` is intentionally a fail-closed profile boundary.
     The setting is backward-compatible when absent, but once present only the
     boolean value ``true`` permits global-root fallback, shared auth state,
-    cross-profile token caches, or ambient credential seeding. Invalid values
-    and unreadable configuration deny those paths rather than silently
-    restoring credential authority. Explicit profile-local reads and writes
-    remain permitted.
+    cross-profile token caches, or ambient credential seeding. Administrator-
+    managed config is applied after the strict profile read, so its leaf value
+    wins exactly as it does for other effective Hermes configuration. Invalid
+    values and unreadable profile configuration deny those paths rather than
+    silently restoring credential authority. Explicit profile-local reads and
+    writes remain permitted.
     """
     try:
-        config = read_raw_config_strict()
+        config = read_raw_config_strict() or {}
+        from hermes_cli.managed_scope import apply_managed_overlay
+
+        config = apply_managed_overlay(config)
     except Exception:
         return False
-    if config is None:
-        return True
     auth_config = config.get("auth")
     if "auth" not in config:
         return True
