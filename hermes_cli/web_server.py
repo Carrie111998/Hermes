@@ -6980,11 +6980,11 @@ async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
             # key absent from the schema — most visibly ``custom_providers``, but
             # also ``agent.personalities``, ``terminal.lifetime_seconds``, etc. —
             # is not sent in the PUT body. A full-replace save would silently
-            # drop those keys. Deep-merge incoming over what's on disk so the
-            # frontend can only overwrite what it explicitly sends.
-            existing = read_raw_config()
+            # drop those keys. Merge inside save_config's lock so the frontend
+            # can only overwrite what it explicitly sends while the complete
+            # on-disk document survives the atomic rewrite.
             incoming = _denormalize_config_from_web(body.config)
-            save_config(_deep_merge(existing, incoming))
+            save_config(incoming, merge_existing=True)
         return {"ok": True}
     except HTTPException:
         raise
