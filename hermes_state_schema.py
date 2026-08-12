@@ -545,13 +545,12 @@ class SessionSchemaMixin:
         """
         expected = self._parse_schema_columns(SCHEMA_SQL)
         for table_name, declared_cols in expected.items():
-            # Get current columns from the live table
-            try:
-                rows = cursor.execute(
-                    f'PRAGMA table_info("{table_name}")'
-                ).fetchall()
-            except sqlite3.OperationalError:
-                continue  # Table doesn't exist yet (shouldn't happen after executescript)
+            # Get current columns from the live table. Inspection failures must
+            # reach SessionDB's open retry/error path; a missing table simply
+            # returns no rows.
+            rows = cursor.execute(
+                f'PRAGMA table_info("{table_name}")'
+            ).fetchall()
             live_cols = set()
             for row in rows:
                 # PRAGMA table_info returns (cid, name, type, notnull, dflt_value, pk)
@@ -566,10 +565,11 @@ class SessionSchemaMixin:
                             f'ALTER TABLE "{table_name}" ADD COLUMN "{safe_name}" {col_type}'
                         )
                     except sqlite3.OperationalError as exc:
-                        # Expected: "duplicate column name" from a race or
-                        # re-run.  Unexpected: "Cannot add a NOT NULL column
-                        # with default value NULL" from a schema mistake.
-                        # Log at DEBUG so it's visible in agent.log.
+                        # A concurrent migrator may add the column after
+                        # ``live_cols`` is read. Only that race is benign;
+                        # every other failure must remain visible (#79531).
+                        if "duplicate column name" not in str(exc).lower():
+                            raise
                         logger.debug(
                             "reconcile %s.%s: %s", table_name, col_name, exc,
                         )
