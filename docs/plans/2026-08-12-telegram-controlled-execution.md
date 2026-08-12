@@ -1,6 +1,6 @@
 # Hermes Telegram controlled-execution reliability
 
-Status: draft implementation, not deployed
+Status: merged and deployed; Telegram end-to-end readiness still unconfirmed
 
 ## Observed behavior
 
@@ -25,8 +25,20 @@ report progress as if the artifact were complete.
    unattended loop behavior, and the tool guidance that distinguishes durable
    memory from documents.
 
+## Deployment evidence
+
+- PR #10 merged to `main` as
+  `af99f0f1ad52e266fcc2cfbf261e1ee9f71e39c2`.
+- CI run `31571694814` completed successfully.
+- DGX release snapshot
+  `/home/cwliao/.hermes/releases/v2026.8.12-telegram-controlled-af99f0f1ad`
+  matches the merge commit.
+- `hermes-gateway.service` is active after restart with MainPID `4109761`,
+  `ExecMainStatus=0`, and `NRestarts=0`.
+
 ## Evidence boundary
 
-This draft addresses the code paths visible in the screenshots. It does not
-prove DGX runtime behavior until the built release is deployed and the Telegram
-path is exercised end to end.
+The implementation addresses the code paths visible in the screenshots. The
+service/release path is verified. Telegram end-to-end message delivery and
+polling readiness remain unconfirmed because the observed post-restart logs
+showed connection initialization but not a successful polling confirmation.

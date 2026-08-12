@@ -1,6 +1,6 @@
 # Hermes Architecture Roadmap
 
-> Snapshot: 2026-08-10 (Asia/Taipei). main is the canonical Hermes
+> Snapshot: 2026-08-12 (Asia/Taipei). main is the canonical Hermes
 > integration line; DGX release branches are staging inputs only.
 
 ## Source-of-truth rules
@@ -16,12 +16,13 @@
 
 | Reference | Current evidence | Meaning |
 |---|---|---|
-| origin/main | 7a14e3fdc2f1f2dc2bcd2b14265e091582e5d71a | Canonical Hermes mainline after CI-BASELINE-001 merge. |
+| origin/main | af99f0f1ad52e266fcc2cfbf261e1ee9f71e39c2 | Canonical Hermes mainline after Telegram controlled-execution merge. |
 | origin/ticket/T0127-v2026.8.3-merged | release staging branch | DGX release input; not the ARCH merge target. |
 | live DGX checkout | /home/cwliao/.hermes/hermes-agent | Claude-owned; do not edit or reset. |
-| live DGX deployed commit | ec50a154eeb44e7206f24b7703f9032b8f97069c | Last verified deployed mainline; gateway was active/running. |
+| live DGX deployed commit | af99f0f1ad52e266fcc2cfbf261e1ee9f71e39c2 | Release snapshot deployed; gateway active after restart. |
+| live DGX release snapshot | /home/cwliao/.hermes/releases/v2026.8.12-telegram-controlled-af99f0f1ad | Service cwd and PYTHONPATH target; live checkout remains untouched. |
 | rollback ref | backup/pre-arch-001-deploy-20260810T031625Z | DGX-local pre-ARCH-001 deploy ref; preserved for rollback. |
-| CI-BASELINE-001 merge | 7a14e3fdc2f1f2dc2bcd2b14265e091582e5d71a | Merged to GitHub main; not deployed to DGX. |
+| Telegram controlled-execution merge | af99f0f1ad52e266fcc2cfbf261e1ee9f71e39c2 | PR #10 merged; CI run 31571694814 successful; deployed to DGX. |
 
 ## Core engineering order
 
@@ -80,6 +81,7 @@ docs/plans/2026-08-10-hermes-skills-roadmap.md.
 | Ticket | Status | Gate |
 |---|---|---|
 | ARCH-001 | complete | Merged to Hermes main and deployed to DGX; service active after restart. |
+| Telegram controlled-execution | complete | PR #10 merged as af99f0f; CI run 31571694814 successful; DGX release active after restart. |
 | ARCH-001-MAINLINE-001 | complete | Merge ec50a154…; compile and 35 targeted tests passed; runtime restart verified. |
 | CI-BASELINE-001 | complete | PR #3 merged as 7a14e3f…; latest required checks were green and Codex/AGY review reconciled READY. |
 | ARCH-002 | proposed | Draft the runtime-state contract ticket and review it before implementation. |
@@ -90,6 +92,7 @@ docs/plans/2026-08-10-hermes-skills-roadmap.md.
 
 ## Runtime and deployment boundary
 
-ARCH-001 remains the last verified DGX deployment. CI-BASELINE-001 and this
-skills-roadmap consolidation have not been deployed or restarted on DGX.
-No roadmap document authorizes a live skill synchronization or runtime change.
+The Telegram controlled-execution release is the latest verified DGX
+deployment. The live checkout remains untouched; deployment used an isolated
+release snapshot and a numbered systemd drop-in. Telegram end-to-end readiness
+was not confirmed in the short post-restart log window.

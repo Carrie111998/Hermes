@@ -1,7 +1,7 @@
 # Project Handover - hermes-agent
 
 **Plan key:** hermes-agent
-**Last verified:** 2026-08-10
+**Last verified:** 2026-08-12
 **Handover owner/session:** Codex
 **Authoritative project log:** docs/ROADMAP-HERMES-DGX.md
 
@@ -19,7 +19,7 @@
   and DGX Spark Hermes home /home/cwliao/.hermes.
 - **Canonical remote/branch:** origin/main; ticket work uses isolated ticket/*
   branches.
-- **Current mainline:** 7a14e3fdc2f1f2dc2bcd2b14265e091582e5d71a.
+- **Current mainline:** af99f0f1ad52e266fcc2cfbf261e1ee9f71e39c2.
 - **Runtime/deployment:** DGX Spark host 140.96.58.171, Hermes checkout under
   /home/cwliao/.hermes/hermes-agent, user service hermes-gateway.service.
 - **Entry points:** hermes_cli.main, gateway.run, messaging adapters,
@@ -38,11 +38,13 @@
   - CI-BASELINE-001 merged to GitHub main as
     7a14e3fdc2f1f2dc2bcd2b14265e091582e5d71a; CI run 31381350666 was green
     and Codex/independent AGY review reconciled READY.
-- **Active:** HERMES-SKILLS-001 consolidates the recovered skill roadmap;
-  this branch changes documentation only. ARCH-002 remains the next core
-  implementation ticket.
-- **Deferred / not goals:** No DGX deployment or service restart for
-  CI-BASELINE-001, HERMES-SKILLS-001, or any proposed SkillClaw work.
+-  Telegram controlled-execution reliability merged as PR #10 at
+   af99f0f1ad52e266fcc2cfbf261e1ee9f71e39c2; CI run 31571694814 completed
+   successfully.
+- **Active:** The Telegram controlled-execution release is deployed and under
+  runtime observation. ARCH-002 remains the next core implementation ticket.
+- **Deferred / not goals:** No live skill synchronization, SkillClaw work, or
+  unrelated DGX service changes were performed.
 - **Next candidates:** ARCH-002, then skills inventory/catalog, teach
   durability, klib discovery evidence, HERMES-SKILLS-004, and
   HERMES-SKILLCLAW-001. HERMES-INTAKE-001 is the current documentation
@@ -50,20 +52,24 @@
 
 ## 3. Verified state
 
-- **CI:** Required checks for CI-BASELINE-001 passed in run 31381350666; no
-  new CI run is claimed for this documentation branch.
-- **DGX health:** Last read-only check showed hermes-gateway.service
-  active/running; DGX remains at ec50a154eeb44e7206f24b7703f9032b8f97069c.
+- **CI:** CI run 31571694814 for PR #10 completed successfully.
+- **DGX health:** `hermes-gateway.service` is active with MainPID 4109761,
+  ExecMainStatus 0, and NRestarts 0 after restart. The process cwd is the
+  deployed release snapshot below.
 - **Skill evidence:** klib manifest commit 674a4fb72 is repository evidence.
   teach durability commit ab1a40040 is historical GitHub evidence and is not
   current mainline documentation. The historical inventory checkpoint is not
   current until re-counted.
-- **Data/storage safety:** No DGX .hermes storage mutation was performed for
-  this roadmap consolidation. No secrets or tokens are stored here.
-- **Deployment:** No CI or skills-roadmap change has been deployed to DGX.
-- **Known limitations:** This branch adds roadmap documentation only; the
-  SkillClaw client, inventory reconciliation, teach port, and klib live smoke
-  remain unimplemented/proposed.
+- **Data/storage safety:** No Hermes memory or user data was mutated. Deployment
+  only added an isolated release snapshot and numbered systemd drop-in. No
+  secrets or tokens are stored here.
+- **Deployment:** Release snapshot
+  `/home/cwliao/.hermes/releases/v2026.8.12-telegram-controlled-af99f0f1ad`
+  is deployed through drop-in `24-telegram-controlled-execution.conf` and
+  matches merged mainline `af99f0f1ad52e266fcc2cfbf261e1ee9f71e39c2`.
+- **Known limitations:** Service-level readiness is verified. Telegram
+  end-to-end ready/polling success was not confirmed in the observed log
+  window; the gateway was still active and attempting connection.
 
 ## 4. Next ticket
 
