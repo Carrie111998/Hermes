@@ -25,6 +25,7 @@ from plugins.platforms.buzz.replay import (
     ReplayError,
     ReplayLedger,
     dispatch_exact_event,
+    profile_replay_lock,
     replay_db_path,
     replay_state,
     run_replay,
@@ -380,11 +381,23 @@ class ReplayIntegrationTests(unittest.TestCase):
                 adapter.gateway_runner = runner
                 runner.adapters[buzz_platform] = adapter
 
+                gates = {}
+
                 async def failing_handler(_message):
-                    await asyncio.sleep(0.05)
+                    gates["started"].set()
+                    await gates["release"].wait()
                     raise RuntimeError("handler failure")
 
                 runner._handle_message = failing_handler
+
+                async def exercise_failure():
+                    gates["started"] = asyncio.Event()
+                    gates["release"] = asyncio.Event()
+                    task = asyncio.create_task(dispatch())
+                    await asyncio.wait_for(gates["started"].wait(), timeout=2.0)
+                    gates["release"].set()
+                    return await task
+
                 adapter.set_message_handler(runner._primary_message_handler())
                 adapter.set_session_store(runner.session_store)
                 adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
@@ -407,8 +420,9 @@ class ReplayIntegrationTests(unittest.TestCase):
                     "last_ts": event["created_at"],
                     "seen": OrderedDict([(event["id"], None)]),
                 }
-                result = asyncio.run(
-                    dispatch_exact_event(
+
+                async def dispatch():
+                    return await dispatch_exact_event(
                         adapter,
                         CHANNEL,
                         event,
@@ -416,7 +430,8 @@ class ReplayIntegrationTests(unittest.TestCase):
                         state,
                         wait_timeout=2.0,
                     )
-                )
+
+                result = asyncio.run(exercise_failure())
 
                 self.assertEqual(result["outcome"]["status"], FAILED)
                 self.assertEqual(result["outcome"]["code"], "processing_failed")
@@ -428,6 +443,14 @@ class ReplayIntegrationTests(unittest.TestCase):
 
 class ReplayLifecycleTests(unittest.TestCase):
     EVENT_ID = "d" * 64
+
+    def test_profile_replay_lock_serializes_same_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "hermes"
+            with profile_replay_lock(home):
+                with self.assertRaisesRegex(ReplayError, "replay_lock_conflict"):
+                    with profile_replay_lock(home):
+                        self.fail("second operator acquired the profile replay lock")
 
     @staticmethod
     def _probe_gateway_lock(home: Path) -> str:

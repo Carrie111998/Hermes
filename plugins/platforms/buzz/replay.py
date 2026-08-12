@@ -183,25 +183,20 @@ class ReplayLedger:
 @contextmanager
 def profile_replay_lock(home: Path) -> Iterator[None]:
     """Serialize one-shot operators within a profile."""
+    from gateway.status import _release_file_lock, _try_acquire_file_lock
+
     path = home / "runtime" / "buzz-replay.lock"
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     handle = path.open("a+", encoding="utf-8")
     locked = False
     try:
-        try:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            locked = True
-        except (ImportError, BlockingIOError, OSError) as exc:
-            raise ReplayError("replay_lock_conflict") from exc
+        locked = _try_acquire_file_lock(handle)
+        if not locked:
+            raise ReplayError("replay_lock_conflict")
         yield
     finally:
         if locked:
-            with contextlib.suppress(Exception):
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            _release_file_lock(handle)
         handle.close()
 
 
