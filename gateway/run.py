@@ -21545,6 +21545,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reply_to_message_id=reply_to_message_id or getattr(source, "message_id", None),
         )
         if getattr(source, "platform", None) == Platform.SLACK:
+            # Interactive approvals are capabilities for the original Slack
+            # requester, not for whoever happens to be present in a channel
+            # or current allowlist.  Carry this through all thread/session
+            # reply paths so Slack can bind a Block Kit prompt to that user.
+            requester_user_id = getattr(source, "user_id", None)
+            if requester_user_id:
+                metadata = dict(metadata or {})
+                metadata["approval_requester_user_id"] = str(requester_user_id)
             team_id = getattr(source, "scope_id", None)
             if team_id:
                 metadata = dict(metadata or {})

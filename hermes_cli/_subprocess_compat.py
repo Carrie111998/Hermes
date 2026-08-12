@@ -43,6 +43,7 @@ __all__ = [
     "windows_detach_flags_without_breakaway",
     "windows_hide_flags",
     "windows_detach_popen_kwargs",
+    "terminate_process_tree",
     "bounded_git_probe",
     "noninteractive_git_env",
 ]
@@ -383,7 +384,7 @@ def noninteractive_git_env(
 # -----------------------------------------------------------------------------
 
 
-def _kill_git_process_tree(proc: "subprocess.Popen") -> None:
+def terminate_process_tree(proc: "subprocess.Popen") -> bool:
     """Best-effort terminate *proc* and its descendants on both platforms.
 
     ``proc.kill()`` alone only terminates the direct child. On Windows a
@@ -435,6 +436,15 @@ def _kill_git_process_tree(proc: "subprocess.Popen") -> None:
             )
         except Exception:
             pass
+    try:
+        return proc.poll() is not None
+    except Exception:
+        return False
+
+
+def _kill_git_process_tree(proc: "subprocess.Popen") -> None:
+    """Backward-compatible private alias for the generic tree terminator."""
+    terminate_process_tree(proc)
 
 
 def bounded_git_probe(argv: Sequence[str], *, timeout: float) -> str:

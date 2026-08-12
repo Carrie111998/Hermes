@@ -95,6 +95,7 @@ class TestSlackExecApproval:
             command="rm -rf /important",
             session_key="agent:main:slack:group:C1:1111",
             description="dangerous deletion",
+            metadata={"slack_team_id": "T1", "approval_requester_user_id": "U_ALICE"},
         )
 
         assert result.success is True
@@ -130,6 +131,7 @@ class TestSlackExecApproval:
         await adapter.send_exec_approval(
             chat_id="C1", command="rm -rf /", session_key="s",
             allow_permanent=False, smart_denied=True,
+            metadata={"slack_team_id": "T1", "approval_requester_user_id": "U_ALICE"},
         )
 
         kwargs = mock_client.chat_postMessage.call_args.kwargs
@@ -152,8 +154,11 @@ class TestSlackApprovalAction:
     async def test_truncates_inflated_original_text(self):
         """Interaction payload re-escapes HTML entities; text must be capped."""
         adapter = _make_adapter()
-        _attach_auth_runner(adapter)
         adapter._approval_resolved["1.2"] = False
+        adapter._approval_requesters["1.2"] = {
+            "requester_user_id": "U_ALICE",
+            "session_key": "session-key",
+        }
 
         # Simulate Slack re-escaping: original was ~2990 chars, but & → &amp;
         # etc. inflates it past 3000.
@@ -180,13 +185,17 @@ class TestSlackApprovalAction:
         assert len(section_text) <= 3000
 
     @pytest.mark.asyncio
-    async def test_global_allowlist_blocks_unauthorized_click(self, monkeypatch):
+    async def test_non_requester_cannot_use_a_button_even_if_globally_allowed(self, monkeypatch):
         adapter = _make_adapter()
         adapter._approval_resolved["1234.5678"] = False
+        adapter._approval_requesters["1234.5678"] = {
+            "requester_user_id": "U_OWNER",
+            "session_key": "agent:main:slack:group:C1:1111",
+        }
         monkeypatch.delenv("SLACK_ALLOWED_USERS", raising=False)
         monkeypatch.delenv("SLACK_ALLOW_ALL_USERS", raising=False)
         monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
-        monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "U_OWNER")
+        monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "U_ATTACKER")
 
         ack = AsyncMock()
         body = {
@@ -204,6 +213,72 @@ class TestSlackApprovalAction:
 
         ack.assert_called_once()
         mock_resolve.assert_not_called()
+        # A rejected click cannot consume the requester's button.
+        assert adapter._approval_resolved["1234.5678"] is False
+
+    @pytest.mark.asyncio
+    async def test_original_requester_can_approve_without_ambient_allowlist(self, monkeypatch):
+        """The inbound request was authorized already; button auth is requester-bound."""
+        adapter = _make_adapter()
+        adapter._approval_resolved["1234.5678"] = False
+        adapter._approval_requesters["1234.5678"] = {
+            "requester_user_id": "U_OWNER",
+            "session_key": "agent:main:slack:group:C1:1111",
+        }
+        monkeypatch.delenv("SLACK_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("SLACK_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "U_SOMEONE_ELSE")
+
+        ack = AsyncMock()
+        body = {
+            "message": {"ts": "1234.5678", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": "owner", "id": "U_OWNER"},
+        }
+        action = {
+            "action_id": "hermes_approve_once",
+            "value": "agent:main:slack:group:C1:1111",
+        }
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            await adapter._handle_approval_action(ack, body, action)
+
+        ack.assert_called_once()
+        mock_resolve.assert_called_once_with("agent:main:slack:group:C1:1111", "once")
+
+    @pytest.mark.asyncio
+    async def test_unbound_button_fails_closed(self):
+        adapter = _make_adapter()
+        adapter._approval_resolved["1234.5678"] = False
+        ack = AsyncMock()
+        body = {
+            "message": {"ts": "1234.5678", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": "owner", "id": "U_OWNER"},
+        }
+        action = {"action_id": "hermes_approve_once", "value": "session-key"}
+
+        with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+            await adapter._handle_approval_action(ack, body, action)
+
+        ack.assert_called_once()
+        mock_resolve.assert_not_called()
+        assert adapter._approval_resolved["1234.5678"] is False
+
+    @pytest.mark.asyncio
+    async def test_send_refuses_button_without_requester_binding(self):
+        adapter = _make_adapter()
+        result = await adapter.send_exec_approval(
+            chat_id="C1",
+            command="rm -rf /important",
+            session_key="session-key",
+        )
+        assert result.success is False
+        assert result.error == "missing approval requester binding"
+        adapter._team_clients["T1"].chat_postMessage.assert_not_called()
 
 
 class TestSlackInteractiveAuth:
@@ -840,4 +915,3 @@ class TestSlackReactionAuthorizationGate:
         assert "U_RANDO" in runner.auth_checked
         assert runner.handled == []
         adapter.handle_message.assert_not_called()
-

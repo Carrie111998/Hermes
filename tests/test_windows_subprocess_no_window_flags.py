@@ -138,6 +138,35 @@ def test_bounded_git_probe_spawn_failure_returns_empty(monkeypatch):
     assert _subprocess_compat.bounded_git_probe(["git", "-C", "/repo", "status"], timeout=1.5) == ""
 
 
+def test_terminate_process_tree_windows_uses_taskkill_tree_flags(monkeypatch):
+    """The shared scheduler cleanup reaches every Windows descendant."""
+    from hermes_cli import _subprocess_compat
+
+    calls = []
+
+    class _Proc:
+        pid = 4567
+
+        def kill(self):
+            calls.append(("kill", self.pid))
+
+        def poll(self):
+            return 0
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return _Completed(returncode=0)
+
+    monkeypatch.setattr(_subprocess_compat, "IS_WINDOWS", True)
+    monkeypatch.setattr(_subprocess_compat, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
+    monkeypatch.setattr(_subprocess_compat.subprocess, "run", fake_run)
+
+    assert _subprocess_compat.terminate_process_tree(_Proc()) is True
+    taskkill = next(call for call in calls if isinstance(call[0], list))
+    assert taskkill[0] == ["taskkill", "/T", "/F", "/PID", "4567"]
+    assert taskkill[1]["creationflags"] == _CREATE_NO_WINDOW
+
+
 
 
 

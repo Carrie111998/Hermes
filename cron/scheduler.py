@@ -42,7 +42,11 @@ from typing import Any, List, Optional
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hermes_constants import get_hermes_home
-from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli._subprocess_compat import (
+    terminate_process_tree,
+    windows_detach_flags_without_breakaway,
+    windows_hide_flags,
+)
 from hermes_cli.config import (
     _expand_env_vars,
     cron_model_drift_guard_enabled,
@@ -108,6 +112,17 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     job_name = job.get("name") or job.get("id") or "cron job"
     text = (error or "unknown error").strip()
     lower = text.lower()
+
+    # A scheduler deadline is an operational containment event, not evidence
+    # that an LLM/provider fallback timed out.  Keeping this branch ahead of
+    # the generic "timeout" classifier prevents a correct partial-run report
+    # from becoming the misleading provider-timeout alert seen in Design Flip.
+    if "operational script timeout" in lower:
+        return (
+            f"⚠️ Cron '{job_name}' reached its operational script deadline. "
+            "The script process tree was terminated; provider fallback was not inferred. "
+            "Full details saved in cron output."
+        )
 
     # Provider/API failures are the common noisy path. Keep these short.
     if "429" in text or "rate limit" in lower or "usage limit" in lower:
@@ -2319,6 +2334,77 @@ _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 _RUN_CLAIM_HEARTBEAT_SECONDS = 60.0
 
+# The Panvola Design Flip launcher is a bounded operational workflow, not an
+# ordinary best-effort cron script.  Its controller, closer, and installer all
+# share the adjacent v2 policy file.  Keep the narrow launcher-name match here
+# rather than changing the global cron timeout: unrelated scripts retain the
+# existing environment/config/default resolution below.
+_DESIGN_STATUS_FLIP_LAUNCHERS = frozenset({
+    "design-status-flip-panvola-live-weekly.sh",
+    "design-status-flip-panvola-live-weekly.cmd",
+})
+_DESIGN_STATUS_FLIP_POLICY_FILENAME = "design-status-flip-policy.json"
+_DESIGN_STATUS_FLIP_CONTRACT_VERSION = 2
+# Handshake with the v2 runtime controller.  On POSIX the controller must not
+# call setsid() for its flip child when the scheduler already owns one process
+# group; otherwise the outer 7,500-second deadline cannot contain that child.
+_DESIGN_STATUS_FLIP_PARENT_TREE_ENV = "HERMES_DESIGN_STATUS_FLIP_PARENT_TREE"
+_DESIGN_STATUS_FLIP_PARENT_TREE_VALUE = "v2"
+
+
+def _require_positive_policy_int(policy: dict[str, Any], key: str) -> int:
+    """Read one policy integer without accepting bools/coercions."""
+    value = policy.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{key} must be a positive integer")
+    return value
+
+
+def _design_status_flip_scheduler_timeout(script_path: Path) -> int | None:
+    """Return the v2 policy-owned outer timeout for a Design Flip launcher.
+
+    This deliberately inspects the *installed sibling* policy, after the
+    normal scripts-dir containment check.  The scheduler must never get its
+    7,500-second deadline from a comment in a launcher or a global setting:
+    that would let the generic 3,600-second default preempt the controller's
+    6,600-second inner deadline.  A malformed or drifted policy fails before
+    spawning the launcher rather than silently falling back to a shorter
+    global timeout.
+    """
+    if script_path.name not in _DESIGN_STATUS_FLIP_LAUNCHERS:
+        return None
+    policy_path = script_path.with_name(_DESIGN_STATUS_FLIP_POLICY_FILENAME)
+    try:
+        raw = json.loads(policy_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"policy unreadable: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("policy must be a JSON object")
+    if raw.get("contract_version") != _DESIGN_STATUS_FLIP_CONTRACT_VERSION:
+        raise ValueError("contract_version mismatch")
+
+    # Validate every timebox/cap the controller consumes, by name rather than
+    # declaration/argv order.  This is intentionally stricter than merely
+    # reading scheduler_timeout_seconds: a partial policy must not launch a
+    # workflow whose outer and inner contracts disagree.
+    scheduler_timeout = _require_positive_policy_int(raw, "scheduler_timeout_seconds")
+    wrapper_timeout = _require_positive_policy_int(raw, "wrapper_timeout_seconds")
+    pass1_timeout = _require_positive_policy_int(raw, "pass1_timeout_seconds")
+    pass2_timeout = _require_positive_policy_int(raw, "pass2_timeout_seconds")
+    _require_positive_policy_int(raw, "pass2_candidate_cap")
+    _require_positive_policy_int(raw, "panvola_target")
+    if scheduler_timeout <= wrapper_timeout:
+        raise ValueError("scheduler_timeout_seconds must exceed wrapper_timeout_seconds")
+    if pass1_timeout + pass2_timeout > wrapper_timeout:
+        raise ValueError("pass timeboxes exceed wrapper_timeout_seconds")
+    return scheduler_timeout
+
+
+def _script_timeout_for_path(script_path: Path) -> int:
+    """Resolve a script deadline, honoring the scoped Design Flip contract."""
+    design_timeout = _design_status_flip_scheduler_timeout(script_path)
+    return design_timeout if design_timeout is not None else _get_script_timeout()
+
 
 def _get_script_timeout() -> int:
     """Resolve cron pre-run script timeout from module/env/config with a safe default."""
@@ -2425,6 +2511,7 @@ def _run_job_script(
     Supported interpreters (chosen by file extension):
 
     * ``.sh`` / ``.bash`` — run with ``/bin/bash``
+    * ``.cmd`` / ``.bat`` on Windows — run with ``cmd.exe /d /s /c``
     * anything else — run with the current Python interpreter
       (``sys.executable``), preserving the original behaviour for
       Python-based pre-check and data-collection scripts.
@@ -2485,10 +2572,13 @@ def _run_job_script(
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 
-    script_timeout = _get_script_timeout()
+    try:
+        script_timeout = _script_timeout_for_path(path)
+    except ValueError as exc:
+        return False, f"Panvola Design Flip policy contract rejected: {exc}"
 
-    # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
-    # everything else.  We deliberately do NOT honour the file's own
+    # Pick an interpreter by extension.  Bash for .sh/.bash, cmd.exe for
+    # Windows batch launchers, Python for everything else.  We deliberately do NOT honour the file's own
     # shebang: the scripts dir is trusted, but keeping the interpreter
     # choice explicit here keeps the allowed surface small and auditable.
     suffix = path.suffix.lower()
@@ -2509,6 +2599,18 @@ def _run_job_script(
         )
         argv = [_bash, str(path)]
         env_overlay: dict[str, str] = {}
+    elif suffix in {".cmd", ".bat"}:
+        if sys.platform != "win32":
+            return False, (
+                f"Cannot run .cmd/.bat script {path.name!r} on this platform. "
+                "Use the POSIX .sh launcher or run it from Windows."
+            )
+        # Batch files are not Python programs.  Route them explicitly through
+        # cmd.exe so the installed Windows Design Flip launcher executes the
+        # same policy-bound controller/closer sequence as its POSIX sibling.
+        cmd_exe = os.environ.get("ComSpec") or os.environ.get("COMSPEC") or "cmd.exe"
+        argv = [cmd_exe, "/d", "/s", "/c", str(path)]
+        env_overlay = {}
     else:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
         argv = [python_exe, str(path)]
@@ -2518,29 +2620,72 @@ def _run_job_script(
 
         popen_kwargs = {}
         if sys.platform == "win32":
+            # The v2 Windows launcher is a bounded operational tree.  Give
+            # it its own hidden group while taskkill /T remains the timeout
+            # containment mechanism.  Ordinary cron scripts preserve their
+            # historical hide-only behavior.
+            creationflags = (
+                windows_detach_flags_without_breakaway()
+                if path.name in _DESIGN_STATUS_FLIP_LAUNCHERS
+                else windows_hide_flags()
+            )
             popen_kwargs = {
-                "creationflags": windows_hide_flags(),
+                "creationflags": creationflags,
                 "encoding": "utf-8",
                 "errors": "replace",
             }
+        else:
+            # The timeout path must be able to kill the script launcher AND
+            # every descendant.  A dedicated POSIX session makes the shared
+            # terminate_process_tree ownership check (pgid == pid) true.
+            popen_kwargs["start_new_session"] = True
         env = build_subprocess_env()
         env.update(env_overlay)
+        if path.name in _DESIGN_STATUS_FLIP_LAUNCHERS:
+            # This is intentionally set only after the launcher has passed
+            # scripts-dir containment and the adjacent policy contract check.
+            # It is an execution-containment capability, not a user setting.
+            env[_DESIGN_STATUS_FLIP_PARENT_TREE_ENV] = _DESIGN_STATUS_FLIP_PARENT_TREE_VALUE
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
         # NEVER mutate the Python process cwd — that would leak into
         # concurrent gateway sessions (#69396).
         _script_cwd = workdir or str(path.parent)
-        result = subprocess.run(
+        proc = subprocess.Popen(
             argv,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             text=True,
-            timeout=script_timeout,
             cwd=_script_cwd,
             env=env,
             **popen_kwargs,
         )
-        stdout = (result.stdout or "").strip()
-        stderr = (result.stderr or "").strip()
+        try:
+            raw_stdout, raw_stderr = proc.communicate(timeout=script_timeout)
+        except subprocess.TimeoutExpired:
+            tree_exited = terminate_process_tree(proc)
+            # Do not let an orphan retaining a pipe turn timeout handling into
+            # an unbounded wait.  The shared tree killer has already attempted
+            # POSIX group/taskkill containment; this is only a bounded drain.
+            try:
+                proc.communicate(timeout=2)
+            except Exception:
+                pass
+            # The shared terminator may signal the tree before the direct
+            # wrapper has been reaped. Re-check after the bounded drain so a
+            # correctly contained timeout is not misreported as unconfirmed.
+            try:
+                tree_exited = proc.poll() is not None
+            except Exception:
+                pass
+            containment = "confirmed" if tree_exited else "attempted; child exit unconfirmed"
+            return False, (
+                f"Operational script timeout after {script_timeout}s; "
+                f"process-tree termination {containment}: {path}"
+            )
+        stdout = (raw_stdout or "").strip()
+        stderr = (raw_stderr or "").strip()
 
         # Redact secrets from both stdout and stderr before any return path.
         try:
@@ -2552,8 +2697,8 @@ def _run_job_script(
             stdout = "[REDACTED - redaction failed]"
             stderr = "[REDACTED - redaction failed]"
 
-        if result.returncode != 0:
-            parts = [f"Script exited with code {result.returncode}"]
+        if proc.returncode != 0:
+            parts = [f"Script exited with code {proc.returncode}"]
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
             if stdout:
@@ -2562,8 +2707,6 @@ def _run_job_script(
 
         return True, stdout
 
-    except subprocess.TimeoutExpired:
-        return False, f"Script timed out after {script_timeout}s: {path}"
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
 
