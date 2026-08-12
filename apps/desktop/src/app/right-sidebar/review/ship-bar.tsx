@@ -14,6 +14,7 @@ import {
   $reviewCommitDefault,
   $reviewCommitMsgBusy,
   $reviewFiles,
+  $reviewScope,
   $reviewShipBusy,
   $reviewShipInfo,
   cancelCommitMessage,
@@ -33,6 +34,7 @@ export function ReviewShipBar() {
   const { t } = useI18n()
   const c = t.statusStack.coding
   const files = useStore($reviewFiles)
+  const scope = useStore($reviewScope)
   const ship = useStore($reviewShipInfo)
   const busy = useStore($reviewShipBusy)
   const generating = useStore($reviewCommitMsgBusy)
@@ -44,9 +46,9 @@ export function ReviewShipBar() {
   const canCommit = hasFiles && message.trim().length > 0 && !busy
   const canGenerate = hasFiles && !generating && !busy
 
-  // Nothing to commit → no ship bar at all; the pane just shows the tree /
-  // "No changes" state.
-  if (!hasFiles) {
+  // Commit / push / PR operate on the working tree, so they only make sense for
+  // the uncommitted scope — the branch / last-turn scopes are read-only views.
+  if (scope !== 'uncommitted' || !hasFiles) {
     return null
   }
 
