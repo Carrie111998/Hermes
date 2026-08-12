@@ -27,9 +27,14 @@ from typing import Any, Callable, Dict, Optional, Tuple, cast
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
-from gateway.relay.descriptor import CapabilityDescriptor
+from gateway.relay.descriptor import (
+    OWNER_BOUND_INTERRUPT_ACK_CAPABILITY,
+    OWNER_BOUND_TURN_COMPLETION_CAPABILITY,
+    OWNER_BOUND_TURN_RECONCILIATION_CAPABILITY,
+    CapabilityDescriptor,
+)
 from gateway.relay.media import RelayMediaClient
-from gateway.relay.transport import RelayTransport
+from gateway.relay.transport import RelayTransport, normalize_owner_id
 from gateway.session import SessionSource
 
 logger = logging.getLogger(__name__)
@@ -41,6 +46,7 @@ logger = logging.getLogger(__name__)
 # reader, and ws.close (~3s), the full drain path stays inside 5s.
 _RELAY_GO_IDLE_ON_DISCONNECT_TIMEOUT_S = 2.0
 _RELAY_REVOCATION_MONITOR_TEARDOWN_TIMEOUT_S = 1.0
+_RELAY_TERMINAL_STOP_OWNER_CACHE = 512
 
 # How many already-answered prompt ids to remember, so a duplicate answer for
 # one of them (a double tap, or a connector redelivery of the same forward) is
@@ -76,6 +82,20 @@ class RelayAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.RELAY)
         self.descriptor = descriptor
         self._transport = transport
+        # The transport reader already serializes inbound frames. This lock
+        # additionally serializes that reader against terminal owner snapshots,
+        # so no event can be half-admitted while completion chooses idle vs.
+        # queued handoff.
+        self._owner_transition_lock = asyncio.Lock()
+        # Recently accepted owner-bound Stops survive a transient transport
+        # reconnect on this adapter instance. If the correlated result was
+        # lost with the socket, a retry for that exact owner is acknowledged
+        # idempotently without running canonical hard-stop twice. A gateway
+        # process restart creates a new adapter/cache and advertises a new
+        # runtime_epoch, which lets the connector clear any phantom owner.
+        self._terminal_stop_owners: OrderedDict[Tuple[str, str, str], None] = (
+            OrderedDict()
+        )
         # Capability surface read by stream_consumer (getattr(..., 4096)).
         self.MAX_MESSAGE_LENGTH = descriptor.max_message_length
         # chat_id -> scope_id (server/workspace scope), learned from inbound
@@ -359,18 +379,65 @@ class RelayAdapter(BasePlatformAdapter):
         self.MAX_MESSAGE_LENGTH = descriptor.max_message_length
         self.supports_code_blocks = descriptor.markdown_dialect not in ("", "plain")
 
-    async def _on_inbound(self, event) -> None:
+    async def _on_inbound(self, event) -> Dict[str, Any]:
+        async with self._owner_transition_lock:
+            return await self._on_inbound_locked(event)
+
+    async def _on_inbound_locked(self, event) -> Dict[str, Any]:
         """Bridge a connector-delivered MessageEvent into the normal adapter path."""
         self._capture_scope(event)
         self._stamp_slack_session_thread(event)
+        session_key = self.session_key_for_source(event.source)
+        event.metadata["relay_session_key"] = session_key
+        event.metadata["relay_chat_id"] = str(event.source.chat_id)
+
+        def guarded_owner() -> Optional[str]:
+            guard = self._active_sessions.get(session_key)
+            return normalize_owner_id(getattr(guard, "_hermes_owner_id", None))
+
+        owner_before = guarded_owner()
         # Phase 3: a structured prompt answer resolves its waiting primitive
-        # (approval/confirm/clarify) and is CONSUMED — it must not also
-        # dispatch as a chat message. Unknown/expired prompt ids fall through
-        # (the command-shaped text then behaves like a typed reply).
+        # (approval/confirm/clarify) and is always CONSUMED — duplicate,
+        # unknown, or expired control frames must never dispatch as chat text.
         if await self._consume_prompt_response(event):
-            return
+            return {
+                "disposition": "absorbed" if owner_before else "rejected",
+                "canonical_turn_owner_id": owner_before,
+                "session_key": session_key,
+                "chat_id": str(event.source.chat_id),
+                "reason": None if owner_before else "no_active_turn",
+            }
         await self._localize_inbound_media(event)
         await self.handle_message(event)
+        owner_after = guarded_owner()
+        requested_owner = normalize_owner_id(getattr(event, "owner_id", None))
+        marked = event.metadata.get("relay_owner_disposition")
+        if owner_after is not None and owner_after == requested_owner:
+            disposition = "started"
+        elif marked in {"queued", "absorbed", "merged", "rejected"}:
+            disposition = marked
+        elif owner_after is not None:
+            disposition = "absorbed"
+        else:
+            disposition = "rejected"
+        canonical_owner = owner_after
+        if disposition == "absorbed":
+            # Reset-like bypass commands are control traffic for the already
+            # running owner. Their temporary command guard carries forward
+            # only the authoritative owner from the guard it replaced, so
+            # preserve that identity rather than reporting a phantom B.
+            marked_owner = normalize_owner_id(
+                event.metadata.get("relay_owner_canonical_id")
+            )
+            if marked_owner is not None:
+                canonical_owner = marked_owner
+        return {
+            "disposition": disposition,
+            "canonical_turn_owner_id": canonical_owner,
+            "session_key": session_key,
+            "chat_id": str(event.source.chat_id),
+            "reason": event.metadata.get("relay_owner_disposition_reason"),
+        }
 
     def _relay_slack_extra(self) -> Dict[str, Any]:
         """The Slack-behavior subset of the RELAY platform config.
@@ -667,16 +734,117 @@ class RelayAdapter(BasePlatformAdapter):
         """Backward-compatible internal alias for follow-up routing."""
         return self.fronts_platform(platform)
 
-    async def on_interrupt(self, session_key: str, chat_id: str) -> None:
-        """Bridge a connector-delivered /stop into the adapter's interrupt path.
+    async def on_interrupt(
+        self,
+        session_key: str,
+        chat_id: str,
+        owner_id: Any = None,
+    ) -> bool:
+        """Hard-stop exactly the relay-owned active turn, fail-closed.
 
-        The connector forwards a mid-turn interrupt down the socket owned by
-        the gateway instance running ``session_key``; this routes it to the
-        existing per-session interrupt mechanism (sets the
-        ``_active_sessions[session_key]`` Event and clears typing), cancelling
-        the right turn without touching sibling sessions.
+        The runner callback is authoritative: it performs agent hard interrupt,
+        run-generation invalidation, terminal-child reaping, running-state
+        release, and cache eviction. Only after that callback returns do we
+        cancel the adapter-owned monitor and drain a queued handoff.
         """
-        await self.interrupt_session_activity(session_key, chat_id)
+        owner_id = normalize_owner_id(owner_id)
+        if not session_key or not chat_id or owner_id is None:
+            return False
+
+        terminal_owner_key = (session_key, chat_id, owner_id)
+        guard = self._active_sessions.get(session_key)
+        owner_task = self._session_tasks.get(session_key)
+        if (
+            guard is not None
+            and getattr(guard, "_hermes_owner_id", None) != owner_id
+        ):
+            return False
+        if guard is None or owner_task is None or owner_task.done():
+            if terminal_owner_key not in self._terminal_stop_owners:
+                return False
+            self._terminal_stop_owners.move_to_end(terminal_owner_key)
+            return True
+
+        source = getattr(guard, "_hermes_session_source", None)
+        run_generation = getattr(guard, "_hermes_run_generation", None)
+        if (
+            source is None
+            or str(getattr(source, "chat_id", "")) != chat_id
+            or not isinstance(run_generation, int)
+            or isinstance(run_generation, bool)
+            or run_generation < 1
+        ):
+            return False
+
+        hard_stop = self._session_interrupt_handler
+        if hard_stop is None:
+            return False
+        # Re-check both adapter owners immediately before the first await.
+        if (
+            self._active_sessions.get(session_key) is not guard
+            or self._session_tasks.get(session_key) is not owner_task
+        ):
+            return False
+        stop_was_cancelled = False
+        try:
+            stopped = await hard_stop(
+                session_key,
+                source,
+                owner_id,
+                run_generation,
+            )
+        except asyncio.CancelledError:
+            # Once this exact owner/generation has crossed the first await into
+            # GatewayRunner, hard interrupt + generation invalidation have
+            # already been applied synchronously. Finish the bounded adapter
+            # cleanup and report terminal acceptance instead of turning a
+            # half-applied Stop into a retryable NACK. Socket teardown may still
+            # make the result frame undeliverable; task cleanup remains bounded.
+            stop_was_cancelled = True
+            stopped = True
+        except Exception as exc:
+            logger.error(
+                "relay hard-stop callback failed reason=internal_error type=%s",
+                type(exc).__name__,
+            )
+            return False
+        if not stopped:
+            return False
+
+        self._terminal_stop_owners[terminal_owner_key] = None
+        self._terminal_stop_owners.move_to_end(terminal_owner_key)
+        while len(self._terminal_stop_owners) > _RELAY_TERMINAL_STOP_OWNER_CACHE:
+            self._terminal_stop_owners.popitem(last=False)
+
+        # Drop only this stopped generation's deferred callback before adapter
+        # cancellation enters the task's finally block. A fresher generation's
+        # callback (if already registered during a handoff) remains untouched.
+        self.pop_post_delivery_callback(
+            session_key,
+            generation=run_generation,
+        )
+
+        # Authoritative runner stop has completed. Cancel only the exact adapter
+        # task/guard snapshot; a replacement installed meanwhile must survive.
+        if (
+            self._active_sessions.get(session_key) is guard
+            and self._session_tasks.get(session_key) is owner_task
+        ):
+            await self.cancel_session_processing(
+                session_key,
+                release_guard=False,
+                discard_pending=False,
+            )
+        if (
+            self._active_sessions.get(session_key) is guard
+            and self._session_tasks.get(session_key) is None
+        ):
+            await self._drain_pending_after_session_command(session_key, guard)
+        if stop_was_cancelled:
+            logger.info(
+                "relay hard-stop caller cancelled after terminal Stop admission"
+            )
+        return True
 
     async def _on_passthrough(self, forward, buffer_id: Optional[str] = None) -> None:
         """Handle a connector-forwarded passthrough request (Phase 5 §5.1).
@@ -2030,13 +2198,18 @@ class RelayAdapter(BasePlatformAdapter):
     async def _consume_prompt_response(self, event) -> bool:
         """Route an inbound prompt_response to its waiting primitive.
 
-        Returns True when the event was a prompt answer (consumed — do NOT
-        dispatch it as a chat message), False otherwise.
+        Returns True for every structured prompt_response frame (consumed —
+        do NOT dispatch it as a chat message), even when its prompt id is
+        duplicate, expired, unknown, malformed, or belongs to a sibling
+        gateway instance. Only ordinary inbound text without a
+        prompt_response falls through to normal dispatch.
 
-        A prompt answer is ALWAYS consumed, whoever it belongs to. The three
-        non-resolving cases each stay silent rather than falling through to
-        chat dispatch:
+        The non-resolving cases each stay silent (or reply with a short
+        notice) rather than falling through to chat dispatch:
 
+        * **Malformed frame** (non-dict prompt_response payload, or missing/
+          blank prompt_id/option_id). Logged and dropped — nothing in a
+          prompt frame is ever valid command text.
         * **A sibling's prompt** (``_minted_here`` false). The connector fans a
           passthrough forward out to every live session of the tenant, so one
           button press reaches every gateway of that tenant while only the
@@ -2052,12 +2225,17 @@ class RelayAdapter(BasePlatformAdapter):
           anything useful with them.
         """
         pr = getattr(event, "prompt_response", None)
-        if not isinstance(pr, dict):
+        present = bool(getattr(event, "prompt_response_present", False))
+        if not present and not isinstance(pr, dict):
             return False
+        if not isinstance(pr, dict):
+            logger.info("relay consumed malformed structured prompt_response")
+            return True
         prompt_id = str(pr.get("prompt_id") or "")
         option_id = str(pr.get("option_id") or "")
         if not prompt_id or not option_id:
-            return False
+            logger.info("relay consumed malformed structured prompt_response")
+            return True
         if not self._minted_here(prompt_id):
             # A sibling gateway of this tenant owns this prompt and is
             # resolving it right now. Consume silently — two gateways must
@@ -2244,6 +2422,12 @@ class RelayAdapter(BasePlatformAdapter):
 
     async def on_processing_start(self, event) -> None:
         """Add the 👀 in-progress reaction (op-gated; silent no-op otherwise)."""
+        publish_started = getattr(self._transport, "send_turn_started", None)
+        if callable(publish_started):
+            try:
+                await publish_started(event)
+            except Exception:
+                logger.debug("relay owner-start publication failed", exc_info=True)
         message_id = getattr(event, "message_id", None) or getattr(
             event.source, "message_id", None
         )
@@ -2252,20 +2436,76 @@ class RelayAdapter(BasePlatformAdapter):
             await self._react(str(chat_id), str(message_id), "👀")
 
     async def on_processing_complete(self, event, outcome) -> None:
-        """Swap 👀 for ✅/❌ per outcome (op-gated; silent no-op otherwise)."""
+        """Emit owner-bound completion, then project the terminal reaction.
+
+        BasePlatformAdapter invokes this hook after the message handler has
+        returned (the runner has flushed transcript/tool/child state) and after
+        the final response/media projection, but before it binds or starts a
+        queued follow-up. That ordering is the relay handoff barrier.
+        """
         from gateway.platforms.base import ProcessingOutcome
 
+        transport = self._transport
+        owner_id = normalize_owner_id(getattr(event, "owner_id", None))
+        source = getattr(event, "source", None)
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        if not chat_id:
+            return
+
+        outcomes = {
+            ProcessingOutcome.SUCCESS: "completed",
+            ProcessingOutcome.FAILURE: "failed",
+            ProcessingOutcome.CANCELLED: "cancelled",
+        }
+        wire_outcome = outcomes.get(outcome)
+        send_completion = getattr(transport, "send_turn_completed", None)
+        if (
+            chat_id
+            and owner_id is not None
+            and wire_outcome is not None
+            and callable(send_completion)
+            and self.descriptor.supports_capability(
+                OWNER_BOUND_INTERRUPT_ACK_CAPABILITY
+            )
+            and self.descriptor.supports_capability(
+                OWNER_BOUND_TURN_COMPLETION_CAPABILITY
+            )
+            and self.descriptor.supports_capability(
+                OWNER_BOUND_TURN_RECONCILIATION_CAPABILITY
+            )
+        ):
+            session_key = self.session_key_for_source(source)
+            async with self._owner_transition_lock:
+                next_event = self._pending_messages.get(session_key)
+                next_owner_id = normalize_owner_id(
+                    getattr(next_event, "owner_id", None)
+                )
+                next_metadata = getattr(next_event, "metadata", {}) or {}
+                next_delivery_id = next_metadata.get("relay_delivery_id")
+                if not isinstance(next_delivery_id, str):
+                    next_owner_id = None
+                    next_delivery_id = None
+                await send_completion(
+                    session_key,
+                    chat_id,
+                    owner_id,
+                    wire_outcome,
+                    next_owner_id,
+                    next_delivery_id,
+                )
+
+        # Reactions reflect a visible message, not an owner lifecycle. In
+        # particular passthrough work has no relay owner and may be connected
+        # to a pre-v3 peer, but its 👀 still needs a terminal projection.
         message_id = getattr(event, "message_id", None) or getattr(
             event.source, "message_id", None
         )
-        chat_id = getattr(event.source, "chat_id", None)
-        if not (message_id and chat_id):
-            return
-        await self._react(str(chat_id), str(message_id), "👀", remove=True)
-        if outcome == ProcessingOutcome.SUCCESS:
-            await self._react(str(chat_id), str(message_id), "✅")
-        elif outcome == ProcessingOutcome.FAILURE:
-            await self._react(str(chat_id), str(message_id), "❌")
+        if message_id:
+            await self._react(chat_id, str(message_id), "👀", remove=True)
+            if outcome == ProcessingOutcome.SUCCESS:
+                await self._react(chat_id, str(message_id), "✅")
+            elif outcome == ProcessingOutcome.FAILURE:
+                await self._react(chat_id, str(message_id), "❌")
 
     # ── Phase 4 thread lifecycle ──────────────────────────────────────────
 

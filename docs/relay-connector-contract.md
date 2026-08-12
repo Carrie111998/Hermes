@@ -1,9 +1,10 @@
-# Relay ↔ Connector Contract (v1, EXPERIMENTAL)
+# Relay ↔ Connector Contract (v3, EXPERIMENTAL)
 
 > **Status:** EXPERIMENTAL. This contract MAY CHANGE without a deprecation
 > cycle until at least two real Class-1 platforms (Discord + Telegram) have
-> validated it. Evolution during the experimental phase is **additive-only**,
-> gated by `contract_version`. A breaking change updates both repos in lockstep.
+> validated it. Additions within one version are additive; any breaking or
+> reinterpreted control semantics require a version bump and update both repos
+> in lockstep. v3 is such a coordinated, fail-closed break from v2.
 
 This document is the formal interface between the **Hermes gateway** (Python,
 `gateway/relay/`) and the **connector** (Node/TypeScript,
@@ -20,16 +21,29 @@ connector owns all platform-specific socket/identity logic.
 
 ## 1. Handshake
 
-1. Gateway opens the transport (`connect`).
-2. Gateway calls `handshake()`; connector returns a `CapabilityDescriptor`
-   (section 2) describing the platform this adapter instance fronts.
-3. Gateway configures the adapter from the descriptor (char limit, length unit,
-   draft/edit/thread/markdown capabilities) and registers an inbound handler.
+1. Gateway opens the transport (`connect`) and sends `hello` with
+   `contract_version: 3`, capabilities `owner-bound-interrupt-ack`,
+   `owner-bound-turn-completion`, and `owner-bound-turn-reconciliation`, an
+   opaque process-lifetime `runtime_epoch` (stable across reconnects, renewed
+   after a gateway restart), and bounded `turn_states`. Snapshot scope is an
+   HMAC fingerprint of the room/session pair, not the raw identifiers, so a
+   multiplexed transport does not disclose one connector's session keys to
+   another connector.
+2. Connector fails the handshake closed unless all values are present, then
+   returns a v3 `CapabilityDescriptor` (section 2) advertising all three
+   capabilities atomically and describing the platform this adapter instance
+   fronts.
+3. Gateway likewise rejects and closes a v1/v2 or partially capable descriptor;
+   otherwise it configures the adapter from the descriptor (char limit, length
+   unit, draft/edit/thread/markdown capabilities) and registers an inbound
+   handler.
 4. Connector then streams inbound events and accepts outbound actions.
 
-`contract_version` (currently `1`) is carried in the descriptor. The gateway
+`contract_version` (currently `3`) is carried in both directions. The gateway
 ignores unknown descriptor fields (forward-compat) and fills missing optional
-fields from defaults.
+fields from defaults. Older peers MUST NOT enable the Stop UI: v3 makes inbound
+owner disposition and reconnect reconciliation part of the same atomic control
+capability as owner-bound Stop and completion.
 
 ---
 
@@ -53,6 +67,7 @@ JSON object. Source of truth: `gateway/relay/descriptor.py`.
 | `pii_safe` | bool | no | Redact PII in session descriptions. |
 | `supports_context` | bool | no | Whether the connector can supply surrounding channel/group **context** for an addressed turn on this platform (Model A on-demand history fetch — Discord/Slack/Matrix; Model B passive buffer — Telegram/Signal/WhatsApp). Default false ⇒ no `context` is attached to inbound events. See §3. |
 | `supported_ops` | string[] | no | Op-level capability discovery: the outbound op names the connector's sender for this platform actually implements (e.g. `["send", "edit", "typing", "follow_up", "get_chat_info"]`). Absent/empty ⇒ the connector predates the field and the gateway assumes the legacy op set (`send`/`edit`/`typing`/`follow_up`); a NEW op is used only when explicitly advertised. |
+| `capabilities` | string[] | no | Control-plane capabilities. v3 requires `owner-bound-interrupt-ack`, `owner-bound-turn-completion`, and `owner-bound-turn-reconciliation` atomically; absence of any member is fail-closed and has no optimistic fallback. |
 
 Most fields are a projection of the gateway's existing `PlatformEntry`; the
 runtime-only fields (`len_unit`, `supports_*`, `markdown_dialect`) come from the
@@ -93,9 +108,118 @@ HTTP call.
 
 Frames (connector → gateway, over the WS):
 
-- `{"type":"inbound", "event": <MessageEvent>, "bufferId"?}`
-- `{"type":"interrupt_inbound", "session_key", "chat_id"}` (§5)
+- `{"type":"inbound", "delivery_id", "event": <MessageEvent>, "bufferId"?}`
+- `{"type":"interrupt_inbound", "session_key", "chat_id", "owner_id", "action_id"}` (§5)
 - `{"type":"passthrough_forward", "forward": <PassthroughForward>, "bufferId"?}` (§5.1)
+
+The correlated response travels in the opposite direction (gateway →
+connector):
+
+- `{"type":"interrupt_result", "action_id", "accepted", "reason"}` (§5)
+- `{"type":"inbound_ack", "delivery_id", "session_key", "chat_id", "owner_id", "runtime_epoch", "disposition", "canonical_turn_owner_id", "owner_state_seq", "bufferId"?}` (§3.1)
+- `{"type":"turn_completed", "session_key", "chat_id", "owner_id", "runtime_epoch", "outcome", "owner_state_seq", "status", "next_owner_id", "next_delivery_id"}` (§3.2)
+
+### 3.1 Owner-bound inbound admission and disposition
+
+Every inbound event carries a required bounded `delivery_id` and a required
+bounded opaque string `event.owner_id`. Neither peer assigns semantics to the
+owner's spelling; in particular, the gateway MUST NOT require a connector-
+specific prefix. Control characters, leading/trailing whitespace, empty values,
+and values over the documented bounds are rejected.
+
+The gateway emits an authoritative `inbound_ack` only after the actual adapter
+and runner admission path has classified the event. `disposition` is one of:
+
+- `started`: this delivery is now the canonical turn owner. Its
+  `canonical_turn_owner_id` equals `owner_id`.
+- `queued`: this delivery may become a later independent owner, but is not yet
+  stoppable. A second `started` ack for the same `delivery_id` announces the
+  authoritative handoff after its guard binds.
+- `absorbed`: redirect, steer, prompt resolution, or another path consumed the
+  event inside the current canonical turn.
+- `merged`: debounce/media merge incorporated it into another queued/current
+  event; it never becomes an independently stoppable owner.
+- `rejected`: authorization, capacity, invalid routing, or another terminal
+  admission failure dropped it.
+
+For every non-`started` disposition,
+`canonical_turn_owner_id` names the already-running owner or is null when no
+owner exists. The connector MUST NOT rebind Stop merely because it wrote an
+`inbound` frame: it binds only from `started`. Thus an absorbed B cannot replace
+guard A, and completion A clears the UI. A queued B transitions A→handoff→B
+only through authoritative sequence-bearing frames, never a timer.
+
+`delivery_id` is the dedupe key. The gateway retains a bounded cache of exact
+ack frames; replay of a duplicate delivery returns the cached ack without
+dispatching the event twice. Durable `bufferId` acknowledgement is carried on
+this same `inbound_ack` after owner disposition—there is no parallel ack
+protocol or unbounded retry queue. The connector validates the complete v3
+owner disposition before committing the durable receipt; a buffer-only,
+foreign, stale, or conflicting ack cannot retire the ledger row.
+
+An exception escaping the admitted inbound handler is not an authoritative
+rejection. The transport emits and caches no `inbound_ack` in that case and
+reconnects; a durable connector retains/reclaims its lease and may redeliver
+the same `delivery_id`. Authorization and bounded-capacity failures remain
+explicit terminal `rejected` dispositions. Consequently this delivery leg is
+at-least-once across a transient handler failure, not exactly-once execution of
+arbitrary handler side effects.
+
+### 3.2 Owner-bound completion, handoff, and reconciliation
+
+The gateway preserves the exact accepted owner and records one logical terminal
+transition only after the final response/media projection, any generation-owned
+post-delivery callback required by that turn, and conversation/tool/child-agent
+unwind:
+
+```json
+{"type":"turn_completed","session_key":"...","chat_id":"...","owner_id":"opaque-owner","runtime_epoch":"...","outcome":"completed","owner_state_seq":2,"status":"idle","next_owner_id":null,"next_delivery_id":null}
+```
+
+`outcome` is one of `completed`, `failed`, or `cancelled`. The processing hook
+is cancellation-shielded and bounded. If outer cancellation arrives during the
+bounded terminal attempt, propagation is deferred until the barrier, debounce,
+late drain, and guard cleanup have run. Error projection remains best-effort
+and precedes completion; a failed projection or cancellation cannot skip the
+terminal state record, and a wedged send cannot block handoff without limit.
+Wire delivery itself remains best-effort and may be recovered by the hello
+snapshot after reconnect.
+
+If an independent queued successor exists, completion uses `status:"handoff"`
+and carries its exact `next_owner_id` plus `next_delivery_id`. The connector
+then reports the successor's actual guard binding with `inbound_ack started`.
+This two-step barrier prevents both a false idle gap and premature Stop on B.
+Completion for owner N is recorded before owner N+1 can bind. Missing,
+malformed, duplicate, stale, foreign, old-epoch, or old-owner frames are inert.
+
+Assistant `send`, `edit`, `typing`, progress, prompt/approval, and media frames
+are non-terminal. No text, label, quiet timer, or outbound-frame heuristic may
+stand in for `turn_completed`.
+
+An accepted `interrupt_result` remains the authoritative Stop terminal event.
+A later `turn_completed` for that stopped owner is idempotently inert; a
+rejected/timed-out Stop or transport disconnect retains the owner. A replacement
+`runtime_epoch` reconciles an owner left behind by a dead gateway process.
+
+The gateway records every owner transition in a bounded room/session-scoped
+ledger before attempting the socket write. On each `hello`, `turn_states`
+contains at most one snapshot for an opaque HMAC scope fingerprint: `running`
+with `active_owner_id`, `handoff` with terminal and next-owner fields, or `idle`
+with terminal owner and outcome. `owner_state_seq` is monotonic within one
+`runtime_epoch`; the initial idle state has the canonical fingerprint
+`idle:0:null:null`.
+
+Fresh reconciliation is the first authenticated hello accepted by a connector
+process, before that process has established any gateway epoch or owner state.
+Because connector-local issued-owner memory cannot survive that process death,
+the matching HMAC-scoped snapshot is authoritative at this one boundary and may
+bootstrap `running`, `handoff`, or `idle` even for a same-epoch gateway. Once an
+epoch is established, an equal sequence must have an identical fingerprint and
+a higher sequence must pass the normal owner transition checks; decreasing or
+conflicting snapshots fail closed and cannot clear newer state. Repeated
+reconnects are therefore idempotent. A new gateway epoch cannot retain an old
+process guard. This reconciles a connector restart or a completion lost at
+socket failure without accepting a later stale-clear replay.
 
 **Channel context on inbound (design relay-channel-context).** When the source
 platform's descriptor advertised `supports_context` (§2) and the chat is
@@ -281,6 +405,13 @@ read off the stored secret record at the WS upgrade, never asserted in a frame):
   drain-without-dup on the **delivery leg**: an instance that dies mid-drain
   redelivers exactly the unacked tail; an acked entry never redelivers.
 
+`going_idle` is exclusively an instance drain/scale-to-zero primitive and is
+never a turn-completion signal. A connector that has not implemented the real
+durable buffered-only flip MUST NOT send `going_idle_ack`; the gateway's
+bounded `go_idle()` timeout is the deliberate compatibility path before socket
+close. It is safer to time out than to acknowledge a durability guarantee the
+connector does not provide.
+
 **Buffer + drain.** While flipped, the connector appends inbound to a durable
 per-instance delivery-leg buffer (`delivery:<instanceId>`) instead of pushing it
 live. On the gateway's **reconnect** (a NET-NEW reconnect loop re-dials +
@@ -452,7 +583,9 @@ from a sibling's. `style` maps per-platform
 (primary/success/danger/secondary). `timeout_s` is advisory on the wire —
 expiry is enforced GATEWAY-side (the pending-prompt registry drops expired
 entries; the owning gateway then replies with a short "no longer waiting"
-notice).
+notice; a stale structured press is consumed without becoming command text,
+while a genuinely typed command with no `prompt_response` field keeps the
+ordinary command path).
 
 **`prompt_response` (Phase 3 inbound).** The user's press crosses back as a
 normal inbound MessageEvent carrying
@@ -477,6 +610,13 @@ ack is `DEFERRED_UPDATE` so no visible "thinking…" reply). Foreign
 callback payloads (another integration's buttons) never become prompt
 events: Telegram/Slack/WhatsApp drop them at the connector; Discord type-3
 forwards keep the legacy custom_id-as-text shape.
+
+Field presence is the control boundary. If `prompt_response` is present but
+has the wrong wire type (`string`, `list`, number, or `null`), or lacks required
+ids, the gateway consumes it terminally and never dispatches its command-shaped
+`text`. If the field is absent, a typed `/c1` remains an ordinary command.
+Durable redelivery of the same `bufferId` repeats the post-consumption
+`inbound_ack`; it does not resurrect the prompt or execute the text lane.
 
 **`react` (Phase 3 ack lifecycle).** Adds/removes the bot's own `emoji`
 reaction on `message_id` — restoring the native adapters' 👀→✅/❌
@@ -561,12 +701,57 @@ gateway holds zero capability material). Source of truth:
 - **Gateway → connector:** `send_interrupt(session_key, reason?)` egresses a
   mid-turn `/stop` over the outbound WS. The connector MUST forward it to the
   gateway instance running that `session_key` (the routing invariant).
-- **Connector → gateway:** an inbound interrupt for a `session_key` is delivered
-  as an `interrupt_inbound` frame down the gateway's outbound WS (§3 transport
-  note) — routed cross-instance via the relay bus to whichever instance holds
-  the socket — and bridged by the adapter's `on_interrupt(session_key, chat_id)`
-  into the existing per-session interrupt mechanism, cancelling exactly that turn
-  (siblings untouched).
+- **Connector → gateway:** a Stop is
+  `interrupt_inbound {session_key, chat_id, owner_id, action_id}`. `owner_id`
+  is minted once with the original inbound turn and remains byte-identical
+  across durable retry/reconnect. `action_id` correlates exactly one attempt.
+- **Gateway → connector result:** after the generation-bound canonical hard
+  stop finishes, the gateway sends
+  `interrupt_result {action_id, accepted:true, reason:"accepted"}`. Validation
+  failures before owner/generation admission return `accepted:false` with a
+  bounded reason. Once that exact Stop has synchronously applied hard interrupt
+  and generation invalidation, it remains terminally accepted even if the
+  caller's timeout/cancellation lands during bounded reaping or task unwind;
+  this prevents a half-applied Stop from being rendered as safely retryable.
+  Raw exception text and frame content never appear in the result or reason log.
+
+The connector MUST clear `activeTurnId`/render Stop success only for the exact
+matching `action_id` with `accepted:true`. A NACK, local timeout, or disconnect
+keeps the same `owner_id` retryable; a late/duplicate result is inert. Repeated
+delivery of the same `action_id` is idempotent: at most one hard stop and one
+result frame. If an accepted result is lost with a transient socket close, the
+same live gateway runtime keeps a bounded terminal-owner cache: a fresh action
+for that exact owner is accepted idempotently without running hard-stop twice.
+A gateway restart clears that cache and changes `runtime_epoch`, causing the
+connector to reconcile the phantom owner instead. Distinct actions for one
+`session_key` are serialized, while the reader continues consuming
+`outbound_result` and durable inbound traffic.
+
+The gateway binds owner plus run generation before slow turn preparation and
+maps the adapter key to the exact multiplexed profile runner key. Stop is
+accepted only when session key, chat id, owner, and generation all match;
+siblings and replacement generations are untouched. The canonical hard-stop
+waits for its existing child-process reaper before releasing a queued handoff,
+so a replacement generation cannot cause an abandoned child to escape reaping.
+
+**Pending-before-Stop semantics.** A follow-up already pending when canonical
+Stop begins is consumed and discarded, matching `/stop`. A message arriving
+after that discard while Stop/cancellation is still in progress remains queued,
+is rebound to its own owner/generation, and starts only after the reaper and old
+task complete.
+
+**Rollout / legacy ledger gate.** Disable Relay admission, deploy both v3 peers,
+then start the connector before the gateway and re-enable admission only after
+the v3 handshake advertises all three owner-bound capabilities. Never serve
+traffic with a partial v3 capability set or a mixed-version pair. Before enabling
+Relay, inspect durable
+`pending`/`inflight` user-message and prompt-response rows. Rows written before
+v3 may have no `owner_id`
+and MUST be drained by the old pair or explicitly handled by an operator.
+The v3 connector performs a read-only health/handshake check and refuses Relay
+activation while any such row remains; it never dead-letters it merely for
+being legacy and never fabricates an owner. Health reports
+`legacy_owner_drain_required` plus the blocking count.
 
 Both directions ride the gateway's outbound WS: the gateway→connector `/stop`
 egresses over it, and the connector→gateway interrupt rides the same `inbound`
@@ -771,8 +956,8 @@ Changes take effect on gateway restart; no connector involvement.
 
 ## 9. Versioning policy
 
-- `contract_version` is an int; bump **only** for additive changes during the
-  experimental phase (new optional fields, new `op`s).
+- `contract_version` is an int. Optional additive fields and new `op`s may be
+  introduced compatibly only when their absence has unchanged semantics.
 - A breaking change (renamed/removed field, changed semantics) requires a
   coordinated update of both repos and a version bump.
 - The connector's first PR references the commit SHA of this file it implements

@@ -35,6 +35,8 @@ class StubConnector:
         self.interrupts: List[Dict[str, Any]] = []
         self.follow_ups: List[Dict[str, Any]] = []
         self.follow_up_platforms: List[Optional[str]] = []
+        self.turn_completions: List[Dict[str, Any]] = []
+        self.turn_starts: List[str] = []
         # The fronted (platform, bot_id) identity set (Phase 1.5). Mirrors the real
         # transport's _identities so RelayAdapter._platform_is_fronted resolves; a
         # single-identity default keeps existing tests' behaviour unchanged.
@@ -99,6 +101,29 @@ class StubConnector:
     async def send_interrupt(self, session_key: str, reason: Optional[str] = None) -> None:
         self.interrupts.append({"session_key": session_key, "reason": reason})
 
+    async def send_turn_completed(
+        self, session_key: str, chat_id: str, owner_id: str, outcome: str,
+        next_owner_id: Optional[str] = None,
+        next_delivery_id: Optional[str] = None,
+    ) -> bool:
+        completion = {
+            "session_key": session_key,
+            "chat_id": chat_id,
+            "owner_id": owner_id,
+            "outcome": outcome,
+        }
+        if next_owner_id is not None:
+            completion["next_owner_id"] = next_owner_id
+            completion["next_delivery_id"] = next_delivery_id
+        self.turn_completions.append(completion)
+        return True
+
+    async def send_turn_started(self, event: MessageEvent) -> bool:
+        if not event.owner_id:
+            return False
+        self.turn_starts.append(event.owner_id)
+        return True
+
     async def send_follow_up(
         self, action: Dict[str, Any], *, platform: Optional[str] = None
     ) -> Dict[str, Any]:
@@ -113,11 +138,16 @@ class StubConnector:
             raise RuntimeError("no inbound handler registered (call adapter.connect first)")
         await self._inbound(event)
 
-    async def push_interrupt(self, session_key: str, chat_id: str) -> None:
+    async def push_interrupt(
+        self,
+        session_key: str,
+        chat_id: str,
+        owner_id: Optional[str] = None,
+    ) -> None:
         """Simulate the connector delivering an interrupt_inbound over the WS."""
         if self._interrupt_inbound is None:
             raise RuntimeError("no interrupt_inbound handler registered (call adapter.connect first)")
-        await self._interrupt_inbound(session_key, chat_id)
+        await self._interrupt_inbound(session_key, chat_id, owner_id)
 
     async def push_passthrough(self, forward: Any, buffer_id: Optional[str] = None) -> None:
         """Simulate the connector forwarding a passthrough request over the WS (§5.1)."""
