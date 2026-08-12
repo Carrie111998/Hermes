@@ -237,6 +237,131 @@ def test_update_job_unrelated_fields_skip_mode_validation(hermes_env):
     assert updated["name"] == "renamed"
 
 
+def test_update_job_resets_baseline_when_monitor_source_changes(hermes_env):
+    from cron.jobs import create_job, get_job, update_job
+    from cron.monitor import _snapshot_path, _write_last_output
+
+    _write_script(hermes_env, "one.sh", "echo one\n")
+    _write_script(hermes_env, "two.sh", "echo two\n")
+    job = create_job(
+        prompt="React",
+        schedule="every 5m",
+        monitor_script="one.sh",
+    )
+    update_job(
+        job["id"],
+        {"monitor_state": {"last_output_hash": "old", "last_changed_at": "now"}},
+    )
+    _write_last_output(job["id"], "old output")
+    assert _snapshot_path(job["id"]).exists()
+
+    update_job(job["id"], {"monitor_script": "two.sh"})
+
+    assert get_job(job["id"])["monitor_state"] is None
+    assert not _snapshot_path(job["id"]).exists()
+
+
+def test_stale_monitor_run_cannot_overwrite_new_source_baseline(hermes_env):
+    from cron.jobs import create_job, get_job, update_job
+    from cron.monitor import _persist_monitor_state
+
+    _write_script(hermes_env, "one.sh", "echo one\n")
+    _write_script(hermes_env, "two.sh", "echo two\n")
+    old_job = create_job(
+        prompt="React",
+        schedule="every 5m",
+        monitor_script="one.sh",
+    )
+
+    update_job(old_job["id"], {"monitor_script": "two.sh"})
+    assert _persist_monitor_state(old_job, "stale-hash", "old output") is False
+
+    current = get_job(old_job["id"])
+    assert current["monitor_script"] == "two.sh"
+    assert current["monitor_state"] is None
+
+
+def test_stale_monitor_run_cannot_commit_after_source_changes_away_and_back(
+    hermes_env,
+):
+    from cron.jobs import create_job, get_job, update_job
+    from cron.monitor import _persist_monitor_state, _snapshot_path
+
+    _write_script(hermes_env, "one.sh", "echo one\n")
+    _write_script(hermes_env, "two.sh", "echo two\n")
+    old_job = create_job(
+        prompt="React",
+        schedule="every 5m",
+        monitor_script="one.sh",
+    )
+
+    update_job(old_job["id"], {"monitor_script": "two.sh"})
+    update_job(old_job["id"], {"monitor_script": "one.sh"})
+
+    assert _persist_monitor_state(old_job, "stale-hash", "old output") is False
+    current = get_job(old_job["id"])
+    assert current["monitor_state"] is None
+    assert current["monitor_source_generation"] == 2
+    assert not _snapshot_path(old_job["id"]).exists()
+
+
+def test_monitor_snapshot_write_stays_inside_generation_commit(
+    hermes_env, monkeypatch
+):
+    import cron.jobs as jobs
+    import cron.monitor as monitor
+
+    old_job = jobs.create_job(
+        prompt="React",
+        schedule="every 5m",
+        monitor_script="one.sh",
+    )
+    observed = {}
+
+    def record_write(job_id, output):
+        observed["job_id"] = job_id
+        observed["output"] = output
+        observed["lock_depth"] = getattr(jobs._jobs_lock_state, "depth", 0)
+
+    monkeypatch.setattr(monitor, "_write_last_output", record_write)
+
+    assert monitor._persist_monitor_state(
+        old_job, "current-hash", "current-output"
+    ) is True
+    assert observed == {
+        "job_id": old_job["id"],
+        "output": "current-output",
+        "lock_depth": 1,
+    }
+
+
+def test_source_edit_during_check_suppresses_obsolete_agent_run(
+    hermes_env, monkeypatch
+):
+    import cron.monitor as monitor
+    from cron.jobs import create_job, get_job, update_job
+
+    _write_script(hermes_env, "one.sh", "echo one\n")
+    _write_script(hermes_env, "two.sh", "echo two\n")
+    old_job = create_job(
+        prompt="React",
+        schedule="every 5m",
+        monitor_script="one.sh",
+    )
+
+    def run_then_edit(_job):
+        update_job(old_job["id"], {"monitor_script": "two.sh"})
+        return True, "old output", b"old output"
+
+    monkeypatch.setattr(monitor, "_run_monitor_source", run_then_edit)
+
+    outcome = monitor.check_monitor(old_job)
+
+    assert outcome.ok is True
+    assert outcome.changed is False
+    assert get_job(old_job["id"])["monitor_state"] is None
+
+
 # ---------------------------------------------------------------------------
 # cron.monitor: hashing + diff unit behavior
 # ---------------------------------------------------------------------------
@@ -248,6 +373,227 @@ def test_hash_is_exact_bytes(hermes_env):
     assert hash_monitor_output("a\nb") == hash_monitor_output("a\nb")
     # Exact-bytes contract: even whitespace-only differences are changes.
     assert hash_monitor_output("a\nb") != hash_monitor_output("a\nb ")
+
+
+def _opaque_credential_url() -> tuple[str, tuple[str, ...]]:
+    values = tuple(f"opaque-{index:02d}" for index in range(1, 11))
+    query = "&".join(
+        f"{name}={value}"
+        for name, value in zip(
+            (
+                "credential",
+                "credentials",
+                "author%69zation",
+                "session_id",
+                "passwd",
+                "auth_token",
+                "awsaccesskeyid",
+                "x-amz-security-token",
+                "x-amz-signature",
+                "public",
+            ),
+            values,
+        )
+    )
+    return f"https://alice:secret@example.com/path?{query}", values
+
+
+def test_monitor_display_and_snapshot_force_strict_url_credential_redaction(
+    hermes_env, monkeypatch
+):
+    import agent.redact as redact
+    from cron.jobs import create_job
+    from cron.monitor import _snapshot_path, check_monitor
+
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+    credential_url, values = _opaque_credential_url()
+    _write_script(
+        hermes_env,
+        "credentials.sh",
+        f"printf '%s' '{credential_url}'",
+    )
+    job = create_job(
+        prompt="React",
+        schedule="every 5m",
+        monitor_script="credentials.sh",
+    )
+
+    outcome = check_monitor(job)
+    output = outcome.context_block or ""
+    snapshot = _snapshot_path(job["id"]).read_text(encoding="utf-8")
+
+    for surfaced in (output, snapshot):
+        assert "secret" not in surfaced
+        for value in values[:-1]:
+            assert value not in surfaced
+        assert "alice:***@example.com" in surfaced
+        for name in (
+            "credential",
+            "credentials",
+            "author%69zation",
+            "session_id",
+            "passwd",
+            "auth_token",
+            "awsaccesskeyid",
+            "x-amz-security-token",
+            "x-amz-signature",
+        ):
+            assert f"{name}=***" in surfaced
+        assert f"public={values[-1]}" in surfaced
+
+
+def test_monitor_failure_forces_strict_url_credential_redaction(
+    hermes_env, monkeypatch
+):
+    import agent.redact as redact
+    import cron.monitor as monitor
+
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+    credential_url, values = _opaque_credential_url()
+    monkeypatch.setattr(
+        monitor,
+        "_fetch_monitor_url_bytes",
+        lambda _url: (
+            False,
+            f"fetch failed for {credential_url}",
+        ),
+    )
+
+    ok, error, raw_output = monitor._run_monitor_source(
+        {"monitor_url": "https://example.com"}
+    )
+
+    assert ok is False
+    assert raw_output == b""
+    assert "secret" not in error
+    for value in values[:-1]:
+        assert value not in error
+    assert "alice:***@example.com" in error
+    for name in (
+        "credential",
+        "credentials",
+        "author%69zation",
+        "session_id",
+        "passwd",
+        "auth_token",
+        "awsaccesskeyid",
+        "x-amz-security-token",
+        "x-amz-signature",
+    ):
+        assert f"{name}=***" in error
+    assert f"public={values[-1]}" in error
+
+
+def test_legacy_monitor_snapshot_is_redacted_before_diff(hermes_env, monkeypatch):
+    """Pre-upgrade snapshots may still hold URL credentials verbatim.
+
+    On the next changed tick those bytes flow into build_monitor_diff and
+    context_block; force the same redaction used for new output.
+    """
+    import agent.redact as redact
+    import cron.monitor as monitor
+    from cron.jobs import create_job, get_job, update_job
+
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+    legacy = "https://alice:secret@example.com/path?token=opaque&public=visible"
+    job = create_job(
+        prompt="React",
+        schedule="every 5m",
+        monitor_url="https://example.com/status",
+    )
+    update_job(
+        job["id"],
+        {
+            "monitor_state": {
+                "last_output_hash": monitor._hash_monitor_bytes(b"legacy-baseline"),
+                "last_changed_at": "now",
+            }
+        },
+    )
+    # Bypass _write_last_output so the on-disk file mimics a pre-upgrade
+    # snapshot that was never redacted at write time.
+    path = monitor._snapshot_path(job["id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(legacy, encoding="utf-8")
+    # Direct read path must redact before any caller builds a diff.
+    loaded = monitor._read_last_output(job["id"])
+    assert "secret" not in loaded
+    assert "opaque" not in loaded
+    assert "alice:***@example.com" in loaded
+    assert "token=***" in loaded
+    assert "public=visible" in loaded
+    monkeypatch.setattr(
+        monitor,
+        "_run_monitor_source",
+        lambda _job: (True, "safe-current-output", b"safe-current-output"),
+    )
+
+    outcome = monitor.check_monitor(get_job(job["id"]))
+
+    assert outcome.ok is True
+    assert outcome.changed is True
+    context = outcome.context_block or ""
+    assert "secret" not in context
+    assert "opaque" not in context
+    assert "alice:***@example.com" in context
+    assert "token=***" in context
+    assert "public=visible" in context
+    assert "safe-current-output" in context
+
+
+def test_monitor_url_rejects_ssrf_blocked_target(hermes_env, monkeypatch):
+    import tools.url_safety as url_safety
+    from cron.monitor import _fetch_monitor_url
+
+    monkeypatch.setattr(url_safety, "is_safe_url", lambda _url: False)
+
+    ok, error = _fetch_monitor_url("http://127.0.0.1:8080/private")
+
+    assert ok is False
+    assert "SSRF" in error
+
+
+def test_monitor_url_rejects_oversized_response(hermes_env, monkeypatch):
+    import tools.url_safety as url_safety
+    from cron.monitor import MAX_URL_BYTES, _fetch_monitor_url
+
+    class FakeResponse:
+        is_redirect = False
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self, _chunk_size):
+            yield b"x" * (MAX_URL_BYTES + 1)
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def stream(self, _method, _url):
+            return FakeResponse()
+
+    monkeypatch.setattr(url_safety, "is_safe_url", lambda _url: True)
+    monkeypatch.setattr(
+        url_safety,
+        "create_ssrf_safe_client",
+        lambda **_kwargs: FakeClient(),
+    )
+
+    ok, error = _fetch_monitor_url("https://example.com/status")
+
+    assert ok is False
+    assert "exceeds" in error
 
 
 def test_unified_diff_is_capped(hermes_env):
@@ -274,6 +620,10 @@ def _make_monitor_job(hermes_env, script_body: str):
         schedule="every 5m",
         monitor_script="mon.sh",
         deliver="local",
+        # Keep the runtime stub and persisted job pins aligned so the
+        # provider/model drift guard does not depend on a developer's config.
+        provider="test",
+        model="test-model",
     )
 
 
@@ -334,6 +684,55 @@ def test_changed_output_injects_diff(hermes_env, monkeypatch):
     assert "-state A" in prompt
     assert "+state B" in prompt
     assert "state B" in prompt  # new output included verbatim
+
+
+def test_boundary_whitespace_change_runs_agent(hermes_env, monkeypatch):
+    from cron.jobs import get_job
+    from cron.scheduler import run_job
+
+    job = _make_monitor_job(hermes_env, "printf 'state A'")
+    observed: dict = {}
+    _install_agent_stubs(monkeypatch, observed)
+
+    run_job(job)
+    _write_script(hermes_env, "mon.sh", "printf 'state A '")
+    run_job(get_job(job["id"]))
+
+    assert observed["agent_runs"] == 2
+    assert "+state A " in observed["prompts"][1]
+
+
+def test_non_utf8_byte_change_runs_agent(hermes_env, monkeypatch):
+    from cron.jobs import create_job, get_job
+    from cron.scheduler import run_job
+
+    _write_script(
+        hermes_env,
+        "raw.py",
+        "import sys\nsys.stdout.buffer.write(b'\\xff')\n",
+    )
+    job = create_job(
+        prompt="Summarize what changed",
+        schedule="every 5m",
+        monitor_script="raw.py",
+        deliver="local",
+        provider="test",
+        model="test-model",
+    )
+    observed: dict = {}
+    _install_agent_stubs(monkeypatch, observed)
+
+    run_job(job)
+    _write_script(
+        hermes_env,
+        "raw.py",
+        "import sys\nsys.stdout.buffer.write(b'\\xfe')\n",
+    )
+    run_job(get_job(job["id"]))
+
+    # Both bytes decode to the same replacement character for display, so only
+    # hashing the exact source bytes can detect this change.
+    assert observed["agent_runs"] == 2
 
 
 def test_hash_persists_across_scheduler_restart(hermes_env, monkeypatch):

@@ -32,8 +32,14 @@ _SENSITIVE_QUERY_PARAMS = frozenset({
     "token",
     "api_key",
     "apikey",
+    "auth_token",
+    "authorization",
+    "awsaccesskeyid",
     "client_secret",
+    "credential",
+    "credentials",
     "password",
+    "passwd",
     "auth",
     "jwt",
     "session",
@@ -41,6 +47,9 @@ _SENSITIVE_QUERY_PARAMS = frozenset({
     "key",
     "code",           # OAuth authorization codes
     "signature",      # pre-signed URL signatures
+    "x_amz_security_token",
+    "x_amz_signature",
+    "x-amz-security-token",
     "x-amz-signature",
 })
 
@@ -668,7 +677,11 @@ def _canonical_url_param_name(name: str) -> str:
     return decoded.casefold().replace("-", "_")
 
 
-def _redact_strict_url_credentials(text: str) -> str:
+def _redact_strict_url_credentials(
+    text: str,
+    *,
+    extra_sensitive_params: frozenset[str] = frozenset(),
+) -> str:
     """Redact credentials from absolute, relative, and network URL references.
 
     This is intentionally stricter than display/log redaction and is used only
@@ -677,7 +690,8 @@ def _redact_strict_url_credentials(text: str) -> str:
     values and URL userinfo.
     """
     def _redact_param(match: re.Match) -> str:
-        if _canonical_url_param_name(match.group(2)) not in _SENSITIVE_QUERY_PARAMS:
+        name = _canonical_url_param_name(match.group(2))
+        if name not in _SENSITIVE_QUERY_PARAMS and name not in extra_sensitive_params:
             return match.group(0)
         return f"{match.group(1)}{match.group(2)}=***"
 
@@ -776,6 +790,7 @@ def redact_sensitive_text(
     code_file: bool = False,
     file_read: bool = False,
     redact_url_credentials: bool = False,
+    extra_sensitive_url_params: frozenset[str] = frozenset(),
 ) -> str:
     """Apply all redaction patterns to a block of text.
 
@@ -786,8 +801,10 @@ def redact_sensitive_text(
 
     Set redact_url_credentials=True at non-navigation egress boundaries to
     additionally redact credential-named query parameters and ``user:pass@``
-    URL userinfo. The default remains False because actionable OAuth callback,
-    magic-link, and pre-signed URLs must survive ordinary tool flows unchanged.
+    URL userinfo. Pass canonical names in extra_sensitive_url_params when a
+    narrower boundary treats an otherwise-public parameter as a credential.
+    The default remains False because actionable OAuth callback, magic-link,
+    and pre-signed URLs must survive ordinary tool flows unchanged.
 
     Set code_file=True to skip the ENV-assignment and JSON-field regex
     patterns when the text is known to be source code (e.g. MAX_TOKENS=***
@@ -989,7 +1006,10 @@ def redact_sensitive_text(
     # left to pass through per #34029.
 
     if redact_url_credentials:
-        text = _redact_strict_url_credentials(text)
+        text = _redact_strict_url_credentials(
+            text,
+            extra_sensitive_params=extra_sensitive_url_params,
+        )
 
     # Form-urlencoded bodies (only triggers on clean k=v&k=v inputs).
     if "&" in text and "=" in text:
