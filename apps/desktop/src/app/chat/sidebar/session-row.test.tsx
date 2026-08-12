@@ -7,8 +7,9 @@ import type { SessionInfo } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import type * as ChatRuntime from '@/lib/chat-runtime'
 import type * as ComposerStatusStore from '@/store/composer-status'
+import { $sessions } from '@/store/session'
 import type * as SessionStore from '@/store/session'
-import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
+import { $sessionStates, clearAllSessionStates, publishSessionState } from '@/store/session-states'
 import type * as SessionStatesStore from '@/store/session-states'
 import type * as WindowsStore from '@/store/windows'
 
@@ -267,5 +268,40 @@ describe('SidebarSessionRow', () => {
     const avatar = handoffAvatar(container)
     expect(avatar).toBeTruthy()
     expect(tipTrigger(avatar as HTMLElement)).toBeTruthy()
+  })
+})
+
+describe('foreign live activity caption', () => {
+  afterEach(() => {
+    $sessions.set([])
+    $sessionStates.set({})
+  })
+
+  it('captions the live activity of a foreign working session', () => {
+    const session = makeSession({
+      is_active: true,
+      last_activity_description: 'executing tool: terminal',
+      title: 'Cron Feed'
+    })
+    act(() => {
+      $sessions.set([session as never])
+      $sessionStates.set({})
+    })
+    const { container } = renderRow(session)
+    expect(container.textContent).toContain('executing tool: terminal')
+  })
+
+  it('does not caption a session an event-owned runtime is driving', () => {
+    const session = makeSession({
+      is_active: true,
+      last_activity_description: 'executing tool: terminal',
+      title: 'Local'
+    })
+    act(() => {
+      $sessions.set([session as never])
+      $sessionStates.set({ r1: { busy: true, storedSessionId: 's1' } as never })
+    })
+    const { container } = renderRow(session)
+    expect(container.textContent).not.toContain('executing tool: terminal')
   })
 })
