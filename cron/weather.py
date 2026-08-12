@@ -55,7 +55,7 @@ def _weather_config() -> Mapping[str, Any]:
 
 
 def _location() -> str:
-    value = _weather_config().get("weather_location", "")
+    value = _weather_config().get("weather_location") or ""
     # Keep user-controlled output bounded and prevent a location value from
     # becoming an accidental second instruction in the injected context.
     return " ".join(str(value).split())[:120]
