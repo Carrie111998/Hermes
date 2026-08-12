@@ -169,6 +169,44 @@ CREATE TABLE IF NOT EXISTS run_events (
     company_id TEXT NOT NULL, ts REAL NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL DEFAULT '',
     data TEXT NOT NULL DEFAULT '{}'
 );
+-- Every upload keeps both forms: the byte-identical original the customer sent
+-- and the Markdown the agent actually reads. `content` is the authority — the
+-- local mirror at `local_path` is a cache that materialize() rebuilds from here
+-- whenever it goes missing or fails its checksum.
+CREATE TABLE IF NOT EXISTS document_processing_attempts (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    company_id TEXT NOT NULL REFERENCES companies(id),
+    public_status TEXT NOT NULL,
+    public_message TEXT,
+    internal_stage TEXT NOT NULL,
+    reason_code TEXT,
+    diagnostic TEXT,
+    input_checksum TEXT NOT NULL,
+    output_checksum TEXT,
+    run_id TEXT,
+    started_at REAL NOT NULL,
+    completed_at REAL
+);
+CREATE TABLE IF NOT EXISTS document_artifacts (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    company_id TEXT NOT NULL REFERENCES companies(id),
+    role TEXT NOT NULL CHECK(role IN ('original','processed')),
+    filename TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    content BLOB NOT NULL,
+    checksum TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    local_path TEXT NOT NULL,
+    attempt_id TEXT REFERENCES document_processing_attempts(id),
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_document_artifacts_scope
+    ON document_artifacts(company_id, document_id, role);
+CREATE INDEX IF NOT EXISTS ix_document_attempts_scope
+    ON document_processing_attempts(company_id, public_status);
 CREATE TABLE IF NOT EXISTS chat_sessions (
     id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id),
     user_id TEXT NOT NULL REFERENCES users(id), profile TEXT NOT NULL DEFAULT 'default',
@@ -199,6 +237,15 @@ SCHEMA = SCHEMA + "\n" + LEAD_RESEARCH_SCHEMA
 # every entry here must default to NULL.
 COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("outreach_messages", "superseded_by", "TEXT REFERENCES outreach_messages(id)"),
+    # Document processing. `status_detail` is customer-facing copy only; the
+    # technical reason code lives on the attempt row, which customers never see.
+    ("documents", "status_detail", "TEXT"),
+    ("documents", "original_checksum", "TEXT"),
+    ("documents", "active_processed_artifact_id", "TEXT REFERENCES document_artifacts(id)"),
+    ("documents", "current_processing_attempt_id", "TEXT REFERENCES document_processing_attempts(id)"),
+    ("documents", "processing_started_at", "REAL"),
+    ("documents", "ready_at", "REAL"),
+    ("documents", "origin", "TEXT"),
 )
 
 

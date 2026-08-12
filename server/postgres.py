@@ -106,7 +106,8 @@ class PostgresDatabase:
     # partial set is how a database ends up with lead-research tables that have
     # no RLS, or credential tables that are world-readable — both silent.
     REQUIRED_MIGRATIONS = ("001_initial", "002_chat_sessions", "003_lead_research",
-                           "004_lead_research_rls", "005_auth_table_rls")
+                           "004_lead_research_rls", "005_auth_table_rls",
+                           "006_message_supersession", "007_document_artifacts")
 
     def _assert_migrations_applied(self) -> None:
         try:
