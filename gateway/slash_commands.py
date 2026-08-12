@@ -2502,6 +2502,7 @@ class GatewaySlashCommandsMixin:
             active_personality_name,
             available_personalities,
             describe_personality,
+            personality_selection_mode,
             persist_personality,
             prompt_text,
             resolve_personality,
@@ -2541,6 +2542,14 @@ class GatewaySlashCommandsMixin:
         # agent.system_prompt (user-owned manual overlay).
         if not persist_personality(name):
             return t("gateway.personality.save_failed", error="config write failed")
+
+        overlay_mode = personality_selection_mode(config) == "overlay"
+        if overlay_mode:
+            return (
+                t("gateway.personality.cleared")
+                if not name
+                else t("gateway.personality.set_to", name=name)
+            )
 
         if not name:
             self._ephemeral_system_prompt = prompt_text(

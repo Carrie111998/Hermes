@@ -1342,6 +1342,7 @@ class CLICommandsMixin:
         from hermes_cli.personality import (
             describe_personality,
             normalize_personality_name,
+            personality_selection_mode,
             persist_personality,
             prompt_text,
             resolve_personality,
@@ -1362,7 +1363,23 @@ class CLICommandsMixin:
                 return
 
             saved = persist_personality(name)
-            if not name:
+            overlay_mode = (
+                personality_selection_mode(getattr(self, "config", None)) == "overlay"
+            )
+            if overlay_mode:
+                verb = "cleared" if not name else f"set to '{name}'"
+                if saved:
+                    print(f"(^_^)b Personality {verb} (saved to config)")
+                else:
+                    print(f"(^_^) Personality {verb} (session only)")
+                if not name:
+                    print("  No personality overlay — using base agent behavior.")
+                else:
+                    print(
+                        f"  \"{personality_prompt[:60]}"
+                        f"{'...' if len(personality_prompt) > 60 else ''}\""
+                    )
+            elif not name:
                 # Neutral reset — fall back to the user-owned manual prompt.
                 try:
                     from hermes_cli.config import cfg_get, read_raw_config

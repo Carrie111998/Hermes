@@ -66,6 +66,30 @@ class TestCLIPersonalityNone:
         assert ("display.personality", "") in saves
         assert not any(k == "agent.system_prompt" for k, _ in saves)
 
+    def test_overlay_selection_keeps_producer_owned_baseline(self):
+        cli = self._make_cli()
+        baseline = "<live-card0>\nbaseline truth\n</live-card0>"
+        cli.system_prompt = baseline
+        cli.config["agent"]["personality_selection_mode"] = "overlay"
+
+        with patch("hermes_cli.personality.persist_personality", return_value=True):
+            cli._handle_personality_command("/personality helpful")
+
+        assert cli.system_prompt == baseline
+        assert cli.agent is not None
+
+    def test_overlay_none_keeps_producer_owned_baseline(self):
+        cli = self._make_cli()
+        baseline = "<live-card0>\nbaseline truth\n</live-card0>"
+        cli.system_prompt = baseline
+        cli.config["agent"]["personality_selection_mode"] = "overlay"
+
+        with patch("hermes_cli.personality.persist_personality", return_value=True):
+            cli._handle_personality_command("/personality none")
+
+        assert cli.system_prompt == baseline
+        assert cli.agent is not None
+
     def test_builtin_personality_works_without_config_entry(self):
         # Built-ins come from hermes_cli.personality, not from config.
         cli = self._make_cli(personalities={})
@@ -149,6 +173,33 @@ class TestGatewayPersonalityNone:
         assert saved["display"]["personality"] == "helpful"
         assert runner._ephemeral_system_prompt == "You are helpful."
         assert "helpful" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_overlay_selection_and_none_keep_producer_owned_baseline(self, tmp_path):
+        runner = self._make_runner()
+        baseline = "<live-card0>\nbaseline truth\n</live-card0>"
+        runner._ephemeral_system_prompt = baseline
+        config_data = {
+            "agent": {
+                "system_prompt": baseline,
+                "personality_selection_mode": "overlay",
+                "personalities": {"helpful": "You are helpful."},
+            },
+            "display": {"personality": "none"},
+        }
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(yaml.dump(config_data))
+
+        p1, p2 = self._gateway_env(tmp_path)
+        with p1, p2:
+            await runner._handle_personality_command(self._make_event("helpful"))
+            assert runner._ephemeral_system_prompt == baseline
+            await runner._handle_personality_command(self._make_event("none"))
+
+        saved = yaml.safe_load(config_file.read_text())
+        assert runner._ephemeral_system_prompt == baseline
+        assert saved["agent"]["system_prompt"] == baseline
+        assert saved["display"]["personality"] == ""
 
     @pytest.mark.asyncio
     async def test_unknown_shows_none_in_available(self, tmp_path):

@@ -147,6 +147,12 @@ def active_personality_name(cfg: Optional[Dict[str, Any]]) -> str:
     return ""
 
 
+def personality_selection_mode(cfg: Optional[Dict[str, Any]]) -> str:
+    """Return whether personality selection replaces or overlays the baseline."""
+    mode = str(_get(cfg, "agent", "personality_selection_mode", default="replace"))
+    return "overlay" if mode.strip().lower() == "overlay" else "replace"
+
+
 def resolve_ephemeral_system_prompt(cfg: Optional[Dict[str, Any]]) -> str:
     """Resolve the session overlay from config.
 
