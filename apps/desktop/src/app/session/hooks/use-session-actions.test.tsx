@@ -959,6 +959,7 @@ describe('resumeSession failure recovery', () => {
             branch: '',
             busy: false,
             cwd: '',
+            profile: '',
             fast: false,
             interimBoundaryPending: false,
             interrupted: false,
@@ -974,6 +975,7 @@ describe('resumeSession failure recovery', () => {
             serviceTier: '',
             storedSessionId: 'stored-1',
             streamId: null,
+            runtime: '',
             turnStartedAt: null,
             usage: null,
             yolo: false
