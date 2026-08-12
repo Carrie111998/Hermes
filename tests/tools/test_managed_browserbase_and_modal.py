@@ -213,6 +213,65 @@ def _install_fake_tools_package():
     sys.modules["tools.environments.managed_modal"] = types.SimpleNamespace(ManagedModalEnvironment=_DummyEnvironment)
 
 
+class TestBrowserEnvIsolatesParentPythonPath:
+    """Regression for #84841 — a PYTHONPATH/PYTHONHOME/VIRTUAL_ENV exported in
+    the parent shell must not reach the agent-browser subprocess.
+
+    The browser worker runs under its own managed interpreter (uvx / uv tool
+    install / npx agent-browser).  Leaked venv pointers aimed at Hermes's
+    site-packages make the child import pydantic from the wrong interpreter,
+    crashing on compiled C-extension ABI mismatches
+    (``ModuleNotFoundError: pydantic_core._pydantic_core``).
+    """
+
+    def _load_browser_tool(self, monkeypatch: pytest.MonkeyPatch):
+        _install_fake_tools_package()
+        # The fake ``tools.environments.local`` stub has no
+        # hermes_subprocess_env; stand in for it with a plain os.environ copy
+        # so only browser_tool's own stripping is under test.
+        monkeypatch.setattr(
+            sys.modules["tools.environments.local"],
+            "hermes_subprocess_env",
+            lambda *, inherit_credentials=False: os.environ.copy(),
+            raising=False,
+        )
+        return _load_tool_module("tools.browser_tool", "browser_tool.py")
+
+    def test_leaked_venv_pointers_are_stripped_from_browser_env(self, monkeypatch):
+        browser_tool = self._load_browser_tool(monkeypatch)
+        with patch.dict(
+            os.environ,
+            {
+                "PYTHONPATH": "/opt/hermes-venv/lib/python3.12/site-packages",
+                "PYTHONHOME": "/opt/hermes-venv",
+                "VIRTUAL_ENV": "/opt/hermes-venv",
+                "PYTHONUTF8": "1",
+            },
+        ):
+            env = browser_tool._build_browser_env()
+
+        assert "PYTHONPATH" not in env
+        assert "PYTHONHOME" not in env
+        assert "VIRTUAL_ENV" not in env
+        # Runtime knobs are not venv pointers and must still pass through.
+        assert env.get("PYTHONUTF8") == "1"
+
+    def test_absent_venv_pointers_leave_browser_env_unchanged(self, monkeypatch):
+        browser_tool = self._load_browser_tool(monkeypatch)
+        with patch.dict(
+            os.environ,
+            {"PYTHONUTF8": "1", "LANG": "en_US.UTF-8"},
+        ):
+            env = browser_tool._build_browser_env()
+
+        # Nothing is invented or re-added when the parent never exported them.
+        assert "PYTHONPATH" not in env
+        assert "PYTHONHOME" not in env
+        assert "VIRTUAL_ENV" not in env
+        assert env.get("PYTHONUTF8") == "1"
+        assert env.get("LANG") == "en_US.UTF-8"
+
+
 def test_browser_use_explicit_local_mode_stays_local_even_when_managed_gateway_is_ready(tmp_path):
     _install_fake_tools_package()
     (tmp_path / "config.yaml").write_text("browser:\n  cloud_provider: local\n", encoding="utf-8")

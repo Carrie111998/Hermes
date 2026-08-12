@@ -137,6 +137,17 @@ def _build_browser_env() -> dict:
     for _key in _BROWSER_PASSTHROUGH_KEYS:
         if _key in os.environ:
             env[_key] = os.environ[_key]
+    # The browser worker runs under its own managed environment (uvx / uv tool
+    # install / npx agent-browser), whose interpreter may differ from Hermes's
+    # venv.  PYTHONPATH / PYTHONHOME / VIRTUAL_ENV leaked from the parent shell
+    # point at Hermes's site-packages, so the child imports packages (e.g.
+    # pydantic) from the wrong interpreter and crashes on compiled C-extension
+    # ABI mismatches (ModuleNotFoundError: pydantic_core._pydantic_core).  These
+    # three vars are pure venv pointers — strip them unconditionally.  Runtime
+    # knobs (PYTHONUTF8, PYTHONIOENCODING, PYTHONDONTWRITEBYTECODE) still pass
+    # through as intended.
+    for _key in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
+        env.pop(_key, None)
     return env
 
 try:
