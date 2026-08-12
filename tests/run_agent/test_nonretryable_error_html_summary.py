@@ -127,3 +127,24 @@ def test_non_retryable_failure_error_is_summarized_not_raw_html():
     # The original page was tens of kilobytes; a summary is short.
     assert len(error) < 500
     assert len(error) < len(_CLOUDFLARE_CHALLENGE_HTML)
+
+
+def test_non_retryable_failure_without_fallback_permission_skips_activation():
+    """A terminal classification with ``should_fallback=False`` must abort."""
+    agent = _make_agent()
+    agent.client.chat.completions.create.side_effect = Exception(
+        "SSL: CERTIFICATE_VERIFY_FAILED"
+    )
+
+    with (
+        patch.object(agent, "_has_pending_fallback") as has_pending_fallback,
+        patch.object(agent, "_try_activate_fallback") as try_activate_fallback,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("daily briefing please")
+
+    assert result.get("failed") is True
+    has_pending_fallback.assert_not_called()
+    try_activate_fallback.assert_not_called()
