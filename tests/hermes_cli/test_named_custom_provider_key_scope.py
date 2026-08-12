@@ -162,3 +162,28 @@ def test_unresolvable_env_ref_api_key_falls_through_to_key_env(
         "an unresolvable ${VAR} ref must fall through to key_env instead of "
         "being sent to the endpoint as a literal"
     )
+
+
+def test_key_env_is_fail_closed_when_multiplexing_runs_without_a_scope(
+    monkeypatch, probed_keys, scope
+):
+    """Multiplexing on with no scope installed must not read ``os.environ``.
+
+    This is the other half of ``get_secret``'s policy and a distinct branch
+    from the scope-installed case above: with no scope there is nothing to
+    identify the caller's profile, so ``os.environ`` is unattributable and the
+    read raises rather than guessing. Silently probing with whatever the
+    process env holds is exactly the cross-profile disclosure the scope exists
+    to prevent.
+    """
+    monkeypatch.setenv("MYCORP_API_KEY", "sk-other-profile")
+    scope(None, multiplex=True)
+
+    from hermes_cli.model_setup_flows import _model_flow_named_custom
+
+    with pytest.raises(secret_scope.UnscopedSecretError):
+        _model_flow_named_custom({}, _provider_info(key_env="MYCORP_API_KEY"))
+
+    assert probed_keys == [], (
+        "no probe may be issued with an unattributable process-env credential"
+    )
