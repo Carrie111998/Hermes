@@ -21,6 +21,7 @@ from tools.approval import (
     is_approved,
     load_permanent,
     prompt_dangerous_approval,
+    request_action_approval,
 )
 
 
@@ -39,6 +40,221 @@ class TestApprovalModeParsing:
     def test_config_bool_false_maps_to_off(self):
         with mock_patch("hermes_cli.config.load_config_readonly", return_value={"approvals": {"mode": False}}):
             assert _get_approval_mode() == "off"
+
+
+class TestOneShotActionApproval:
+    def test_exact_action_id_resolves_only_its_own_pending_entry(self):
+        session_key = "concurrent-action-approval"
+        first = approval_module._ApprovalEntry({"approval_id": "first"})
+        second = approval_module._ApprovalEntry({"approval_id": "second"})
+        approval_module._gateway_queues[session_key] = [first, second]
+        try:
+            assert approval_module.resolve_gateway_approval(
+                session_key, "once", approval_id="second",
+            ) == 1
+            assert second.event.is_set()
+            assert second.result == "once"
+            assert not first.event.is_set()
+            assert approval_module._gateway_queues[session_key] == [first]
+        finally:
+            approval_module._gateway_queues.pop(session_key, None)
+
+    def test_gateway_returns_authenticated_click_context_without_persistence(self, monkeypatch):
+        session_key = "test-action-approval"
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.setenv("HERMES_SESSION_KEY", session_key)
+        approval_module._gateway_queues.clear()
+        approval_module._gateway_notify_cbs.clear()
+        approval_module._session_approved.clear()
+        approval_module._permanent_approved.clear()
+
+        observed = []
+
+        def notify(data):
+            observed.append(data)
+            approval_module.resolve_gateway_approval(
+                session_key,
+                "once",
+                decision_context={
+                    "platform": "slack",
+                    "user_id": "U_OPERATOR",
+                    "channel_id": "C_CITY",
+                    "observed_at": 123,
+                },
+            )
+
+        approval_module.register_gateway_notify(session_key, notify)
+        try:
+            result = request_action_approval(
+                title="Grant access",
+                summary="Grant the exact resolved role.",
+                facts=["Account: person@example.com", "Role: producer"],
+                approve_label="Approve & run",
+                decline_label="Decline",
+                surface="test-action",
+            )
+        finally:
+            approval_module.unregister_gateway_notify(session_key)
+
+        assert result == {
+            "decision": "approve",
+            "context": {
+                "platform": "slack",
+                "user_id": "U_OPERATOR",
+                "channel_id": "C_CITY",
+                "observed_at": 123,
+            },
+        }
+        assert observed[0]["approval_kind"] == "action"
+        assert observed[0]["allow_session"] is False
+        assert observed[0]["allow_permanent"] is False
+        assert observed[0]["approve_label"] == "Approve & run"
+        assert observed[0]["decline_label"] == "Decline"
+        assert not approval_module._session_approved
+        assert not approval_module._permanent_approved
+
+    def test_gateway_without_notify_callback_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.setenv("HERMES_SESSION_KEY", "missing-action-notify")
+        approval_module._gateway_notify_cbs.clear()
+
+        assert request_action_approval("Grant access", "Exact plan") == {
+            "decision": "decline",
+            "context": None,
+        }
+
+    def test_cli_path_offers_only_once_or_decline(self, monkeypatch):
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        observed = {}
+
+        def prompt(*args, **kwargs):
+            observed.update(kwargs)
+            return "session"
+
+        monkeypatch.setattr(approval_module, "prompt_dangerous_approval", prompt)
+        assert request_action_approval(
+            "Grant access", "Exact plan", timeout_seconds=17,
+        ) == {"decision": "decline", "context": None}
+        assert observed["allow_permanent"] is False
+        assert observed["allow_session"] is False
+        assert observed["timeout_seconds"] == 17
+
+    def test_gateway_honors_action_specific_timeout(self, monkeypatch):
+        session_key = "action-specific-timeout"
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.setenv("HERMES_SESSION_KEY", session_key)
+        approval_module._gateway_queues.clear()
+        approval_module._gateway_notify_cbs.clear()
+        approval_module.register_gateway_notify(session_key, lambda data: None)
+        started = time.monotonic()
+        try:
+            result = request_action_approval(
+                "Grant access", "Exact plan", timeout_seconds=0.02,
+            )
+        finally:
+            approval_module.unregister_gateway_notify(session_key)
+        assert result == {"decision": "timeout", "context": None}
+        assert time.monotonic() - started < 0.5
+
+    def test_raw_prompt_rejects_session_when_session_is_disabled(self, monkeypatch, capsys):
+        monkeypatch.setattr("builtins.input", lambda _prompt="": "session")
+        assert prompt_dangerous_approval(
+            "grant exact access",
+            "one-shot action",
+            timeout_seconds=1,
+            allow_permanent=False,
+            allow_session=False,
+        ) == "deny"
+        rendered = capsys.readouterr().out.lower()
+        assert "[s]ession" not in rendered
+
+    def test_scheduler_action_routes_to_explicit_profile_destination(self, monkeypatch):
+        from gateway.session_context import (
+            bind_scheduler_service_origin,
+            clear_scheduler_service_origin,
+            clear_session_vars,
+            reset_session_vars,
+            set_session_vars,
+        )
+
+        owner_session_key = "cron-owner-session-123"
+        session_tokens = set_session_vars(
+            cron_session="1", session_key=owner_session_key,
+        )
+        service_token = bind_scheduler_service_origin("job-123", "cadence")
+        observed, resolvers = [], []
+
+        def route(profile_ref, destination, session_key):
+            assert profile_ref == "cadence"
+            assert destination == {"platform": "slack", "channel_id": "C_REVIEW"}
+
+            def notify(data):
+                observed.append((session_key, data))
+                def resolve():
+                    time.sleep(0.03)
+                    approval_module.resolve_gateway_approval(
+                        session_key,
+                        "once",
+                        decision_context={
+                            "platform": "slack", "user_id": "U_OPERATOR",
+                            "channel_id": "C_REVIEW", "observed_at": 123,
+                        },
+                        approval_id=data["approval_id"],
+                    )
+
+                thread = threading.Thread(target=resolve)
+                thread.start()
+                resolvers.append(thread)
+
+            return notify
+
+        monkeypatch.setattr(approval_module, "_service_action_approval_notify", route)
+        try:
+            result = request_action_approval(
+                "Cadence proposes a bounded action",
+                "*Proposal context*\nEvidence\n\n*AB4 exact action*\nExact plan",
+                destination={"platform": "slack", "channel_id": "C_REVIEW"},
+                timeout_seconds=2,
+            )
+        finally:
+            for thread in resolvers:
+                thread.join(timeout=1)
+            clear_scheduler_service_origin(service_token)
+            clear_session_vars(session_tokens)
+            reset_session_vars()
+
+        assert result == {
+            "decision": "approve",
+            "context": {
+                "platform": "slack", "user_id": "U_OPERATOR",
+                "channel_id": "C_REVIEW", "observed_at": 123,
+            },
+        }
+        assert observed[0][1]["allow_session"] is False
+        assert observed[0][1]["allow_permanent"] is False
+        approval_session_key = observed[0][0]
+        assert approval_session_key.startswith("service-action:")
+        assert approval_session_key != owner_session_key
+        assert approval_module.human_wait_seconds(owner_session_key) > 0
+        assert approval_module.human_wait_seconds(approval_session_key) == 0
+
+    def test_destination_without_core_scheduler_origin_fails_before_route(self, monkeypatch):
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        called = []
+        monkeypatch.setattr(
+            approval_module,
+            "_service_action_approval_notify",
+            lambda *_args: called.append(True),
+        )
+        assert request_action_approval(
+            "Cadence proposes a bounded action",
+            "Exact combined plan",
+            destination={"platform": "slack", "channel_id": "C_REVIEW"},
+        ) == {"decision": "decline", "context": None}
+        assert called == []
 
 
 class TestSmartApproval:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 
 import pytest
 
@@ -34,10 +35,16 @@ def test_execution_projection_is_opaque_bounded_and_content_free():
     assert event["status"] == "failed"
     assert event["job_key"].startswith("sha256:")
     assert len(event["job_key"]) == len("sha256:") + 24
+    assert event["run_key"].startswith("sha256:")
+    assert len(event["run_key"]) == len("sha256:") + 24
+    assert event["run_key"] == "sha256:" + hashlib.sha256(
+        b"agent-run:execution-private-id"
+    ).hexdigest()[:24]
     assert event["duration_ms"] == 2250
     assert event["delivery_outcome"] == "failed"
     assert event["error_class"] == "auth_failed"
     assert "job_id" not in event
+    assert "execution-private-id" not in str(event)
     assert "error" not in event
     assert "alice@example.com" not in str(event)
     assert "top-secret-token" not in str(event)

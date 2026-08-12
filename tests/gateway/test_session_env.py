@@ -7,7 +7,11 @@ from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionContext, SessionSource
 from gateway.session_context import (
+    _SCHEDULER_SERVICE_ORIGIN,
     get_session_env,
+    get_scheduler_service_origin,
+    bind_scheduler_service_origin,
+    clear_scheduler_service_origin,
     set_session_vars,
     clear_session_vars,
     reset_session_vars,
@@ -29,6 +33,7 @@ def _reset_contextvars():
     for var in _VAR_MAP.values():
         # Can't use var.reset() without a token; just set back to sentinel.
         var.set(_UNSET)
+    _SCHEDULER_SERVICE_ORIGIN.set(_UNSET)
 
 
 def test_set_session_env_sets_contextvars(monkeypatch):
@@ -273,3 +278,48 @@ def test_cron_session_set_clear_and_reset_tristate(monkeypatch):
     reset_session_vars()
     assert get_session_env("HERMES_CRON_SESSION") == "1"
 
+
+def test_scheduler_service_origin_is_task_local_core_state_without_env_fallback(monkeypatch):
+    monkeypatch.setenv("HERMES_SCHEDULER_SERVICE_ORIGIN", "forged")
+    assert get_scheduler_service_origin() is None
+
+    session_tokens = set_session_vars(cron_session="1")
+    assert get_scheduler_service_origin() is None
+    service_token = bind_scheduler_service_origin(
+        "job-123", "cadence", run_id="0123456789abcdef0123456789abcdef",
+    )
+    try:
+        origin = get_scheduler_service_origin()
+        assert origin is not None
+        assert origin["version"] == "hermes.scheduler-origin.v1"
+        assert origin["profile_ref"] == "cadence"
+        assert origin["job_id"] == "job-123"
+        assert origin["runtime_attested"] is True
+        assert origin["run_id"] == "0123456789abcdef0123456789abcdef"
+        assert len(origin["nonce"]) >= 24
+
+        # Callers receive a copy and cannot rewrite the bound authority.
+        origin["profile_ref"] = "forged"
+        assert get_scheduler_service_origin()["profile_ref"] == "cadence"
+    finally:
+        clear_scheduler_service_origin(service_token)
+        clear_session_vars(session_tokens)
+    assert get_scheduler_service_origin() is None
+
+
+def test_scheduler_service_origin_rejects_invalid_explicit_run_id():
+    with __import__("pytest").raises(ValueError):
+        bind_scheduler_service_origin("job-123", "cadence", run_id="../state.db")
+
+
+def test_ordinary_session_binding_clears_inherited_scheduler_origin():
+    service_token = bind_scheduler_service_origin("job-parent", "cadence")
+    try:
+        assert get_scheduler_service_origin() is not None
+        tokens = set_session_vars(platform="slack", user_id="U1")
+        try:
+            assert get_scheduler_service_origin() is None
+        finally:
+            clear_session_vars(tokens)
+    finally:
+        clear_scheduler_service_origin(service_token)

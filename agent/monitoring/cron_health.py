@@ -42,6 +42,13 @@ def _job_key(raw: Any) -> str:
     return f"sha256:{hashlib.sha256(value).hexdigest()[:24]}"
 
 
+def _run_key(raw: Any) -> Optional[str]:
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    return f"sha256:{hashlib.sha256(('agent-run:' + value).encode('utf-8', errors='replace')).hexdigest()[:24]}"
+
+
 def classify_cron_error(raw: Any) -> str:
     text = str(raw or "").lower()
     if (
@@ -98,6 +105,7 @@ def project_execution_event(
     return CronExecutionEvent(
         status=status if status in _KNOWN_STATUSES else "unknown",
         job_key=_job_key(record.get("job_id")),
+        run_key=_run_key(record.get("id")),
         source=source if source in _KNOWN_SOURCES else "unknown",
         duration_ms=_duration_ms(record),
         delivery_outcome=(

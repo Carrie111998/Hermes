@@ -16,6 +16,7 @@ import hashlib
 import logging
 import os
 import re
+import secrets
 import shlex
 import sys
 import tempfile
@@ -2228,7 +2229,15 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
     operand = argv[2]
     temp_dir = os.path.realpath(tempfile.gettempdir())
     basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+    allowed_literal_dirs = {temp_dir}
+    # macOS exposes /tmp as the stable public spelling of its canonical
+    # /private/tmp directory. Accept that single OS alias without broadly
+    # trusting arbitrary symlinked temp directories (which could be swapped).
+    if sys.platform == "darwin" and temp_dir == "/private/tmp":
+        allowed_literal_dirs.add("/tmp")
+    if operand not in {
+        os.path.join(literal_dir, basename) for literal_dir in allowed_literal_dirs
+    }:
         return False
 
     target = os.path.realpath(operand)
@@ -2507,7 +2516,7 @@ def _denial_breaker_addendum(session_key: str) -> str:
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason")
+    __slots__ = ("event", "data", "result", "reason", "decision_context", "approval_id")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
@@ -2517,6 +2526,12 @@ class _ApprovalEntry:
         # (``/deny <reason>``) so the agent can adapt instead of only
         # hearing "denied". Ported from qwibitai/nanoclaw#2832.
         self.reason: Optional[str] = None
+        # Adapter-owned metadata captured at decision time (for example the
+        # authenticated Slack clicker and channel).  Callers may use it to
+        # re-establish authority after a human wait without trusting model
+        # arguments or stale turn context.
+        self.decision_context: Optional[dict] = None
+        self.approval_id = str(data.get("approval_id") or "")
 
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
@@ -2550,7 +2565,9 @@ def unregister_gateway_notify(session_key: str) -> None:
 
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
-                             reason: Optional[str] = None) -> int:
+                             reason: Optional[str] = None,
+                             decision_context: Optional[dict] = None,
+                             approval_id: Optional[str] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
@@ -2562,6 +2579,14 @@ def resolve_gateway_approval(session_key: str, choice: str,
     deny (``/deny <reason>``).  It is relayed back to the agent in the
     BLOCKED message so it can adapt instead of only hearing "denied".
 
+    *decision_context* is trusted metadata supplied by the gateway adapter
+    after it authenticates the decision.  It is returned only to the waiting
+    in-process caller and is never accepted from tool/model arguments.
+
+    *approval_id* targets one exact pending entry. Interactive action cards use
+    it so concurrent approvals in one session cannot resolve each other. Legacy
+    command approvals omit it and retain FIFO behavior.
+
     Returns the number of approvals resolved (0 means nothing was pending).
     """
     with _lock:
@@ -2571,6 +2596,14 @@ def resolve_gateway_approval(session_key: str, choice: str,
         if resolve_all:
             targets = list(queue)
             queue.clear()
+        elif approval_id:
+            target_index = next(
+                (index for index, entry in enumerate(queue) if entry.approval_id == approval_id),
+                None,
+            )
+            if target_index is None:
+                return 0
+            targets = [queue.pop(target_index)]
         else:
             targets = [queue.pop(0)]
         if not queue:
@@ -2580,6 +2613,8 @@ def resolve_gateway_approval(session_key: str, choice: str,
         entry.result = choice
         if reason:
             entry.reason = reason
+        if decision_context:
+            entry.decision_context = dict(decision_context)
         entry.event.set()
     return len(targets)
 
@@ -2775,13 +2810,17 @@ def prompt_dangerous_approval(command: str, description: str,
                               timeout_seconds: int | None = None,
                               allow_permanent: bool = True,
                               approval_callback=None,
-                              *, smart_denied: bool = False) -> str:
+                              *, smart_denied: bool = False,
+                              allow_session: bool = True) -> str:
     """Prompt the user to approve a dangerous command (CLI only).
 
     Args:
         allow_permanent: When False, hide the [a]lways option (used when
             tirith warnings are present, since broad permanent allowlisting
             is inappropriate for content-level security findings).
+        allow_session: When False, offer only one-operation approval or denial.
+            This is the action-approval contract; it must never imply a wider
+            session grant.
         smart_denied: When True, this is an owner override of a Smart DENY.
             Offer only one-operation approval or denial.
         approval_callback: Optional callback registered by the CLI for
@@ -2810,6 +2849,7 @@ def prompt_dangerous_approval(command: str, description: str,
             allow_permanent,
             approval_callback,
             smart_denied=smart_denied,
+            allow_session=allow_session,
         )
 
 
@@ -2817,7 +2857,8 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
                                      timeout_seconds: int,
                                      allow_permanent: bool = True,
                                      approval_callback=None,
-                                     *, smart_denied: bool = False) -> str:
+                                     *, smart_denied: bool = False,
+                                     allow_session: bool = True) -> str:
     # Redact secrets before any user-visible rendering. The original
     # `command` is still what executes after approval; only the displayed
     # copy is scrubbed. Reuses the same redaction module used for memory
@@ -2829,6 +2870,8 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
     if approval_callback is not None:
         try:
             callback_kwargs = {"allow_permanent": allow_permanent}
+            if not allow_session:
+                callback_kwargs["allow_session"] = False
             if smart_denied:
                 callback_kwargs["smart_denied"] = True
             return approval_callback(
@@ -2875,7 +2918,7 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
             print(f"  {t('approval.dangerous_header', description=display_description)}")
             print(f"      {display_command}")
             print()
-            if smart_denied:
+            if smart_denied or not allow_session:
                 print(t("approval.choose_smart_deny"))
             elif allow_permanent:
                 print(t("approval.choose_long"))
@@ -2888,7 +2931,7 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
 
             def get_input():
                 try:
-                    if smart_denied:
+                    if smart_denied or not allow_session:
                         prompt = t("approval.prompt_smart_deny")
                     else:
                         prompt = t("approval.prompt_long") if allow_permanent else t("approval.prompt_short")
@@ -2908,7 +2951,7 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
                 return "timeout"
 
             choice = result["choice"]
-            if smart_denied:
+            if smart_denied or not allow_session:
                 choice_map = {
                     **{
                         value: "once"
@@ -3667,7 +3710,9 @@ def _format_tirith_description(tirith_result: dict) -> str:
 
 
 def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
-                            *, surface: str = "gateway") -> dict:
+                            *, surface: str = "gateway",
+                            timeout_seconds: int | None = None,
+                            human_wait_session_key: str | None = None) -> dict:
     """Enqueue *approval_data*, notify the user, and block the calling agent
     thread until the request is resolved or the gateway approval timeout
     elapses — firing pre/post approval hooks and cleaning up the queue entry.
@@ -3733,7 +3778,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     # every ~10s to the agent's inactivity tracker — otherwise the gateway
     # watchdog kills the agent while the user is still responding. Mirrors
     # _wait_for_process() cadence.
-    timeout = _get_approval_timeout()
+    timeout = _get_approval_timeout() if timeout_seconds is None else timeout_seconds
 
     try:
         from tools.environments.base import touch_activity_if_due
@@ -3748,7 +3793,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     # tapping approve/deny on the gateway surface), bounded by the approval
     # timeout. Record it as human-wait time so the concurrent batch deadline
     # excludes it (#79719).
-    with human_wait_window(session_key):
+    wait_owner = session_key if human_wait_session_key is None else human_wait_session_key
+    with human_wait_window(wait_owner):
         while True:
             # Respect interrupt signals (e.g. /stop, /new, or an inactivity
             # timeout from the gateway) so a pending approval doesn't keep the
@@ -3793,7 +3839,12 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         surface=surface,
         choice=_outcome,
     )
-    return {"resolved": resolved, "choice": choice, "reason": entry.reason}
+    return {
+        "resolved": resolved,
+        "choice": choice,
+        "reason": entry.reason,
+        "context": entry.decision_context,
+    }
 
 
 def check_all_command_guards(command: str, env_type: str,
@@ -4524,8 +4575,235 @@ def check_execute_code_guard(code: str, env_type: str,
 
 
 # =========================================================================
-# MCP elicitation entry point
+# One-shot action approval and MCP elicitation entry points
 # =========================================================================
+
+def _service_action_approval_notify(
+    profile_ref: str,
+    destination: dict[str, str],
+    session_key: str,
+):
+    """Build a sync notifier over the live, profile-scoped gateway adapter."""
+    try:
+        from agent.async_utils import safe_schedule_threadsafe
+        from gateway.config import Platform
+        from gateway.run import _gateway_runner_ref
+        from hermes_cli.profiles import get_active_profile_name
+
+        runner = _gateway_runner_ref()
+        if runner is None:
+            return None
+        platform = Platform(destination["platform"])
+        active_profile = get_active_profile_name()
+        if profile_ref == active_profile:
+            adapters = getattr(runner, "adapters", {})
+        else:
+            adapters = getattr(runner, "_profile_adapters", {}).get(profile_ref, {})
+        adapter = adapters.get(platform) if isinstance(adapters, dict) else None
+        loop = getattr(runner, "_gateway_loop", None)
+        if (
+            adapter is None
+            or loop is None
+            or getattr(type(adapter), "send_action_approval", None) is None
+        ):
+            return None
+    except Exception:
+        return None
+
+    def notify(approval_data: dict) -> None:
+        future = safe_schedule_threadsafe(
+            adapter.send_action_approval(
+                chat_id=destination["channel_id"],
+                session_key=session_key,
+                approval_id=approval_data.get("approval_id", ""),
+                title=approval_data.get("action_title", "Approve action"),
+                summary=approval_data.get("action_summary", "Review this action."),
+                facts=approval_data.get("action_facts", []),
+                approve_label=approval_data.get("approve_label", "Approve"),
+                decline_label=approval_data.get("decline_label", "Decline"),
+                metadata=None,
+            ),
+            loop,
+            logger=logger,
+            log_message="background send_action_approval scheduling error",
+        )
+        if future is None:
+            raise RuntimeError("gateway loop unavailable")
+        result = future.result(timeout=15)
+        if not getattr(result, "success", False):
+            raise RuntimeError(getattr(result, "error", "approval delivery failed"))
+
+    return notify
+
+
+def request_action_approval(
+    title: str,
+    summary: str,
+    *,
+    facts: Optional[list[str]] = None,
+    approve_label: str = "Approve",
+    decline_label: str = "Decline",
+    timeout_seconds: int | None = None,
+    surface: str = "action-approval",
+    destination: Optional[dict[str, str]] = None,
+) -> dict:
+    """Request one exact, non-persistent human decision.
+
+    This is a native extension point for trusted plugins that already own an
+    action plan.  It does not register a model-visible tool and it never offers
+    session or permanent approval.  Gateway adapters may return authenticated
+    click metadata in ``context`` so the plugin can re-establish authority at
+    decision time.
+
+    Returns ``{"decision": "approve"|"decline"|"timeout", "context": ...}``.
+    Missing gateway state, delivery errors, malformed prompts, and exceptions
+    fail closed.
+    """
+    try:
+        clean_title = str(title or "").strip()
+        clean_summary = str(summary or "").strip()
+        clean_facts = list(facts or [])
+        clean_approve = str(approve_label or "").strip()
+        clean_decline = str(decline_label or "").strip()
+        if not clean_title or len(clean_title) > 150:
+            raise ValueError("action approval title must be 1-150 characters")
+        if not clean_summary or len(clean_summary) > 2000:
+            raise ValueError("action approval summary must be 1-2000 characters")
+        if len(clean_facts) > 20 or any(
+            not isinstance(item, str) or not item.strip() or len(item) > 500
+            for item in clean_facts
+        ):
+            raise ValueError("action approval facts are invalid")
+        if not clean_approve or len(clean_approve) > 75:
+            raise ValueError("action approval approve label is invalid")
+        if not clean_decline or len(clean_decline) > 75:
+            raise ValueError("action approval decline label is invalid")
+        clean_facts = [item.strip() for item in clean_facts]
+        session_key = get_current_session_key()
+        clean_destination = None
+        if destination is not None:
+            if not isinstance(destination, dict) or set(destination) != {
+                "platform", "channel_id"
+            }:
+                raise ValueError("action approval destination has an unknown shape")
+            platform = str(destination.get("platform") or "").strip().lower()
+            channel_id = str(destination.get("channel_id") or "").strip()
+            if not platform or len(platform) > 40 or not channel_id or len(channel_id) > 160:
+                raise ValueError("action approval destination is invalid")
+            clean_destination = {"platform": platform, "channel_id": channel_id}
+    except Exception as exc:
+        logger.warning("Action approval prompt rejected: %s", exc)
+        return {"decision": "decline", "context": None}
+
+    display = clean_summary
+    if clean_facts:
+        display += "\n" + "\n".join(f"• {item}" for item in clean_facts)
+    if len(f"*{clean_title}*\n\n{display}") > 2800:
+        logger.warning("Action approval prompt rejected: rendered prompt is too long")
+        return {"decision": "decline", "context": None}
+
+    approval_data = {
+        "approval_kind": "action",
+        "approval_id": secrets.token_urlsafe(24),
+        "command": display,
+        "description": clean_title,
+        "pattern_key": "one_shot_action",
+        "pattern_keys": ["one_shot_action"],
+        "action_title": clean_title,
+        "action_summary": clean_summary,
+        "action_facts": clean_facts,
+        "approve_label": clean_approve,
+        "decline_label": clean_decline,
+        "allow_permanent": False,
+        "allow_session": False,
+    }
+
+    # Background action cards are permitted only inside a core-created
+    # scheduler service context. The destination is supplied by a trusted
+    # plugin's profile configuration, never borrowed from stored cron origin.
+    if clean_destination is not None:
+        try:
+            from gateway.session_context import get_scheduler_service_origin
+
+            origin = get_scheduler_service_origin()
+            if not isinstance(origin, dict):
+                raise RuntimeError("no trusted scheduler service origin")
+            profile_ref = str(origin.get("profile_ref") or "")
+            if not profile_ref or origin.get("runtime_attested") is not True:
+                raise RuntimeError("invalid scheduler service origin")
+            owner_session_key = session_key
+            session_key = "service-action:" + secrets.token_urlsafe(24)
+            notify_cb = _service_action_approval_notify(
+                profile_ref, clean_destination, session_key
+            )
+            if notify_cb is None:
+                raise RuntimeError("no live profile approval route")
+            decision = _await_gateway_decision(
+                session_key,
+                notify_cb,
+                approval_data,
+                surface=surface,
+                timeout_seconds=timeout_seconds,
+                human_wait_session_key=owner_session_key,
+            )
+        except Exception as exc:
+            logger.error("Background action approval dispatch failed: %s", exc, exc_info=True)
+            return {"decision": "decline", "context": None}
+        if decision.get("notify_failed"):
+            return {"decision": "decline", "context": None}
+        if not decision.get("resolved"):
+            return {"decision": "timeout", "context": None}
+        return {
+            "decision": "approve" if decision.get("choice") == "once" else "decline",
+            "context": decision.get("context"),
+        }
+
+    if _is_gateway_approval_context():
+        with _lock:
+            notify_cb = _gateway_notify_cbs.get(session_key)
+        if notify_cb is None:
+            logger.warning(
+                "Action approval requested in gateway session %s without a notify callback",
+                session_key,
+            )
+            return {"decision": "decline", "context": None}
+        try:
+            decision = _await_gateway_decision(
+                session_key,
+                notify_cb,
+                approval_data,
+                surface=surface,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception as exc:
+            logger.error("Action approval gateway dispatch failed: %s", exc, exc_info=True)
+            return {"decision": "decline", "context": None}
+        if decision.get("notify_failed"):
+            return {"decision": "decline", "context": None}
+        if not decision.get("resolved"):
+            return {"decision": "timeout", "context": None}
+        return {
+            "decision": "approve" if decision.get("choice") == "once" else "decline",
+            "context": decision.get("context"),
+        }
+
+    try:
+        choice = prompt_dangerous_approval(
+            display,
+            clean_title,
+            timeout_seconds=timeout_seconds,
+            allow_permanent=False,
+            allow_session=False,
+        )
+    except Exception as exc:
+        logger.error("Action approval CLI prompt failed: %s", exc, exc_info=True)
+        return {"decision": "decline", "context": None}
+    if choice == "timeout":
+        return {"decision": "timeout", "context": None}
+    return {
+        "decision": "approve" if choice == "once" else "decline",
+        "context": None,
+    }
 
 def request_elicitation_consent(
     message: str,

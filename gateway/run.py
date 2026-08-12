@@ -5363,10 +5363,53 @@ class TurnRunner:
             # the redacted value.
             cmd = _redact_approval_command(cmd)
 
+            # Trusted plugins can request a one-shot action decision with
+            # domain-owned wording.  This is deliberately separate from the
+            # dangerous-command grant UI: there are no session/permanent
+            # choices and no model-visible approval tool.
+            _is_action_approval = approval_data.get("approval_kind") == "action"
+            if (
+                _is_action_approval
+                and getattr(type(ctx._status_adapter), "send_action_approval", None) is not None
+            ):
+                try:
+                    _approval_fut = safe_schedule_threadsafe(
+                        ctx._status_adapter.send_action_approval(
+                            chat_id=ctx._status_chat_id,
+                            session_key=_approval_session_key,
+                            approval_id=approval_data.get("approval_id", ""),
+                            title=approval_data.get("action_title", desc),
+                            summary=approval_data.get("action_summary", cmd),
+                            facts=approval_data.get("action_facts", []),
+                            approve_label=approval_data.get("approve_label", "Approve"),
+                            decline_label=approval_data.get("decline_label", "Decline"),
+                            metadata=ctx._status_thread_metadata,
+                        ),
+                        ctx._loop_for_step,
+                        logger=logger,
+                        log_message="send_action_approval scheduling error",
+                    )
+                    if _approval_fut is None:
+                        raise RuntimeError("send_action_approval: loop unavailable")
+                    _approval_result = _approval_fut.result(timeout=15)
+                    if _approval_result.success:
+                        return
+                    logger.warning(
+                        "Action approval send returned an error; falling back to text: %s",
+                        _approval_result.error,
+                    )
+                except Exception as _e:
+                    logger.warning(
+                        "Action approval buttons failed; falling back to text: %s", _e
+                    )
+
             # Prefer button-based approval when the adapter supports it.
             # Check the *class* for the method, not the instance — avoids
             # false positives from MagicMock auto-attribute creation in tests.
-            if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
+            if (
+                not _is_action_approval
+                and getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None
+            ):
                 try:
                     _approval_fut = safe_schedule_threadsafe(
                         ctx._status_adapter.send_exec_approval(

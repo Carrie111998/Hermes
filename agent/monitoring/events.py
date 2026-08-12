@@ -69,6 +69,7 @@ class CronExecutionEvent:
 
     status: str
     job_key: str
+    run_key: Optional[str] = None
     source: str = "unknown"
     duration_ms: Optional[int] = None
     delivery_outcome: Optional[str] = None

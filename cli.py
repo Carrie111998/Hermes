@@ -13636,6 +13636,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def _approval_callback(self, command: str, description: str,
                            *, allow_permanent: bool = True,
+                           allow_session: bool = True,
                            smart_denied: bool = False) -> str:
         """
         Prompt for dangerous command approval through the prompt_toolkit UI.
@@ -13663,6 +13664,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 "choices": self._approval_choices(
                     command,
                     allow_permanent=allow_permanent,
+                    allow_session=allow_session,
                     smart_denied=smart_denied,
                 ),
                 "selected": 0,
@@ -13714,9 +13716,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return "timeout"
 
     def _approval_choices(self, command: str, *, allow_permanent: bool = True,
+                          allow_session: bool = True,
                           smart_denied: bool = False) -> list[str]:
         """Return approval choices for a dangerous command prompt."""
-        if smart_denied:
+        if smart_denied or not allow_session:
             choices = ["once", "deny"]
         else:
             choices = ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]

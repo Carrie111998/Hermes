@@ -15,6 +15,7 @@ import cron.scheduler as cron_scheduler
 from gateway.session_context import (
     clear_session_vars,
     get_session_env,
+    get_scheduler_service_origin,
     reset_session_vars,
     set_session_vars,
 )
@@ -37,12 +38,20 @@ class _FakeCronAgent:
         self.kwargs = kwargs
 
     def run_conversation(self, prompt):
+        assert self.kwargs["enabled_toolsets"] == ["ab4"]
         result = approval_module.check_execute_code_guard(
             "import os; print(1)", "local"
         )
         assert result["approved"] is False
         assert result["outcome"] == "blocked"
         assert get_session_env("HERMES_CRON_SESSION") == "1"
+        origin = get_scheduler_service_origin()
+        assert origin is not None
+        assert origin["version"] == "hermes.scheduler-origin.v1"
+        assert origin["proposer_kind"] == "service"
+        assert origin["job_id"] == "ctx-isolation"
+        assert origin["run_id"] == "0123456789abcdef0123456789abcdef"
+        assert origin["runtime_attested"] is True
         return {
             "completed": True,
             "failed": False,
@@ -118,9 +127,12 @@ def test_run_job_cron_execute_code_deny_does_not_pollute_later_gateway_execute_c
     success, _output, final_response, error = cron_scheduler.run_job(
         {
             "id": "ctx-isolation",
+            "execution_id": "0123456789abcdef0123456789abcdef",
             "name": "Context Isolation",
             "prompt": "Run safely",
             "schedule_display": "manual",
+            # The autonomous AB4 pilot has no terminal/file/code or MCP surface.
+            "enabled_toolsets": ["ab4", "no_mcp"],
         }
     )
 
@@ -129,6 +141,7 @@ def test_run_job_cron_execute_code_deny_does_not_pollute_later_gateway_execute_c
     assert final_response == "cron execute_code blocked"
     assert os.environ.get("HERMES_CRON_SESSION") is None
     assert get_session_env("HERMES_CRON_SESSION") == ""
+    assert get_scheduler_service_origin() is None
 
     # A completed in-process job must restore the truly-unset ContextVar state,
     # not leave an explicit empty value that shadows the standalone cron env

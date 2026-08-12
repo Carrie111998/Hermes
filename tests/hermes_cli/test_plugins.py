@@ -1306,6 +1306,27 @@ class TestPluginContextProfileName:
         monkeypatch.setenv("HERMES_HOME", str(prof))
         assert self._ctx().profile_name == "coder"
 
+    def test_settings_are_profile_local_copy_and_exclude_other_entry_data(self):
+        ctx = self._ctx()
+        configured = {
+            "review_channel_id": "C123",
+            "allowed_slack_ids": ["U1"],
+        }
+        with patch("hermes_cli.config.load_config", return_value={
+            "plugins": {"entries": {
+                "test-plugin": {
+                    "enabled": True,
+                    "settings": configured,
+                    "secret_value": "must-not-be-returned",
+                },
+                "another-plugin": {"settings": {"private": "other"}},
+            }},
+        }):
+            settings = ctx.settings
+        assert settings == configured
+        settings["allowed_slack_ids"].append("U2")
+        assert configured["allowed_slack_ids"] == ["U1"]
+
 
 class TestDispatchToolWithoutCliRef:
     """ctx.dispatch_tool works in worker/hook contexts (no _cli_ref).

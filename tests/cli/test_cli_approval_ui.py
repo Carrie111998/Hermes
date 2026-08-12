@@ -93,6 +93,29 @@ class TestCliApprovalUi:
         thread.join(timeout=2)
         assert result["value"] == "deny"
 
+    def test_one_shot_callback_offers_only_once_and_deny(self):
+        cli = _make_cli_stub()
+        result = {}
+
+        def _run_callback():
+            result["value"] = cli._approval_callback(
+                "grant exact access",
+                "one-shot action",
+                allow_permanent=False,
+                allow_session=False,
+            )
+
+        thread = threading.Thread(target=_run_callback, daemon=True)
+        thread.start()
+        deadline = time.time() + 2
+        while cli._approval_state is None and time.time() < deadline:
+            time.sleep(0.01)
+        assert cli._approval_state is not None
+        assert cli._approval_state["choices"] == ["once", "deny"]
+        cli._approval_state["response_queue"].put("deny")
+        thread.join(timeout=2)
+        assert result["value"] == "deny"
+
 
     def test_sudo_prompt_restores_existing_draft_after_response(self):
         cli = _make_cli_stub()
@@ -561,4 +584,3 @@ class TestClearOverlaysForInterrupt:
 
         assert not t.is_alive(), "worker thread never unblocked"
         assert result["value"] == "deny"
-

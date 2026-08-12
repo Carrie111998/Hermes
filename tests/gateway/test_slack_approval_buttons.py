@@ -1,6 +1,7 @@
 """Tests for Slack Block Kit approval buttons and thread context fetching."""
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -140,6 +141,46 @@ class TestSlackExecApproval:
         assert "one operation" in kwargs["blocks"][0]["text"]["text"].lower()
 
 
+class TestSlackActionApproval:
+    """One-shot action prompts preserve trusted domain wording."""
+
+    @pytest.mark.asyncio
+    async def test_sends_exact_two_choice_prompt(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "4321.8765"})
+
+        result = await adapter.send_action_approval(
+            chat_id="C1",
+            session_key="agent:main:slack:group:C1:1111",
+            approval_id="approval-123",
+            title="Grant AB4 door access",
+            summary="Grant producer access to the resolved account.",
+            facts=["Account: person@example.com", "Event: AB1234"],
+            approve_label="Approve & run",
+            decline_label="Decline",
+        )
+
+        assert result.success is True
+        kwargs = mock_client.chat_postMessage.call_args.kwargs
+        rendered = kwargs["blocks"][0]["text"]["text"]
+        assert "Grant AB4 door access" in rendered
+        assert "Grant producer access to the resolved account." in rendered
+        assert "Account: person@example.com" in rendered
+        assert "Event: AB1234" in rendered
+        elements = kwargs["blocks"][1]["elements"]
+        assert [element["action_id"] for element in elements] == [
+            "hermes_action_approve", "hermes_action_decline",
+        ]
+        assert [element["text"]["text"] for element in elements] == [
+            "Approve & run", "Decline",
+        ]
+        assert all(json.loads(element["value"]) == {
+            "session_key": "agent:main:slack:group:C1:1111",
+            "approval_id": "approval-123",
+        } for element in elements)
+
+
 # ===========================================================================
 # _handle_approval_action — button click handler
 # ===========================================================================
@@ -178,6 +219,35 @@ class TestSlackApprovalAction:
         update_kwargs = mock_client.chat_update.call_args[1]
         section_text = update_kwargs["blocks"][0]["text"]["text"]
         assert len(section_text) <= 3000
+
+    @pytest.mark.asyncio
+    async def test_action_click_returns_authenticated_decision_context(self):
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        adapter._approval_resolved["9.9"] = False
+        ack = AsyncMock()
+        body = {
+            "message": {"ts": "9.9", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": "alice", "id": "U_ALICE"},
+        }
+        action = {
+            "action_id": "hermes_action_approve",
+            "value": json.dumps({"session_key": "session-key", "approval_id": "approval-123"}),
+        }
+        adapter._team_clients["T1"].chat_update = AsyncMock()
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
+            await adapter._handle_approval_action(ack, body, action)
+
+        resolve.assert_called_once()
+        assert resolve.call_args.args == ("session-key", "once")
+        context = resolve.call_args.kwargs["decision_context"]
+        assert context["platform"] == "slack"
+        assert context["user_id"] == "U_ALICE"
+        assert context["channel_id"] == "C1"
+        assert isinstance(context["observed_at"], int)
+        assert resolve.call_args.kwargs["approval_id"] == "approval-123"
 
     @pytest.mark.asyncio
     async def test_global_allowlist_blocks_unauthorized_click(self, monkeypatch):
@@ -840,4 +910,3 @@ class TestSlackReactionAuthorizationGate:
         assert "U_RANDO" in runner.auth_checked
         assert runner.handled == []
         adapter.handle_message.assert_not_called()
-
