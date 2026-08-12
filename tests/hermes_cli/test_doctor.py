@@ -71,7 +71,7 @@ def _fast_agent_browser_runnable(path):
 
 
 @pytest.fixture(autouse=True)
-def _stub_doctor_externals(monkeypatch):
+def _stub_doctor_externals(request, monkeypatch):
     """Keep ``run_doctor`` off the three slowest host probes.
 
     Measured on Windows, each ``run_doctor(...)`` test spent ~31s of its ~39s
@@ -87,12 +87,9 @@ def _stub_doctor_externals(monkeypatch):
     probes are also host state, not behaviour under test, so stubbing them
     makes the tests deterministic as well as fast.
 
-    This is autouse and runs *before* each test's own ``monkeypatch`` calls,
-    so a test that installs its own ``subprocess.run`` (see
-    ``TestGitHubTokenCheck``) still wins.
+    Classes that deliberately exercise the real gh probe opt out by setting
+    ``exercises_real_gh_probe = True`` (see ``TestGitHubTokenCheck``).
     """
-    import subprocess as _subprocess
-
     from hermes_cli import install_doctor as _install_doctor
 
     _real_section_lines = _install_doctor.doctor_section_lines
@@ -103,18 +100,8 @@ def _stub_doctor_externals(monkeypatch):
     monkeypatch.setattr(_install_doctor, "doctor_section_lines", _stubbed_section_lines)
     monkeypatch.setattr(doctor_mod, "agent_browser_runnable", _fast_agent_browser_runnable)
 
-    # ``_gh_authenticated`` is a closure inside ``run_doctor``, so it can only
-    # be reached through ``subprocess.run``. Intercept just that one argv and
-    # delegate everything else to whatever is currently installed (the
-    # conftest live-system guard wraps ``run`` too, and must stay in the chain).
-    _real_run = _subprocess.run
-
-    def _run(cmd, *args, **kwargs):
-        if isinstance(cmd, (list, tuple)) and list(cmd[:3]) == ["gh", "auth", "status"]:
-            return SimpleNamespace(returncode=1, stdout="", stderr="")
-        return _real_run(cmd, *args, **kwargs)
-
-    monkeypatch.setattr(_subprocess, "run", _run)
+    if not getattr(request.instance, "exercises_real_gh_probe", False):
+        monkeypatch.setattr(doctor_mod, "_gh_authenticated", lambda: False)
 
 
 class TestDoctorPlatformHints:
@@ -958,6 +945,12 @@ def test_run_doctor_opencode_go_skips_invalid_models_probe(monkeypatch, tmp_path
 
 class TestGitHubTokenCheck:
     """Tests for GitHub token / gh auth detection in doctor."""
+
+    # This class *is* the test of the gh probe, so it opts out of the autouse
+    # stub in ``_stub_doctor_externals``. Each test below still keeps itself
+    # hermetic on its own -- two blank the PATH so the ``gh`` exec fails
+    # immediately, and the third mocks ``subprocess.run``.
+    exercises_real_gh_probe = True
 
     @staticmethod
     def _isolate_home(monkeypatch, home):
