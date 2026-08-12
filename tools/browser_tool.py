@@ -332,7 +332,10 @@ def _read_command_output_files(stdout_path: str, stderr_path: str) -> tuple[str,
     stdout = stderr = ""
     for path, slot in ((stdout_path, "stdout"), (stderr_path, "stderr")):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            # errors="replace": agent-browser can emit non-UTF-8 (cp932/OEM)
+            # diagnostic bytes on Windows — replacement preserves JSON parsing
+            # and redaction instead of raising UnicodeDecodeError.
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
                 text = f.read().strip()
         except OSError:
             continue
@@ -1197,7 +1200,7 @@ def _run_chrome_fallback_command(
             proc.wait()
             return {"success": False, "error": f"Chrome fallback '{cmd}' timed out"}
         try:
-            with open(stdout_path, "r", encoding="utf-8") as f:
+            with open(stdout_path, "r", encoding="utf-8", errors="replace") as f:
                 stdout = f.read().strip()
             if stdout:
                 return json.loads(stdout.split("\n")[-1])
@@ -2569,9 +2572,12 @@ def _run_browser_command(
             }
             # Fall through to fallback check below
         else:
-            with open(stdout_path, "r", encoding="utf-8") as f:
+            # errors="replace": agent-browser may emit non-UTF-8 (cp932/OEM)
+            # diagnostic bytes on Windows — replacement keeps JSON stdout
+            # parseable instead of raising UnicodeDecodeError.
+            with open(stdout_path, "r", encoding="utf-8", errors="replace") as f:
                 stdout = f.read()
-            with open(stderr_path, "r", encoding="utf-8") as f:
+            with open(stderr_path, "r", encoding="utf-8", errors="replace") as f:
                 stderr = f.read()
             returncode = proc.returncode
 

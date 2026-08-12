@@ -1,0 +1,7 @@
+name: web-bing-browser
+version: 1.0.0
+description: "Bing search + page extraction via the local agent-browser CLI — no API key. Requires the agent-browser CLI (install via `hermes tools` → Browser). Explicit opt-in: set web.search_backend / web.extract_backend / web.backend to bing-browser."
+author: NousResearch
+kind: backend
+provides_web_providers:
+  - bing-browser

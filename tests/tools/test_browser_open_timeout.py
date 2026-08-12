@@ -88,6 +88,66 @@ class TestReadCommandOutputFiles:
         assert stdout == "ok"
         assert stderr == "warn"
 
+    def test_invalid_utf8_bytes_are_replaced_not_fatal(self, tmp_path):
+        # Regression: agent-browser emits cp932/OEM diagnostic bytes (e.g. 0x82)
+        # on Japanese-locale Windows. Reads must not raise UnicodeDecodeError.
+        stdout_path = tmp_path / "out"
+        stderr_path = tmp_path / "err"
+        stdout_path.write_bytes(b'{"success": true}\n')
+        stderr_path.write_bytes(b"prefix\x82suffix")
+        stdout, stderr = bt._read_command_output_files(str(stdout_path), str(stderr_path))
+        assert stdout == '{"success": true}'
+        assert "prefix" in stderr and "suffix" in stderr
+        assert "\ufffd" in stderr  # invalid byte replaced, not fatal
+
+
+class TestRunBrowserCommandOutputDecoding:
+    def test_success_path_parses_json_stdout_with_invalid_utf8_stderr(
+        self, monkeypatch, tmp_path
+    ):
+        # Regression: on the success path, agent-browser stderr temp files can
+        # carry non-UTF-8 (cp932/OEM) bytes on Windows; the command must still
+        # parse the JSON stdout without raising UnicodeDecodeError.
+        socket_tmp = tmp_path / "sockets"
+        socket_tmp.mkdir()
+        monkeypatch.setattr(bt, "_find_agent_browser", lambda: "agent-browser")
+        monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda cmd: False)
+        monkeypatch.setattr(bt, "_is_local_mode", lambda: True)
+        monkeypatch.setattr(bt, "_chromium_installed", lambda: True)
+        monkeypatch.setattr(bt, "_get_browser_engine", lambda: "auto")
+        monkeypatch.setattr(
+            bt,
+            "_get_session_info",
+            lambda task_id: {"session_name": "test-session", "cdp_url": None},
+        )
+        monkeypatch.setattr(bt, "_is_headed_mode", lambda: False)
+        monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(socket_tmp))
+        monkeypatch.setattr(bt, "_write_owner_pid", lambda *a, **kw: None)
+        monkeypatch.setattr(bt, "_build_browser_env", lambda: {"PATH": "/usr/bin"})
+        monkeypatch.setattr(bt, "_merge_browser_path", lambda path: path)
+
+        task_socket_dir = socket_tmp / "agent-browser-test-session"
+        task_socket_dir.mkdir()
+        stdout_path = task_socket_dir / "_stdout_open"
+        stderr_path = task_socket_dir / "_stderr_open"
+
+        class FakePopen:
+            returncode = 0
+
+            def __init__(self, *args, **kwargs):
+                stdout_path.write_bytes(b'{"success": true, "data": {"title": "t"}}')
+                stderr_path.write_bytes(b"diag \x82 output")
+
+            def wait(self, timeout=None):
+                return 0
+
+        monkeypatch.setattr(bt.subprocess, "Popen", FakePopen)
+
+        result = bt._run_browser_command("task-1", "open")
+
+        assert result["success"] is True
+        assert result["data"]["title"] == "t"
+
 
 class TestBrowserNavigateOpenTimeout:
     def test_first_navigation_uses_first_open_timeout(self, monkeypatch):
