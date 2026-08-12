@@ -368,6 +368,8 @@ export interface Translations {
       terminalFontReset: string
       translucencyTitle: string
       translucencyDesc: string
+      minimizeToTrayTitle: string
+      minimizeToTrayDesc: string
       backdropTitle: string
       backdropDesc: string
       reactionsTitle: string
