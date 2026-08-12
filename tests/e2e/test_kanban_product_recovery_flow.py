@@ -357,6 +357,18 @@ def test_governed_product_story_recovers_through_release_and_done(
             text=True,
         )
         assert test_result.returncode == 0, test_result.stderr
+        contract = kb.repository_contract_for_board(board, repo_root=repo)
+        assert contract is not None
+        configured_verification = kb.run_verification(
+            contract.verification["story_integration"],
+            story_worktree,
+            source_sha=second_development_sha,
+            candidate_sha=second_development_sha,
+            contract_digest=contract.digest,
+            scope="story_integration",
+            subject_id=task_id,
+        )
+        assert configured_verification.status == "passed"
         passed_test = _claim(conn, task_id, board=board, claimer="tester-passed")
         test_pin = kb._prepare_test_target(
             conn, task_id, story_worktree, board=board

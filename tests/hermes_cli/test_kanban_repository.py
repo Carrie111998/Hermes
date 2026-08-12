@@ -378,6 +378,7 @@ def test_refresh_story_branch_advances_clean_story_by_isolated_cas(repository: P
     _commit(epic, "epic.txt", "epic\n", "epic change")
     _git(repository, "checkout", "story")
     before = _git(story, "rev-parse", "story")
+    remote_main_before = _git(repository, "rev-parse", "refs/remotes/origin/main")
 
     result = refresh_story_branch(_refresh_request(story, epic, story_sha=before))
 
@@ -387,6 +388,7 @@ def test_refresh_story_branch_advances_clean_story_by_isolated_cas(repository: P
     assert result.after_sha != before
     assert (story / "epic.txt").read_text(encoding="utf-8") == "epic\n"
     assert _git(story, "status", "--porcelain", "--untracked-files=all") == ""
+    assert _git(repository, "rev-parse", "refs/remotes/origin/main") == remote_main_before
 
 
 def test_refresh_story_branch_returns_dirty_evidence_without_touching_story(repository: Path, tmp_path: Path):
@@ -397,6 +399,7 @@ def test_refresh_story_branch_returns_dirty_evidence_without_touching_story(repo
     dirty = story / "operator-note.txt"
     dirty.write_text("keep me\n", encoding="utf-8")
     before = _git(story, "rev-parse", "story")
+    remote_main_before = _git(repository, "rev-parse", "refs/remotes/origin/main")
 
     result = refresh_story_branch(_refresh_request(story, epic, story_sha=before))
 
@@ -406,6 +409,7 @@ def test_refresh_story_branch_returns_dirty_evidence_without_touching_story(repo
     assert result.dirty_paths == ("operator-note.txt",)
     assert _git(story, "rev-parse", "story") == before
     assert dirty.read_text(encoding="utf-8") == "keep me\n"
+    assert _git(repository, "rev-parse", "refs/remotes/origin/main") == remote_main_before
 
 
 def test_refresh_story_branch_returns_conflict_and_retains_isolated_evidence(
@@ -418,6 +422,7 @@ def test_refresh_story_branch_returns_conflict_and_retains_isolated_evidence(
     _commit(epic, "shared.txt", "epic\n", "epic change")
     _git(repository, "checkout", "story")
     before = _git(story, "rev-parse", "story")
+    remote_main_before = _git(repository, "rev-parse", "refs/remotes/origin/main")
 
     result = refresh_story_branch(_refresh_request(story, epic, story_sha=before))
 
@@ -429,6 +434,7 @@ def test_refresh_story_branch_returns_conflict_and_retains_isolated_evidence(
     assert result.conflict_paths == ("shared.txt",)
     assert _git(story, "rev-parse", "story") == before
     assert _git(story, "status", "--porcelain", "--untracked-files=all") == ""
+    assert _git(repository, "rev-parse", "refs/remotes/origin/main") == remote_main_before
 
 
 def test_refresh_story_branch_returns_source_moved_evidence(repository: Path, tmp_path: Path):
@@ -437,6 +443,7 @@ def test_refresh_story_branch_returns_source_moved_evidence(repository: Path, tm
     _commit(epic, "epic.txt", "epic\n", "epic change")
     _git(repository, "checkout", "story")
     pinned_story_sha = _git(story, "rev-parse", "story")
+    remote_main_before = _git(repository, "rev-parse", "refs/remotes/origin/main")
     _commit(story, "story.txt", "moved\n", "move story source")
     moved_story_sha = _git(story, "rev-parse", "story")
 
@@ -448,6 +455,7 @@ def test_refresh_story_branch_returns_source_moved_evidence(repository: Path, tm
     assert result.before_sha == pinned_story_sha
     assert result.current_sha == moved_story_sha
     assert _git(story, "rev-parse", "story") == moved_story_sha
+    assert _git(repository, "rev-parse", "refs/remotes/origin/main") == remote_main_before
 
 
 def test_refresh_story_branch_detects_source_move_between_merge_and_cas(
@@ -709,3 +717,168 @@ def test_run_verification_process_error_is_infrastructure_error(
     assert len(result.steps) == 1
     assert result.steps[0].status == "infrastructure_error"
     assert result.steps[0].error == "process_error"
+
+
+def _git_dir(repo: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", "--git-dir", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+def _remote_fixture(tmp_path: Path) -> tuple[Path, Path, str]:
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main", str(seed)],
+        check=True,
+        capture_output=True,
+    )
+    _git(seed, "config", "user.email", "boundary@example.com")
+    _git(seed, "config", "user.name", "Boundary Fixture")
+    (seed / "dashboard").mkdir()
+    (seed / "dashboard" / "data.json").write_text("{}\n", encoding="utf-8")
+    (seed / "scripts").mkdir()
+    runner = seed / "scripts" / "run_tests.sh"
+    runner.write_text(
+        "#!/bin/sh\nset -eu\ntest -f story.txt\ntest -f epic.txt\n",
+        encoding="utf-8",
+    )
+    runner.chmod(0o755)
+    (seed / "README.md").write_text("boundary fixture\n", encoding="utf-8")
+    _git(seed, "add", ".")
+    _git(seed, "commit", "-m", "fixture: initialize repository boundary")
+    initial_sha = _git(seed, "rev-parse", "HEAD")
+
+    remote = tmp_path / "origin.git"
+    # Clone the seed into a bare fixture remote.  No push is needed for setup,
+    # and the production repository service still has no remote-write path.
+    subprocess.run(
+        ["git", "clone", "--bare", str(seed), str(remote)],
+        check=True,
+        capture_output=True,
+    )
+
+    local = tmp_path / "local"
+    subprocess.run(
+        ["git", "clone", str(remote), str(local)],
+        check=True,
+        capture_output=True,
+    )
+    _git(local, "config", "user.email", "boundary@example.com")
+    _git(local, "config", "user.name", "Boundary Fixture")
+    return remote, local, initial_sha
+
+
+def test_repository_boundary_refreshes_verifies_and_preserves_remote_refs(
+    tmp_path: Path,
+):
+    remote, repository, base_sha = _remote_fixture(tmp_path)
+    _git(repository, "branch", "epic")
+    _git(repository, "branch", "story")
+    _git(repository, "checkout", "epic")
+    epic_tip_sha = _commit(repository, "epic.txt", "epic\n", "fixture: advance epic")
+    _git(repository, "checkout", "story")
+    story_sha = _commit(repository, "story.txt", "story\n", "fixture: add story change")
+
+    metadata = {
+        "repository": {
+            "base_ref": "refs/remotes/origin/main",
+            "target_branch": "main",
+            "verification_profiles": {
+                "story_integration": [
+                    {
+                        "argv": ["bash", "scripts/run_tests.sh"],
+                        "workdir": ".",
+                        "timeout_seconds": 30,
+                    }
+                ],
+                "epic_release": [
+                    {
+                        "argv": ["bash", "scripts/run_tests.sh"],
+                        "workdir": ".",
+                        "timeout_seconds": 30,
+                    }
+                ],
+            },
+            "ci_observation": {
+                "provider": "github_actions",
+                "required_workflows": ["CI"],
+            },
+            "boundary_evidence": {
+                "test_globs": ["tests/**"],
+                "fixture_globs": ["tests/fixtures/**"],
+                "generated_paths": ["dashboard/data.json"],
+            },
+        }
+    }
+    contract = load_repository_contract(metadata, repo_root=repository)
+    assert resolve_commit(repository, contract.base_ref) == base_sha
+    assert _git(repository, "branch", "--show-current") == "story"
+    remote_refs_before = _git_dir(
+        remote,
+        "for-each-ref",
+        "--format=%(refname)=%(objectname)",
+        "refs/heads",
+    )
+    local_remote_base_before = _git(
+        repository, "rev-parse", "refs/remotes/origin/main"
+    )
+
+    refreshed = refresh_story_branch(
+        RefreshRequest(
+            repo_root=repository,
+            story_id="story-boundary",
+            story_worktree=repository,
+            story_branch="story",
+            story_sha=story_sha,
+            epic_branch="epic",
+            epic_tip_sha=epic_tip_sha,
+        )
+    )
+    assert refreshed.kind == "refreshed"
+    assert refreshed.before_sha == story_sha
+    assert refreshed.after_sha is not None
+    candidate_sha = refreshed.after_sha
+    assert candidate_sha == _git(repository, "rev-parse", "refs/heads/story")
+    assert candidate_sha != story_sha
+    assert _git(repository, "branch", "--show-current") == "story"
+
+    verification = run_verification(
+        contract.verification["story_integration"],
+        repository,
+        source_sha=candidate_sha,
+        candidate_sha=candidate_sha,
+        contract_digest=contract.digest,
+        scope="story_integration",
+        subject_id="story-boundary",
+    )
+    assert verification.status == "passed"
+    assert verification.source_sha == candidate_sha
+    assert verification.candidate_sha == candidate_sha
+
+    generated = repository / "dashboard" / "data.json"
+    generated.write_text("{\"evidence\": true}\n", encoding="utf-8")
+    evidence = inspect_evidence_workspace(
+        repository,
+        candidate_sha,
+        contract.generated_paths,
+    )
+    assert evidence.branch == "story"
+    assert evidence.branch_head == candidate_sha
+    assert evidence.undeclared_tracked == ()
+    assert evidence.declared_generated == (PurePosixPath("dashboard/data.json"),)
+    restore_generated_paths(repository, candidate_sha, evidence.declared_generated)
+    assert generated.read_text(encoding="utf-8") == "{}\n"
+    assert _git(repository, "status", "--porcelain", "--untracked-files=all") == ""
+
+    assert _git_dir(
+        remote,
+        "for-each-ref",
+        "--format=%(refname)=%(objectname)",
+        "refs/heads",
+    ) == remote_refs_before
+    assert _git(repository, "rev-parse", "refs/remotes/origin/main") == local_remote_base_before
