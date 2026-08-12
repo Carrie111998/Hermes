@@ -11,7 +11,7 @@ import logging
 import threading
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable, cast
 
 from hermes_constants import get_hermes_home
 
@@ -296,6 +296,41 @@ class RelayRuntime:
         )
         return result if isinstance(result, dict) else args
 
+    @staticmethod
+    def _flush_subscribers(subscribers: Any) -> None:
+        """Flush Relay subscribers safely from sync or async callers."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            subscribers.flush()
+            return
+
+        flush_async = getattr(subscribers, "flush_async", None)
+        if not callable(flush_async):
+            subscribers.flush()
+            return
+
+        failure: list[BaseException] = []
+
+        async def _await_flush() -> None:
+            await cast(Awaitable[Any], flush_async())
+
+        def _run() -> None:
+            try:
+                asyncio.run(_await_flush())
+            except BaseException as exc:
+                failure.append(exc)
+
+        worker = threading.Thread(
+            target=_run,
+            name="hermes-relay-subscriber-flush",
+            daemon=True,
+        )
+        worker.start()
+        worker.join()
+        if failure:
+            raise failure[0]
+
     def close_session(self, event: dict[str, Any]) -> None:
         """Close one session scope and remove it from the core registry."""
         session_id = _session_id(event)
@@ -327,7 +362,7 @@ class RelayRuntime:
                 except Exception as exc:
                     failures.append(f"session scope close failed: {exc}")
         try:
-            self.relay.subscribers.flush()
+            self._flush_subscribers(self.relay.subscribers)
         except Exception as exc:
             failures.append(f"subscriber flush failed: {exc}")
         with self._sessions_lock:
