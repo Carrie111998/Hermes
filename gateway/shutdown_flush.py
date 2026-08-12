@@ -338,6 +338,57 @@ def _order_flush_files(paths) -> list[tuple[Path, Optional[Dict[str, Any]]]]:
     return [(path, payload) for _key, path, payload in entries]
 
 
+def _transcript_append_kwargs(
+    session_id: str,
+    message: Dict[str, Any],
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build ``SessionDB.append_message`` kwargs for a spooled transcript row.
+
+    Mirrors ``SessionStore._append_transcript_message`` in
+    ``gateway/session.py`` field for field, so a message replayed after a
+    restart lands as the same row the live drain would have written.  The
+    fields are listed explicitly rather than splatted from *message*: the
+    spool payload is arbitrary JSON from disk and an unexpected key would
+    raise ``TypeError`` and abort the recovery pass.
+
+    ``timestamp`` keeps the payload-level ``ts`` fallback, which is the only
+    clock available when the message itself was spooled without one.
+    """
+    from agent.turn_context import extract_api_content_sidecar
+
+    role = message.get("role", "unknown")
+    # Reasoning columns are assistant-only in the live writer; copying them
+    # onto another role would fabricate rows the gateway never produces.
+    assistant_only = role == "assistant"
+
+    def _if_assistant(key: str) -> Any:
+        return message.get(key) if assistant_only else None
+
+    return {
+        "session_id": session_id,
+        "role": role,
+        "content": message.get("content"),
+        "tool_name": message.get("tool_name"),
+        "tool_calls": message.get("tool_calls"),
+        "tool_call_id": message.get("tool_call_id"),
+        "reasoning": _if_assistant("reasoning"),
+        "reasoning_content": _if_assistant("reasoning_content"),
+        "reasoning_details": _if_assistant("reasoning_details"),
+        "codex_reasoning_items": _if_assistant("codex_reasoning_items"),
+        "codex_message_items": _if_assistant("codex_message_items"),
+        "platform_message_id": (
+            message.get("platform_message_id") or message.get("message_id")
+        ),
+        "observed": bool(message.get("observed")),
+        "timestamp": message.get("timestamp") or payload.get("ts"),
+        # The api_content sidecar is the exact bytes sent to the API for this
+        # row; gateway/session.py requires it to survive "any gateway-side
+        # persistence path or the next turn's replay diverges at this row".
+        "api_content": extract_api_content_sidecar(message),
+    }
+
+
 def recover_pending_to_db(
     session_db=None,
 ) -> int:
@@ -398,10 +449,7 @@ def recover_pending_to_db(
                     )
                     continue
                 session_db.append_message(
-                    session_id=spooled_sid,
-                    role=message.get("role", "unknown"),
-                    content=message.get("content") or "",
-                    timestamp=message.get("timestamp") or payload.get("ts"),
+                    **_transcript_append_kwargs(spooled_sid, message, payload)
                 )
                 recovered += 1
                 path.unlink(missing_ok=True)
