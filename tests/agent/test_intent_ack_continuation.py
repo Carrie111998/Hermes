@@ -116,6 +116,44 @@ def test_all_path_drops_workspace_requirement():
     )
 
 
+# ── detector: multilingual future-ack ────────────────────────────────────────
+
+
+def test_portuguese_future_ack_detected_in_broad_mode():
+    a = _agent(True, "chat_completions")
+    msgs = [{"role": "user", "content": "verifique o status do servidor"}]
+    ack = "Vou verificar o status do servidor agora."
+    assert looks_like_codex_intermediate_ack(
+        a, "verifique", ack, msgs, require_workspace=False
+    )
+
+
+def test_portuguese_deixa_eu_detected():
+    a = _agent(True, "chat_completions")
+    msgs = [{"role": "user", "content": "revise o código"}]
+    ack = "Deixa eu revisar os arquivos do projeto."
+    assert looks_like_codex_intermediate_ack(
+        a, "revise", ack, msgs, require_workspace=False
+    )
+
+
+def test_portuguese_without_action_verb_not_detected():
+    a = _agent(True, "chat_completions")
+    msgs = [{"role": "user", "content": "oi"}]
+    ack = "Vou pensar sobre isso."  # future-ack but no action verb
+    assert not looks_like_codex_intermediate_ack(
+        a, "oi", ack, msgs, require_workspace=False
+    )
+
+
+def test_english_still_detected():
+    a = _agent(True, "chat_completions")
+    msgs = [{"role": "user", "content": REPRO_USER}]
+    assert looks_like_codex_intermediate_ack(
+        a, REPRO_USER, REPRO_ACK, msgs, require_workspace=False
+    )
+
+
 # ── detector: guardrails that hold regardless of workspace ───────────────────
 
 

@@ -3526,7 +3526,12 @@ def looks_like_codex_intermediate_ack(
         return False
 
     has_future_ack = bool(
-        re.search(r"\b(i['’]ll|i will|let me|i can do that|i can help with that)\b", assistant_text)
+        re.search(
+            r"\b(i['’]ll|i will|let me|i can do that|i can help with that"
+            r"|vou|deixa eu|deixo eu|posso fazer isso|posso ajudar com isso"
+            r"|voy a|puedo hacer eso)\b",
+            assistant_text,
+        )
     )
     if not has_future_ack:
         return False
@@ -3551,6 +3556,23 @@ def looks_like_codex_intermediate_ack(
         "walkthrough",
         "report back",
         "summarize",
+        # Portuguese (pt-BR) action verbs.
+        "investigar",
+        "verificar",
+        "analisar",
+        "revisar",
+        "explorar",
+        "abrir",
+        "rodar",
+        "executar",
+        "testar",
+        "corrigir",
+        "depurar",
+        "buscar",
+        "procurar",
+        "encontrar",
+        "resumir",
+        "olhar",
     )
     workspace_markers = (
         "directory",
