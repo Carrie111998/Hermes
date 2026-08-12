@@ -33,6 +33,7 @@ from gateway.platforms.base import (
     MessageType,
 )
 from gateway.session import SessionSource, build_session_key
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 
 class _StubAdapter(BasePlatformAdapter):
@@ -93,7 +94,7 @@ async def test_pending_drain_keeps_active_session_guard_live():
     await adapter.handle_message(_make_event(text="M1"))
 
     # Wait until M1 is actively running inside the handler.
-    await asyncio.wait_for(first_started.wait(), timeout=1.0)
+    await asyncio.wait_for(first_started.wait(), timeout=HANG_GUARD_S)
 
     # Assert: session is active.
     assert sk in adapter._active_sessions

@@ -27,6 +27,7 @@ _ensure_telegram_mock()
 
 from plugins.platforms.telegram import adapter as tg_adapter  # noqa: E402
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 
 @pytest.mark.asyncio
@@ -129,7 +130,7 @@ async def test_await_with_thread_deadline_abandons_and_runs_cleanup_on_timeout()
     # Returned control promptly — well before the wedged coroutine's ~1s span.
     assert elapsed < 0.8
     # The detached cleanup was scheduled; give the loop a tick to run it.
-    await _asyncio.wait_for(cleanup_ran.wait(), timeout=2.0)
+    await _asyncio.wait_for(cleanup_ran.wait(), timeout=HANG_GUARD_S)
     assert cleanup_ran.is_set()
 
 

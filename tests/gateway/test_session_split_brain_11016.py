@@ -29,6 +29,7 @@ from gateway.platforms.base import (
 )
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +219,7 @@ class TestAdapterSessionCancellation:
 
         allow_command_finish.set()
         await command_task
-        await asyncio.wait_for(follow_up_processed.wait(), timeout=1.0)
+        await asyncio.wait_for(follow_up_processed.wait(), timeout=HANG_GUARD_S)
 
         assert any("handled:new" in r for r in adapter.sent_responses)
         assert call_order.index("command:end") < call_order.index("original:cancelled")

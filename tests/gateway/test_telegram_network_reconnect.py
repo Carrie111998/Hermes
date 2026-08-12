@@ -37,6 +37,7 @@ _ensure_telegram_mock()
 
 from plugins.platforms.telegram import adapter as tg_adapter  # noqa: E402
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 
 @pytest.fixture(autouse=True)
@@ -411,7 +412,7 @@ async def test_heartbeat_force_escalates_wedged_recovery_task(monkeypatch):
     monkeypatch.setattr(tg_adapter.time, "monotonic", lambda: clock[0])
 
     with patch("asyncio.sleep", new=AsyncMock(side_effect=_fake_sleep)):
-        await asyncio.wait_for(adapter._polling_heartbeat_loop(), timeout=5)
+        await asyncio.wait_for(adapter._polling_heartbeat_loop(), timeout=HANG_GUARD_S)
 
     assert adapter.has_fatal_error, "wedged recovery task must force a fatal escalation"
     adapter._notify_fatal_error.assert_awaited()

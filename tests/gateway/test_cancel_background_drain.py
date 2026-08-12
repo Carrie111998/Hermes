@@ -16,6 +16,7 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 
 class _StubAdapter(BasePlatformAdapter):
@@ -83,7 +84,7 @@ async def test_cancel_background_tasks_drains_late_arrivals():
 
     # Spawn M1.
     await adapter.handle_message(_event("M1"))
-    await asyncio.wait_for(m1_started.wait(), timeout=1.0)
+    await asyncio.wait_for(m1_started.wait(), timeout=HANG_GUARD_S)
 
     # Kick off shutdown.  This will cancel M1 and await its cleanup.
     cancel_task = asyncio.create_task(adapter.cancel_background_tasks())
@@ -92,7 +93,7 @@ async def test_cancel_background_tasks_drains_late_arrivals():
     # This is the race window: cancel_task is awaiting gather, M1 is
     # shielded in cleanup, the _active_sessions entry has been cleared
     # by M1's own finally.
-    await asyncio.wait_for(m1_cleanup_running.wait(), timeout=1.0)
+    await asyncio.wait_for(m1_cleanup_running.wait(), timeout=HANG_GUARD_S)
 
     # Clear the active-session entry (M1's finally hasn't fully run yet,
     # but in production the platform dispatcher would deliver a new
@@ -104,11 +105,11 @@ async def test_cancel_background_tasks_drains_late_arrivals():
     # task and adds it to _background_tasks while cancel_task is still
     # in gather.
     await adapter.handle_message(_event("M2"))
-    await asyncio.wait_for(m2_started.wait(), timeout=1.0)
+    await asyncio.wait_for(m2_started.wait(), timeout=HANG_GUARD_S)
 
     # Let cancel_task finish.  Round 1's gather completes when M1's
     # shielded cleanup finishes.  Round 2 should pick up M2.
-    await asyncio.wait_for(cancel_task, timeout=5.0)
+    await asyncio.wait_for(cancel_task, timeout=HANG_GUARD_S)
 
     # Assert M2 was drained, not leaked.
     assert m2_cancelled.is_set(), (

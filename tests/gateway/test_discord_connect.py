@@ -70,6 +70,7 @@ _ensure_discord_mock()
 
 import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 
 @pytest.fixture(autouse=True)
@@ -476,12 +477,12 @@ async def test_connect_does_not_wait_for_slash_sync(monkeypatch):
     # ready-versus-post-connect-sync behavior.
     monkeypatch.setattr(adapter, "_register_slash_commands", lambda: None)
 
-    ok = await asyncio.wait_for(adapter.connect(), timeout=1.0)
+    ok = await asyncio.wait_for(adapter.connect(), timeout=HANG_GUARD_S)
 
     assert ok is True
     assert adapter._ready_event.is_set()
 
-    await asyncio.wait_for(created["bot"].tree.started.wait(), timeout=1.0)
+    await asyncio.wait_for(created["bot"].tree.started.wait(), timeout=HANG_GUARD_S)
     assert created["bot"].tree.sync.await_count == 1
 
     created["bot"].tree.allow_finish.set()

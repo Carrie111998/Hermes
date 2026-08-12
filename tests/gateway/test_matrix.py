@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch, AsyncMock
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageType
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 
 def _make_fake_mautrix():
@@ -1498,9 +1499,9 @@ class TestMatrixAccessTokenAuth:
         with patch.dict("sys.modules", fake_mautrix_mods):
             with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
                 with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
-                    assert await asyncio.wait_for(adapter.connect(), timeout=1) is True
+                    assert await asyncio.wait_for(adapter.connect(), timeout=HANG_GUARD_S) is True
 
-        await asyncio.wait_for(join_started.wait(), timeout=1)
+        await asyncio.wait_for(join_started.wait(), timeout=HANG_GUARD_S)
         assert "!dead:example.org" in adapter._invite_join_tasks
 
         await adapter.disconnect()
@@ -2225,7 +2226,7 @@ class TestMatrixSyncLoop:
         adapter._client = fake_client
 
         await adapter._sync_loop()
-        await asyncio.wait_for(join_started.wait(), timeout=1)
+        await asyncio.wait_for(join_started.wait(), timeout=HANG_GUARD_S)
 
         assert "!dead:example.org" not in adapter._joined_rooms
         assert "!dead:example.org" in adapter._invite_join_tasks

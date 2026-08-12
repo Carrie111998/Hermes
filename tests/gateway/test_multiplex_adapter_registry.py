@@ -10,6 +10,7 @@ import pytest
 import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.run import GatewayRunner
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 
 class _FakeAdapter:
@@ -311,7 +312,7 @@ class TestSecondaryProfileFatalRecovery:
         await connect_started.wait()
         runner._running = False
         release_connect.set()
-        await asyncio.wait_for(task, timeout=0.2)
+        await asyncio.wait_for(task, timeout=HANG_GUARD_S)
 
         assert runner._profile_adapters == {}
         assert replacement.disconnected is True

@@ -9,6 +9,7 @@ import pytest
 from gateway.config import PlatformConfig
 from plugins.platforms.telegram import adapter as tg_adapter
 from plugins.platforms.telegram.adapter import TelegramAdapter
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 
 class _ControlledRequest:
@@ -193,7 +194,7 @@ async def test_webhook_disconnect_polling_reconnect_resets_mode_and_waits_for_pr
         assert adapter._webhook_mode is False
         assert adapter._polling_heartbeat_task is not None
         assert not adapter._polling_heartbeat_task.done()
-        await asyncio.wait_for(heartbeat_started.wait(), timeout=1)
+        await asyncio.wait_for(heartbeat_started.wait(), timeout=HANG_GUARD_S)
         assert heartbeat_modes == [False]
         assert adapter._send_path_degraded is True
 
@@ -201,7 +202,7 @@ async def test_webhook_disconnect_polling_reconnect_resets_mode_and_waits_for_pr
         polling_request = builders[1].polling_request
         polling_request.result = (200, b'{"ok":true,"result":[]}')
         await _request_for_generation(generation, polling_request, "getUpdates")
-        await asyncio.wait_for(adapter._polling_progress_verifier_task, timeout=1)
+        await asyncio.wait_for(adapter._polling_progress_verifier_task, timeout=HANG_GUARD_S)
         assert adapter._send_path_degraded is False
     finally:
         await adapter.disconnect()
@@ -476,7 +477,7 @@ async def test_matching_get_updates_progress_heals_and_stops_verifier(monkeypatc
     await _request_for_generation(
         adapter._polling_generation, request, "getUpdates"
     )
-    await asyncio.wait_for(verifier, timeout=1)
+    await asyncio.wait_for(verifier, timeout=HANG_GUARD_S)
 
     assert adapter._send_path_degraded is False
     assert verifier.done()
@@ -496,7 +497,7 @@ async def test_general_path_success_without_get_updates_progress_recovers_once(m
         error_callback=MagicMock(),
     )
     verifier = adapter._polling_progress_verifier_task
-    await asyncio.wait_for(verifier, timeout=1)
+    await asyncio.wait_for(verifier, timeout=HANG_GUARD_S)
 
     assert adapter._app.bot.get_me.await_count == 1
     recovery.assert_called_once()
@@ -527,7 +528,7 @@ async def test_general_path_error_only_recovers_connectivity_failures(
         drop_pending_updates=False,
         error_callback=MagicMock(),
     )
-    await asyncio.wait_for(adapter._polling_progress_verifier_task, timeout=1)
+    await asyncio.wait_for(adapter._polling_progress_verifier_task, timeout=HANG_GUARD_S)
 
     assert recovery.called is should_recover
     if should_recover:
@@ -564,7 +565,7 @@ async def test_retry_start_requires_matching_progress_to_heal(monkeypatch, retry
         _ControlledRequest(result=(200, b'{"ok":true,"result":[]}'))
     )
     await _request_for_generation(generation, request, "getUpdates")
-    await asyncio.wait_for(verifier, timeout=1)
+    await asyncio.wait_for(verifier, timeout=HANG_GUARD_S)
     assert adapter._polling_network_error_count == 0
     assert adapter._polling_conflict_count == 0
     assert adapter._send_path_degraded is False

@@ -22,9 +22,10 @@ import threading
 import time
 
 import pytest
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 
-def _wait_for(predicate, timeout=5.0, interval=0.02):
+def _wait_for(predicate, timeout=HANG_GUARD_S, interval=0.02):
     """Bounded wait-until — never a fixed sleep (events invariant #4)."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

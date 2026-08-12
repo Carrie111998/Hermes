@@ -21,6 +21,7 @@ import pytest
 
 from gateway.config import Platform
 from gateway.run import GatewayRunner
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 
 @pytest.fixture
@@ -61,7 +62,7 @@ async def test_teardown_bounds_hanging_disconnect(bare_runner, monkeypatch, capl
     with caplog.at_level(logging.WARNING, logger="gateway.run"):
         await asyncio.wait_for(
             bare_runner._bounded_adapter_teardown(adapter, Platform.FEISHU),
-            timeout=5.0,  # the helper itself must return well under this
+            timeout=HANG_GUARD_S,  # the helper itself must return well under this
         )
 
     adapter.disconnect.assert_awaited_once()
@@ -83,7 +84,7 @@ async def test_teardown_bounds_hanging_cancel(bare_runner, monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="gateway.run"):
         await asyncio.wait_for(
             bare_runner._bounded_adapter_teardown(adapter, Platform.FEISHU),
-            timeout=5.0,
+            timeout=HANG_GUARD_S,
         )
 
     assert "feishu background-task cancel timed out" in caplog.text

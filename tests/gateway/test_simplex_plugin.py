@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 _simplex = load_plugin_adapter("simplex")
 
@@ -367,7 +368,7 @@ async def test_health_monitor_does_not_reconnect_quiet_healthy_ws(monkeypatch):
     task = asyncio.create_task(adapter._health_monitor())
     await asyncio.sleep(0.03)
     adapter._running = False
-    await asyncio.wait_for(task, timeout=1)
+    await asyncio.wait_for(task, timeout=HANG_GUARD_S)
 
     adapter._ws.close.assert_not_called()
 

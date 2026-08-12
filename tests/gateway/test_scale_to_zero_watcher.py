@@ -16,6 +16,7 @@ import time
 import pytest
 
 from gateway.run import GatewayRunner
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 
 class _FakeRelayAdapter:
@@ -77,7 +78,7 @@ async def test_watcher_goes_dormant_when_idle(monkeypatch):
         "watcher never called go_dormant() on an idle, armed runner",
     )
     r._running = False
-    await asyncio.wait_for(task, timeout=2)
+    await asyncio.wait_for(task, timeout=HANG_GUARD_S)
     assert adapter.go_dormant_calls >= 1
     # After driving dormant, a re-arm cooldown is set (0.F).
     assert r._scale_to_zero_cooldown_until > time.time()
@@ -89,7 +90,7 @@ async def test_watcher_does_not_go_dormant_when_busy(monkeypatch):
     task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
     await asyncio.sleep(0.1)
     r._running = False
-    await asyncio.wait_for(task, timeout=2)
+    await asyncio.wait_for(task, timeout=HANG_GUARD_S)
     assert adapter.go_dormant_calls == 0
 
 
@@ -101,7 +102,7 @@ async def test_watcher_respects_cooldown(monkeypatch):
     task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
     await asyncio.sleep(0.1)
     r._running = False
-    await asyncio.wait_for(task, timeout=2)
+    await asyncio.wait_for(task, timeout=HANG_GUARD_S)
     assert adapter.go_dormant_calls == 0
 
 
@@ -112,7 +113,7 @@ async def test_watcher_noop_when_no_relay_adapter(monkeypatch):
     task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
     await asyncio.sleep(0.1)
     r._running = False
-    await asyncio.wait_for(task, timeout=2)
+    await asyncio.wait_for(task, timeout=HANG_GUARD_S)
     # No exception, loop exits cleanly — nothing to assert beyond survival.
 
 

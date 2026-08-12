@@ -13,6 +13,7 @@ import gateway.platforms.base as base_platform
 from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -1278,7 +1279,7 @@ async def test_base_processing_stops_typing_before_hung_post_delivery_callback(
     adapter._post_delivery_callbacks[session_key] = _post_delivery_cb
 
     await asyncio.wait_for(
-        adapter._process_message_background(event, session_key), timeout=1.0
+        adapter._process_message_background(event, session_key), timeout=HANG_GUARD_S
     )
 
     assert [call["content"] for call in adapter.sent] == ["done"]
@@ -1430,7 +1431,7 @@ async def test_keep_typing_stops_immediately_when_interrupt_event_is_set():
     )
     await asyncio.sleep(0.05)
     stop_event.set()
-    await asyncio.wait_for(task, timeout=0.5)
+    await asyncio.wait_for(task, timeout=HANG_GUARD_S)
 
     normal_typing_calls = [
         call for call in adapter.typing if call.get("metadata") != {"stopped": True}

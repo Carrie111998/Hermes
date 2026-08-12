@@ -28,6 +28,7 @@ import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
 from gateway.config import Platform, PlatformConfig  # noqa: E402
 from gateway.run import GatewayRunner  # noqa: E402
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 
 class _LiveBot(FakeBot):
@@ -477,8 +478,8 @@ async def test_liveness_recovery_not_blocked_by_hanging_client_close(monkeypatch
         retryable=True,
     )
     notify_task = asyncio.create_task(adapter._notify_liveness_fatal_error(wedged))
-    await asyncio.wait_for(close_started.wait(), timeout=0.5)
-    await asyncio.wait_for(notify_task, timeout=2.0)
+    await asyncio.wait_for(close_started.wait(), timeout=HANG_GUARD_S)
+    await asyncio.wait_for(notify_task, timeout=HANG_GUARD_S)
     assert close_started.is_set() is True
     assert handler.await_count == 1
     assert adapter.fatal_error_code == "discord_websocket_health_stale"
@@ -559,12 +560,12 @@ async def test_liveness_close_timeout_aborts_aiohttp_transport_before_fatal_noti
     )
     notify_task = asyncio.create_task(adapter._notify_liveness_fatal_error(client))
 
-    await asyncio.wait_for(close_started.wait(), timeout=0.5)
+    await asyncio.wait_for(close_started.wait(), timeout=HANG_GUARD_S)
     done, _pending = await asyncio.wait({notify_task}, timeout=1.5)
     finished_within_bound = notify_task in done
     release_close.set()
     if not notify_task.done():
-        await asyncio.wait_for(notify_task, timeout=0.5)
+        await asyncio.wait_for(notify_task, timeout=HANG_GUARD_S)
 
     assert finished_within_bound is True
     transport.abort.assert_called_once_with()

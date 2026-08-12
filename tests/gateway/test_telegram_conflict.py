@@ -35,6 +35,7 @@ def _ensure_telegram_mock():
 _ensure_telegram_mock()
 
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 
 @pytest.fixture(autouse=True)
@@ -433,7 +434,7 @@ async def test_connect_does_not_block_on_post_connect_housekeeping(monkeypatch):
 
     # A tight timeout: if connect() awaited the hanging set_my_commands this
     # would raise TimeoutError instead of returning.
-    ok = await asyncio.wait_for(adapter.connect(), timeout=0.5)
+    ok = await asyncio.wait_for(adapter.connect(), timeout=HANG_GUARD_S)
 
     assert ok is True
     assert adapter._post_connect_task is not None

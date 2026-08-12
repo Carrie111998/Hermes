@@ -32,6 +32,7 @@ from gateway.platforms.base import (
     PlatformConfig,
     SendResult,
 )
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 
 class _StubAdapter(BasePlatformAdapter):
@@ -84,7 +85,7 @@ class TestKeepTypingTimeoutPerTick:
         await asyncio.sleep(3.0)
         stop_event.set()
         try:
-            await asyncio.wait_for(task, timeout=2.0)
+            await asyncio.wait_for(task, timeout=HANG_GUARD_S)
         except asyncio.TimeoutError:
             task.cancel()
             pytest.fail(
@@ -127,7 +128,7 @@ class TestKeepTypingTimeoutPerTick:
         )
         await asyncio.sleep(1.2)  # ~3 ticks
         stop_event.set()
-        await asyncio.wait_for(task, timeout=1.0)
+        await asyncio.wait_for(task, timeout=HANG_GUARD_S)
 
         assert len(completed) >= 2, (
             f"expected multiple completed send_typing calls, got "
@@ -161,7 +162,7 @@ class TestKeepTypingTimeoutPerTick:
         )
         await asyncio.sleep(1.0)
         stop_event.set()
-        await asyncio.wait_for(task, timeout=1.0)
+        await asyncio.wait_for(task, timeout=HANG_GUARD_S)
 
         assert tick_count["n"] >= 2, (
             f"loop exited after first send_typing exception; expected it to "
@@ -193,7 +194,7 @@ class TestKeepTypingTimeoutPerTick:
         )
         await asyncio.sleep(1.0)
         stop_event.set()
-        await asyncio.wait_for(task, timeout=1.0)
+        await asyncio.wait_for(task, timeout=HANG_GUARD_S)
 
         assert calls == [], (
             f"send_typing was called on a paused chat: {calls}"

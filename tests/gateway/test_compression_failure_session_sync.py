@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import gateway.run as gateway_run
 from gateway.config import Platform
 from gateway.session import SessionSource
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 
 SESSION_KEY = "agent:main:telegram:dm:12345"
@@ -151,7 +152,7 @@ def _run_compression_failure_turn(runner, source, *, run_generation=None):
                 session_key=SESSION_KEY,
                 run_generation=run_generation,
             ),
-            timeout=2,
+            timeout=HANG_GUARD_S,
         )
     )
 

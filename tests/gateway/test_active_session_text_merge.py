@@ -37,6 +37,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.session import SessionSource, build_session_key
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 
 def _make_event(
@@ -205,7 +206,7 @@ async def test_active_drain_force_flushes_debounce_before_release():
 
     task = asyncio.create_task(adapter._process_message_background(current, session_key))
     adapter._session_tasks[session_key] = task
-    await asyncio.wait_for(task, timeout=1.0)
+    await asyncio.wait_for(task, timeout=HANG_GUARD_S)
 
     for _ in range(20):
         if processed == ["current", "follow up"] and session_key not in adapter._active_sessions:

@@ -21,6 +21,7 @@ import types
 import pytest
 
 import gateway.run as run
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 
 class _RecordingSessionDB:
@@ -102,7 +103,7 @@ async def _run_one_tick(fake, monkeypatch):
     monkeypatch.setattr(run.asyncio, "sleep", _no_sleep)
     # Bind the real (patched) method onto our minimal stand-in.
     coro = run.GatewayRunner._handoff_watcher(fake, interval=0.0)
-    await asyncio.wait_for(coro, timeout=5)
+    await asyncio.wait_for(coro, timeout=HANG_GUARD_S)
 
 
 @pytest.mark.asyncio

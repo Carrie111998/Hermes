@@ -25,6 +25,7 @@ from gateway.platforms.api_server import (
     security_headers_middleware,
 )
 from tools import approval as approval_mod
+from tests.gateway.hang_guards import HANG_GUARD_S
 
 
 # ---------------------------------------------------------------------------
@@ -831,7 +832,7 @@ class TestStopRun:
                 assert stop_resp.status == 200
 
                 # Events stream should close
-                events_resp = await asyncio.wait_for(events_task, timeout=5.0)
+                events_resp = await asyncio.wait_for(events_task, timeout=HANG_GUARD_S)
                 assert events_resp.status == 200
                 body = await events_resp.text()
                 # Stream should have received run.failed and closed
