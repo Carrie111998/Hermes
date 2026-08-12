@@ -312,18 +312,21 @@ describe('Hermes REST helpers', () => {
   })
 
   it('uses a source-qualified query route only for legacy custom endpoints', async () => {
+    setApiRequestProfile('xiaoxuxu')
     await deleteCustomEndpoint('legacy-2-a/b', 'custom_providers')
 
     expect(api).toHaveBeenLastCalledWith({
       method: 'DELETE',
-      path: '/api/providers/custom-endpoints?endpoint_id=legacy-2-a%2Fb&source=custom_providers'
+      path: '/api/providers/custom-endpoints?endpoint_id=legacy-2-a%2Fb&source=custom_providers',
+      profile: 'xiaoxuxu'
     })
 
     await deleteCustomEndpoint('modern', 'providers')
 
     expect(api).toHaveBeenLastCalledWith({
       method: 'DELETE',
-      path: '/api/providers/custom-endpoints/modern'
+      path: '/api/providers/custom-endpoints/modern',
+      profile: 'xiaoxuxu'
     })
   })
 

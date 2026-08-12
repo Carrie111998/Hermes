@@ -2247,6 +2247,42 @@ class TestWebServerEndpoints:
         assert resp.status_code == 404
         assert load_config() == before
 
+    def test_deleting_legacy_endpoint_scopes_to_requested_profile(self):
+        from hermes_cli import profiles as profiles_mod
+
+        worker_home = profiles_mod.get_profile_dir("worker")
+        worker_home.mkdir(parents=True)
+        worker_config = worker_home / "config.yaml"
+        worker_config.write_text(
+            yaml.safe_dump({
+                "custom_providers": [{
+                    "name": "Worker Legacy",
+                    "base_url": "https://worker.example/v1",
+                }],
+            }),
+            encoding="utf-8",
+        )
+
+        endpoints = self.client.get(
+            "/api/providers/custom-endpoints?profile=worker"
+        ).json()["endpoints"]
+        endpoint = next(row for row in endpoints if row["name"] == "Worker Legacy")
+        resp = self.client.request(
+            "DELETE",
+            "/api/providers/custom-endpoints",
+            params={
+                "endpoint_id": endpoint["id"],
+                "source": endpoint["source"],
+                "profile": "worker",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["endpoints"] == []
+        assert yaml.safe_load(worker_config.read_text(encoding="utf-8"))[
+            "custom_providers"
+        ] == []
+
     def test_bare_custom_legacy_delete_only_detaches_matching_base_url(self):
         from hermes_cli.config import load_config, save_config
 
