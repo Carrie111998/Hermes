@@ -242,7 +242,11 @@ def test_reader_loop_streams_incremental_chunks_from_read1(registry, monkeypatch
 
     monkeypatch.setattr(registry, "_check_watch_patterns", lambda _s, _c: None)
     monkeypatch.setattr(registry, "_emit_output", lambda _s, chunk: emitted.append(chunk))
-    monkeypatch.setattr(registry, "_move_to_finished", lambda _s: moved.append(_s.id))
+    monkeypatch.setattr(
+        registry,
+        "_move_to_finished",
+        lambda _s, **_kw: moved.append(_s.id),
+    )
 
     registry._reader_loop(session)
 
@@ -1225,7 +1229,7 @@ class TestKillProcess:
             "_terminate_host_pid",
             lambda pid, expected_start=None: terminate_calls.append((pid, expected_start)),
         )
-        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda **_kw: None)
 
         result = registry.kill_process(s.id)
 

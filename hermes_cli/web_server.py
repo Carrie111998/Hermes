@@ -9941,14 +9941,30 @@ def _new_oauth_session(
     flow: str,
     profile: Optional[str] = None,
 ) -> tuple[str, Dict[str, Any]]:
-    """Create + register a new OAuth session, return (session_id, session_dict)."""
+    """Create + register a new OAuth session, return (session_id, session_dict).
+
+    The session's ``hermes_home`` is captured HERE — at request time, the
+    moment it is fixed. Device-code pollers run for up to ~15 minutes on
+    a daemon thread and then write the auth store; when no profile is named,
+    ``_profile_scope`` installs no override, so without this capture the write
+    resolves whatever ``HERMES_HOME`` holds when the flow finally completes.
+    Same shape as ``DashboardOAuthFlow.hermes_home`` (GBrain
+    ``concepts/import-time-hermes-home-snapshot-bug``).
+    """
     sid = secrets.token_urlsafe(16)
     profile_name = _oauth_profile_name(profile)
+    try:
+        # Resolving only — never creating, and never raising: a login must not
+        # fail because the home could not be resolved.
+        captured_home = str(get_hermes_home().expanduser().resolve(strict=False))
+    except Exception:
+        captured_home = None
     sess = {
         "session_id": sid,
         "provider": provider_id,
         "flow": flow,
         "profile": profile_name,
+        "hermes_home": captured_home,
         "created_at": time.time(),
         "status": "pending",  # pending | approved | denied | expired | error
         "error_message": None,
@@ -9967,6 +9983,17 @@ def _oauth_session_profile(
         sess = _oauth_sessions.get(session_id)
         profile = sess.get("profile") if sess else None
     return profile or _oauth_profile_name(fallback)
+
+
+def _oauth_session_home(session_id: str) -> Optional[str]:
+    """Return the HERMES_HOME captured when an OAuth session was created.
+
+    None means "resolve live" — the session predates the capture, or the home
+    could not be resolved at request time.
+    """
+    with _oauth_sessions_lock:
+        sess = _oauth_sessions.get(session_id)
+        return sess.get("hermes_home") if sess else None
 
 
 def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_at_ms: int) -> None:
@@ -10391,7 +10418,10 @@ def _nous_poller(session_id: str) -> None:
             ),
             "expires_in": token_ttl,
         }
-        with _profile_scope(_oauth_session_profile(session_id)):
+        with _profile_scope(
+            _oauth_session_profile(session_id),
+            hermes_home=_oauth_session_home(session_id),
+        ):
             full_state = refresh_nous_oauth_from_state(
                 auth_state,
                 timeout_seconds=15.0,
@@ -10481,7 +10511,10 @@ def _minimax_poller(session_id: str) -> None:
             ).isoformat(),
             "expires_in": expires_in_s,
         }
-        with _profile_scope(_oauth_session_profile(session_id)):
+        with _profile_scope(
+            _oauth_session_profile(session_id),
+            hermes_home=_oauth_session_home(session_id),
+        ):
             _minimax_save_auth_state(auth_state)
         with _oauth_sessions_lock:
             sess["status"] = "approved"
@@ -10530,7 +10563,10 @@ def _xai_device_poller(session_id: str) -> None:
             "expires_in": token_data.get("expires_in"),
             "token_type": str(token_data.get("token_type") or "Bearer").strip() or "Bearer",
         }
-        with _profile_scope(_oauth_session_profile(session_id)):
+        with _profile_scope(
+            _oauth_session_profile(session_id),
+            hermes_home=_oauth_session_home(session_id),
+        ):
             _save_xai_oauth_tokens(
                 tokens,
                 discovery=discovery,
@@ -10707,7 +10743,10 @@ def _codex_full_login_worker(session_id: str) -> None:
 
         from hermes_cli.auth import _save_codex_tokens
 
-        with _profile_scope(_oauth_session_profile(session_id)):
+        with _profile_scope(
+            _oauth_session_profile(session_id),
+            hermes_home=_oauth_session_home(session_id),
+        ):
             _save_codex_tokens({
                 "access_token": access_token,
                 "refresh_token": refresh_token,
@@ -14876,7 +14915,7 @@ _SKILLS_PROFILE_LOCK = threading.RLock()
 
 
 @contextmanager
-def _profile_scope(profile: Optional[str]):
+def _profile_scope(profile: Optional[str], *, hermes_home: Optional[str] = None):
     """Scope config + skill-directory resolution to ``profile`` for one request.
 
     Two seams must be redirected for skills/toolsets endpoints:
@@ -14896,6 +14935,13 @@ def _profile_scope(profile: Optional[str]):
     live home even when the import-time binding is stale (e.g. the process
     imported the modules before a HERMES_HOME override, or under test
     isolation).
+
+    ``hermes_home`` is a home captured earlier, by a caller whose work
+    outlives the scope that fixed it (the device-code OAuth pollers, which
+    finish up to ~15 minutes after their request). It applies only to the
+    "dashboard's own profile" case above — a named ``profile`` is a stronger
+    statement of intent and still wins. Callers running on the request thread
+    pass nothing and resolve live, which stays correct.
     """
     requested = (profile or "").strip()
 
@@ -14909,7 +14955,11 @@ def _profile_scope(profile: Optional[str]):
 
     token = None
     if not requested or requested.lower() == "current":
-        profile_dir = get_hermes_home()
+        if hermes_home:
+            profile_dir = Path(hermes_home)
+            token = set_hermes_home_override(hermes_home)
+        else:
+            profile_dir = get_hermes_home()
     else:
         profile_dir = _resolve_profile_dir(requested)
         token = set_hermes_home_override(str(profile_dir))
