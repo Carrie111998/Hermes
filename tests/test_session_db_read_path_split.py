@@ -1,16 +1,15 @@
-"""Tests for the SessionDB read-path split (bounded pooled readers).
+"""Tests for the SessionDB read-path split (pooled read-only connections).
 
 The gateway shares ONE SessionDB across every agent, so recall/browse reads
 used to queue behind writer flushes on self._lock — a measured production
 convoy (a 0.2s FTS query stretched to 112s while 6-8 concurrent turns
 flushed tool results). These tests pin the new contract: reads run on a
-leased read-only connection under WAL, never touch self._lock when pool capacity
-is available, and fall back to the legacy locked path when WAL or a reader is
-unavailable.
+read-only connection borrowed from a bounded pool under WAL, never touch
+self._lock, and fall back to the legacy locked path when WAL or the read
+connection is missing.
 """
 
 import threading
-from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -27,99 +26,33 @@ def db(tmp_path):
     d.close()
 
 
-def test_read_pool_reuses_connections_across_short_lived_threads(db):
-    """Completed executor threads must not leave one reader each behind."""
-    db._wal_active = True
-    seen = []
+@pytest.mark.requires_wal
+def test_read_conn_is_per_thread(db):
+    conns = {}
 
-    def read_once():
-        assert db.get_session("s1")["id"] == "s1"
-        with db._read_pool_lock:
-            seen.append(len(db._read_pool_all))
+    def grab(key):
+        conns[key] = db._get_read_conn()
 
-    for _ in range(db._READ_POOL_MAX * 4):
-        t = threading.Thread(target=read_once)
-        t.start()
-        t.join()
-
-    assert max(seen) <= db._READ_POOL_MAX
-    assert len(db._read_pool_all) <= db._READ_POOL_MAX
-    assert len(db._read_pool_idle) == len(db._read_pool_all)
-
-
-def test_read_pool_leases_distinct_connections_concurrently(db):
-    db._wal_active = True
-    barrier = threading.Barrier(2)
-    conns = []
-
-    def lease():
-        with db._read_ctx() as conn:
-            conns.append(conn)
-            barrier.wait(timeout=5)
-
-    t1 = threading.Thread(target=lease)
-    t2 = threading.Thread(target=lease)
+    t1 = threading.Thread(target=grab, args=(1,))
+    t2 = threading.Thread(target=grab, args=(2,))
     t1.start(); t2.start(); t1.join(); t2.join()
-
-    assert len(conns) == 2
-    assert conns[0] is not conns[1]
-    assert len(db._read_pool_all) == 2
-    assert len(db._read_pool_idle) == 2
+    assert conns[1] is not None and conns[2] is not None
+    assert conns[1] is not conns[2]
 
 
-def test_read_pool_saturation_falls_back_without_opening_extra_connection(db):
-    db._wal_active = True
-    db._READ_POOL_MAX = 1
-    entered = threading.Event()
-    release = threading.Event()
+@pytest.mark.requires_wal
+def test_read_conn_reused_via_pool(db):
+    """Reuse is now the pool's job, not a per-thread memo.
 
-    def hold_reader():
-        with db._read_ctx():
-            entered.set()
-            release.wait(timeout=5)
-
-    holder = threading.Thread(target=hold_reader)
-    holder.start()
-    assert entered.wait(timeout=5)
-
-    assert db._acquire_read_conn() is None
-    assert len(db._read_pool_all) == 1
-
-    release.set()
-    holder.join(timeout=5)
-    assert not holder.is_alive()
-    assert len(db._read_pool_all) == 1
-    assert len(db._read_pool_idle) == 1
-
-
-def test_read_pool_discards_broken_connection(db):
-    db._wal_active = True
-    conn = db._acquire_read_conn()
-    assert conn is not None
-    db._release_read_conn(conn, broken=True)
-
-    assert conn not in db._read_pool_all
-    assert conn not in db._read_pool_idle
-    replacement = db._acquire_read_conn()
-    assert replacement is not None
-    assert replacement is not conn
-    db._release_read_conn(replacement)
-
-
-def test_close_closes_active_reader_when_returned(db):
-    db._wal_active = True
-    conn = db._acquire_read_conn()
-    assert conn is not None
-
-    db.close()
-    assert db._read_pool_closed
-    assert conn in db._read_pool_all
-
-    db._release_read_conn(conn)
-    assert conn not in db._read_pool_all
-    assert conn not in db._read_pool_idle
-    with pytest.raises(Exception):
-        conn.execute("SELECT 1")
+    The old contract (``_get_read_conn()`` returns the same object twice on one
+    thread) was the leak: that memo pinned one unclosable connection per
+    (SessionDB x thread) forever. ``_get_read_conn`` now always opens a fresh
+    connection and reuse happens via checkout/return, so assert on that.
+    """
+    with db._read_ctx() as first:
+        assert first is not None
+    with db._read_ctx() as second:
+        assert second is first, "sequential readers must reuse the pooled conn"
 
 
 @pytest.mark.requires_wal
@@ -159,14 +92,14 @@ def test_read_your_writes(db):
 
 def test_non_wal_uses_locked_path(db):
     db._wal_active = False
-    assert db._acquire_read_conn() is None
+    assert db._get_read_conn() is None
     # And queries still work via the legacy path.
     assert db.get_session("s1")["id"] == "s1"
 
 
 @pytest.mark.requires_wal
 def test_read_conn_open_failure_marks_thread(db, monkeypatch, tmp_path):
-    """A failed pooled-reader open falls back without retaining a connection."""
+    """A failed read-conn open must not retry per query; fallback still works."""
     import sqlite3 as _sqlite3
 
     calls = {"n": 0}
@@ -184,50 +117,9 @@ def test_read_conn_open_failure_marks_thread(db, monkeypatch, tmp_path):
         monkeypatch.setattr("hermes_state.sqlite3.connect", failing_connect)
         assert fresh.get_session("x")["id"] == "x"
         assert fresh.get_session("x")["id"] == "x"
-        assert calls["n"] == 2
-        assert not fresh._read_pool_all
+        assert calls["n"] == 1, "open failure should be remembered per thread"
     finally:
         fresh.close()
-
-
-def test_non_sql_exception_returns_reader_to_pool(db):
-    db._wal_active = True
-    with pytest.raises(ValueError):
-        with db._read_ctx():
-            raise ValueError("caller failure")
-
-    assert len(db._read_pool_all) == 1
-    assert len(db._read_pool_idle) == 1
-
-
-def test_non_sql_exceptions_do_not_exhaust_pool(db):
-    db._wal_active = True
-
-    def fail_once(_):
-        with pytest.raises(ValueError):
-            with db._read_ctx():
-                raise ValueError("caller failure")
-
-    with ThreadPoolExecutor(max_workers=db._READ_POOL_MAX) as executor:
-        list(executor.map(fail_once, range(db._READ_POOL_MAX * 4)))
-
-    assert len(db._read_pool_all) <= db._READ_POOL_MAX
-    assert len(db._read_pool_idle) == len(db._read_pool_all)
-
-
-def test_reader_initialization_failure_closes_unpublished_connection(db, monkeypatch):
-    db._wal_active = True
-    import sqlite3
-    real_pragmas = __import__("hermes_state").apply_database_pragmas
-
-    def failing_pragmas(conn, *, db_label):
-        real_pragmas(conn, db_label=db_label)
-        raise sqlite3.DatabaseError("simulated post-connect initialization failure")
-
-    monkeypatch.setattr("hermes_state.apply_database_pragmas", failing_pragmas)
-    assert db.get_session("s1")["id"] == "s1"
-    assert not db._read_pool_all
-    assert not db._read_pool_idle
 
 
 @pytest.mark.requires_wal
