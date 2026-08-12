@@ -230,6 +230,60 @@ async def test_active_owner_flow_is_closed_before_replacement(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_explicit_retry_coalesces_with_scheduled_owner_cleanup(
+    tmp_path, monkeypatch
+):
+    """A retry cannot enter a flow while automatic owner cleanup is running."""
+    from tools.mcp_oauth_manager import MCPOAuthManager, _ProviderEntry
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    manager = MCPOAuthManager()
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    close_calls = 0
+
+    class Flow:
+        async def aclose(self):
+            nonlocal close_calls
+            close_calls += 1
+            if close_calls > 1:
+                raise AssertionError("duplicate concurrent owner cleanup")
+            close_started.set()
+            await release_close.wait()
+
+    flow = Flow()
+    provider = SimpleNamespace(
+        _hermes_active_flows={id(flow): flow},
+        _hermes_loop=asyncio.get_running_loop(),
+        _hermes_generation=0,
+    )
+    entry = _ProviderEntry(
+        server_url="https://old.example/mcp",
+        oauth_config={},
+        provider=provider,
+        loop=asyncio.get_running_loop(),
+        oauth_config_fingerprint="old",
+    )
+    manager._entries[manager._key("srv")] = entry
+
+    assert manager._fence_and_schedule_close(entry) is False
+    await close_started.wait()
+    retry = asyncio.create_task(manager.retry_active_flow_cleanup("srv"))
+    # Yield only to let the already-created public retry task reach its
+    # owner-task await; the held event barrier, not elapsed time, proves the
+    # first close remains the sole owner.
+    await asyncio.sleep(0)
+    assert not retry.done()
+    assert close_calls == 1
+
+    release_close.set()
+    assert await retry is True
+    await asyncio.sleep(0)
+    assert close_calls == 1
+    assert provider._hermes_active_flows == {}
+
+
+@pytest.mark.asyncio
 async def test_failed_owner_cleanup_is_retained_until_explicit_retry(
     tmp_path, monkeypatch
 ):
@@ -326,6 +380,61 @@ def test_resolved_callback_identity_is_retained_after_build(tmp_path, monkeypatc
         is provider
     )
     assert builds == 1
+
+
+def test_effective_transport_policy_rebuilds_and_identical_policy_reuses(
+    tmp_path, monkeypatch
+):
+    """Every load-bearing transport policy input participates in public cache identity."""
+    from tools.mcp_oauth_manager import MCPOAuthManager
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    manager = MCPOAuthManager()
+    builds = []
+
+    monkeypatch.setattr(
+        manager,
+        "_build_provider",
+        lambda _name, _entry: builds.append(SimpleNamespace()) or builds[-1],
+    )
+    base = {
+        "ssl_verify": "ca.pem",
+        "client_cert": ("client.pem", "client.key"),
+        "connect_timeout": 2,
+        "read_timeout": 9,
+        "follow_redirects": True,
+        "headers": {"x-policy": "one"},
+        "request_hooks": ["request-hook"],
+        "response_hooks": ["response-hook"],
+    }
+    first = manager.get_or_build_provider(
+        "policy", "https://example.test/mcp", {}, base
+    )
+    same = manager.get_or_build_provider(
+        "policy", "https://example.test/mcp", {}, dict(base)
+    )
+    assert same is first
+    assert len(builds) == 1
+
+    for field, value in (
+        ("ssl_verify", "other-ca.pem"),
+        ("client_cert", ("other-client.pem", "other-client.key")),
+        ("connect_timeout", 3),
+        ("read_timeout", 10),
+        ("follow_redirects", False),
+        ("headers", {"x-policy": "two"}),
+        ("request_hooks", ["other-request-hook"]),
+        ("response_hooks", ["other-response-hook"]),
+    ):
+        changed = dict(base)
+        changed[field] = value
+        rebuilt = manager.get_or_build_provider(
+            "policy", "https://example.test/mcp", {}, changed
+        )
+        assert rebuilt is not first
+        first = rebuilt
+        base = changed
+    assert len(builds) == 9
 
 
 @pytest.mark.asyncio

@@ -871,6 +871,39 @@ class MCPOAuthManager:
         if entry is None or entry.provider is None:
             return True
         provider = entry.provider
+        cleanup_task = getattr(provider, "_hermes_cleanup_task", None)
+        if cleanup_task is not None and not cleanup_task.done():
+            owner = entry.loop or getattr(provider, "_hermes_loop", None)
+            if owner is None or owner.is_closed() or not owner.is_running():
+                return False
+
+            async def wait_for_owner_cleanup() -> bool:
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:
+                    # The failed close is now terminal.  Retain poisoned
+                    # ownership, clear only the completed task marker, and
+                    # let the explicit retry below make the next close claim.
+                    pass
+                if getattr(provider, "_hermes_cleanup_task", None) is cleanup_task:
+                    provider._hermes_cleanup_task = None
+                return True
+
+            current = asyncio.get_running_loop()
+            if current is owner:
+                await wait_for_owner_cleanup()
+            else:
+                future = asyncio.run_coroutine_threadsafe(
+                    wait_for_owner_cleanup(), owner
+                )
+                await asyncio.wrap_future(future)
+            flows = getattr(provider, "_hermes_active_flows", {})
+            if not flows:
+                provider._hermes_cleanup_failed = False
+                return True
+
         flows = getattr(provider, "_hermes_active_flows", {})
         if not flows:
             provider._hermes_cleanup_failed = False
@@ -951,12 +984,13 @@ class MCPOAuthManager:
                     try:
                         task.result()
                     except BaseException as exc:
+                        provider._hermes_cleanup_failed = True
                         logger.warning(
                             "MCP OAuth '%s': owner-side flow cleanup failed: %s",
                             getattr(provider, "_hermes_server_name", ""),
                             exc,
                         )
-                    finally:
+                    else:
                         provider._hermes_cleanup_task = None
 
                 task.add_done_callback(_observe)
