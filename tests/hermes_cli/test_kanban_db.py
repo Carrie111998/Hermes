@@ -681,6 +681,90 @@ def test_create_task_rejects_unknown_project(kanban_home):
             kb.create_task(conn, title="Lost governance", project_id="missing-project")
 
 
+def test_decomposed_child_preserves_complete_execution_context(kanban_home):
+    with kb.connect() as conn:
+        root_id = kb.create_task(
+            conn,
+            title="Context root",
+            body="root body",
+            assignee="orchestrator",
+            workspace_kind="worktree",
+            workspace_path="/repo/.worktrees/root",
+            branch_name="project/root",
+            tenant="tenant-a",
+            max_runtime_seconds=120,
+            skills=["skill-a"],
+            max_retries=2,
+            model_override="model-a",
+            provider_override="provider-a",
+            reasoning_effort="high",
+            goal_mode=True,
+            goal_max_turns=7,
+            workflow_template_id="custom",
+            current_step_key="implementation",
+            source_commit_required=True,
+            source_commit_forbidden=False,
+            triage=True,
+        )
+        conn.execute(
+            "UPDATE tasks SET project_id = ?, work_contract_id = ? WHERE id = ?",
+            ("project-a", "contract-a", root_id),
+        )
+        conn.commit()
+
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root_id,
+            root_assignee="orchestrator",
+            children=[
+                {
+                    "title": "Generated child",
+                    "body": "child body",
+                    "assignee": "developer",
+                },
+                {
+                    "title": "Overridden workspace",
+                    "assignee": "tester",
+                    "workspace_kind": "dir",
+                    "workspace_path": "/tmp/generated-child",
+                },
+            ],
+        )
+
+        child = kb.get_task(conn, child_ids[0])
+        overridden = kb.get_task(conn, child_ids[1])
+
+    assert child is not None
+    assert child.title == "Generated child"
+    assert child.body == "child body"
+    assert child.assignee == "developer"
+    assert child.project_id == "project-a"
+    assert child.branch_name is None
+    assert child.tenant == "tenant-a"
+    assert child.workspace_kind == "worktree"
+    assert child.workspace_path is None
+    assert child.max_runtime_seconds == 120
+    assert child.skills == ["skill-a"]
+    assert child.max_retries == 2
+    assert child.model_override == "model-a"
+    assert child.provider_override == "provider-a"
+    assert child.reasoning_effort == "high"
+    assert child.goal_mode is True
+    assert child.goal_max_turns == 7
+    assert child.workflow_template_id == "custom"
+    assert child.current_step_key == "implementation"
+    # Contracts are one-to-one with cards; reusing the root contract would
+    # violate idx_tasks_work_contract_unique.
+    assert child.work_contract_id is None
+    assert child.work_item_kind == "card"
+    assert child.source_commit_required is True
+    assert child.source_commit_forbidden is False
+    assert overridden is not None
+    assert overridden.assignee == "tester"
+    assert overridden.workspace_kind == "dir"
+    assert overridden.workspace_path == "/tmp/generated-child"
+
+
 @pytest.mark.parametrize(
     ("step", "verdict", "target"),
     [

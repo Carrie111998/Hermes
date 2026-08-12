@@ -12732,8 +12732,14 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, branch_name, project_id, tenant, created_at, "
+                " created_by, max_runtime_seconds, skills, max_retries, "
+                " model_override, provider_override, reasoning_effort, goal_mode, "
+                " goal_max_turns, workflow_template_id, current_step_key, "
+                " work_contract_id, work_item_kind, source_commit_required, "
+                " source_commit_forbidden) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                " ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -12741,9 +12747,25 @@ def decompose_triage_task(
                     assignee,
                     child_ws_kind,
                     child_ws_path,
+                    None,
+                    root_row["project_id"],
                     tenant,
                     now,
                     (author or "decomposer"),
+                    root_row["max_runtime_seconds"],
+                    root_row["skills"],
+                    root_row["max_retries"],
+                    root_row["model_override"],
+                    root_row["provider_override"],
+                    root_row["reasoning_effort"],
+                    root_row["goal_mode"],
+                    root_row["goal_max_turns"],
+                    root_row["workflow_template_id"],
+                    root_row["current_step_key"],
+                    None,
+                    root_row["work_item_kind"],
+                    root_row["source_commit_required"],
+                    root_row["source_commit_forbidden"],
                 ),
             )
             _append_event(
