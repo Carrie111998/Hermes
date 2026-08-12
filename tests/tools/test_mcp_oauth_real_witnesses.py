@@ -1383,7 +1383,13 @@ async def _run_composed_tls_public(
     async def request_hook(request):
         request.headers["x-composed-hook"] = "yes"
 
+    peer.response_hook_events = []
+
     async def response_hook(response):
+        peer.response_hook_events.append((
+            str(response.request.url),
+            response.status_code,
+        ))
         response.extensions["composed_response_hook"] = True
 
     async def stop(_self):
@@ -1438,10 +1444,22 @@ async def test_composed_cold_public_real_https_oauth_control_plane(
     else:
         assert any(target == "/register" for _, target, *_ in peer.requests)
     for _method, target, headers, _payload in peer.requests:
-        if target not in {"/mcp", "/messages", "/callback"}:
+        if (
+            target.startswith("/.well-known")
+            or target in {"/register", "/token", "/cimd.json"}
+            or target.startswith("/authorize")
+        ):
             assert "authorization" not in headers
-        if target not in {"/mcp", "/messages", "/callback"} and headers:
+            assert headers.get("x-witness") == "real"
             assert headers.get("x-composed-hook") == "yes"
+    assert peer.response_hook_events
+    observed_urls = {urlsplit(url).path for url, _status in peer.response_hook_events}
+    expected_targets = {
+        target
+        for _method, target, _headers, _payload in peer.requests
+        if target.startswith("/")
+    }
+    assert expected_targets <= observed_urls
     assert await storage.get_tokens() is not None
 
 
@@ -1460,6 +1478,25 @@ async def test_composed_cold_public_real_https_oauth_refresh_and_step_up(
     assert saved.refresh_token.startswith("tls-refresh-")
     assert sum(target == "/token" for _, target, *_ in peer.requests) >= 1
     assert any(status == 403 for _, status in peer.response_statuses)
+    assert peer.response_hook_events
+    for _method, target, headers, _payload in peer.requests:
+        if (
+            target.startswith("/.well-known")
+            or target in {"/register", "/token", "/cimd.json"}
+            or target.startswith("/authorize")
+        ):
+            assert "authorization" not in headers
+            assert headers.get("x-witness") == "real"
+            assert headers.get("x-composed-hook") == "yes"
+    resource_headers = [
+        headers
+        for _method, target, headers, _payload in peer.requests
+        if target in {"/mcp", "/messages"}
+    ]
+    assert any(
+        headers.get("authorization", "").lower().startswith("bearer tls-access-")
+        for headers in resource_headers
+    )
 
 
 @pytest.mark.asyncio

@@ -28,6 +28,63 @@ from mcp.shared.auth import OAuthMetadata
 
 from tools.mcp_oauth import HermesTokenStorage
 from tools.mcp_oauth_manager import _HERMES_PROVIDER_CLS
+from tools.mcp_oauth_manager import _merge_oauth_control_request
+
+
+@pytest.mark.asyncio
+async def test_explicit_sdk_metadata_request_merges_safe_client_headers():
+    """HTTPX ``send(Request)`` skips defaults; the OAuth seam must not."""
+    import httpx
+
+    seen = []
+
+    async def handler(request):
+        seen.append(request)
+        return httpx.Response(200, request=request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        headers={"X-Witness": "configured", "Authorization": "Bearer never"},
+    ) as client:
+        baseline_request = httpx.Request(
+            "GET",
+            "https://example.test/.well-known/oauth-authorization-server",
+            headers={"MCP-Protocol-Version": "2025-06-18"},
+        )
+        baseline = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            headers={"X-Witness": "configured"},
+        )
+        try:
+            await baseline.send(baseline_request)
+        finally:
+            await baseline.aclose()
+        assert "x-witness" not in seen[0].headers
+
+        request = httpx.Request(
+            "POST",
+            "https://example.test/.well-known/oauth-authorization-server",
+            content=b"payload",
+            headers={"MCP-Protocol-Version": "2025-06-18"},
+        )
+        merged = _merge_oauth_control_request(client, request)
+        response = await client.send(merged)
+
+        collision = httpx.Request(
+            "GET",
+            "https://example.test/.well-known/oauth-authorization-server",
+            headers={"MCP-Protocol-Version": "2025-06-18", "x-witness": "request"},
+        )
+        await client.send(_merge_oauth_control_request(client, collision))
+
+    assert response.status_code == 200
+    assert seen[1].method == "POST"
+    assert seen[1].content == b"payload"
+    assert seen[1].headers["x-witness"] == "configured"
+    assert seen[1].headers["mcp-protocol-version"] == "2025-06-18"
+    assert "authorization" not in seen[1].headers
+    assert seen[2].headers["x-witness"] == "request"
+    assert "authorization" not in seen[2].headers
 
 
 def _make_metadata(token_endpoint: str = "https://auth.example.com/oauth/token") -> OAuthMetadata:

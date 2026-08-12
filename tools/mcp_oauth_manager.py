@@ -48,6 +48,44 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+def _oauth_control_headers(configured_headers: Any, request_headers: Any) -> Any:
+    """Merge safe client headers into an explicit SDK OAuth request."""
+    import httpx
+
+    merged = httpx.Headers({
+        key: value
+        for key, value in (configured_headers or {}).items()
+        if key.lower() != "authorization"
+    })
+    # HTTPX Headers.update is case-insensitive and request values win, matching
+    # AsyncClient.build_request while preserving SDK-generated Authorization.
+    merged.update(request_headers)
+    return merged
+
+
+def _rebuild_oauth_control_request(request: Any, headers: Any) -> Any:
+    """Rebuild an SDK request without changing its method, URL, body, or extensions."""
+    import httpx
+
+    return httpx.Request(
+        request.method,
+        request.url,
+        content=request.content,
+        headers=headers,
+        extensions=dict(request.extensions),
+    )
+
+
+def _merge_oauth_control_request(client: Any, request: Any) -> Any:
+    """Apply safe HTTPX client headers to one explicit OAuth request."""
+    if not hasattr(request, "headers"):
+        return request
+    return _rebuild_oauth_control_request(
+        request,
+        _oauth_control_headers(getattr(client, "headers", {}), request.headers),
+    )
+
+
 class MCPAuthFlowProtocolError(RuntimeError):
     """Raised when the installed SDK cannot provide HTTPX auth-flow semantics."""
 
@@ -410,15 +448,16 @@ def _make_hermes_provider_class() -> Optional[type]:
             server_url = self.context.server_url
             options = getattr(self, "_hermes_transport_options", {})
             timeout = float(options.get("connect_timeout", 10.0))
+            configured_headers = {
+                key: value
+                for key, value in (options.get("headers") or {}).items()
+                if key.lower() != "authorization"
+            }
             client_kwargs = {
                 "timeout": httpx.Timeout(timeout, read=300.0),
                 "follow_redirects": True,
                 "verify": options.get("ssl_verify", True),
-                "headers": {
-                    key: value
-                    for key, value in (options.get("headers") or {}).items()
-                    if key.lower() != "authorization"
-                },
+                "headers": configured_headers,
                 "event_hooks": {
                     "request": list(options.get("request_hooks") or []),
                     "response": list(options.get("response_hooks") or []),
@@ -432,7 +471,9 @@ def _make_hermes_provider_class() -> Optional[type]:
                 for url in build_protected_resource_metadata_discovery_urls(
                     None, server_url
                 ):
-                    req = create_oauth_metadata_request(url)
+                    req = _merge_oauth_control_request(
+                        client, create_oauth_metadata_request(url)
+                    )
                     try:
                         resp = await client.send(req)
                     except httpx.HTTPError as exc:
@@ -462,7 +503,9 @@ def _make_hermes_provider_class() -> Optional[type]:
                 for url in build_oauth_authorization_server_metadata_discovery_urls(
                     self.context.auth_server_url, server_url
                 ):
-                    req = create_oauth_metadata_request(url)
+                    req = _merge_oauth_control_request(
+                        client, create_oauth_metadata_request(url)
+                    )
                     try:
                         resp = await client.send(req)
                     except httpx.HTTPError as exc:
@@ -689,8 +732,17 @@ def _make_hermes_provider_class() -> Optional[type]:
                 else:
                     active_flows.pop(flow_id, None)
 
+            def merge_outgoing(request):
+                if not hasattr(request, "headers"):
+                    return request
+                options = getattr(self, "_hermes_transport_options", {})
+                return _rebuild_oauth_control_request(
+                    request,
+                    _oauth_control_headers(options.get("headers"), request.headers),
+                )
+
             try:
-                outgoing = await inner.__anext__()
+                outgoing = merge_outgoing(await inner.__anext__())
                 while True:
                     incoming = yield outgoing
                     if generation != self._hermes_generation:
@@ -727,7 +779,7 @@ def _make_hermes_provider_class() -> Optional[type]:
                                 headers=headers,
                                 request=incoming.request,
                             )
-                    outgoing = await inner.asend(incoming)
+                    outgoing = merge_outgoing(await inner.asend(incoming))
             except StopAsyncIteration:
                 # Persist any metadata the SDK discovered lazily during the
                 # 401 branch so a subsequent cold-load skips discovery.
