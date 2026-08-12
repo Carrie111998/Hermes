@@ -355,9 +355,10 @@ class AgentRunService:
         if run["run_type"] == "lead_scan" and payload.get("scan_id"):
             self.db.execute("UPDATE lead_scans SET status=?,updated_at=? WHERE id=? AND company_id=?",
                             (status, now(), payload["scan_id"], run["company_id"]))
-        if run["run_type"] == "document_processing" and payload.get("document_id") and status != "succeeded":
-            self.db.execute("UPDATE documents SET status=?,updated_at=? WHERE id=? AND company_id=?",
-                            (status, now(), payload["document_id"], run["company_id"]))
+        # `documents.status` is technical readiness of the file itself, owned by
+        # DocumentProcessingService. A semantic extraction run that fails says
+        # nothing about whether the document is still usable, so it must not
+        # push the document out of `ready` — the run's own status carries that.
 
     def cancel(self, company_id: str, run_id: str) -> dict:
         run = self.get(company_id, run_id)
@@ -413,6 +414,43 @@ class AgentRunService:
             "failed_runs": count("agent_runs", "AND status='failed'"),
         }
 
+    def _clear_document_records(self, company_id: str, document_id: str) -> None:
+        """Retire the records a previous run derived from this same document.
+
+        Re-running extraction is meant to replace, never accumulate. Products
+        already collapse on their unique name, but contacts and the free-form
+        `processed_records` section appended, so a second run doubled them.
+
+        Matching happens in Python rather than SQL because `data` is a JSON
+        string on both backends and the extraction operators differ
+        (json_extract vs ->>); the row counts here are per-document, not
+        per-tenant.
+        """
+        for table in ("products", "contacts"):
+            for row in self.db.all(
+                f"SELECT id, data FROM {table} WHERE company_id=?", (company_id,)
+            ):
+                if json_load(row["data"], {}).get("source_document_id") == document_id:
+                    self.db.execute(
+                        f"DELETE FROM {table} WHERE id=? AND company_id=?",
+                        (row["id"], company_id),
+                    )
+
+        section = self.db.one(
+            "SELECT data FROM company_sections WHERE company_id=? AND section='processed_records'",
+            (company_id,),
+        )
+        if not section:
+            return
+        records = json_load(section["data"], {}).get("records", [])
+        kept = [r for r in records if r.get("source_document_id") != document_id]
+        if len(kept) != len(records):
+            self.db.execute(
+                "UPDATE company_sections SET data=?,updated_at=? "
+                "WHERE company_id=? AND section='processed_records'",
+                (json_dump({"records": kept}), now(), company_id),
+            )
+
     def apply_output(self, run: dict, output: dict) -> None:
         # Domain-specific persistence is intentionally deterministic. The model
         # proposes records; this code owns IDs, tenant keys, and state changes.
@@ -421,13 +459,17 @@ class AgentRunService:
         if run_type == "document_processing":
             document_id = payload.get("document_id")
             if document_id:
+                # The document's own status is not touched here: it stays
+                # `ready` because the file is still perfectly usable. Only the
+                # semantic result and the run pointer are recorded.
                 self.db.execute(
-                    "UPDATE documents SET status='processed',processing_run_id=?,data=?,updated_at=? "
+                    "UPDATE documents SET processing_run_id=?,data=?,updated_at=? "
                     "WHERE id=? AND company_id=?",
                     (run["id"], json_dump({"records": output.get("records", []),
                                             "rejects": output.get("rejects", [])}),
                      stamp, document_id, company_id),
                 )
+                self._clear_document_records(company_id, document_id)
             for record in output.get("records", []):
                 record_type = record.get("record_type") or payload.get("document_type")
                 if record_type in {"product", "product_catalog", "technical_sheet"}:

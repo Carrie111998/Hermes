@@ -47,10 +47,18 @@ def _scope(principal: Principal, header: str | None) -> str:
 
 
 def _document(row) -> dict:
+    """The customer's view of a document.
+
+    Deliberately hand-written rather than a row splat: the row also carries the
+    artifact ids, checksums, local mirror path, and attempt pointer, none of
+    which a customer surface has any use for. `status_detail` is the only new
+    field — a plain sentence, never a reason code.
+    """
     return {
         "id": row["id"], "company_id": row["company_id"], "document_type": row["document_type"],
         "name": row["name"], "content_type": row["content_type"], "size_bytes": row["size_bytes"],
-        "status": row["status"], "processing_run_id": row["processing_run_id"],
+        "status": row["status"], "status_detail": row["status_detail"],
+        "processing_run_id": row["processing_run_id"],
         "data": json_load(row["data"], {}), "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -83,19 +91,33 @@ async def upload_document(
     if document_type not in DOCUMENT_TYPES:
         raise HTTPException(422, "Unsupported document_type")
     company_id = _scope(principal, x_company_id)
+    limit = max(0, int(request.app.state.settings.max_upload_bytes))
+    # Read one byte past the limit and reject before anything is committed, so
+    # an oversized upload never leaves an orphaned document row behind.
+    content = await file.read(limit + 1 if limit else -1)
+    if limit and len(content) > limit:
+        raise HTTPException(413, "Document exceeds the configured upload limit")
+
     document_id = new_id("doc")
     safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", Path(file.filename or "upload").name)[:180]
-    location, size = await request.app.state.storage.save(
-        company_id, document_id, safe_name, file,
-    )
     stamp = now()
     request.app.state.db.execute(
         "INSERT INTO documents(id,company_id,document_type,name,storage_path,content_type,size_bytes,status,data,created_at,updated_at) "
         "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        (document_id, company_id, document_type, safe_name, location, file.content_type,
-         size, "uploaded", json_dump({}), stamp, stamp),
+        (document_id, company_id, document_type, safe_name, None, file.content_type,
+         len(content), "uploaded", json_dump({}), stamp, stamp),
+    )
+    request.app.state.db.execute(
+        "UPDATE documents SET origin='onboarding_upload' WHERE id=?", (document_id,)
+    )
+    request.app.state.document_artifacts.store_original(
+        company_id, document_id, safe_name,
+        file.content_type or "application/octet-stream", content,
     )
     request.app.state.db.activity(company_id, principal.id, "document_uploaded", "document", document_id)
+    # Processing starts immediately and runs behind the response: the customer
+    # sees Uploaded/Processing right away rather than waiting on a conversion.
+    request.app.state.document_processing.submit(company_id, document_id)
     return _document(request.app.state.db.one("SELECT * FROM documents WHERE id=?", (document_id,)))
 
 
@@ -114,13 +136,20 @@ def get_document(document_id: str, request: Request, principal: Principal = Depe
 def delete_document(document_id: str, request: Request, principal: Principal = Depends(current_principal),
                     x_company_id: str | None = Header(default=None)):
     company_id = _scope(principal, x_company_id)
-    row = request.app.state.db.one("SELECT storage_path FROM documents WHERE id=? AND company_id=?",
-                                   (document_id, company_id))
-    if not row:
-        raise HTTPException(404, "Document not found")
-    request.app.state.db.execute("DELETE FROM documents WHERE id=? AND company_id=?", (document_id, company_id))
-    if row["storage_path"]:
-        request.app.state.storage.delete(row["storage_path"])
+    try:
+        request.app.state.document_artifacts.delete_document(company_id, document_id)
+    except LookupError as exc:
+        raise HTTPException(404, "Document not found") from exc
+
+
+# Product-safe copy for the states a semantic run cannot start from. Names the
+# file's condition and the customer's next action, never the machinery.
+_NOT_READY_MESSAGES = {
+    "uploaded": "This file is still being prepared. Please try again in a moment.",
+    "processing": "This file is still being prepared. Please try again in a moment.",
+    "needs_attention": "This file needs attention before it can be used.",
+    "failed": "We couldn't use this file. Please upload it again.",
+}
 
 
 @router.post("/documents/{document_id}/process", status_code=202)
@@ -131,15 +160,30 @@ def process_document(document_id: str, request: Request, principal: Principal = 
                                         (document_id, company_id))
     if not document:
         raise HTTPException(404, "Document not found")
+    if document["status"] != "ready":
+        raise HTTPException(409, _NOT_READY_MESSAGES.get(
+            document["status"], "This file can't be used yet. Please try again in a moment."
+        ))
+
+    artifacts = request.app.state.document_artifacts
+    processed = artifacts.get_active_processed(company_id, document_id)
+    if processed is None:
+        raise HTTPException(409, _NOT_READY_MESSAGES["processing"])
+    # Verified on every start: the agent must read the same bytes the admin
+    # previews, even if the mirror was cleared since the document went Ready.
+    path = artifacts.materialize(company_id, processed.id)
+
     run = request.app.state.runs.create(
         company_id, "document_processing",
         {"document_id": document_id, "document_type": document["document_type"],
-         "path": request.app.state.storage.resolve(document["storage_path"])},
-        f"document-process:{document_id}:{document['updated_at']}",
+         "source_document_id": document_id, "path": str(path)},
+        f"document-process:{document_id}:{processed.checksum}",
     )
+    # The document stays `ready`: this run is semantic extraction, a separate
+    # concern from whether the file itself is usable.
     request.app.state.db.execute(
-        "UPDATE documents SET status='processing',processing_run_id=?,updated_at=? WHERE id=?",
-        (run["id"], now(), document_id),
+        "UPDATE documents SET processing_run_id=?,updated_at=? WHERE id=? AND company_id=?",
+        (run["id"], now(), document_id, company_id),
     )
     if run["status"] == "queued":
         run = request.app.state.runs.start(company_id, run["id"])

@@ -124,21 +124,131 @@ def test_company_brain_version_and_approval():
     assert approved.status_code == 200 and approved.json()["status"] == "approved"
 
 
-def test_document_upload_and_processing_pipeline():
-    _, client, headers, _ = make_client()
-    uploaded = client.post(
+def upload_document(client, headers, name, content, content_type="text/plain",
+                    document_type="product_catalog"):
+    response = client.post(
         "/api/v1/documents/upload", headers=headers,
-        data={"document_type": "product_catalog"},
-        files={"file": ("catalog.txt", b"Widget catalogue", "text/plain")},
+        data={"document_type": document_type},
+        files={"file": (name, content, content_type)},
     )
-    assert uploaded.status_code == 201, uploaded.text
-    started = client.post(f"/api/v1/documents/{uploaded.json()['id']}/process", headers=headers)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def wait_for_document(client, headers, document_id, timeout=5):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        document = client.get(f"/api/v1/documents/{document_id}", headers=headers).json()
+        if document["status"] in {"ready", "needs_attention", "failed"}:
+            return document
+        time.sleep(0.01)
+    raise AssertionError(f"document {document_id} never settled")
+
+
+def test_document_upload_stores_both_forms_and_semantic_run_reads_markdown():
+    _, client, headers, _ = make_client()
+    uploaded = upload_document(client, headers, "catalog.txt", b"Widget catalogue")
+    ready = wait_for_document(client, headers, uploaded["id"])
+    assert ready["status"] == "ready"
+    assert set(ready) >= {"id", "name", "status"}
+    assert "active_processed_artifact_id" not in ready
+
+    started = client.post(f"/api/v1/documents/{uploaded['id']}/process", headers=headers)
     run = wait_for_run(client, headers, started.json()["id"])
     assert run["status"] == "succeeded"
-    status = client.get(
-        f"/api/v1/documents/{uploaded.json()['id']}/processing-status", headers=headers,
-    ).json()
-    assert status["status"] == "processed"
+    assert run["payload"]["path"].endswith("content.md")
+
+
+def test_customer_document_json_hides_every_internal_field():
+    _, client, headers, _ = make_client()
+    uploaded = upload_document(client, headers, "catalog.csv", b"name\nWidget\n", "text/csv")
+    ready = wait_for_document(client, headers, uploaded["id"])
+    forbidden = {
+        "active_processed_artifact_id", "current_processing_attempt_id",
+        "original_checksum", "storage_path", "local_path", "reason_code", "diagnostic",
+    }
+    assert not (forbidden & set(ready))
+    body = str(ready).lower()
+    for term in ("anydoc", "converter", "conversion", "ocr", "markdown"):
+        assert term not in body
+
+
+def test_semantic_run_leaves_the_document_ready():
+    """Technical readiness and semantic extraction are separate states."""
+    _, client, headers, _ = make_client()
+    uploaded = upload_document(client, headers, "catalog.txt", b"Widget catalogue")
+    wait_for_document(client, headers, uploaded["id"])
+    started = client.post(f"/api/v1/documents/{uploaded['id']}/process", headers=headers)
+    wait_for_run(client, headers, started.json()["id"])
+
+    document = client.get(f"/api/v1/documents/{uploaded['id']}", headers=headers).json()
+    assert document["status"] == "ready"
+    assert document["processing_run_id"]
+    assert document["data"]["records"] or document["data"]["rejects"] == []
+
+
+def test_semantic_reprocessing_replaces_records_instead_of_duplicating():
+    _, client, headers, _ = make_client()
+    uploaded = upload_document(client, headers, "catalog.txt", b"Widget catalogue")
+    wait_for_document(client, headers, uploaded["id"])
+
+    for _ in range(2):
+        started = client.post(f"/api/v1/documents/{uploaded['id']}/process", headers=headers)
+        assert started.status_code == 202, started.text
+        wait_for_run(client, headers, started.json()["id"])
+
+    products = client.get("/api/v1/products", headers=headers).json()
+    from_document = [
+        product for product in products
+        if product.get("source_document_id") == uploaded["id"]
+    ]
+    assert len(from_document) == len({p["product_name"] for p in from_document})
+
+
+def test_processing_an_unready_document_is_a_safe_conflict():
+    _, client, headers, company_id = make_client()
+    app = client.app
+    document_id = new_id("doc")
+    stamp = now()
+    app.state.db.execute(
+        "INSERT INTO documents(id,company_id,document_type,name,status,data,created_at,updated_at)"
+        " VALUES(?,?,?,?,?,?,?,?)",
+        (document_id, company_id, "product_catalog", "locked.pdf", "needs_attention",
+         json_dump({}), stamp, stamp),
+    )
+    response = client.post(f"/api/v1/documents/{document_id}/process", headers=headers)
+    assert response.status_code == 409
+    detail = response.json()["detail"].lower()
+    for term in ("anydoc", "converter", "conversion", "ocr", "markdown"):
+        assert term not in detail
+
+
+def test_oversized_upload_is_rejected_before_any_row_is_written():
+    _, client, headers, company_id = make_client()
+    app = client.app
+    app.state.settings = type(app.state.settings)(
+        **{**app.state.settings.__dict__, "max_upload_bytes": 8}
+    )
+    response = client.post(
+        "/api/v1/documents/upload", headers=headers,
+        data={"document_type": "product_catalog"},
+        files={"file": ("big.txt", b"x" * 64, "text/plain")},
+    )
+    assert response.status_code == 413
+    assert app.state.db.all("SELECT id FROM documents WHERE company_id=?", (company_id,)) == []
+
+
+def test_deleting_a_document_removes_both_forms():
+    _, client, headers, company_id = make_client()
+    app = client.app
+    uploaded = upload_document(client, headers, "catalog.csv", b"name\nWidget\n", "text/csv")
+    wait_for_document(client, headers, uploaded["id"])
+
+    assert client.delete(f"/api/v1/documents/{uploaded['id']}", headers=headers).status_code == 204
+    assert app.state.db.all(
+        "SELECT id FROM document_artifacts WHERE document_id=?", (uploaded["id"],)
+    ) == []
+    assert app.state.db.one("SELECT id FROM documents WHERE id=?", (uploaded["id"],)) is None
 
 
 def test_local_password_reset_flow():

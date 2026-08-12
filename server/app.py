@@ -90,6 +90,10 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         public_base_url=settings.public_base_url,
         credential_key=settings.credential_key,
     )
+    # No live route reads this any more — uploads go straight into
+    # document_artifacts. It survives solely as the resolver the one-time
+    # legacy backfill uses to pull pre-artifact documents out of Supabase
+    # Storage, after which nothing depends on a signed URL again.
     app.state.storage = create_storage(settings)
     app.state.document_artifacts = document_artifacts
     app.state.document_processing = document_processing
