@@ -2411,6 +2411,19 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
+def _cron_script_argv(path: Path) -> str:
+    """Return the best shell-script argument for cron.
+
+    Native Windows cron uses Git Bash for `.sh/.bash` scripts.  Bash expects
+    forward-slash paths (for example ``C:/Users/...``), so normalise only on
+    win32 to avoid backslash-related launch failures while preserving normal
+    POSIX behavior.
+    """
+    if sys.platform == "win32":
+        return path.as_posix()
+    return str(path)
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
@@ -2506,13 +2519,12 @@ def _run_job_script(
                 f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
-        )
-        argv = [_bash, str(path)]
+            )
+        argv = [_bash, _cron_script_argv(path)]
         env_overlay: dict[str, str] = {}
     else:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
         argv = [python_exe, str(path)]
-
     try:
         from tools.environments.local import build_subprocess_env
 

@@ -175,6 +175,24 @@ class TestRunJobScript:
         assert str(site_packages) in env["PYTHONPATH"]
 
 
+    def test_windows_script_arg_normalizes_backslashes(self, monkeypatch):
+        from pathlib import PureWindowsPath
+        from cron.scheduler import _cron_script_argv
+
+        monkeypatch.setattr("cron.scheduler.sys.platform", "win32")
+
+        windows_path = PureWindowsPath(r"C:\\Users\\Example\\.hermes\\scripts\\watch.sh")
+        assert _cron_script_argv(windows_path) == "C:/Users/Example/.hermes/scripts/watch.sh"
+
+    def test_non_windows_script_arg_preserves_posix_path(self, monkeypatch):
+        from pathlib import Path
+        from cron.scheduler import _cron_script_argv
+
+        monkeypatch.setattr("cron.scheduler.sys.platform", "linux")
+
+        posix_path = Path("/Users/Example/.hermes/scripts/watch.sh")
+        assert _cron_script_argv(posix_path) == str(posix_path)
+
     def test_non_windows_script_preserves_default_text_decoding(self, cron_env, monkeypatch):
         # No platform patching: the Linux CI host already takes this branch.
         from cron import scheduler as sched_mod
