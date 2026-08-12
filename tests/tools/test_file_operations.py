@@ -872,3 +872,29 @@ class TestEscapeNativeToolArg:
         assert rg_cmds, f"no rg command captured in: {commands}"
         assert any("'C:/Users/alice/project'" in c for c in rg_cmds), rg_cmds
         assert all("/c/Users" not in c for c in rg_cmds), rg_cmds
+
+    def test_shell_linter_uses_native_form(self, mock_env, monkeypatch):
+        """_check_lint must hand node/python/etc. the native C:/ path.
+
+        Regression for the double-prefix failure (#84303): node given the
+        MSYS /c/Users/... form resolves it as C:\\c\\Users\\... and every
+        .js write reports a phantom ENOENT lint error.
+        """
+        import tools.environments.local as local_mod
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        commands = []
+
+        def side_effect(command, **kwargs):
+            commands.append(command)
+            if "command -v" in command:
+                return {"output": "yes", "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        ops = self._ops(mock_env)
+        result = ops._check_lint(r"C:\Users\alice\app\main.js")
+        assert result.skipped is False
+        node_cmds = [c for c in commands if "node --check" in c]
+        assert node_cmds, f"no node command captured in: {commands}"
+        assert "'C:/Users/alice/app/main.js'" in node_cmds[0]
+        assert "/c/Users" not in node_cmds[0]
