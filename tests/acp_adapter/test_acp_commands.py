@@ -169,6 +169,31 @@ def test_acp_expansion_preserves_explicit_empty_toolsets():
     assert _expand_acp_enabled_toolsets([], ["scoped"]) == ["mcp-scoped"]
 
 
+def test_acp_skip_configured_mcp_prevents_session_discovery(monkeypatch):
+    calls = []
+    captured, _ = _capture_real_agent_kwargs(
+        monkeypatch,
+        {
+            "model": {"default": "m", "provider": "p"},
+            "platform_toolsets": {"acp": []},
+            "mcp_servers": {"global": {"command": "example"}},
+        },
+    )
+    import hermes_cli.mcp_startup
+
+    monkeypatch.setenv("HERMES_ACP_SKIP_CONFIGURED_MCP", "1")
+    monkeypatch.setattr(
+        hermes_cli.mcp_startup,
+        "ensure_mcp_discovery_before_agent_build",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    SessionManager(db=NoopDb())._make_agent(session_id="acp-session", cwd=".")
+
+    assert calls == []
+    assert captured["enabled_toolsets"] == []
+
+
 @pytest.mark.asyncio
 async def test_acp_steer_slash_command_injects_into_running_agent():
     acp_agent, state, fake, _conn = make_agent_and_state()

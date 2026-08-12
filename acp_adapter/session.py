@@ -623,9 +623,15 @@ class SessionManager:
         ]
         platform_toolsets = config.get("platform_toolsets") or {}
         if isinstance(platform_toolsets.get("acp"), list):
-            from hermes_cli.tools_config import _get_platform_tools
+            configured_acp_toolsets = platform_toolsets["acp"]
+            if configured_acp_toolsets:
+                from hermes_cli.tools_config import _get_platform_tools
 
-            enabled_toolsets = sorted(_get_platform_tools(config, "acp"))
+                enabled_toolsets = sorted(_get_platform_tools(config, "acp"))
+            else:
+                # An explicit empty ACP list is a meaningful deny-all baseline.
+                # Session-provided MCP servers may be added after session/new.
+                enabled_toolsets = []
         else:
             # Backward compatibility: ACP historically used its curated
             # composite plus every configured MCP server.
@@ -679,15 +685,16 @@ class SessionManager:
         # ``mcp_discovery_timeout`` (config.yaml, default ~1.5s) so a dead
         # server can't block — servers that miss the bound are picked up by
         # the automatic late-refresh (see HermesACPAgent._schedule_mcp_late_refresh).
-        try:
-            from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
+        if os.environ.get("HERMES_ACP_SKIP_CONFIGURED_MCP", "").strip() != "1":
+            try:
+                from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
 
-            ensure_mcp_discovery_before_agent_build(
-                logger=logger,
-                thread_name="acp-mcp-discovery",
-            )
-        except Exception:
-            logger.debug("ACP: bounded MCP discovery wait failed", exc_info=True)
+                ensure_mcp_discovery_before_agent_build(
+                    logger=logger,
+                    thread_name="acp-mcp-discovery",
+                )
+            except Exception:
+                logger.debug("ACP: bounded MCP discovery wait failed", exc_info=True)
 
         agent = AIAgent(**kwargs)
         # Codex app-server sessions are spawned lazily on the first turn. Stamp
