@@ -92,15 +92,19 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Tuple
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from hermes_cli.kanban_intake import DEFAULT_POLICY_VERSION
 from hermes_cli.kanban_repository import (
+    EvidenceWorkspaceError,
+    EvidenceWorkspaceResult,
     RepositoryConfigurationError,
     RepositoryContract,
     RefreshRequest,
     RefreshResult,
     VerificationProfile,
     VerificationResult,
+    inspect_evidence_workspace,
     load_repository_contract,
     refresh_story_branch,
     resolve_commit,
+    restore_generated_paths,
     run_verification,
 )
 from hermes_cli.kanban_product_outcomes import (
@@ -15807,6 +15811,106 @@ def _commit_worker_diff(
     return sha or None
 
 
+def record_generated_mutations(
+    conn: sqlite3.Connection,
+    run_id: int,
+    declared_generated: Iterable[object],
+    *,
+    metadata: Optional[dict] = None,
+) -> dict:
+    """Persist the generated-file observation before restoring its paths."""
+    run = get_run(conn, run_id)
+    if run is None or run.ended_at is not None:
+        raise EvidenceWorkspaceError("run_changed")
+    active_metadata = run.metadata if isinstance(run.metadata, dict) else {}
+    current = dict(active_metadata)
+    if metadata is not None:
+        # Keep the active dispatcher snapshot as the base so the returned
+        # completion metadata retains the worker's outcome/provenance while
+        # ``_end_run`` can still compare it with the untouched pin.
+        current.update(metadata)
+    evidence = current.get("evidence_workspace")
+    evidence_payload = dict(evidence) if isinstance(evidence, dict) else {}
+    evidence_payload["declared_generated"] = [
+        path.as_posix() if hasattr(path, "as_posix") else str(path)
+        for path in declared_generated
+    ]
+    current["evidence_workspace"] = evidence_payload
+    with write_txn(conn):
+        _append_event(
+            conn,
+            run.task_id,
+            "evidence_generated_mutations",
+            {
+                "run_id": int(run_id),
+                "paths": list(evidence_payload["declared_generated"]),
+            },
+            run_id=int(run_id),
+        )
+    return current
+
+
+def _evidence_generated_paths(
+    board: Optional[str],
+    workspace: Path,
+    error_type: type[RuntimeError],
+) -> tuple:
+    """Load the board-owned generated-path allowlist for an evidence run."""
+    meta = product_board_metadata(board) or {}
+    if "repository" not in meta:
+        return ()
+    try:
+        contract = load_repository_contract(meta, repo_root=workspace)
+    except RepositoryConfigurationError as exc:
+        raise error_type(f"repository contract: {exc}") from exc
+    return contract.generated_paths
+
+
+def _latest_test_target(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[dict[str, str]]:
+    """Return only the latest ended Test pin; never fall back to older runs."""
+    row = conn.execute(
+        "SELECT metadata FROM task_runs "
+        "WHERE task_id = ? AND step_key = 'test' AND ended_at IS NOT NULL "
+        "ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        metadata = json.loads(row["metadata"] or "{}")
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(metadata, dict):
+        return {}
+    branch = str(metadata.get("test_branch") or "").strip()
+    head = str(metadata.get("test_head_sha") or "").strip()
+    if not branch or not _FULL_GIT_SHA_RE.fullmatch(head):
+        return {}
+    return {"test_branch": branch, "test_head_sha": head}
+
+
+def _evidence_pin(
+    conn: sqlite3.Connection,
+    task_id: str,
+    step: str,
+) -> tuple[Optional[str], Optional[str], Optional[int], Optional[Path]]:
+    """Read the dispatcher-owned pin from the active evidence run."""
+    task = get_task(conn, task_id)
+    if task is None or task.current_run_id is None or not task.workspace_path:
+        return None, None, None, None
+    run = get_run(conn, task.current_run_id)
+    if run is None or run.ended_at is not None or not isinstance(run.metadata, dict):
+        return None, None, None, None
+    head = str(run.metadata.get(f"{step}_head_sha") or "").strip()
+    branch = str(run.metadata.get(f"{step}_branch") or "").strip()
+    if not _FULL_GIT_SHA_RE.fullmatch(head) or not branch:
+        return None, None, run.id, Path(task.workspace_path).expanduser().resolve(strict=False)
+    return head, branch, run.id, Path(task.workspace_path).expanduser().resolve(strict=False)
+
+
 def handoff(
     conn: sqlite3.Connection,
     task_id: str,
@@ -15829,9 +15933,9 @@ def handoff(
     provenance (raises :class:`ProductProvenanceError` on failure, card
     untouched) -> when ``expected_run_id`` is given, a run-ownership
     precondition check (before any commit, so a reclaimed worker can't
-    create a stale commit) -> commit any staged source diff; source-producing
-    steps require a commit SHA, while evidence-only test/review handoffs may
-    advance with ``sha=None`` -> one atomic
+    create a stale commit) -> commit Development's source diff; Test/Review
+    inspect the dispatcher-pinned evidence workspace and never author source
+    commits -> one atomic
     transaction: advance the phase, clear ``running``, retag the assignee,
     sync the legacy ``status``, and emit exactly one ``handoff`` event
     carrying the optional commit SHA. The advance UPDATE re-checks run ownership
@@ -15877,22 +15981,82 @@ def handoff(
     )
     _validate_product_ai_provenance(conn, task_id, step, metadata, meta)
 
-    sha = _commit_worker_diff(conn, task_id)
-    if sha is None and str(step or "") == "development":
-        repair_payload = _latest_resolver_repair_payload(conn, task_id) or {}
-        repair = repair_payload.get("repair")
-        adopted_sha = (
-            repair.get("adopt_handoff_sha")
-            if isinstance(repair, dict)
-            else None
+    sha: Optional[str] = None
+    if str(step or "") in {"test", "review"}:
+        pinned_sha, pinned_branch, run_id, workspace = _evidence_pin(
+            conn, task_id, str(step)
         )
-        if adopted_sha:
-            try:
-                sha = _validate_adopted_handoff_sha(
-                    conn, task_id, str(adopted_sha),
+        if (run_id is not None or workspace is not None) and (
+            pinned_sha is None
+            or not pinned_branch
+            or run_id is None
+            or workspace is None
+        ):
+            raise EvidenceWorkspaceError("missing_pin")
+        if pinned_sha is not None:
+            if run_id is None or workspace is None:
+                raise EvidenceWorkspaceError("missing_pin")
+            generated_paths = _evidence_generated_paths(
+                board,
+                workspace,
+                ReviewTargetPreparationError if str(step) == "review" else TestTargetPreparationError,
+            )
+            observed = inspect_evidence_workspace(
+                workspace,
+                pinned_sha,
+                generated_paths,
+            )
+            if (
+                observed.branch != pinned_branch
+                or observed.branch_head != pinned_sha
+            ):
+                raise EvidenceWorkspaceError("source_moved")
+            if observed.undeclared_tracked:
+                raise EvidenceWorkspaceError(
+                    "source_moved",
+                    ", ".join(observed.undeclared_tracked),
                 )
-            except ValueError:
-                return False
+            if observed.untracked:
+                raise EvidenceWorkspaceError(
+                    "untracked_output",
+                    ", ".join(observed.untracked),
+                )
+            evidence_metadata = dict(metadata or {})
+            evidence_metadata["evidence_workspace"] = {
+                "branch": observed.branch,
+                "branch_head": observed.branch_head,
+                "pinned_sha": pinned_sha,
+            }
+            metadata = record_generated_mutations(
+                conn,
+                run_id,
+                observed.declared_generated,
+                metadata=evidence_metadata,
+            )
+            if observed.declared_generated:
+                restore_generated_paths(
+                    workspace,
+                    pinned_sha,
+                    observed.declared_generated,
+                )
+            sha = pinned_sha
+    else:
+        sha = _commit_worker_diff(conn, task_id)
+        if sha is None and str(step or "") == "development":
+            repair_payload = _latest_resolver_repair_payload(conn, task_id) or {}
+            repair = repair_payload.get("repair")
+            adopted_sha = (
+                repair.get("adopt_handoff_sha")
+                if isinstance(repair, dict)
+                else None
+            )
+            if adopted_sha:
+                try:
+                    sha = _validate_adopted_handoff_sha(
+                        conn, task_id, str(adopted_sha),
+                    )
+                except ValueError:
+                    return False
     if sha is None and str(step or "") in _PRODUCT_COMMIT_REQUIRED_STEPS:
         return False
 
@@ -16104,9 +16268,20 @@ def _prepare_review_target(
     )
     if dirty:
         raise ReviewTargetPreparationError("review workspace is dirty or uncommitted")
+    workspace_branch = (_git_current_branch(actual_workspace) or "").strip()
+    if not workspace_branch:
+        raise ReviewTargetPreparationError("review workspace has no active branch")
+    if task.branch_name and task.branch_name != workspace_branch:
+        raise ReviewTargetPreparationError("review workspace branch does not match task branch")
     head_sha = _review_git_output(
         actual_workspace, "rev-parse", "--verify", "HEAD^{commit}"
     )
+    tested_target = _latest_test_target(conn, task_id)
+    if tested_target:
+        if tested_target["test_branch"] != workspace_branch:
+            raise ReviewTargetPreparationError("review branch does not match tested branch")
+        if tested_target["test_head_sha"] != head_sha:
+            raise ReviewTargetPreparationError("review head does not match tested SHA")
     base_ref = _review_target_branch(
         conn, task_id, actual_workspace, board=board
     )
@@ -16117,9 +16292,8 @@ def _prepare_review_target(
         raise ReviewTargetPreparationError("review base is not a full commit SHA")
     if not _FULL_GIT_SHA_RE.fullmatch(head_sha):
         raise ReviewTargetPreparationError("review head is not a full commit SHA")
-    review_branch = (task.branch_name or _git_current_branch(actual_workspace) or "").strip()
-    if not review_branch:
-        raise ReviewTargetPreparationError("review workspace has no active branch")
+    review_branch = workspace_branch
+    _evidence_generated_paths(board, actual_workspace, ReviewTargetPreparationError)
 
     metadata = dict(run.metadata or {})
     metadata.update(
@@ -16222,11 +16396,14 @@ def _prepare_test_target(
     head_sha = _review_git_output(
         actual_workspace, "rev-parse", "--verify", "HEAD^{commit}"
     )
-    test_branch = (task.branch_name or _git_current_branch(actual_workspace) or "").strip()
+    test_branch = (_git_current_branch(actual_workspace) or "").strip()
     if not test_branch:
         raise TestTargetPreparationError("test workspace has no active branch")
+    if task.branch_name and task.branch_name != test_branch:
+        raise TestTargetPreparationError("test workspace branch does not match task branch")
     if not _FULL_GIT_SHA_RE.fullmatch(head_sha):
         raise TestTargetPreparationError("test head is not a full commit SHA")
+    _evidence_generated_paths(board, actual_workspace, TestTargetPreparationError)
 
     metadata = dict(run.metadata or {})
     metadata.update({"test_branch": test_branch, "test_head_sha": head_sha})
@@ -19952,6 +20129,24 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.body and task.body.strip():
         lines.append("## Body")
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
+        lines.append("")
+
+    if task.workflow_template_id == "product" and task.current_step_key in {"test", "review"}:
+        phase = str(task.current_step_key).title()
+        pinned_sha, pinned_branch, _run_id, _workspace = _evidence_pin(
+            conn, task_id, str(task.current_step_key)
+        )
+        lines.append("## Evidence-phase source boundary")
+        lines.append(
+            f"{phase} is evidence-only: never commit source or fixture changes."
+        )
+        lines.append(
+            "If a source or fixture edit is required, report it as a concrete "
+            "finding with workflow_outcome.verdict=changes_requested targeting "
+            "development; do not create a source commit in this phase."
+        )
+        if pinned_branch and pinned_sha:
+            lines.append(f"Dispatcher-pinned source: `{pinned_branch}` at `{pinned_sha}`")
         lines.append("")
 
     contract_view = work_contract_view(conn, task.work_contract_id)

@@ -9,13 +9,17 @@ import pytest
 
 import hermes_cli.kanban_repository as repository_module
 from hermes_cli.kanban_repository import (
+    EvidenceWorkspaceError,
+    EvidenceWorkspaceResult,
     RepositoryConfigurationError,
     RefreshRequest,
     VerificationCommand,
     VerificationProfile,
+    inspect_evidence_workspace,
     load_repository_contract,
     refresh_story_branch,
     resolve_commit,
+    restore_generated_paths,
     run_verification,
 )
 
@@ -176,6 +180,103 @@ def test_contract_rejects_invalid_generated_paths(repository: Path, generated_pa
         load_repository_contract(metadata, repo_root=repository)
 
     assert exc_info.value.code in {"invalid_path", "untracked_path"}
+
+
+def test_inspect_evidence_workspace_allows_declared_generated_and_ignored_output(
+    repository: Path,
+):
+    pinned_sha = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (repository / ".gitignore").write_text("artifacts/\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repository), "add", ".gitignore"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-m", "ignore artifacts"],
+        check=True,
+        capture_output=True,
+    )
+    pinned_sha = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (repository / "dashboard" / "index.html").write_text("generated\n", encoding="utf-8")
+    (repository / "artifacts").mkdir()
+    (repository / "artifacts" / "report.txt").write_text("evidence\n", encoding="utf-8")
+
+    result = inspect_evidence_workspace(
+        repository,
+        pinned_sha,
+        (PurePosixPath("dashboard/index.html"), PurePosixPath("dashboard/data.json")),
+    )
+
+    assert isinstance(result, EvidenceWorkspaceResult)
+    assert result.branch_head == pinned_sha
+    assert result.declared_generated == (PurePosixPath("dashboard/index.html"),)
+    assert result.undeclared_tracked == ()
+    assert result.untracked == ()
+
+
+def test_inspect_evidence_workspace_reports_undeclared_tracked_and_untracked_output(
+    repository: Path,
+):
+    pinned_sha = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (repository / "scripts" / "run_tests.sh").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    (repository / "artifact.txt").write_text("diagnostic\n", encoding="utf-8")
+
+    result = inspect_evidence_workspace(
+        repository,
+        pinned_sha,
+        (PurePosixPath("dashboard/index.html"),),
+    )
+
+    assert result.branch_head == pinned_sha
+    assert result.undeclared_tracked == ("scripts/run_tests.sh",)
+    assert result.untracked == ("artifact.txt",)
+
+
+def test_restore_generated_paths_restores_only_explicit_allowlist(repository: Path):
+    pinned_sha = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (repository / "dashboard" / "index.html").write_text("generated\n", encoding="utf-8")
+    (repository / "scripts" / "run_tests.sh").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+
+    restore_generated_paths(
+        repository,
+        pinned_sha,
+        (PurePosixPath("dashboard/index.html"),),
+    )
+
+    assert (repository / "dashboard" / "index.html").read_text(encoding="utf-8") == "index\n"
+    assert (repository / "scripts" / "run_tests.sh").read_text(encoding="utf-8") == "#!/bin/sh\nexit 1\n"
+
+
+def test_restore_generated_paths_rejects_unvalidated_path(repository: Path):
+    pinned_sha = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    with pytest.raises(EvidenceWorkspaceError, match="invalid_generated_path"):
+        restore_generated_paths(repository, pinned_sha, (PurePosixPath("../outside"),))
 
 
 def test_contract_rejects_workdir_escape(repository: Path):

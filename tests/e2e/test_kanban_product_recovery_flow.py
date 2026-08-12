@@ -123,6 +123,35 @@ def test_governed_product_story_recovers_through_release_and_done(
     )
     metadata_path = kb.board_metadata_path(board)
     board_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    board_metadata["repository"] = {
+        "base_ref": "refs/heads/main",
+        "target_branch": "main",
+        "verification_profiles": {
+            "story_integration": [
+                {
+                    "argv": ["bash", "scripts/run_tests.sh"],
+                    "workdir": ".",
+                    "timeout_seconds": 30,
+                }
+            ],
+            "epic_release": [
+                {
+                    "argv": ["bash", "scripts/run_tests.sh"],
+                    "workdir": ".",
+                    "timeout_seconds": 30,
+                }
+            ],
+        },
+        "ci_observation": {
+            "provider": "github_actions",
+            "required_workflows": ["CI"],
+        },
+        "boundary_evidence": {
+            "test_globs": ["tests/**"],
+            "fixture_globs": ["tests/fixtures/**"],
+            "generated_paths": ["README.md"],
+        },
+    }
     board_metadata["product_workflow"]["deployment_policy"] = "required"
     metadata_path.write_text(
         json.dumps(board_metadata, indent=2) + "\n",
@@ -329,6 +358,17 @@ def test_governed_product_story_recovers_through_release_and_done(
         )
         assert test_result.returncode == 0, test_result.stderr
         passed_test = _claim(conn, task_id, board=board, claimer="tester-passed")
+        test_pin = kb._prepare_test_target(
+            conn, task_id, story_worktree, board=board
+        )
+        assert test_pin == {
+            "test_branch": branch,
+            "test_head_sha": second_development_sha,
+        }
+        assert isinstance(test_pin, dict)
+        (story_worktree / "README.md").write_text(
+            "test-generated evidence\n", encoding="utf-8"
+        )
         assert kb.complete_task(
             conn,
             task_id,
@@ -339,18 +379,32 @@ def test_governed_product_story_recovers_through_release_and_done(
                     "writer": {"agent": "claude-code"},
                     "tester": {"agent": "hermes", "result": "passed"}
                 },
-                "test_branch": branch,
-                "test_head_sha": second_development_sha,
+                **test_pin,
                 "tests_run": ["scripts/run_tests.sh"],
             },
             expected_run_id=passed_test.current_run_id,
             board=board,
+        )
+        assert (story_worktree / "README.md").read_text(encoding="utf-8") == (
+            "governed recovery fixture\n"
         )
 
         reviewer = kb.claim_review_task(
             conn, task_id, claimer="independent-reviewer"
         )
         assert reviewer is not None and reviewer.current_run_id is not None
+        review_pin = kb._prepare_review_target(
+            conn, task_id, story_worktree, board=board
+        )
+        assert review_pin == {
+            "review_branch": branch,
+            "review_base_sha": rollback_target,
+            "review_head_sha": second_development_sha,
+        }
+        assert isinstance(review_pin, dict)
+        (story_worktree / "README.md").write_text(
+            "review-generated evidence\n", encoding="utf-8"
+        )
         assert kb.complete_task(
             conn,
             task_id,
@@ -366,12 +420,13 @@ def test_governed_product_story_recovers_through_release_and_done(
                         "reviewed_commit": second_development_sha,
                     },
                 },
-                "review_branch": branch,
-                "review_base_sha": rollback_target,
-                "review_head_sha": second_development_sha,
+                **review_pin,
             },
             expected_run_id=reviewer.current_run_id,
             board=board,
+        )
+        assert (story_worktree / "README.md").read_text(encoding="utf-8") == (
+            "governed recovery fixture\n"
         )
 
         release = _claim(conn, task_id, board=board, claimer="release-measure")

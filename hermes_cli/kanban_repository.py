@@ -16,7 +16,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -412,6 +412,198 @@ class RepositoryContract:
     generated_paths: tuple[PurePosixPath, ...]
     ci_workflows: tuple[str, ...]
     digest: str
+
+
+class EvidenceWorkspaceError(RuntimeError):
+    """A Test/Review workspace crossed the dispatcher-owned source boundary."""
+
+    def __init__(self, code: str, detail: str | None = None):
+        self.code = code
+        message = code if not detail else f"{code}: {detail}"
+        super().__init__(message)
+
+
+@dataclass(frozen=True)
+class EvidenceWorkspaceResult:
+    """Observed Git state for one pinned Test/Review evidence workspace."""
+
+    branch: str
+    branch_head: str
+    tracked: tuple[str, ...] = ()
+    undeclared_tracked: tuple[str, ...] = ()
+    declared_generated: tuple[PurePosixPath, ...] = ()
+    untracked: tuple[str, ...] = ()
+
+    @property
+    def tracked_paths(self) -> tuple[str, ...]:
+        """Compatibility alias for callers that use the explicit name."""
+
+        return self.tracked
+
+    @property
+    def untracked_paths(self) -> tuple[str, ...]:
+        """Compatibility alias for callers that use the explicit name."""
+
+        return self.untracked
+
+    @property
+    def declared_generated_paths(self) -> tuple[PurePosixPath, ...]:
+        """Compatibility alias for callers that use the explicit name."""
+
+        return self.declared_generated
+
+
+def _evidence_git(workspace: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run one bounded, read-only or explicit-path Git operation."""
+
+    try:
+        return subprocess.run(
+            ["git", "-C", str(workspace), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise EvidenceWorkspaceError("git_error", str(exc)) from exc
+
+
+def _evidence_paths(value: object) -> tuple[PurePosixPath, ...]:
+    if value is None:
+        return ()
+    try:
+        raw_paths = tuple(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise EvidenceWorkspaceError("invalid_generated_path") from exc
+    normalized: list[PurePosixPath] = []
+    for raw_path in raw_paths:
+        path = raw_path if isinstance(raw_path, PurePosixPath) else PurePosixPath(str(raw_path))
+        if path.is_absolute() or not path.parts or ".." in path.parts:
+            raise EvidenceWorkspaceError("invalid_generated_path", str(path))
+        normalized.append(path)
+    if len(set(normalized)) != len(normalized):
+        raise EvidenceWorkspaceError("invalid_generated_path", "duplicate path")
+    return tuple(normalized)
+
+
+def _evidence_status_paths(output: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    tracked: set[str] = set()
+    untracked: set[str] = set()
+    for line in output.splitlines():
+        if len(line) < 4:
+            continue
+        status = line[:2]
+        raw_path = line[3:]
+        paths = (
+            tuple(part.strip() for part in raw_path.split(" -> ", 1))
+            if " -> " in raw_path and status[0] in {"R", "C"}
+            else (raw_path,)
+        )
+        target = untracked if status == "??" else tracked
+        target.update(path for path in paths if path)
+    return tuple(sorted(tracked)), tuple(sorted(untracked))
+
+
+def inspect_evidence_workspace(
+    workspace: Path | str,
+    pinned_sha: str,
+    generated_paths: Iterable[PurePosixPath | str] = (),
+) -> EvidenceWorkspaceResult:
+    """Inspect a pinned evidence checkout without changing its source files.
+
+    Gitignored output is intentionally absent from porcelain status and is
+    therefore allowed.  Every non-ignored untracked path remains visible as a
+    rejection signal; the caller decides whether to preserve it for diagnosis.
+    """
+
+    actual = Path(workspace).expanduser().resolve(strict=False)
+    if not actual.is_dir():
+        raise EvidenceWorkspaceError("workspace_unavailable", str(actual))
+    if not FULL_SHA.fullmatch(str(pinned_sha or "")):
+        raise EvidenceWorkspaceError("invalid_pinned_sha")
+    branch_result = _evidence_git(actual, "branch", "--show-current")
+    head_result = _evidence_git(actual, "rev-parse", "--verify", "HEAD^{commit}")
+    status_result = _evidence_git(
+        actual,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    )
+    if branch_result.returncode or head_result.returncode or status_result.returncode:
+        detail = (
+            head_result.stderr
+            or branch_result.stderr
+            or status_result.stderr
+            or "git inspection failed"
+        ).strip()
+        raise EvidenceWorkspaceError("git_error", detail[:300])
+    tracked, untracked = _evidence_status_paths(status_result.stdout or "")
+    allowed = _evidence_paths(generated_paths)
+    allowed_names = {path.as_posix() for path in allowed}
+    declared = tuple(
+        PurePosixPath(path)
+        for path in tracked
+        if path in allowed_names
+    )
+    undeclared = tuple(path for path in tracked if path not in allowed_names)
+    return EvidenceWorkspaceResult(
+        branch=(branch_result.stdout or "").strip(),
+        branch_head=(head_result.stdout or "").strip(),
+        tracked=tracked,
+        undeclared_tracked=undeclared,
+        declared_generated=declared,
+        untracked=untracked,
+    )
+
+
+def restore_generated_paths(
+    workspace: Path | str,
+    pinned_sha: str,
+    generated_paths: Iterable[PurePosixPath | str],
+) -> None:
+    """Restore only validated generated paths to one exact pinned commit.
+
+    The explicit pathspec terminator is intentional: this helper never resets,
+    cleans, stashes, or accepts an arbitrary directory from an evidence worker.
+    """
+
+    actual = Path(workspace).expanduser().resolve(strict=False)
+    if not actual.is_dir():
+        raise EvidenceWorkspaceError("workspace_unavailable", str(actual))
+    if not FULL_SHA.fullmatch(str(pinned_sha or "")):
+        raise EvidenceWorkspaceError("invalid_pinned_sha")
+    paths = _evidence_paths(generated_paths)
+    if not paths:
+        return
+    for path in paths:
+        listed = _evidence_git(
+            actual,
+            "ls-tree",
+            "-r",
+            "--name-only",
+            pinned_sha,
+            "--",
+            path.as_posix(),
+        )
+        if listed.returncode != 0 or path.as_posix() not in {
+            line.strip() for line in (listed.stdout or "").splitlines()
+        }:
+            raise EvidenceWorkspaceError("invalid_generated_path", path.as_posix())
+    restored = _evidence_git(
+        actual,
+        "restore",
+        "--source",
+        pinned_sha,
+        "--staged",
+        "--worktree",
+        "--",
+        *(path.as_posix() for path in paths),
+    )
+    if restored.returncode != 0:
+        detail = (restored.stderr or restored.stdout or "restore failed").strip()
+        raise EvidenceWorkspaceError("restore_failed", detail[:300])
 
 
 @dataclass(frozen=True)

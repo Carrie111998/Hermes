@@ -3447,6 +3447,34 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+def test_worker_context_marks_product_test_as_evidence_only(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "worker-context-evidence-boundary"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid, _workspace, _branch = _seed_product_test_worktree(conn, board, repo)
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 5252,
+        )
+        assert result.spawned[0][0] == tid
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
+        run = kb.get_run(conn, task.current_run_id)
+        context = kb.build_worker_context(conn, tid)
+
+    assert run is not None and run.metadata is not None
+    assert "## Evidence-phase source boundary" in context
+    assert "never commit source or fixture changes" in context
+    assert "workflow_outcome.verdict=changes_requested" in context
+    assert run.metadata["test_head_sha"] in context
+
+
 
 
 
@@ -7545,6 +7573,368 @@ def test_pinned_review_target_survives_run_completion(
         "review_base_sha": base_sha,
         "review_head_sha": head_sha,
     }
+
+
+# Production baseline measured before R04: 56 ended Test runs contained six
+# distinct SHAs and 76 ended Review runs contained zero SHAs.  These behavior
+# tests cover the replacement contract instead of freezing those observations.
+
+
+def _set_generated_path_policy(board: str, repo: Path, *paths: str) -> None:
+    policy = {
+        "base_ref": "refs/heads/main",
+        "target_branch": "main",
+        "verification_profiles": {
+            "story_integration": {
+                "commands": [
+                    {
+                        "argv": ["python3", "-m", "unittest"],
+                        "workdir": ".",
+                        "timeout_seconds": 60,
+                    }
+                ]
+            },
+            "epic_release": {
+                "commands": [
+                    {
+                        "argv": ["python3", "-m", "unittest"],
+                        "workdir": ".",
+                        "timeout_seconds": 60,
+                    }
+                ]
+            },
+        },
+        "ci_observation": {
+            "provider": "github_actions",
+            "required_workflows": ["CI"],
+        },
+        "boundary_evidence": {
+            "test_globs": ["tests/**"],
+            "fixture_globs": ["tests/fixtures/**"],
+            "generated_paths": list(paths),
+        },
+    }
+    kb.write_board_metadata(
+        board,
+        default_workdir=str(repo),
+        repository=policy,
+    )
+
+
+def test_test_completion_rejects_source_head_movement(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "test-evidence-head-moved"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid, workspace, _branch = _seed_product_test_worktree(conn, board, repo)
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 5252,
+        )
+        assert result.spawned[0][0] == tid
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
+        pinned = kb.get_run(conn, task.current_run_id)
+        assert pinned is not None
+        pinned_sha = pinned.metadata["test_head_sha"]
+        _commit_file(workspace, "source.txt", "moved\n", "move test head")
+
+        with pytest.raises(kb.EvidenceWorkspaceError, match="source_moved"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Tests passed",
+                board=board,
+                metadata={
+                    "workflow_outcome": {"verdict": "passed"},
+                    "ai_provenance": {"tester": {"agent": "hermes"}},
+                },
+                expected_run_id=pinned.id,
+            )
+
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert task is not None and task.current_step_key == "test"
+    assert task.status == "running"
+    assert _git_output(workspace, "rev-parse", "HEAD") != pinned_sha
+    assert not any(event.kind == "handoff" for event in events)
+
+
+def test_test_completion_rejects_missing_dispatcher_pin(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "test-evidence-missing-pin"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid, workspace, _branch = _seed_product_test_worktree(conn, board, repo)
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 5252,
+        )
+        assert result.spawned[0][0] == tid
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
+        run_id = task.current_run_id
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (json.dumps({}), run_id),
+        )
+        with pytest.raises(kb.EvidenceWorkspaceError, match="missing_pin"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Tests passed",
+                board=board,
+                metadata={
+                    "workflow_outcome": {"verdict": "passed"},
+                    "ai_provenance": {"tester": {"agent": "hermes"}},
+                },
+                expected_run_id=run_id,
+            )
+        current = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert current is not None and current.status == "running"
+    assert current.current_step_key == "test"
+    assert not any(event.kind == "handoff" for event in events)
+
+
+def test_test_completion_restores_declared_generated_path_and_uses_pinned_sha(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "test-evidence-generated-restore"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+    _set_generated_path_policy(board, repo, "README.md")
+
+    with kb.connect(board=board) as conn:
+        tid, workspace, _branch = _seed_product_test_worktree(conn, board, repo)
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 5252,
+        )
+        assert result.spawned[0][0] == tid
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
+        run_id = task.current_run_id
+        run = kb.get_run(conn, run_id)
+        assert run is not None
+        pinned_sha = run.metadata["test_head_sha"]
+        (workspace / "README.md").write_text("generated evidence\n", encoding="utf-8")
+
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Tests passed",
+            board=board,
+            metadata={
+                "workflow_outcome": {"verdict": "passed"},
+                "ai_provenance": {"tester": {"agent": "hermes"}},
+            },
+            expected_run_id=run_id,
+        )
+        closed = kb.get_run(conn, run_id)
+        events = kb.list_events(conn, tid)
+
+    assert (workspace / "README.md").read_text(encoding="utf-8") == "hello\n"
+    assert closed is not None and closed.metadata is not None
+    assert closed.metadata["evidence_workspace"]["declared_generated"] == ["README.md"]
+    generated_event = next(
+        event for event in events if event.kind == "evidence_generated_mutations"
+    )
+    assert generated_event.payload == {"run_id": run_id, "paths": ["README.md"]}
+    handoff = next(event for event in events if event.kind == "handoff")
+    assert handoff.payload["sha"] == pinned_sha
+
+
+def test_test_completion_preserves_nonignored_untracked_output_and_rejects(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "test-evidence-untracked"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid, workspace, _branch = _seed_product_test_worktree(conn, board, repo)
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 5252,
+        )
+        assert result.spawned[0][0] == tid
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
+        (workspace / "artifact.txt").write_text("diagnosis\n", encoding="utf-8")
+
+        with pytest.raises(kb.EvidenceWorkspaceError, match="untracked_output"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Tests passed",
+                board=board,
+                metadata={
+                    "workflow_outcome": {"verdict": "passed"},
+                    "ai_provenance": {"tester": {"agent": "hermes"}},
+                },
+                expected_run_id=task.current_run_id,
+            )
+        current = kb.get_task(conn, tid)
+
+    assert current is not None and current.current_step_key == "test"
+    assert (workspace / "artifact.txt").read_text(encoding="utf-8") == "diagnosis\n"
+
+
+def test_test_completion_rejects_undeclared_tracked_mutation(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "test-evidence-undeclared-tracked"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid, workspace, _branch = _seed_product_test_worktree(conn, board, repo)
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 5252,
+        )
+        assert result.spawned[0][0] == tid
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
+        (workspace / "README.md").write_text("source edit\n", encoding="utf-8")
+
+        with pytest.raises(kb.EvidenceWorkspaceError, match="source_moved"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Tests passed",
+                board=board,
+                metadata={
+                    "workflow_outcome": {"verdict": "passed"},
+                    "ai_provenance": {"tester": {"agent": "hermes"}},
+                },
+                expected_run_id=task.current_run_id,
+            )
+
+    assert (workspace / "README.md").read_text(encoding="utf-8") == "source edit\n"
+
+
+def test_review_dispatch_requires_the_latest_test_sha_when_one_is_pinned(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "review-evidence-tested-sha"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid, workspace, _base_sha, head_sha = _seed_product_review_worktree(
+            conn, board, repo
+        )
+        with kb.write_txn(conn):
+            kb._synthesize_ended_run(
+                conn,
+                tid,
+                outcome="advanced",
+                step_key="test",
+                metadata={
+                    "test_branch": kb._git_current_branch(workspace),
+                    "test_head_sha": head_sha,
+                    "workflow_outcome": {"verdict": "passed"},
+                    "ai_provenance": {
+                        "writer": {"agent": "writer"},
+                        "tester": {"agent": "hermes"},
+                    },
+                },
+            )
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 5252,
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
+        run = kb.get_run(conn, task.current_run_id)
+
+    assert result.spawned[0][0] == tid
+    assert run is not None
+    assert run.metadata["review_head_sha"] == head_sha
+
+
+def test_review_completion_rejects_source_edit_without_authoring_a_commit(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "review-evidence-source-edit"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid, workspace, _base_sha, head_sha = _seed_product_review_worktree(
+            conn, board, repo
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.branch_name
+        with kb.write_txn(conn):
+            kb._synthesize_ended_run(
+                conn,
+                tid,
+                outcome="advanced",
+                step_key="test",
+                metadata={
+                    "test_branch": task.branch_name,
+                    "test_head_sha": head_sha,
+                    "workflow_outcome": {"verdict": "passed"},
+                    "ai_provenance": {
+                        "writer": {"agent": "writer"},
+                        "tester": {"agent": "hermes"},
+                    },
+                },
+            )
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 5252,
+        )
+        assert result.spawned[0][0] == tid
+        running = kb.get_task(conn, tid)
+        assert running is not None and running.current_run_id is not None
+        before_head = _git_output(workspace, "rev-parse", "HEAD")
+        (workspace / "README.md").write_text("reviewer source edit\n", encoding="utf-8")
+
+        with pytest.raises(kb.EvidenceWorkspaceError, match="source_moved"):
+            kb.handoff(
+                conn,
+                tid,
+                board=board,
+                summary="Approved review",
+                metadata={
+                    "workflow_outcome": {"verdict": "approved"},
+                    "ai_provenance": {
+                        "writer": {"agent": "writer"},
+                        "reviewer": {"agent": "reviewer", "verdict": "approved"},
+                    },
+                },
+                expected_run_id=running.current_run_id,
+                expected_phase="review",
+            )
+
+    assert _git_output(workspace, "rev-parse", "HEAD") == before_head
+    assert (workspace / "README.md").read_text(encoding="utf-8") == "reviewer source edit\n"
 
 
 def test_review_closure_keeps_dispatcher_pins_over_worker_claims(
