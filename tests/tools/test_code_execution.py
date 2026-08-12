@@ -579,9 +579,8 @@ class TestExecuteCodeEdgeCases(unittest.TestCase):
 
 
     @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
-    def test_nonoverlapping_tools_fallback(self):
-        """When enabled_tools has no overlap with SANDBOX_ALLOWED_TOOLS,
-        should fall back to all allowed tools."""
+    def test_nonoverlapping_tools_are_not_exposed(self):
+        """Explicit tool restrictions must not fall back to all tools."""
         code = (
             "from hermes_tools import terminal\n"
             "print('fallback ok')\n"
@@ -592,8 +591,17 @@ class TestExecuteCodeEdgeCases(unittest.TestCase):
                 code, task_id="test-nonoverlap",
                 enabled_tools=["vision_analyze", "browser_snapshot"],
             ))
-        self.assertEqual(result["status"], "success")
-        self.assertIn("fallback ok", result["output"])
+        self.assertEqual(result["status"], "error")
+        self.assertIn("cannot import name", result["error"].lower())
+
+    @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
+    def test_empty_tools_are_not_exposed(self):
+        """An explicit empty list must expose no sandbox helper tools."""
+        code = "from hermes_tools import terminal\nprint('should not run')\n"
+        with patch("model_tools.handle_function_call", return_value=json.dumps({"ok": True})):
+            result = json.loads(execute_code(code, task_id="test-empty-tools", enabled_tools=[]))
+        self.assertEqual(result["status"], "error")
+        self.assertIn("cannot import name", result["error"].lower())
 
 
 # ---------------------------------------------------------------------------

@@ -393,7 +393,11 @@ def _sandbox_failure_hint(stderr_text: str, enabled_tools=None) -> Optional[str]
         )
         if m:
             missing = m.group(1)
-            available = sorted(SANDBOX_ALLOWED_TOOLS & set(enabled_tools or SANDBOX_ALLOWED_TOOLS))
+            available = sorted(
+                SANDBOX_ALLOWED_TOOLS
+                if enabled_tools is None
+                else SANDBOX_ALLOWED_TOOLS & set(enabled_tools)
+            )
             builtin = {"json_parse", "shell_quote", "retry"}
             if missing in builtin:
                 return (
@@ -1077,10 +1081,11 @@ def _execute_remote(
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    sandbox_tools = (
+        SANDBOX_ALLOWED_TOOLS
+        if enabled_tools is None
+        else frozenset(SANDBOX_ALLOWED_TOOLS & set(enabled_tools))
+    )
 
     effective_task_id = task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
@@ -1331,11 +1336,11 @@ def execute_code(
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
     # Determine which tools the sandbox can call
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    sandbox_tools = (
+        SANDBOX_ALLOWED_TOOLS
+        if enabled_tools is None
+        else frozenset(SANDBOX_ALLOWED_TOOLS & set(enabled_tools))
+    )
 
     # --- Set up temp directory with hermes_tools.py and script.py ---
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
