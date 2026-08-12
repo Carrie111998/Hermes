@@ -28,6 +28,11 @@ from pathlib import Path
 
 import pytest
 
+from agent.context_compressor import (
+    COMPRESSED_SUMMARY_HAS_USER_TURN_KEY,
+    COMPRESSED_SUMMARY_METADATA_KEY,
+    SUMMARY_PREFIX,
+)
 from hermes_state import SessionDB
 
 
@@ -298,3 +303,196 @@ def test_undo_session_rewind_routes_through_compaction(db):
     assert "[SUMMARY]" not in live_user_contents
     # The revived pre-compaction rows are present.
     assert "q3" in live_user_contents or "q2" in live_user_contents
+
+
+def _seed_and_compact(db, sid, n_pairs, summary_content, tail_pairs=()):
+    """Seed *sid* with ``n_pairs`` user/assistant pairs, then archive them and
+    insert a compaction projection whose FIRST row is the synthetic summary.
+
+    The projection mirrors a real in-place compaction: it leads with a
+    ``role='user'`` summary carrying the in-process compressed-summary
+    metadata flag (persisted in-memory only — SessionDB drops underscore keys,
+    so the persisted discriminator is the ``display_kind`` stamp), optionally
+    an assistant carry-over, then preserved real tail turns.
+    """
+    _seed(db, sid, n_pairs)
+    projection = [
+        {
+            "role": "user",
+            "content": summary_content,
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+            COMPRESSED_SUMMARY_HAS_USER_TURN_KEY: False,
+        }
+    ]
+    if tail_pairs:
+        # Each pair is inserted as (assistant carry-over, preserved user turn,
+        # assistant reply) — matching a real compaction projection's tail.
+        for q, a in tail_pairs:
+            projection.append({"role": "assistant", "content": "carry-over"})
+            projection.append({"role": "user", "content": q})
+            projection.append({"role": "assistant", "content": a})
+    else:
+        projection.append({"role": "assistant", "content": "ok"})
+    db.archive_and_compact(sid, projection)
+    return projection
+
+
+def test_synthetic_summary_row_persists_display_kind(db):
+    """A user-role compaction summary persisted through ``archive_and_compact``
+    must carry a stable ``display_kind`` marker (#81130 root-cause 3).
+
+    The in-process ``_compressed_summary`` flag is underscore-prefixed and
+    deliberately stripped before the wire / not persisted by SessionDB, so the
+    ONLY durable signal distinguishing a synthetic summary from a real user
+    turn is the ``display_kind`` column. Without it the /undo picker's SQL
+    ``display_clause`` (``display_kind IS NULL``) counts the summary as a real
+    turn and /undo N can land on it — the empty-context failure the issue
+    reports.
+    """
+    # Content intentionally does NOT start with any known handoff prefix so the
+    # content-prefix heuristic (classify_summary_content) cannot be what makes
+    # this pass — only the display_kind stamp can.
+    _seed_and_compact(
+        db, "s", 4, "Compressed earlier turns. Resume from here."
+    )
+    row = db._conn.execute(
+        "SELECT display_kind FROM messages WHERE session_id = ? "
+        "AND role = 'user' AND active = 1 AND "
+        "content = 'Compressed earlier turns. Resume from here.'",
+        ("s",),
+    ).fetchone()
+    assert row is not None
+    assert row["display_kind"] == "hidden"
+
+    # The picker (with include_compacted=True, as /undo uses) must NOT surface
+    # the summary — even though its content fails every prefix heuristic, the
+    # persisted display_kind excludes it at the SQL display_clause.
+    recents = db.list_recent_user_messages("s", limit=10, include_compacted=True)
+    previews = [r["preview"] for r in recents]
+    assert "Compressed earlier turns" not in " ".join(previews)
+    # The preserved tail / archived real turns are still valid targets.
+    for q in ("q3", "q0"):
+        assert any(q in p for p in previews), f"missing real turn {q} in picker"
+
+
+def test_undo_multiple_turns_never_lands_on_synthetic_summary(db):
+    """``/undo N`` counting across the compaction boundary must never pick the
+    synthetic user-role summary as a target — N resolves against REAL user
+    turns only (#81130 root-cause 3).
+
+    This is the issue's exact failure mode: with the summary occupying the
+    newest live user slot, ``/undo 3`` used to count it and drop to an empty
+    live context. Here the summary carries the real ``SUMMARY_PREFIX`` banner
+    (what production compaction emits), so it is double-excluded: the content
+    heuristic AND the persisted display_kind. The regression is that the
+    3rd-from-last user turn is a REAL archived turn, and rewinding to it
+    revives the pre-compaction transcript instead of draining the context.
+    """
+    _seed_and_compact(
+        db,
+        "s6",
+        6,
+        SUMMARY_PREFIX + " q1..q4",
+        tail_pairs=[("q5", "a5"), ("q6: trigger", "a6")],
+    )
+    # Sanity: pre-undo the live set is the projection.
+    live = _live_messages(db, "s6")
+    assert any(SUMMARY_PREFIX in (m.get("content") or "") for m in live)
+
+    recents = db.list_recent_user_messages("s6", limit=10, include_compacted=True)
+    summary_in_picker = any(
+        (r["preview"] or "").startswith(SUMMARY_PREFIX[:12]) for r in recents
+    )
+    assert not summary_in_picker, "summary must never be a /undo target"
+
+    # /undo 3 → the third-from-last real user turn across the boundary. The
+    # summary is excluded, so this lands on a compacted=1 archive row (a real
+    # pre-compaction turn), which must route through rewind_through_compaction
+    # rather than soft-deleting the summary into an empty context.
+    target = recents[2]
+    archived = db._conn.execute(
+        "SELECT active, compacted FROM messages WHERE id = ?",
+        (target["id"],),
+    ).fetchone()
+    assert int(archived["active"]) == 0
+    assert int(archived["compacted"]) == 1
+
+    db.rewind_through_compaction("s6", target["id"])
+    post_live = [
+        m.get("content") for m in _live_messages(db, "s6") if m.get("role") == "user"
+    ]
+    # The summary is gone from the live set; a real pre-compaction turn is back.
+    assert not any(
+        SUMMARY_PREFIX in (c or "") for c in post_live
+    ), "summary must be discarded on a cross-boundary /undo"
+    assert any(
+        c in ("q0", "q1", "q2", "q3", "q4") for c in post_live
+    ), "rewind must restore a pre-compaction real user turn"
+
+
+def test_rewind_through_compaction_limits_to_nearest_boundary(db):
+    """After SEVERAL in-place compactions, ``rewind_through_compaction`` must
+    revive only the boundary the target sits in — not every historical
+    boundary's accumulated ``compacted=1`` rows (#81130 LOW).
+
+    Two compactions stack two boundaries:
+      B1 = original turns [q0,a0,q1,a1]  (ids 1-4)
+      B2 = first projection [S1, ok1]    (ids 5-6)
+      live = second projection [S2, ok2] (ids 7-8)
+    Rewinding to a turn in B1 must revive ONLY ids 1-4; B2 stays archived. If
+    the revive swept the whole archive it would pull B2 back too and blow up
+    the next context window.
+    """
+    _seed_and_compact(db, "s", 2, SUMMARY_PREFIX + " S1")   # B1 archived, B2 live
+    db.archive_and_compact(  # second compaction: B2 archived, live = [S2, ok2]
+        "s",
+        [
+            {
+                "role": "user",
+                "content": SUMMARY_PREFIX + " S2",
+                COMPRESSED_SUMMARY_METADATA_KEY: True,
+                COMPRESSED_SUMMARY_HAS_USER_TURN_KEY: False,
+            },
+            {"role": "assistant", "content": "ok2"},
+        ],
+    )
+
+    # Sanity: the accumulated archive has both B1 and B2.
+    compacted_all = db._conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id = ? "
+        "AND active = 0 AND compacted = 1",
+        ("s",),
+    ).fetchone()[0]
+    assert compacted_all == 6
+
+    q0_id = db._conn.execute(
+        "SELECT id FROM messages WHERE session_id = ? AND content = 'q0'",
+        ("s",),
+    ).fetchone()["id"]
+    res = db.rewind_through_compaction("s", q0_id)
+    # Only the first boundary (4 rows) came back.
+    assert res["revived_count"] == 4
+
+    revived_first_boundary = db._conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id = ? "
+        "AND active = 1 AND compacted = 0 AND id <= 4",
+        ("s",),
+    ).fetchone()[0]
+    assert revived_first_boundary == 4
+
+    # The second boundary (first projection) stays archived — not revived.
+    second_boundary_still_archived = db._conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id = ? "
+        "AND compacted = 1 AND id IN (5, 6)",
+        ("s",),
+    ).fetchone()[0]
+    assert second_boundary_still_archived == 2
+
+    # The live projection was soft-deleted (rewound).
+    projection_rewound = db._conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id = ? "
+        "AND active = 0 AND compacted = 0 AND id IN (7, 8)",
+        ("s",),
+    ).fetchone()[0]
+    assert projection_rewound == 2
+
