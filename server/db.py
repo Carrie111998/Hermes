@@ -207,6 +207,28 @@ CREATE INDEX IF NOT EXISTS ix_document_artifacts_scope
     ON document_artifacts(company_id, document_id, role);
 CREATE INDEX IF NOT EXISTS ix_document_attempts_scope
     ON document_processing_attempts(company_id, public_status);
+-- What a run actually looked at. Separate from run_events (which is a live
+-- progress feed that scrolls) so "where did this claim come from?" survives.
+CREATE TABLE IF NOT EXISTS agent_run_evidence (
+    id TEXT PRIMARY KEY,
+    company_id TEXT NOT NULL REFERENCES companies(id),
+    run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+    entity_type TEXT,
+    entity_id TEXT,
+    source_type TEXT NOT NULL,
+    source_url TEXT,
+    file_reference TEXT,
+    title TEXT,
+    retrieved_at REAL,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    result TEXT NOT NULL DEFAULT 'null',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_run_evidence_run ON agent_run_evidence(company_id, run_id);
+CREATE INDEX IF NOT EXISTS ix_run_evidence_entity
+    ON agent_run_evidence(company_id, entity_type, entity_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_run_evidence_dedupe
+    ON agent_run_evidence(run_id, source_type, source_url, file_reference);
 CREATE TABLE IF NOT EXISTS chat_sessions (
     id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id),
     user_id TEXT NOT NULL REFERENCES users(id), profile TEXT NOT NULL DEFAULT 'default',

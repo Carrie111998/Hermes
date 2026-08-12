@@ -51,6 +51,18 @@ def get_run(run_id: str, request: Request, principal: Principal = Depends(curren
     return request.app.state.runs.get(_scope(principal, x_company_id), run_id)
 
 
+@router.get("/{run_id}/detail")
+def run_detail(run_id: str, request: Request, principal: Principal = Depends(current_principal),
+               x_company_id: str | None = Header(default=None)):
+    """Run, events, structured output, related entities, and evidence.
+
+    Tenant-scoped through the same `company_scope` guard as every other route
+    here. The cross-company admin view is a separate endpoint that requires
+    admin and resolves the run's owning company itself.
+    """
+    return request.app.state.runs.detail(_scope(principal, x_company_id), run_id)
+
+
 @router.post("/{run_id}/start", status_code=202)
 def start_run(run_id: str, request: Request, principal: Principal = Depends(current_principal),
               x_company_id: str | None = Header(default=None)):

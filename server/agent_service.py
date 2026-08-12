@@ -19,6 +19,7 @@ from typing import Any
 from fastapi import HTTPException
 
 from . import run_types
+from .agent_evidence import evidence_from_log, evidence_from_output
 from .db import Database, json_dump, json_load, new_id, now
 from .quality import (canonical_linkedin_url, content_hash, normalize_name,
                       preflight_message, validate_contact_record)
@@ -213,6 +214,11 @@ class HermesProcessExecutor(BaseRunExecutor):
                     else:
                         lines.append(line)
                         service.event(run["id"], run["company_id"], "log", line.rstrip()[:4000])
+                        # Sources are captured as they scroll past: run_events
+                        # is trimmed and read live, this outlives the run.
+                        service.record_evidence(
+                            run["company_id"], run["id"], evidence_from_log(line)
+                        )
                 except queue.Empty:
                     pass
                 if service.cancellation_requested(run["id"]):
@@ -318,6 +324,9 @@ class AgentRunService:
         try:
             output = self.executor.execute(self, run)
             self._validate_output(run["run_type"], output)
+            # From the validated output, before persistence: the sources the
+            # agent explicitly cited are the ones worth keeping.
+            self.record_evidence(company_id, run_id, evidence_from_output(output))
             self.apply_output(run, output)
             stamp = now()
             self.db.execute(
@@ -390,6 +399,83 @@ class AgentRunService:
             "INSERT INTO run_events(run_id,company_id,ts,kind,message,data) VALUES(?,?,?,?,?,?)",
             (run_id, company_id, now(), kind, message, json_dump(data or {})),
         )
+
+    def record_evidence(
+        self,
+        company_id: str,
+        run_id: str,
+        items,
+        *,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+    ) -> int:
+        """Persist what a run looked at. Redacted, deduplicated, never fatal.
+
+        Called from the log-reading loop while a run is still going, so it must
+        not raise: losing an evidence row is a gap in the audit trail; raising
+        would abort the run itself.
+        """
+        from .agent_evidence import serialize_evidence
+
+        stored = 0
+        for item in items or []:
+            try:
+                self.db.execute(
+                    "INSERT INTO agent_run_evidence(id,company_id,run_id,entity_type,entity_id,"
+                    "source_type,source_url,file_reference,title,retrieved_at,metadata,result,"
+                    "created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    # Empty string, never NULL: SQLite treats NULLs as distinct
+                    # in a UNIQUE index, so a NULL source_url would let the
+                    # same file-based source insert without limit.
+                    (new_id("ev"), company_id, run_id, entity_type, entity_id,
+                     item.source_type, item.source_url or "",
+                     item.file_reference or "", item.title or None, now(),
+                     serialize_evidence(item.metadata), serialize_evidence(item.result),
+                     now()),
+                )
+                stored += 1
+            except Exception:
+                # Almost always the dedupe index: the same source seen twice.
+                continue
+        return stored
+
+    def evidence(self, company_id: str, run_id: str) -> list[dict]:
+        return [
+            {
+                "id": row["id"], "source_type": row["source_type"],
+                "source_url": row["source_url"], "file_reference": row["file_reference"],
+                "title": row["title"], "retrieved_at": row["retrieved_at"],
+                "entity_type": row["entity_type"], "entity_id": row["entity_id"],
+                "metadata": json_load(row["metadata"], {}),
+                "result": json_load(row["result"], None),
+            }
+            for row in self.db.all(
+                "SELECT * FROM agent_run_evidence WHERE company_id=? AND run_id=?"
+                " ORDER BY created_at, id",
+                (company_id, run_id),
+            )
+        ]
+
+    def detail(self, company_id: str, run_id: str) -> dict:
+        """Everything an administrator needs to audit one run.
+
+        Tenant-scoped like every other read here: callers that reach this from
+        the cross-company admin API must resolve the run's own company first.
+        """
+        run = self.get(company_id, run_id)
+        payload = run.get("payload") or {}
+        related = {
+            key: payload[key]
+            for key in ("document_id", "source_document_id", "lead_id", "contact_id",
+                        "scan_id", "campaign_id", "message_id", "product_id")
+            if payload.get(key)
+        }
+        return {
+            **run,
+            "events": self.events(company_id, run_id),
+            "evidence": self.evidence(company_id, run_id),
+            "related": related,
+        }
 
     def events(self, company_id: str, run_id: str) -> list[dict]:
         self.get(company_id, run_id)

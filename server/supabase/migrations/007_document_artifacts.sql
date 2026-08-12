@@ -70,12 +70,42 @@ comment on column documents.status_detail is
 comment on column documents.active_processed_artifact_id is
   'Promoted processed artifact. Set only by the transaction that completes a successful attempt.';
 
+-- What a run actually looked at. `run_events` is a live progress feed that
+-- scrolls; this is the durable answer to "where did this claim come from?".
+-- Values are redacted before insert (server/agent_evidence.py) — credentials,
+-- system prompts, and raw tool arguments never reach these columns.
+create table if not exists agent_run_evidence (
+  id text primary key,
+  company_id text not null references companies(id),
+  run_id text not null references agent_runs(id) on delete cascade,
+  entity_type text,
+  entity_id text,
+  source_type text not null,
+  source_url text,
+  file_reference text,
+  title text,
+  retrieved_at double precision,
+  metadata jsonb not null default '{}'::jsonb,
+  result jsonb not null default 'null'::jsonb,
+  created_at double precision not null
+);
+
+create index if not exists ix_run_evidence_run on agent_run_evidence (company_id, run_id);
+create index if not exists ix_run_evidence_entity
+  on agent_run_evidence (company_id, entity_type, entity_id);
+-- One row per distinct source per run: a run that re-reads the same page while
+-- retrying must not multiply its own evidence.
+create unique index if not exists ix_run_evidence_dedupe
+  on agent_run_evidence (run_id, source_type, coalesce(source_url,''), coalesce(file_reference,''));
+
 -- These tables carry full document bytes, so they need the same tenant guard as
 -- every other product row: direct Supabase reads must never cross a company.
 do $$
 declare table_name text;
 begin
-  foreach table_name in array array['document_artifacts','document_processing_attempts'] loop
+  foreach table_name in array array[
+    'document_artifacts','document_processing_attempts','agent_run_evidence'
+  ] loop
     execute format('alter table %I enable row level security', table_name);
     if not exists (
       select 1 from pg_policies
