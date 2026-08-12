@@ -221,7 +221,10 @@ class TestCustomProviderModelSwitch:
             "custom_providers:\n"
             "- name: NeuralWatt\n"
             "  base_url: ${NEURALWATT_API_BASE}\n"
+            "  models_url: https://catalog.neuralwatt.com/models\n"
             "  api_key: ${NEURALWATT_API_KEY}\n"
+            "  extra_headers:\n"
+            "    X-Catalog-Token: catalog-token\n"
             "  model: qwen3.6-35b-fast\n"
             "  models: []\n"
         )
@@ -254,6 +257,12 @@ class TestCustomProviderModelSwitch:
         mock_fetch.assert_called_once()
         probe_args, probe_kwargs = mock_fetch.call_args
         assert probe_args[0] == "sk-live-neuralwatt-secret"
+        assert probe_args[1] == "https://api.neuralwatt.com/v1"
+        assert probe_kwargs == {
+            "timeout": 8.0,
+            "models_url": "https://catalog.neuralwatt.com/models",
+            "headers": {"X-Catalog-Token": "catalog-token"},
+        }
 
         # But config.yaml must keep the env reference, not the plaintext secret.
         saved = config_path.read_text()
