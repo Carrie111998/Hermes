@@ -1,0 +1,9 @@
+# QENEX LTD Code Owners
+# These owners will be automatically requested for review on PRs
+
+# Default owner for everything
+* @abdulrahman305
+
+# Security-sensitive files require explicit review
+SECURITY.md @abdulrahman305
+.github/ @abdulrahman305
