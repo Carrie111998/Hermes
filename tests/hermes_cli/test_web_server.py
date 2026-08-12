@@ -648,7 +648,20 @@ class TestWebServerEndpoints:
                 return subprocess.CompletedProcess(command, 0, stdout="installed", stderr="")
             raise AssertionError(f"Unexpected command: {command}")
 
-        monkeypatch.setattr(web_server.subprocess, "run", fake_run)
+        # ``_run_setup_command`` uses ``run_text_capture``, not
+        # ``subprocess.run``: these are dependency install/check commands that
+        # spawn deep process trees (and with shell=True the real command is
+        # ALWAYS a grandchild of cmd.exe), so a grandchild inheriting the
+        # capture pipes defeats the timeout on Windows.
+        #
+        # Patch it on ``web_server`` itself — unlike the WhatsApp adapter, this
+        # module imports the helper at module level, so the name is already
+        # bound here and patching the source module would not be seen.
+        #
+        # Patching ``subprocess.run`` intercepted nothing and let this test
+        # really execute `curl -fsSL https://byterover.dev/install.sh | sh`,
+        # running whatever that host serves. tests/conftest.py now blocks it.
+        monkeypatch.setattr(web_server, "run_text_capture", fake_run)
 
         resp = self.client.post("/api/memory/providers/byterover/setup", json={"values": {}})
 

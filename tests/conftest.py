@@ -729,7 +729,9 @@ def _live_system_guard(request, monkeypatch):
       • asyncio.create_subprocess_exec / create_subprocess_shell
     The same subprocess interception also blocks pip/uv/ensurepip
     commands that would install or remove packages in the LIVE venv the
-    developer and the gateway run from (see ``_is_package_install``).
+    developer and the gateway run from (see ``_is_package_install``),
+    Node package managers (see ``_is_node_package_install``), and
+    ``curl … | sh`` remote installers (see ``_is_remote_installer_pipe``).
     Subprocess inspection looks at the WHOLE command string (not just
     tokens[0]), so ``bash -c "systemctl restart hermes-gateway"``,
     ``sudo systemctl ...``, ``env systemctl ...``, ``setsid systemctl ...``
@@ -866,9 +868,30 @@ def _live_system_guard(request, monkeypatch):
         "--target", "--prefix", "--root", "--python", "--dry-run",
     )
 
+    # Node package managers. Same hazard class as pip, different ecosystem:
+    # a real ``npm install`` rewrites node_modules under the live checkout and
+    # reaches the registry, and on Windows it is the *grandchild* of npm.cmd
+    # that does the work — which is why it can wedge a whole test file rather
+    # than merely fail it. No test in this suite runs one for real.
+    _NODE_PM_HEADS = ("npm", "npx", "yarn", "pnpm", "bun", "corepack")
+    _NODE_PM_VERBS = (
+        "install", "uninstall", "ci", "i", "add", "remove",
+        "run", "exec", "rebuild", "update",
+    )
+    # ``curl … | sh``-style one-liners: fetch a remote script, pipe it into a
+    # shell. Provider-supplied memory-backend setup snippets take this shape.
+    _REMOTE_FETCH_HEADS = ("curl", "wget", "iwr", "invoke-webrequest")
+    _REMOTE_SHELL_HEADS = ("sh", "bash", "zsh", "dash", "iex", "invoke-expression")
+
     def _exe_head(tok: str) -> str:
         head = tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
-        return head[:-4] if head.endswith(".exe") else head
+        # ``.cmd``/``.bat``/``.ps1`` matter as much as ``.exe`` here: on
+        # Windows ``find_node_executable("npm")`` resolves to ``npm.cmd``, so
+        # a suffix-blind head would miss every real npm invocation.
+        for _suffix in (".exe", ".cmd", ".bat", ".ps1"):
+            if head.endswith(_suffix):
+                return head[: -len(_suffix)]
+        return head
 
     def _is_foreign_interpreter(tok: str) -> bool:
         """True if *tok* is a python executable other than the one we run."""
@@ -920,6 +943,77 @@ def _live_system_guard(request, monkeypatch):
             if tok.split("=", 1)[0] in _INSTALL_REDIRECT_FLAGS:
                 return False
         return not _is_foreign_interpreter(tokens[0])
+
+    def _cmd_tokens(cmd) -> list:
+        """Tokenise *cmd* without destroying Windows paths.
+
+        A list/tuple argv is already tokenised — joining it into a string and
+        re-splitting with ``shlex`` (posix mode) silently eats the backslashes,
+        so ``C:\\…\\node\\npm.cmd`` collapses to ``C:…nodenpm.cmd`` and no
+        basename check can match it. That is not hypothetical: it is why the
+        first version of this guard failed to fire on the very npm install it
+        was written to catch. Only genuine command *strings* get shlex, and
+        those have separators normalised first.
+        """
+        if isinstance(cmd, (list, tuple)):
+            return [str(t) for t in cmd]
+        cmd_str = _cmd_to_string(cmd).replace("\\", "/")
+        try:
+            return _shlex.split(cmd_str)
+        except ValueError:
+            return cmd_str.split()
+
+    def _is_node_package_install(cmd) -> bool:
+        """True if *cmd* would really run a Node package manager.
+
+        This is the tripwire for a defect class the pip guard above could not
+        see. Production call sites were converted from ``subprocess.run`` to
+        ``hermes_cli._subprocess_compat.run_text_capture`` (because npm.cmd
+        puts the real work in a grandchild that inherits the capture pipes and
+        so defeats ``timeout``). Tests that patched ``subprocess.run`` stopped
+        intercepting anything and silently reached a REAL ``npm install`` —
+        which merely *fails* an assertion here, but in
+        tests/gateway/test_whatsapp_connect.py wedged the run until
+        pytest-timeout killed the process, reporting the whole file to the
+        nightly gate as "no tests ran".
+
+        Blocking at ``subprocess.Popen`` catches it regardless of which
+        helper the call site uses, so re-pointing a mock can never regress
+        this way again.
+        """
+        tokens = _cmd_tokens(cmd)
+        if not tokens:
+            return False
+        heads = [_exe_head(t) for t in tokens]
+        if heads[0] in _NODE_PM_HEADS:
+            return True
+        # Shell-wrapped forms (``cmd /c npm ci``, ``sh -c "npm install"``)
+        # only count alongside a package-manager verb, so that a command
+        # merely *mentioning* npm in an argument is not blocked.
+        return any(h in _NODE_PM_HEADS for h in heads) and any(
+            t in _NODE_PM_VERBS for t in tokens
+        )
+
+    def _is_remote_installer_pipe(cmd) -> bool:
+        """True if *cmd* downloads a script and pipes it into a shell.
+
+        ``curl -fsSL https://…/install.sh | sh`` executes whatever the remote
+        host serves, on the developer's machine, from a test run.
+        """
+        cmd_str = _cmd_to_string(cmd)
+        low = cmd_str.lower()
+        if "://" not in low or "|" not in low:
+            return False
+        segments = low.split("|")
+        if not any(
+            seg.split() and _exe_head(seg.split()[0]) in _REMOTE_FETCH_HEADS
+            for seg in segments
+        ):
+            return False
+        return any(
+            seg.split() and _exe_head(seg.split()[0]) in _REMOTE_SHELL_HEADS
+            for seg in segments[1:]
+        )
 
     def _cmd_to_string(cmd) -> str:
         if cmd is None:
@@ -1088,6 +1182,38 @@ def _live_system_guard(request, monkeypatch):
                 "run it against a throwaway venv's interpreter — both pass "
                 "through this guard — or mark with "
                 "@pytest.mark.live_system_guard_bypass."
+            )
+        if _is_node_package_install(cmd):
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked "
+                f"subprocess.{name}({cmd!r}) — this would run a REAL Node "
+                "package manager: network access, a rewritten node_modules "
+                "under the live checkout, and (on Windows) a node grandchild "
+                "that can wedge the whole test file until pytest-timeout "
+                "kills it, which the nightly gate reports as 'no tests ran'. "
+                "Reaching here means the mock is not intercepting. The "
+                "install call sites use "
+                "hermes_cli._subprocess_compat.run_text_capture, NOT "
+                "subprocess.run. Patch it where the call site resolves it: "
+                "for a function-local import (the WhatsApp adapter, cli.py) "
+                "patch 'hermes_cli._subprocess_compat.run_text_capture'; for "
+                "a module-level import (hermes_cli.web_server, "
+                "agent.lsp.install) the name is already bound, so patch "
+                "'<that module>.run_text_capture' instead. Mark with "
+                "@pytest.mark.live_system_guard_bypass only if a real "
+                "package install is genuinely the point."
+            )
+        if _is_remote_installer_pipe(cmd):
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked "
+                f"subprocess.{name}({cmd!r}) — this fetches a remote script "
+                "and pipes it into a shell, executing whatever the remote "
+                "host serves on this machine from a test run. Reaching here "
+                "means the mock is not intercepting; "
+                "hermes_cli.web_server._run_setup_command uses "
+                "run_text_capture, not subprocess.run. Mark with "
+                "@pytest.mark.live_system_guard_bypass only if genuinely "
+                "intended."
             )
         # Block any subprocess that would run `hermes update` (or the
         # equivalent `python -m hermes_cli.main update`).  These commands
