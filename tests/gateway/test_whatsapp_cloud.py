@@ -1079,6 +1079,47 @@ class TestOutboundRecipientType:
         assert event.source.chat_id == GROUP_JID
 
     @pytest.mark.asyncio
+    async def test_unaddressable_group_id_is_refused_not_misdelivered(self, caplog):
+        """Inbound and outbound must agree on what a group is.
+
+        send() derives recipient_type from the destination JID. A group id we
+        cannot recognise there would be answered as an individual, so refuse
+        it at intake instead of accepting a message we cannot reply to.
+        """
+        adapter = _make_adapter()
+        adapter._group_policy = "open"
+
+        with caplog.at_level("WARNING"):
+            event = await adapter._build_message_event_from_cloud(
+                _group_raw(chat="120363012345678901"),  # no @g.us suffix
+                {"15551234567": "Alice"}, {},
+            )
+
+        assert event is None
+        assert any("not an addressable" in rec.message for rec in caplog.records), caplog.text
+
+    @pytest.mark.asyncio
+    async def test_unparseable_chat_object_is_refused_not_treated_as_a_dm(self, caplog):
+        """A group envelope we cannot read must never become a DM reply.
+
+        If the `chat` object carries neither a recognised id key nor an
+        addressable JID, falling through would answer the individual sender
+        instead of the group. The previous code dropped any populated `chat`;
+        that refusal is preserved for shapes we cannot address.
+        """
+        adapter = _make_adapter()
+        adapter._group_policy = "open"
+
+        with caplog.at_level("WARNING"):
+            event = await adapter._build_message_event_from_cloud(
+                _group_raw(chat={"unexpected_key": "whatever"}),
+                {"15551234567": "Alice"}, {},
+            )
+
+        assert event is None
+        assert any("not an addressable" in rec.message for rec in caplog.records), caplog.text
+
+    @pytest.mark.asyncio
     async def test_dm_path_is_unaffected(self):
         """No ``chat`` field means DM: chat_id stays the sender's wa_id."""
         adapter = _make_adapter()

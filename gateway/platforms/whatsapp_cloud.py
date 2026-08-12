@@ -2007,6 +2007,20 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             group_id = str(chat_field.get("id") or chat_field.get("wa_id") or "").strip()
         elif chat_field:
             group_id = str(chat_field).strip()
+        # Only accept a group we can also address on the way out. send() and
+        # friends derive recipient_type from the destination, and the only
+        # signal available there is the JID itself -- so if Meta hands us a
+        # group id we cannot recognise, routing it inbound would accept the
+        # message and then answer it as an individual. Refuse instead, and say
+        # so, which is the pre-existing behaviour for anything unrecognised.
+        if chat_field and not self._is_group_jid(group_id):
+            logger.warning(
+                "[whatsapp_cloud] group-shaped message (chat=%s, wamid=%s) is not "
+                "an addressable %s group id; dropping rather than replying to it "
+                "as an individual",
+                group_id, raw_message.get("id"), GROUP_JID_SUFFIX,
+            )
+            return None
         is_group = bool(group_id)
 
         # Replies must address the group, never the individual sender.
