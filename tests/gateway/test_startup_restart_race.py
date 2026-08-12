@@ -25,7 +25,7 @@ from gateway.restart import (
 # That ordering matters: pytest-timeout's thread method kills the whole
 # process, so letting it win would drop every other result in this file and
 # report the run as "no tests ran" rather than naming one slow await.
-_AWAIT_DEADLINE_S = 30
+STARTUP_DEADLOCK_GUARD_S = 30
 
 
 class StartupRaceAdapter(BasePlatformAdapter):
@@ -152,7 +152,7 @@ async def test_startup_aborts_when_restart_requested_before_start(tmp_path, monk
     runner.request_restart(detached=False, via_service=True)
     runner._create_adapter = MagicMock()
 
-    result = await asyncio.wait_for(runner.start(), timeout=_AWAIT_DEADLINE_S)
+    result = await asyncio.wait_for(runner.start(), timeout=STARTUP_DEADLOCK_GUARD_S)
 
     assert result is True
     runner._create_adapter.assert_not_called()
@@ -180,7 +180,7 @@ async def test_startup_aborts_when_restart_begins_during_platform_connect(tmp_pa
     discord = StartupRaceAdapter(Platform.DISCORD)
     runner._create_adapter = MagicMock(side_effect=[slack, discord])
 
-    result = await asyncio.wait_for(runner.start(), timeout=_AWAIT_DEADLINE_S)
+    result = await asyncio.wait_for(runner.start(), timeout=STARTUP_DEADLOCK_GUARD_S)
 
     assert result is True
     assert slack.disconnected is True
@@ -215,7 +215,7 @@ async def test_startup_abort_waits_for_existing_stop_task(tmp_path):
 
     result = await asyncio.wait_for(
         runner._abort_startup_if_shutdown_requested(adapter, Platform.TELEGRAM),
-        timeout=_AWAIT_DEADLINE_S,
+        timeout=STARTUP_DEADLOCK_GUARD_S,
     )
 
     assert result is True
@@ -244,7 +244,7 @@ async def test_startup_aborts_after_registered_adapter_restart(tmp_path, monkeyp
 
     runner._update_platform_runtime_status = MagicMock(side_effect=update_platform_runtime_status)
 
-    result = await asyncio.wait_for(runner.start(), timeout=_AWAIT_DEADLINE_S)
+    result = await asyncio.wait_for(runner.start(), timeout=STARTUP_DEADLOCK_GUARD_S)
 
     assert result is True
     assert slack.connected is True
@@ -291,7 +291,7 @@ async def test_background_connect_does_not_wire_in_when_restart_races(tmp_path, 
             Platform.TELEGRAM,
             runner.config.platforms[Platform.TELEGRAM],
         ),
-        timeout=_AWAIT_DEADLINE_S,
+        timeout=STARTUP_DEADLOCK_GUARD_S,
     )
 
     # Connect succeeded, but a restart was requested during it — the adapter must
