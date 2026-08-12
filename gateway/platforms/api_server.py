@@ -1426,6 +1426,10 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_stream_subscribers: set[str] = set()
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
+        # Session chat streams build their agent inside _run_agent, so they
+        # register a mutable ref that is filled in once it exists rather than
+        # the agent itself.
+        self._session_stream_agent_refs: Dict[str, list] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
         # Stop is cooperative: the executor thread may outlive the HTTP request.
         self._stopping_run_ids: set[str] = set()
@@ -2591,6 +2595,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        reasoning_callback=None,
         gateway_session_key: Optional[str] = None,
         requested_model: Optional[str] = None,
         requested_provider: Optional[str] = None,
@@ -2903,6 +2908,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
+            "reasoning_callback": reasoning_callback,
             "session_db": self._ensure_session_db(),
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
@@ -3837,6 +3843,13 @@ class APIServerAdapter(BasePlatformAdapter):
         message_id = f"msg_{uuid.uuid4().hex}"
         run_id = f"run_{uuid.uuid4().hex}"
         seq = 0
+        # This run_id is reported on every event of the stream, but the run was
+        # never registered — so POST /v1/runs/{run_id}/stop answered 404 for
+        # every chat turn and dropping the HTTP connection was the only way to
+        # interrupt one. `agent_ref` is filled in by _run_agent once the agent
+        # exists; the stop handler reads it.
+        agent_ref: list = [None]
+        self._session_stream_agent_refs[run_id] = agent_ref
 
         def _event_payload(name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
             nonlocal seq
@@ -3865,12 +3878,50 @@ class APIServerAdapter(BasePlatformAdapter):
             if delta:
                 _enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
 
+        def _reasoning(text: str) -> None:
+            # The agent fires this with reasoning DELTAS while streaming, and
+            # once with the whole block when it is not (agent/
+            # chat_completion_helpers.py). Either way appending is correct, and
+            # it is the same contract the desktop gateway publishes as
+            # `reasoning.delta`. Kept separate from tool.progress/_thinking,
+            # which carries the reply text rather than the reasoning.
+            if text:
+                _enqueue("reasoning.delta", {"message_id": message_id, "delta": text})
+
+        # A tool result can be a whole file read. Cap it so one chatty tool
+        # cannot wedge the SSE queue; clients that need the full payload still
+        # have it in the stored transcript.
+        _TOOL_RESULT_LIMIT = 16000
+
+        def _tool_result_for_event(result) -> str:
+            if isinstance(result, str):
+                text = result
+            else:
+                try:
+                    text = json.dumps(result, ensure_ascii=False, default=str)
+                except Exception:
+                    text = str(result)
+            if len(text) > _TOOL_RESULT_LIMIT:
+                return text[:_TOOL_RESULT_LIMIT] + "\n… (truncated)"
+            return text
+
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
             if event_type == "reasoning.available":
                 _enqueue("tool.progress", {"message_id": message_id, "tool_name": tool_name or "_thinking", "delta": preview or ""})
             elif event_type in {"tool.started", "tool.completed", "tool.failed"}:
                 event_name = event_type.replace("tool.", "tool.")
-                _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
+                payload = {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args}
+                # The executor passes the tool's result, wall time and error
+                # flag through **kwargs. Swallowing them left every consumer of
+                # this endpoint with a tool row that never said what happened.
+                result = kwargs.get("result")
+                if result is not None:
+                    payload["result"] = _tool_result_for_event(result)
+                for key in ("duration", "is_error", "tool_call_id"):
+                    value = kwargs.get(key)
+                    if value is not None:
+                        payload[key] = value
+                _enqueue(event_name, payload)
 
         async def _run_and_signal() -> None:
             try:
@@ -3887,6 +3938,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
+                    reasoning_callback=_reasoning,
+                    agent_ref=agent_ref,
                     gateway_session_key=gateway_session_key,
                     route=route,
                     session_model=session_model,
@@ -3940,12 +3993,25 @@ class APIServerAdapter(BasePlatformAdapter):
                 await queue.put(None)
 
         task = asyncio.create_task(_run_and_signal())
+        self._active_run_tasks[run_id] = task
+        self._set_run_status(
+            run_id, "running", created_at=time.time(), session_id=session_id,
+            last_event="run.started",
+        )
         try:
             self._background_tasks.add(task)
         except TypeError:
             pass
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
+
+        def _release_run(_task) -> None:
+            self._active_run_tasks.pop(run_id, None)
+            self._session_stream_agent_refs.pop(run_id, None)
+            self._stopping_run_ids.discard(run_id)
+
+        if hasattr(task, "add_done_callback"):
+            task.add_done_callback(_release_run)
 
         headers = {
             "Content-Type": "text/event-stream",
@@ -6109,6 +6175,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        reasoning_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         requested_model: Optional[str] = None,
@@ -6169,6 +6236,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         tool_progress_callback=tool_progress_callback,
                         tool_start_callback=tool_start_callback,
                         tool_complete_callback=tool_complete_callback,
+                        reasoning_callback=reasoning_callback,
                         gateway_session_key=gateway_session_key,
                         requested_model=requested_model,
                         requested_provider=requested_provider,
@@ -7023,6 +7091,9 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id = request.match_info["run_id"]
         agent = self._active_run_agents.get(run_id)
         task = self._active_run_tasks.get(run_id)
+        if agent is None:
+            ref = self._session_stream_agent_refs.get(run_id)
+            agent = ref[0] if ref else None
 
         if agent is None and task is None:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
@@ -7043,6 +7114,12 @@ class APIServerAdapter(BasePlatformAdapter):
             _reap_disconnected_agent_processes(
                 agent, source="api_server_run_stop"
             )
+        elif task is not None and not task.done():
+            # A registered run whose agent has not been built yet (still
+            # loading history, or resolving the provider). Cancelling the task
+            # is the same mechanism a client disconnect uses, so a stop pressed
+            # one second into a turn is not silently ignored.
+            task.cancel()
 
         return web.json_response({"run_id": run_id, "status": "stopping"})
 
