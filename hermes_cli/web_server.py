@@ -7501,23 +7501,33 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
 
 
 @app.get("/api/providers/custom-endpoints")
-def list_custom_endpoints():
-    """Return configured OpenAI-compatible custom endpoints for Desktop."""
+def list_custom_endpoints(profile: Optional[str] = None):
+    """Return configured OpenAI-compatible custom endpoints for Desktop.
+
+    Scoped to the requested profile's config.yaml (issue: custom providers
+    only landing in the default profile): the desktop settings UI targets the
+    active profile, so read/write must resolve that profile's home rather than
+    the process-level HERMES_HOME. Mirrors ``/api/config``'s profile scoping.
+    """
     try:
-        return _custom_endpoint_response(load_config())
+        with _config_profile_scope(profile):
+            return _custom_endpoint_response(load_config())
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("GET /api/providers/custom-endpoints failed")
         raise HTTPException(status_code=500, detail="Failed to list custom endpoints")
 
 
 @app.post("/api/providers/custom-endpoints")
-def upsert_custom_endpoint(body: CustomEndpointUpdate):
+def upsert_custom_endpoint(body: CustomEndpointUpdate, profile: Optional[str] = None):
     """Create or update a v12+ ``providers`` custom endpoint entry."""
     try:
-        cfg = load_config()
-        endpoint_id, _entry = _write_custom_endpoint(cfg, body)
-        save_config(cfg)
-        response = _custom_endpoint_response(cfg)
+        with _config_profile_scope(profile):
+            cfg = load_config()
+            endpoint_id, _entry = _write_custom_endpoint(cfg, body)
+            save_config(cfg)
+            response = _custom_endpoint_response(cfg)
         response["ok"] = True
         response["id"] = endpoint_id
         return response
@@ -7529,30 +7539,31 @@ def upsert_custom_endpoint(body: CustomEndpointUpdate):
 
 
 @app.post("/api/providers/custom-endpoints/{endpoint_id}/activate")
-def activate_custom_endpoint(endpoint_id: str):
+def activate_custom_endpoint(endpoint_id: str, profile: Optional[str] = None):
     """Set a configured custom endpoint as the default model provider."""
     try:
-        cfg = load_config()
-        provider_key = _custom_endpoint_id(endpoint_id)
-        providers = cfg.get("providers")
-        entry = providers.get(provider_key) if isinstance(providers, dict) else None
-        if not isinstance(entry, dict):
-            raise HTTPException(status_code=404, detail="custom endpoint not found")
+        with _config_profile_scope(profile):
+            cfg = load_config()
+            provider_key = _custom_endpoint_id(endpoint_id)
+            providers = cfg.get("providers")
+            entry = providers.get(provider_key) if isinstance(providers, dict) else None
+            if not isinstance(entry, dict):
+                raise HTTPException(status_code=404, detail="custom endpoint not found")
 
-        models = _models_from_custom_endpoint_entry(entry)
-        model = str(entry.get("model") or (models[0] if models else "")).strip()
-        base_url = str(entry.get("base_url") or "").strip()
-        if not model or not base_url:
-            raise HTTPException(status_code=400, detail="custom endpoint is incomplete")
+            models = _models_from_custom_endpoint_entry(entry)
+            model = str(entry.get("model") or (models[0] if models else "")).strip()
+            base_url = str(entry.get("base_url") or "").strip()
+            if not model or not base_url:
+                raise HTTPException(status_code=400, detail="custom endpoint is incomplete")
 
-        model_cfg = _apply_main_model_assignment(cfg.get("model", {}), provider_key, model, base_url)
-        if entry.get("key_env"):
-            model_cfg["key_env"] = entry["key_env"]
-            model_cfg.pop("api_key", None)
-        elif entry.get("api_key"):
-            model_cfg["api_key"] = entry["api_key"]
-        cfg["model"] = model_cfg
-        save_config(cfg)
+            model_cfg = _apply_main_model_assignment(cfg.get("model", {}), provider_key, model, base_url)
+            if entry.get("key_env"):
+                model_cfg["key_env"] = entry["key_env"]
+                model_cfg.pop("api_key", None)
+            elif entry.get("api_key"):
+                model_cfg["api_key"] = entry["api_key"]
+            cfg["model"] = model_cfg
+            save_config(cfg)
         return {"ok": True, "provider": provider_key, "model": model}
     except HTTPException:
         raise
@@ -7562,20 +7573,21 @@ def activate_custom_endpoint(endpoint_id: str):
 
 
 @app.delete("/api/providers/custom-endpoints/{endpoint_id}")
-def delete_custom_endpoint(endpoint_id: str):
+def delete_custom_endpoint(endpoint_id: str, profile: Optional[str] = None):
     """Remove a configured custom endpoint from ``providers``."""
     try:
-        cfg = load_config()
-        provider_key = _custom_endpoint_id(endpoint_id)
-        providers = cfg.get("providers")
-        if not isinstance(providers, dict) or provider_key not in providers:
-            raise HTTPException(status_code=404, detail="custom endpoint not found")
-        providers.pop(provider_key, None)
-        cfg["providers"] = providers
-        _detach_main_model_from_provider(cfg, provider_key)
-        remove_env_value(custom_endpoint_key_env(provider_key))
-        save_config(cfg)
-        response = _custom_endpoint_response(cfg)
+        with _config_profile_scope(profile):
+            cfg = load_config()
+            provider_key = _custom_endpoint_id(endpoint_id)
+            providers = cfg.get("providers")
+            if not isinstance(providers, dict) or provider_key not in providers:
+                raise HTTPException(status_code=404, detail="custom endpoint not found")
+            providers.pop(provider_key, None)
+            cfg["providers"] = providers
+            _detach_main_model_from_provider(cfg, provider_key)
+            remove_env_value(custom_endpoint_key_env(provider_key))
+            save_config(cfg)
+            response = _custom_endpoint_response(cfg)
         response["ok"] = True
         return response
     except HTTPException:
@@ -17696,9 +17708,26 @@ def _maybe_open_browser(
     threading.Thread(target=_open, daemon=True).start()
 
 
-def _is_serve_orphaned(original_ppid: int, getppid=os.getppid) -> bool:
-    """True when this process lost its original spawning parent (ppid changed)."""
-    return getppid() != original_ppid
+def _is_serve_orphaned(desktop_pid: int, pid_exists=None) -> bool:
+    """True when the Desktop process that owns this serve backend is gone.
+
+    ``HERMES_PARENT_PID`` is the Electron Desktop PID, not necessarily this
+    Python process's immediate PPID. On Windows the venv ``hermes.exe`` launcher
+    introduces one or more shim processes, so comparing ``os.getppid()`` to the
+    Electron PID incorrectly treats a healthy backend as orphaned and exits 0.
+    Probe the recorded Desktop PID directly instead.
+
+    Any liveness-probe failure is fail-safe: keep serving rather than killing a
+    backend whose owner could not be conclusively shown to be dead.
+    """
+    try:
+        if pid_exists is None:
+            from gateway.status import _pid_exists
+
+            pid_exists = _pid_exists
+        return not bool(pid_exists(int(desktop_pid)))
+    except Exception:
+        return False
 
 
 def _start_parent_death_watchdog() -> None:
@@ -17716,7 +17745,7 @@ def _start_parent_death_watchdog() -> None:
     if not raw:
         return
     try:
-        original_ppid = int(raw)
+        desktop_pid = int(raw)
     except (TypeError, ValueError):
         return
     try:
@@ -17725,7 +17754,7 @@ def _start_parent_death_watchdog() -> None:
         poll = 2.0
 
     def _loop() -> None:
-        while not _is_serve_orphaned(original_ppid):
+        while not _is_serve_orphaned(desktop_pid):
             time.sleep(poll)
         os._exit(0)
 
@@ -17733,9 +17762,8 @@ def _start_parent_death_watchdog() -> None:
 
 
 def _demo() -> None:
-    # orphan iff current ppid differs from the recorded spawning parent
-    assert _is_serve_orphaned(999999999, getppid=lambda: 1) is True
-    assert _is_serve_orphaned(42, getppid=lambda: 42) is False
+    assert _is_serve_orphaned(999999999, pid_exists=lambda _pid: False) is True
+    assert _is_serve_orphaned(42, pid_exists=lambda _pid: True) is False
     print("web_server parent-death watchdog self-check: OK")
 
 
