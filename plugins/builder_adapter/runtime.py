@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import os
+import signal
 import stat
 import sys
 import tempfile
@@ -196,10 +197,27 @@ def build_runtime(settings: RuntimeSettings):
 
 async def serve(settings: RuntimeSettings) -> None:
     app, schema_temp = build_runtime(settings)
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    installed_signals = _install_shutdown_handlers(loop, stop)
     try:
-        await serve_until(app, settings.socket_path, asyncio.Event())
+        await serve_until(app, settings.socket_path, stop)
     finally:
+        for signum in installed_signals:
+            loop.remove_signal_handler(signum)
         schema_temp.cleanup()
+
+
+def _install_shutdown_handlers(loop, stop: asyncio.Event) -> tuple[signal.Signals, ...]:
+    """Turn supervisor termination into an orderly UDS cleanup."""
+    installed = []
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(signum, stop.set)
+        except (NotImplementedError, RuntimeError):
+            continue
+        installed.append(signum)
+    return tuple(installed)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -20,7 +20,11 @@ from plugins.builder_adapter.service import (
     serve_until,
 )
 from plugins.builder_adapter.errors import AdapterError
-from plugins.builder_adapter.runtime import RuntimeSettings, _load_keys
+from plugins.builder_adapter.runtime import (
+    RuntimeSettings,
+    _install_shutdown_handlers,
+    _load_keys,
+)
 from plugins.builder_adapter.store import DispatchStore
 
 
@@ -68,6 +72,21 @@ def test_health_proves_loaded_cycle_registry():
     assert payload["cycle_registry_sha256"] == canonical_sha256(
         adapter.cycle_registry
     )
+
+
+def test_shutdown_signal_requests_orderly_socket_cleanup():
+    callbacks = {}
+
+    class Loop:
+        def add_signal_handler(self, signum, callback):
+            callbacks[signum] = callback
+
+    stop = asyncio.Event()
+    installed = _install_shutdown_handlers(Loop(), stop)
+
+    assert installed
+    callbacks[installed[-1]]()
+    assert stop.is_set()
 
 
 @pytest.mark.asyncio
