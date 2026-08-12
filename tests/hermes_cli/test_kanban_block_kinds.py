@@ -203,6 +203,32 @@ def test_legacy_recurrence_row_recovers_cause_from_latest_event(
         assert kb.get_task(conn, tid).status == "triage"
 
 
+def test_legacy_fingerprint_tolerates_invalid_utf8_block_payload(
+    kanban_home: Path,
+) -> None:
+    """Corrupt BLOB payloads must not crash the legacy cause reader."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        reason = "Waiting for the same credential"
+        kb.block_task(conn, tid, reason=reason, kind="capability")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET block_reason_fingerprint = NULL WHERE id = ?",
+                (tid,),
+            )
+            conn.execute(
+                "UPDATE task_events SET payload = ? "
+                "WHERE task_id = ? AND kind = 'blocked'",
+                (b"\x80", tid),
+            )
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason=reason, kind="capability")
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_recurrences == 1
+
+
 # ---------------------------------------------------------------------------
 # Dependency routing
 # ---------------------------------------------------------------------------
