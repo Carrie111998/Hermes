@@ -4,6 +4,7 @@ import { closeActiveTab } from '@/app/chat/close-tab'
 import { openSession } from '@/app/open-session'
 import { storedSessionIdForNotification } from '@/lib/session-ids'
 import { respondToApprovalAction } from '@/store/native-notifications'
+import { ensureGatewayProfile } from '@/store/profile'
 import { openFolderAsProject } from '@/store/projects'
 import {
   getRememberedRoute,
@@ -21,6 +22,13 @@ import { requestComposerFocus, requestComposerInsert } from '../../chat/composer
 import { appViewForPath, isOverlayView, NEW_CHAT_ROUTE, routeSessionId, sessionRoute } from '../../routes'
 
 type RememberedSession = Pick<SessionInfo, '_lineage_root_id' | 'id' | 'profile'>
+
+// Deep-link deliveries are serialised by generation: switching the gateway is
+// async, so a second link can arrive while the first is still awaiting its
+// profile swap. The newest delivery owns the user's navigation intent — a stale
+// one must not open its session on top of it. Mirrors the guard #67392 adds to
+// its own dispatcher.
+let latestDeepLinkGeneration = 0
 
 interface DesktopIntegrationsParams {
   activeProfile: string
@@ -187,9 +195,39 @@ export function useDesktopIntegrations({
     return () => unsubscribe?.()
   }, [])
 
-  // hermes:// deep links -> a reviewable /blueprint command in the composer.
+  // hermes:// deep links -> a reviewable /blueprint command in the composer,
+  // or a jump to an existing session (same outside-the-app semantics as a
+  // native-notification click).
   useEffect(() => {
     const unsubscribe = window.hermesDesktop?.onDeepLink?.(payload => {
+      if (payload?.kind === 'session' && payload.name) {
+        const storedSessionId = storedSessionIdForNotification(payload.name, runtimeIdByStoredSessionId.current)
+        // Same defensive read upstream uses for blueprint slots below.
+        const profile = (payload.params || {}).profile?.trim()
+
+        // Swap the live gateway to the session's OWN profile before opening it.
+        // Without an explicit profile the renderer has to discover the owner by
+        // probing each profile's backend (resolveStoredSession's cross-profile
+        // ladder) — and Desktop reaps idle profile backends after POOL_IDLE_MS,
+        // so a link into a cold profile resolves to nothing and the session
+        // opens against whichever gateway is live: the launch profile.
+        const generation = ++latestDeepLinkGeneration
+
+        void (async () => {
+          if (profile) {
+            await ensureGatewayProfile(profile).catch(() => undefined)
+          }
+
+          if (generation !== latestDeepLinkGeneration) {
+            return
+          }
+
+          openSession(storedSessionId, navigate, 'stack')
+        })()
+
+        return
+      }
+
       if (!payload || payload.kind !== 'blueprint' || !payload.name) {
         return
       }
@@ -210,7 +248,7 @@ export function useDesktopIntegrations({
     void window.hermesDesktop?.signalDeepLinkReady?.()
 
     return () => unsubscribe?.()
-  }, [])
+  }, [navigate, runtimeIdByStoredSessionId])
 
   // ⌘W via the macOS menu accelerator → close the focused tab; if nothing is
   // closeable, fall back to closing the window (so ⌘W still works as the
