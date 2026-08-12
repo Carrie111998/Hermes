@@ -1,0 +1,73 @@
+{
+  "id": 407,
+  "task_id": "t_823be5b8",
+  "epic_id": "t_a0c4e8c9",
+  "step_key": "review",
+  "status": "completed",
+  "outcome": "advanced",
+  "summary": "Independent Review REJECT on candidate 8c934c79737240713e2a78d0a6685ac0b241fde5. The React retirement work and the placeholder/forbidden-string criteria are correct, but the legacy renderer hides live open_tickets rows behind a false memo_review_queue retirement notice, invents an evidence-gaps panel for a key the sourcing matrix records as having no legacy consumer, and still emits a provenance-derived \"no cited source\" absence claim in the memo library. Findings and fixes are in comment 395.</summary>\n<parameter name=\"workflow_outcome\">{\"verdict\": \"changes_requested\", \"target_step\": \"development\", \"findings\": [\"dashboard.py:1866 and template :2432 replace $tickets_table with a memo_review_queue retirement notice, hiding live open_tickets rows and claiming a retained local ledger is retired while the Open tickets KPI at :1691 still prints its live count. The sourcing matrix records $tickets_table under open_tickets (verdict local) and records memo_review_queue legacy consumers as none found. Restore $tickets_table and remove the gate.\", \"dashboard.py:1867 and template :2350-2351 add a new legacy Evidence gaps section for a retired key the matrix records as having no legacy consumer, contrary to the architecture rule against creating panels for retired keys with no visible consumer; its non-retired branch is a hard-coded empty paragraph that can never render rows. Remove the section and its substitution.\", \"dashboard.py:1412/1444: when memo_provenance is retired, prov is empty so the memo library's Sources behind this memo/KPI block renders 'No cited source attached to this object.' A memo's sources are only reachable through the retired provenance chain, so this is an unqualified absence claim on a retired surface. Gate that block on provenance_retired and emit _retired_notice.\", \"tests/test_truthful_paperclip_states.py:260-268 asserts legacy notices for memo_review_queue and evidence_gaps, which have no legacy consumer; that assertion is what forced findings 1 and 2. Narrow the marker set to the six keys with a real legacy consumer and add an assertion that live open-ticket rows still render.\"]}",
+  "metadata": {
+    "ai_provenance": {
+      "reviewer": {
+        "agent": "claude-cli",
+        "provider": "claude-cli",
+        "model": "opus",
+        "effort": "high",
+        "profile": "reviewer",
+        "surface": "claude-cli",
+        "verdict": "changes_requested",
+        "reviewed_branch": "the-trading-company/t_823be5b8-make-every-consumer-say-a-surface-is-ret",
+        "reviewed_commit": "8c934c79737240713e2a78d0a6685ac0b241fde5"
+      },
+      "writer": {
+        "agent": "openai-codex",
+        "provider": "openai-codex",
+        "model": "gpt-5.6-luna",
+        "effort": "max",
+        "profile": "developer",
+        "surface": "hermes-primary"
+      }
+    },
+    "review_base_sha": "c376e080a92adaac6aa8b57bc722ef7417eab13d",
+    "review_head_sha": "8c934c79737240713e2a78d0a6685ac0b241fde5",
+    "reviewed_commit": "8c934c79737240713e2a78d0a6685ac0b241fde5",
+    "branch": "the-trading-company/t_823be5b8-make-every-consumer-say-a-surface-is-ret",
+    "worktree": "/Users/cloudadvisor/.hermes/projects/The Trading Company/.worktrees/t_823be5b8",
+    "verdict": "changes_requested",
+    "review_comment_id": 395,
+    "changed_files_reviewed": [
+      "cockpit/src/App.tsx",
+      "cockpit/src/lib.tsx",
+      "cockpit/src/views.tsx",
+      "tests/test_truthful_paperclip_states.py",
+      "trading_company/dashboard.py"
+    ],
+    "done_when_assessment": {
+      "every_matrix_consumer_renders_typed_reason": "failed - legacy memo-library sources block still renders an absence claim derived from retired memo_provenance; separately, two legacy consumers were invented for keys the matrix records as having none, one of which suppresses a live ledger",
+      "forbidden_live_claims_removed": "passed - independently re-grepped cockpit/src and trading_company/dashboard.py for all four strings plus NO_QUORUM_LINK; zero matches",
+      "legacy_placeholders_replaced_and_no_orphans": "passed - every $placeholder in the template at dashboard.py:2245-2494 has a matching safe_substitute kwarg"
+    },
+    "verified_correct": [
+      "Shared typed RetiredPanel in cockpit/src/lib.tsx:9-20 matches the specified interface and message precedence",
+      "All React retired-key consumers branch before deriving arrays, counts, maps or empty states",
+      "memo_provenance list-to-object transition guarded at App.tsx:70-71, views.tsx:173-174 and lib.tsx:170-172 without hiding live memo content",
+      "No React panel invented for pitch_dispatch or mvp_readiness",
+      "Generated dashboard/index.html and cockpit/dist not hand-edited; payload shape unchanged; research-only boundary intact"
+    ],
+    "non_blocking_observations": [
+      "views.tsx:124 re-sources the Pipeline Evidence tile from idea_funnel.stages.evidence_packets to evidence_packets.total_packets - an architecture deviation that is nonetheless more truthful; should be recorded as a decision",
+      "App.tsx:394 renders RetiredPanel unconditionally rather than branching on signals_state.status; follows the architecture handoff and is truthful against the current payload"
+    ],
+    "evidence_method": "read-only inspection of the pinned diff via review_target plus independent re-derivation of retired-key consumers from trading_company/dashboard.py:45-56 and docs/decisions/cockpit-panel-sourcing.md:33-93",
+    "independence": "reviewer provider claude-cli differs from writer provider openai-codex",
+    "executor": {
+      "effort": "high",
+      "model": "opus",
+      "profile": "reviewer",
+      "provider": "claude-cli",
+      "source": "dispatcher",
+      "surface": "claude-cli",
+      "version": 1
+    }
+  }
+}

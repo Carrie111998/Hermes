@@ -1,0 +1,94 @@
+{
+  "id": 410,
+  "task_id": "t_823be5b8",
+  "epic_id": "t_a0c4e8c9",
+  "step_key": "review",
+  "status": "completed",
+  "outcome": "advanced",
+  "summary": "Reviewed pinned candidate c376e08..35d2149 read-only and approved it. All three blocking findings preserved from Review run 407 are fixed ($tickets_table restored from live open_tickets with the memo_review_queue gate removed, the unwarranted legacy Evidence gaps panel dropped, and the memo-library Sources block gated on provenance retirement), the required regression-test correction narrowing the marker set to six keys plus a live open-ticket assertion is applied, and the accepted Pipeline Evidence re-source is recorded as a Development decision.</summary>\n<parameter name=\"workflow_outcome\">{\"verdict\": \"approved\"}",
+  "metadata": {
+    "ai_provenance": {
+      "reviewer": {
+        "agent": "claude-cli",
+        "effort": "high",
+        "model": "opus",
+        "profile": "reviewer",
+        "provider": "claude-cli",
+        "reviewed_branch": "the-trading-company/t_823be5b8-make-every-consumer-say-a-surface-is-ret",
+        "reviewed_commit": "35d214929cb68cd2cd8a105a003f26aabdb4c49c",
+        "surface": "claude-cli",
+        "verdict": "approved"
+      },
+      "writer": {
+        "agent": "openai-codex",
+        "effort": "max",
+        "model": "gpt-5.6-luna",
+        "profile": "developer",
+        "provider": "openai-codex",
+        "surface": "hermes-primary"
+      }
+    },
+    "binary_files": 0,
+    "branch": "the-trading-company/t_823be5b8-make-every-consumer-say-a-surface-is-ret",
+    "changed_files": [
+      "cockpit/src/App.tsx",
+      "cockpit/src/lib.tsx",
+      "cockpit/src/views.tsx",
+      "tests/test_truthful_paperclip_states.py",
+      "trading_company/dashboard.py"
+    ],
+    "evidence_method": "read-only inspection of the pinned candidate at head SHA plus the sourcing-matrix decision record; no commands executed (this run has no terminal)",
+    "executor": {
+      "effort": "high",
+      "model": "opus",
+      "profile": "reviewer",
+      "provider": "claude-cli",
+      "source": "dispatcher",
+      "surface": "claude-cli",
+      "version": 1
+    },
+    "independent_checks": [
+      "React consumer coverage: idea_funnel, signals_state, quorum_state, decision_spine, memo_review_queue, independence, evidence_gaps and memo_provenance are all branched; pitch_floor, pitch_dispatch and mvp_readiness have no SPA consumer per matrix rows 53/64/69",
+      "Legacy consumer coverage: stage cards, pitch/quorum/challenge tables, both quorum stat cards, the Pitches stat card, memo graph, memo library and the signal tape all branch on _is_retired; gate keys match matrix rows 60 and 62",
+      "Escaping: _text ends in html.escape at dashboard.py:126-136, so _retired_notice reason text cannot inject markup",
+      "Template integrity: every $placeholder at :2242-2489 has a matching safe_substitute kwarg at :2534-2591; no orphans. Removed $mvp_* kwargs had no template placeholder (matrix row 64 records them as unused substitutions)",
+      "Derived-surface union safety: _build_decision_summaries:328-332 narrows pitch_floor and memo_provenance before iterating, so $decision_cards emits only live open_tickets cards",
+      "Forbidden-claim search across *.tsx/*.ts/*.py finds the four retired live claims only inside the new assertions; remaining NO_QUORUM_LINK occurrences are backend gate values in provenance.py:209 and memo_readiness.py:141, not renderer-invented fallbacks",
+      "Research-only boundary intact: no broker/exchange keys, order paths, real-holdings reads, payload-shape changes or ledger rebuilds"
+    ],
+    "non_blocking_observations": [
+      "views.tsx:124 re-sources the Pipeline Evidence tile from idea_funnel.stages.evidence_packets to evidence_packets.total_packets - an accepted architecture deviation, more truthful because evidence_packets is matrix row 68 local while idea_funnel is retired; now recorded as a Development decision",
+      "App.tsx:394 renders RetiredPanel unconditionally rather than branching on signals_state.status; truthful today because dashboard.py:1169 always publishes _retired() and it follows the architecture handoff, but it is the one consumer that would not self-correct if the key became live",
+      "assertNotRegex(visible, '\\\\$[A-Za-z_]...') is deliberately broad and would also trip on a legitimate $TICKER in fixture prose",
+      "role=\"status\" on a static retired panel in both renderers announces a live region that never updates - minor a11y nit",
+      "cast in _memo_library_cards:1428 is redundant next to the adjacent isinstance narrow"
+    ],
+    "prior_review_findings_resolved": [
+      "Finding 1 - live open_tickets hidden behind a false retirement notice: resolved; tickets_content and the memo_review_queue gate removed, template :2427 renders $tickets_table built at :1854 from open_tickets, substitution present at :2554",
+      "Finding 2 - new legacy Evidence gaps panel for a key with no legacy consumer: resolved; no _retired_notice call and no template section for evidence_gaps remain",
+      "Finding 3 - 'No cited source attached to this object.' under retired provenance: resolved; _memo_library_cards:1421/1429 gate the decision chain and Sources blocks on provenance_retired, and raw_refs/badges drop provenance-derived values while live memo fields stay visible",
+      "Required regression-test correction: applied; marker set narrowed to signals_state, pitch_floor, quorum_state, independence, idea_funnel, memo_provenance, and a live open-ticket render assertion added",
+      "Non-blocking decision record: applied; Development metadata records preserving the Pipeline Evidence tile re-source to evidence_packets.total_packets"
+    ],
+    "review_base_sha": "c376e080a92adaac6aa8b57bc722ef7417eab13d",
+    "review_comment_id": 397,
+    "review_head_sha": "35d214929cb68cd2cd8a105a003f26aabdb4c49c",
+    "reviewed_commit": "35d214929cb68cd2cd8a105a003f26aabdb4c49c",
+    "reviewer_independence": "reviewer provider claude-cli differs from writer provider openai-codex",
+    "tests_relied_on": {
+      "executed_by": "tester profile (openai-codex) on candidate 35d214929cb68cd2cd8a105a003f26aabdb4c49c",
+      "results": [
+        "focused legacy-renderer contract test - passed",
+        "python3 -m unittest discover -s tests -v - 307 passed",
+        "npm run lint (cockpit) - exit 0",
+        "npm run build (cockpit, tsc -b && vite build) - exit 0"
+      ],
+      "reviewer_reexecuted": false,
+      "reviewer_reexecution_note": "This Reviewer run is read-only with no terminal, so the pass/fail claim rests on the pinned Test run; all other conclusions come from direct source inspection at the pinned head"
+    },
+    "workflow_outcome": {
+      "verdict": "approved"
+    },
+    "worktree": "/Users/cloudadvisor/.hermes/projects/The Trading Company/.worktrees/t_823be5b8"
+  }
+}

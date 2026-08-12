@@ -86,11 +86,44 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Tuple
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from hermes_cli.kanban_intake import DEFAULT_POLICY_VERSION
+from hermes_cli.kanban_repository import (
+    EvidenceWorkspaceError,
+    EvidenceWorkspaceResult,
+    RepositoryConfigurationError,
+    RepositoryContract,
+    RefreshRequest,
+    RefreshResult,
+    VerificationProfile,
+    VerificationResult,
+    VerificationStepResult,
+    build_verification_receipt_key,
+    build_verification_receipt,
+    inspect_evidence_workspace,
+    load_repository_contract,
+    refresh_story_branch,
+    resolve_commit,
+    restore_generated_paths,
+    run_verification,
+    verification_receipt_from_payload,
+)
+from hermes_cli.kanban_product_outcomes import (
+    ApprovedCandidate,
+    CandidateEligibilityError,
+    OutcomeValidationError,
+    PassedTest,
+    ProductOutcomeError,
+    TerminalOutcome,
+    TerminalRunRecord,
+    candidate_eligibility,
+    latest_review_authority,
+    latest_test_authority,
+    validate_terminal_outcome,
+)
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -875,6 +908,7 @@ def write_board_metadata(
     project_id: Optional[str] = None,
     preset: Optional[str] = None,
     columns: Optional[list[dict[str, str]]] = None,
+    repository: Optional[Mapping[str, object]] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -912,8 +946,12 @@ def write_board_metadata(
         meta["preset"] = preset_name
     if columns is not None:
         meta["columns"] = [dict(column) for column in columns]
+    if repository is not None:
+        meta["repository"] = dict(repository)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
+    if "repository" in meta:
+        repository_contract_for_metadata(meta)
     path = board_metadata_path(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -976,6 +1014,7 @@ def ensure_product_board_defaults(
     color: Optional[str] = None,
     default_workdir: Optional[str] = None,
     switch: bool = False,
+    repository: Optional[Mapping[str, object]] = None,
 ) -> dict:
     """Create/update a product board with canonical Kanban V2 defaults."""
 
@@ -993,6 +1032,7 @@ def ensure_product_board_defaults(
         default_workdir=default_workdir,
         preset="product",
         columns=defaults["columns"],
+        repository=repository,
     )
     meta.pop("db_path", None)
     existing_wf = meta.get("product_workflow")
@@ -1050,6 +1090,7 @@ def create_board(
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
     preset: Optional[str] = None,
+    repository: Optional[Mapping[str, object]] = None,
 ) -> dict:
     """Create a new board directory + DB + metadata. Idempotent.
 
@@ -1073,6 +1114,7 @@ def create_board(
         project_id=project_id,
         preset=preset_name,
         columns=BOARD_PRESETS[preset_name] if preset_name else None,
+        repository=repository,
     )
     # Touch the DB so list_boards() sees it immediately.
     init_db(board=normed)
@@ -1089,6 +1131,40 @@ def product_board_metadata(board: Optional[str] = None) -> Optional[dict]:
     slug = _normalize_board_slug(board) if board is not None else get_current_board()
     meta = read_board_metadata(slug or DEFAULT_BOARD)
     return meta if str(meta.get("preset") or "").lower() == "product" else None
+
+
+def repository_contract_for_metadata(
+    metadata: Mapping[str, object], *, repo_root: Optional[Path] = None
+) -> Optional[RepositoryContract]:
+    """Validate a board's repository policy when one is configured.
+
+    Repository policy is opt-in for older boards while the migration is
+    rolling out.  Once the ``repository`` key is present, every write and
+    governed Epic materialization goes through the same strict loader.
+    """
+    if "repository" not in metadata:
+        return None
+    raw_root = repo_root
+    if raw_root is None:
+        raw_default = metadata.get("default_workdir")
+        if not isinstance(raw_default, str) or not raw_default.strip():
+            raise RepositoryConfigurationError("missing_repo_root", "default_workdir")
+        raw_root = Path(raw_default).expanduser()
+    else:
+        raw_root = Path(raw_root).expanduser()
+    if not raw_root.is_absolute():
+        raise RepositoryConfigurationError("invalid_repo_root", str(raw_root))
+    return load_repository_contract(metadata, repo_root=raw_root)
+
+
+def repository_contract_for_board(
+    board: Optional[str] = None, *, repo_root: Optional[Path] = None
+) -> Optional[RepositoryContract]:
+    """Return the validated repository policy for a product board, if set."""
+    metadata = product_board_metadata(board)
+    if metadata is None:
+        return None
+    return repository_contract_for_metadata(metadata, repo_root=repo_root)
 
 
 def is_product_board(board: Optional[str] = None) -> bool:
@@ -3923,6 +3999,8 @@ class Task:
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
     rework_count: int = 0
+    source_commit_required: bool = False
+    source_commit_forbidden: bool = False
     # Canonical handoff_v2 state flags (see ``_apply_v2_flags`` /
     # ``_legacy_status``). Always False on legacy (non-v2) boards and on
     # rows read before these columns existed.
@@ -4035,6 +4113,16 @@ class Task:
                 if "rework_count" in keys and row["rework_count"] is not None
                 else 0
             ),
+            source_commit_required=(
+                bool(row["source_commit_required"])
+                if "source_commit_required" in keys
+                else False
+            ),
+            source_commit_forbidden=(
+                bool(row["source_commit_forbidden"])
+                if "source_commit_forbidden" in keys
+                else False
+            ),
             running=bool(row["running"]) if "running" in keys else False,
             blocked=bool(row["blocked"]) if "blocked" in keys else False,
         )
@@ -4125,6 +4213,26 @@ class Event:
     payload: Optional[dict]
     created_at: int
     run_id: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class ReworkDirective:
+    """Durable, first-class instructions for the next product worker."""
+
+    id: int
+    task_id: str
+    origin_kind: str
+    origin_run_id: Optional[int]
+    origin_intent_key: Optional[str]
+    origin_phase: str
+    target_phase: str
+    rejected_branch: Optional[str]
+    rejected_sha: Optional[str]
+    epic_tip_sha: Optional[str]
+    findings: tuple[str, ...]
+    status: str
+    created_at: int
+    resolved_by_run_id: Optional[int]
 
 
 # ---------------------------------------------------------------------------
@@ -4236,7 +4344,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- writers nor gating consult these yet (added in T1.2/T1.3/T1.4) — this
     -- migration only makes the columns exist.
     running               INTEGER NOT NULL DEFAULT 0,
-    blocked               INTEGER NOT NULL DEFAULT 0
+    blocked               INTEGER NOT NULL DEFAULT 0,
+    source_commit_required INTEGER NOT NULL DEFAULT 0,
+    source_commit_forbidden INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -4385,6 +4495,23 @@ CREATE TABLE IF NOT EXISTS task_runs (
     error               TEXT
 );
 
+CREATE TABLE IF NOT EXISTS product_rework_directives (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id             TEXT NOT NULL,
+    origin_kind         TEXT NOT NULL,
+    origin_run_id       INTEGER,
+    origin_intent_key   TEXT,
+    origin_phase        TEXT NOT NULL,
+    target_phase        TEXT NOT NULL,
+    rejected_branch     TEXT,
+    rejected_sha        TEXT,
+    epic_tip_sha        TEXT,
+    findings_json       TEXT NOT NULL,
+    status              TEXT NOT NULL CHECK (status IN ('active', 'resolved', 'superseded')),
+    created_at          INTEGER NOT NULL,
+    resolved_by_run_id  INTEGER
+);
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
@@ -4430,6 +4557,11 @@ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, c
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+CREATE INDEX IF NOT EXISTS idx_product_rework_directives_task
+    ON product_rework_directives(task_id, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_product_rework_directives_active
+    ON product_rework_directives(task_id)
+    WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 CREATE INDEX IF NOT EXISTS idx_qualification_intake_status
@@ -5646,6 +5778,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "work_item_kind",
             "work_item_kind TEXT NOT NULL DEFAULT 'card'",
         )
+    if "source_commit_required" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "source_commit_required",
+            "source_commit_required INTEGER NOT NULL DEFAULT 0",
+        )
+    if "source_commit_forbidden" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "source_commit_forbidden",
+            "source_commit_forbidden INTEGER NOT NULL DEFAULT 0",
+        )
     if "skills" not in cols:
         # JSON array of skill names the dispatcher force-loads into the
         # worker via --skills. NULL is fine for existing rows.
@@ -6439,6 +6585,16 @@ class TaskSnapshotConflict(RuntimeError):
     def __init__(self, action: str, current: dict[str, Any]):
         super().__init__(f"task changed; refresh before {action}")
         self.current = current
+
+
+@dataclass(frozen=True)
+class ClearTerminalStateRequest:
+    task_id: str
+    expected_completed_at: int
+    expected_phase: str
+    expected_latest_event_id: int
+    actor: str
+    reason: str
 
 
 def task_snapshot_from_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -7676,6 +7832,8 @@ def create_task(
     work_contract_id: Optional[str] = None,
     work_item_kind: str = "card",
     project_source_task_id: Optional[str] = None,
+    source_commit_required: bool = False,
+    source_commit_forbidden: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -7721,6 +7879,10 @@ def create_task(
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
+    if source_commit_required and source_commit_forbidden:
+        raise ValueError(
+            "source_commit_required and source_commit_forbidden are mutually exclusive"
+        )
     assignee = _canonical_assignee(assignee)
     if assignee == RESOLVER_PROFILE:
         # A card being created has no preflight yet, so this routing can
@@ -8114,8 +8276,9 @@ def create_task(
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id,
                         workflow_template_id, current_step_key,
-                        work_contract_id, work_item_kind
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        work_contract_id, work_item_kind,
+                        source_commit_required, source_commit_forbidden
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -8145,6 +8308,8 @@ def create_task(
                         current_step_key,
                         work_contract_id,
                         work_item_kind,
+                        1 if source_commit_required else 0,
+                        1 if source_commit_forbidden else 0,
                     ),
                 )
                 for pid in parents:
@@ -8171,6 +8336,8 @@ def create_task(
                         "current_step_key": current_step_key,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "source_commit_required": bool(source_commit_required),
+                        "source_commit_forbidden": bool(source_commit_forbidden),
                     },
                 )
                 if workflow_defaulted:
@@ -8894,6 +9061,171 @@ def _append_event(
     return int(cursor.lastrowid)
 
 
+_REWORK_DIRECTIVE_ORIGIN_KINDS = frozenset(
+    {"test", "review", "integration", "refresh"}
+)
+_REWORK_DIRECTIVE_TARGET_PHASES = frozenset({"architecture", "development"})
+_FULL_REWORK_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _rework_directive_from_row(row: sqlite3.Row) -> ReworkDirective:
+    try:
+        raw_findings = json.loads(row["findings_json"])
+    except (TypeError, ValueError):
+        raw_findings = []
+    findings = (
+        tuple(item if isinstance(item, str) else str(item) for item in raw_findings)
+        if isinstance(raw_findings, list)
+        else ()
+    )
+    return ReworkDirective(
+        id=int(row["id"]),
+        task_id=row["task_id"],
+        origin_kind=row["origin_kind"],
+        origin_run_id=(
+            int(row["origin_run_id"])
+            if row["origin_run_id"] is not None
+            else None
+        ),
+        origin_intent_key=row["origin_intent_key"],
+        origin_phase=row["origin_phase"],
+        target_phase=row["target_phase"],
+        rejected_branch=row["rejected_branch"],
+        rejected_sha=row["rejected_sha"],
+        epic_tip_sha=row["epic_tip_sha"],
+        findings=findings,
+        status=row["status"],
+        created_at=int(row["created_at"]),
+        resolved_by_run_id=(
+            int(row["resolved_by_run_id"])
+            if row["resolved_by_run_id"] is not None
+            else None
+        ),
+    )
+
+
+def create_rework_directive(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    origin_kind: str,
+    origin_run_id: Optional[int] = None,
+    origin_intent_key: Optional[str] = None,
+    origin_phase: str,
+    target_phase: str,
+    rejected_branch: Optional[str] = None,
+    rejected_sha: Optional[str] = None,
+    epic_tip_sha: Optional[str] = None,
+    findings: Iterable[str],
+) -> ReworkDirective:
+    """Append a rework directive, superseding the previous active one."""
+    origin_kind = str(origin_kind or "").strip()
+    origin_phase = str(origin_phase or "").strip()
+    target_phase = str(target_phase or "").strip()
+    if origin_kind not in _REWORK_DIRECTIVE_ORIGIN_KINDS:
+        raise ValueError(f"invalid rework directive origin kind: {origin_kind}")
+    if not origin_phase:
+        raise ValueError("rework directive origin phase is required")
+    if target_phase not in _REWORK_DIRECTIVE_TARGET_PHASES:
+        raise ValueError(f"invalid rework directive target phase: {target_phase}")
+    normalized_findings = tuple(str(item).strip() for item in findings)
+    if not normalized_findings or any(not item for item in normalized_findings):
+        raise ValueError("rework directive findings must be non-empty strings")
+
+    def _clean_optional(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        cleaned = str(value).strip()
+        return cleaned or None
+
+    now = int(time.time())
+    with write_txn(conn):
+        if not conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone():
+            raise ValueError(f"unknown task {task_id}")
+        conn.execute(
+            "UPDATE product_rework_directives SET status = 'superseded' "
+            "WHERE task_id = ? AND status = 'active'",
+            (task_id,),
+        )
+        cursor = conn.execute(
+            "INSERT INTO product_rework_directives ("
+            "task_id, origin_kind, origin_run_id, origin_intent_key, "
+            "origin_phase, target_phase, rejected_branch, rejected_sha, "
+            "epic_tip_sha, findings_json, status, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)",
+            (
+                task_id,
+                origin_kind,
+                int(origin_run_id) if origin_run_id is not None else None,
+                _clean_optional(origin_intent_key),
+                origin_phase,
+                target_phase,
+                _clean_optional(rejected_branch),
+                _clean_optional(rejected_sha),
+                _clean_optional(epic_tip_sha),
+                json.dumps(list(normalized_findings), ensure_ascii=False),
+                now,
+            ),
+        )
+        directive_id = cursor.lastrowid
+        if directive_id is None:
+            raise RuntimeError("rework directive insert did not return an id")
+        row = conn.execute(
+            "SELECT * FROM product_rework_directives WHERE id = ?",
+            (int(directive_id),),
+        ).fetchone()
+        assert row is not None
+        return _rework_directive_from_row(row)
+
+
+def active_rework_directive(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[ReworkDirective]:
+    """Return the task's one active directive, if it has one."""
+    row = conn.execute(
+        "SELECT * FROM product_rework_directives "
+        "WHERE task_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return _rework_directive_from_row(row) if row is not None else None
+
+
+def resolve_rework_directive(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    new_sha: Optional[str],
+    resolved_by_run_id: Optional[int],
+) -> bool:
+    """Resolve an active directive only after a different Development SHA."""
+    candidate_sha = str(new_sha or "").strip()
+    if not _FULL_REWORK_SHA_RE.fullmatch(candidate_sha):
+        return False
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT id, rejected_sha FROM product_rework_directives "
+            "WHERE task_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        rejected_sha = str(row["rejected_sha"] or "").strip()
+        if candidate_sha == rejected_sha:
+            return False
+        updated = conn.execute(
+            "UPDATE product_rework_directives "
+            "SET status = 'resolved', resolved_by_run_id = ? "
+            "WHERE id = ? AND status = 'active'",
+            (
+                int(resolved_by_run_id) if resolved_by_run_id is not None else None,
+                int(row["id"]),
+            ),
+        )
+        return updated.rowcount == 1
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8943,7 +9275,16 @@ def _end_run(
         active_metadata = {}
     dispatcher_metadata_conflicts: dict[str, dict[str, Any]] = {}
     if isinstance(active_metadata, dict):
-        for key in ("review_base_sha", "review_head_sha", "executor"):
+        for key in (
+            "test_branch",
+            "test_head_sha",
+            "review_branch",
+            "review_base_sha",
+            "review_head_sha",
+            "executor",
+            "source_completion_intent",
+            "source_completion_receipt",
+        ):
             value = active_metadata.get(key)
             if value is not None:
                 if key in final_metadata and final_metadata[key] != value:
@@ -10025,38 +10366,116 @@ def _validate_product_workflow_outcome(
     outcome: Any,
     current_step: str,
 ) -> tuple[str, Optional[str], list[str]]:
-    if not isinstance(outcome, dict):
-        raise ValueError("workflow_outcome must be an object")
-    verdict = outcome.get("verdict")
-    positive = PRODUCT_POSITIVE_OUTCOMES.get(current_step)
-    if verdict in {"passed", "approved"}:
-        if set(outcome) != {"verdict"} or verdict != positive:
-            raise ValueError(
-                f"invalid workflow_outcome for {current_step}: verdict={verdict!r}"
-            )
-        return str(verdict), None, []
+    try:
+        validated = validate_terminal_outcome(
+            task_id="<direct>",
+            run_id=0,
+            phase=current_step,
+            summary=None,
+            result=None,
+            metadata={"workflow_outcome": outcome},
+        )
+    except OutcomeValidationError as exc:
+        raise ValueError(
+            f"invalid workflow_outcome for {current_step}: {exc.code}"
+        ) from exc
+    return validated.verdict, validated.target_step, list(validated.findings)
 
-    if set(outcome) != {"verdict", "target_step", "findings"}:
-        raise ValueError(
-            "rework workflow_outcome must contain exactly verdict, target_step, and findings"
+
+def _record_product_outcome_rejection(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: Optional[int],
+    phase: str,
+    error: OutcomeValidationError,
+) -> None:
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "phase": phase,
+        "code": error.code,
+    }
+    if error.qualifier is not None:
+        payload["qualifier"] = error.qualifier
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "completion_rejected_outcome",
+            payload,
+            run_id=run_id,
         )
-    target_step = outcome.get("target_step")
-    expected_target = PRODUCT_REWORK_ROUTES.get((current_step, verdict))
-    if expected_target is None or target_step != expected_target:
-        raise ValueError(
-            f"invalid workflow_outcome for {current_step}: verdict={verdict!r}, "
-            f"target_step={target_step!r}"
+
+
+def _record_product_outcome_observations(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: Optional[int],
+    phase: str,
+    outcome: Optional[TerminalOutcome],
+) -> None:
+    if outcome is None or "serialized_parameter_leak" not in outcome.observations:
+        return
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "serialized_parameter_leak",
+            {"run_id": run_id, "phase": phase},
+            run_id=run_id,
         )
-    raw_findings = outcome.get("findings")
-    if (
-        not isinstance(raw_findings, list)
-        or not raw_findings
-        or not all(isinstance(item, str) and item.strip() for item in raw_findings)
-    ):
-        raise ValueError(
-            "workflow_outcome findings must be a non-empty list of non-empty strings"
+
+
+def _validate_ordinary_product_outcome(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str],
+    result: Optional[str],
+    metadata: Optional[dict],
+    expected_run_id: Optional[int],
+) -> tuple[Optional[TerminalOutcome], Optional[str], Optional[int]]:
+    """Validate an active Test/Review envelope before any completion write."""
+    row = conn.execute(
+        "SELECT current_step_key, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None, None, None
+    phase = str(row["current_step_key"] or "").strip()
+    if phase not in PRODUCT_POSITIVE_OUTCOME_STEPS.values():
+        return None, None, None
+    run_id = (
+        int(row["current_run_id"])
+        if row["current_run_id"] is not None
+        else (int(expected_run_id) if expected_run_id is not None else None)
+    )
+    try:
+        outcome = validate_terminal_outcome(
+            task_id=task_id,
+            run_id=run_id or 0,
+            phase=phase,
+            summary=summary,
+            result=result,
+            metadata=metadata,
         )
-    return str(verdict), str(target_step), [item.strip() for item in raw_findings]
+    except OutcomeValidationError as exc:
+        _record_product_outcome_rejection(
+            conn,
+            task_id,
+            run_id=run_id,
+            phase=phase,
+            error=exc,
+        )
+        raise ProductOutcomeError(
+            task_id,
+            run_id or 0,
+            phase,
+            exc.code,
+            exc.qualifier,
+        ) from exc
+    return outcome, phase, run_id
 
 
 def _route_product_rework_if_requested(
@@ -10068,6 +10487,7 @@ def _route_product_rework_if_requested(
     summary: Optional[str],
     expected_run_id: Optional[int],
     product_role_assignees: Optional[dict[str, str]],
+    validated_outcome: Optional[TerminalOutcome] = None,
 ) -> Optional[bool]:
     outcome = metadata.get("workflow_outcome") if isinstance(metadata, dict) else None
     if outcome is None:
@@ -10082,7 +10502,7 @@ def _route_product_rework_if_requested(
     with authorized_governance_write(), write_txn(conn):
         row = conn.execute(
             "SELECT title, assignee, status, current_step_key, "
-            "current_run_id, rework_count FROM tasks WHERE id = ?",
+            "current_run_id, rework_count, branch_name FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if row is None:
@@ -10099,9 +10519,14 @@ def _route_product_rework_if_requested(
                 )
                 or ""
             )
-        verdict, target_step, findings = _validate_product_workflow_outcome(
-            outcome, current_step
-        )
+        if validated_outcome is None:
+            verdict, target_step, findings = _validate_product_workflow_outcome(
+                outcome, current_step
+            )
+        else:
+            verdict = validated_outcome.verdict
+            target_step = validated_outcome.target_step
+            findings = list(validated_outcome.findings)
         if verdict in {"passed", "approved"}:
             return None
         if expected_run_id is None:
@@ -10111,6 +10536,47 @@ def _route_product_rework_if_requested(
             or row["current_run_id"] != int(expected_run_id)
         ):
             return False
+
+        run_metadata: dict = {}
+        if row["current_run_id"] is not None:
+            run_row = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id = ?",
+                (int(row["current_run_id"]),),
+            ).fetchone()
+            if run_row is not None and run_row["metadata"]:
+                try:
+                    parsed_run_metadata = json.loads(run_row["metadata"])
+                except (TypeError, ValueError):
+                    parsed_run_metadata = None
+                if isinstance(parsed_run_metadata, dict):
+                    run_metadata = parsed_run_metadata
+
+        def _directive_value(*keys: str) -> Optional[str]:
+            for source in (run_metadata, metadata if isinstance(metadata, dict) else {}):
+                for key in keys:
+                    value = source.get(key)
+                    if value is not None and str(value).strip():
+                        return str(value).strip()
+            return None
+
+        rejected_branch = _directive_value(
+            f"{current_step}_branch", "rejected_branch", "branch"
+        ) or row["branch_name"]
+        rejected_sha = _directive_value(
+            f"{current_step}_head_sha",
+            "rejected_sha",
+            "head_sha",
+            "source_sha",
+        )
+        epic_tip_sha = _directive_value("epic_tip_sha", "epic_head_sha")
+        origin_intent_key = _directive_value(
+            "origin_intent_key", "integration_intent_key", "intent_key"
+        )
+        origin_kind = (
+            current_step
+            if current_step in _REWORK_DIRECTIVE_ORIGIN_KINDS
+            else "refresh"
+        )
 
         observed_count = int(row["rework_count"] or 0)
         next_count = observed_count + 1
@@ -10157,6 +10623,19 @@ def _route_product_rework_if_requested(
         )
         if expected_run_id is not None and run_id is None:
             raise RuntimeError("rework run ownership changed")
+        directive = create_rework_directive(
+            conn,
+            task_id,
+            origin_kind=origin_kind,
+            origin_run_id=run_id,
+            origin_intent_key=origin_intent_key,
+            origin_phase=current_step,
+            target_phase=str(target_step),
+            rejected_branch=rejected_branch,
+            rejected_sha=rejected_sha,
+            epic_tip_sha=epic_tip_sha,
+            findings=findings,
+        )
         _append_event(
             conn,
             task_id,
@@ -10168,9 +10647,21 @@ def _route_product_rework_if_requested(
                 "findings": findings,
                 "rework_count": next_count,
                 "max_rework_cycles": max_cycles,
+                "directive_id": directive.id,
             },
             run_id=run_id,
         )
+        if (
+            validated_outcome is not None
+            and "serialized_parameter_leak" in validated_outcome.observations
+        ):
+            _append_event(
+                conn,
+                task_id,
+                "serialized_parameter_leak",
+                {"run_id": run_id, "phase": current_step},
+                run_id=run_id,
+            )
         if limit_reached:
             _append_event(
                 conn,
@@ -10190,6 +10681,18 @@ def _route_product_rework_if_requested(
 
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
+
+
+class _SourceCommitError(RuntimeError):
+    """Typed failure raised when commit-first completion cannot be proven."""
+
+    def __init__(self, code: str, detail: Optional[str] = None):
+        self.code = code
+        self.detail = detail
+        message = f"source completion failed: {code}"
+        if detail:
+            message += f": {detail}"
+        super().__init__(message)
 
 
 def complete_task(
@@ -10242,6 +10745,26 @@ def complete_task(
     """
     board = board or _board_slug_for_connection(conn)
     now = int(time.time())
+    validated_terminal_outcome: Optional[TerminalOutcome] = None
+    validated_outcome_phase: Optional[str] = None
+    validated_outcome_run_id: Optional[int] = None
+    if product_workflow_enabled:
+        outcome_meta = (
+            board_meta if board_meta is not None else product_board_metadata(board)
+        )
+        if outcome_meta is not None and _handoff_v2_enabled(outcome_meta):
+            (
+                validated_terminal_outcome,
+                validated_outcome_phase,
+                validated_outcome_run_id,
+            ) = _validate_ordinary_product_outcome(
+                conn,
+                task_id,
+                summary=summary,
+                result=result,
+                metadata=metadata,
+                expected_run_id=expected_run_id,
+            )
 
     task_kind_row = conn.execute(
         "SELECT work_item_kind FROM tasks WHERE id = ?", (task_id,)
@@ -10314,6 +10837,7 @@ def complete_task(
                 summary=summary if summary is not None else result,
                 expected_run_id=expected_run_id,
                 product_role_assignees=product_role_assignees,
+                validated_outcome=validated_terminal_outcome,
             )
             if rework_routed is not None:
                 return rework_routed
@@ -10367,6 +10891,13 @@ def complete_task(
                     # -- do NOT fall through to the terminal-done UPDATE,
                     # which would wrongly mark an uncommitted card done.
                     return False
+                _record_product_outcome_observations(
+                    conn,
+                    task_id,
+                    run_id=validated_outcome_run_id,
+                    phase=validated_outcome_phase or str(step_key or ""),
+                    outcome=validated_terminal_outcome,
+                )
                 return True
             # Terminal / non-advancing v2 step (e.g. release_measure, or no
             # transition at all): fall through to the existing legacy path
@@ -10389,7 +10920,89 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    source_policy = conn.execute(
+        "SELECT source_commit_required, source_commit_forbidden, current_run_id, "
+        "workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    source_commit_required = bool(
+        source_policy is not None and source_policy["source_commit_required"]
+    )
+    source_commit_forbidden = bool(
+        source_policy is not None and source_policy["source_commit_forbidden"]
+    )
+    if source_commit_forbidden and source_policy is not None and source_policy["workspace_path"]:
+        repo_root = _git_toplevel(Path(str(source_policy["workspace_path"])))
+        if repo_root is not None:
+            status = subprocess.run(
+                ["git", "-C", str(repo_root), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if status.returncode == 0 and status.stdout:
+                raise _SourceCommitError("source_forbidden_dirty")
+            if status.returncode == 0:
+                candidate = subprocess.run(
+                    ["git", "-C", str(repo_root), "rev-parse", "HEAD^{commit}"],
+                    capture_output=True, text=True, timeout=30, check=False,
+                )
+                candidate_sha = (candidate.stdout or "").strip()
+                if candidate.returncode == 0 and len(candidate_sha) == 40:
+                    metadata = dict(metadata or {})
+                    metadata["candidate_sha"] = candidate_sha
+    if source_commit_required:
+        source_run_id = (
+            int(expected_run_id)
+            if expected_run_id is not None
+            else (
+                int(source_policy["current_run_id"])
+                if source_policy is not None
+                and source_policy["current_run_id"] is not None
+                else None
+            )
+        )
+        if source_run_id is None:
+            raise _SourceCommitError("missing_run")
+        _commit_worker_diff(
+            conn,
+            task_id,
+            message=f"complete: {task_id}",
+            expected_run_id=source_run_id,
+        )
+        expected_run_id = source_run_id
+        source_run = get_run(conn, source_run_id)
+        if source_run is None or not isinstance(source_run.metadata, dict):
+            raise _SourceCommitError("missing_receipt")
+        source_metadata = {
+            key: source_run.metadata[key]
+            for key in ("source_completion_intent", "source_completion_receipt")
+            if key in source_run.metadata
+        }
+        if "source_completion_receipt" not in source_metadata:
+            raise _SourceCommitError("missing_receipt")
+        metadata = dict(metadata or {})
+        metadata.update(source_metadata)
     with authorized_governance_write(), write_txn(conn):
+        if source_commit_required:
+            owned = conn.execute(
+                "SELECT r.metadata FROM tasks t JOIN task_runs r "
+                "ON r.id = t.current_run_id "
+                "WHERE t.id = ? AND t.current_run_id = ? AND r.ended_at IS NULL",
+                (task_id, int(expected_run_id)),
+            ).fetchone()
+            if owned is None:
+                raise _SourceCommitError("run_changed")
+            try:
+                owned_metadata = json.loads(owned["metadata"] or "{}")
+            except (TypeError, ValueError) as exc:
+                raise _SourceCommitError("missing_receipt") from exc
+            receipt = owned_metadata.get("source_completion_receipt")
+            if not isinstance(receipt, dict) or receipt.get("run_id") != int(
+                expected_run_id
+            ):
+                raise _SourceCommitError("missing_receipt")
         terminal_row = conn.execute(
             "SELECT current_step_key FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -10473,6 +11086,7 @@ def complete_task(
             outcome="completed", status="done",
             summary=summary if summary is not None else result,
             metadata=metadata,
+            expected_run_id=expected_run_id,
         )
         # If complete_task was called on a never-claimed task (ready or
         # blocked → done with no run in flight), synthesize a
@@ -10557,6 +11171,113 @@ def complete_task(
         run_id=run_id,
         summary=(summary if summary is not None else result),
     )
+    return True
+
+
+def clear_terminal_state(
+    conn: sqlite3.Connection,
+    request: ClearTerminalStateRequest,
+) -> bool:
+    """Clear a stale generic terminal flag without rewriting workflow history.
+
+    The operator must present the exact terminal snapshot observed before the
+    repair. Only ``status`` and ``completed_at`` are changed; the stored phase,
+    assignee, evidence, runs, and prior events remain untouched. A successful
+    repair appends one auditable event carrying the expected snapshot.
+    """
+    if not isinstance(request, ClearTerminalStateRequest):
+        raise TypeError("request must be ClearTerminalStateRequest")
+
+    task_id = str(request.task_id or "").strip()
+    if not task_id:
+        raise ValueError("task_id is required")
+    for field in ("expected_completed_at", "expected_latest_event_id"):
+        value = getattr(request, field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{field} is required")
+    expected_phase = str(request.expected_phase or "").strip()
+    if not expected_phase:
+        raise ValueError("expected_phase is required")
+    actor = str(request.actor or "").strip()
+    if not actor:
+        raise ValueError("actor is required")
+    reason = str(request.reason or "").strip()
+    if not reason:
+        raise ValueError("reason is required")
+
+    expected_snapshot = {
+        "status": "done",
+        "completed_at": request.expected_completed_at,
+        "phase": expected_phase,
+        "latest_event_id": request.expected_latest_event_id,
+    }
+    board = _board_slug_for_connection(conn)
+    board_meta = product_board_metadata(board)
+    with authorized_governance_write(), write_txn(conn):
+        row = conn.execute(
+            "SELECT status, completed_at, current_step_key FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "done":
+            return False
+        if (
+            row["completed_at"] != request.expected_completed_at
+            or row["current_step_key"] != expected_phase
+        ):
+            return False
+        if row["current_step_key"] == "done":
+            return False
+
+        latest_event = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if (
+            latest_event is None
+            or int(latest_event["id"]) != request.expected_latest_event_id
+        ):
+            return False
+
+        restored_status = _column_status_for_step(board_meta, expected_phase)
+        if restored_status in {"done", "archived"}:
+            return False
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = ?, completed_at = NULL
+             WHERE id = ?
+               AND status = 'done'
+               AND completed_at = ?
+               AND current_step_key = ?
+               AND (
+                   SELECT id FROM task_events
+                    WHERE task_id = ?
+                    ORDER BY id DESC
+                    LIMIT 1
+               ) = ?
+            """,
+            (
+                restored_status,
+                task_id,
+                request.expected_completed_at,
+                expected_phase,
+                task_id,
+                request.expected_latest_event_id,
+            ),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "terminal_state_cleared",
+            {
+                "operation": "clear_terminal_state",
+                "actor": actor,
+                "reason": reason,
+                "expected": expected_snapshot,
+            },
+        )
     return True
 
 
@@ -12039,8 +12760,14 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, branch_name, project_id, tenant, created_at, "
+                " created_by, max_runtime_seconds, skills, max_retries, "
+                " model_override, provider_override, reasoning_effort, goal_mode, "
+                " goal_max_turns, workflow_template_id, current_step_key, "
+                " work_contract_id, work_item_kind, source_commit_required, "
+                " source_commit_forbidden) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                " ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -12048,9 +12775,25 @@ def decompose_triage_task(
                     assignee,
                     child_ws_kind,
                     child_ws_path,
+                    None,
+                    root_row["project_id"],
                     tenant,
                     now,
                     (author or "decomposer"),
+                    root_row["max_runtime_seconds"],
+                    root_row["skills"],
+                    root_row["max_retries"],
+                    root_row["model_override"],
+                    root_row["provider_override"],
+                    root_row["reasoning_effort"],
+                    root_row["goal_mode"],
+                    root_row["goal_max_turns"],
+                    root_row["workflow_template_id"],
+                    root_row["current_step_key"],
+                    None,
+                    root_row["work_item_kind"],
+                    root_row["source_commit_required"],
+                    root_row["source_commit_forbidden"],
                 ),
             )
             _append_event(
@@ -12447,6 +13190,74 @@ def _story_base_branch(
     return epic_branch_for(epic_id)
 
 
+def _dependency_source_base(
+    conn: sqlite3.Connection, task: Task, repo_root: Path
+) -> Optional[str]:
+    """Return the common source-receipt commit for a Default-board child."""
+    required: list[tuple[str, str]] = []
+    candidates_from_forbidden: list[tuple[str, str]] = []
+    for parent_id in parent_ids(conn, task.id):
+        row = conn.execute(
+            "SELECT t.status, t.source_commit_required, t.source_commit_forbidden, r.metadata "
+            "FROM tasks t LEFT JOIN task_runs r ON r.id = ("
+            "SELECT id FROM task_runs WHERE task_id = t.id AND ended_at IS NOT NULL "
+            "AND outcome = 'completed' "
+            "ORDER BY id DESC LIMIT 1) "
+            "WHERE t.id = ?",
+            (parent_id,),
+        ).fetchone()
+        if row is None or not (row["source_commit_required"] or row["source_commit_forbidden"]):
+            continue
+        if row["status"] != "done":
+            raise RuntimeError(f"required source parent {parent_id} is not done")
+        try:
+            receipt = (json.loads(row["metadata"] or "{}").get(
+                "source_completion_receipt"
+            ))
+        except (TypeError, ValueError, AttributeError):
+            receipt = None
+        if row["source_commit_forbidden"]:
+            try:
+                sha = (json.loads(row["metadata"] or "{}").get("candidate_sha"))
+            except (TypeError, ValueError, AttributeError):
+                sha = None
+            if isinstance(sha, str) and sha.strip():
+                candidates_from_forbidden.append((parent_id, sha.strip()))
+            continue
+        sha = receipt.get("commit_sha") if isinstance(receipt, dict) else None
+        if not isinstance(sha, str) or not sha.strip():
+            raise RuntimeError(f"required source parent {parent_id} has no completion receipt")
+        required.append((parent_id, sha.strip()))
+    evidence = required + candidates_from_forbidden
+    if not evidence:
+        return None
+
+    resolved: list[tuple[str, str]] = []
+    for parent_id, sha in evidence:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", f"{sha}^{{commit}}"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        resolved_sha = (result.stdout or "").strip()
+        if result.returncode != 0 or len(resolved_sha) != 40:
+            raise RuntimeError(f"source parent {parent_id} evidence is foreign or invalid")
+        resolved.append((parent_id, resolved_sha))
+    resolved_shas = list(dict.fromkeys(sha for _, sha in resolved))
+    candidates = []
+    for candidate in resolved_shas:
+        if all(
+            subprocess.run(
+                ["git", "-C", str(repo_root), "merge-base", "--is-ancestor", other, candidate],
+                capture_output=True, timeout=30, check=False,
+            ).returncode == 0
+            for other in resolved_shas
+        ):
+            candidates.append(candidate)
+    if len(candidates) != 1:
+        raise RuntimeError("required source parent receipts diverge")
+    return candidates[0]
+
+
 #: Durable record of the exact commit an epic base branch was created at.
 #: Written to the epic's own event stream, so the base survives branch
 #: cleanup and re-cloning — local refs are not evidence of history.
@@ -12558,6 +13369,9 @@ def _epic_base_start_point(
     epic_id = epic_id_for_task(conn, task.id)
     if epic_id is None:
         return None, None
+    contract = repository_contract_for_board(
+        _board_slug_for_connection(conn), repo_root=repo_root
+    )
     recovered = (
         _latest_epic_integration_sha(conn, epic_id)
         or _epic_base_pinned_sha(conn, epic_id)
@@ -12566,7 +13380,10 @@ def _epic_base_start_point(
         return epic_id, recovered
     if _epic_has_materialization_history(conn, epic_id, excluding=task.id):
         return epic_id, None
-    # Genuinely fresh epic: this story is the first, so HEAD really is the base.
+    if contract is not None:
+        return epic_id, resolve_commit(repo_root, contract.base_ref)
+    # Legacy boards without a repository policy retain their historical
+    # behavior. Configured boards never consult ambient checkout state.
     return epic_id, _git_head_sha(repo_root)
 
 
@@ -12756,8 +13573,22 @@ def _resolve_worktree_workspace(
         base_branch = _story_base_branch(conn, task.id, board=board)
     base = base_branch or "HEAD"
 
+    def resolve_default_base(repo_root: Path) -> None:
+        nonlocal base_branch, base
+        if (
+            base_branch is None
+            and conn is not None
+            and not _handoff_v2_enabled(product_board_metadata(board))
+        ):
+            base_branch = _dependency_source_base(conn, task, repo_root)
+            base = base_branch or "HEAD"
+
     def ensure_epic_base(repo_root: Path) -> None:
-        if base_branch is None or _git_branch_exists(repo_root, base_branch):
+        if (
+            base_branch is None
+            or not _handoff_v2_enabled(product_board_metadata(board))
+            or _git_branch_exists(repo_root, base_branch)
+        ):
             return
         epic_id, start_point = _epic_base_start_point(conn, task, repo_root)
         if _ensure_epic_branch(repo_root, base_branch, start_point=start_point):
@@ -12792,6 +13623,7 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
+        resolve_default_base(repo_root)
         ensure_epic_base(repo_root)
         _materialize_worktree_with_dependencies(
             repo_root,
@@ -12832,6 +13664,7 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
+                resolve_default_base(fallback_root)
                 ensure_epic_base(fallback_root)
                 _materialize_worktree_with_dependencies(
                     fallback_root,
@@ -12850,6 +13683,7 @@ def _resolve_worktree_workspace(
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
+        resolve_default_base(repo_root)
         ensure_epic_base(repo_root)
         _materialize_worktree_with_dependencies(
             repo_root,
@@ -12867,6 +13701,7 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
+    resolve_default_base(repo_root)
     ensure_epic_base(repo_root)
     _materialize_worktree_with_dependencies(
         repo_root,
@@ -12890,6 +13725,7 @@ class IntegrationCandidate:
     scratch_worktree: Path
     repo_root: Path
     candidate_ref: str
+    verification_result: Optional[VerificationResult] = None
 
 
 _RECONCILE_INTEGRATION_VERIFY_UNSET = object()
@@ -12906,9 +13742,136 @@ class ReleaseResult:
 
 
 class IntegrationCandidateError(RuntimeError):
-    def __init__(self, message: str, *, scratch_worktree: Optional[Path] = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        scratch_worktree: Optional[Path] = None,
+        verification_result: Optional[VerificationResult] = None,
+    ):
         super().__init__(message)
         self.scratch_worktree = scratch_worktree
+        self.verification_result = verification_result
+
+
+def _verification_result_payload(
+    result: VerificationResult, *, scope: str, subject_id: str
+) -> dict[str, Any]:
+    """Serialize bounded repository verification evidence for a task event."""
+    payload: dict[str, Any] = {
+        "scope": scope,
+        "subject_id": subject_id,
+        "status": result.status,
+        "source_sha": result.source_sha,
+        "candidate_sha": result.candidate_sha,
+        "contract_digest": result.contract_digest,
+        "profile": result.profile,
+        "error": result.error,
+        "rework_eligible": result.status == "failed",
+        "steps": [
+            {
+                "argv": list(step.argv),
+                "workdir": str(step.workdir),
+                "status": step.status,
+                "returncode": step.returncode,
+                "duration_seconds": step.duration_seconds,
+                "stdout_tail": step.stdout_tail,
+                "stderr_tail": step.stderr_tail,
+                "error": step.error,
+            }
+            for step in result.steps
+        ],
+    }
+    if result.status == "passed":
+        try:
+            receipt = build_verification_receipt(
+                result, subject_id=subject_id, created_at=int(time.time())
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("passed verification result cannot produce receipt") from exc
+        else:
+            payload["receipt"] = {
+                "key": {
+                    "candidate_sha": receipt.key.candidate_sha,
+                    "contract_digest": receipt.key.contract_digest,
+                    "command_set_digest": receipt.key.command_set_digest,
+                    "runtime_toolchain_digest": receipt.key.runtime_toolchain_digest,
+                    "generated_policy_digest": receipt.key.generated_policy_digest,
+                    "gate_kind": receipt.key.gate_kind,
+                    "executor_policy": receipt.key.executor_policy,
+                    "digest": receipt.key.digest,
+                },
+                "result_digest": receipt.result_digest,
+                "created_at": receipt.created_at,
+            }
+    return payload
+
+
+def _verification_needs_attention(result: Optional[VerificationResult]) -> bool:
+    return result is not None and result.status in {
+        "configuration_error",
+        "infrastructure_error",
+    }
+
+
+def _run_or_reuse_configured_verification(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    candidate_path: Path,
+    source_sha: str,
+    candidate_sha: str,
+    contract: RepositoryContract,
+    profile_name: str,
+    gate_kind: str,
+) -> VerificationResult:
+    profile = contract.verification.get(profile_name)
+    expected_key = build_verification_receipt_key(
+        profile, candidate_path, candidate_sha=candidate_sha,
+        contract_digest=contract.digest,
+        generated_policy_digest=contract.generated_policy_digest,
+        gate_kind=gate_kind, profile_name=profile_name,
+    )
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC",
+        (task_id, "repository_verification"),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else None
+        except (TypeError, ValueError):
+            payload = None
+        if not isinstance(payload, dict):
+            continue
+        receipt = verification_receipt_from_payload(payload)
+        if (receipt is None or receipt.key.digest != expected_key.digest
+                or payload.get("scope") != gate_kind
+                or payload.get("subject_id") != task_id
+                or payload.get("status") != "passed"):
+            continue
+        steps = tuple(
+            VerificationStepResult(
+                argv=tuple(step["argv"]), workdir=PurePosixPath(step["workdir"]),
+                status=step["status"], returncode=step["returncode"],
+                duration_seconds=step["duration_seconds"],
+                stdout_tail=step["stdout_tail"], stderr_tail=step["stderr_tail"],
+                error=step["error"],
+            ) for step in payload.get("steps", []) if isinstance(step, dict)
+        )
+        return VerificationResult(
+            status="passed", source_sha=source_sha, candidate_sha=candidate_sha,
+            contract_digest=contract.digest, profile=profile_name, steps=steps,
+            key=expected_key, error=None, reused=True,
+        )
+    result = run_verification(
+        profile, candidate_path, source_sha=source_sha, candidate_sha=candidate_sha,
+        contract_digest=contract.digest, scope=gate_kind, subject_id=task_id,
+        profile_name=profile_name, generated_policy_digest=contract.generated_policy_digest,
+    )
+    with write_txn(conn):
+        _append_event(conn, task_id, "repository_verification",
+                      _verification_result_payload(result, scope=gate_kind, subject_id=task_id))
+    return result
 
 
 def _integration_git(
@@ -12968,6 +13931,14 @@ def _build_verified_merge_candidate(
     candidate_verify_fn: Optional[Callable[[Path], bool]] = None,
     *,
     expected_source_sha: Optional[str] = None,
+    allow_empty_contribution: bool = False,
+    verification_profile: Optional[VerificationProfile] = None,
+    verification_contract_digest: Optional[str] = None,
+    verification_scope: str = "story_integration",
+    verification_subject_id: str = "",
+    verification_profile_name: Optional[str] = None,
+    verification_generated_policy_digest: str = "",
+    configured_verification_fn: Optional[Callable[[Path, str, str], VerificationResult]] = None,
 ) -> IntegrationCandidate:
     repo_root = repo_root.resolve()
     target_worktree = _checked_out_branch_worktree(repo_root, target_branch)
@@ -12991,6 +13962,16 @@ def _build_verified_merge_candidate(
     if pre_result.returncode != 0 or not pre_sha:
         raise IntegrationCandidateError(f"could not resolve {target_branch}")
 
+    source_ancestor = _integration_git(
+        repo_root,
+        ["merge-base", "--is-ancestor", approved_source_sha, pre_sha],
+    )
+    empty_contribution = source_ancestor.returncode == 0
+    if empty_contribution and not allow_empty_contribution:
+        raise IntegrationCandidateError("empty contribution")
+    if source_ancestor.returncode not in {0, 1}:
+        raise IntegrationCandidateError("could not verify candidate contribution")
+
     nonce = secrets.token_hex(6)
     scratch = repo_root / ".worktrees" / f"integration-{nonce}"
     scratch.parent.mkdir(parents=True, exist_ok=True)
@@ -13000,15 +13981,16 @@ def _build_verified_merge_candidate(
     if added.returncode != 0:
         raise IntegrationCandidateError("could not create integration worktree")
 
-    merged = _integration_git(
-        scratch,
-        ["merge", "--no-ff", approved_source_sha, "-m", message],
-        timeout=900,
-    )
-    if merged.returncode != 0:
-        _integration_git(scratch, ["merge", "--abort"])
-        _remove_clean_integration_worktree(repo_root, scratch)
-        raise IntegrationCandidateError("merge conflict")
+    if not empty_contribution:
+        merged = _integration_git(
+            scratch,
+            ["merge", "--no-ff", approved_source_sha, "-m", message],
+            timeout=900,
+        )
+        if merged.returncode != 0:
+            _integration_git(scratch, ["merge", "--abort"])
+            _remove_clean_integration_worktree(repo_root, scratch)
+            raise IntegrationCandidateError("merge conflict")
 
     try:
         _provision_node_dependencies(_primary_checkout_root(repo_root), scratch)
@@ -13027,7 +14009,26 @@ def _build_verified_merge_candidate(
             "could not resolve integration candidate", scratch_worktree=scratch
         )
 
-    if candidate_verify_fn is None:
+    verification_result: Optional[VerificationResult] = None
+    if configured_verification_fn is not None:
+        configured_result = configured_verification_fn(scratch, approved_source_sha, candidate_sha)
+        verification_result = configured_result
+        verified = configured_result.status == "passed"
+    elif verification_contract_digest is not None and candidate_verify_fn is None:
+        configured_result = run_verification(
+            verification_profile,
+            scratch,
+            source_sha=approved_source_sha,
+            candidate_sha=candidate_sha,
+            contract_digest=verification_contract_digest,
+            scope=verification_scope,
+            subject_id=verification_subject_id,
+            profile_name=verification_profile_name,
+            generated_policy_digest=verification_generated_policy_digest,
+        )
+        verification_result = configured_result
+        verified = configured_result.status == "passed"
+    elif candidate_verify_fn is None:
         script = scratch / "scripts" / "run_tests.sh"
         if not script.is_file():
             verified = False
@@ -13052,7 +14053,12 @@ def _build_verified_merge_candidate(
     if not verified:
         _cleanup_provisioned_node_dependencies(scratch)
         _remove_clean_integration_worktree(repo_root, scratch)
-        raise IntegrationCandidateError("candidate verification failed")
+        raise IntegrationCandidateError(
+            "candidate verification failed"
+            if verification_result is None
+            else f"candidate verification {verification_result.status}",
+            verification_result=verification_result,
+        )
 
     _cleanup_provisioned_node_dependencies(scratch)
 
@@ -13092,6 +14098,7 @@ def _build_verified_merge_candidate(
         scratch_worktree=scratch,
         repo_root=repo_root,
         candidate_ref=candidate_ref,
+        verification_result=verification_result,
     )
 
 
@@ -13139,14 +14146,18 @@ def _fast_forward_target(candidate: IntegrationCandidate) -> bool:
     return True
 
 
-def _default_epic_verify(epic_branch: str) -> bool:
+def _default_epic_verify(
+    epic_branch: str, *, board: Optional[str] = None
+) -> bool:
     """Run the project's test suite against ``epic_branch`` and report green.
 
-    The real (slow) verify path for :func:`epic_ready`. Resolves the active
+    The legacy (slow) verify path for :func:`epic_ready`. Resolves the active
     board's repo root the same way :func:`_resolve_worktree_workspace` does
     (board ``default_workdir`` -> :func:`_git_toplevel`), materializes/locates
     a worktree checked out to ``epic_branch``, then shells out to
-    ``scripts/run_tests.sh`` in that worktree.
+    ``scripts/run_tests.sh`` in that worktree. Boards with a repository
+    contract refuse this legacy fallback until the configured verification
+    service is used.
 
     Defensive: any exception, or a missing ``run_tests.sh``, means "not
     green" -- this never raises. Exercised by the dogfood checkpoint, not by
@@ -13154,13 +14165,14 @@ def _default_epic_verify(epic_branch: str) -> bool:
     """
     try:
         board_default = (
-            read_board_metadata(get_current_board()).get("default_workdir") or ""
+            read_board_metadata(board or get_current_board()).get("default_workdir") or ""
         ).strip()
         if not board_default:
             return False
         repo_root = _git_toplevel(Path(board_default).expanduser())
         if repo_root is None:
             return False
+        contract = repository_contract_for_board(board, repo_root=repo_root)
         _ensure_epic_branch(repo_root, epic_branch, start_point=None)
         target = repo_root / ".worktrees" / f"epic-verify-{epic_branch.replace('/', '-')}"
         from hermes_cli.worktree_dependencies import _acquire_project_lock
@@ -13175,6 +14187,23 @@ def _default_epic_verify(epic_branch: str) -> bool:
                 repo_root, target, epic_branch, base="HEAD"
             )
             try:
+                if contract is not None:
+                    source_sha = _git_ref_sha(repo_root, epic_branch)
+                    candidate_result = _integration_git(target, ["rev-parse", "HEAD"])
+                    candidate_sha = (candidate_result.stdout or "").strip()
+                    if not source_sha or candidate_result.returncode != 0 or not candidate_sha:
+                        return False
+                    result = run_verification(
+                        contract.verification.get("epic_release"),
+                        target,
+                        source_sha=source_sha,
+                        candidate_sha=candidate_sha,
+                        contract_digest=contract.digest,
+                        scope="epic_release",
+                        subject_id=epic_branch,
+                        profile_name="epic_release",
+                    )
+                    return result.status == "passed"
                 script = target / "scripts" / "run_tests.sh"
                 if not script.exists():
                     return False
@@ -13228,7 +14257,9 @@ def epic_ready(
         child = get_task(conn, child_id)
         if child is None or child.status != "done":
             return False
-    verify = verify_fn or _default_epic_verify
+    verify = verify_fn or (
+        lambda branch: _default_epic_verify(branch, board=board)
+    )
     return bool(verify(epic_branch_for(epic_id)))
 
 
@@ -13310,7 +14341,15 @@ def merge_epic_to_main(
         return None
     _validate_stored_product_workflow_state(conn, epic_id)
 
-    readiness_verify = (lambda _branch: True) if candidate_verify_fn else verify_fn
+    # A repository contract owns verification for governed boards.  Do not
+    # run the legacy boolean readiness probe first: it would discard typed
+    # configuration/infrastructure results and return ``not_ready`` before the
+    # candidate builder can persist the required attention evidence.
+    readiness_verify = (
+        (lambda _branch: True)
+        if candidate_verify_fn is not None or "repository" in meta
+        else verify_fn
+    )
     if not epic_ready(conn, epic_id, board=board, verify_fn=readiness_verify):
         return "not_ready"
 
@@ -13320,6 +14359,7 @@ def merge_epic_to_main(
         epic_branch = epic_branch_for(epic_id)
         if repo_root is None or not _git_branch_exists(repo_root, epic_branch):
             return "not_ready"
+        contract = repository_contract_for_metadata(meta, repo_root=repo_root)
     except Exception:
         return "not_ready"
 
@@ -13339,6 +14379,23 @@ def merge_epic_to_main(
             f"merge epic {epic_id}",
             effective_verify_fn,
             expected_source_sha=expected_source_sha,
+            verification_profile=(
+                contract.verification.get("epic_release") if contract is not None else None
+            ),
+            verification_contract_digest=(contract.digest if contract is not None else None),
+            verification_scope="epic_release",
+            verification_subject_id=epic_id,
+            verification_profile_name="epic_release",
+            verification_generated_policy_digest=(
+                contract.generated_policy_digest if contract is not None else ""
+            ),
+            configured_verification_fn=(
+                lambda path, source, candidate: _run_or_reuse_configured_verification(
+                    conn, task_id=epic_id, candidate_path=path, source_sha=source,
+                    candidate_sha=candidate, contract=contract,
+                    profile_name="epic_release", gate_kind="epic_release"
+                )
+            ) if contract is not None and candidate_verify_fn is None else None,
         )
         if before_apply_fn is not None and not before_apply_fn():
             return "ownership_conflict"
@@ -13351,6 +14408,17 @@ def merge_epic_to_main(
 
         try:
             with write_txn(conn):
+                if candidate.verification_result is not None and not candidate.verification_result.reused:
+                    _append_event(
+                        conn,
+                        epic_id,
+                        "repository_verification",
+                        _verification_result_payload(
+                            candidate.verification_result,
+                            scope="epic_release",
+                            subject_id=epic_id,
+                        ),
+                    )
                 _append_event(
                     conn,
                     epic_id,
@@ -13371,7 +14439,24 @@ def merge_epic_to_main(
         return "merged"
     except IntegrationCandidateError as exc:
         reason = str(exc)
+        if exc.verification_result is not None:
+            try:
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        epic_id,
+                        "repository_verification",
+                        _verification_result_payload(
+                            exc.verification_result,
+                            scope="epic_release",
+                            subject_id=epic_id,
+                        ),
+                    )
+            except Exception:
+                pass
         _fail(reason)
+        if _verification_needs_attention(exc.verification_result):
+            return "attention_required"
         if "merge conflict" in reason:
             return "conflict"
         return "verify_failed"
@@ -13481,14 +14566,22 @@ def integrate_story_to_epic(
     # any Git ref only for the ordinary reconcile fast path. Explicit source,
     # candidate, or ownership controls must retain their verification semantics
     # and must never be hidden by an older integration row.
-    reviewed_candidate: Optional[tuple[str, str]] = None
+    authority_records = _terminal_run_records(conn, story_id)
+    authority_phase_present = any(
+        record.phase in {"test", "review"} for record in authority_records
+    )
+    reviewed_candidate = latest_review_authority(authority_records)
+    passed_test = (
+        latest_test_authority(authority_records, reviewed_candidate.source_sha)
+        if reviewed_candidate is not None
+        else None
+    )
     ordinary_reconcile = (
         candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
         and expected_source_sha is None
         and before_apply_fn is None
     )
     if ordinary_reconcile:
-        reviewed_candidate = _latest_approved_review_candidate(conn, story_id)
         if reviewed_candidate is not None:
             already_integrated = conn.execute(
                 """
@@ -13518,6 +14611,13 @@ def integrate_story_to_epic(
             ).fetchone()
         if already_integrated is not None:
             return "already_integrated"
+    if authority_phase_present and (
+        reviewed_candidate is None or passed_test is None
+    ):
+        # A product Test/Review attempt exists, so legacy ancestor replay is
+        # not allowed to create a new integration fact without current,
+        # dispatcher-pinned authority from both phases.
+        return None
 
     try:
         board_default = str(meta.get("default_workdir") or "").strip()
@@ -13533,6 +14633,24 @@ def integrate_story_to_epic(
             or not _git_branch_exists(repo_root, story_branch)
         ):
             return None
+        contract = repository_contract_for_metadata(meta, repo_root=repo_root)
+        if reviewed_candidate is not None:
+            if reviewed_candidate.branch != story_branch:
+                return None
+            if (
+                expected_source_sha is not None
+                and expected_source_sha != reviewed_candidate.source_sha
+            ):
+                return None
+            assert passed_test is not None
+            try:
+                candidate_eligibility(
+                    repo_root, reviewed_candidate, passed_test
+                )
+            except CandidateEligibilityError:
+                # No candidate intent/fact has been written yet.  Leave the
+                # existing integration state untouched for a later replay.
+                return "verify_failed"
         if ordinary_reconcile and reviewed_candidate is None:
             current_source_sha = _git_ref_sha(repo_root, story_branch)
             if current_source_sha and conn.execute(
@@ -13569,6 +14687,12 @@ def integrate_story_to_epic(
             and candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
             and expected_source_sha is None
         ):
+            if reviewed_candidate is not None:
+                # A reviewed source that is already an ancestor may have been
+                # applied by an earlier crash, but without the exact durable
+                # composite fact the ancestor relation alone is not replay
+                # authority.
+                return "verify_failed"
             _record_story_integration(
                 conn, story_id, epic_id, epic_branch,
                 {
@@ -13586,6 +14710,24 @@ def integrate_story_to_epic(
             or expected_source_sha is not None
             or reviewed_candidate is not None
         ):
+            reviewed_source_sha = (
+                reviewed_candidate.source_sha
+                if reviewed_candidate is not None
+                else expected_source_sha
+            )
+            existing_integration = (
+                reviewed_source_sha is not None
+                and conn.execute(
+                    """
+                    SELECT 1
+                      FROM epic_story_integrations
+                     WHERE epic_id=? AND story_id=? AND source_sha=?
+                     LIMIT 1
+                    """,
+                    (epic_id, story_id, reviewed_source_sha),
+                ).fetchone()
+                is not None
+            )
             candidate_source_branch = story_branch
             candidate_expected_source_sha = expected_source_sha
             reviewed_source_ref: Optional[str] = None
@@ -13624,6 +14766,31 @@ def integrate_story_to_epic(
                         f"integrate story {story_id}",
                         effective_verify_fn,
                         expected_source_sha=candidate_expected_source_sha,
+                        allow_empty_contribution=existing_integration,
+                        verification_profile=(
+                            contract.verification.get("story_integration")
+                            if contract is not None
+                            else None
+                        ),
+                        verification_contract_digest=(
+                            contract.digest if contract is not None else None
+                        ),
+                        verification_scope="story_integration",
+                        verification_subject_id=story_id,
+                        verification_profile_name="story_integration",
+                        verification_generated_policy_digest=(
+                            contract.generated_policy_digest if contract is not None else ""
+                        ),
+                        configured_verification_fn=(
+                            lambda path, source, candidate: _run_or_reuse_configured_verification(
+                                conn, task_id=story_id, candidate_path=path, source_sha=source,
+                                candidate_sha=candidate, contract=contract,
+                                profile_name="story_integration", gate_kind="story_integration"
+                            )
+                        ) if (
+                            contract is not None
+                            and candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
+                        ) else None,
                     )
                 finally:
                     if reviewed_source_ref is not None:
@@ -13656,14 +14823,39 @@ def integrate_story_to_epic(
                     return "verify_failed"
             except IntegrationCandidateError as exc:
                 with write_txn(conn):
+                    if exc.verification_result is not None:
+                        _append_event(
+                            conn,
+                            story_id,
+                            "repository_verification",
+                            _verification_result_payload(
+                                exc.verification_result,
+                                scope="story_integration",
+                                subject_id=story_id,
+                            ),
+                        )
                     _append_event(
                         conn,
                         story_id,
                         "story_integration_failed",
                         {"reason": str(exc), "release_candidate": True},
                     )
+                if _verification_needs_attention(exc.verification_result):
+                    return "attention_required"
                 return "conflict" if "merge conflict" in str(exc) else "verify_failed"
 
+            if candidate.verification_result is not None and not candidate.verification_result.reused:
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        story_id,
+                        "repository_verification",
+                        _verification_result_payload(
+                            candidate.verification_result,
+                            scope="story_integration",
+                            subject_id=story_id,
+                        ),
+                    )
             _record_story_integration(
                 conn, story_id, epic_id, epic_branch,
                 {
@@ -13832,6 +15024,32 @@ def _merge_standalone_story_to_main(
             or not _git_branch_exists(repo_root, story_branch)
         ):
             return "not_ready"
+        contract = repository_contract_for_metadata(meta, repo_root=repo_root)
+        authority_records = _terminal_run_records(conn, story_id)
+        authority_phase_present = any(
+            record.phase in {"test", "review"} for record in authority_records
+        )
+        reviewed_candidate = latest_review_authority(authority_records)
+        passed_test = (
+            latest_test_authority(authority_records, reviewed_candidate.source_sha)
+            if reviewed_candidate is not None
+            else None
+        )
+        if authority_phase_present:
+            if (
+                reviewed_candidate is None
+                or passed_test is None
+                or reviewed_candidate.branch != story_branch
+                or (
+                    expected_source_sha is not None
+                    and expected_source_sha != reviewed_candidate.source_sha
+                )
+            ):
+                return "verify_failed"
+            try:
+                candidate_eligibility(repo_root, reviewed_candidate, passed_test)
+            except CandidateEligibilityError:
+                return "verify_failed"
     except Exception:
         return "not_ready"
 
@@ -13844,6 +15062,8 @@ def _merge_standalone_story_to_main(
         )
         already_merged = ancestor_result.returncode == 0
         if already_merged and expected_source_sha is None:
+            if reviewed_candidate is not None:
+                return "verify_failed"
             with write_txn(conn):
                 _append_event(
                     conn,
@@ -13871,6 +15091,26 @@ def _merge_standalone_story_to_main(
             f"merge story {story_id}",
             effective_verify_fn,
             expected_source_sha=expected_source_sha,
+            allow_empty_contribution=already_merged,
+            verification_profile=(
+                contract.verification.get("story_integration")
+                if contract is not None
+                else None
+            ),
+            verification_contract_digest=(contract.digest if contract is not None else None),
+            verification_scope="story_integration",
+            verification_subject_id=story_id,
+            verification_profile_name="story_integration",
+            verification_generated_policy_digest=(
+                contract.generated_policy_digest if contract is not None else ""
+            ),
+            configured_verification_fn=(
+                lambda path, source, candidate: _run_or_reuse_configured_verification(
+                    conn, task_id=story_id, candidate_path=path, source_sha=source,
+                    candidate_sha=candidate, contract=contract,
+                    profile_name="story_integration", gate_kind="story_integration"
+                )
+            ) if contract is not None and candidate_verify_fn is None else None,
         )
         if before_apply_fn is not None and not before_apply_fn():
             return "ownership_conflict"
@@ -13883,6 +15123,17 @@ def _merge_standalone_story_to_main(
 
         try:
             with write_txn(conn):
+                if candidate.verification_result is not None and not candidate.verification_result.reused:
+                    _append_event(
+                        conn,
+                        story_id,
+                        "repository_verification",
+                        _verification_result_payload(
+                            candidate.verification_result,
+                            scope="story_integration",
+                            subject_id=story_id,
+                        ),
+                    )
                 _append_event(
                     conn,
                     story_id,
@@ -13903,7 +15154,24 @@ def _merge_standalone_story_to_main(
         return "already_merged" if already_merged else "merged"
     except IntegrationCandidateError as exc:
         reason = str(exc)
+        if exc.verification_result is not None:
+            try:
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        story_id,
+                        "repository_verification",
+                        _verification_result_payload(
+                            exc.verification_result,
+                            scope="story_integration",
+                            subject_id=story_id,
+                        ),
+                    )
+            except Exception:
+                pass
         _fail(reason)
+        if _verification_needs_attention(exc.verification_result):
+            return "attention_required"
         if "merge conflict" in reason:
             return "conflict"
         return "verify_failed"
@@ -13969,25 +15237,53 @@ def _reviewer_evidence(metadata: dict) -> tuple[str, str, str]:
     )
 
 
+def _terminal_run_records(
+    conn: sqlite3.Connection, task_id: str
+) -> list[TerminalRunRecord]:
+    """Convert ended runs to the authority kernel's immutable input shape."""
+
+    records: list[TerminalRunRecord] = []
+    ended_runs = sorted(
+        list_runs(conn, task_id, include_active=False),
+        key=lambda run: (int(run.ended_at or 0), int(run.id)),
+    )
+    for run in ended_runs:
+        metadata = run.metadata if isinstance(run.metadata, dict) else {}
+        try:
+            outcome = validate_terminal_outcome(
+                task_id=task_id,
+                run_id=run.id,
+                phase=str(run.step_key or ""),
+                summary=run.summary,
+                result=None,
+                metadata=metadata,
+            )
+        except OutcomeValidationError:
+            outcome = None
+        records.append(
+            TerminalRunRecord(
+                run_id=run.id,
+                phase=str(run.step_key or ""),
+                outcome=outcome,
+                test_branch=str(metadata.get("test_branch") or "").strip() or None,
+                test_head_sha=str(metadata.get("test_head_sha") or "").strip() or None,
+                review_branch=str(metadata.get("review_branch") or "").strip() or None,
+                review_base_sha=str(metadata.get("review_base_sha") or "").strip() or None,
+                review_head_sha=str(metadata.get("review_head_sha") or "").strip() or None,
+                writer_provider=_writer_agent_from_metadata(metadata),
+                tester_provider=_tester_agent_from_metadata(metadata),
+                reviewer_provider=_reviewer_agent_from_metadata(metadata),
+            )
+        )
+    return records
+
+
 def _latest_approved_review_candidate(
     conn: sqlite3.Connection,
     task_id: str,
-) -> Optional[tuple[str, str]]:
+) -> Optional[ApprovedCandidate]:
     """Return the latest immutable branch/SHA approved by independent Review."""
-    for run in reversed(list_runs(conn, task_id, include_active=False)):
-        metadata = run.metadata if isinstance(run.metadata, dict) else {}
-        workflow = metadata.get("workflow_outcome")
-        verdict, branch, commit = _reviewer_evidence(metadata)
-        if (
-            run.step_key == "review"
-            and isinstance(workflow, dict)
-            and workflow.get("verdict") == "approved"
-            and verdict == "approved"
-            and _reviewer_agent_from_metadata(metadata)
-        ):
-            if branch and commit:
-                return branch, commit
-    return None
+    return latest_review_authority(_terminal_run_records(conn, task_id))
 
 
 def _release_run_evidence(
@@ -13996,50 +15292,36 @@ def _release_run_evidence(
     branch: str,
     source_sha: str,
 ) -> dict[str, int]:
-    test_run: Optional[Run] = None
-    review_run: Optional[Run] = None
-    writer_agent: Optional[str] = None
-    reviewer_agent: Optional[str] = None
-    reviewed_writer_agent: Optional[str] = None
-    reviewed_branch: Optional[str] = None
-    reviewed_commit: Optional[str] = None
-
-    for run in list_runs(conn, task_id, include_active=False):
-        metadata = run.metadata if isinstance(run.metadata, dict) else {}
-        run_writer = _writer_agent_from_metadata(metadata)
-        if run_writer:
-            writer_agent = run_writer
-        provenance = _provenance_payload(metadata)
-        workflow = metadata.get("workflow_outcome")
-        if run.step_key == "test":
-            tester = provenance.get("tester")
-            if (
-                isinstance(workflow, dict)
-                and workflow.get("verdict") == "passed"
-                and isinstance(tester, dict)
-                and tester.get("result") == "passed"
-                and _tester_agent_from_metadata(metadata)
-            ):
-                test_run = run
-        if run.step_key == "review":
-            verdict, run_branch, run_commit = _reviewer_evidence(metadata)
-            if (
-                isinstance(workflow, dict)
-                and workflow.get("verdict") == "approved"
-                and verdict == "approved"
-                and _reviewer_agent_from_metadata(metadata)
-            ):
-                review_run = run
-                reviewer_agent = _reviewer_agent_from_metadata(metadata)
-                reviewed_branch = run_branch
-                reviewed_commit = run_commit
-                reviewed_writer_agent = run_writer or writer_agent
+    runs = list_runs(conn, task_id, include_active=False)
+    records = _terminal_run_records(conn, task_id)
+    approved = latest_review_authority(records)
+    passed = latest_test_authority(records, source_sha)
+    test_run = next((run for run in runs if passed and run.id == passed.run_id), None)
+    review_run = next((run for run in runs if approved and run.id == approved.run_id), None)
+    reviewer_agent = approved.reviewer_provider if approved else None
+    reviewed_writer_agent = approved.writer_provider if approved else None
+    reviewed_branch = approved.branch if approved else None
+    reviewed_commit = approved.source_sha if approved else None
 
     missing: list[str] = []
     if test_run is None:
         missing.append("tester_pass")
     if review_run is None:
         missing.append("reviewer_approval")
+        latest_review = next(
+            (record for record in reversed(records) if record.phase == "review"),
+            None,
+        )
+        if (
+            latest_review is not None
+            and latest_review.outcome is not None
+            and latest_review.outcome.verdict == "approved"
+            and latest_review.writer_provider
+            and latest_review.reviewer_provider
+            and _agent_compare_key(latest_review.writer_provider)
+            == _agent_compare_key(latest_review.reviewer_provider)
+        ):
+            missing.append("independent_reviewer")
     if (
         review_run is not None
         and reviewed_writer_agent
@@ -14052,6 +15334,8 @@ def _release_run_evidence(
         reviewed_branch != branch or reviewed_commit != source_sha
     ):
         missing.append("reviewed_candidate")
+    if test_run is not None and passed is not None and passed.branch != branch:
+        missing.append("tester_pass")
     if not reviewed_writer_agent:
         missing.append("writer_evidence")
     if review_run is not None and not reviewer_agent:
@@ -14270,6 +15554,22 @@ def release_product_task(
     evidence: dict[str, Any] = _release_run_evidence(
         conn, task_id, branch, source_sha
     )
+    if reviewed_candidate is not None:
+        authority_records = _terminal_run_records(conn, task_id)
+        passed_test = latest_test_authority(
+            authority_records, reviewed_candidate.source_sha
+        )
+        if passed_test is None:
+            raise ReleaseEvidenceError(task_id, ["tester_pass"])
+        try:
+            candidate_eligibility(repo_root, reviewed_candidate, passed_test)
+        except CandidateEligibilityError as exc:
+            missing = (
+                "reviewed_candidate"
+                if exc.code == "stale_review"
+                else exc.code
+            )
+            raise ReleaseEvidenceError(task_id, [missing]) from exc
     evidence.update(source_branch=branch, source_sha=source_sha)
     evidence.update(_release_history_evidence(conn, task_id))
     note = str(measurement_note or "").strip()
@@ -14795,8 +16095,48 @@ def set_branch_name(
         )
 
 
+def _persist_source_completion_metadata(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    *,
+    intent: dict[str, Any],
+    receipt: Optional[dict[str, Any]] = None,
+) -> None:
+    """CAS-write one completion intent and optional receipt onto the owned run."""
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT r.metadata FROM tasks t JOIN task_runs r "
+            "ON r.id = t.current_run_id "
+            "WHERE t.id = ? AND t.current_run_id = ? AND r.ended_at IS NULL",
+            (task_id, int(run_id)),
+        ).fetchone()
+        if row is None:
+            raise _SourceCommitError("run_changed")
+        try:
+            run_metadata = json.loads(row["metadata"] or "{}")
+        except (TypeError, ValueError):
+            run_metadata = {}
+        if not isinstance(run_metadata, dict):
+            run_metadata = {}
+        run_metadata["source_completion_intent"] = dict(intent)
+        if receipt is not None:
+            run_metadata["source_completion_receipt"] = dict(receipt)
+        updated = conn.execute(
+            "UPDATE task_runs SET metadata = ? "
+            "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+            (json.dumps(run_metadata, ensure_ascii=False), int(run_id), task_id),
+        )
+        if updated.rowcount != 1:
+            raise _SourceCommitError("run_changed")
+
+
 def _commit_worker_diff(
-    conn: sqlite3.Connection, task_id: str, *, message: Optional[str] = None
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    message: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> Optional[str]:
     """Commit a card's worktree, source-only, and return the new SHA.
 
@@ -14807,44 +16147,145 @@ def _commit_worker_diff(
     This is load-bearing for T2.2: no commit means the card does not advance.
     """
     row = conn.execute(
-        "SELECT title, workspace_path FROM tasks WHERE id = ?",
+        "SELECT title, workspace_path, current_run_id FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
         return None
+    strict = expected_run_id is not None
+    if strict and row["current_run_id"] != int(expected_run_id):
+        raise _SourceCommitError("run_changed")
     workspace_path: Optional[str] = row["workspace_path"]
     if not workspace_path:
+        if strict:
+            raise _SourceCommitError("missing_workspace")
         return None
     repo_root = _git_toplevel(Path(workspace_path))
     if repo_root is None:
+        if strict:
+            raise _SourceCommitError("not_a_git_repository")
         return None
 
+    def git(
+        *args: str, ok_codes: tuple[int, ...] = (0,)
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(repo_root), *args],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except Exception as exc:
+            if strict:
+                raise _SourceCommitError("git_failed", str(exc)) from exc
+            raise
+        if completed.returncode not in ok_codes and strict:
+            detail = (completed.stderr or completed.stdout or "").strip()
+            raise _SourceCommitError("git_failed", detail)
+        return completed
+
     try:
-        add_result = subprocess.run(
-            ["git", "-C", str(repo_root), "add", "-A"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        add_result = git("add", "-A")
     except Exception:
+        if strict:
+            raise
         return None
     if add_result.returncode != 0:
         return None
 
     try:
-        diff_result = subprocess.run(
-            ["git", "-C", str(repo_root), "diff", "--cached", "--quiet"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        diff_result = git("diff", "--cached", "--quiet", ok_codes=(0, 1))
     except Exception:
+        if strict:
+            raise
         return None
     if diff_result.returncode == 0:
-        # Nothing staged — clean tree, nothing to commit.
+        if strict:
+            intent_row = conn.execute(
+                "SELECT id, metadata FROM task_runs WHERE task_id = ? "
+                "AND id != ? ORDER BY id DESC",
+                (task_id, int(expected_run_id)),
+            ).fetchall()
+            head = git("rev-parse", "HEAD").stdout.strip()
+            for prior in intent_row:
+                try:
+                    prior_metadata = json.loads(prior["metadata"] or "{}")
+                except (TypeError, ValueError):
+                    continue
+                intent = (
+                    prior_metadata.get("source_completion_intent")
+                    if isinstance(prior_metadata, dict)
+                    else None
+                )
+                if not isinstance(intent, dict):
+                    continue
+                base_sha = str(intent.get("base_sha") or "")
+                tree_sha = str(intent.get("tree_sha") or "")
+                parent = git("rev-parse", "HEAD^").stdout.strip()
+                head_tree = git("rev-parse", "HEAD^{tree}").stdout.strip()
+                if parent != base_sha or head_tree != tree_sha:
+                    continue
+                paths = [
+                    path
+                    for path in git(
+                        "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"
+                    ).stdout.splitlines()
+                    if path
+                ]
+                if paths != intent.get("paths"):
+                    continue
+                receipt = {
+                    "intent_id": intent["intent_id"],
+                    "intent_run_id": int(prior["id"]),
+                    "run_id": int(expected_run_id),
+                    "base_sha": base_sha,
+                    "commit_sha": head,
+                    "tree_sha": tree_sha,
+                    "diff_digest": intent["diff_digest"],
+                    "paths": paths,
+                    "created_at": int(time.time()),
+                    "adopted": True,
+                }
+                _persist_source_completion_metadata(
+                    conn,
+                    task_id,
+                    int(expected_run_id),
+                    intent=intent,
+                    receipt=receipt,
+                )
+                return head
+            raise _SourceCommitError("nothing_to_commit")
         return None
+
+    intent: Optional[dict[str, Any]] = None
+    if strict:
+        base_sha = git("rev-parse", "HEAD").stdout.strip()
+        tree_sha = git("write-tree").stdout.strip()
+        paths = [
+            path
+            for path in git("diff", "--cached", "--name-only", base_sha).stdout.splitlines()
+            if path
+        ]
+        diff_bytes = subprocess.run(
+            ["git", "-C", str(repo_root), "diff", "--cached", "--binary", base_sha],
+            capture_output=True,
+            timeout=30,
+            check=True,
+        ).stdout
+        intent = {
+            "intent_id": secrets.token_hex(16),
+            "run_id": int(expected_run_id),
+            "base_sha": base_sha,
+            "tree_sha": tree_sha,
+            "diff_digest": hashlib.sha256(diff_bytes).hexdigest(),
+            "paths": paths,
+            "created_at": int(time.time()),
+        }
+        _persist_source_completion_metadata(
+            conn, task_id, int(expected_run_id), intent=intent
+        )
 
     if message is not None:
         commit_message = message
@@ -14853,32 +16294,144 @@ def _commit_worker_diff(
         commit_message = f"handoff: {title} ({task_id})" if title else f"handoff: {task_id}"
 
     try:
-        commit_result = subprocess.run(
-            ["git", "-C", str(repo_root), "commit", "-m", commit_message],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        commit_result = git("commit", "-m", commit_message)
     except Exception:
+        if strict:
+            raise
         return None
     if commit_result.returncode != 0:
         return None
 
     try:
-        sha_result = subprocess.run(
-            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        sha_result = git("rev-parse", "HEAD")
     except Exception:
+        if strict:
+            raise
         return None
     if sha_result.returncode != 0:
         return None
     sha = (sha_result.stdout or "").strip()
+    if strict and sha and intent is not None:
+        receipt = {
+            "intent_id": intent["intent_id"],
+            "intent_run_id": int(expected_run_id),
+            "run_id": int(expected_run_id),
+            "base_sha": intent["base_sha"],
+            "commit_sha": sha,
+            "tree_sha": intent["tree_sha"],
+            "diff_digest": intent["diff_digest"],
+            "paths": intent["paths"],
+            "created_at": int(time.time()),
+            "adopted": False,
+        }
+        _persist_source_completion_metadata(
+            conn,
+            task_id,
+            int(expected_run_id),
+            intent=intent,
+            receipt=receipt,
+        )
     return sha or None
+
+
+def record_generated_mutations(
+    conn: sqlite3.Connection,
+    run_id: int,
+    declared_generated: Iterable[object],
+    *,
+    metadata: Optional[dict] = None,
+) -> dict:
+    """Persist the generated-file observation before restoring its paths."""
+    run = get_run(conn, run_id)
+    if run is None or run.ended_at is not None:
+        raise EvidenceWorkspaceError("run_changed")
+    active_metadata = run.metadata if isinstance(run.metadata, dict) else {}
+    current = dict(active_metadata)
+    if metadata is not None:
+        # Keep the active dispatcher snapshot as the base so the returned
+        # completion metadata retains the worker's outcome/provenance while
+        # ``_end_run`` can still compare it with the untouched pin.
+        current.update(metadata)
+    evidence = current.get("evidence_workspace")
+    evidence_payload = dict(evidence) if isinstance(evidence, dict) else {}
+    evidence_payload["declared_generated"] = [
+        path.as_posix() if hasattr(path, "as_posix") else str(path)
+        for path in declared_generated
+    ]
+    current["evidence_workspace"] = evidence_payload
+    with write_txn(conn):
+        _append_event(
+            conn,
+            run.task_id,
+            "evidence_generated_mutations",
+            {
+                "run_id": int(run_id),
+                "paths": list(evidence_payload["declared_generated"]),
+            },
+            run_id=int(run_id),
+        )
+    return current
+
+
+def _evidence_generated_paths(
+    board: Optional[str],
+    workspace: Path,
+    error_type: type[RuntimeError],
+) -> tuple:
+    """Load the board-owned generated-path allowlist for an evidence run."""
+    meta = product_board_metadata(board) or {}
+    if "repository" not in meta:
+        return ()
+    try:
+        contract = load_repository_contract(meta, repo_root=workspace)
+    except RepositoryConfigurationError as exc:
+        raise error_type(f"repository contract: {exc}") from exc
+    return contract.generated_paths
+
+
+def _latest_test_target(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[dict[str, str]]:
+    """Return only the latest ended Test pin; never fall back to older runs."""
+    row = conn.execute(
+        "SELECT metadata FROM task_runs "
+        "WHERE task_id = ? AND step_key = 'test' AND ended_at IS NOT NULL "
+        "ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        metadata = json.loads(row["metadata"] or "{}")
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(metadata, dict):
+        return {}
+    branch = str(metadata.get("test_branch") or "").strip()
+    head = str(metadata.get("test_head_sha") or "").strip()
+    if not branch or not _FULL_GIT_SHA_RE.fullmatch(head):
+        return {}
+    return {"test_branch": branch, "test_head_sha": head}
+
+
+def _evidence_pin(
+    conn: sqlite3.Connection,
+    task_id: str,
+    step: str,
+) -> tuple[Optional[str], Optional[str], Optional[int], Optional[Path]]:
+    """Read the dispatcher-owned pin from the active evidence run."""
+    task = get_task(conn, task_id)
+    if task is None or task.current_run_id is None or not task.workspace_path:
+        return None, None, None, None
+    run = get_run(conn, task.current_run_id)
+    if run is None or run.ended_at is not None or not isinstance(run.metadata, dict):
+        return None, None, None, None
+    head = str(run.metadata.get(f"{step}_head_sha") or "").strip()
+    branch = str(run.metadata.get(f"{step}_branch") or "").strip()
+    if not _FULL_GIT_SHA_RE.fullmatch(head) or not branch:
+        return None, None, run.id, Path(task.workspace_path).expanduser().resolve(strict=False)
+    return head, branch, run.id, Path(task.workspace_path).expanduser().resolve(strict=False)
 
 
 def handoff(
@@ -14903,9 +16456,9 @@ def handoff(
     provenance (raises :class:`ProductProvenanceError` on failure, card
     untouched) -> when ``expected_run_id`` is given, a run-ownership
     precondition check (before any commit, so a reclaimed worker can't
-    create a stale commit) -> commit any staged source diff; source-producing
-    steps require a commit SHA, while evidence-only test/review handoffs may
-    advance with ``sha=None`` -> one atomic
+    create a stale commit) -> commit Development's source diff; Test/Review
+    inspect the dispatcher-pinned evidence workspace and never author source
+    commits -> one atomic
     transaction: advance the phase, clear ``running``, retag the assignee,
     sync the legacy ``status``, and emit exactly one ``handoff`` event
     carrying the optional commit SHA. The advance UPDATE re-checks run ownership
@@ -14951,22 +16504,82 @@ def handoff(
     )
     _validate_product_ai_provenance(conn, task_id, step, metadata, meta)
 
-    sha = _commit_worker_diff(conn, task_id)
-    if sha is None and str(step or "") == "development":
-        repair_payload = _latest_resolver_repair_payload(conn, task_id) or {}
-        repair = repair_payload.get("repair")
-        adopted_sha = (
-            repair.get("adopt_handoff_sha")
-            if isinstance(repair, dict)
-            else None
+    sha: Optional[str] = None
+    if str(step or "") in {"test", "review"}:
+        pinned_sha, pinned_branch, run_id, workspace = _evidence_pin(
+            conn, task_id, str(step)
         )
-        if adopted_sha:
-            try:
-                sha = _validate_adopted_handoff_sha(
-                    conn, task_id, str(adopted_sha),
+        if (run_id is not None or workspace is not None) and (
+            pinned_sha is None
+            or not pinned_branch
+            or run_id is None
+            or workspace is None
+        ):
+            raise EvidenceWorkspaceError("missing_pin")
+        if pinned_sha is not None:
+            if run_id is None or workspace is None:
+                raise EvidenceWorkspaceError("missing_pin")
+            generated_paths = _evidence_generated_paths(
+                board,
+                workspace,
+                ReviewTargetPreparationError if str(step) == "review" else TestTargetPreparationError,
+            )
+            observed = inspect_evidence_workspace(
+                workspace,
+                pinned_sha,
+                generated_paths,
+            )
+            if (
+                observed.branch != pinned_branch
+                or observed.branch_head != pinned_sha
+            ):
+                raise EvidenceWorkspaceError("source_moved")
+            if observed.undeclared_tracked:
+                raise EvidenceWorkspaceError(
+                    "source_moved",
+                    ", ".join(observed.undeclared_tracked),
                 )
-            except ValueError:
-                return False
+            if observed.untracked:
+                raise EvidenceWorkspaceError(
+                    "untracked_output",
+                    ", ".join(observed.untracked),
+                )
+            evidence_metadata = dict(metadata or {})
+            evidence_metadata["evidence_workspace"] = {
+                "branch": observed.branch,
+                "branch_head": observed.branch_head,
+                "pinned_sha": pinned_sha,
+            }
+            metadata = record_generated_mutations(
+                conn,
+                run_id,
+                observed.declared_generated,
+                metadata=evidence_metadata,
+            )
+            if observed.declared_generated:
+                restore_generated_paths(
+                    workspace,
+                    pinned_sha,
+                    observed.declared_generated,
+                )
+            sha = pinned_sha
+    else:
+        sha = _commit_worker_diff(conn, task_id)
+        if sha is None and str(step or "") == "development":
+            repair_payload = _latest_resolver_repair_payload(conn, task_id) or {}
+            repair = repair_payload.get("repair")
+            adopted_sha = (
+                repair.get("adopt_handoff_sha")
+                if isinstance(repair, dict)
+                else None
+            )
+            if adopted_sha:
+                try:
+                    sha = _validate_adopted_handoff_sha(
+                        conn, task_id, str(adopted_sha),
+                    )
+                except ValueError:
+                    return False
     if sha is None and str(step or "") in _PRODUCT_COMMIT_REQUIRED_STEPS:
         return False
 
@@ -15030,6 +16643,13 @@ def handoff(
             )
             if expected_run_id is not None and run_id is None:
                 raise RuntimeError("handoff run ownership changed")
+            if str(step or "") == "development" and sha is not None:
+                resolve_rework_directive(
+                    conn,
+                    task_id,
+                    new_sha=sha,
+                    resolved_by_run_id=run_id,
+                )
             _append_event(
                 conn,
                 task_id,
@@ -15055,6 +16675,10 @@ _FULL_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 class ReviewTargetPreparationError(RuntimeError):
     """Reviewer input could not be pinned safely before worker launch."""
+
+
+class TestTargetPreparationError(RuntimeError):
+    """Tester input could not be pinned safely before worker launch."""
 
 
 class WorkerRuntimeIdentityError(RuntimeError):
@@ -15126,13 +16750,26 @@ def _prepare_review_target(
     workspace: Path | str,
     *,
     board: Optional[str] = None,
+    default_review_status: bool = False,
 ) -> Optional[dict[str, str]]:
     """Pin immutable base/head commits into the active review run."""
     task = get_task(conn, task_id)
     if task is None:
         raise ReviewTargetPreparationError(f"task {task_id} not found")
-    if task.current_step_key != "review":
+    product_review = (
+        task.workflow_template_id == "product" and task.current_step_key == "review"
+    )
+    default_review = (
+        default_review_status
+        and task.workflow_template_id is None
+        and task.current_step_key is None
+    )
+    if not product_review and not default_review:
         return None
+    if default_review and (task.assignee != "reviewer" or not task.source_commit_forbidden):
+        raise ReviewTargetPreparationError(
+            "Default review requires reviewer ownership and forbidden source commits"
+        )
     if not task.workspace_path:
         raise ReviewTargetPreparationError("task has no workspace path")
     try:
@@ -15158,7 +16795,7 @@ def _prepare_review_target(
         or run.ended_at is not None
         or run.status != "running"
         or run.profile != "reviewer"
-        or run.step_key != "review"
+        or run.step_key != ("review" if product_review else None)
     ):
         raise ReviewTargetPreparationError("active run is not the current review run")
 
@@ -15167,12 +16804,75 @@ def _prepare_review_target(
     )
     if dirty:
         raise ReviewTargetPreparationError("review workspace is dirty or uncommitted")
+    workspace_branch = (_git_current_branch(actual_workspace) or "").strip()
+    if not workspace_branch:
+        raise ReviewTargetPreparationError("review workspace has no active branch")
+    if task.branch_name and task.branch_name != workspace_branch:
+        raise ReviewTargetPreparationError("review workspace branch does not match task branch")
     head_sha = _review_git_output(
         actual_workspace, "rev-parse", "--verify", "HEAD^{commit}"
     )
-    base_ref = _review_target_branch(
-        conn, task_id, actual_workspace, board=board
-    )
+    if product_review:
+        tested_target = _latest_test_target(conn, task_id)
+        if tested_target:
+            if tested_target["test_branch"] != workspace_branch:
+                raise ReviewTargetPreparationError("review branch does not match tested branch")
+            if tested_target["test_head_sha"] != head_sha:
+                raise ReviewTargetPreparationError("review head does not match tested SHA")
+        base_ref = _review_target_branch(
+            conn, task_id, actual_workspace, board=board
+        )
+    else:
+        if not task.branch_name:
+            raise ReviewTargetPreparationError(
+                "Default review execution contract has no task branch binding"
+            )
+        board_meta = read_board_metadata(board)
+        try:
+            contract = repository_contract_for_metadata(board_meta)
+        except RepositoryConfigurationError as exc:
+            raise ReviewTargetPreparationError(
+                f"Default review repository binding is invalid: {exc.code}"
+            ) from exc
+        if contract is None:
+            raise ReviewTargetPreparationError(
+                "Default review execution contract has no repository binding"
+            )
+        if _git_common_dir(contract.repo_root) != _git_common_dir(actual_workspace):
+            raise ReviewTargetPreparationError(
+                "Default review workspace does not match the configured repository"
+            )
+        predecessor = conn.execute(
+            "SELECT json_extract(r.metadata, '$.candidate_sha') AS candidate_sha "
+            "FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+            "JOIN task_runs r ON r.task_id = p.id "
+            "WHERE l.child_id = ? AND p.status = 'done' "
+            "AND r.ended_at IS NOT NULL AND r.outcome = 'completed' "
+            "AND p.workspace_path = ? AND p.branch_name = ? "
+            "AND json_valid(COALESCE(r.metadata, '{}')) "
+            "ORDER BY p.completed_at DESC, r.ended_at DESC, r.id DESC LIMIT 1",
+            (task_id, task.workspace_path, task.branch_name),
+        ).fetchone()
+        if predecessor is None:
+            raise ReviewTargetPreparationError(
+                "Default review execution contract has no completed predecessor target"
+            )
+        candidate_sha = str(predecessor["candidate_sha"] or "").strip()
+        if not _FULL_GIT_SHA_RE.fullmatch(candidate_sha):
+            raise ReviewTargetPreparationError(
+                "Default review predecessor has no full candidate SHA"
+            )
+        resolved_candidate = _review_git_output(
+            actual_workspace,
+            "rev-parse",
+            "--verify",
+            f"{candidate_sha}^{{commit}}",
+        )
+        if resolved_candidate != candidate_sha or candidate_sha != head_sha:
+            raise ReviewTargetPreparationError(
+                "Default review head does not match the completed predecessor candidate"
+            )
+        base_ref = contract.base_ref
     base_sha = _review_git_output(
         actual_workspace, "merge-base", base_ref, head_sha
     )
@@ -15180,11 +16880,19 @@ def _prepare_review_target(
         raise ReviewTargetPreparationError("review base is not a full commit SHA")
     if not _FULL_GIT_SHA_RE.fullmatch(head_sha):
         raise ReviewTargetPreparationError("review head is not a full commit SHA")
+    review_branch = workspace_branch
+    _evidence_generated_paths(board, actual_workspace, ReviewTargetPreparationError)
 
     metadata = dict(run.metadata or {})
     metadata.update(
-        {"review_base_sha": base_sha, "review_head_sha": head_sha}
+        {
+            "review_branch": review_branch,
+            "review_base_sha": base_sha,
+            "review_head_sha": head_sha,
+        }
     )
+    if default_review:
+        metadata["review_contract_kind"] = "default"
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE task_runs SET metadata = ? "
@@ -15195,7 +16903,11 @@ def _prepare_review_target(
             raise ReviewTargetPreparationError(
                 "active review run changed before target pinning"
             )
-    return {"review_base_sha": base_sha, "review_head_sha": head_sha}
+    return {
+        "review_branch": review_branch,
+        "review_base_sha": base_sha,
+        "review_head_sha": head_sha,
+    }
 
 
 def _pin_review_target_or_block(
@@ -15204,11 +16916,29 @@ def _pin_review_target_or_block(
     workspace: Path | str,
     *,
     board: Optional[str] = None,
+    default_review_status: bool = False,
 ) -> bool:
-    if task.current_step_key != "review" or task.assignee != "reviewer":
+    product_review = (
+        task.workflow_template_id == "product"
+        and task.current_step_key == "review"
+        and task.assignee == "reviewer"
+    )
+    default_review_candidate = (
+        default_review_status
+        and task.workflow_template_id is None
+        and task.current_step_key is None
+        and task.assignee == "reviewer"
+    )
+    if not product_review and not default_review_candidate:
         return True
     try:
-        _prepare_review_target(conn, task.id, workspace, board=board)
+        _prepare_review_target(
+            conn,
+            task.id,
+            workspace,
+            board=board,
+            default_review_status=default_review_status,
+        )
         return True
     except Exception as exc:
         _record_task_failure(
@@ -15222,6 +16952,344 @@ def _pin_review_target_or_block(
             end_run=True,
         )
         return False
+
+
+def _prepare_test_target(
+    conn: sqlite3.Connection,
+    task_id: str,
+    workspace: Path | str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[dict[str, str]]:
+    """Pin the exact clean branch/head that a product Test run verifies."""
+    task = get_task(conn, task_id)
+    if task is None:
+        raise TestTargetPreparationError(f"task {task_id} not found")
+    if task.workflow_template_id != "product" or task.current_step_key != "test":
+        return None
+    if not task.workspace_path:
+        raise TestTargetPreparationError("task has no workspace path")
+    try:
+        expected_workspace = Path(task.workspace_path).expanduser().resolve(strict=True)
+        actual_workspace = Path(workspace).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise TestTargetPreparationError(f"workspace is unavailable: {exc}") from exc
+    if actual_workspace != expected_workspace:
+        raise TestTargetPreparationError(
+            f"launch workspace {actual_workspace} does not match task workspace "
+            f"{expected_workspace}"
+        )
+    if not actual_workspace.is_dir():
+        raise TestTargetPreparationError(
+            f"task workspace is not a directory: {actual_workspace}"
+        )
+    if task.current_run_id is None:
+        raise TestTargetPreparationError("task has no active test run")
+    run = get_run(conn, task.current_run_id)
+    if (
+        run is None
+        or run.task_id != task_id
+        or run.ended_at is not None
+        or run.status != "running"
+        or run.profile != "tester"
+        or run.step_key != "test"
+    ):
+        raise TestTargetPreparationError("active run is not the current test run")
+
+    dirty = _review_git_output(
+        actual_workspace, "status", "--porcelain", "--untracked-files=all"
+    )
+    if dirty:
+        raise TestTargetPreparationError("test workspace is dirty or uncommitted")
+    head_sha = _review_git_output(
+        actual_workspace, "rev-parse", "--verify", "HEAD^{commit}"
+    )
+    test_branch = (_git_current_branch(actual_workspace) or "").strip()
+    if not test_branch:
+        raise TestTargetPreparationError("test workspace has no active branch")
+    if task.branch_name and task.branch_name != test_branch:
+        raise TestTargetPreparationError("test workspace branch does not match task branch")
+    if not _FULL_GIT_SHA_RE.fullmatch(head_sha):
+        raise TestTargetPreparationError("test head is not a full commit SHA")
+    _evidence_generated_paths(board, actual_workspace, TestTargetPreparationError)
+
+    metadata = dict(run.metadata or {})
+    metadata.update({"test_branch": test_branch, "test_head_sha": head_sha})
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE task_runs SET metadata = ? "
+            "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+            (json.dumps(metadata, sort_keys=True), run.id, task_id),
+        )
+        if cur.rowcount != 1:
+            raise TestTargetPreparationError(
+                "active test run changed before target pinning"
+            )
+    return {"test_branch": test_branch, "test_head_sha": head_sha}
+
+
+def _pin_test_target_or_block(
+    conn: sqlite3.Connection,
+    task: Task,
+    workspace: Path | str,
+    *,
+    board: Optional[str] = None,
+) -> bool:
+    if task.workflow_template_id != "product" or task.current_step_key != "test":
+        return True
+    try:
+        _prepare_test_target(conn, task.id, workspace, board=board)
+        return True
+    except Exception as exc:
+        _record_task_failure(
+            conn,
+            task.id,
+            f"test target preparation: {exc}",
+            outcome="spawn_failed",
+            failure_limit=1,
+            force_trip=True,
+            release_claim=True,
+            end_run=True,
+        )
+        return False
+
+
+def _story_refresh_preflight(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    board: Optional[str],
+) -> tuple[Optional[RefreshRequest], Optional[RefreshResult]]:
+    """Build and execute the dispatcher-owned story refresh preflight."""
+
+    meta = product_board_metadata(board)
+    if (
+        meta is None
+        or not _handoff_v2_enabled(meta)
+        or task.workflow_template_id != "product"
+        or task.current_step_key not in {"architecture", "development"}
+        or epic_id_for_task(conn, task.id) is None
+    ):
+        return None, None
+    if task.workspace_kind != "worktree":
+        return None, RefreshResult(
+            "error", error="product story refresh requires a worktree workspace"
+        )
+
+    try:
+        workspace, resolved_branch = _resolve_worktree_workspace(
+            task,
+            board=board,
+            base_branch=_story_base_branch(conn, task.id, board=board),
+            conn=conn,
+        )
+        branch = (
+            str(resolved_branch or task.branch_name or "").strip()
+            or _git_current_branch(workspace)
+        )
+        repo_root = _git_toplevel(workspace)
+        if repo_root is None or not branch:
+            return None, RefreshResult("error", error="story_repository_unresolved")
+        story_sha = _git_ref_sha(repo_root, branch)
+        epic_id = epic_id_for_task(conn, task.id)
+        epic_branch = epic_branch_for(epic_id) if epic_id else ""
+        epic_tip_sha = _git_ref_sha(repo_root, epic_branch) if epic_branch else None
+        if story_sha is None or epic_tip_sha is None:
+            return None, RefreshResult("error", error="story_refresh_source_missing")
+
+        # Materialization is part of preflight, so the first Architecture
+        # dispatch and every later Development dispatch inspect the same
+        # durable story worktree rather than the board's repository root.
+        if task.workspace_path != str(workspace):
+            set_workspace_path(conn, task.id, str(workspace))
+        if task.branch_name != branch:
+            set_branch_name(conn, task.id, branch)
+        request = RefreshRequest(
+            repo_root=repo_root,
+            story_id=task.id,
+            story_branch=branch,
+            story_worktree=workspace,
+            story_sha=story_sha,
+            epic_branch=epic_branch,
+            epic_tip_sha=epic_tip_sha,
+        )
+        return request, refresh_story_branch(request)
+    except Exception as exc:
+        _log.warning(
+            "kanban story refresh preflight failed for %s: %s",
+            task.id,
+            exc,
+        )
+        return None, RefreshResult("error", error="story_refresh_preflight_failed")
+
+
+def _route_story_refresh_rework(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str],
+    request: RefreshRequest,
+    refresh: RefreshResult,
+) -> bool:
+    """Route an isolated refresh conflict to the Development lane."""
+
+    meta = product_board_metadata(board) or {}
+    workflow = meta.get("product_workflow") if isinstance(meta, dict) else {}
+    try:
+        max_cycles = max(1, int((workflow or {}).get("max_rework_cycles", 3)))
+    except (TypeError, ValueError):
+        max_cycles = 3
+    findings = [
+        "isolated story refresh found merge conflicts in: "
+        + ", ".join(refresh.conflict_paths),
+        "retained conflict worktree: "
+        + str(refresh.conflict_worktree or "(unavailable)"),
+        f"story source SHA: {request.story_sha}",
+        f"Epic tip SHA: {request.epic_tip_sha}",
+    ]
+    with authorized_governance_write(), write_txn(conn):
+        row = conn.execute(
+            "SELECT current_step_key, status, claim_lock, rework_count "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] != "ready"
+            or row["claim_lock"] is not None
+        ):
+            return False
+        origin_phase = str(row["current_step_key"] or "development")
+        observed_count = int(row["rework_count"] or 0)
+        next_count = observed_count + 1
+        limit_reached = next_count > max_cycles
+        target_phase = "development"
+        next_status = (
+            "blocked"
+            if limit_reached
+            else _column_status_for_step(meta, target_phase)
+        )
+        next_assignee = (
+            "default"
+            if limit_reached
+            else _product_role_assignee(meta, "developer")
+        )
+        updated = conn.execute(
+            "UPDATE tasks SET rework_count = ?, current_step_key = ?, "
+            "status = ?, assignee = ?, running = 0, blocked = ?, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "workflow_template_id = 'product' "
+            "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL "
+            "AND current_step_key IS ? AND rework_count = ?",
+            (
+                next_count,
+                target_phase,
+                next_status,
+                next_assignee,
+                1 if limit_reached else 0,
+                task_id,
+                row["current_step_key"],
+                observed_count,
+            ),
+        )
+        if updated.rowcount != 1:
+            return False
+        directive = create_rework_directive(
+            conn,
+            task_id,
+            origin_kind="refresh",
+            origin_phase=origin_phase,
+            target_phase=target_phase,
+            rejected_branch=request.story_branch,
+            rejected_sha=request.story_sha,
+            epic_tip_sha=request.epic_tip_sha,
+            findings=findings,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "story_refresh_rework_routed",
+            {
+                "from_step": origin_phase,
+                "target_step": target_phase,
+                "directive_id": directive.id,
+                "findings": findings,
+                "rework_count": next_count,
+                "max_rework_cycles": max_cycles,
+                "conflict_worktree": str(refresh.conflict_worktree or ""),
+            },
+        )
+        if limit_reached:
+            _append_event(
+                conn,
+                task_id,
+                "rework_limit_reached",
+                {
+                    "reason": "maximum product rework cycles exceeded",
+                    "kind": "rework_limit",
+                    "rework_count": next_count,
+                },
+            )
+    return True
+
+
+def _consume_story_refresh_preflight(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    board: Optional[str],
+    request: Optional[RefreshRequest],
+    refresh: Optional[RefreshResult],
+) -> bool:
+    """Record preflight evidence and say whether the task may be claimed."""
+
+    if refresh is None:
+        return True
+    payload: dict[str, Any] = {"kind": refresh.kind}
+    if request is not None:
+        payload.update(
+            {
+                "story_branch": request.story_branch,
+                "story_sha": request.story_sha,
+                "epic_branch": request.epic_branch,
+                "epic_tip_sha": request.epic_tip_sha,
+            }
+        )
+    if refresh.after_sha:
+        payload["after_sha"] = refresh.after_sha
+    if refresh.current_sha:
+        payload["current_sha"] = refresh.current_sha
+    if refresh.current_epic_tip_sha:
+        payload["current_epic_tip_sha"] = refresh.current_epic_tip_sha
+    if refresh.dirty_paths:
+        payload["dirty_paths"] = list(refresh.dirty_paths)
+    if refresh.conflict_paths:
+        payload["conflict_paths"] = list(refresh.conflict_paths)
+    if refresh.conflict_worktree is not None:
+        payload["conflict_worktree"] = str(refresh.conflict_worktree)
+    if refresh.error:
+        payload["error"] = refresh.error
+
+    if refresh.kind == "unchanged":
+        with write_txn(conn):
+            _append_event(conn, task.id, "story_refresh_checked", payload)
+        return True
+    if refresh.kind == "refreshed":
+        payload["authority_invalidated"] = True
+        with write_txn(conn):
+            _append_event(conn, task.id, "story_refreshed", payload)
+        return True
+    if refresh.kind == "conflict" and request is not None:
+        with write_txn(conn):
+            _append_event(conn, task.id, "story_refresh_conflict", payload)
+        _route_story_refresh_rework(
+            conn, task.id, board=board, request=request, refresh=refresh
+        )
+        return False
+
+    with write_txn(conn):
+        _append_event(conn, task.id, "story_refresh_attention_required", payload)
+    return False
 
 
 def _spawn_one_v2(
@@ -15251,6 +17319,19 @@ def _spawn_one_v2(
     longer ready) or the spawn attempt failed (a spawn failure is recorded
     via :func:`_record_spawn_failure` in that case).
     """
+    refresh_task = get_task(conn, task_id)
+    if refresh_task is not None:
+        refresh_request, refresh_result = _story_refresh_preflight(
+            conn, refresh_task, board=board
+        )
+        if not _consume_story_refresh_preflight(
+            conn,
+            refresh_task,
+            board=board,
+            request=refresh_request,
+            refresh=refresh_result,
+        ):
+            return None
     claimed = claim_task(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         # Already claimed (or no longer ready) -- the CAS fire-once
@@ -15288,6 +17369,10 @@ def _spawn_one_v2(
             conn, claimed.id,
             resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
         )
+    if not _pin_test_target_or_block(
+        conn, claimed, workspace, board=board
+    ):
+        return None
     if not _pin_review_target_or_block(
         conn, claimed, workspace, board=board
     ):
@@ -15795,6 +17880,15 @@ class DispatchResult:
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    story_refresh_attention_required: list[str] = field(default_factory=list)
+    """Product story ids held before dispatch because their source checkout
+    needs operator/developer attention (dirty, source moved, or refresh I/O)."""
+    story_refresh_conflicts: list[str] = field(default_factory=list)
+    """Product story ids routed to a Development rework directive after an
+    isolated refresh reported merge conflicts."""
+    story_refresh_refreshed: list[str] = field(default_factory=list)
+    """Product story ids whose clean branch advanced from the Epic tip before
+    the worker was claimed."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
@@ -17632,6 +19726,26 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
+        refresh_task = get_task(conn, row["id"])
+        if refresh_task is not None:
+            refresh_request, refresh_result = _story_refresh_preflight(
+                conn, refresh_task, board=board
+            )
+            if refresh_result is not None:
+                if refresh_result.kind == "conflict":
+                    result.story_refresh_conflicts.append(row["id"])
+                elif refresh_result.kind == "refreshed":
+                    result.story_refresh_refreshed.append(row["id"])
+                elif refresh_result.kind not in {"unchanged"}:
+                    result.story_refresh_attention_required.append(row["id"])
+            if not _consume_story_refresh_preflight(
+                conn,
+                refresh_task,
+                board=board,
+                request=refresh_request,
+                refresh=refresh_result,
+            ):
+                continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
@@ -17665,6 +19779,11 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+        if not _pin_test_target_or_block(
+            conn, claimed, workspace, board=board
+        ):
+            result.auto_blocked.append(claimed.id)
+            continue
         if not _pin_review_target_or_block(
             conn, claimed, workspace, board=board
         ):
@@ -17774,8 +19893,17 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
-        if not _pin_review_target_or_block(
+        if not _pin_test_target_or_block(
             conn, claimed, workspace, board=board
+        ):
+            result.auto_blocked.append(claimed.id)
+            continue
+        if not _pin_review_target_or_block(
+            conn,
+            claimed,
+            workspace,
+            board=board,
+            default_review_status=True,
         ):
             result.auto_blocked.append(claimed.id)
             continue
@@ -18553,17 +20681,18 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     Order:
       1. Task title (mandatory).
       2. Task body (optional opening post, capped at 8 KB).
-      3. Prior attempts on THIS task (most recent ``_CTX_MAX_PRIOR_ATTEMPTS``
+      3. The active product rework directive, when present.
+      4. Prior attempts on THIS task (most recent ``_CTX_MAX_PRIOR_ATTEMPTS``
          shown; older attempts collapsed into a one-line summary).
          Each attempt's ``summary`` / ``error`` / ``metadata`` capped at
          ``_CTX_MAX_FIELD_BYTES`` each.
-      4. Structured handoff results of every done parent task. Prefers
+      5. Structured handoff results of every done parent task. Prefers
          ``run.summary`` / ``run.metadata`` when the parent was executed
          via a run; falls back to ``task.result`` for older data. Same
          per-field cap.
-      5. Cross-task role history for the assignee (most recent 5
+      6. Cross-task role history for the assignee (most recent 5
          completed runs on other tasks).
-      6. Comment thread (most recent ``_CTX_MAX_COMMENTS`` shown, older
+      7. Comment thread (most recent ``_CTX_MAX_COMMENTS`` shown, older
          collapsed).
 
     All caps exist so worker prompts stay bounded even on pathological
@@ -18612,6 +20741,24 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.body and task.body.strip():
         lines.append("## Body")
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
+        lines.append("")
+
+    if task.workflow_template_id == "product" and task.current_step_key in {"test", "review"}:
+        phase = str(task.current_step_key).title()
+        pinned_sha, pinned_branch, _run_id, _workspace = _evidence_pin(
+            conn, task_id, str(task.current_step_key)
+        )
+        lines.append("## Evidence-phase source boundary")
+        lines.append(
+            f"{phase} is evidence-only: never commit source or fixture changes."
+        )
+        lines.append(
+            "If a source or fixture edit is required, report it as a concrete "
+            "finding with workflow_outcome.verdict=changes_requested targeting "
+            "development; do not create a source commit in this phase."
+        )
+        if pinned_branch and pinned_sha:
+            lines.append(f"Dispatcher-pinned source: `{pinned_branch}` at `{pinned_sha}`")
         lines.append("")
 
     contract_view = work_contract_view(conn, task.work_contract_id)
@@ -18683,6 +20830,37 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             "or escalate; diagnosis, reason, fault_domain, and "
             "the complete expected snapshot are required."
         )
+        lines.append("")
+
+    directive = active_rework_directive(conn, task_id)
+    if directive is not None:
+        lines.append("## Required rework directive")
+        lines.append(
+            "_This is persisted workflow authority. Complete the target phase "
+            "before treating the directive as resolved._"
+        )
+        lines.append(
+            f"Origin: {directive.origin_kind} / phase `{directive.origin_phase}`"
+            + (
+                f" / run `{directive.origin_run_id}`"
+                if directive.origin_run_id is not None
+                else ""
+            )
+        )
+        if directive.origin_intent_key:
+            lines.append(f"Origin intent: `{_cap(directive.origin_intent_key)}`")
+        lines.append(f"Target phase: `{directive.target_phase}`")
+        if directive.rejected_branch:
+            lines.append(
+                f"Rejected branch: `{_cap(directive.rejected_branch)}`"
+            )
+        if directive.rejected_sha:
+            lines.append(f"Rejected SHA: `{directive.rejected_sha}`")
+        if directive.epic_tip_sha:
+            lines.append(f"Epic tip SHA: `{directive.epic_tip_sha}`")
+        lines.append("Findings:")
+        for finding in directive.findings:
+            lines.append(f"- {_cap(finding)}")
         lines.append("")
 
     # Attachments — files uploaded to this task (PDFs, source docs,

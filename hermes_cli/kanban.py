@@ -397,6 +397,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("title", help="Task title")
     p_create.add_argument("--body", default=None, help="Optional opening post")
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
+    p_create.add_argument(
+        "--source-policy",
+        choices=("none", "required", "forbidden"),
+        default="none",
+        help="Source commit policy for the execution contract.",
+    )
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
     p_create.add_argument("--workspace", default="scratch",
@@ -679,6 +685,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+
+    p_clear_terminal_state = sub.add_parser(
+        "clear-terminal-state",
+        help="Clear a stale generic terminal flag with an exact snapshot CAS",
+    )
+    p_clear_terminal_state.add_argument("task_id")
+    p_clear_terminal_state.add_argument("--expected-completed-at", required=True, type=int)
+    p_clear_terminal_state.add_argument("--expected-phase", required=True)
+    p_clear_terminal_state.add_argument("--expected-latest-event-id", required=True, type=int)
+    p_clear_terminal_state.add_argument("--actor", required=True)
+    p_clear_terminal_state.add_argument("--reason", required=True)
+    p_clear_terminal_state.add_argument("--json", action="store_true")
 
     p_release = sub.add_parser(
         "release",
@@ -1196,6 +1214,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "attachments": _cmd_attachments,
             "attach-rm": _cmd_attach_rm,
             "complete": _cmd_complete,
+            "clear-terminal-state": _cmd_clear_terminal_state,
             "release":  _cmd_release,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
@@ -1263,6 +1282,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "attach",
     "attach-rm",
     "complete",
+    "clear-terminal-state",
     "release",
     "edit",
     "block",
@@ -1715,6 +1735,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
     with kb.connect_closing(board=board) as conn:
         metadata = kb.read_board_metadata(board or kb.get_current_board())
         if kanban_intake.qualification_required(metadata):
+            if args.source_policy != "none":
+                print(
+                    "kanban: non-none source policy is a Default-board execution contract",
+                    file=sys.stderr,
+                )
+                return 2
             receipt = kanban_intake.submit_intake(
                 conn,
                 request={
@@ -1777,6 +1803,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 board=board,
                 workflow_template_id=getattr(args, "workflow_template_id", None),
                 current_step_key=getattr(args, "current_step_key", None),
+                source_commit_required=args.source_policy == "required",
+                source_commit_forbidden=args.source_policy == "forbidden",
             )
         except ValueError as exc:
             print(f"kanban: {exc}", file=sys.stderr)
@@ -2755,6 +2783,45 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_clear_terminal_state(args: argparse.Namespace) -> int:
+    request = kb.ClearTerminalStateRequest(
+        task_id=args.task_id,
+        expected_completed_at=args.expected_completed_at,
+        expected_phase=args.expected_phase,
+        expected_latest_event_id=args.expected_latest_event_id,
+        actor=args.actor,
+        reason=args.reason,
+    )
+    with kb.connect_closing() as conn:
+        try:
+            cleared = kb.clear_terminal_state(conn, request)
+        except (TypeError, ValueError) as exc:
+            print(f"kanban: cannot clear terminal state {args.task_id}: {exc}", file=sys.stderr)
+            return 1
+        if not cleared:
+            print(
+                f"kanban: cannot clear terminal state {args.task_id}: "
+                "expected snapshot no longer matches",
+                file=sys.stderr,
+            )
+            return 1
+        task = kb.get_task(conn, args.task_id)
+    payload = {
+        "operation": "clear_terminal_state",
+        "task_id": args.task_id,
+        "status": task.status if task is not None else None,
+        "completed_at": task.completed_at if task is not None else None,
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        print(
+            f"Cleared terminal state {args.task_id} "
+            f"(status={payload['status']}, completed_at={payload['completed_at']})"
+        )
+    return 0
+
+
 def _cmd_edit(args: argparse.Namespace) -> int:
     raw_meta = getattr(args, "metadata", None)
     metadata = None
@@ -3706,6 +3773,7 @@ Common subcommands:
   `comment <id> <msg>`  Append a comment
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
+  `clear-terminal-state <id> …`  Operator-only exact-snapshot recovery
   `release <id> --note` Operator gate: release a product card from Release / Measure
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign

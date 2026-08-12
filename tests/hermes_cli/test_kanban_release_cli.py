@@ -117,8 +117,13 @@ def _seed_reviewed_card(
             outcome="advanced",
             step_key="test",
             metadata={
+                "test_branch": branch,
+                "test_head_sha": source_sha,
                 "workflow_outcome": {"verdict": "passed"},
-                "ai_provenance": {"tester": {"agent": "hermes", "result": "passed"}},
+                "ai_provenance": {
+                    "writer": {"agent": "claude-code"},
+                    "tester": {"agent": "hermes", "result": "passed"},
+                },
             },
         )
         kb._synthesize_ended_run(
@@ -127,6 +132,9 @@ def _seed_reviewed_card(
             outcome="advanced",
             step_key="review",
             metadata={
+                "review_branch": branch,
+                "review_base_sha": _git(repo, "merge-base", branch, "main"),
+                "review_head_sha": source_sha,
                 "workflow_outcome": {"verdict": "approved"},
                 "ai_provenance": {
                     "writer": {"agent": "claude-code"},

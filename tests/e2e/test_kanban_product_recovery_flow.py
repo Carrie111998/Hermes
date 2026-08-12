@@ -123,6 +123,35 @@ def test_governed_product_story_recovers_through_release_and_done(
     )
     metadata_path = kb.board_metadata_path(board)
     board_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    board_metadata["repository"] = {
+        "base_ref": "refs/heads/main",
+        "target_branch": "main",
+        "verification_profiles": {
+            "story_integration": [
+                {
+                    "argv": ["bash", "scripts/run_tests.sh"],
+                    "workdir": ".",
+                    "timeout_seconds": 30,
+                }
+            ],
+            "epic_release": [
+                {
+                    "argv": ["bash", "scripts/run_tests.sh"],
+                    "workdir": ".",
+                    "timeout_seconds": 30,
+                }
+            ],
+        },
+        "ci_observation": {
+            "provider": "github_actions",
+            "required_workflows": ["CI"],
+        },
+        "boundary_evidence": {
+            "test_globs": ["tests/**"],
+            "fixture_globs": ["tests/fixtures/**"],
+            "generated_paths": ["README.md"],
+        },
+    }
     board_metadata["product_workflow"]["deployment_policy"] = "required"
     metadata_path.write_text(
         json.dumps(board_metadata, indent=2) + "\n",
@@ -274,9 +303,26 @@ def test_governed_product_story_recovers_through_release_and_done(
                 "ai_provenance": {
                     "tester": {"agent": "hermes", "result": "failed"}
                 },
+                "rejected_branch": branch,
+                "rejected_sha": first_development_sha,
+                "epic_tip_sha": rollback_target,
             },
             expected_run_id=failed_test.current_run_id,
             board=board,
+        )
+
+        directive = kb.active_rework_directive(conn, task_id)
+        assert directive is not None
+        assert directive.origin_phase == "test"
+        assert directive.target_phase == "development"
+        assert directive.rejected_branch == branch
+        assert directive.rejected_sha == first_development_sha
+        assert directive.epic_tip_sha == rollback_target
+        recovery_context = kb.build_worker_context(conn, task_id)
+        assert "## Required rework directive" in recovery_context
+        assert first_development_sha in recovery_context
+        assert recovery_context.index("## Required rework directive") < recovery_context.index(
+            "## Prior attempts on this task"
         )
 
         development_two = _claim(conn, task_id, board=board, claimer="developer-two")
@@ -301,6 +347,7 @@ def test_governed_product_story_recovers_through_release_and_done(
         ]
         second_development_sha = development_handoffs[-1].payload["sha"]
         assert second_development_sha != first_development_sha
+        assert kb.active_rework_directive(conn, task_id) is None
 
         test_result = subprocess.run(
             [str(story_worktree / "scripts" / "run_tests.sh")],
@@ -310,7 +357,30 @@ def test_governed_product_story_recovers_through_release_and_done(
             text=True,
         )
         assert test_result.returncode == 0, test_result.stderr
+        contract = kb.repository_contract_for_board(board, repo_root=repo)
+        assert contract is not None
+        configured_verification = kb.run_verification(
+            contract.verification["story_integration"],
+            story_worktree,
+            source_sha=second_development_sha,
+            candidate_sha=second_development_sha,
+            contract_digest=contract.digest,
+            scope="story_integration",
+            subject_id=task_id,
+        )
+        assert configured_verification.status == "passed"
         passed_test = _claim(conn, task_id, board=board, claimer="tester-passed")
+        test_pin = kb._prepare_test_target(
+            conn, task_id, story_worktree, board=board
+        )
+        assert test_pin == {
+            "test_branch": branch,
+            "test_head_sha": second_development_sha,
+        }
+        assert isinstance(test_pin, dict)
+        (story_worktree / "README.md").write_text(
+            "test-generated evidence\n", encoding="utf-8"
+        )
         assert kb.complete_task(
             conn,
             task_id,
@@ -318,18 +388,35 @@ def test_governed_product_story_recovers_through_release_and_done(
             metadata={
                 "workflow_outcome": {"verdict": "passed"},
                 "ai_provenance": {
+                    "writer": {"agent": "claude-code"},
                     "tester": {"agent": "hermes", "result": "passed"}
                 },
+                **test_pin,
                 "tests_run": ["scripts/run_tests.sh"],
             },
             expected_run_id=passed_test.current_run_id,
             board=board,
+        )
+        assert (story_worktree / "README.md").read_text(encoding="utf-8") == (
+            "governed recovery fixture\n"
         )
 
         reviewer = kb.claim_review_task(
             conn, task_id, claimer="independent-reviewer"
         )
         assert reviewer is not None and reviewer.current_run_id is not None
+        review_pin = kb._prepare_review_target(
+            conn, task_id, story_worktree, board=board
+        )
+        assert review_pin == {
+            "review_branch": branch,
+            "review_base_sha": rollback_target,
+            "review_head_sha": second_development_sha,
+        }
+        assert isinstance(review_pin, dict)
+        (story_worktree / "README.md").write_text(
+            "review-generated evidence\n", encoding="utf-8"
+        )
         assert kb.complete_task(
             conn,
             task_id,
@@ -345,9 +432,13 @@ def test_governed_product_story_recovers_through_release_and_done(
                         "reviewed_commit": second_development_sha,
                     },
                 },
+                **review_pin,
             },
             expected_run_id=reviewer.current_run_id,
             board=board,
+        )
+        assert (story_worktree / "README.md").read_text(encoding="utf-8") == (
+            "governed recovery fixture\n"
         )
 
         release = _claim(conn, task_id, board=board, claimer="release-measure")
@@ -402,6 +493,15 @@ def test_governed_product_story_recovers_through_release_and_done(
 
     rework = [event for event in events if event.kind == "rework_requested"]
     assert len(rework) == 1 and rework[0].payload["rework_count"] == 1
+    directive_rows = conn.execute(
+        "SELECT status, rejected_sha, resolved_by_run_id "
+        "FROM product_rework_directives WHERE task_id = ?",
+        (task_id,),
+    ).fetchall()
+    assert len(directive_rows) == 1
+    assert directive_rows[0]["status"] == "resolved"
+    assert directive_rows[0]["rejected_sha"] == first_development_sha
+    assert directive_rows[0]["resolved_by_run_id"] == development_two.current_run_id
     integration = next(event for event in events if event.kind == "story_merged_to_main")
     policy = next(event for event in events if event.kind == "deployment_policy_evaluated")
     smoke = next(event for event in events if event.kind == "deployment_recorded")

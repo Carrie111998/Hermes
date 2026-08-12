@@ -102,8 +102,14 @@ def _seed_structured_evidence(
     include_review: bool = True,
     reviewer: str = "codex",
     reviewed_commit: str | None = None,
+    reviewed_head_sha: str | None = None,
+    test_branch: str | None = None,
 ) -> dict[str, int]:
     ids: dict[str, int] = {}
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.workspace_path is not None
+    base_sha = _git(Path(task.workspace_path), "merge-base", branch, "main")
     with kb.write_txn(conn):
         ids["writer"] = kb._synthesize_ended_run(
             conn,
@@ -129,8 +135,11 @@ def _seed_structured_evidence(
                 metadata={
                     "workflow_outcome": {"verdict": "passed"},
                     "ai_provenance": {
+                        "writer": {"agent": "claude-code"},
                         "tester": {"agent": "hermes", "result": "passed"}
                     },
+                    "test_branch": test_branch or branch,
+                    "test_head_sha": source_sha,
                 },
             )
         if include_review:
@@ -150,6 +159,9 @@ def _seed_structured_evidence(
                             "reviewed_commit": reviewed_commit or source_sha,
                         },
                     },
+                    "review_branch": branch,
+                    "review_base_sha": base_sha,
+                    "review_head_sha": reviewed_head_sha or source_sha,
                 },
             )
     return ids
@@ -176,7 +188,7 @@ def test_product_board_defaults_to_manual_deployment_policy(release_home):
         ({"include_test": False}, "tester_pass"),
         ({"include_review": False}, "reviewer_approval"),
         ({"reviewer": "claude-code"}, "independent_reviewer"),
-        ({"reviewed_commit": "0" * 40}, "reviewed_candidate"),
+        ({"reviewed_head_sha": "0" * 40}, "reviewed_candidate"),
     ],
 )
 def test_release_rejects_missing_or_untrustworthy_run_evidence(
@@ -233,6 +245,65 @@ def test_release_evidence_prefers_dispatcher_pinned_review_commit(
         assert "reviewed_candidate" in exc_info.value.missing
 
 
+def test_release_evidence_rejects_test_branch_mismatch(
+    release_home, tmp_path,
+):
+    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
+    board = "release-test-branch-mismatch"
+    _release_board(board, repo)
+    with kb.connect(board=board) as conn:
+        task_id = _release_task(conn, board, repo, branch)
+        _seed_structured_evidence(
+            conn,
+            task_id,
+            branch,
+            source_sha,
+            test_branch="worker-authored-alias",
+        )
+
+        with pytest.raises(kb.ReleaseEvidenceError) as exc_info:
+            kb._release_run_evidence(conn, task_id, branch, source_sha)
+
+    assert "tester_pass" in exc_info.value.missing
+
+
+@pytest.mark.parametrize(
+    ("phase", "verdict", "target", "missing"),
+    [
+        ("test", "changes_requested", "development", "tester_pass"),
+        ("review", "changes_requested", "development", "reviewer_approval"),
+    ],
+)
+def test_release_evidence_latest_rejection_invalidates_older_authority(
+    release_home, tmp_path, phase, verdict, target, missing,
+):
+    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
+    board = f"release-latest-rejection-{phase}"
+    _release_board(board, repo)
+    with kb.connect(board=board) as conn:
+        task_id = _release_task(conn, board, repo, branch)
+        _seed_structured_evidence(conn, task_id, branch, source_sha)
+        with kb.write_txn(conn):
+            kb._synthesize_ended_run(
+                conn,
+                task_id,
+                outcome="rework_requested",
+                step_key=phase,
+                metadata={
+                    "workflow_outcome": {
+                        "verdict": verdict,
+                        "target_step": target,
+                        "findings": ["new finding"],
+                    },
+                },
+            )
+
+        with pytest.raises(kb.ReleaseEvidenceError) as exc_info:
+            kb._release_run_evidence(conn, task_id, branch, source_sha)
+
+    assert missing in exc_info.value.missing
+
+
 @pytest.mark.parametrize(
     "review_facts",
     [
@@ -240,7 +311,7 @@ def test_release_evidence_prefers_dispatcher_pinned_review_commit(
         lambda branch, sha: {"reviewed_branch": branch, "reviewed_commit": sha},
     ],
 )
-def test_release_evidence_accepts_historical_unpinned_review_shapes(
+def test_release_evidence_rejects_historical_unpinned_review_shapes(
     release_home, tmp_path, review_facts,
 ):
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
@@ -259,8 +330,9 @@ def test_release_evidence_accepts_historical_unpinned_review_shapes(
         }
         _replace_run_metadata(conn, run_ids["review"], historical)
 
-        evidence = kb._release_run_evidence(conn, task_id, branch, source_sha)
-        assert evidence["review_run_id"] == run_ids["review"]
+        with pytest.raises(kb.ReleaseEvidenceError) as exc_info:
+            kb._release_run_evidence(conn, task_id, branch, source_sha)
+        assert "reviewer_approval" in exc_info.value.missing
 
 
 def test_review_canonicalization_records_dispatcher_pinned_commit(

@@ -963,20 +963,33 @@ def _handle_review_target(args: dict, **kw) -> str:
         kb, conn = _connect()
         try:
             task = kb.get_task(conn, task_id)
+            run = kb.get_run(conn, run_id)
+            metadata = run.metadata if run and isinstance(run.metadata, dict) else {}
+            review_shape = (
+                (task.workflow_template_id, task.current_step_key, run.step_key)
+                if task is not None and run is not None else None
+            )
+            product_review = review_shape == ("product", "review", "review")
+            default_review = (
+                review_shape == (None, None, None)
+                and task.assignee == "reviewer"
+                and task.source_commit_forbidden
+                and task.branch_name
+                and metadata.get("review_branch") == task.branch_name
+                and metadata.get("review_contract_kind") == "default"
+            )
             if (
                 task is None
-                or task.current_step_key != "review"
                 or task.current_run_id != run_id
+                or not (product_review or default_review)
             ):
                 return tool_error(
                     "review_target: task is not owned by the current reviewer run"
                 )
-            run = kb.get_run(conn, run_id)
             if (
                 run is None
                 or run.task_id != task_id
                 or run.profile != "reviewer"
-                or run.step_key != "review"
                 or run.ended_at is not None
                 or run.status != "running"
             ):
@@ -992,7 +1005,6 @@ def _handle_review_target(args: dict, **kw) -> str:
                 return tool_error(
                     "review_target: task is not owned by the current reviewer claim"
                 )
-            metadata = run.metadata if isinstance(run.metadata, dict) else {}
             base_sha = metadata.get("review_base_sha")
             head_sha = metadata.get("review_head_sha")
             if (
@@ -1664,6 +1676,17 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"{artifact_err}. Your task is still in-flight and its "
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
+                )
+            except kb.ProductOutcomeError as outcome_err:
+                qualifier = (
+                    f" ({outcome_err.qualifier})"
+                    if outcome_err.qualifier
+                    else ""
+                )
+                return tool_error(
+                    "kanban_complete blocked by canonical outcome validation: "
+                    f"{outcome_err.code}{qualifier}. Your task is still in-flight "
+                    "(no state change). Retry with a structured terminal outcome."
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -2343,6 +2366,9 @@ def _handle_create(args: dict, **kw) -> str:
     project_id = args.get("project") or args.get("project_id")
     workflow_template_id = args.get("workflow_template_id")
     current_step_key = args.get("current_step_key") or args.get("step_key")
+    source_policy = args.get("source_policy") or "none"
+    if source_policy not in {"none", "required", "forbidden"}:
+        return tool_error("source_policy must be one of: none, required, forbidden")
     project_source_task_id = None
     _inherit_project = workspace_kind is None and workspace_path is None
     if workspace_kind is None:
@@ -2385,6 +2411,10 @@ def _handle_create(args: dict, **kw) -> str:
                 board or kb._board_slug_for_connection(conn)
             )
             if kanban_intake.qualification_required(metadata):
+                if source_policy != "none":
+                    return tool_error(
+                        "non-none source policy is a Default-board execution contract"
+                    )
                 receipt = kanban_intake.submit_intake(
                     conn,
                     request={
@@ -2461,6 +2491,8 @@ def _handle_create(args: dict, **kw) -> str:
                 board=board,
                 workflow_template_id=workflow_template_id,
                 current_step_key=current_step_key,
+                source_commit_required=source_policy == "required",
+                source_commit_forbidden=source_policy == "forbidden",
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -3329,6 +3361,11 @@ KANBAN_CREATE_SCHEMA = {
                     "Use 'backlog' for new product user-story/work cards unless "
                     "a later approved flow intentionally targets another step."
                 ),
+            },
+            "source_policy": {
+                "type": "string",
+                "enum": ["none", "required", "forbidden"],
+                "description": "Default-board execution contract for source commits.",
             },
             "triage": {
                 "type": "boolean",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+from dataclasses import replace
 import json
 import os
 import sqlite3
@@ -12,12 +13,18 @@ import threading
 import time
 import types
 import unittest.mock
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
 import hermes_state
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_repository import (
+    VerificationCommand,
+    VerificationProfile,
+    run_verification,
+    verification_receipt_from_payload,
+)
 
 
 @pytest.fixture
@@ -103,7 +110,71 @@ def test_init_creates_expected_tables(kanban_home):
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         ).fetchall()
     names = {r["name"] for r in rows}
-    assert {"tasks", "task_links", "task_comments", "task_events"} <= names
+    assert {
+        "tasks",
+        "task_links",
+        "task_comments",
+        "task_events",
+        "product_rework_directives",
+    } <= names
+
+
+def test_board_metadata_repository_policy_is_validated(kanban_home, tmp_path):
+    repo = tmp_path / "repository-policy"
+    _init_git_repo(repo)
+    _commit_file(repo, "generated.txt", "generated\n", "add generated path")
+    policy = {
+        "base_ref": "refs/heads/main",
+        "target_branch": "main",
+        "verification_profiles": {
+            "story_integration": {
+                "commands": [
+                    {
+                        "argv": ["python", "-m", "unittest"],
+                        "workdir": ".",
+                        "timeout_seconds": 60,
+                    }
+                ]
+            },
+            "epic_release": {
+                "commands": [
+                    {
+                        "argv": ["python", "-m", "unittest"],
+                        "workdir": ".",
+                        "timeout_seconds": 60,
+                    }
+                ]
+            },
+        },
+        "ci_observation": {
+            "provider": "github_actions",
+            "required_workflows": ["CI"],
+        },
+        "boundary_evidence": {
+            "test_globs": ["tests/**"],
+            "fixture_globs": ["tests/fixtures/**"],
+            "generated_paths": ["generated.txt"],
+        },
+    }
+
+    metadata = kb.ensure_product_board_defaults(
+        "repository-policy",
+        default_workdir=str(repo),
+        repository=policy,
+    )
+    assert metadata["repository"]["base_ref"] == "refs/heads/main"
+    contract = kb.repository_contract_for_board("repository-policy")
+    assert contract is not None and contract.digest
+
+    invalid = dict(policy)
+    invalid["target_branch"] = ""
+    with pytest.raises(kb.RepositoryConfigurationError) as exc_info:
+        kb.write_board_metadata(
+            "repository-policy",
+            default_workdir=str(repo),
+            repository=invalid,
+        )
+    assert exc_info.value.code == "malformed_target_branch"
 
 
 
@@ -374,6 +445,196 @@ def _seed_v2_card(board: str, *, step: str = "development") -> str:
     return tid
 
 
+def _seed_stale_terminal_card(board: str, *, phase: str = "development") -> tuple[str, int, int]:
+    task_id = _seed_v2_card(board, step=phase)
+    completed_at = 1_700_000_123
+    with kb.connect(board=board) as conn:
+        with kb.authorized_governance_write(), kb.write_txn(conn):
+            conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'done',
+                       completed_at = ?,
+                       assignee = 'developer',
+                       result = 'preserve this evidence',
+                       project_id = 'project-1',
+                       branch_name = 'feature/preserve-evidence'
+                 WHERE id = ?
+                """,
+                (completed_at, task_id),
+            )
+            event_id = kb._append_event(
+                conn,
+                task_id,
+                "completed",
+                {"evidence": "preserve this event payload"},
+            )
+    return task_id, completed_at, event_id
+
+
+def test_clear_terminal_state_clears_only_the_stale_generic_terminal_flag(kanban_home):
+    board = "clear-terminal-success"
+    _v2_product_board(board)
+    task_id, completed_at, event_id = _seed_stale_terminal_card(board)
+
+    with kb.connect(board=board) as conn:
+        before = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
+        before_runs = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (task_id,)
+            ).fetchall()
+        ]
+        before_events = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (task_id,)
+            ).fetchall()
+        ]
+
+        request = kb.ClearTerminalStateRequest(
+            task_id=task_id,
+            expected_completed_at=completed_at,
+            expected_phase="development",
+            expected_latest_event_id=event_id,
+            actor="operator",
+            reason="clear stale generic terminal state",
+        )
+        assert kb.clear_terminal_state(conn, request) is True
+
+        after = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
+        assert after["status"] == "ready"
+        assert after["completed_at"] is None
+        for field, value in before.items():
+            if field not in {"status", "completed_at"}:
+                assert after[field] == value, field
+        assert [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (task_id,)
+            ).fetchall()
+        ] == before_runs
+
+        events = conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (task_id,)
+        ).fetchall()
+        assert [tuple(row) for row in events[:-1]] == before_events
+        assert events[-1]["kind"] == "terminal_state_cleared"
+        payload = json.loads(events[-1]["payload"])
+        assert payload == {
+            "operation": "clear_terminal_state",
+            "actor": "operator",
+            "reason": "clear stale generic terminal state",
+            "expected": {
+                "status": "done",
+                "completed_at": completed_at,
+                "phase": "development",
+                "latest_event_id": event_id,
+            },
+        }
+
+
+@pytest.mark.parametrize("field", ["expected_completed_at", "expected_latest_event_id"])
+def test_clear_terminal_state_refuses_stale_cas_fields(kanban_home, field):
+    board = f"clear-terminal-stale-{field}"
+    _v2_product_board(board)
+    task_id, completed_at, event_id = _seed_stale_terminal_card(board)
+    with kb.connect(board=board) as conn:
+        before = {
+            "task": tuple(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()),
+            "events": [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (task_id,)
+                ).fetchall()
+            ],
+        }
+        request = kb.ClearTerminalStateRequest(
+            task_id=task_id,
+            expected_completed_at=(completed_at + 1 if field == "expected_completed_at" else completed_at),
+            expected_phase="development",
+            expected_latest_event_id=(event_id + 1 if field == "expected_latest_event_id" else event_id),
+            actor="operator",
+            reason="stale CAS must refuse",
+        )
+        assert kb.clear_terminal_state(conn, request) is False
+        assert tuple(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()) == before["task"]
+        assert [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (task_id,)
+            ).fetchall()
+        ] == before["events"]
+
+
+def test_clear_terminal_state_refuses_non_done_status(kanban_home):
+    board = "clear-terminal-non-done"
+    _v2_product_board(board)
+    task_id, completed_at, event_id = _seed_stale_terminal_card(board)
+    with kb.connect(board=board) as conn:
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+        conn.commit()
+        before = {
+            "task": tuple(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()),
+            "events": len(kb.list_events(conn, task_id)),
+        }
+        request = kb.ClearTerminalStateRequest(
+            task_id=task_id,
+            expected_completed_at=completed_at,
+            expected_phase="development",
+            expected_latest_event_id=event_id,
+            actor="operator",
+            reason="non-done must refuse",
+        )
+        assert kb.clear_terminal_state(conn, request) is False
+        assert tuple(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()) == before["task"]
+        assert len(kb.list_events(conn, task_id)) == before["events"]
+
+
+def test_clear_terminal_state_refuses_already_terminal_phase(kanban_home):
+    board = "clear-terminal-terminal-phase"
+    _v2_product_board(board)
+    task_id, completed_at, event_id = _seed_stale_terminal_card(board, phase="done")
+    with kb.connect(board=board) as conn:
+        before = {
+            "task": tuple(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()),
+            "events": len(kb.list_events(conn, task_id)),
+        }
+        request = kb.ClearTerminalStateRequest(
+            task_id=task_id,
+            expected_completed_at=completed_at,
+            expected_phase="done",
+            expected_latest_event_id=event_id,
+            actor="operator",
+            reason="terminal phase must refuse",
+        )
+        assert kb.clear_terminal_state(conn, request) is False
+        assert tuple(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()) == before["task"]
+        assert len(kb.list_events(conn, task_id)) == before["events"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("actor", ""), ("actor", "  "), ("reason", ""), ("reason", "  ")],
+)
+def test_clear_terminal_state_refuses_empty_actor_or_reason(kanban_home, field, value):
+    board = f"clear-terminal-empty-{field}-{len(value)}"
+    _v2_product_board(board)
+    task_id, completed_at, event_id = _seed_stale_terminal_card(board)
+    values = {
+        "task_id": task_id,
+        "expected_completed_at": completed_at,
+        "expected_phase": "development",
+        "expected_latest_event_id": event_id,
+        "actor": "operator",
+        "reason": "required reason",
+    }
+    values[field] = value
+    with kb.connect(board=board) as conn:
+        with pytest.raises(ValueError, match=field):
+            kb.clear_terminal_state(conn, kb.ClearTerminalStateRequest(**values))
+
+
 @pytest.mark.parametrize("step", sorted(kb.PRODUCT_WORKFLOW_STEP_SET))
 def test_create_task_accepts_each_product_step(kanban_home, step):
     with kb.connect() as conn:
@@ -424,6 +685,90 @@ def test_create_task_rejects_unknown_project(kanban_home):
     with kb.connect() as conn:
         with pytest.raises(ValueError, match="unknown project"):
             kb.create_task(conn, title="Lost governance", project_id="missing-project")
+
+
+def test_decomposed_child_preserves_complete_execution_context(kanban_home):
+    with kb.connect() as conn:
+        root_id = kb.create_task(
+            conn,
+            title="Context root",
+            body="root body",
+            assignee="orchestrator",
+            workspace_kind="worktree",
+            workspace_path="/repo/.worktrees/root",
+            branch_name="project/root",
+            tenant="tenant-a",
+            max_runtime_seconds=120,
+            skills=["skill-a"],
+            max_retries=2,
+            model_override="model-a",
+            provider_override="provider-a",
+            reasoning_effort="high",
+            goal_mode=True,
+            goal_max_turns=7,
+            workflow_template_id="custom",
+            current_step_key="implementation",
+            source_commit_required=True,
+            source_commit_forbidden=False,
+            triage=True,
+        )
+        conn.execute(
+            "UPDATE tasks SET project_id = ?, work_contract_id = ? WHERE id = ?",
+            ("project-a", "contract-a", root_id),
+        )
+        conn.commit()
+
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root_id,
+            root_assignee="orchestrator",
+            children=[
+                {
+                    "title": "Generated child",
+                    "body": "child body",
+                    "assignee": "developer",
+                },
+                {
+                    "title": "Overridden workspace",
+                    "assignee": "tester",
+                    "workspace_kind": "dir",
+                    "workspace_path": "/tmp/generated-child",
+                },
+            ],
+        )
+
+        child = kb.get_task(conn, child_ids[0])
+        overridden = kb.get_task(conn, child_ids[1])
+
+    assert child is not None
+    assert child.title == "Generated child"
+    assert child.body == "child body"
+    assert child.assignee == "developer"
+    assert child.project_id == "project-a"
+    assert child.branch_name is None
+    assert child.tenant == "tenant-a"
+    assert child.workspace_kind == "worktree"
+    assert child.workspace_path is None
+    assert child.max_runtime_seconds == 120
+    assert child.skills == ["skill-a"]
+    assert child.max_retries == 2
+    assert child.model_override == "model-a"
+    assert child.provider_override == "provider-a"
+    assert child.reasoning_effort == "high"
+    assert child.goal_mode is True
+    assert child.goal_max_turns == 7
+    assert child.workflow_template_id == "custom"
+    assert child.current_step_key == "implementation"
+    # Contracts are one-to-one with cards; reusing the root contract would
+    # violate idx_tasks_work_contract_unique.
+    assert child.work_contract_id is None
+    assert child.work_item_kind == "card"
+    assert child.source_commit_required is True
+    assert child.source_commit_forbidden is False
+    assert overridden is not None
+    assert overridden.assignee == "tester"
+    assert overridden.workspace_kind == "dir"
+    assert overridden.workspace_path == "/tmp/generated-child"
 
 
 @pytest.mark.parametrize(
@@ -479,6 +824,175 @@ def test_product_rejection_routes_backward(
     assert any(event.kind == "rework_requested" for event in events)
 
 
+def test_rework_directive_is_append_only_with_one_active_row(kanban_home):
+    board = "rework-directive-append-only"
+    _v2_product_board(board)
+    rejected_sha = "a" * 40
+    replacement_sha = "b" * 40
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: durable directive",
+            workflow_template_id="product",
+            current_step_key="test",
+            board=board,
+        )
+        first = kb.create_rework_directive(
+            conn,
+            tid,
+            origin_kind="test",
+            origin_run_id=11,
+            origin_intent_key="intent-1",
+            origin_phase="test",
+            target_phase="development",
+            rejected_branch="story/durable-directive",
+            rejected_sha=rejected_sha,
+            epic_tip_sha="c" * 40,
+            findings=["first finding"],
+        )
+        assert first.status == "active"
+        assert kb.active_rework_directive(conn, tid) == first
+
+        second = kb.create_rework_directive(
+            conn,
+            tid,
+            origin_kind="review",
+            origin_run_id=12,
+            origin_intent_key="intent-2",
+            origin_phase="review",
+            target_phase="development",
+            rejected_branch="story/durable-directive",
+            rejected_sha=replacement_sha,
+            epic_tip_sha="d" * 40,
+            findings=["replacement finding"],
+        )
+        rows = conn.execute(
+            "SELECT status FROM product_rework_directives "
+            "WHERE task_id = ? ORDER BY id",
+            (tid,),
+        ).fetchall()
+
+    assert second.status == "active"
+    assert [row["status"] for row in rows] == ["superseded", "active"]
+
+
+def test_rework_directive_routes_with_exact_sha_and_precedes_attempts(
+    kanban_home,
+):
+    board = "rework-directive-context"
+    _v2_product_board(board)
+    rejected_sha = "e" * 40
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: visible rework",
+            assignee="tester",
+            workflow_template_id="product",
+            current_step_key="test",
+            board=board,
+        )
+        claimed = kb.claim_task(conn, tid, board=board, claimer="tester")
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Test rejected the candidate",
+            metadata={
+                "workflow_outcome": {
+                    "verdict": "changes_requested",
+                    "target_step": "development",
+                    "findings": ["the candidate is incomplete"],
+                },
+                "rejected_branch": "story/visible-rework",
+                "rejected_sha": rejected_sha,
+                "epic_tip_sha": "f" * 40,
+            },
+            expected_run_id=claimed.current_run_id,
+            board=board,
+        )
+        directive = kb.active_rework_directive(conn, tid)
+        context = kb.build_worker_context(conn, tid)
+
+    assert directive is not None
+    assert directive.origin_phase == "test"
+    assert directive.target_phase == "development"
+    assert directive.rejected_branch == "story/visible-rework"
+    assert directive.rejected_sha == rejected_sha
+    assert directive.findings == ("the candidate is incomplete",)
+    assert "## Required rework directive" in context
+    assert rejected_sha in context
+    assert context.index("## Required rework directive") < context.index(
+        "## Prior attempts on this task"
+    )
+
+
+def test_rework_directive_resolves_only_after_new_development_sha(
+    kanban_home, tmp_path
+):
+    board = "rework-directive-resolution"
+    _v2_product_board(board)
+    repo = tmp_path / "directive-repo"
+    _init_git_repo(repo)
+    rejected_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: resolve rework",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name="main",
+            board=board,
+        )
+        kb.create_rework_directive(
+            conn,
+            tid,
+            origin_kind="test",
+            origin_run_id=21,
+            origin_phase="test",
+            target_phase="development",
+            rejected_branch="story/resolve-rework",
+            rejected_sha=rejected_sha,
+            findings=["fix the implementation"],
+        )
+        assert not kb.resolve_rework_directive(
+            conn,
+            tid,
+            new_sha=rejected_sha,
+            resolved_by_run_id=22,
+        )
+        assert kb.active_rework_directive(conn, tid) is not None
+
+        claimed = kb.claim_task(conn, tid, board=board, claimer="developer")
+        assert claimed is not None and claimed.current_run_id is not None
+        (repo / "fixed.txt").write_text("fixed\n", encoding="utf-8")
+        assert kb.handoff(
+            conn,
+            tid,
+            board=board,
+            summary="Implemented the requested fix",
+            metadata={"ai_provenance": {"writer": {"agent": "hermes"}}},
+            expected_run_id=claimed.current_run_id,
+            expected_phase="development",
+        )
+        resolved = conn.execute(
+            "SELECT status, resolved_by_run_id FROM product_rework_directives "
+            "WHERE task_id = ?",
+            (tid,),
+        ).fetchone()
+
+    assert resolved["status"] == "resolved"
+    assert resolved["resolved_by_run_id"] == claimed.current_run_id
+
+
 @pytest.mark.parametrize(
     "findings",
     [[], "not-a-list", [""], [1], ["Concrete", ""]],
@@ -496,7 +1010,7 @@ def test_product_rework_requires_nonempty_string_findings(kanban_home, findings)
             board=board,
         )
         claimed = kb.claim_task(conn, tid)
-        with pytest.raises(ValueError, match="findings"):
+        with pytest.raises(kb.ProductOutcomeError) as raised:
             kb.complete_task(
                 conn,
                 tid,
@@ -511,6 +1025,7 @@ def test_product_rework_requires_nonempty_string_findings(kanban_home, findings)
                 expected_run_id=claimed.current_run_id,
                 board=board,
             )
+        assert raised.value.code == "invalid_findings"
         task = kb.get_task(conn, tid)
     assert task is not None and task.current_step_key == "test"
 
@@ -643,7 +1158,7 @@ def test_product_positive_rework_verdict_must_match_phase(
         )
         claimed = kb.claim_task(conn, tid)
         assert claimed is not None and claimed.current_run_id is not None
-        with pytest.raises(ValueError, match="invalid workflow_outcome"):
+        with pytest.raises(kb.ProductOutcomeError) as raised:
             kb.complete_task(
                 conn,
                 tid,
@@ -655,6 +1170,7 @@ def test_product_positive_rework_verdict_must_match_phase(
                 expected_run_id=claimed.current_run_id,
                 board=board,
             )
+        assert raised.value.code == "phase_mismatch"
         task = kb.get_task(conn, tid)
     assert task is not None
     assert task.current_step_key == step
@@ -1078,6 +1594,54 @@ def test_complete_task_refuses_unresolved_preflight_without_mutation(kanban_home
                 board=board,
             )
         assert _resolver_state(conn, tid) == before
+
+
+@pytest.mark.parametrize(
+    ("step", "metadata", "code"),
+    [
+        ("test", None, "missing"),
+        (
+            "review",
+            {"workflow_outcome": {"verdict": "approved", "unexpected": True}},
+            "invalid_shape",
+        ),
+    ],
+)
+def test_complete_task_rejects_unresolved_test_review_without_mutation(
+    kanban_home, step, metadata, code
+):
+    """Ordinary completion validates Test/Review before the Resolver path."""
+    board = f"resolver-complete-outcome-{step}"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board, step=step)
+        before = _resolver_state(conn, tid)
+        with pytest.raises(kb.ProductOutcomeError) as raised:
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Ordinary completion without a canonical outcome",
+                metadata=metadata,
+                expected_run_id=run_id,
+                board=board,
+            )
+        after = _resolver_state(conn, tid)
+
+    assert raised.value.code == code
+    assert after["task"] == before["task"]
+    assert after["runs"] == before["runs"]
+    assert after["links"] == before["links"]
+    assert after["events"][:-1] == before["events"]
+    rejection = [
+        event for event in after["events"]
+        if event[3] == "completion_rejected_outcome"
+    ]
+    assert len(rejection) == 1
+    assert json.loads(rejection[0][4]) == {
+        "run_id": run_id,
+        "phase": step,
+        "code": code,
+    }
 
 
 def test_resolve_product_preflight_resume_uses_complete_snapshot(kanban_home):
@@ -2973,6 +3537,34 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+def test_worker_context_marks_product_test_as_evidence_only(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "worker-context-evidence-boundary"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid, _workspace, _branch = _seed_product_test_worktree(conn, board, repo)
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 5252,
+        )
+        assert result.spawned[0][0] == tid
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
+        run = kb.get_run(conn, task.current_run_id)
+        context = kb.build_worker_context(conn, tid)
+
+    assert run is not None and run.metadata is not None
+    assert "## Evidence-phase source boundary" in context
+    assert "never commit source or fixture changes" in context
+    assert "workflow_outcome.verdict=changes_requested" in context
+    assert run.metadata["test_head_sha"] in context
+
+
 
 
 
@@ -3978,6 +4570,531 @@ def _head_sha(repo: Path) -> str:
     ).stdout.strip()
 
 
+def test_dependency_source_base_selects_required_parent_receipt(kanban_home, tmp_path):
+    repo = tmp_path / "dependency-source-base"
+    _init_git_repo(repo)
+
+
+    with kb.connect() as conn:
+        parent_id = kb.create_task(
+            conn, title="Parent", workspace_kind="worktree", workspace_path=str(repo),
+            source_commit_required=True,
+        )
+        parent = kb.claim_task(conn, parent_id)
+        assert parent is not None and parent.current_run_id is not None
+        (repo / "parent.txt").write_text("parent\n", encoding="utf-8")
+        assert kb.complete_task(conn, parent_id, expected_run_id=parent.current_run_id)
+        child_id = kb.create_task(conn, title="Child", parents=[parent_id])
+        child = kb.get_task(conn, child_id)
+        assert child is not None
+        assert kb._dependency_source_base(conn, child, repo) == _head_sha(repo)
+
+
+def test_dependency_source_base_uses_latest_completed_receipt(kanban_home, tmp_path):
+    repo = tmp_path / "completed-receipt-repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        parent_id = kb.create_task(
+            conn, title="Parent", workspace_kind="worktree", workspace_path=str(repo),
+            source_commit_required=True,
+        )
+        parent = kb.claim_task(conn, parent_id)
+        assert parent is not None and parent.current_run_id is not None
+        (repo / "first.txt").write_text("first\n", encoding="utf-8")
+        assert kb.complete_task(conn, parent_id, expected_run_id=parent.current_run_id)
+        first_sha = _head_sha(repo)
+        conn.execute(
+            "UPDATE task_runs SET ended_at = ended_at + 100 WHERE id = ?",
+            (parent.current_run_id,),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at, metadata) "
+            "VALUES (?, 'crashed', 'crashed', 200, 300, ?)",
+            (parent_id, json.dumps({"source_completion_receipt": {"commit_sha": first_sha}})),
+        )
+        child_id = kb.create_task(conn, title="Child", parents=[parent_id])
+        child = kb.get_task(conn, child_id)
+        assert child is not None
+        assert kb._dependency_source_base(conn, child, repo) == first_sha
+
+
+def test_dependency_source_base_deduplicates_identical_receipts(kanban_home, tmp_path):
+    repo = tmp_path / "duplicate-receipt-repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        parents = []
+        shared_sha = _head_sha(repo)
+        for title in ("One", "Two"):
+            parent_id = kb.create_task(
+                conn, title=title, workspace_kind="worktree", workspace_path=str(repo),
+                source_commit_required=True,
+            )
+            parent = kb.claim_task(conn, parent_id)
+            assert parent is not None and parent.current_run_id is not None
+            (repo / f"{title.lower()}.txt").write_text(f"{title}\n", encoding="utf-8")
+            assert kb.complete_task(conn, parent_id, expected_run_id=parent.current_run_id)
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps({"source_completion_receipt": {"commit_sha": shared_sha}}), parent.current_run_id),
+            )
+            parents.append(parent_id)
+        child_id = kb.create_task(conn, title="Child", parents=parents)
+        child = kb.get_task(conn, child_id)
+        assert child is not None
+        assert kb._dependency_source_base(conn, child, repo) == shared_sha
+
+
+def test_resolve_worktree_workspace_rejects_divergent_receipts_before_materializing(
+    kanban_home, tmp_path, monkeypatch
+):
+    board = "dependency-source-divergence"
+    kb.create_board(board, name="Dependency Source", preset="generic")
+    repo = tmp_path / "divergent-receipts-repo"
+    _init_git_repo(repo)
+    subprocess.run(["git", "-C", str(repo), "checkout", "-b", "side"], check=True,
+                   capture_output=True, text=True)
+    second_sha = _commit_file(repo, "second.txt", "second\n", "second")
+    subprocess.run(["git", "-C", str(repo), "checkout", "main"], check=True,
+                   capture_output=True, text=True)
+    first_sha = _commit_file(repo, "first.txt", "first\n", "first")
+    target = repo / ".worktrees" / "child"
+    monkeypatch.setattr(kb, "_story_base_branch", lambda *args, **kwargs: None)
+    monkeypatch.setattr(kb, "_handoff_v2_enabled", lambda _meta: False)
+    with kb.connect(board=board) as conn:
+        parents = []
+        for title, sha in (("One", first_sha), ("Two", second_sha)):
+            parent_id = kb.create_task(
+                conn, title=title, board=board, workspace_kind="worktree", workspace_path=str(repo),
+                source_commit_required=True,
+            )
+            parent = kb.claim_task(conn, parent_id)
+            assert parent is not None and parent.current_run_id is not None
+            (repo / f"{title.lower()}.txt").write_text(f"{title}\n", encoding="utf-8")
+            assert kb.complete_task(conn, parent_id, expected_run_id=parent.current_run_id)
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps({"source_completion_receipt": {"commit_sha": sha}}),
+                 parent.current_run_id),
+            )
+            parents.append(parent_id)
+        child_id = kb.create_task(
+            conn, title="Child", board=board, parents=parents, workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        child = kb.get_task(conn, child_id)
+        assert child is not None
+        with pytest.raises(RuntimeError, match="diverge"):
+            kb._resolve_worktree_workspace(child, board=board, conn=conn)
+    assert not target.exists()
+    assert not kb._git_branch_exists(repo, f"wt/{child_id}")
+
+
+def test_dependency_source_base_linear_multi_parent_uses_descendant(kanban_home, tmp_path):
+    repo = tmp_path / "linear-multi-parent-repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        parent_ids = []
+        for title in ("Ancestor", "Descendant"):
+            parent_id = kb.create_task(conn, title=title, workspace_kind="worktree", workspace_path=str(repo), source_commit_required=True)
+            parent = kb.claim_task(conn, parent_id)
+            assert parent is not None and parent.current_run_id is not None
+            (repo / f"{title.lower()}.txt").write_text(title, encoding="utf-8")
+            assert kb.complete_task(conn, parent_id, expected_run_id=parent.current_run_id)
+            parent_ids.append(parent_id)
+        child_id = kb.create_task(conn, title="Child", parents=parent_ids)
+        child = kb.get_task(conn, child_id)
+        assert child is not None
+        assert kb._dependency_source_base(conn, child, repo) == _head_sha(repo)
+
+
+def test_dependency_source_flow_resolves_parent_and_child_worktrees(kanban_home, tmp_path):
+    board = "dependency-source-e2e"
+    kb.create_board(board, name="Dependency Source E2E", preset="generic")
+    repo = tmp_path / "dependency-source-e2e-repo"
+    _init_git_repo(repo)
+    with kb.connect(board=board) as conn:
+        parent_id = kb.create_task(
+            conn, title="Parent", board=board, assignee="developer",
+            workspace_kind="worktree", workspace_path=str(repo),
+            source_commit_required=True,
+        )
+        parent = kb.get_task(conn, parent_id)
+        assert parent is not None
+        parent_ws, parent_branch = kb._resolve_worktree_workspace(parent, board=board, conn=conn)
+        conn.execute("UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(parent_ws), parent_id))
+        (parent_ws / "parent.txt").write_text("parent content\n", encoding="utf-8")
+        claimed = kb.claim_task(conn, parent_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.complete_task(conn, parent_id, expected_run_id=claimed.current_run_id)
+        child_id = kb.create_task(conn, title="Child", board=board, parents=[parent_id], workspace_kind="worktree", workspace_path=str(repo), source_commit_required=True)
+        child = kb.get_task(conn, child_id)
+        assert child is not None and child.status == "ready"
+        child_ws, child_branch = kb._resolve_worktree_workspace(child, board=board, conn=conn)
+    assert parent_ws != child_ws
+    assert parent_branch != child_branch
+    assert (child_ws / "parent.txt").read_text(encoding="utf-8") == "parent content\n"
+
+
+def test_dependency_source_flow_resolves_concrete_child_worktree_from_parent(kanban_home, tmp_path):
+    board = "dependency-source-concrete-child"
+    kb.create_board(board, name="Dependency Source Concrete Child", preset="generic")
+    repo = tmp_path / "dependency-source-concrete-child-repo"
+    _init_git_repo(repo)
+    with kb.connect(board=board) as conn:
+        parent_id = kb.create_task(
+            conn, title="Parent", board=board, assignee="developer",
+            workspace_kind="worktree", workspace_path=str(repo),
+            source_commit_required=True,
+        )
+        parent = kb.get_task(conn, parent_id)
+        assert parent is not None
+        parent_ws, parent_branch = kb._resolve_worktree_workspace(parent, board=board, conn=conn)
+        conn.execute("UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(parent_ws), parent_id))
+        (parent_ws / "parent.txt").write_text("parent content\n", encoding="utf-8")
+        claimed = kb.claim_task(conn, parent_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.complete_task(conn, parent_id, expected_run_id=claimed.current_run_id)
+
+        child_id = kb.create_task(
+            conn, title="Child", board=board, parents=[parent_id], assignee="developer",
+            workspace_kind="worktree", workspace_path=str(repo / ".worktrees" / "child"),
+            branch_name=f"child/{parent_id}",
+        )
+        child = kb.get_task(conn, child_id)
+        assert child is not None and child.status == "ready"
+        child_ws, child_branch = kb._resolve_worktree_workspace(child, board=board, conn=conn)
+
+    assert parent_branch != child_branch
+    assert child_ws == repo / ".worktrees" / "child"
+    assert (child_ws / "parent.txt").read_text(encoding="utf-8") == "parent content\n"
+
+
+def test_complete_task_required_source_commits_before_terminal_update_and_persists_receipt(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "completion-repo"
+    _init_git_repo(repo)
+    base_sha = _head_sha(repo)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Commit before done",
+            assignee="developer",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            source_commit_required=True,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        (repo / "feature.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Implemented feature",
+            expected_run_id=run_id,
+        )
+
+        task = kb.get_task(conn, tid)
+        run = kb.get_run(conn, run_id)
+
+    assert task is not None and task.status == "done"
+    assert run is not None and run.metadata is not None
+    intent = run.metadata["source_completion_intent"]
+    receipt = run.metadata["source_completion_receipt"]
+    assert intent["run_id"] == run_id
+    assert receipt["intent_id"] == intent["intent_id"]
+    assert receipt["run_id"] == run_id
+    assert receipt["base_sha"] == base_sha
+    assert receipt["commit_sha"] == _head_sha(repo)
+    assert receipt["commit_sha"] != base_sha
+    assert len(receipt["tree_sha"]) == 40
+    assert len(receipt["diff_digest"]) == 64
+    assert receipt["paths"] == ["feature.py"]
+    assert receipt["created_at"] >= intent["created_at"]
+    assert subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == ""
+
+
+def test_default_board_forbidden_dependency_chain_forwards_candidate_sha(
+    kanban_home, tmp_path
+):
+    board = "default"
+    repo = tmp_path / "default-source-three-card-repo"
+    _init_git_repo(repo)
+    with kb.connect(board=board) as conn:
+        developer_id = kb.create_task(conn, title="Developer", board=board,
+            assignee="developer", workspace_kind="worktree", workspace_path=str(repo),
+            source_commit_required=True)
+        developer = kb.get_task(conn, developer_id)
+        assert developer is not None
+        developer_ws, _ = kb._resolve_worktree_workspace(developer, board=board, conn=conn)
+        conn.execute("UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(developer_ws), developer_id))
+        (developer_ws / "feature.txt").write_text("candidate\n", encoding="utf-8")
+        claimed = kb.claim_task(conn, developer_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.complete_task(conn, developer_id, expected_run_id=claimed.current_run_id)
+        developer_sha = _head_sha(developer_ws)
+        tester_id = kb.create_task(conn, title="Tester", board=board, assignee="tester",
+            parents=[developer_id], workspace_kind="worktree", workspace_path=str(repo),
+            source_commit_forbidden=True)
+        tester = kb.get_task(conn, tester_id)
+        assert tester is not None and tester.status == "ready"
+        tester_ws, _ = kb._resolve_worktree_workspace(tester, board=board, conn=conn)
+        conn.execute("UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(tester_ws), tester_id))
+        assert _head_sha(tester_ws) == developer_sha
+        tester_claimed = kb.claim_task(conn, tester_id)
+        assert tester_claimed is not None and tester_claimed.current_run_id is not None
+        assert kb.complete_task(conn, tester_id, metadata={"candidate_sha": "caller-value"},
+            expected_run_id=tester_claimed.current_run_id)
+        tester_run = kb.get_run(conn, tester_claimed.current_run_id)
+        assert tester_run is not None and tester_run.metadata["candidate_sha"] == developer_sha
+        reviewer_id = kb.create_task(conn, title="Reviewer", board=board, assignee="reviewer",
+            parents=[tester_id], workspace_kind="worktree", workspace_path=str(repo),
+            source_commit_forbidden=True)
+        reviewer = kb.get_task(conn, reviewer_id)
+        assert reviewer is not None and reviewer.status == "ready"
+        reviewer_ws, _ = kb._resolve_worktree_workspace(reviewer, board=board, conn=conn)
+        conn.execute("UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(reviewer_ws), reviewer_id))
+        assert _head_sha(reviewer_ws) == developer_sha
+        assert (reviewer_ws / "feature.txt").read_text(encoding="utf-8") == "candidate\n"
+
+
+def test_complete_task_adopts_the_one_exact_commit_after_crash_before_receipt(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "adoption-repo"
+    _init_git_repo(repo)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Adopt exact commit",
+            assignee="developer",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            source_commit_required=True,
+        )
+        first = kb.claim_task(conn, tid)
+        assert first is not None and first.current_run_id is not None
+        first_run_id = first.current_run_id
+        (repo / "feature.py").write_text("VALUE = 2\n", encoding="utf-8")
+        original_persist = kb._persist_source_completion_metadata
+        persist_calls = 0
+
+        def crash_before_receipt(*args, **kwargs):
+            nonlocal persist_calls
+            persist_calls += 1
+            if persist_calls == 2:
+                raise RuntimeError("simulated crash after git commit")
+            return original_persist(*args, **kwargs)
+
+        monkeypatch.setattr(kb, "_persist_source_completion_metadata", crash_before_receipt)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            kb.complete_task(conn, tid, expected_run_id=first_run_id)
+        committed_sha = _head_sha(repo)
+        assert kb.get_task(conn, tid).status == "running"
+
+        monkeypatch.setattr(kb, "_persist_source_completion_metadata", original_persist)
+        assert kb.reclaim_task(conn, tid, reason="retry source finalization")
+        second = kb.claim_task(conn, tid)
+        assert second is not None and second.current_run_id is not None
+        second_run_id = second.current_run_id
+
+        assert kb.complete_task(conn, tid, expected_run_id=second_run_id)
+        receipt = kb.get_run(conn, second_run_id).metadata["source_completion_receipt"]
+
+    assert receipt["adopted"] is True
+    assert receipt["commit_sha"] == committed_sha == _head_sha(repo)
+    assert receipt["intent_run_id"] == first_run_id
+    assert receipt["run_id"] == second_run_id
+    log_count = subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--count", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert log_count == "2"
+
+
+def test_complete_task_forbidden_source_does_not_commit_worker_diff(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "forbidden-repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Evidence only",
+            assignee="reviewer",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            source_commit_forbidden=True,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        monkeypatch.setattr(
+            kb,
+            "_commit_worker_diff",
+            lambda *args, **kwargs: pytest.fail("forbidden completion authored source"),
+        )
+
+        assert kb.complete_task(
+            conn, tid, expected_run_id=claimed.current_run_id
+        )
+
+        task = kb.get_task(conn, tid)
+
+    assert task is not None and task.status == "done"
+    assert task.source_commit_forbidden is True
+    assert _head_sha(repo) == subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--max-parents=0", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_complete_task_forbidden_source_rejects_dirty_git_before_terminal_mutation(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "dirty-forbidden-repo"
+    _init_git_repo(repo)
+    before_sha = _head_sha(repo)
+    with kb.connect() as conn:
+        parent_id = kb.create_task(
+            conn,
+            title="Evidence-only parent",
+            assignee="reviewer",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            source_commit_forbidden=True,
+        )
+        child_id = kb.create_task(conn, title="Dependent")
+        kb.link_tasks(conn, parent_id, child_id)
+        claimed = kb.claim_task(conn, parent_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        (repo / "README.md").write_text("dirty\n", encoding="utf-8")
+        (repo / "untracked.txt").write_text("diagnosis\n", encoding="utf-8")
+
+        with pytest.raises(kb._SourceCommitError) as raised:
+            kb.complete_task(conn, parent_id, expected_run_id=claimed.current_run_id)
+
+        parent = kb.get_task(conn, parent_id)
+        child = kb.get_task(conn, child_id)
+        run = kb.get_run(conn, claimed.current_run_id)
+
+    assert raised.value.code == "source_forbidden_dirty"
+    assert parent is not None and parent.status == "running"
+    assert child is not None and child.status == "todo"
+    assert run is not None and run.ended_at is None
+    assert _head_sha(repo) == before_sha
+    assert (repo / "README.md").read_text(encoding="utf-8") == "dirty\n"
+    assert (repo / "untracked.txt").read_text(encoding="utf-8") == "diagnosis\n"
+
+
+def test_complete_task_forbidden_source_allows_non_git_report_only_workspace(
+    kanban_home, tmp_path
+):
+    workspace = tmp_path / "report-only"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Report-only evidence",
+            assignee="reviewer",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+            source_commit_forbidden=True,
+        )
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+
+        assert kb.complete_task(conn, task_id, expected_run_id=claimed.current_run_id)
+
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None and task.status == "done"
+
+
+def test_complete_task_required_source_raises_typed_failure_without_commit(
+    kanban_home, tmp_path
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Missing source",
+            assignee="developer",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+            source_commit_required=True,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+
+        with pytest.raises(kb._SourceCommitError) as raised:
+            kb.complete_task(conn, tid, expected_run_id=claimed.current_run_id)
+
+        task = kb.get_task(conn, tid)
+
+    assert raised.value.code == "not_a_git_repository"
+    assert task is not None and task.status == "running"
+
+
+def test_complete_task_required_source_rechecks_run_ownership_before_done(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "cas-repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="CAS before done",
+            assignee="developer",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            source_commit_required=True,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        (repo / "feature.py").write_text("VALUE = 3\n", encoding="utf-8")
+        original_persist = kb._persist_source_completion_metadata
+
+        def lose_ownership_after_receipt(*args, **kwargs):
+            original_persist(*args, **kwargs)
+            if kwargs.get("receipt") is not None:
+                conn.execute(
+                    "UPDATE tasks SET current_run_id = NULL WHERE id = ?",
+                    (tid,),
+                )
+                conn.commit()
+
+        monkeypatch.setattr(
+            kb, "_persist_source_completion_metadata", lose_ownership_after_receipt
+        )
+
+        with pytest.raises(kb._SourceCommitError) as raised:
+            kb.complete_task(conn, tid, expected_run_id=run_id)
+
+        task = kb.get_task(conn, tid)
+
+    assert raised.value.code == "run_changed"
+    assert task is not None and task.status == "running"
+    assert _head_sha(repo) != subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--max-parents=0", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 def test_commit_worker_diff_dirty_worktree_returns_sha_and_cleans_tree(kanban_home, tmp_path):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
@@ -4505,7 +5622,10 @@ def test_complete_task_v2_clean_test_evidence_advances_without_commit(kanban_hom
             tid,
             summary="Tests passed",
             board=board,
-            metadata={"ai_provenance": {"tester": {"agent": "hermes", "result": "passed"}}},
+            metadata={
+                "workflow_outcome": {"verdict": "passed"},
+                "ai_provenance": {"tester": {"agent": "hermes", "result": "passed"}},
+            },
         )
 
         card = _card_snapshot(conn, tid)
@@ -4560,6 +5680,7 @@ def test_complete_task_v2_clean_review_evidence_advances_without_commit(kanban_h
             summary="Independent review passed",
             board=board,
             metadata={
+                "workflow_outcome": {"verdict": "approved"},
                 "ai_provenance": {
                     "writer": {"agent": "claude-code"},
                     "reviewer": {"agent": "codex"},
@@ -6947,6 +8068,55 @@ def _seed_product_review_worktree(
     return tid, workspace, base_sha, head_sha
 
 
+def _seed_product_test_worktree(conn, board: str, repo: Path):
+    tid = kb.create_task(
+        conn,
+        title="Test committed change",
+        board=board,
+        assignee="tester",
+        workflow_template_id="product",
+        current_step_key="test",
+        workspace_kind="worktree",
+        workspace_path=str(repo),
+        max_retries=5,
+    )
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    workspace, branch = kb._resolve_worktree_workspace(task, board=board, conn=conn)
+    kb.set_workspace_path(conn, tid, str(workspace))
+    kb.set_branch_name(conn, tid, branch)
+    return tid, workspace, branch
+
+
+def test_dispatch_pins_test_target_before_tester_spawn(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "test-target-pinned"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+    observed = []
+
+    with kb.connect(board=board) as conn:
+        tid, workspace, branch = _seed_product_test_worktree(conn, board, repo)
+
+        def capture_spawn(task, launched_workspace, board=None):
+            run = kb.get_run(conn, task.current_run_id)
+            observed.append((launched_workspace, run.metadata))
+            return 5252
+
+        result = kb.dispatch_once(conn, board=board, spawn_fn=capture_spawn)
+
+    head_sha = _git_output(workspace, "rev-parse", "HEAD")
+    assert result.spawned[0][0] == tid
+    assert observed == [
+        (
+            str(workspace),
+            {"test_branch": branch, "test_head_sha": head_sha},
+        )
+    ]
+
+
 def test_dispatch_pins_review_target_before_reviewer_spawn(
     kanban_home, tmp_path, all_assignees_spawnable,
 ):
@@ -6972,9 +8142,272 @@ def test_dispatch_pins_review_target_before_reviewer_spawn(
     assert observed == [
         (
             str(workspace),
-            {"review_base_sha": base_sha, "review_head_sha": head_sha},
+            {
+                "review_branch": _git_output(workspace, "branch", "--show-current"),
+                "review_base_sha": base_sha,
+                "review_head_sha": head_sha,
+            },
         )
     ]
+
+
+def test_default_review_dispatch_requires_structural_target_contract(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    """A generic review card must not launch without an explicit target contract."""
+    board = "default-review-contract"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    base_sha = _head_sha(repo)
+    head_sha = _commit_file(repo, "reviewed.txt", "candidate\n", "candidate")
+    _set_generated_path_policy(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Default review without product step",
+            board=board,
+            assignee="reviewer",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            source_commit_forbidden=True,
+        )
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        conn.commit()
+
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: pytest.fail("review launched without contract"),
+        )
+        task = kb.get_task(conn, tid)
+
+    assert result.spawned == []
+    assert task is not None and task.status == "blocked"
+    assert task.current_step_key is None
+    assert task.last_failure_error is not None
+    assert "review execution contract" in task.last_failure_error
+    assert base_sha != head_sha
+
+
+def test_default_review_dispatch_pins_completed_predecessor_target(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "default-review-target-pinned"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    base_sha = _head_sha(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "-b", "review-candidate"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    head_sha = _commit_file(repo, "reviewed.txt", "candidate\n", "candidate")
+    _set_generated_path_policy(board, repo)
+    observed = []
+
+    with kb.connect(board=board) as conn:
+        predecessor_id = kb.create_task(
+            conn,
+            title="Completed test gate",
+            board=board,
+            assignee="tester",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            source_commit_forbidden=True,
+        )
+        kb.set_branch_name(conn, predecessor_id, "review-candidate")
+        conn.execute(
+            "UPDATE tasks SET status='done', completed_at=1 WHERE id=?",
+            (predecessor_id,),
+        )
+        predecessor_run_id = kb._synthesize_ended_run(
+            conn,
+            predecessor_id,
+            outcome="completed",
+            metadata={"candidate_sha": head_sha},
+        )
+        tid = kb.create_task(
+            conn,
+            title="Default immutable review",
+            board=board,
+            assignee="reviewer",
+            parents=[predecessor_id],
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            source_commit_forbidden=True,
+        )
+        kb.set_branch_name(conn, tid, "review-candidate")
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        conn.commit()
+
+        def capture_spawn(task, launched_workspace, board=None):
+            run = kb.get_run(conn, task.current_run_id)
+            observed.append((launched_workspace, run.step_key, run.metadata))
+            return 4242
+
+        result = kb.dispatch_once(conn, board=board, spawn_fn=capture_spawn)
+        task = kb.get_task(conn, tid)
+
+    assert result.spawned[0][0] == tid
+    assert task is not None
+    assert task.workflow_template_id is None
+    assert task.current_step_key is None
+    assert predecessor_run_id > 0
+    assert observed == [
+        (
+            str(repo),
+            None,
+            {
+                "review_contract_kind": "default",
+                "review_branch": "review-candidate",
+                "review_base_sha": base_sha,
+                "review_head_sha": head_sha,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "invalid_contract",
+    [
+        "missing_candidate",
+        "invalid_candidate",
+        "missing_source_policy",
+        "dirty_workspace",
+        "mismatched_branch",
+        "mismatched_repository",
+        "moved_candidate",
+        "wrong_active_profile",
+        "absent_predecessor",
+    ],
+)
+def test_default_review_dispatch_rejects_invalid_target_contract_before_spawn(
+    kanban_home, tmp_path, all_assignees_spawnable, monkeypatch, invalid_contract,
+):
+    board = f"default-review-invalid-{invalid_contract}"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "-b", "review-candidate"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    head_sha = _commit_file(repo, "reviewed.txt", "candidate\n", "candidate")
+    configured_repo = repo
+    if invalid_contract == "mismatched_repository":
+        configured_repo = tmp_path / "configured-repo"
+        _init_git_repo(configured_repo)
+    _set_generated_path_policy(board, configured_repo)
+
+    with kb.connect(board=board) as conn:
+        predecessor_id = kb.create_task(
+            conn,
+            title="Completed Tester gate",
+            board=board,
+            assignee="tester",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            source_commit_forbidden=True,
+        )
+        kb.set_branch_name(
+            conn,
+            predecessor_id,
+            "main" if invalid_contract == "mismatched_branch" else "review-candidate",
+        )
+        conn.execute(
+            "UPDATE tasks SET status='done', completed_at=1 WHERE id=?",
+            (predecessor_id,),
+        )
+        predecessor_metadata = {
+            "candidate_sha": (
+                "not-a-full-sha" if invalid_contract == "invalid_candidate" else head_sha
+            )
+        }
+        if invalid_contract == "missing_candidate":
+            predecessor_metadata = {}
+        kb._synthesize_ended_run(
+            conn,
+            predecessor_id,
+            outcome="completed",
+            metadata=predecessor_metadata,
+        )
+        tid = kb.create_task(
+            conn,
+            title="Invalid Default review target",
+            board=board,
+            assignee="reviewer",
+            parents=[] if invalid_contract == "absent_predecessor" else [predecessor_id],
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            source_commit_forbidden=invalid_contract != "missing_source_policy",
+        )
+        kb.set_branch_name(conn, tid, "review-candidate")
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        conn.commit()
+        if invalid_contract == "dirty_workspace":
+            (repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+        elif invalid_contract == "moved_candidate":
+            _commit_file(repo, "moved.txt", "moved\n", "moved review head")
+        if invalid_contract == "wrong_active_profile":
+            original_stamp = kb._stamp_run_executor_identity
+
+            def stamp_wrong_profile(active_conn, claimed):
+                original_stamp(active_conn, claimed)
+                active_conn.execute(
+                    "UPDATE task_runs SET profile='default' WHERE id=?",
+                    (claimed.current_run_id,),
+                )
+                active_conn.commit()
+
+            monkeypatch.setattr(kb, "_stamp_run_executor_identity", stamp_wrong_profile)
+
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 4242,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert result.spawned == []
+    assert task is not None and task.status == "blocked"
+    assert task.workflow_template_id is None
+    assert task.current_step_key is None
+    assert task.last_failure_error is not None
+    assert "review target preparation" in task.last_failure_error
+
+
+def test_non_review_source_forbidden_task_remains_outside_default_review_contract(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "default-read-only-non-review"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    spawned = []
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Read-only inspection",
+            board=board,
+            assignee="default",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            source_commit_forbidden=True,
+        )
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda task, workspace: spawned.append((task.id, workspace)) or 4242,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert result.spawned[0][0] == tid
+    assert spawned == [(tid, str(repo))]
+    assert task is not None and task.status == "running"
+    assert task.last_failure_error is None
 
 
 def test_pinned_review_target_survives_run_completion(
@@ -6986,7 +8419,7 @@ def test_pinned_review_target_survives_run_completion(
     _v2_product_board_with_repo(board, repo)
 
     with kb.connect(board=board) as conn:
-        tid, _workspace, base_sha, head_sha = _seed_product_review_worktree(
+        tid, workspace, base_sha, head_sha = _seed_product_review_worktree(
             conn, board, repo
         )
         result = kb.dispatch_once(
@@ -7010,9 +8443,372 @@ def test_pinned_review_target_survives_run_completion(
 
     assert run.metadata == {
         "findings": [],
+        "review_branch": _git_output(workspace, "branch", "--show-current"),
         "review_base_sha": base_sha,
         "review_head_sha": head_sha,
     }
+
+
+# Production baseline measured before R04: 56 ended Test runs contained six
+# distinct SHAs and 76 ended Review runs contained zero SHAs.  These behavior
+# tests cover the replacement contract instead of freezing those observations.
+
+
+def _set_generated_path_policy(board: str, repo: Path, *paths: str) -> None:
+    policy = {
+        "base_ref": "refs/heads/main",
+        "target_branch": "main",
+        "verification_profiles": {
+            "story_integration": {
+                "commands": [
+                    {
+                        "argv": ["python3", "-m", "unittest"],
+                        "workdir": ".",
+                        "timeout_seconds": 60,
+                    }
+                ]
+            },
+            "epic_release": {
+                "commands": [
+                    {
+                        "argv": ["python3", "-m", "unittest"],
+                        "workdir": ".",
+                        "timeout_seconds": 60,
+                    }
+                ]
+            },
+        },
+        "ci_observation": {
+            "provider": "github_actions",
+            "required_workflows": ["CI"],
+        },
+        "boundary_evidence": {
+            "test_globs": ["tests/**"],
+            "fixture_globs": ["tests/fixtures/**"],
+            "generated_paths": list(paths),
+        },
+    }
+    kb.write_board_metadata(
+        board,
+        default_workdir=str(repo),
+        repository=policy,
+    )
+
+
+def test_test_completion_rejects_source_head_movement(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "test-evidence-head-moved"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid, workspace, _branch = _seed_product_test_worktree(conn, board, repo)
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 5252,
+        )
+        assert result.spawned[0][0] == tid
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
+        pinned = kb.get_run(conn, task.current_run_id)
+        assert pinned is not None
+        pinned_sha = pinned.metadata["test_head_sha"]
+        _commit_file(workspace, "source.txt", "moved\n", "move test head")
+
+        with pytest.raises(kb.EvidenceWorkspaceError, match="source_moved"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Tests passed",
+                board=board,
+                metadata={
+                    "workflow_outcome": {"verdict": "passed"},
+                    "ai_provenance": {"tester": {"agent": "hermes"}},
+                },
+                expected_run_id=pinned.id,
+            )
+
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert task is not None and task.current_step_key == "test"
+    assert task.status == "running"
+    assert _git_output(workspace, "rev-parse", "HEAD") != pinned_sha
+    assert not any(event.kind == "handoff" for event in events)
+
+
+def test_test_completion_rejects_missing_dispatcher_pin(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "test-evidence-missing-pin"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid, workspace, _branch = _seed_product_test_worktree(conn, board, repo)
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 5252,
+        )
+        assert result.spawned[0][0] == tid
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
+        run_id = task.current_run_id
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (json.dumps({}), run_id),
+        )
+        with pytest.raises(kb.EvidenceWorkspaceError, match="missing_pin"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Tests passed",
+                board=board,
+                metadata={
+                    "workflow_outcome": {"verdict": "passed"},
+                    "ai_provenance": {"tester": {"agent": "hermes"}},
+                },
+                expected_run_id=run_id,
+            )
+        current = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert current is not None and current.status == "running"
+    assert current.current_step_key == "test"
+    assert not any(event.kind == "handoff" for event in events)
+
+
+def test_test_completion_restores_declared_generated_path_and_uses_pinned_sha(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "test-evidence-generated-restore"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+    _set_generated_path_policy(board, repo, "README.md")
+
+    with kb.connect(board=board) as conn:
+        tid, workspace, _branch = _seed_product_test_worktree(conn, board, repo)
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 5252,
+        )
+        assert result.spawned[0][0] == tid
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
+        run_id = task.current_run_id
+        run = kb.get_run(conn, run_id)
+        assert run is not None
+        pinned_sha = run.metadata["test_head_sha"]
+        (workspace / "README.md").write_text("generated evidence\n", encoding="utf-8")
+
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Tests passed",
+            board=board,
+            metadata={
+                "workflow_outcome": {"verdict": "passed"},
+                "ai_provenance": {"tester": {"agent": "hermes"}},
+            },
+            expected_run_id=run_id,
+        )
+        closed = kb.get_run(conn, run_id)
+        events = kb.list_events(conn, tid)
+
+    assert (workspace / "README.md").read_text(encoding="utf-8") == "hello\n"
+    assert closed is not None and closed.metadata is not None
+    assert closed.metadata["evidence_workspace"]["declared_generated"] == ["README.md"]
+    generated_event = next(
+        event for event in events if event.kind == "evidence_generated_mutations"
+    )
+    assert generated_event.payload == {"run_id": run_id, "paths": ["README.md"]}
+    handoff = next(event for event in events if event.kind == "handoff")
+    assert handoff.payload["sha"] == pinned_sha
+
+
+def test_test_completion_preserves_nonignored_untracked_output_and_rejects(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "test-evidence-untracked"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid, workspace, _branch = _seed_product_test_worktree(conn, board, repo)
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 5252,
+        )
+        assert result.spawned[0][0] == tid
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
+        (workspace / "artifact.txt").write_text("diagnosis\n", encoding="utf-8")
+
+        with pytest.raises(kb.EvidenceWorkspaceError, match="untracked_output"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Tests passed",
+                board=board,
+                metadata={
+                    "workflow_outcome": {"verdict": "passed"},
+                    "ai_provenance": {"tester": {"agent": "hermes"}},
+                },
+                expected_run_id=task.current_run_id,
+            )
+        current = kb.get_task(conn, tid)
+
+    assert current is not None and current.current_step_key == "test"
+    assert (workspace / "artifact.txt").read_text(encoding="utf-8") == "diagnosis\n"
+
+
+def test_test_completion_rejects_undeclared_tracked_mutation(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "test-evidence-undeclared-tracked"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid, workspace, _branch = _seed_product_test_worktree(conn, board, repo)
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 5252,
+        )
+        assert result.spawned[0][0] == tid
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
+        (workspace / "README.md").write_text("source edit\n", encoding="utf-8")
+
+        with pytest.raises(kb.EvidenceWorkspaceError, match="source_moved"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Tests passed",
+                board=board,
+                metadata={
+                    "workflow_outcome": {"verdict": "passed"},
+                    "ai_provenance": {"tester": {"agent": "hermes"}},
+                },
+                expected_run_id=task.current_run_id,
+            )
+
+    assert (workspace / "README.md").read_text(encoding="utf-8") == "source edit\n"
+
+
+def test_review_dispatch_requires_the_latest_test_sha_when_one_is_pinned(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "review-evidence-tested-sha"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid, workspace, _base_sha, head_sha = _seed_product_review_worktree(
+            conn, board, repo
+        )
+        with kb.write_txn(conn):
+            kb._synthesize_ended_run(
+                conn,
+                tid,
+                outcome="advanced",
+                step_key="test",
+                metadata={
+                    "test_branch": kb._git_current_branch(workspace),
+                    "test_head_sha": head_sha,
+                    "workflow_outcome": {"verdict": "passed"},
+                    "ai_provenance": {
+                        "writer": {"agent": "writer"},
+                        "tester": {"agent": "hermes"},
+                    },
+                },
+            )
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 5252,
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
+        run = kb.get_run(conn, task.current_run_id)
+
+    assert result.spawned[0][0] == tid
+    assert run is not None
+    assert run.metadata["review_head_sha"] == head_sha
+
+
+def test_review_completion_rejects_source_edit_without_authoring_a_commit(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "review-evidence-source-edit"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid, workspace, _base_sha, head_sha = _seed_product_review_worktree(
+            conn, board, repo
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.branch_name
+        with kb.write_txn(conn):
+            kb._synthesize_ended_run(
+                conn,
+                tid,
+                outcome="advanced",
+                step_key="test",
+                metadata={
+                    "test_branch": task.branch_name,
+                    "test_head_sha": head_sha,
+                    "workflow_outcome": {"verdict": "passed"},
+                    "ai_provenance": {
+                        "writer": {"agent": "writer"},
+                        "tester": {"agent": "hermes"},
+                    },
+                },
+            )
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 5252,
+        )
+        assert result.spawned[0][0] == tid
+        running = kb.get_task(conn, tid)
+        assert running is not None and running.current_run_id is not None
+        before_head = _git_output(workspace, "rev-parse", "HEAD")
+        (workspace / "README.md").write_text("reviewer source edit\n", encoding="utf-8")
+
+        with pytest.raises(kb.EvidenceWorkspaceError, match="source_moved"):
+            kb.handoff(
+                conn,
+                tid,
+                board=board,
+                summary="Approved review",
+                metadata={
+                    "workflow_outcome": {"verdict": "approved"},
+                    "ai_provenance": {
+                        "writer": {"agent": "writer"},
+                        "reviewer": {"agent": "reviewer", "verdict": "approved"},
+                    },
+                },
+                expected_run_id=running.current_run_id,
+                expected_phase="review",
+            )
+
+    assert _git_output(workspace, "rev-parse", "HEAD") == before_head
+    assert (workspace / "README.md").read_text(encoding="utf-8") == "reviewer source edit\n"
 
 
 def test_review_closure_keeps_dispatcher_pins_over_worker_claims(
@@ -7081,8 +8877,11 @@ def test_review_closure_keeps_dispatcher_pins_over_worker_claims(
                 metadata={
                     "workflow_outcome": {"verdict": "passed"},
                     "ai_provenance": {
+                        "writer": {"agent": writer_executor["provider"]},
                         "tester": {"agent": "hermes", "result": "passed"},
                     },
+                    "test_branch": branch,
+                    "test_head_sha": pinned_head_sha,
                 },
             )
         result = kb.dispatch_once(
@@ -7248,7 +9047,11 @@ def test_dispatch_review_pins_against_board_checkout_branch(
 
     assert result.spawned[0][0] == tid
     assert observed == [
-        {"review_base_sha": base_sha, "review_head_sha": head_sha}
+        {
+            "review_branch": _git_output(workspace, "branch", "--show-current"),
+            "review_base_sha": base_sha,
+            "review_head_sha": head_sha,
+        }
     ]
     assert workspace.name == tid
 
@@ -9032,6 +10835,35 @@ def _v2_product_board_with_repo(name: str, repo: Path) -> None:
     meta_path.write_text(json.dumps(meta), encoding="utf-8")
 
 
+def _configure_candidate_verification(
+    board: str, repo: Path, *, command: tuple[str, ...] = ("python", "-c", "print('ok')")
+) -> kb.RepositoryContract:
+    meta_path = kb.board_metadata_path(board)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["repository"] = {
+        "base_ref": "refs/heads/main",
+        "target_branch": "main",
+        "verification_profiles": {
+            name: {
+                "commands": [
+                    {"argv": list(command), "workdir": ".", "timeout_seconds": 5}
+                ]
+            }
+            for name in ("story_integration", "epic_release")
+        },
+        "ci_observation": {"provider": "test", "required_workflows": ["CI"]},
+        "boundary_evidence": {
+            "test_globs": [],
+            "fixture_globs": [],
+            "generated_paths": [],
+        },
+    }
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    contract = kb.repository_contract_for_board(board, repo_root=repo)
+    assert contract is not None
+    return contract
+
+
 def _make_epic_branch(repo: Path, epic_branch: str, *, from_branch: str = "main") -> str:
     """Branch ``epic_branch`` off ``from_branch`` and add a unique commit.
     Returns the new commit sha. Leaves ``from_branch`` checked out."""
@@ -9174,6 +11006,355 @@ def test_build_merge_candidate_verification_failure_preserves_target(tmp_path):
             repo, "main", "wt/source", "test candidate", lambda _path: False
         )
     assert _git_output(repo, "rev-parse", "main") == pre_sha
+
+
+def test_build_merge_candidate_uses_configured_verification_profile(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", "wt/source"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    verifier = repo / "verify.py"
+    verifier.write_text(
+        "#!/usr/bin/env python3\nprint('configured-verifier')\n",
+        encoding="utf-8",
+    )
+    verifier.chmod(0o755)
+    source_sha = _commit_file(repo, "verify.py", verifier.read_text(), "verifier")
+    profile = kb.VerificationProfile(
+        (
+            VerificationCommand(
+                argv=("verify.py",),
+                workdir=PurePosixPath("."),
+                timeout_seconds=5,
+            ),
+        )
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    candidate = kb._build_verified_merge_candidate(
+        repo,
+        "main",
+        "wt/source",
+        "configured candidate",
+        verification_profile=profile,
+        verification_contract_digest="contract-digest",
+        verification_scope="story_integration",
+        verification_subject_id="story-1",
+        expected_source_sha=source_sha,
+    )
+
+    assert candidate.verification_result is not None
+    assert candidate.verification_result.status == "passed"
+    assert candidate.verification_result.profile == "story_integration"
+    assert candidate.verification_result.contract_digest == "contract-digest"
+
+
+def test_build_merge_candidate_missing_configured_profile_is_not_legacy_fallback(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    source_sha = _make_epic_branch(repo, "wt/source")
+    pre_sha = _git_output(repo, "rev-parse", "main")
+
+    with pytest.raises(kb.IntegrationCandidateError) as exc_info:
+        kb._build_verified_merge_candidate(
+            repo,
+            "main",
+            "wt/source",
+            "configured candidate",
+            verification_profile=None,
+            verification_contract_digest="contract-digest",
+            verification_scope="epic_release",
+            verification_subject_id="epic-1",
+            expected_source_sha=source_sha,
+        )
+
+    assert exc_info.value.verification_result is not None
+    assert exc_info.value.verification_result.status == "configuration_error"
+    assert _git_output(repo, "rev-parse", "main") == pre_sha
+
+
+def test_merge_epic_preserves_explicit_injected_candidate_verification(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-merge-injected-verification"
+    _v2_product_board_with_repo(board, repo)
+    _configure_candidate_verification(
+        board, repo, command=("python", "-c", "raise SystemExit(9)")
+    )
+    epic, children = _make_epic_with_children(board, n_children=1)
+    with kb.connect(board=board) as conn:
+        _set_task_status(conn, children[0], "done")
+    _make_epic_branch(repo, kb.epic_branch_for(epic))
+    injected = unittest.mock.Mock(return_value=True)
+
+    with kb.connect(board=board) as conn:
+        result = kb.merge_epic_to_main(
+            conn, epic, board=board, candidate_verify_fn=injected
+        )
+
+    assert result == "merged"
+    injected.assert_called_once()
+
+
+def _verification_run_fixture(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-verification-reuse"
+    _v2_product_board_with_repo(board, repo)
+    count_file = tmp_path / "verification-count.txt"
+    command = (
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; p=Path({str(count_file)!r}); "
+        "p.write_text(p.read_text() + 'x' if p.exists() else 'x')",
+    )
+    contract = _configure_candidate_verification(board, repo, command=command)
+    candidate_sha = _git_output(repo, "rev-parse", "HEAD")
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(conn, title="Story", board=board)
+    return repo, board, task_id, contract, candidate_sha, count_file
+
+
+def _run_reusable_verification(conn, fixture):
+    repo, _board, task_id, contract, candidate_sha, _count_file = fixture
+    return kb._run_or_reuse_configured_verification(
+        conn,
+        task_id=task_id,
+        candidate_path=repo,
+        source_sha=candidate_sha,
+        candidate_sha=candidate_sha,
+        contract=contract,
+        profile_name="story_integration",
+        gate_kind="story_integration",
+    )
+
+
+def test_exact_repository_verification_receipt_skips_command(
+    kanban_home, tmp_path, monkeypatch
+):
+    fixture = _verification_run_fixture(kanban_home, tmp_path, monkeypatch)
+    _repo, board, task_id, _contract, _candidate_sha, count_file = fixture
+
+    with kb.connect(board=board) as conn:
+        first = _run_reusable_verification(conn, fixture)
+        second = _run_reusable_verification(conn, fixture)
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='repository_verification'",
+            (task_id,),
+        ).fetchone()[0]
+
+    assert first.status == second.status == "passed"
+    assert first.reused is False
+    assert second.reused is True
+    assert second.steps == first.steps
+    assert count_file.read_text(encoding="utf-8") == "x"
+    assert event_count == 1
+
+
+def test_configured_verification_reuses_receipt_after_connection_crash_boundary(
+    kanban_home, tmp_path, monkeypatch
+):
+    fixture = _verification_run_fixture(kanban_home, tmp_path, monkeypatch)
+    _repo, board, _task_id, _contract, _candidate_sha, count_file = fixture
+
+    with kb.connect(board=board) as conn:
+        first = _run_reusable_verification(conn, fixture)
+    with kb.connect(board=board) as conn:
+        recovered = _run_reusable_verification(conn, fixture)
+
+    assert first.reused is False
+    assert recovered.reused is True
+    assert count_file.read_text(encoding="utf-8") == "x"
+
+
+def test_verified_candidate_crash_reuses_persisted_receipt(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-verification-crash-reuse"
+    _v2_product_board_with_repo(board, repo)
+    count_file = tmp_path / "verification-count.txt"
+    _configure_candidate_verification(
+        board,
+        repo,
+        command=(
+            sys.executable,
+            "-c",
+            f"from pathlib import Path; p=Path({str(count_file)!r}); "
+            "p.write_text(p.read_text() + 'x' if p.exists() else 'x')",
+        ),
+    )
+    epic, children = _make_epic_with_children(board, n_children=1)
+    with kb.connect(board=board) as conn:
+        _set_task_status(conn, children[0], "done")
+    _make_epic_branch(repo, kb.epic_branch_for(epic))
+    monkeypatch.setenv("GIT_AUTHOR_DATE", "2001-01-01T00:00:00+00:00")
+    monkeypatch.setenv("GIT_COMMITTER_DATE", "2001-01-01T00:00:00+00:00")
+    apply = unittest.mock.Mock(side_effect=[False, True])
+    monkeypatch.setattr(kb, "_fast_forward_target", apply)
+
+    with kb.connect(board=board) as conn:
+        first = kb.merge_epic_to_main(conn, epic, board=board)
+        second = kb.merge_epic_to_main(conn, epic, board=board)
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='repository_verification'",
+            (epic,),
+        ).fetchone()[0]
+
+    assert first == "verify_failed"
+    assert second == "merged"
+    assert apply.call_count == 2
+    assert count_file.read_text(encoding="utf-8") == "x"
+    assert event_count == 1
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "candidate_sha",
+        "contract_digest",
+        "command_set_digest",
+        "runtime_toolchain_digest",
+        "generated_policy_digest",
+        "gate_kind",
+        "executor_policy",
+        "key_digest",
+        "result_digest",
+        "foreign_scope",
+        "foreign_subject",
+        "foreign_task",
+        "malformed_json",
+        "failed_result",
+        "missing_receipt",
+    ],
+)
+def test_configured_verification_rejects_key_result_and_foreign_receipts(
+    kanban_home, tmp_path, monkeypatch, tamper
+):
+    fixture = _verification_run_fixture(kanban_home, tmp_path, monkeypatch)
+    _repo, board, task_id, _contract, _candidate_sha, count_file = fixture
+
+    with kb.connect(board=board) as conn:
+        first = _run_reusable_verification(conn, fixture)
+        row = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? AND kind='repository_verification'",
+            (task_id,),
+        ).fetchone()
+        payload = json.loads(row["payload"])
+        if tamper == "foreign_task":
+            foreign = kb.create_task(conn, title="Foreign", board=board)
+            conn.execute("UPDATE task_events SET task_id=? WHERE id=?", (foreign, row["id"]))
+        elif tamper == "malformed_json":
+            conn.execute("UPDATE task_events SET payload='{' WHERE id=?", (row["id"],))
+        elif tamper == "failed_result":
+            payload["status"] = "failed"
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row["id"])
+            )
+        elif tamper == "missing_receipt":
+            payload.pop("receipt")
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row["id"])
+            )
+        elif tamper == "foreign_scope":
+            payload["scope"] = "epic_release"
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row["id"])
+            )
+        elif tamper == "foreign_subject":
+            payload["subject_id"] = "foreign-story"
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row["id"])
+            )
+        elif tamper == "result_digest":
+            payload["receipt"]["result_digest"] = "0" * 64
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row["id"])
+            )
+        else:
+            key_name = "digest" if tamper == "key_digest" else tamper
+            payload["receipt"]["key"][key_name] = "0" * 64
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row["id"])
+            )
+        conn.commit()
+
+        rerun = _run_reusable_verification(conn, fixture)
+
+    assert first.reused is False
+    assert rerun.reused is False
+    assert count_file.read_text(encoding="utf-8") == "xx"
+
+
+def test_merge_epic_records_configured_profile_failure_as_attention_required(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-merge-config-attention"
+    _v2_product_board_with_repo(board, repo)
+    meta_path = kb.board_metadata_path(board)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["repository"] = {
+        "base_ref": "refs/heads/main",
+        "target_branch": "main",
+        "verification_profiles": {
+            "story_integration": {
+                "commands": [
+                    {
+                        "argv": ["python", "-m", "unittest"],
+                        "workdir": ".",
+                        "timeout_seconds": 5,
+                    }
+                ]
+            }
+        },
+        "ci_observation": {
+            "provider": "test",
+            "required_workflows": ["CI"],
+        },
+        "boundary_evidence": {
+            "test_globs": [],
+            "fixture_globs": [],
+            "generated_paths": ["README.md"],
+        },
+    }
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    epic, children = _make_epic_with_children(board, n_children=1)
+    with kb.connect(board=board) as conn:
+        _set_task_status(conn, children[0], "done")
+    epic_branch = kb.epic_branch_for(epic)
+    _make_epic_branch(repo, epic_branch)
+
+    with kb.connect(board=board) as conn:
+        result = kb.merge_epic_to_main(conn, epic, board=board)
+        task = kb.get_task(conn, epic)
+        verification_events = [
+            event
+            for event in kb.list_events(conn, epic)
+            if event.kind == "repository_verification"
+        ]
+
+    assert result == "attention_required"
+    assert task is not None and task.rework_count == 0
+    assert verification_events
+    payload = verification_events[-1].payload
+    assert isinstance(payload, dict)
+    assert payload["status"] == "configuration_error"
+    assert payload["rework_eligible"] is False
 
 
 def test_fast_forward_rejects_target_that_moved_after_candidate(tmp_path):
@@ -9647,6 +11828,27 @@ def _add_approved_review_candidate(
     branch: str,
     source_sha: str,
 ) -> None:
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.workspace_path is not None
+    epic_id = kb.epic_id_for_task(conn, task_id)
+    assert epic_id is not None
+    base_sha = _git_output(
+        Path(task.workspace_path),
+        "merge-base",
+        branch,
+        kb.epic_branch_for(epic_id),
+    )
+    now = int(time.time())
+    test_metadata = {
+        "workflow_outcome": {"verdict": "passed"},
+        "ai_provenance": {
+            "writer": {"agent": "developer"},
+            "tester": {"agent": "hermes", "result": "passed"},
+        },
+        "test_branch": branch,
+        "test_head_sha": source_sha,
+    }
     metadata = {
         "workflow_outcome": {"verdict": "approved"},
         "ai_provenance": {
@@ -9658,8 +11860,18 @@ def _add_approved_review_candidate(
                 "reviewed_commit": source_sha,
             },
         },
+        "review_branch": branch,
+        "review_base_sha": base_sha,
+        "review_head_sha": source_sha,
     }
-    now = int(time.time())
+    conn.execute(
+        """
+        INSERT INTO task_runs
+            (task_id, step_key, status, started_at, ended_at, outcome, metadata)
+        VALUES (?, 'test', 'done', ?, ?, 'completed', ?)
+        """,
+        (task_id, now, now, json.dumps(test_metadata)),
+    )
     conn.execute(
         """
         INSERT INTO task_runs
@@ -9722,6 +11934,121 @@ def test_integrate_story_to_epic_idempotent_second_call_is_noop(kanban_home, tmp
     assert not any("merge" in cmd and "--no-ff" in cmd for cmd in calls), (
         "must not re-merge an already-integrated story"
     )
+    assert calls == []
+
+
+def test_integrate_story_to_epic_rejects_empty_contribution_before_fact(
+    kanban_home, tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-integrate-empty-contribution"
+    _v2_product_board_with_repo(board, repo)
+    epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
+    story_branch = f"story/{epic}-s1"
+    _git_output(repo, "branch", "-f", story_branch, epic_branch)
+    empty_sha = _git_output(repo, "rev-parse", story_branch)
+    assert empty_sha != story_sha
+
+    with kb.connect(board=board) as conn:
+        _add_approved_review_candidate(conn, story, story_branch, empty_sha)
+        before = conn.execute(
+            "SELECT COUNT(*) FROM epic_story_integrations WHERE story_id=?",
+            (story,),
+        ).fetchone()[0]
+        result = kb.integrate_story_to_epic(conn, story, board=board)
+        after = conn.execute(
+            "SELECT COUNT(*) FROM epic_story_integrations WHERE story_id=?",
+            (story,),
+        ).fetchone()[0]
+        events = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id=? AND kind='story_integrated_to_epic'",
+            (story,),
+        ).fetchone()[0]
+
+    assert result == "verify_failed"
+    assert after == before == 0
+    assert events == 0
+    assert _git_output(repo, "rev-parse", epic_branch) == _git_output(
+        repo, "rev-parse", story_branch
+    )
+
+
+def test_integrate_story_to_epic_rejects_ancestor_without_existing_fact(
+    kanban_home, tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-integrate-ancestor-without-fact"
+    _v2_product_board_with_repo(board, repo)
+    epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
+    story_branch = f"story/{epic}-s1"
+
+    with kb.connect(board=board) as conn:
+        _add_approved_review_candidate(conn, story, story_branch, story_sha)
+
+    # The reviewed contribution is now already in the target branch, but no
+    # durable composite fact records that handoff.  An ancestor check alone is
+    # not enough to manufacture that fact during a later reconcile pass.
+    _git_output(repo, "branch", "-f", epic_branch, story_sha)
+
+    with kb.connect(board=board) as conn:
+        result = kb.integrate_story_to_epic(conn, story, board=board)
+        fact_count = conn.execute(
+            "SELECT COUNT(*) FROM epic_story_integrations WHERE story_id=?",
+            (story,),
+        ).fetchone()[0]
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id=? AND kind='story_integrated_to_epic'",
+            (story,),
+        ).fetchone()[0]
+
+    assert result == "verify_failed"
+    assert fact_count == 0
+    assert event_count == 0
+
+
+def test_integrate_story_to_epic_replays_existing_composite_fact(
+    kanban_home, tmp_path, monkeypatch,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-integrate-replay"
+    _v2_product_board_with_repo(board, repo)
+    epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
+    story_branch = f"story/{epic}-s1"
+
+    with kb.connect(board=board) as conn:
+        _add_approved_review_candidate(conn, story, story_branch, story_sha)
+        kb._record_story_integration(
+            conn,
+            story,
+            epic,
+            epic_branch,
+            {
+                "source_branch": story_branch,
+                "source_sha": story_sha,
+                "target_branch": epic_branch,
+                "candidate_sha": story_sha,
+            },
+        )
+        before = conn.execute(
+            "SELECT COUNT(*) FROM epic_story_integrations WHERE story_id=?",
+            (story,),
+        ).fetchone()[0]
+
+    calls = _record_git_calls(monkeypatch)
+    with kb.connect(board=board) as conn:
+        result = kb.integrate_story_to_epic(conn, story, board=board)
+        after = conn.execute(
+            "SELECT COUNT(*) FROM epic_story_integrations WHERE story_id=?",
+            (story,),
+        ).fetchone()[0]
+
+    assert result == "already_integrated"
+    assert after == before == 1
     assert calls == []
 
 

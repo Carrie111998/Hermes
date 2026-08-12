@@ -52,6 +52,30 @@ def test_run_slash_create_and_list(kanban_home):
     assert "alice" in out
 
 
+@pytest.mark.parametrize(
+    ("policy", "required", "forbidden"),
+    [("none", False, False), ("required", True, False), ("forbidden", False, True)],
+)
+def test_run_slash_create_source_policy(kanban_home, policy, required, forbidden):
+    payload = json.loads(kc.run_slash(
+        f"create 'policy task' --source-policy {policy} --json"
+    ))
+    with kb.connect() as conn:
+        task = kb.get_task(conn, payload["id"])
+    assert task.source_commit_required is required
+    assert task.source_commit_forbidden is forbidden
+
+
+def test_run_slash_rejects_source_policy_on_qualified_board(kanban_home):
+    kb.ensure_product_board_defaults("strict", switch=True)
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    out = kc.run_slash("create 'policy task' --source-policy required")
+    assert "Default-board execution contract" in out
+
+
 def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
     target = tmp_path / ".worktrees" / "t6-wire"
     target_arg = target.as_posix()
@@ -508,3 +532,100 @@ def test_answer_escalation_cli_stale_conflict_is_concise_and_public(kanban_home)
     assert "task changed" in second
     assert "Traceback" not in second
     assert "sqlite3" not in second
+
+
+def _cli_clear_terminal_card(board: str) -> tuple[str, int, int]:
+    _cli_d4_board(board)
+    completed_at = 1_700_000_456
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Story: clear terminal state",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            board=board,
+        )
+        with kb.authorized_governance_write(), kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='done', completed_at=?, result=? WHERE id=?",
+                (completed_at, "preserve CLI evidence", task_id),
+            )
+            event_id = kb._append_event(
+                conn,
+                task_id,
+                "completed",
+                {"evidence": "preserve CLI payload"},
+            )
+    return task_id, completed_at, event_id
+
+
+def test_clear_terminal_state_parser_requires_every_expected_option():
+    wrapper = argparse.ArgumentParser()
+    subparsers = wrapper.add_subparsers(dest="root")
+    parser = kc.build_parser(subparsers)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["clear-terminal-state", "t_example"])
+    args = parser.parse_args(
+        [
+            "clear-terminal-state",
+            "t_example",
+            "--expected-completed-at",
+            "1700000000",
+            "--expected-phase",
+            "development",
+            "--expected-latest-event-id",
+            "42",
+            "--actor",
+            "operator",
+            "--reason",
+            "stale state",
+        ]
+    )
+    assert args.expected_completed_at == 1_700_000_000
+    assert args.expected_phase == "development"
+    assert args.expected_latest_event_id == 42
+    assert args.actor == "operator"
+    assert args.reason == "stale state"
+
+
+def test_clear_terminal_state_cli_success_has_structured_non_evidence_output(kanban_home):
+    board = "clear-terminal-cli-success"
+    task_id, completed_at, event_id = _cli_clear_terminal_card(board)
+    with kb.scoped_current_board(board):
+        out = kc.run_slash(
+            f"clear-terminal-state {task_id} "
+            f"--expected-completed-at {completed_at} "
+            "--expected-phase development "
+            f"--expected-latest-event-id {event_id} "
+            "--actor operator --reason 'clear stale state' --json"
+        )
+    payload = json.loads(out)
+    assert payload == {
+        "operation": "clear_terminal_state",
+        "task_id": task_id,
+        "status": "ready",
+        "completed_at": None,
+    }
+    assert "preserve CLI evidence" not in out
+    with kb.connect(board=board) as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready" and task.completed_at is None
+
+
+def test_clear_terminal_state_cli_refuses_lost_cas_without_evidence_payload(kanban_home):
+    board = "clear-terminal-cli-conflict"
+    task_id, completed_at, event_id = _cli_clear_terminal_card(board)
+    with kb.scoped_current_board(board):
+        out = kc.run_slash(
+            f"clear-terminal-state {task_id} "
+            f"--expected-completed-at {completed_at} "
+            "--expected-phase development "
+            f"--expected-latest-event-id {event_id + 1} "
+            "--actor operator --reason 'stale event'"
+        )
+    assert "cannot clear terminal state" in out
+    assert "preserve CLI evidence" not in out
+    with kb.connect(board=board) as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "done" and task.completed_at == completed_at
