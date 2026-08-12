@@ -79,6 +79,32 @@ class TestFormatForInjection:
         assert "Working" in text
         assert "context compression" in text.lower()
 
+    def test_injection_preserves_each_active_items_rationale(self):
+        store = TodoStore()
+        store.write([
+            {
+                "id": "remove",
+                "content": "Remove the checkout route",
+                "status": "pending",
+                "rationale": "User requested removal before provenance was checked",
+            },
+        ])
+
+        text = store.format_for_injection()
+
+        assert "Basis: User requested removal before provenance was checked" in text
+
+    def test_injection_pauses_legacy_items_without_a_rationale(self):
+        store = TodoStore()
+        store.write([
+            {"id": "remove", "content": "Remove the checkout route", "status": "pending"},
+        ])
+
+        text = store.format_for_injection()
+
+        assert "basis was not preserved" in text.lower()
+        assert "revalidate it before acting" in text.lower()
+
 
 class TestMergeMode:
     def test_update_existing_by_id(self):
@@ -122,6 +148,23 @@ class TestMergeMode:
             {"id": "2", "content": "Verify freed space", "status": "pending"},
         ]
 
+    def test_content_update_without_new_rationale_discards_stale_basis(self):
+        store = TodoStore()
+        store.write([{
+            "id": "1",
+            "content": "Trace route provenance",
+            "status": "in_progress",
+            "rationale": "Need to learn whether the task created it",
+        }])
+
+        store.write(
+            [{"id": "1", "content": "Remove route", "status": "pending"}],
+            merge=True,
+        )
+
+        assert "rationale" not in store.read()[0]
+        assert "basis was not preserved" in store.format_for_injection().lower()
+
 
 class TestTodoToolFunction:
     def test_read_mode(self):
@@ -155,6 +198,21 @@ class TestTodoStoreBounds:
         item = store.read()[0]
         assert len(item["content"]) <= MAX_TODO_CONTENT_CHARS
         assert item["content"].endswith("… [truncated]")
+
+    def test_oversized_rationale_is_truncated(self):
+        from tools.todo_tool import MAX_TODO_RATIONALE_CHARS
+
+        store = TodoStore()
+        store.write([{
+            "id": "1",
+            "content": "task",
+            "status": "pending",
+            "rationale": "R" * 5000,
+        }])
+
+        rationale = store.read()[0]["rationale"]
+        assert len(rationale) == MAX_TODO_RATIONALE_CHARS
+        assert rationale.endswith("… [truncated]")
 
     def test_injection_block_is_bounded(self):
         from tools.todo_tool import MAX_TODO_CONTENT_CHARS

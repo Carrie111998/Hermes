@@ -582,7 +582,7 @@ def _skill_pruned_marker(skill_name: str) -> str:
     """
     return (
         f"{SKILL_PRUNED_MARKER_PREFIX} content lost in compression; "
-        f"reload with skill_view(name='{skill_name}')]"
+        f"reload with skill_view(name='{skill_name}') before any further action]"
     )
 
 

@@ -29,6 +29,7 @@ VALID_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
 # re-injection block. Generous relative to real plans — a todo item is a short
 # task description, and active lists are a handful of items, not hundreds.
 MAX_TODO_CONTENT_CHARS = 4000
+MAX_TODO_RATIONALE_CHARS = 500
 MAX_TODO_ITEMS = 256
 # Upper bound on a single todo tool-result payload accepted during history
 # hydration. The gateway/API server replays caller-supplied conversation
@@ -51,6 +52,7 @@ class TodoStore:
       - id: unique string identifier (agent-chosen)
       - content: task description
       - status: pending | in_progress | completed | cancelled
+      - rationale: optional one-line basis that must survive compression
     """
 
     def __init__(self):
@@ -81,11 +83,18 @@ class TodoStore:
                 if item_id in existing:
                     # Update only the fields the LLM actually provided
                     if "content" in t and t["content"]:
-                        existing[item_id]["content"] = self._cap_content(str(t["content"]).strip())
+                        next_content = self._cap_content(str(t["content"]).strip())
+                        if next_content != existing[item_id]["content"] and not t.get("rationale"):
+                            existing[item_id].pop("rationale", None)
+                        existing[item_id]["content"] = next_content
                     if "status" in t and t["status"]:
                         status = str(t["status"]).strip().lower()
                         if status in VALID_STATUSES:
                             existing[item_id]["status"] = status
+                    if "rationale" in t and t["rationale"]:
+                        existing[item_id]["rationale"] = self._cap_rationale(
+                            str(t["rationale"]).strip()
+                        )
                 else:
                     # New item -- validate fully and append to end
                     validated = self._validate(t)
@@ -146,6 +155,13 @@ class TodoStore:
         for item in active_items:
             marker = markers.get(item["status"], "[?]")
             lines.append(f"- {marker} {item['id']}. {item['content']} ({item['status']})")
+            rationale = item.get("rationale")
+            if rationale:
+                lines.append(f"  Basis: {rationale}")
+            else:
+                lines.append(
+                    "  Basis was not preserved. Revalidate it before acting."
+                )
 
         return "\n".join(lines)
 
@@ -161,6 +177,14 @@ class TodoStore:
             keep = MAX_TODO_CONTENT_CHARS - len(_TRUNCATION_MARKER)
             return content[:keep] + _TRUNCATION_MARKER
         return content
+
+    @staticmethod
+    def _cap_rationale(rationale: str) -> str:
+        """Keep provenance useful without letting it duplicate large context."""
+        if len(rationale) > MAX_TODO_RATIONALE_CHARS:
+            keep = MAX_TODO_RATIONALE_CHARS - len(_TRUNCATION_MARKER)
+            return rationale[:keep] + _TRUNCATION_MARKER
+        return rationale
 
     @staticmethod
     def _validate(item: Dict[str, Any]) -> Dict[str, str]:
@@ -187,7 +211,11 @@ class TodoStore:
         if status not in VALID_STATUSES:
             status = "pending"
 
-        return {"id": item_id, "content": content, "status": status}
+        validated = {"id": item_id, "content": content, "status": status}
+        rationale = str(item.get("rationale", "")).strip()
+        if rationale:
+            validated["rationale"] = TodoStore._cap_rationale(rationale)
+        return validated
 
     @staticmethod
     def _dedupe_by_id(todos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -302,7 +330,10 @@ TODO_SCHEMA = {
         "- merge=false (default): replace the entire list with a fresh plan\n"
         "- merge=true: update existing items by id, add any new ones\n\n"
         "Each item: {id: string, content: string, "
-        "status: pending|in_progress|completed|cancelled}\n"
+        "status: pending|in_progress|completed|cancelled, rationale?: string}\n"
+        "For new or materially revised items, include a short rationale that "
+        "records the user request, finding, or decision that justifies the item. "
+        "This basis is preserved with active items across compression.\n"
         "List order is priority. Only ONE item in_progress at a time.\n"
         "Mark items completed immediately when done. If something fails, "
         "cancel it and add a revised item.\n\n"
@@ -329,6 +360,13 @@ TODO_SCHEMA = {
                             "type": "string",
                             "enum": ["pending", "in_progress", "completed", "cancelled"],
                             "description": "Current status"
+                        },
+                        "rationale": {
+                            "type": "string",
+                            "description": (
+                                "Short basis for the task (user request, finding, or "
+                                "decision), preserved across context compression"
+                            )
                         }
                     },
                     "required": ["id", "content", "status"]
