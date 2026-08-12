@@ -146,6 +146,7 @@ export function reportMarketEquivalent(report: UsageReport): number | null {
       : null
 
   if (
+    (!estimated && !included && !unknown) ||
     report.totals.cost == null ||
     (unknown?.sessions ?? 0) > 0 ||
     (report.totals.unknown_cost_sessions ?? 0) > 0 ||

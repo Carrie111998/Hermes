@@ -691,7 +691,12 @@ class InsightsEngine:
             )
             stored = raw.get("estimated_cost_usd")
             status = raw.get("cost_status")
-            if stored is not None and (
+            if status == "unknown":
+                # Unknown is an explicit absence-of-complete-evidence state.
+                # A legacy/stale numeric column must neither leak as a partial
+                # estimate nor trigger repricing from the same incomplete row.
+                estimated = 0.0
+            elif stored is not None and (
                 raw.get("_estimated_cost_reconciled")
                 or status or raw.get("cost_source") or float(stored) > 0
             ):

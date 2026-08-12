@@ -397,6 +397,31 @@ class TestInsightsAuxTotals:
         assert sum(model["cost"] for model in report["models"]) == pytest.approx(12.5)
         assert sum(day["estimated_cost_usd"] for day in report["daily_series"]) == pytest.approx(12.5)
 
+    def test_unknown_cost_row_does_not_surface_stored_partial_estimate(self, db):
+        """An explicitly unknown route cannot expose a numeric estimate."""
+        from agent.insights import InsightsEngine
+
+        db.create_session("unknown-cost", source="cli")
+        db.update_token_counts(
+            "unknown-cost",
+            model="model",
+            billing_provider="custom",
+            input_tokens=100,
+            estimated_cost_usd=1.0,
+            cost_status="unknown",
+            api_call_count=1,
+        )
+        db.flush_token_counts()
+
+        report = InsightsEngine(db).generate(days=30)
+        model = next(row for row in report["models"] if row["model"] == "model")
+        unknown = report["overview"]["cost_buckets"]["unknown"]
+
+        assert model["cost_status"] == "unknown"
+        assert model["cost"] == 0.0
+        assert unknown["cost_usd"] == 0.0
+        assert report["overview"]["estimated_cost"] == 0.0
+
     def test_mixed_included_and_estimated_session_keeps_complete_market_value(self, db):
         """A priced aux row must not hide the included main route's list value."""
         from agent.insights import InsightsEngine

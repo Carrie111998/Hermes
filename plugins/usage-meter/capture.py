@@ -52,14 +52,14 @@ def _int_bucket(usage: Dict[str, Any], *keys: str) -> Optional[int]:
     for key in keys:
         if key not in usage:
             continue
-        if usage[key] is None:
+        raw = usage[key]
+        if isinstance(raw, bool):
             return None
-        try:
-            value = int(usage[key])
-        except (TypeError, ValueError):
+        if not isinstance(raw, int):
             return None
+        value = raw
         return value if value >= 0 else None
-    return 0
+    return None
 
 
 def _price_event(

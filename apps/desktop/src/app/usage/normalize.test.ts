@@ -172,6 +172,27 @@ describe('normalizeUsageOverview', () => {
     expect(report.totals.skill_calls).toBeNull()
   })
 
+  it('keeps market equivalent unavailable when all cost buckets are absent', () => {
+    const report = normalizeUsageOverview({
+      ...usageOverviewFixture,
+      overview: {
+        ...usageOverviewFixture.overview,
+        estimated_cost: 12.5,
+        included_cost_sessions: undefined,
+        unknown_cost_sessions: undefined,
+        cost_buckets: undefined
+      }
+    })
+
+    expect(report.totals.cost).toBe(12.5)
+    expect(report.totals.cost_buckets).toEqual({
+      estimated: null,
+      included: null,
+      unknown: null
+    })
+    expect(reportMarketEquivalent(report)).toBeNull()
+  })
+
   it('fails closed when included-session evidence exists without its comparison bucket', () => {
     const report = normalizeUsageOverview({
       ...usageOverviewFixture,

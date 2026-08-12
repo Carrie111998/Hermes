@@ -156,3 +156,49 @@ def test_skip_malformed_usage_callback(meter_db: Path):
         usage={"input_tokens": "not-a-number"},
     )
     assert mod.meter_recent(limit=5)["events"] == []
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"input_tokens": 11},
+        {
+            "input_tokens": "11",
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+        },
+        {
+            "input_tokens": 1.9,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+        },
+        {
+            "input_tokens": True,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+        },
+    ],
+    ids=[
+        "incomplete-vector",
+        "numeric-string",
+        "fractional-token-count",
+        "boolean-token-count",
+    ],
+)
+def test_skip_incomplete_or_non_integer_usage_vector(meter_db: Path, usage: dict):
+    """Unavailable token evidence must not be coerced into a priced event."""
+    mod = usage_meter_api._load()
+
+    usage_meter_api.on_post_api_request(
+        model="gpt-5.6-sol",
+        provider="openai",
+        usage=usage,
+    )
+
+    assert mod.meter_recent(limit=5)["events"] == []
