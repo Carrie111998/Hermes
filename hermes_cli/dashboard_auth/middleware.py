@@ -463,7 +463,8 @@ async def gated_auth_middleware(
         # serve the request transparently; only after every provider rejects
         # the RT do we fall through to clear-and-relogin.
         try:
-            refreshed = _attempt_refresh(
+            refreshed = await asyncio.to_thread(
+                _attempt_refresh,
                 request,
                 refresh_token=_rt,
                 provider_hint=provider_hint,
@@ -564,6 +565,10 @@ def _attempt_refresh(request: Request, *, refresh_token, provider_hint: str | No
     no RT or every reachable provider rejects it. If no provider succeeds and
     at least one raised ``ProviderError``, re-raises with that provider's name
     so the caller can return 503 without clearing potentially valid cookies.
+
+    Blocking: performs provider IDP I/O (``refresh_session`` is a token-endpoint
+    round trip). Callers on the event loop must invoke it through
+    ``asyncio.to_thread``.
     """
     if not refresh_token:
         return None
