@@ -1944,6 +1944,13 @@ class TestConcurrentToolExecution:
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=agent.disabled_toolsets,
                 tool_request_middleware_trace=[],
+                runtime_identity={
+                    "provider": agent.provider,
+                    "model": agent.model,
+                    "api_mode": agent.api_mode,
+                    "session_id": agent.session_id,
+                    "source": "agent_runtime_after_provider_response",
+                },
             )
             assert result == "result"
 

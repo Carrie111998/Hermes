@@ -167,17 +167,24 @@ def _worker_run_id(task_id: str) -> Optional[int]:
 
 
 def _stamp_worker_session_metadata(
-    task_id: str, metadata: Optional[dict]
+    task_id: str,
+    metadata: Optional[dict],
+    *,
+    runtime_identity: Optional[dict] = None,
 ) -> Optional[dict]:
-    """Add trusted worker session id metadata for this worker's own task."""
+    """Add trusted worker session and actual runtime route metadata."""
     if os.environ.get("HERMES_KANBAN_TASK") != task_id:
         return metadata
     session_id = os.environ.get("HERMES_SESSION_ID")
-    if not session_id:
-        return metadata
     stamped = dict(metadata or {})
-    stamped["worker_session_id"] = session_id
-    return stamped
+    if session_id:
+        stamped["worker_session_id"] = session_id
+    if runtime_identity:
+        stamped["runtime_identity"] = {
+            key: str(runtime_identity.get(key) or "").strip()
+            for key in ("provider", "model", "api_mode", "session_id", "source")
+        }
+    return stamped or None
 
 
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
@@ -741,7 +748,9 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
-    metadata = _stamp_worker_session_metadata(tid, metadata)
+    metadata = _stamp_worker_session_metadata(
+        tid, metadata, runtime_identity=kw.get("runtime_identity")
+    )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -832,6 +841,9 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    metadata = _stamp_worker_session_metadata(
+        tid, None, runtime_identity=kw.get("runtime_identity")
+    )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -870,6 +882,7 @@ def _handle_block(args: dict, **kw) -> str:
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id(tid),
+                metadata=metadata,
             )
             if not ok:
                 return tool_error(
@@ -926,7 +939,9 @@ def _handle_request_review(args: dict, **kw) -> str:
             metadata = json.loads(metadata_json)
         except json.JSONDecodeError:
             return tool_error("metadata could not be safely serialized")
-    metadata = _stamp_worker_session_metadata(tid, metadata)
+    metadata = _stamp_worker_session_metadata(
+        tid, metadata, runtime_identity=kw.get("runtime_identity")
+    )
     reviewer = args.get("reviewer") or None
     if reviewer:
         # Model-supplied free text stored durably on the event payload —
@@ -990,6 +1005,9 @@ def _handle_request_changes(args: dict, **kw) -> str:
     if not reason or not str(reason).strip():
         return tool_error("reason is required — describe the changes needed")
     reason = redact_sensitive_text(str(reason), force=True)
+    metadata = _stamp_worker_session_metadata(
+        tid, None, runtime_identity=kw.get("runtime_identity")
+    )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -999,6 +1017,7 @@ def _handle_request_changes(args: dict, **kw) -> str:
                 tid,
                 reason=reason,
                 expected_run_id=_worker_run_id(tid),
+                metadata=metadata,
             )
             if not ok:
                 return tool_error(
