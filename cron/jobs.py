@@ -298,6 +298,12 @@ def _jobs_lock():
 
     with _jobs_file_lock:
         _jobs_lock_state.depth = 1
+        # Stamp of jobs.json as of this section's load_jobs() (#80703's
+        # fast-path, credit @JoaoMarcos44): lets _save_jobs_unlocked skip the
+        # shrink-merge parse when the file provably hasn't changed since this
+        # section read it. Reset on entry/exit so stale stamps from unlocked
+        # loads or prior sections can never suppress a needed merge.
+        _jobs_lock_state.load_stamp = None
         lock_fd = None
         try:
             try:
@@ -363,6 +369,7 @@ def _jobs_lock():
                         lock_fd.close()
         finally:
             _jobs_lock_state.depth = 0
+            _jobs_lock_state.load_stamp = None
 
 # Fields on a cron job that must never change after creation. ``id`` is used
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
@@ -464,12 +471,53 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     normalized["name"] = name
     normalized["schedule_display"] = _schedule_display_for_job(normalized)
 
-    state = _coerce_job_text(normalized.get("state")).strip()
-    if not state:
-        state = "scheduled" if normalized.get("enabled", True) else "paused"
-    normalized["state"] = state
+    # Display state is derived from the scheduler-honoured ``enabled`` flag so a
+    # half-paused record (enabled=true + state/paused_at) cannot render as
+    # "paused" while the fleet is still live. See effective_job_state().
+    normalized["state"] = effective_job_state(normalized)
 
     return normalized
+
+
+def _has_pause_marker(job: Dict[str, Any]) -> bool:
+    """True when the record carries any operator-facing pause signal."""
+    if _coerce_job_text(job.get("state")).strip() == "paused":
+        return True
+    return bool(job.get("paused_at"))
+
+
+def is_job_runnable(job: Dict[str, Any]) -> bool:
+    """True iff the scheduler may fire this job.
+
+    ``enabled`` is the scheduler-honoured flag. Pause markers (``state`` /
+    ``paused_at``) are a second gate so a contradictory half-paused record
+    never fires even before self-heal runs.
+    """
+    if not job.get("enabled", True):
+        return False
+    if _has_pause_marker(job):
+        return False
+    return True
+
+
+def effective_job_state(job: Dict[str, Any]) -> str:
+    """Operator-facing state derived from the scheduler-honoured flag.
+
+    A job with ``enabled=true`` must never display as paused — that was the
+    07-30 outage failure mode (list looked frozen, fleet kept merging).
+    Terminal states (completed/error) are preserved regardless of enabled.
+    """
+    stored = _coerce_job_text(job.get("state")).strip()
+    if stored in {"completed", "error"}:
+        return stored
+    if not job.get("enabled", True):
+        if _has_pause_marker(job) or stored == "paused":
+            return "paused"
+        return stored or "paused"
+    # enabled=true is authoritative: never claim paused
+    if stored == "paused" or job.get("paused_at"):
+        return "scheduled"
+    return stored or "scheduled"
 
 
 def _secure_dir(path: Path):
@@ -1499,6 +1547,36 @@ def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Opti
     )
 
 
+def _validate_job_mode_invariants(
+    monitor_script: Optional[str],
+    monitor_url: Optional[str],
+    no_agent: bool,
+    script: Optional[str],
+) -> None:
+    """Shared create/update validation for job execution-mode invariants.
+
+    ONE owner for the class: create_job and update_job both call this so an
+    invariant enforced at create time cannot be violated through the update
+    door (monitor jobs silently degrading when no_agent is flipped on, etc.).
+    """
+    if monitor_script and monitor_url:
+        raise ValueError(
+            "monitor_script and monitor_url are mutually exclusive — a job "
+            "can only have one monitor source."
+        )
+    if (monitor_script or monitor_url) and no_agent:
+        raise ValueError(
+            "monitor_script/monitor_url cannot be combined with no_agent=True — "
+            "the whole point of a monitor job is to suppress or wake the AGENT "
+            "based on source changes. Use a plain no_agent script job instead."
+        )
+    if no_agent and not script:
+        raise ValueError(
+            "no_agent=True requires a script — with no agent and no script "
+            "there is nothing for the job to run."
+        )
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1517,6 +1595,8 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    monitor_script: Optional[str] = None,
+    monitor_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1561,6 +1641,19 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        monitor_script: Optional path to a cheap monitor source script (same
+                resolution/containment rules as ``script``: relative to
+                ~/.hermes/scripts/, .sh/.bash via bash, else Python). Each
+                tick the script runs FIRST and its output is hashed as exact
+                bytes: unchanged output suppresses the agent run entirely
+                (recorded as a silent 'no_change' tick); changed output
+                injects a MONITOR CHANGE DETECTED block (unified diff + new
+                output) into the prompt before a normal agent run. Scripts
+                should emit stable output (no timestamps). Mutually exclusive
+                with ``monitor_url``; incompatible with ``no_agent=True``.
+        monitor_url: Optional http(s) URL used as the monitor source instead
+                of a script — fetched with a bounded GET each tick. Same
+                hash-suppression semantics as ``monitor_script``.
 
     Returns:
         The created job dict
@@ -1593,15 +1686,23 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_monitor_script = str(monitor_script).strip() if isinstance(monitor_script, str) else None
+    normalized_monitor_script = normalized_monitor_script or None
+    normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
+    normalized_monitor_url = normalized_monitor_url or None
 
+    # Monitor-mode validation: exactly one source, and monitor mode only
+    # makes sense when there IS an agent to suppress/wake.
     # no_agent jobs are meaningless without a script — the script IS the job.
-    # Surface this as a clear ValueError at create time so bad configs never
-    # reach the scheduler.
-    if normalized_no_agent and not normalized_script:
-        raise ValueError(
-            "no_agent=True requires a script — with no agent and no script "
-            "there is nothing for the job to run."
-        )
+    # Surface these as clear ValueErrors at create time so bad configs never
+    # reach the scheduler (shared with update_job, see
+    # _validate_job_mode_invariants).
+    _validate_job_mode_invariants(
+        normalized_monitor_script,
+        normalized_monitor_url,
+        normalized_no_agent,
+        normalized_script,
+    )
 
     # Normalize context_from: accept str or list of str, store as list or None
     if isinstance(context_from, str):
@@ -1660,6 +1761,11 @@ def create_job(
         "base_url": normalized_base_url,
         "script": normalized_script,
         "no_agent": normalized_no_agent,
+        "monitor_script": normalized_monitor_script,
+        "monitor_url": normalized_monitor_url,
+        # Hash-suppression state for monitor jobs: {"last_output_hash": ...,
+        # "last_changed_at": ...}. None until the first monitor tick.
+        "monitor_state": None,
         "context_from": context_from,
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),
@@ -1786,8 +1892,33 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
 
+            # Normalize monitor fields the same way create_job does (empty
+            # string clears the field).
+            for _mon_field in ("monitor_script", "monitor_url"):
+                if _mon_field in updates:
+                    _mv = updates[_mon_field]
+                    _mv = str(_mv).strip() if isinstance(_mv, str) else None
+                    updates[_mon_field] = _mv or None
+
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+
+            # Re-check execution-mode invariants on the MERGED record when
+            # any participating field changes, so create-time invariants
+            # can't be violated through the update door (e.g. flipping
+            # no_agent=True on a monitor job would silently disable the
+            # monitor: the scheduler's no_agent short-circuit runs before
+            # the monitor gate). Scoped to changed fields so legacy records
+            # untouched by this update keep loading.
+            if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
+                _upd_script = updated.get("script")
+                _upd_script = str(_upd_script).strip() if isinstance(_upd_script, str) else None
+                _validate_job_mode_invariants(
+                    updated.get("monitor_script") or None,
+                    updated.get("monitor_url") or None,
+                    bool(updated.get("no_agent")),
+                    _upd_script or None,
+                )
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
@@ -1934,16 +2065,63 @@ def remove_job(job_id: str) -> bool:
             # left over from before the create-time guard) fails closed without
             # half-applying the removal.
             job_output_dir = _job_output_dir(canonical_id)
-            save_jobs(jobs)
+            save_jobs(jobs, removed_ids={canonical_id})
             # Clean up output directory to prevent orphaned dirs accumulating
             if job_output_dir.exists():
                 shutil.rmtree(job_output_dir)
+            # Clean up the job's durable notepad (cron/notepad.db) — without
+            # this, removed jobs orphan their KV rows forever. Best effort:
+            # a notepad failure must never block the removal itself.
+            try:
+                from cron.notepad import clear_notepad
+                clear_notepad(canonical_id)
+            except Exception:
+                logger.debug(
+                    "Failed to clear notepad for removed job %s",
+                    canonical_id, exc_info=True,
+                )
             return True
     return False
 
 
+def _set_preflight_alerted(job_id: str, value: bool) -> bool:
+    """Set/clear the preflight alert-dedup marker; return the PRIOR value.
+
+    The marker records that the operator was already alerted about this
+    job's blocked configuration, so the scheduler alerts exactly once and
+    stays silent on subsequent ticks until the config heals (same
+    alert-once shape as the dead-pin auto-pause in #73506). Persisted on
+    the job record so the dedup survives gateway restarts.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job["id"] == job_id:
+                prior = bool(job.get("preflight_alerted"))
+                if value:
+                    job["preflight_alerted"] = True
+                else:
+                    job.pop("preflight_alerted", None)
+                if prior != value:
+                    jobs[i] = job
+                    save_jobs(jobs)
+                return prior
+    return False
+
+
+def mark_preflight_alerted(job_id: str) -> bool:
+    """Mark the job as preflight-alerted; return True if it already was."""
+    return _set_preflight_alerted(job_id, True)
+
+
+def clear_preflight_alerted(job_id: str) -> None:
+    """Clear the preflight alert-dedup marker (config validates again)."""
+    _set_preflight_alerted(job_id, False)
+
+
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 status: Optional[str] = None):
     """
     Mark a job as having been run.
     
@@ -1952,6 +2130,12 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+
+    ``status`` overrides the derived ``last_status`` ("ok"/"error") with a
+    specific terminal status for this run — e.g. ``"blocked_config"`` when
+    the pre-dispatch configuration validation refused to run the agent
+    (T1-26), so `cronjob list` distinguishes "your config is broken" from
+    "the run itself failed".
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -1959,8 +2143,13 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
             if job["id"] == job_id:
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
-                job["last_status"] = "ok" if success else "error"
+                job["last_status"] = status or ("ok" if success else "error")
                 job["last_error"] = error if not success else None
+                # A healthy run means the configuration validates again — drop
+                # the preflight alert-dedup marker so a FUTURE config break
+                # re-alerts instead of being silently swallowed.
+                if success:
+                    job.pop("preflight_alerted", None)
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
                 # Clear any external-fire claim so a re-armed recurring job can
@@ -1994,8 +2183,19 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
                     # Check if we've hit the repeat limit
                     if times is not None and times > 0 and completed >= times:
-                        # Remove the job (limit reached)
-                        jobs.pop(i)
+                        # Limit reached: retain the record as a terminal
+                        # completion instead of popping it. Deleting the job
+                        # here discarded the last_status / last_error /
+                        # last_delivery_error written above — a finished
+                        # one-shot vanished from `cronjob list` with no
+                        # inspectable outcome, and a failed delivery was
+                        # invisible. Mirror the terminal shape of the
+                        # next_run_at-is-None branch below; the retention
+                        # sweep prunes these after
+                        # COMPLETED_ONESHOT_RETENTION_DAYS.
+                        job["enabled"] = False
+                        job["state"] = "completed"
+                        job["next_run_at"] = None
                         save_jobs(jobs)
                         return
                 
@@ -2113,13 +2313,29 @@ def claim_dispatch(job_id: str) -> bool:
                 return True  # infinite — always dispatch
             completed = repeat.get("completed", 0)
             if completed >= times:
-                # Already dispatched the max number of times (e.g. a prior
-                # tick claimed then died before mark_job_run could remove it).
-                # Clean up so it stops appearing as due on every tick.
+                # Already dispatched the max number of times.
+                if job.get("last_run_at") is not None:
+                    # A prior run completed normally (e.g. mark_job_run raced
+                    # with this tick). Retain the terminal record — same shape
+                    # as mark_job_run's repeat-limit branch — instead of
+                    # deleting the job and its final status/delivery error.
+                    job["enabled"] = False
+                    job["state"] = "completed"
+                    job["next_run_at"] = None
+                    save_jobs(jobs)
+                    logger.info(
+                        "Job '%s': dispatch limit reached (%d/%d) — marking completed",
+                        job.get("name", job.get("id", "?")),
+                        completed,
+                        times,
+                    )
+                    return False
+                # A prior tick claimed the dispatch then died before the run
+                # completed (#73973) — a genuinely wedged claim. Remove it so
+                # it stops appearing as due, and leave an operator-visible
+                # diagnostic instead of vanishing silently.
                 jobs.pop(i)
-                save_jobs(jobs)
-                # If the claimed run never completed (#73973), leave an
-                # operator-visible diagnostic instead of vanishing silently.
+                save_jobs(jobs, removed_ids={job_id})
                 _write_wedged_oneshot_diagnostic(job)
                 logger.info(
                     "Job '%s': dispatch limit reached (%d/%d) — removing",
@@ -2179,6 +2395,43 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
     return False
 
 
+def advance_next_runs(job_ids) -> int:
+    """Batch form of :func:`advance_next_run` for the due-dispatch loop.
+
+    One ``load_jobs()`` + at most one ``save_jobs()`` for the whole due
+    set, instead of one of each per job — the per-job form costs
+    O(N loads + N saves) for N due jobs (~110 ms at N=50, measured), the
+    batch form O(1 + 1) (~2 ms). ``job_ids`` may contain ids of one-shot
+    or unknown jobs; they are skipped exactly as the per-job form skips
+    them. Returns the number of jobs whose ``next_run_at`` was advanced.
+
+    Crash semantics: the batch persists once at the end, so a crash
+    mid-batch re-fires the whole set on restart (at-least-once burst)
+    rather than advancing a prefix — acceptable given the sub-10ms window,
+    and identical to the per-job form once the batch completes.
+    """
+    ids = set(job_ids)
+    if not ids:
+        return 0
+    with _jobs_lock():
+        jobs = load_jobs()
+        now = _hermes_now().isoformat()
+        advanced = 0
+        for job in jobs:
+            if job["id"] not in ids:
+                continue
+            kind = job.get("schedule", {}).get("kind")
+            if kind not in {"cron", "interval"}:
+                continue
+            new_next = compute_next_run(job["schedule"], now)
+            if new_next and new_next != job.get("next_run_at"):
+                job["next_run_at"] = new_next
+                advanced += 1
+        if advanced:
+            save_jobs(jobs)
+        return advanced
+
+
 def advance_next_run(job_id: str) -> bool:
     """Preemptively advance next_run_at for a recurring job before execution.
 
@@ -2191,21 +2444,9 @@ def advance_next_run(job_id: str) -> bool:
 
     Returns True if next_run_at was advanced, False otherwise.
     """
-    with _jobs_lock():
-        jobs = load_jobs()
-        for job in jobs:
-            if job["id"] == job_id:
-                kind = job.get("schedule", {}).get("kind")
-                if kind not in {"cron", "interval"}:
-                    return False
-                now = _hermes_now().isoformat()
-                new_next = compute_next_run(job["schedule"], now)
-                if new_next and new_next != job.get("next_run_at"):
-                    job["next_run_at"] = new_next
-                    save_jobs(jobs)
-                    return True
-                return False
-        return False
+    # >= 1 (not == 1): a corrupted jobs file with duplicate ids advances
+    # every matching record; the wrapper still reports the advance.
+    return advance_next_runs([job_id]) >= 1
 
 
 def _machine_id() -> str:
@@ -2251,7 +2492,9 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
         for job in jobs:
             if job["id"] != job_id:
                 continue
-            if not job.get("enabled", True) or job.get("state") == "paused":
+            # enabled + pause markers must both clear — a half-paused record
+            # (enabled=true, state=paused/paused_at set) must not claim.
+            if not is_job_runnable(job):
                 return False
             now = _hermes_now()
             existing = job.get("fire_claim")
@@ -2280,6 +2523,92 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
         return False
 
 
+# Completed one-shot job records are retained in jobs.json (final status +
+# delivery error stay inspectable via `cronjob list`) instead of being deleted
+# at completion, then pruned by _sweep_completed_oneshots once they age out.
+COMPLETED_ONESHOT_RETENTION_DAYS = 7
+
+
+def _completed_oneshot_retention_days() -> float:
+    """Resolve the completed one-shot retention window from config.
+
+    ``cron.completed_retention_days`` (number, default
+    ``COMPLETED_ONESHOT_RETENTION_DAYS``). A non-positive value disables the
+    sweep, retaining completed one-shot records indefinitely.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        return float(
+            cron_cfg.get(
+                "completed_retention_days", COMPLETED_ONESHOT_RETENTION_DAYS
+            )
+        )
+    except Exception:
+        return float(COMPLETED_ONESHOT_RETENTION_DAYS)
+
+
+def _sweep_completed_oneshots(
+    raw_jobs: List[Dict[str, Any]],
+    now: datetime,
+    *,
+    removed_ids: Optional[Set[str]] = None,
+) -> bool:
+    """Prune terminal ``state == "completed"`` one-shot records past retention.
+
+    Mutates *raw_jobs* in place; returns True when anything was removed (the
+    caller persists). Ids removed are added to *removed_ids* when provided so
+    ``save_jobs``'s shrink-merge guard (#80624) allows the intentional delete.
+    Only one-shot (``schedule.kind == "once"``) records in the terminal
+    completed state are candidates; recurring jobs and non-terminal one-shots
+    are never touched. Age is measured from ``last_run_at`` — a completed
+    record without a parseable ``last_run_at`` is kept (never guess a record
+    into deletion).
+    """
+    retention_days = _completed_oneshot_retention_days()
+    if retention_days <= 0:
+        return False
+    cutoff = now - timedelta(days=retention_days)
+    removed = False
+    for rj in list(raw_jobs):
+        try:
+            if rj.get("state") != "completed":
+                continue
+            schedule = rj.get("schedule")
+            kind = schedule.get("kind") if isinstance(schedule, dict) else None
+            if kind != "once":
+                continue
+            last_run = rj.get("last_run_at")
+            if not isinstance(last_run, str):
+                continue
+            try:
+                last_run_dt = _ensure_aware(datetime.fromisoformat(last_run))
+            except Exception:
+                continue
+            if last_run_dt >= cutoff:
+                continue
+            raw_jobs.remove(rj)
+            removed = True
+            rid = rj.get("id")
+            if removed_ids is not None and rid:
+                removed_ids.add(str(rid))
+            logger.info(
+                "Job '%s': pruning completed one-shot record "
+                "(finished %s, retention %.1f days)",
+                rj.get("name", rj.get("id", "?")),
+                last_run,
+                retention_days,
+            )
+        except Exception:
+            logger.debug(
+                "Retention sweep skipped malformed job record %r",
+                rj.get("id", "?"),
+                exc_info=True,
+            )
+    return removed
+
+
 def get_due_jobs() -> List[Dict[str, Any]]:
     """Get all jobs that are due to run now.
 
@@ -2303,6 +2632,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     now = _hermes_now()
     raw_jobs = load_jobs()
     needs_save = False
+    intentionally_removed: Set[str] = set()
 
     # Repair id-less records BEFORE anything keys off ``job["id"]``. A direct
     # jobs.json edit that bypassed add_job() can leave a record without an "id"
@@ -2399,6 +2729,15 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     # (derived from HERMES_CRON_TIMEOUT). See _oneshot_run_claim_ttl_seconds.
     _run_claim_ttl = _oneshot_run_claim_ttl_seconds()
 
+    # Retention sweep: completed one-shots are retained (so their final
+    # status / delivery error stay inspectable via `cronjob list`) instead of
+    # being deleted on completion, but they must not accumulate in jobs.json
+    # forever. Prune terminal one-shot records older than the retention
+    # window each scan.
+    if _sweep_completed_oneshots(raw_jobs, now, removed_ids=intentionally_removed):
+        needs_save = True
+        jobs = [j for j in jobs if any(rj.get("id") == j.get("id") for rj in raw_jobs)]
+
     for job in jobs:
         # Per-job containment (structural guard): one malformed or
         # unexpected job record must never abort the whole scan. The id /
@@ -2408,6 +2747,34 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         # state still reaches save_jobs() below.
         try:
             if not job.get("enabled", True):
+                continue
+
+            # Contradiction self-heal: enabled=true with pause markers means the
+            # operator believes the job is frozen while the scheduler would still
+            # fire it (07-30 outage). Refuse to run and force enabled=false so
+            # the next list/report is honest. Log loudly — this should be rare
+            # after pause_job sets both fields atomically.
+            if _has_pause_marker(job):
+                jid = job.get("id")
+                logger.error(
+                    "Job '%s' (%s) has pause markers while enabled=true; "
+                    "self-disabling so it cannot fire (pause must be authoritative).",
+                    job.get("name", jid),
+                    jid,
+                )
+                for rj in raw_jobs:
+                    if rj.get("id") != jid:
+                        continue
+                    rj["enabled"] = False
+                    rj["state"] = "paused"
+                    if not rj.get("paused_at"):
+                        rj["paused_at"] = now.isoformat()
+                    if not rj.get("paused_reason"):
+                        rj["paused_reason"] = (
+                            "auto-disabled: enabled+paused contradiction"
+                        )
+                    needs_save = True
+                    break
                 continue
 
             # Cross-process running-claim guard (#59229): if another scheduler
@@ -2592,6 +2959,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                             for rj in raw_jobs:
                                 if rj["id"] == job["id"]:
                                     raw_jobs.remove(rj)
+                                    intentionally_removed.add(str(rj["id"]))
                                     needs_save = True
                                     break
                             # The claimed run never completed here by
@@ -2635,7 +3003,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             continue
 
     if needs_save:
-        save_jobs(raw_jobs)
+        save_jobs(raw_jobs, removed_ids=intentionally_removed or None)
 
     return due
 
@@ -2723,6 +3091,33 @@ def save_job_output(job_id: str, output: str):
 # Skill reference rewriting (curator integration)
 # =============================================================================
 
+def _canonical_skill_ref(raw: Any) -> str:
+    """Reduce one job skill reference to the bare name the curator matches on.
+
+    A job may store an absolute path under ``HERMES_HOME/skills`` or an
+    external skills dir; the scheduler resolves those through
+    ``normalize_skill_lookup_name`` before handing them to ``skill_view``.
+    The curator compares this set against bare skill names, so it has to
+    resolve them the same way — otherwise a path-referencing job's skill
+    looks unreferenced and gets archived out from under it.
+
+    Best-effort: if the resolver is unavailable or rejects the value, fall
+    back to the plain cleanup so a broken import can never lose a name.
+    """
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    try:
+        from agent.skill_utils import normalize_skill_lookup_name
+        value = normalize_skill_lookup_name(value) or value
+    except Exception:
+        logger.debug(
+            "referenced_skill_names: could not normalize skill ref %r", raw,
+            exc_info=True,
+        )
+    return value.strip().lstrip("/")
+
+
 def referenced_skill_names() -> Set[str]:
     """Return the set of skill names referenced by ANY cron job.
 
@@ -2731,6 +3126,9 @@ def referenced_skill_names() -> Set[str]:
     resuming it must still find its skills present. The curator uses this
     set to protect referenced skills from inactivity archival — a skill a
     live job depends on is "in use" regardless of when it was last loaded.
+
+    Names are canonicalized the way the scheduler resolves them at load
+    time, so a job that stores an absolute skill path is protected too.
 
     Best-effort: a corrupt/unreadable jobs store returns an empty set
     rather than raising, so a cron issue can never break the curator.
@@ -2746,7 +3144,7 @@ def referenced_skill_names() -> Set[str]:
         if not isinstance(job, dict):
             continue
         for name in _normalize_skill_list(job.get("skill"), job.get("skills")):
-            cleaned = str(name).strip().lstrip("/")
+            cleaned = _canonical_skill_ref(name)
             if cleaned:
                 names.add(cleaned)
     return names
