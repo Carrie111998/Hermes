@@ -1772,8 +1772,10 @@ def test_default_source_flow_creates_separate_child_worktree_from_parent_receipt
     child_id = child["task_id"]
 
     with kb.connect() as conn:
-        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent_id,))
-        conn.commit()
+        parent_task = kb.get_task(conn, parent_id)
+        child_task = kb.get_task(conn, child_id)
+        assert parent_task is not None and parent_task.status == "ready"
+        assert child_task is not None and child_task.status == "todo"
         claimed = kb.claim_task(conn, parent_id)
         assert claimed is not None and claimed.current_run_id is not None
         parent_run_id = claimed.current_run_id
@@ -1804,6 +1806,7 @@ def test_default_source_flow_creates_separate_child_worktree_from_parent_receipt
     assert parent_run is not None
     receipt = parent_run.metadata["source_completion_receipt"]
     assert receipt["run_id"] == parent_run_id
+    assert receipt["commit_sha"] == _git(parent_workspace, "rev-parse", "HEAD")
     assert completed.workspace_path == str(parent_workspace)
     assert _git(parent_workspace, "status", "--porcelain") == ""
 
@@ -1818,6 +1821,7 @@ def test_default_source_flow_creates_separate_child_worktree_from_parent_receipt
 
     assert child_workspace != parent_workspace
     assert (child_workspace / "parent.txt").read_text(encoding="utf-8") == "from parent\n"
+    assert _git(child_workspace, "rev-parse", "HEAD") == receipt["commit_sha"]
     assert _git(child_workspace, "status", "--porcelain") == ""
 
 
