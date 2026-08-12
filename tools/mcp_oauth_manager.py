@@ -134,6 +134,7 @@ def _oauth_config_fingerprint(oauth_config: Optional[dict]) -> str:
     """Fingerprint JSON OAuth settings; reject opaque values fail-closed."""
     if oauth_config is not None and not isinstance(oauth_config, dict):
         raise MCPAuthConfigurationError("OAuth configuration must be a JSON object")
+
     def _fingerprint_value(value: Any) -> Any:
         if callable(value):
             return {
@@ -183,9 +184,7 @@ def _effective_provider_fingerprint(
     effective_oauth.setdefault("client_name", "Hermes Agent")
     if not effective_oauth.get("token_endpoint_auth_method"):
         effective_oauth["token_endpoint_auth_method"] = (
-            "client_secret_post"
-            if effective_oauth.get("client_secret")
-            else "none"
+            "client_secret_post" if effective_oauth.get("client_secret") else "none"
         )
     effective_oauth.setdefault("redirect_host", "127.0.0.1")
     effective_oauth.setdefault("timeout", 300.0)
@@ -195,11 +194,8 @@ def _effective_provider_fingerprint(
         raise MCPAuthConfigurationError(
             "OAuth redirect_port must be an integer"
         ) from exc
-    effective_oauth["effective_redirect_uri"] = effective_oauth.get(
-        "redirect_uri"
-    ) or (
-        f"http://{effective_oauth['redirect_host']}:{effective_redirect_port}"
-        "/callback"
+    effective_oauth["effective_redirect_uri"] = effective_oauth.get("redirect_uri") or (
+        f"http://{effective_oauth['redirect_host']}:{effective_redirect_port}/callback"
     )
     effective_transport = {
         "connect_timeout": 60.0,
@@ -213,9 +209,10 @@ def _effective_provider_fingerprint(
         "strict_redirect_headers": False,
         **transport_options,
     }
-    return _oauth_config_fingerprint(
-        {"oauth": effective_oauth, "transport": effective_transport}
-    )
+    return _oauth_config_fingerprint({
+        "oauth": effective_oauth,
+        "transport": effective_transport,
+    })
 
 
 def _same_endpoint(a: str, b: str) -> bool:
@@ -387,6 +384,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             # providers) and require a full browser re-authorization.
             storage = self.context.storage
             from tools.mcp_oauth import HermesTokenStorage
+
             if (
                 isinstance(storage, HermesTokenStorage)
                 and self.context.oauth_metadata is None
@@ -406,10 +404,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             # Only runs when we have tokens on cold-load but no cached
             # metadata — i.e. the exact scenario where the SDK's built-in
             # 401-branch discovery hasn't had a chance to run yet.
-            if (
-                tokens is not None
-                and self.context.oauth_metadata is None
-            ):
+            if tokens is not None and self.context.oauth_metadata is None:
                 try:
                     await self._prefetch_oauth_metadata()
                 except Exception as exc:  # pragma: no cover — defensive
@@ -493,6 +488,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             }
             if options.get("strict_redirect_headers"):
                 from tools.mcp_oauth_manager import _StrictRedirectAsyncClient
+
                 client_kwargs["redirect_origin"] = httpx.URL(server_url)
                 client_kwargs["configured_header_names"] = {
                     key.lower() for key in configured_headers
@@ -517,7 +513,9 @@ def _make_hermes_provider_class() -> Optional[type]:
                     except httpx.HTTPError as exc:
                         logger.debug(
                             "MCP OAuth '%s': PRM discovery to %s failed: %s",
-                            self._hermes_server_name, url, exc,
+                            self._hermes_server_name,
+                            url,
+                            exc,
                         )
                         continue
                     prm = await handle_protected_resource_response(resp)
@@ -549,7 +547,9 @@ def _make_hermes_provider_class() -> Optional[type]:
                     except httpx.HTTPError as exc:
                         logger.debug(
                             "MCP OAuth '%s': ASM discovery to %s failed: %s",
-                            self._hermes_server_name, url, exc,
+                            self._hermes_server_name,
+                            url,
+                            exc,
                         )
                         continue
                     ok, asm = await handle_auth_metadata_response(resp)
@@ -561,12 +561,14 @@ def _make_hermes_provider_class() -> Optional[type]:
                         # skip discovery entirely.
                         storage = self.context.storage
                         from tools.mcp_oauth import HermesTokenStorage
+
                         if isinstance(storage, HermesTokenStorage):
                             storage.save_oauth_metadata(asm)
                         logger.debug(
                             "MCP OAuth '%s': pre-flight ASM discovered "
                             "token_endpoint=%s",
-                            self._hermes_server_name, asm.token_endpoint,
+                            self._hermes_server_name,
+                            asm.token_endpoint,
                         )
                         break
                 if self.context.oauth_metadata is None:
@@ -586,12 +588,12 @@ def _make_hermes_provider_class() -> Optional[type]:
                 return
             storage = self.context.storage
             from tools.mcp_oauth import HermesTokenStorage
+
             if not isinstance(storage, HermesTokenStorage):
                 return
             existing = storage.load_oauth_metadata()
-            if (
-                existing is None
-                or str(existing.token_endpoint) != str(meta.token_endpoint)
+            if existing is None or str(existing.token_endpoint) != str(
+                meta.token_endpoint
             ):
                 storage.save_oauth_metadata(meta)
 
@@ -652,6 +654,7 @@ def _make_hermes_provider_class() -> Optional[type]:
 
                 storage = self.context.storage
                 from tools.mcp_oauth import HermesTokenStorage
+
                 if isinstance(storage, HermesTokenStorage):
                     storage.poison_client_registration()
                 # Drop the in-memory client so the SDK re-registers next flow.
@@ -660,7 +663,8 @@ def _make_hermes_provider_class() -> Optional[type]:
             except Exception as exc:  # pragma: no cover — defensive, must not throw
                 logger.debug(
                     "MCP OAuth '%s': invalid_client detection failed (non-fatal): %s",
-                    self._hermes_server_name, exc,
+                    self._hermes_server_name,
+                    exc,
                 )
 
         @staticmethod
@@ -697,7 +701,8 @@ def _make_hermes_provider_class() -> Optional[type]:
             except Exception as exc:  # pragma: no cover — defensive
                 logger.debug(
                     "MCP OAuth '%s': pre-flow disk-watch failed (non-fatal): %s",
-                    self._hermes_server_name, exc,
+                    self._hermes_server_name,
+                    exc,
                 )
 
             # Manually bridge the bidirectional generator protocol. httpx's
@@ -806,7 +811,9 @@ def _make_hermes_provider_class() -> Optional[type]:
                         if (
                             error_match
                             and error_match.group(1) == "insufficient_scope"
-                            and (scope_match is None or not scope_match.group(1).strip())
+                            and (
+                                scope_match is None or not scope_match.group(1).strip()
+                            )
                         ):
                             import httpx
 
@@ -899,10 +906,7 @@ class MCPOAuthManager:
             entry = self._entries.get(key)
             if entry is not None and (
                 entry.server_url != server_url
-                or (
-                    entry.requested_fingerprint
-                    or entry.oauth_config_fingerprint
-                )
+                or (entry.requested_fingerprint or entry.oauth_config_fingerprint)
                 != fingerprint
             ):
                 if self._entry_has_active_flows(entry):
@@ -955,14 +959,16 @@ class MCPOAuthManager:
                             f":{int(resolved)}"
                         )
                         entry.resolved_callback_fingerprint = callback_identity
-                        entry.oauth_config_fingerprint = _effective_provider_fingerprint(
-                            server_name,
-                            server_url,
-                            entry.oauth_config,
-                            {
-                                **entry.transport_options,
-                                "resolved_callback_identity": callback_identity,
-                            },
+                        entry.oauth_config_fingerprint = (
+                            _effective_provider_fingerprint(
+                                server_name,
+                                server_url,
+                                entry.oauth_config,
+                                {
+                                    **entry.transport_options,
+                                    "resolved_callback_identity": callback_identity,
+                                },
+                            )
                         )
 
             return entry.provider
@@ -1160,7 +1166,8 @@ class MCPOAuthManager:
         """
         if _HERMES_PROVIDER_CLS is None:
             logger.warning(
-                "MCP OAuth '%s': SDK auth module unavailable", server_name,
+                "MCP OAuth '%s': SDK auth module unavailable",
+                server_name,
             )
             return None
 
@@ -1258,6 +1265,7 @@ class MCPOAuthManager:
             entry = self._entries.pop(self._key(server_name, hermes_home), None)
 
         from tools.mcp_oauth import remove_oauth_tokens
+
         remove_oauth_tokens(server_name, hermes_home=hermes_home)
         logger.info(
             "MCP OAuth '%s': evicted from cache and removed from disk",
@@ -1311,7 +1319,9 @@ class MCPOAuthManager:
             return False
 
         async with entry.lock:
-            tokens_path = _get_token_dir(hermes_home) / f"{_safe_filename(server_name)}.json"
+            tokens_path = (
+                _get_token_dir(hermes_home) / f"{_safe_filename(server_name)}.json"
+            )
             try:
                 mtime_ns = tokens_path.stat().st_mtime_ns
             except (FileNotFoundError, OSError):
@@ -1328,7 +1338,9 @@ class MCPOAuthManager:
                 logger.info(
                     "MCP OAuth '%s': tokens file changed (mtime %d -> %d), "
                     "forcing reload",
-                    server_name, old, mtime_ns,
+                    server_name,
+                    old,
+                    mtime_ns,
                 )
                 return True
             return False
@@ -1395,7 +1407,8 @@ class MCPOAuthManager:
                     except Exception as exc:  # pragma: no cover — defensive
                         logger.warning(
                             "MCP OAuth '%s': 401 handler failed: %s",
-                            server_name, exc,
+                            server_name,
+                            exc,
                         )
                         if not pending.done():
                             pending.set_result(False)
@@ -1411,7 +1424,8 @@ class MCPOAuthManager:
         except Exception as exc:  # pragma: no cover — defensive
             logger.warning(
                 "MCP OAuth '%s': awaiting 401 handler failed: %s",
-                server_name, exc,
+                server_name,
+                exc,
             )
             return False
 
