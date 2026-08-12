@@ -594,6 +594,12 @@ export function useMessageStream({
         const keepFailedPartialText = Boolean(failure?.partial && finalText)
         const interimBoundaryPending = state.interimBoundaryPending
 
+        // Wall-clock seconds this turn actually ran (message.start stamped
+        // turnStartedAt). Read BEFORE the state return below nulls it.
+        const durationS = state.turnStartedAt
+          ? Math.max(1, Math.round((Date.now() - state.turnStartedAt) / 1000))
+          : undefined
+
         const replaceTextPart = (parts: ChatMessagePart[]) => {
           const visibleFinalText = stripGeneratedImageEchoes(finalText, generatedImageEchoSources(parts)).trim()
 
@@ -608,7 +614,8 @@ export function useMessageStream({
             completedAt: occurredAt,
             parts: completeOpenTimelineParts(message.parts, occurredAt),
             pending: false,
-            interim: false
+            interim: false,
+            ...(durationS !== undefined ? { durationS } : {})
           }
 
           if (completionError && !keepFailedPartialText) {
@@ -632,6 +639,7 @@ export function useMessageStream({
           timestamp: occurredAt,
           completedAt: occurredAt,
           branchGroupId: state.pendingBranchGroup ?? undefined,
+          ...(durationS !== undefined ? { durationS } : {}),
           ...(completionError && { error: completionError })
         })
 
@@ -777,6 +785,10 @@ export function useMessageStream({
         const prev = state.messages
         const error = errorMessage.trim() || 'Hermes reported an error'
 
+        const durationS = state.turnStartedAt
+          ? Math.max(1, Math.round((Date.now() - state.turnStartedAt) / 1000))
+          : undefined
+
         const nextMessages = prev.some(m => m.id === streamId)
           ? prev.map(message =>
               message.id === streamId
@@ -785,7 +797,8 @@ export function useMessageStream({
                     completedAt: occurredAt,
                     error,
                     parts: completeOpenTimelineParts(message.parts, occurredAt),
-                    pending: false
+                    pending: false,
+                    ...(durationS !== undefined ? { durationS } : {})
                   }
                 : message
             )
@@ -799,7 +812,8 @@ export function useMessageStream({
                 completedAt: occurredAt,
                 error,
                 pending: false,
-                branchGroupId: groupId
+                branchGroupId: groupId,
+                ...(durationS !== undefined ? { durationS } : {})
               }
             ]
 
