@@ -15269,7 +15269,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # with an empty response.
             if _raw_clarify_reply and not _raw_clarify_reply.startswith("/"):
                 _resolved = _clarify_mod.resolve_text_response_for_session(
-                    _quick_key, _raw_clarify_reply,
+                    _quick_key,
+                    _raw_clarify_reply,
+                    # Telegram chats are serialized behind the active agent
+                    # turn. Treat any next text as the clarify prompt's
+                    # free-form "Other" response so it cannot sit silently in
+                    # the follow-up queue for up to clarify_timeout. Threaded
+                    # platforms keep the strict numeric/exact-label behavior
+                    # because their prose may be an unrelated follow-up.
+                    accept_custom=source.platform == Platform.TELEGRAM,
                 )
                 if _resolved:
                     logger.info(
