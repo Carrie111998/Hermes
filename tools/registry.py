@@ -18,6 +18,7 @@ import ast
 import importlib
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -205,11 +206,13 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "check_fn_context_scoped",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 check_fn_context_scoped=False):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -228,6 +231,11 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        # Most probes depend only on external/profile state and should share
+        # their TTL verdict across parent and child agents. Gates that inspect
+        # delegation ContextVars opt in so one agent role cannot inherit
+        # another role's availability or last-good verdict.
+        self.check_fn_context_scoped = bool(check_fn_context_scoped)
 
 
 # ---------------------------------------------------------------------------
@@ -260,9 +268,9 @@ _CHECK_FN_TTL_SECONDS = 30.0
 # so a genuinely-down backend is reflected within a couple of turns.
 _CHECK_FN_FAILURE_GRACE_SECONDS = 60.0
 _CHECK_FN_CACHE_MAX = 512
-_check_fn_cache: Dict[tuple[Callable, Optional[str]], tuple[float, bool]] = {}
-# Monotonic timestamp of the most recent True result per check_fn.
-_check_fn_last_good: Dict[tuple[Callable, Optional[str]], float] = {}
+_check_fn_cache: Dict[tuple, tuple[float, bool]] = {}
+# Monotonic timestamp of the most recent True result per cache scope.
+_check_fn_last_good: Dict[tuple, float] = {}
 _check_fn_cache_lock = threading.Lock()
 CHECK_FN_CACHE_BYPASS = ""
 
@@ -309,7 +317,39 @@ def check_fn_cache_scope() -> Optional[str]:
         return CHECK_FN_CACHE_BYPASS
 
 
-def _check_fn_cached(fn: Callable) -> bool:
+def _check_fn_context_scope() -> tuple[bool, bool, bool]:
+    """Return the canonical runtime identity used by context-aware gates."""
+    kanban_task_present = bool(os.environ.get("HERMES_KANBAN_TASK"))
+    try:
+        from agent.delegation_context import (
+            is_delegated_child_context,
+            is_dispatcher_owned_worker_context,
+        )
+
+        return (
+            kanban_task_present,
+            bool(is_delegated_child_context()),
+            bool(is_dispatcher_owned_worker_context()),
+        )
+    except Exception:
+        # Match existing gate helpers: ordinary parent/orchestrator context is
+        # the compatibility fallback when delegation state cannot be imported.
+        return (kanban_task_present, False, True)
+
+
+def _check_fn_cache_key(
+    fn: Callable,
+    profile_scope: Optional[str],
+    *,
+    context_scoped: bool = False,
+) -> tuple:
+    """Build a cache key from every input an availability gate may inspect."""
+    if context_scoped:
+        return (fn, profile_scope, *_check_fn_context_scope())
+    return (fn, profile_scope)
+
+
+def _check_fn_cached(fn: Callable, *, context_scoped: bool = False) -> bool:
     """Return bool(fn()), TTL-cached across calls.
 
     Exceptions are swallowed as False. A transient False/exception within
@@ -331,7 +371,11 @@ def _check_fn_cached(fn: Callable) -> bool:
                 exc_info=True,
             )
             return False
-    cache_key = (fn, scope)
+    cache_key = _check_fn_cache_key(
+        fn,
+        scope,
+        context_scoped=context_scoped,
+    )
     with _check_fn_cache_lock:
         _prune_check_fn_caches(now)
         cached = _check_fn_cache.get(cache_key)
@@ -456,15 +500,19 @@ class ToolRegistry:
         Mixed toolsets (e.g. ``terminal`` plus desktop-only ``read_terminal``)
         must not be gated solely by the first registered ``check_fn``.
         """
-        check_results: Dict[Callable, bool] = {}
+        check_results: Dict[tuple[Callable, bool], bool] = {}
         for entry in entries:
             if entry.toolset != toolset:
                 continue
             if not entry.check_fn:
                 return True
-            if entry.check_fn not in check_results:
-                check_results[entry.check_fn] = _check_fn_cached(entry.check_fn)
-            if check_results[entry.check_fn]:
+            check_key = (entry.check_fn, entry.check_fn_context_scoped)
+            if check_key not in check_results:
+                check_results[check_key] = _check_fn_cached(
+                    entry.check_fn,
+                    context_scoped=entry.check_fn_context_scoped,
+                )
+            if check_results[check_key]:
                 return True
         return False
 
@@ -573,6 +621,7 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
+        check_fn_context_scoped: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -581,6 +630,11 @@ class ToolRegistry:
         default browser tool for a headed-Chrome CDP backend). Without it,
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
+
+        ``check_fn_context_scoped=True`` isolates availability and last-good
+        verdicts for gates that inspect Kanban task/delegation ContextVars.
+        Leave it disabled for ordinary external/profile probes so their TTL
+        results remain shared across parent and child agents.
         """
         with self._lock:
             existing = self._tools.get(name)
@@ -632,6 +686,7 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                check_fn_context_scoped=check_fn_context_scoped,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -729,16 +784,20 @@ class ToolRegistry:
         # Per-call cache on top of the 30 s TTL — handles repeat probes of the
         # same check_fn within one definitions pass without re-reading the
         # TTL clock.
-        check_results: Dict[Callable, bool] = {}
+        check_results: Dict[tuple[Callable, bool], bool] = {}
         entries_by_name = {entry.name: entry for entry in self._snapshot_entries()}
         for name in sorted(tool_names):
             entry = entries_by_name.get(name)
             if not entry:
                 continue
             if entry.check_fn:
-                if entry.check_fn not in check_results:
-                    check_results[entry.check_fn] = _check_fn_cached(entry.check_fn)
-                if not check_results[entry.check_fn]:
+                check_key = (entry.check_fn, entry.check_fn_context_scoped)
+                if check_key not in check_results:
+                    check_results[check_key] = _check_fn_cached(
+                        entry.check_fn,
+                        context_scoped=entry.check_fn_context_scoped,
+                    )
+                if not check_results[check_key]:
                     if not quiet:
                         logger.debug("Tool %s unavailable (check failed)", name)
                     continue

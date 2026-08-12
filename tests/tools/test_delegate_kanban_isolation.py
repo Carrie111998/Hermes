@@ -60,11 +60,14 @@ def _make_running_kanban_task(monkeypatch, tmp_path):
     return kb, tid, workspace, attachments_root
 
 
-def test_delegated_child_context_suppresses_env_gated_kanban_tools(monkeypatch, tmp_path):
-    """A delegate_task child must not inherit the parent's Kanban tool schema.
+def test_delegated_child_context_suppresses_parent_cached_kanban_tools(
+    monkeypatch, tmp_path
+):
+    """A child must not inherit a Kanban verdict warmed by its parent.
 
-    The parent process may be a dispatcher worker with HERMES_KANBAN_TASK set;
-    the child is only a subagent, not the run owner.
+    Use an explicit ``kanban`` toolset to exercise the model-facing schema path
+    even when a direct agent/plugin caller bypasses delegate_task's defensive
+    toolset stripping. The registry gate remains the authorization boundary.
     """
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "123")
@@ -72,19 +75,36 @@ def test_delegated_child_context_suppresses_env_gated_kanban_tools(monkeypatch, 
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
 
-    import tools.kanban_tools  # noqa: F401 - ensure registered
+    import tools.kanban_tools as kanban_tools
     from agent.delegation_context import delegated_child_context
     from model_tools import _clear_tool_defs_cache, get_tool_definitions
     from tools.registry import invalidate_check_fn_cache
 
+    monkeypatch.setattr(
+        kanban_tools, "_profile_has_kanban_toolset", lambda: False
+    )
     invalidate_check_fn_cache()
     _clear_tool_defs_cache()
-    with delegated_child_context():
-        schema = get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True)
 
-    names = {s["function"].get("name") for s in schema if "function" in s}
-    assert "terminal" in names
-    assert {n for n in names if n and n.startswith("kanban_")} == set()
+    def kanban_names():
+        schema = get_tool_definitions(
+            enabled_toolsets=["kanban"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        return {
+            item["function"].get("name")
+            for item in schema
+            if "function" in item
+            and item["function"].get("name", "").startswith("kanban_")
+        }
+
+    parent_names = kanban_names()
+    assert "kanban_show" in parent_names
+    assert "kanban_complete" in parent_names
+
+    with delegated_child_context("child-session"):
+        assert kanban_names() == set()
 
 
 def test_build_child_agent_strips_kanban_toolset_even_when_parent_is_worker(monkeypatch):
