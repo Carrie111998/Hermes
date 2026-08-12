@@ -394,6 +394,18 @@ describe('renderMediaTags', () => {
 
     expect(text).toBe('ok\n[Audio: voice.mp3](#media:%2Ftmp%2Fvoice.mp3)')
   })
+
+  it('does not freeze a streamed standalone MEDIA path before later space-separated chunks arrive', () => {
+    const path = '/Users/zora/Documents/ZORA/hermes/operations/B17-B Value Extraction and Retirement Receipt.md'
+    let parts = appendAssistantTextPart([], 'ready\nMEDIA:/Users/zora/Documents/ZORA/hermes/operations/B17-B')
+
+    parts = appendAssistantTextPart(parts, ' Value Ex')
+    parts = appendAssistantTextPart(parts, 'traction and Retirement Receipt.md\n')
+
+    expect(chatMessageText({ id: 'a', role: 'assistant', parts })).toBe(
+      `ready\n[File: B17-B Value Extraction and Retirement Receipt.md](#media:${encodeURIComponent(path)})\n`
+    )
+  })
 })
 
 describe('interleaved reasoning/text coalescing', () => {

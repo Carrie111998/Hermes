@@ -449,8 +449,44 @@ export function appendReasoningPart(parts: ChatMessagePart[], delta: string): Ch
   return appendStreamPart(parts, 'reasoning', delta).parts
 }
 
+const TRAILING_MEDIA_LINK_RE = /\[[^\n]*\]\(#media:(?<path>[^)\n]+)\)$/
+
+function restoreTrailingMediaDirective(parts: ChatMessagePart[]): ChatMessagePart[] {
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const part = parts[i]
+
+    if (part.type === 'text') {
+      const match = TRAILING_MEDIA_LINK_RE.exec(part.text)
+
+      if (!match?.groups?.path || match.index === undefined) {
+        return parts
+      }
+
+      try {
+        const next = [...parts]
+
+        next[i] = { ...part, text: `${part.text.slice(0, match.index)}MEDIA:${decodeURIComponent(match.groups.path)}` }
+
+        return next
+      } catch {
+        return parts
+      }
+    }
+
+    if (part.type !== 'reasoning') {
+      break
+    }
+  }
+
+  return parts
+}
+
 export function appendAssistantTextPart(parts: ChatMessagePart[], delta: string): ChatMessagePart[] {
-  const { index, parts: next } = appendStreamPart(parts, 'text', delta)
+  // A standalone MEDIA line can be rendered before the stream reveals that
+  // more filename chunks follow. Restore our trailing generated link to its
+  // directive before appending so later spaces and mid-word deltas extend the
+  // path instead of becoming prose outside a frozen link.
+  const { index, parts: next } = appendStreamPart(restoreTrailingMediaDirective(parts), 'text', delta)
   const part = next[index]
 
   if (part?.type !== 'text') {
