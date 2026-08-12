@@ -146,6 +146,12 @@ class TestBuzzAdapterInit:
         adapter = BuzzAdapter(PlatformConfig(enabled=True, extra={"relay_url": "https://cfg.relay"}))
         assert adapter.relay_url == "https://env.relay"
 
+    def test_explicit_empty_alias_mapping_preserves_legacy_non_mutual_config(self):
+        adapter = _make_adapter({"mention_aliases": {}})
+
+        assert adapter._config_errors == []
+        assert adapter._mention_aliases == {}
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "extra",
@@ -155,12 +161,22 @@ class TestBuzzAdapterInit:
             {"mention_required_users": [OTHER_PUBKEY], "max_agent_hops": 0},
             {"mention_aliases": {"Warren": "not-a-pubkey"}},
             {"mention_aliases": {"Bot": OTHER_PUBKEY, "bot": "b" * 64}},
+            {"mention_aliases": None},
+            {"mention_aliases": "   "},
+            {"mention_aliases": []},
+            {"mention_aliases": 42},
+            {"mention_aliases": True},
+            {"mention_aliases": {"K": OTHER_PUBKEY}},
+            {"mention_aliases": {"@@Self": OTHER_PUBKEY}},
             {"max_agent_hops": float("inf")},
             {"max_agent_hops": float("nan")},
             {"max_agent_hops": 1.5},
             {"max_agent_hops": -1},
             {"max_agent_hops": True},
             {"max_agent_hops": "bad"},
+            {"max_agent_hops": 1001},
+            {"max_agent_hops": "1001"},
+            {"max_agent_hops": 10**100},
             {"max_agent_hops": "9" * 5000},
         ],
     )
@@ -178,6 +194,27 @@ class TestBuzzAdapterInit:
             "mention_required_users": [OTHER_PUBKEY],
             "max_agent_hops": 4,
         })
+
+        assert await adapter.connect() is False
+        assert adapter.fatal_error_code == "config_invalid"
+        assert adapter.fatal_error_retryable is False
+
+    @pytest.mark.asyncio
+    async def test_blank_mention_aliases_env_override_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("BUZZ_MENTION_ALIASES", "   ")
+        adapter = _make_adapter({"mention_aliases": {"Self": SELF_PUBKEY}})
+
+        assert await adapter.connect() is False
+        assert adapter.fatal_error_code == "config_invalid"
+        assert adapter.fatal_error_retryable is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("override", [",", " , , "])
+    async def test_delimiter_only_mention_aliases_env_override_fails_closed(
+        self, monkeypatch, override
+    ):
+        monkeypatch.setenv("BUZZ_MENTION_ALIASES", override)
+        adapter = _make_adapter({"mention_aliases": {"Self": SELF_PUBKEY}})
 
         assert await adapter.connect() is False
         assert adapter.fatal_error_code == "config_invalid"
@@ -333,6 +370,7 @@ class TestMentionGating:
         adapter = _make_adapter({
             "require_mention": False,
             "mention_required_users": [OTHER_PUBKEY],
+            "mention_aliases": {"Chip": SELF_PUBKEY},
         })
         adapter._dispatched = []
 
@@ -355,6 +393,315 @@ class TestMentionGating:
         await adapter._poll_channel(CHANNEL)
 
         assert [d["message_id"] for d in adapter._dispatched] == ["e3"]
+
+    @pytest.mark.asyncio
+    async def test_protected_sender_cannot_use_unconfigured_self_identity(self):
+        adapter = _make_adapter({
+            "require_mention": False,
+            "mention_required_users": [OTHER_PUBKEY],
+            "mention_aliases": {"Self": SELF_PUBKEY},
+        })
+        adapter._display_name = "Chip"
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        contents = [
+            "@Chip display name",
+            f"@{SELF_NPUB} npub",
+            f"@{SELF_PUBKEY} raw pubkey",
+            "@Self configured alias",
+        ]
+        for index, content in enumerate(contents):
+            event = _event(f"identity-{index}", content=content, created_at=10 + index)
+            event["tags"].append(["p", SELF_PUBKEY])
+            await adapter._handle_event(CHANNEL, state, event)
+
+        assert [d["message_id"] for d in adapter._dispatched] == ["identity-3"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("alias", "confusable"),
+        [("K", "K"), ("S", "ſ"), ("I", "ı"), ("I", "İ")],
+    )
+    async def test_protected_sender_rejects_unicode_alias_confusables(
+        self, alias, confusable
+    ):
+        adapter = _make_adapter({
+            "require_mention": False,
+            "mention_required_users": [OTHER_PUBKEY],
+            "mention_aliases": {alias: SELF_PUBKEY},
+        })
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        event = _event("confusable", content=f"@{confusable} review", created_at=10)
+        event["tags"].append(["p", SELF_PUBKEY])
+
+        assert adapter._explicit_mentions(event["content"]) == []
+        await adapter._handle_event(CHANNEL, state, event)
+
+        assert adapter._dispatched == []
+        assert adapter._strip_mention(event["content"]) == event["content"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "suffix",
+        [
+            "K",
+            "é",
+            "ſ",
+            "ı",
+            "İ",
+            "\u0301",
+            "\u200c",
+            "\u200d",
+            "\ufe0f",
+            "\u203f",
+            "\u20dd",
+            "²",
+            "·",
+            "·",
+            "℘",
+            "℮",
+        ],
+    )
+    async def test_protected_sender_rejects_unicode_suffix_on_ascii_alias(self, suffix):
+        adapter = _make_adapter({
+            "require_mention": False,
+            "mention_required_users": [OTHER_PUBKEY],
+            "mention_aliases": {"Bot": SELF_PUBKEY},
+        })
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        content = f"@Bot{suffix} review"
+        event = _event("unicode-suffix", content=content, created_at=10)
+        event["tags"].append(["p", SELF_PUBKEY])
+
+        assert adapter._explicit_mentions(content) == []
+        await adapter._handle_event(CHANNEL, state, event)
+
+        assert adapter._dispatched == []
+        assert adapter._strip_mention(content) == content
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            "é",
+            "K",
+            "\u0301",
+            "\u200c",
+            "\u200d",
+            "\ufe0f",
+            "\u203f",
+            "\u20dd",
+            "²",
+            "·",
+            "·",
+            "℘",
+            "℮",
+        ],
+    )
+    async def test_protected_sender_rejects_unicode_prefix_on_ascii_alias(self, prefix):
+        adapter = _make_adapter({
+            "require_mention": False,
+            "mention_required_users": [OTHER_PUBKEY],
+            "mention_aliases": {"Bot": SELF_PUBKEY},
+        })
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        content = f"{prefix}@Bot review"
+        event = _event("unicode-prefix", content=content, created_at=10)
+        event["tags"].append(["p", SELF_PUBKEY])
+
+        assert adapter._explicit_mentions(content) == []
+        await adapter._handle_event(CHANNEL, state, event)
+
+        assert adapter._dispatched == []
+
+    @pytest.mark.parametrize("prefix", ["(", "—", "👋"])
+    def test_punctuation_or_emoji_before_alias_remains_a_valid_delimiter(self, prefix):
+        adapter = _make_adapter({"mention_aliases": {"Peer": OTHER_PUBKEY}})
+
+        assert adapter._explicit_mentions(f"{prefix}@Peer review") == [OTHER_PUBKEY]
+
+    @pytest.mark.parametrize("suffix", [",", ":", ";", "!", "?", ")", "—", "👋"])
+    def test_punctuation_or_emoji_after_alias_remains_a_valid_delimiter(self, suffix):
+        adapter = _make_adapter({"mention_aliases": {"Peer": OTHER_PUBKEY}})
+
+        assert adapter._explicit_mentions(f"@Peer{suffix} review") == [OTHER_PUBKEY]
+
+    def test_exact_configured_alias_stripping_rejects_other_self_identity_forms(self):
+        adapter = _make_adapter({"mention_aliases": {"Self": SELF_PUBKEY}})
+        adapter._display_name = "Chip"
+
+        assert adapter._strip_mention("@Self review") == "review"
+        assert adapter._strip_mention("@Chip review") == "@Chip review"
+        assert adapter._strip_mention(f"@{SELF_NPUB} review") == f"@{SELF_NPUB} review"
+        assert adapter._strip_mention(f"@{SELF_PUBKEY} review") == f"@{SELF_PUBKEY} review"
+
+    def test_ascii_alias_matching_remains_case_insensitive(self):
+        adapter = _make_adapter({"mention_aliases": {"Peer": OTHER_PUBKEY}})
+
+        assert adapter._explicit_mentions("@pEeR review") == [OTHER_PUBKEY]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "For documentation only: `@Self` is the configured handle.",
+            "For documentation only: ``@Self`` is the configured handle.",
+            "Documentation: `first line\n@Self example\nlast line`",
+            "Example:\n```text\n@Self review this\n```",
+            "Example:\n```text\n@Self unterminated code fence",
+            "Example:\n````text\n`\n@Self still inside longer fence\n````",
+            "```text\ndocumentation\n    ```\n@Self still fenced\n```",
+            "Example:\n~~~text\n@Self review this\n~~~",
+            "    @Self indented code is not active",
+            "> @Self this quoted request is not active",
+            "> Delegation documentation\n@Self is an example, not a request",
+            "- ```text\n  @Self is inside list-nested code\n  ```",
+            "[not a command](https://example.test/@Self)",
+            "https://example.test/@Self",
+            "See https://example.test/@Self/docs",
+            "www.example.test/@Self",
+            "ftp://example.test/@Self",
+            "file:///tmp/@Self.txt",
+            "<https://example.test/@Self>",
+            "mailto:user@Self.test",
+            "<mailto:user@Self.test>",
+            "<!-- @Self documentation -->",
+            "@Se<!-- hidden example -->lf review",
+            "@Self<!-- hidden example -->é review",
+            "@Se<?hidden?>lf review",
+            "@Self**é** review",
+            "[@Self**é**](https://example.test)",
+            "<span>@Self<strong>é</strong></span>",
+            "@Se`example`lf review",
+            "@Se<code>example</code>lf review",
+            "@Self<code>example</code>é review",
+            "<code></blockquote>@Self</code>",
+            "<pre></code>@Self</pre>",
+            "<code/>@Self",
+            "<pre/>@Self",
+            "<template>@Self</template>",
+            "<span hidden>@Self</span>",
+            "<title>@Self</title>",
+            "<span>@Self</span>",
+            "<div>@Self</div>",
+            "<div>\n\n@Self review\n\n</div>",
+            "<x-agent>\n\n@Self review\n\n</x-agent>",
+            "<div>open\n\n@Self review",
+            "<CoDe><pre>@Self</pre></CoDe>",
+            "<code><pre></code>@Self</pre>",
+            "@\n\nSelf review",
+            "<div>@</div><div>Self review</div>",
+            "<menu>@</menu><menu>Self review</menu>",
+            "<center>@</center><center>Self review</center>",
+            "<search>@</search><search>Self review</search>",
+            "<irc://example.test/@Self>",
+            "<ssh://example.test/@Self>",
+            "<git://example.test/@Self>",
+            "irc://example.test/@Self",
+            "/docs/@Self",
+            "./docs/@Self",
+            "../docs/@Self",
+            r"docs\@Self",
+            "example.test/@Self",
+            "user+@Self",
+            "?assignee=@Self",
+            "#@Self",
+            "@Self/docs",
+            "@Self?view=full",
+            "@Se&#108;f review",
+            "&#64;Self review",
+            "&commat;Self review",
+            "@Se<![CDATA[x]]>lf review",
+        ],
+    )
+    async def test_alias_in_code_or_quote_is_not_an_agent_invocation(self, content):
+        adapter = _make_adapter({
+            "require_mention": False,
+            "mention_required_users": [OTHER_PUBKEY],
+            "mention_aliases": {"Self": SELF_PUBKEY},
+        })
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        event = _event("presentation-context", content=content, created_at=10)
+        event["tags"].append(["p", SELF_PUBKEY])
+
+        assert adapter._explicit_mentions(content) == []
+        await adapter._handle_event(CHANNEL, state, event)
+
+        assert adapter._dispatched == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "[visible @Self request](https://example.test/delegate)",
+            "See https://example.test/docs then @Self review",
+            "https://example.test/docs @Self review",
+            "> quoted documentation\n\n@Self active after the quote",
+            "```text\nquoted documentation\n```\n@Self active after the fence",
+            "<code>quoted documentation</code>@Self active after raw code",
+            "<pre>quoted documentation</pre>@Self active after raw pre",
+            "<div>\n\nquoted documentation\n\n</div>\n\n@Self active after closed raw block",
+            "Entity example &#64;Self, then @Self active request",
+            "CDATA example <![CDATA[Self]], then @Self active request",
+            "@Self\n\nreview after a block boundary",
+            "@Se**lf** review across inline formatting",
+        ],
+    )
+    async def test_visible_alias_outside_presentation_context_remains_active(self, content):
+        adapter = _make_adapter({
+            "require_mention": False,
+            "mention_required_users": [OTHER_PUBKEY],
+            "mention_aliases": {"Self": SELF_PUBKEY},
+        })
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        event = _event("visible-context", content=content, created_at=10)
+        event["tags"].append(["p", SELF_PUBKEY])
+
+        assert adapter._explicit_mentions(content) == [SELF_PUBKEY]
+        await adapter._handle_event(CHANNEL, state, event)
+
+        assert [item["message_id"] for item in adapter._dispatched] == ["visible-context"]
 
     @pytest.mark.asyncio
     async def test_configured_self_alias_counts_as_visible_mention(self):
@@ -420,6 +767,7 @@ class TestMentionGating:
         adapter = _make_adapter({
             "require_mention": False,
             "mention_required_users": [OTHER_PUBKEY, second_agent],
+            "mention_aliases": {"Chip": SELF_PUBKEY},
             "max_agent_hops": 2,
         })
         adapter._dispatched = []
@@ -451,6 +799,7 @@ class TestMentionGating:
         adapter = _make_adapter({
             "require_mention": False,
             "mention_required_users": [OTHER_PUBKEY, second_agent],
+            "mention_aliases": {"Chip": SELF_PUBKEY},
             "max_agent_hops": 2,
         })
         adapter._dispatched = []
@@ -481,6 +830,7 @@ class TestMentionGating:
         adapter = _make_adapter({
             "require_mention": False,
             "mention_required_users": [OTHER_PUBKEY],
+            "mention_aliases": {"Chip": SELF_PUBKEY},
             "max_agent_hops": 2,
         })
         adapter._dispatched = []
@@ -697,6 +1047,147 @@ class TestBuzzAdapterSend:
         assert mentions == [second_agent]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "suffix",
+        [
+            "\u0301",
+            "\u200c",
+            "\u200d",
+            "\ufe0f",
+            "\u203f",
+            "\u20dd",
+            "²",
+            "·",
+            "·",
+            "℘",
+            "℮",
+            "**é**",
+            "<strong>é</strong>",
+        ],
+    )
+    @pytest.mark.parametrize("lane", ["text", "media"])
+    async def test_send_does_not_tag_alias_with_attached_unicode_mark_or_format(
+        self, tmp_path, suffix, lane
+    ):
+        adapter = _make_adapter({"mention_aliases": {"Warren": OTHER_PUBKEY}})
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group",
+            "last_ts": 0,
+            "seen": {},
+        }
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-boundary"})
+        adapter._run_cli = cli
+        content = f"@Warren{suffix} review"
+
+        if lane == "text":
+            result = await adapter.send(CHANNEL, content)
+        else:
+            media = tmp_path / "proof.png"
+            media.write_bytes(b"png")
+            result = await adapter.send_image(CHANNEL, str(media), caption=content)
+
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert "--mention" not in args
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "/docs/@Warren",
+            "./docs/@Warren",
+            "../docs/@Warren",
+            r"docs\@Warren",
+            "example.test/@Warren",
+            "user+@Warren",
+            "?assignee=@Warren",
+            "#@Warren",
+            "@Warren/docs",
+            "@Warren?view=full",
+        ],
+    )
+    @pytest.mark.parametrize("lane", ["text", "local_media", "url_media"])
+    async def test_send_does_not_tag_alias_embedded_in_path_or_address(
+        self, tmp_path, content, lane
+    ):
+        adapter = _make_adapter({"mention_aliases": {"Warren": OTHER_PUBKEY}})
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group",
+            "last_ts": 0,
+            "seen": {},
+        }
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-address"})
+        adapter._run_cli = cli
+
+        if lane == "text":
+            result = await adapter.send(CHANNEL, content)
+        elif lane == "local_media":
+            media = tmp_path / "proof.png"
+            media.write_bytes(b"png")
+            result = await adapter.send_image(CHANNEL, str(media), caption=content)
+        else:
+            result = await adapter.send_image(
+                CHANNEL, "https://example.test/proof.png", caption=content
+            )
+
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert "--mention" not in args
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "<div>\n\n@Warren review\n\n</div>",
+            "<x-agent>\n\n@Warren review\n\n</x-agent>",
+            "<div>open\n\n@Warren review",
+            "@War&#114;en review",
+            "&#64;Warren review",
+            "&commat;Warren review",
+            "@War<![CDATA[x]]>ren review",
+        ],
+    )
+    @pytest.mark.parametrize("lane", ["text", "local_media", "url_media"])
+    async def test_send_does_not_tag_alias_in_cross_block_html_or_character_reference(
+        self, tmp_path, content, lane
+    ):
+        adapter = _make_adapter({"mention_aliases": {"Warren": OTHER_PUBKEY}})
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group",
+            "last_ts": 0,
+            "seen": {},
+        }
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-presentation"})
+        adapter._run_cli = cli
+
+        if lane == "text":
+            result = await adapter.send(CHANNEL, content)
+        elif lane == "local_media":
+            media = tmp_path / "proof.png"
+            media.write_bytes(b"png")
+            result = await adapter.send_image(CHANNEL, str(media), caption=content)
+        else:
+            result = await adapter.send_image(
+                CHANNEL, "https://example.test/proof.png", caption=content
+            )
+
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert "--mention" not in args
+
+    @pytest.mark.parametrize(
+        "content",
+        ["@Self/docs", "@Self?view=full", "@Self+tag", "@Self#fragment"],
+    )
+    def test_strip_does_not_remove_alias_embedded_in_path_or_address(self, content):
+        adapter = _make_adapter({"mention_aliases": {"Self": SELF_PUBKEY}})
+
+        assert adapter._strip_mention(content) == content
+
+    @pytest.mark.asyncio
     async def test_send_with_agent_mention_recovers_missing_reply_parent(self):
         adapter = _make_adapter({
             "mention_aliases": {"Warren": OTHER_PUBKEY},
@@ -718,7 +1209,27 @@ class TestBuzzAdapterSend:
         assert adapter._agent_hops["evt-recovered-parent"] == 3
 
     @pytest.mark.asyncio
-    async def test_send_with_agent_mention_overrides_stale_lower_hop_parent(self):
+    async def test_send_with_agent_mention_uses_stored_hop_after_cache_eviction(self):
+        adapter = _make_adapter({
+            "mention_aliases": {"Warren": OTHER_PUBKEY},
+            "mention_required_users": [OTHER_PUBKEY],
+            "max_agent_hops": 4,
+        })
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._active_agent_events[CHANNEL] = ("evicted-parent", 4)
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-evicted-parent"})
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "@Warren continue this delegation")
+
+        assert result.success is True
+        args, _stdin_text = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "evicted-parent"
+        assert adapter._agent_hops["evt-evicted-parent"] == 5
+
+    @pytest.mark.asyncio
+    async def test_send_with_agent_mention_preserves_explicit_lower_hop_parent(self):
         adapter = _make_adapter({
             "mention_aliases": {"Warren": OTHER_PUBKEY},
             "mention_required_users": [OTHER_PUBKEY],
@@ -726,7 +1237,7 @@ class TestBuzzAdapterSend:
         })
         adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
         adapter._active_agent_events[CHANNEL] = ("current-agent-parent", 4)
-        adapter._agent_hops.update({"stale-parent": 1, "current-agent-parent": 4})
+        adapter._agent_hops.update({"explicit-parent": 1, "current-agent-parent": 4})
         cli = _ScriptedCli()
         cli.script("messages", "send", {"accepted": True, "event_id": "evt-safe-parent"})
         adapter._run_cli = cli
@@ -734,13 +1245,34 @@ class TestBuzzAdapterSend:
         result = await adapter.send(
             CHANNEL,
             "@Warren continue this delegation",
-            reply_to="stale-parent",
+            reply_to="explicit-parent",
         )
 
         assert result.success is True
         args, _stdin_text = cli.calls[0]
-        assert args[args.index("--reply-to") + 1] == "current-agent-parent"
-        assert adapter._agent_hops["evt-safe-parent"] == 5
+        assert args[args.index("--reply-to") + 1] == "explicit-parent"
+        assert adapter._agent_hops["evt-safe-parent"] == 2
+
+    @pytest.mark.asyncio
+    async def test_send_with_unknown_explicit_agent_parent_fails_closed(self):
+        adapter = _make_adapter({
+            "mention_aliases": {"Warren": OTHER_PUBKEY},
+            "mention_required_users": [OTHER_PUBKEY],
+            "max_agent_hops": 4,
+        })
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-unknown-parent"})
+        adapter._run_cli = cli
+
+        result = await adapter.send(
+            CHANNEL,
+            "@Warren continue this delegation",
+            reply_to="unknown-agent-parent",
+        )
+
+        assert result.success is True
+        assert adapter._agent_hops["evt-unknown-parent"] == 5
 
     @pytest.mark.asyncio
     async def test_new_agent_root_replaces_higher_hop_active_chain(self):
@@ -872,6 +1404,15 @@ class TestBuzzAdapterLifecycle:
         await adapter.disconnect()
         assert released == [("buzz", "wss://relay.example:" + SELF_PUBKEY)]
         assert adapter._lock_key is None
+
+    @pytest.mark.asyncio
+    async def test_disconnect_clears_transient_active_agent_state(self):
+        adapter = _make_adapter()
+        adapter._active_agent_events[CHANNEL] = ("stale-event", 4)
+
+        await adapter.disconnect()
+
+        assert adapter._active_agent_events == {}
 
     @pytest.mark.asyncio
     async def test_connect_fails_when_identity_lock_held(self, monkeypatch):
@@ -1025,3 +1566,169 @@ class TestStandaloneSend:
         args = captured["args"]
         assert args[args.index("--mention") + 1] == OTHER_PUBKEY
         assert args[args.index("--file") + 1] == str(media)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "suffix",
+        [
+            "\u0301",
+            "\u200c",
+            "\u200d",
+            "\ufe0f",
+            "\u203f",
+            "\u20dd",
+            "²",
+            "·",
+            "·",
+            "℘",
+            "℮",
+            "**é**",
+            "<strong>é</strong>",
+        ],
+    )
+    @pytest.mark.parametrize("with_media", [False, True])
+    async def test_standalone_send_does_not_tag_alias_with_attached_unicode_mark_or_format(
+        self, monkeypatch, tmp_path, suffix, with_media
+    ):
+        from gateway.config import PlatformConfig
+
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://r")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1x")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+        captured = {}
+
+        async def fake_exec(
+            cli_path, args, *, relay_url, private_key, input_text=None, timeout=30.0
+        ):
+            captured["args"] = args
+            return 0, json.dumps({"accepted": True, "event_id": "evt-boundary"}), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        config = PlatformConfig(
+            enabled=True,
+            extra={"mention_aliases": {"Warren": OTHER_PUBKEY}},
+        )
+        media_files = None
+        if with_media:
+            media = tmp_path / "proof.png"
+            media.write_bytes(b"png")
+            media_files = [str(media)]
+
+        result = await _standalone_send(
+            config,
+            CHANNEL,
+            f"@Warren{suffix} review",
+            media_files=media_files,
+        )
+
+        assert result == {"success": True, "message_id": "evt-boundary"}
+        assert "--mention" not in captured["args"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "/docs/@Warren",
+            r"docs\@Warren",
+            "example.test/@Warren",
+            "user+@Warren",
+            "?assignee=@Warren",
+            "#@Warren",
+            "@Warren/docs",
+            "@Warren?view=full",
+        ],
+    )
+    @pytest.mark.parametrize("with_media", [False, True])
+    async def test_standalone_send_does_not_tag_alias_embedded_in_path_or_address(
+        self, monkeypatch, tmp_path, content, with_media
+    ):
+        from gateway.config import PlatformConfig
+
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://r")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1x")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+        captured = {}
+
+        async def fake_exec(
+            cli_path, args, *, relay_url, private_key, input_text=None, timeout=30.0
+        ):
+            captured["args"] = args
+            return 0, json.dumps({"accepted": True, "event_id": "evt-address"}), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        config = PlatformConfig(
+            enabled=True,
+            extra={"mention_aliases": {"Warren": OTHER_PUBKEY}},
+        )
+        media_files = None
+        if with_media:
+            media = tmp_path / "proof.png"
+            media.write_bytes(b"png")
+            media_files = [str(media)]
+
+        result = await _standalone_send(
+            config,
+            CHANNEL,
+            content,
+            media_files=media_files,
+        )
+
+        assert result == {"success": True, "message_id": "evt-address"}
+        assert "--mention" not in captured["args"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "<div>\n\n@Warren review\n\n</div>",
+            "<x-agent>\n\n@Warren review\n\n</x-agent>",
+            "<div>open\n\n@Warren review",
+            "@War&#114;en review",
+            "&#64;Warren review",
+            "&commat;Warren review",
+            "@War<![CDATA[x]]>ren review",
+        ],
+    )
+    @pytest.mark.parametrize("with_media", [False, True])
+    async def test_standalone_send_does_not_tag_alias_in_cross_block_html_or_character_reference(
+        self, monkeypatch, tmp_path, content, with_media
+    ):
+        from gateway.config import PlatformConfig
+
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://r")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1x")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+        captured = {}
+
+        async def fake_exec(
+            cli_path, args, *, relay_url, private_key, input_text=None, timeout=30.0
+        ):
+            captured["args"] = args
+            return 0, json.dumps({"accepted": True, "event_id": "evt-presentation"}), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        config = PlatformConfig(
+            enabled=True,
+            extra={"mention_aliases": {"Warren": OTHER_PUBKEY}},
+        )
+        media_files = None
+        if with_media:
+            media = tmp_path / "proof.png"
+            media.write_bytes(b"png")
+            media_files = [str(media)]
+
+        result = await _standalone_send(
+            config,
+            CHANNEL,
+            content,
+            media_files=media_files,
+        )
+
+        assert result == {"success": True, "message_id": "evt-presentation"}
+        assert "--mention" not in captured["args"]

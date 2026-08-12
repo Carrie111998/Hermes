@@ -47,11 +47,15 @@ import os
 import re
 import shutil
 import time
+import unicodedata
 from collections import OrderedDict
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
+
+from markdown_it import MarkdownIt
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -79,6 +83,111 @@ def _get_scoped_secret(name, default=None):
 
 logger = logging.getLogger(__name__)
 
+_INVOCATION_MARKDOWN = MarkdownIt("commonmark", {"html": True})
+_INVOCATION_URL_RE = re.compile(
+    r"(?i)(?<![@A-Za-z0-9+.-])(?:[A-Za-z][A-Za-z0-9+.-]*:(?://)?|www\.)[^\s<>]+"
+)
+_INVOCATION_HIDDEN_BOUNDARY = "\u200d"
+_INVOCATION_CHARACTER_REFERENCE_RE = re.compile(
+    r"&(?:#[0-9]+|#[xX][0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]*);"
+)
+
+
+class _RawHtmlInvocationTextParser(HTMLParser):
+    """Exclude text enclosed by any raw HTML element from invocations."""
+
+    _VOID_TAGS = {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._stack: List[str] = []
+        self._hidden_depth = 0
+        self._parts: List[str] = []
+
+    def add_text(self, text: str) -> None:
+        if not self._hidden_depth:
+            self._parts.append(text)
+
+    def add_hidden_boundary(self) -> None:
+        if not self._hidden_depth:
+            self._parts.append(_INVOCATION_HIDDEN_BOUNDARY)
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        normalized = tag.lower()
+        if normalized in self._VOID_TAGS:
+            if not self._hidden_depth:
+                self._parts.append(_INVOCATION_HIDDEN_BOUNDARY)
+            return
+        if not self._hidden_depth:
+            self._parts.append(_INVOCATION_HIDDEN_BOUNDARY)
+        self._stack.append(normalized)
+        self._hidden_depth += 1
+
+    def handle_startendtag(
+        self, tag: str, attrs: List[Tuple[str, Optional[str]]]
+    ) -> None:
+        normalized = tag.lower()
+        if normalized in self._VOID_TAGS:
+            self.handle_starttag(normalized, attrs)
+            return
+        # HTML ignores ``/>`` on non-void elements. Keep the context open so
+        # malformed ``<tag/>@Alias`` fails closed.
+        self.handle_starttag(normalized, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized = tag.lower()
+        if not self._stack or self._stack[-1] != normalized:
+            if not self._hidden_depth:
+                self._parts.append(_INVOCATION_HIDDEN_BOUNDARY)
+            return
+        self._stack.pop()
+        self._hidden_depth -= 1
+        if not self._hidden_depth:
+            self._parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        self.add_text(data)
+
+    def handle_comment(self, data: str) -> None:
+        self.add_hidden_boundary()
+
+    def handle_decl(self, decl: str) -> None:
+        self.add_hidden_boundary()
+
+    def unknown_decl(self, data: str) -> None:
+        # ``HTMLParser`` routes CDATA and other marked sections here. Treat
+        # every omitted declaration as a source boundary so it cannot splice
+        # fragments into a configured alias.
+        self.add_hidden_boundary()
+
+    def handle_pi(self, data: str) -> None:
+        self.add_hidden_boundary()
+
+    def handle_entityref(self, name: str) -> None:
+        self.add_hidden_boundary()
+
+    def handle_charref(self, name: str) -> None:
+        self.add_hidden_boundary()
+
+    @property
+    def text(self) -> str:
+        return "".join(self._parts)
+
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
@@ -103,6 +212,7 @@ _DM_DISCOVERY_EVERY = 5
 _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
 _CLI_TIMEOUT = 30.0
+_MAX_AGENT_HOPS = 1000
 
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 # kind 44100 is Buzz's channel-membership event — used for live DM discovery.
@@ -440,26 +550,41 @@ class BuzzAdapter(BasePlatformAdapter):
 
         # Outbound aliases ensure model-authored @names become real Nostr
         # p-tags. Config accepts a mapping or CSV entries like Alias=pubkey.
-        raw_aliases = os.getenv("BUZZ_MENTION_ALIASES") or extra.get("mention_aliases", {})
+        aliases_env = os.getenv("BUZZ_MENTION_ALIASES")
+        aliases_explicit = aliases_env is not None or "mention_aliases" in extra
+        raw_aliases = aliases_env if aliases_env is not None else extra.get("mention_aliases", {})
+        if aliases_explicit and (
+            raw_aliases is None
+            or not isinstance(raw_aliases, (dict, str))
+            or (isinstance(raw_aliases, str) and not raw_aliases.strip())
+        ):
+            self._config_errors.append("mention_aliases must be a non-empty mapping or CSV")
         if isinstance(raw_aliases, dict):
             alias_entries = list(raw_aliases.items())
         else:
             alias_entries = []
+            saw_alias_csv_item = False
             for item in str(raw_aliases or "").split(","):
                 if not item.strip():
                     continue
+                saw_alias_csv_item = True
                 alias, separator, user_ref = item.partition("=")
                 if not separator:
                     self._config_errors.append("mention_aliases contains an invalid entry")
                     continue
                 alias_entries.append((alias, user_ref))
+            if isinstance(raw_aliases, str) and not saw_alias_csv_item:
+                self._config_errors.append("mention_aliases contains no alias entries")
         self._mention_aliases: Dict[str, str] = {}
         for alias, user_ref in alias_entries:
-            normalized_alias = alias.strip().lstrip("@").lower() if isinstance(alias, str) else ""
+            raw_alias = alias.strip() if isinstance(alias, str) else ""
+            if raw_alias.startswith("@"):
+                raw_alias = raw_alias[1:]
+            normalized_alias = raw_alias.lower()
             normalized_user = _normalize_user_ref(user_ref) if isinstance(user_ref, str) else None
             if (
-                not normalized_alias
-                or not re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", normalized_alias)
+                not raw_alias
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", raw_alias, re.ASCII)
                 or not normalized_user
             ):
                 self._config_errors.append("mention_aliases contains an invalid alias or identity")
@@ -479,15 +604,17 @@ class BuzzAdapter(BasePlatformAdapter):
         max_hops_valid = False
         if isinstance(max_hops_raw, int) and not isinstance(max_hops_raw, bool):
             parsed_max_hops = max_hops_raw
-            max_hops_valid = parsed_max_hops >= 0
+            max_hops_valid = 0 <= parsed_max_hops <= _MAX_AGENT_HOPS
         elif isinstance(max_hops_raw, str) and re.fullmatch(r"[0-9]+", max_hops_raw.strip()):
             try:
                 parsed_max_hops = int(max_hops_raw.strip())
-                max_hops_valid = True
+                max_hops_valid = parsed_max_hops <= _MAX_AGENT_HOPS
             except ValueError:
                 max_hops_valid = False
         if not max_hops_valid and max_hops_explicit:
-            self._config_errors.append("max_agent_hops must be a non-negative integer")
+            self._config_errors.append(
+                f"max_agent_hops must be an integer between 0 and {_MAX_AGENT_HOPS}"
+            )
             parsed_max_hops = 0
         self.max_agent_hops = parsed_max_hops
         if self._mention_required_pubkeys and self.max_agent_hops == 0:
@@ -690,6 +817,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 pass
         self._poll_task = None
         self._channel_state = {}
+        self._active_agent_events = {}
         self._poll_count = 0
 
     # ── Sending ───────────────────────────────────────────────────────────
@@ -731,7 +859,7 @@ class BuzzAdapter(BasePlatformAdapter):
             # our own pubkey, but marking the id seen makes de-dupe explicit.
             self._mark_seen(str(chat_id), str(event_id))
             if self.max_agent_hops:
-                parent_hops = self._agent_hops.get(str(reply_target or ""), 0)
+                parent_hops = self._outbound_parent_hops(str(chat_id), reply_target)
                 self._remember_agent_hop(str(event_id), parent_hops + 1)
         return SendResult(
             success=bool(data.get("accepted", True)),
@@ -807,7 +935,7 @@ class BuzzAdapter(BasePlatformAdapter):
             if event_id:
                 self._mark_seen(str(chat_id), str(event_id))
                 if self.max_agent_hops:
-                    parent_hops = self._agent_hops.get(str(reply_target or ""), 0)
+                    parent_hops = self._outbound_parent_hops(str(chat_id), reply_target)
                     self._remember_agent_hop(str(event_id), parent_hops + 1)
             return SendResult(
                 success=bool(data.get("accepted", True)),
@@ -1004,15 +1132,19 @@ class BuzzAdapter(BasePlatformAdapter):
                                 raise ConnectionError(str(detail))
                             elif message[0] == "NOTICE":
                                 logger.warning("Buzz: relay notice: %s", message[-1])
+                        self._ws_active = False
+                        self._active_agent_events = {}
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
                     self._ws_active = False
+                    self._active_agent_events = {}
                     logger.warning("Buzz: WebSocket disconnected; retrying in %.1fs: %s", backoff, e)
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 30.0)
         finally:
             self._ws_active = False
+            self._active_agent_events = {}
 
     # ── Inbound polling ───────────────────────────────────────────────────
 
@@ -1299,27 +1431,123 @@ class BuzzAdapter(BasePlatformAdapter):
                 return True
         return False
 
+    @staticmethod
+    def _is_alias_continuation(char: str) -> bool:
+        """Return whether ``char`` can visually continue an alias token."""
+        if not char:
+            return False
+        category = unicodedata.category(char)
+        return (
+            char in "_.-"
+            or ("a" + char).isidentifier()
+            or category[0] in {"L", "M", "N"}
+            or category in {"Cf", "Pc"}
+        )
+
+    @staticmethod
+    def _is_alias_path_or_address_join(
+        content: str, match: re.Match[str]
+    ) -> bool:
+        """Reject aliases joined directly to URI/path/address syntax."""
+        if match.start() > 0 and content[match.start() - 1] in "/\\+?#=&;%:":
+            return True
+        if match.end() >= len(content):
+            return False
+        following = content[match.end()]
+        if following in "/\\+=&%":
+            return True
+        if following in "?#;:" and match.end() + 1 < len(content):
+            return not content[match.end() + 1].isspace()
+        return False
+
+    @classmethod
+    def _alias_match(
+        cls, content: str, alias: str, *, leading: bool = False
+    ) -> Optional[re.Match[str]]:
+        """Find one exact ASCII alias with Unicode-safe token boundaries."""
+        pattern = re.compile(rf"@{re.escape(alias)}", re.IGNORECASE | re.ASCII)
+        for match in pattern.finditer(content):
+            if leading and match.start() != 0:
+                return None
+            if not leading and match.start() > 0:
+                previous = content[match.start() - 1]
+                if previous == "@" or cls._is_alias_continuation(previous):
+                    continue
+            if match.end() < len(content) and cls._is_alias_continuation(
+                content[match.end()]
+            ):
+                continue
+            if cls._is_alias_path_or_address_join(content, match):
+                continue
+            return match
+        return None
+
+    @staticmethod
+    def _invocation_text(content: str) -> str:
+        """Return visible Markdown prose eligible to contain invocation aliases."""
+        # Character references are decoded into ordinary text by CommonMark.
+        # Replace their source ranges first so they cannot synthesize an alias
+        # such as ``@Se&#108;f`` or ``&#64;Self`` after parsing.
+        source = _INVOCATION_CHARACTER_REFERENCE_RE.sub(
+            _INVOCATION_HIDDEN_BOUNDARY, content
+        )
+        parser = _RawHtmlInvocationTextParser()
+        blockquote_depth = 0
+
+        for token in _INVOCATION_MARKDOWN.parse(source):
+            if token.type == "blockquote_open":
+                blockquote_depth += 1
+                parser.add_hidden_boundary()
+                continue
+            if token.type == "blockquote_close":
+                blockquote_depth = max(0, blockquote_depth - 1)
+                parser.add_text("\n")
+                continue
+            if blockquote_depth:
+                continue
+            if token.type in {"fence", "code_block"}:
+                parser.add_hidden_boundary()
+                parser.add_text("\n")
+                continue
+            if token.type == "html_block":
+                parser.feed(token.content)
+                parser.add_text("\n")
+                continue
+            if token.type != "inline" or not token.children:
+                continue
+
+            autolink_depth = 0
+            for child in token.children:
+                if child.type == "link_open" and child.markup == "autolink":
+                    autolink_depth += 1
+                    parser.add_hidden_boundary()
+                    continue
+                if child.type == "link_close" and child.markup == "autolink":
+                    autolink_depth = max(0, autolink_depth - 1)
+                    parser.add_hidden_boundary()
+                    continue
+                if autolink_depth:
+                    continue
+                if child.type == "text":
+                    parser.add_text(child.content)
+                elif child.type in {"softbreak", "hardbreak"}:
+                    parser.add_text("\n")
+                elif child.type in {"code_inline", "image"}:
+                    parser.add_hidden_boundary()
+                elif child.type == "html_inline":
+                    parser.feed(child.content)
+            parser.add_text("\n")
+
+        parser.close()
+        return _INVOCATION_URL_RE.sub("", parser.text)
+
     def _has_visible_self_mention(self, content: str) -> bool:
-        """Require an explicit @identity token for agent-authored messages."""
-        candidates = []
-        if self._display_name:
-            candidates.append(self._display_name)
-        candidates.extend(
-            alias
+        """Require an exact configured self @alias outside code and quotes."""
+        invocation_text = self._invocation_text(content)
+        return any(
+            self._alias_match(invocation_text, alias)
             for alias, pubkey in self._mention_aliases.items()
             if pubkey == self._self_pubkey
-        )
-        if self._self_npub:
-            candidates.append(self._self_npub)
-        if self._self_pubkey:
-            candidates.append(self._self_pubkey)
-        return any(
-            re.search(
-                rf"(?<![\w@])@{re.escape(candidate)}(?![\w.-])",
-                content,
-                flags=re.IGNORECASE,
-            )
-            for candidate in candidates
         )
 
     def _event_mentions_self(self, event: dict) -> bool:
@@ -1338,13 +1566,25 @@ class BuzzAdapter(BasePlatformAdapter):
         )
 
     def _explicit_mentions(self, content: str) -> List[str]:
-        """Resolve configured @aliases in outbound text to explicit pubkeys."""
+        """Resolve configured @aliases outside code and quotes to pubkeys."""
+        invocation_text = self._invocation_text(content)
         mentions = []
         for alias, pubkey in sorted(self._mention_aliases.items(), key=lambda item: -len(item[0])):
-            pattern = rf"(?<![\w@])@{re.escape(alias)}(?![\w.-])"
-            if re.search(pattern, content, flags=re.IGNORECASE) and pubkey not in mentions:
+            if self._alias_match(invocation_text, alias) and pubkey not in mentions:
                 mentions.append(pubkey)
         return mentions
+
+    def _outbound_parent_hops(self, chat_id: str, reply_target: Optional[str]) -> int:
+        """Return known parent hops, including retained active-state metadata."""
+        target = str(reply_target or "")
+        if target in self._agent_hops:
+            return self._agent_hops[target]
+        active = self._active_agent_events.get(chat_id)
+        if active and active[0] == target:
+            return active[1]
+        if target and self.max_agent_hops:
+            return self.max_agent_hops
+        return 0
 
     def _outbound_reply_target(
         self,
@@ -1361,12 +1601,10 @@ class BuzzAdapter(BasePlatformAdapter):
         """
         if not self.max_agent_hops or not mentions:
             return str(requested) if requested else None
+        if requested:
+            return str(requested)
         active = self._active_agent_events.get(chat_id)
-        if active:
-            requested_hops = self._agent_hops.get(str(requested or ""), 0)
-            if not requested or active[1] > requested_hops:
-                return active[0]
-        return str(requested) if requested else None
+        return active[0] if active else None
 
     @staticmethod
     def _reply_parent_id(event: dict) -> str:
@@ -1448,12 +1686,23 @@ class BuzzAdapter(BasePlatformAdapter):
         are left intact so normal prose is unaffected.
         """
         text = content.strip()
-        candidates = []
-        if self._display_name:
-            candidates.append(re.escape(self._display_name))
+        self_aliases = []
         for alias, pubkey in self._mention_aliases.items():
             if pubkey == self._self_pubkey:
-                candidates.append(re.escape(alias))
+                self_aliases.append(alias)
+        for alias in sorted(self_aliases, key=len, reverse=True):
+            match = self._alias_match(text, alias, leading=True)
+            if match:
+                return text[match.end() :].lstrip(" \t:,").strip()
+
+        # Preserve the permissive legacy stripping behavior only when no
+        # configured self alias exists. Protected peer dispatch never uses
+        # these alternate identity forms for authorization.
+        candidates = []
+        if self_aliases:
+            return text
+        if self._display_name:
+            candidates.append(re.escape(self._display_name))
         if self._self_npub:
             candidates.append(re.escape(self._self_npub))
         if self._self_pubkey:
@@ -1465,7 +1714,13 @@ class BuzzAdapter(BasePlatformAdapter):
         # require an alias-token boundary so @bot never strips @bot-2.
         alternatives = "|".join(sorted(set(candidates), key=len, reverse=True))
         pattern = rf"^@?(?:{alternatives})(?![\w.-])[\s:,]*"
-        stripped = re.sub(pattern, "", text, count=1, flags=re.IGNORECASE)
+        stripped = re.sub(
+            pattern,
+            "",
+            text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
         return stripped.strip()
 
     async def _resolve_user_name(self, pubkey: str) -> str:
