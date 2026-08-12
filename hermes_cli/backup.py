@@ -358,7 +358,10 @@ def _safe_copy_db(
     conn = None
     backup_conn = None
     try:
-        conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+        # Disable sqlite3's implicit busy wait so backup() progress callbacks
+        # control the full locked-source deadline instead of adding the
+        # connection's default timeout before each callback.
+        conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=0.0)
         backup_conn = sqlite3.connect(str(dst))
         busy_deadline = time.monotonic() + max(0.0, timeout_seconds)
 
@@ -382,6 +385,15 @@ def _safe_copy_db(
         return True
     except Exception as exc:
         logger.warning("SQLite safe copy failed for %s: %s", src, exc)
+        # Windows will not remove the partial destination while SQLite still
+        # has it open.  Close it before fail-closed cleanup; the finally block
+        # still owns the source and any close failure.
+        if backup_conn is not None:
+            try:
+                backup_conn.close()
+            except Exception:
+                pass
+            backup_conn = None
         try:
             dst.unlink(missing_ok=True)
         except OSError:

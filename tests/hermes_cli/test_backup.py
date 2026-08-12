@@ -652,15 +652,33 @@ class TestSafeCopyDb:
 
         class FakeDestinationConnection:
             def close(self):
-                pass
+                destination_closed.append(True)
 
+        destination_closed = []
         connections = iter((FakeSourceConnection(), FakeDestinationConnection()))
+
+        real_unlink = Path.unlink
+
+        def assert_closed_before_unlink(path, *args, **kwargs):
+            assert destination_closed
+            return real_unlink(path, *args, **kwargs)
+
+        connect_calls = []
+
+        def fake_connect(*args, **kwargs):
+            connect_calls.append((args, kwargs))
+            return next(connections)
+
         monkeypatch.setattr(
-            backup_mod.sqlite3, "connect", lambda *_a, **_kw: next(connections)
+            backup_mod.sqlite3,
+            "connect",
+            fake_connect,
         )
         monkeypatch.setattr(backup_mod.time, "monotonic", lambda: next(clock))
+        monkeypatch.setattr(Path, "unlink", assert_closed_before_unlink)
 
         assert backup_mod._safe_copy_db(src, dst, timeout_seconds=1.0) is False
+        assert connect_calls[0][1]["timeout"] == 0.0
         assert not dst.exists()
 
 
