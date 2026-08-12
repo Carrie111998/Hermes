@@ -34,17 +34,30 @@ low on this box and kills the whole file rather than one test.
 
 ### Status as of 2026-08-11
 
-**9 of the 14 are FIXED** by `e467da742` *"fix(gateway): repair the standing tests/gateway
-failures on Windows"* (2026-08-11) — an ancestor of `main` **and** of the deployed branch
-`claude/checkpoint-all-nonsecret-20260808`. Those entries are annotated in place below
+**13 of the 14 are FIXED. Exactly one — the group E load artifact — still fails.**
+Every one of the 14 was re-run against `main` @ `eda64dfdc` on 2026-08-11; nothing below is
+an inherited claim.
+
+| group | count | status at `eda64dfdc` | evidence |
+|-------|-------|-----------------------|----------|
+| A | 5 | ✅ fixed by `e467da742` | 32 passed |
+| B | 4 | ✅ fixed by `e467da742` | 21 + 114 passed |
+| C | 3 | ✅ green | see group C |
+| D | 1 | ✅ green — but the "ordering artifact" reading is disputed | see group D |
+| E | 1 | ❌ **still fails** — the only open entry | see group E |
+
+Two runs, both from an isolated worktree, both `0 failed` except where noted:
+`167 passed in 497.35s` over the three A+B files, and `1 failed, 298 passed, 1 skipped in
+727.01s` over the four C/D/E files — that single failure being group E.
+
+`e467da742` *"fix(gateway): repair the standing tests/gateway failures on Windows"* and
+`bff71e7ed` *"fix(tests+whatsapp): clear the nightly gate lane's 4 named failures"* are both
+ancestors of `main`; `e467da742` is also on the deployed branch
+`claude/checkpoint-all-nonsecret-20260808`. Fixed entries are annotated in place below
 rather than deleted, because the record of the run is worth keeping.
 
-**5 remain open** — groups C (3), D (1) and E (1), left unannotated and unchanged. They were
-not re-verified here; apply the rule above to them too before acting.
-
-Caveat on this document's own location: `e467da742` is **not** an ancestor of the branch
-this file lives on (`claude/optimistic-darwin-0c9c89` @ `9591ec2e4`), so the test files
-sitting next to it are the pre-fix ones and still fail. Verify against `main`, not here.
+Caveat on where you verify: neither fix commit is an ancestor of the branch this document
+was written on (`claude/optimistic-darwin-0c9c89` @ `9591ec2e4`). Verify against `main`.
 
 ## Delta vs the six known failures
 
@@ -126,7 +139,25 @@ Note `run.py:9586` and `:14319` already guard the attribute with `hasattr`/`geta
 
 Same class as the five POSIX-isms previously found in the plugins suite.
 
-### C. Real failures — reproduce in isolation — 3
+### C. ✅ FIXED — Real failures — reproduce in isolation — 3
+
+> **✅ All three green at `main` @ `eda64dfdc`, verified 2026-08-11.** The three files ran
+> in one invocation with the four C/D/E files: `1 failed, 298 passed, 1 skipped in 727.01s`,
+> and the single failure was group E, not one of these.
+>
+> Attribution, at two different confidence levels — the green above is measured, this is not:
+> `bff71e7ed` *"fix(tests+whatsapp): clear the nightly gate lane's 4 named failures"* is on
+> `main` and touches `tests/gateway/test_discord_liveness.py` and
+> `plugins/platforms/whatsapp/adapter.py`, which covers the `latency_non_finite` and
+> `test_kill_port_spares_client_process` entries. For
+> `test_update_streaming::test_recognized_slash_command_bypasses_pending_update_prompt` no
+> commit was traced here; a separate session records it as fixed by `e467da742`'s
+> `run.py:14353` guard (`if getattr(self, "config", None) is None: return None`) — the same
+> fail-closed correction described under group A. **That last attribution is second-hand.
+> The passing test is not.**
+>
+> The original triage is preserved verbatim below.
+
 Verified by re-running each file alone (`gw_iso.log`):
 - `test_discord_liveness::…[health2-latency_non_finite]` — 1 failed, 18 passed.
   `assert 'latency_non_finite' in 'Discord Gateway WebSocket health check failed: ack_stale'`.
@@ -140,12 +171,34 @@ Verified by re-running each file alone (`gw_iso.log`):
   1 failed, 7 passed. `_wait_dead(listener, timeout=5.0)` — stale listener not killed.
   **Newly surfaced — never triaged.**
 
-### D. Monolithic-ordering artifact — 1
+### D. ✅ FIXED — ~~Monolithic-ordering artifact~~ — 1
+
+> **✅ Green at `main` @ `eda64dfdc`, verified 2026-08-11**, in the same run as group C.
+>
+> **The "ordering artifact" label below is disputed.** `bff71e7ed` edits
+> `tests/gateway/test_discord_liveness.py` — a *test-side* change to the very file this
+> entry lives in, which is not what you would expect if the cause were a state leak from
+> some other module. A separate session records it as the same frozen-fake-clock bug as the
+> `latency_non_finite` entry next to it, making the split 4 real + 1 artifact rather than
+> 3 + 2. **That reading was not re-derived here** — only the green was measured. Treat
+> "passes in isolation" as insufficient grounds for calling something a run artifact.
+
 - `test_discord_liveness::test_liveness_probe_does_not_call_rest_while_websocket_is_healthy`
   — `assert adapter._running is True` → False. **PASSES in isolation** (18 passed).
   State leak / ordering, not a defect in the test's subject.
 
-### E. Load artifact — 1
+### E. ❌ STILL OPEN — Load artifact — 1 — the only remaining entry
+
+> **❌ Still fails at `main` @ `eda64dfdc`, reproduced 2026-08-11.** The one failure in
+> `1 failed, 298 passed, 1 skipped in 727.01s`, for exactly the cause diagnosed below:
+> `subprocess.TimeoutExpired … timed out after 10 seconds` on the cold-interpreter spawn.
+> Nothing has landed against it.
+>
+> Note it reproduced in a **four-file** run, not just the 9,898-test monolithic one — so
+> "only fails under the full suite" understates it. Any concurrent load on this box is
+> enough. The fix is to raise or remove the hard-coded `timeout=10` at `test_matrix.py:1224`,
+> which is a wall-clock deadline in a test, not a property of the code under test.
+
 - `test_matrix::TestMatrixModuleImport::test_module_importable_without_mautrix` —
   `subprocess.TimeoutExpired … timed out after 10 seconds`. Confirmed PASSED when run
   alone (`1 passed in 26.44s`, explicitly PASSED not skipped). Hard-coded `timeout=10` at
@@ -155,15 +208,19 @@ Verified by re-running each file alone (`gw_iso.log`):
 
 ## Deferred / not done
 
-*(As written, this section describes the state at `e3bfc2ebc`. Items 1 and 3 have since
-been superseded — annotated inline.)*
+*(As written, this section describes the state at `e3bfc2ebc`. **Every item has since been
+superseded** — annotated inline. Nothing here is a live to-do except the group E timeout.)*
 
 1. **Nothing was fixed.** No test or production file edited, nothing committed.
    — ✅ **Superseded.** True of *this run*; `e467da742` (2026-08-11) then fixed the A- and
    B-group 9 and landed on `main`.
 2. C-group items (3) are the only ones needing real investigation; two are brand new.
+   — ✅ **All three green** at `main` @ `eda64dfdc`. Nothing left to investigate here.
 3. A-group (5) and B-group (4) are mechanical fixes — 9 of 14 are test-side.
    — ✅ **Done in `e467da742`**, but the "test-side" read was half wrong: the A-group fix
    was production-side (`gateway/run.py`), and it exposed a real fail-closed defect.
 4. The load artifact (E) would likely vanish on an idle box; the 0.40 tests/sec rate means
    a rerun under low memory pressure should be ~3h, not 7h.
+   — ⚠️ **Half wrong, and it is now the only open entry.** E reproduced in a four-file,
+   300-test run, so it does not need the full suite to fire — "an idle box" is a stronger
+   precondition than assumed. The throughput observation stands.
