@@ -284,21 +284,31 @@ def test_shell_hooks_hide_hook_command_windows(monkeypatch):
 
 
 def test_inline_skill_shell_hides_bash_window(monkeypatch):
+    """The bash console stays hidden — now via ``run_text_capture``.
+
+    ``run_inline_shell`` used to pass ``creationflags=windows_hide_flags()`` to
+    ``subprocess.run`` directly. It can no longer capture through pipes: the
+    snippet is arbitrary, so whatever it launches is a grandchild that holds
+    the capture pipe's write end open and makes the timeout unenforceable on
+    Windows. ``run_text_capture`` captures into temp files and applies
+    ``CREATE_NO_WINDOW`` itself, so the no-flash guarantee is preserved by
+    routing through it — which is what this asserts.
+    """
     from agent import skill_preprocessing
 
     captured = []
 
-    def fake_run(cmd, **kwargs):
+    def fake_capture(cmd, **kwargs):
         captured.append((cmd, kwargs))
         return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
 
-    monkeypatch.setattr(skill_preprocessing, "IS_WINDOWS", True)
-    monkeypatch.setattr(skill_preprocessing, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
-    monkeypatch.setattr(skill_preprocessing.subprocess, "run", fake_run)
+    monkeypatch.setattr(skill_preprocessing, "run_text_capture", fake_capture)
 
     assert skill_preprocessing.run_inline_shell("echo ok", cwd=None, timeout=5) == "ok"
     assert captured[0][0] == ["bash", "-c", "echo ok"]
-    assert captured[0][1]["creationflags"] == _CREATE_NO_WINDOW
+    # No creationflags here by design: the helper owns CREATE_NO_WINDOW.
+    # tests/test_gbrain_cli_timeout.py covers the helper's own behaviour.
+    assert "creationflags" not in captured[0][1]
 
 
 def test_tts_opus_conversion_hides_ffmpeg_window(monkeypatch, tmp_path):

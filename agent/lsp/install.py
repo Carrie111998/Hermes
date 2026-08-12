@@ -35,6 +35,8 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from hermes_cli._subprocess_compat import run_text_capture
+
 logger = logging.getLogger("agent.lsp.install")
 
 # Package-name → install-strategy hint registry.  Each entry is a
@@ -261,13 +263,14 @@ def _install_npm(
             staging,
             " ".join(install_targets),
         )
-        proc = subprocess.run(
+        # run_text_capture, not capture_output=True: on Windows ``npm`` resolves
+        # to ``npm.cmd``, so the direct child is cmd.exe and the real install is
+        # a node grandchild that inherits the capture pipes. Pipe capture would
+        # leave the 300s timeout unenforceable — subprocess.run kills only
+        # cmd.exe, then blocks re-draining a pipe that never reaches EOF.
+        proc = run_text_capture(
             [npm, "install", "--prefix", str(staging), "--silent", "--no-fund", "--no-audit", *install_targets],
-            check=False,
-            capture_output=True,
-            text=True,
             timeout=300,
-            stdin=subprocess.DEVNULL,
         )
         if proc.returncode != 0:
             logger.warning(
@@ -309,15 +312,10 @@ def _install_go(pkg: str, bin_name: str) -> Optional[str]:
     env["GOBIN"] = str(staging)
     try:
         logger.info("[install] go install %s (GOBIN=%s)", pkg, staging)
-        proc = subprocess.run(
-            [go, "install", pkg],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            env=env,
-            stdin=subprocess.DEVNULL,
-        )
+        # Same hazard as the npm branch: ``go install`` fans out to compiler and
+        # linker subprocesses, and every one of them inherits a capture pipe.
+        # With a 600s budget an unenforced timeout is a ten-minute-plus hang.
+        proc = run_text_capture([go, "install", pkg], timeout=600, env=env)
         if proc.returncode != 0:
             logger.warning(
                 "[install] go install failed for %s: %s", pkg, proc.stderr.strip()[:500]

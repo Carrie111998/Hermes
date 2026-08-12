@@ -1,6 +1,8 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
 import threading
+import traceback
+
 import pytest
 from datetime import datetime, timedelta, timezone
 
@@ -1584,8 +1586,13 @@ class TestMarkJobRunConcurrency:
         def run_mark(job_id: str, success: bool, error_msg=None):
             try:
                 mark_job_run(job_id, success=success, error=error_msg)
-            except Exception as exc:  # pragma: no cover
-                errors.append(exc)
+            except Exception:  # pragma: no cover
+                # Capture the FORMATTED traceback, not the exception object: a
+                # worker-thread failure here is intermittent (seen once in the
+                # 2026-08-11 nightly-gate sweep, not reproducible on demand),
+                # and ``repr(exc)`` alone names no frame, so the one run that
+                # catches it must carry enough to locate the culprit.
+                errors.append(traceback.format_exc())
 
         # Fire all three concurrently
         threads = [
@@ -1635,8 +1642,9 @@ class TestMarkJobRunConcurrency:
         def run_mark(job_id: str):
             try:
                 mark_job_run(job_id, success=True)
-            except Exception as exc:  # pragma: no cover
-                errors.append(exc)
+            except Exception:  # pragma: no cover
+                # See the sibling test: formatted traceback, not repr(exc).
+                errors.append(traceback.format_exc())
 
         threads = [threading.Thread(target=run_mark, args=(j["id"],)) for j in jobs]
         for t in threads:

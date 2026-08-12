@@ -222,6 +222,24 @@ class EventType(Enum):
     # changelog write. Existing TOPIC_ROUTING in telegram_notifier.py already
     # routes critic_auto_applied -> critic_proposals topic; this enum entry
     # makes the event actually emittable via EventType.from_string().
+    # ✅ COLLISION VERDICT (settled 2026-08-11 — do NOT re-open):
+    #   ✅ is also APPLICATION_SUBMITTED's. This is DRIFT, not design:
+    #   fa9915e07 added this entry purely to close a coverage gap ("Additions
+    #   only"), and its verification line names test_event_icons_cover_all_types
+    #   only — never a uniqueness check. Compare SECRET_DETECTED above, where the
+    #   author explicitly recorded "no existing icon conflicts"; that sentence is
+    #   absent here because nobody looked.
+    #   It is nonetheless LEGAL and is being KEPT: the standard is per-topic
+    #   (see the EventType docstring — "disjoint from its neighbours in the same
+    #   Telegram topic"), and these two land in different lanes —
+    #   application_submitted -> JOBFLOW, critic_auto_applied -> CRITIC
+    #   (events/routing_policy.py). No operator sees both ✅ in one feed, which
+    #   is exactly what test_event_icons_are_unique_within_a_telegram_topic
+    #   asserts — it permits this pair on purpose.
+    #   If a future change ever makes it worth de-duping, CRITIC_AUTO_APPLIED is
+    #   the safer target (narrower audience) — but these glyphs are operator-
+    #   facing muscle memory, so ASK DIEGO before changing one.
+    #   Contrast 🟢 (GATEWAY_STARTED, below): that cross-topic dupe IS deliberate.
     CRITIC_AUTO_APPLIED = ("critic_auto_applied", Priority.NORMAL, "✅")
 
     # Watchdog signals — added 2026-04-25 (iter5).

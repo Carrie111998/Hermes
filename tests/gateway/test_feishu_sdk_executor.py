@@ -9,10 +9,34 @@ ThreadPoolExecutor and recreates it on demand if it has been shut down.
 Covers: #10849
 """
 import concurrent.futures
+import importlib.util
 
 import pytest
 
-from plugins.platforms.feishu.adapter import FeishuAdapter
+# Warm the Feishu SDK HERE, at collection, when it is installed.
+#
+# ``lark_oapi`` is a thousands-of-module SDK whose first import costs ~100s on
+# this box.  Nothing in this file imports it directly, but
+# ``test_reconnect_rearms_executor`` calls ``FeishuAdapter.connect()``, which
+# reaches ``check_feishu_requirements()`` and loads the whole SDK *inside the
+# test body* — where the gate's per-test ``--timeout`` applies.  Measured
+# 2026-08-11 under the nightly gate's own argv (``--timeout=60
+# --timeout-method=thread``): the run died with the timeout dump parked
+# mid-``lark_oapi`` import after 6 of 7 tests, and pytest-timeout's thread
+# method kills the process, so the file reported as "no tests ran".
+#
+# Collection is NOT covered by the per-test timeout, so paying the load here is
+# the same one-time cost in an untimed place — not a new one.  Same fix as
+# 671b38765 gave tests/gateway/test_feishu.py.  Best-effort on purpose: a
+# failure here must not change what any test asserts, and the adapter import
+# below is what actually decides whether this file can run at all.
+if importlib.util.find_spec("lark_oapi") is not None:
+    try:
+        import lark_oapi  # noqa: F401
+    except Exception:
+        pass
+
+from plugins.platforms.feishu.adapter import FeishuAdapter  # noqa: E402
 
 
 def _bare_adapter() -> FeishuAdapter:

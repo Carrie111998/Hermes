@@ -15,15 +15,18 @@ timeout (HERMES_CRON_SESSION_DB_TIMEOUT, default 10s) so a hang there can
 never again wedge the job past that bound, and — end to end — that the
 dispatch guard is released and the job becomes dispatchable again afterward.
 
-Note: each test releases its ``never_set`` event in a ``finally`` before
+Note: each test releases its ``_WedgedSessionDb.release`` event in a ``finally`` before
 returning. concurrent.futures.thread registers an atexit hook that joins
 EVERY worker thread ever created by ANY ThreadPoolExecutor in the process
 regardless of ``shutdown(wait=False)`` — an event left permanently unset
 would hang the whole test process at interpreter exit, not just this test.
 """
 
+import os
+import shutil
+import tempfile
 import threading
-import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -31,19 +34,103 @@ import pytest
 from cron.scheduler import run_job
 
 
-def _hanging_session_db(never_set: threading.Event):
-    """Stand-in for hermes_state.SessionDB() that blocks until released —
-    like the real incident's wedged sqlite3.connect, but bounded so the test
-    process can still exit cleanly once the assertions are done."""
-    never_set.wait(timeout=30)
-    return MagicMock()
+_PROVIDER = {
+    "api_key": "test-key",
+    "base_url": "https://example.invalid/v1",
+    "provider": "openrouter",
+    "api_mode": "chat_completions",
+}
+
+def _warm_run_job() -> None:
+    """Pay ``run_job``'s one-time cost HERE, at collection.
+
+    ``run_job`` resolves a pile of things lazily on its first call
+    in a process — profile context, cron activity policy, config load, and the
+    agent/jsonschema import chain the ``patch`` headers have not already pulled
+    in. That cost used to land inside a ``time.monotonic()`` bracket the tests
+    asserted on; it no longer decides any verdict (see ``_WedgedSessionDb``),
+    but it can still blow the per-test cap outright and kill the file.
+
+    Measured 2026-08-11 under the nightly gate's argv: cold, the first test's
+    ``run_job`` call was 27.8s; with a second suite competing for the box (the
+    ordinary state of a 24-worker gate lane) that cost blew the 60s per-test
+    cap outright and pytest-timeout's thread method killed the process, so the
+    whole file reported as "no tests ran". Collection is not covered by the
+    per-test timeout, so paying it here puts it somewhere it cannot kill the
+    file. Warms the TIMED-OUT branch specifically, since that is the path the
+    tests exercise. Best-effort: a failure must not change what any test
+    asserts.
+    """
+    home = Path(tempfile.mkdtemp(prefix="warm-run-job-"))
+    wedge = _WedgedSessionDb()
+    try:
+        # Warm the TIMED-OUT branch specifically: a run that gets a SessionDB
+        # back exercises different code than one whose init is cut short, and
+        # only the latter is what the tests below measure.
+        with patch.dict(os.environ, {"HERMES_CRON_SESSION_DB_TIMEOUT": "0.2"}), \
+             patch("cron.scheduler._hermes_home", home), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", side_effect=wedge), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=_PROVIDER), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent_cls.return_value.run_conversation.return_value = {"final_response": "ok"}
+            run_job({"id": "warm-run-job", "name": "warm", "prompt": "hello"})
+    except Exception:
+        pass
+    finally:
+        wedge.release.set()
+        shutil.rmtree(home, ignore_errors=True)
+
+
+# Upper bound on the stand-in's block, so an unreleased event can never hang the
+# test process at interpreter exit (see the module docstring). Nothing asserts
+# on it: a passing run releases the wedge in a ``finally`` long before this.
+_HANG_SECONDS = 30.0
+
+
+class _WedgedSessionDb:
+    """Stand-in for ``hermes_state.SessionDB()`` that blocks until released.
+
+    Like the real incident's wedged ``sqlite3.connect``, but bounded so the
+    test process can still exit cleanly once the assertions are done.
+
+    ``returned`` is the load-independent evidence these tests run on. It is set
+    ONLY if this call ran to completion — i.e. if ``run_job`` sat and waited the
+    wedge out. If ``run_job``'s own timeout did its job, ``run_job`` returns
+    while this call is still parked inside ``wait()`` and ``returned`` is still
+    clear.
+
+    This replaces a wall-clock assertion (``elapsed < N``) that repeatedly
+    failed on correct code. ``run_job`` does a lot besides construct a
+    SessionDB, all of it inside the measured region, and that cost scales with
+    machine load: 6.83s standalone on 2026-08-11 against a 5.0s budget, and
+    18.39s in the shared checkout with a sibling suite running — while the
+    third test in this file, identical shape and identical 0.2s bound but
+    running warm on an idle box, measured 1.8s. Every one of those runs had a
+    working timeout. A stopwatch cannot separate "the wedge was abandoned" from
+    "the machinery was slow"; this flag can, exactly, at any load.
+    """
+
+    def __init__(self):
+        self.release = threading.Event()
+        self.returned = threading.Event()
+
+    def __call__(self):
+        self.release.wait(timeout=_HANG_SECONDS)
+        self.returned.set()
+        return MagicMock()
+
+
+_warm_run_job()
 
 
 class TestSessionDbInitTimeout:
     def test_run_job_does_not_hang_when_sessiondb_init_wedges(self, tmp_path, monkeypatch):
         """run_job returns promptly even if SessionDB() never returns."""
         monkeypatch.setenv("HERMES_CRON_SESSION_DB_TIMEOUT", "0.2")
-        never_set = threading.Event()
+        wedge = _WedgedSessionDb()
         job = {"id": "wedged-sessiondb", "name": "test", "prompt": "hello"}
 
         try:
@@ -51,7 +138,7 @@ class TestSessionDbInitTimeout:
                  patch("cron.scheduler._resolve_origin", return_value=None), \
                  patch("hermes_cli.env_loader.load_hermes_dotenv"), \
                  patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-                 patch("hermes_state.SessionDB", side_effect=lambda: _hanging_session_db(never_set)), \
+                 patch("hermes_state.SessionDB", side_effect=wedge), \
                  patch(
                      "hermes_cli.runtime_provider.resolve_runtime_provider",
                      return_value={
@@ -66,15 +153,18 @@ class TestSessionDbInitTimeout:
                 mock_agent.run_conversation.return_value = {"final_response": "ok"}
                 mock_agent_cls.return_value = mock_agent
 
-                start = time.monotonic()
                 success, output, final_response, error = run_job(job)
-                elapsed = time.monotonic() - start
+                # Sample BEFORE the finally releases the wedge.
+                abandoned = not wedge.returned.is_set()
         finally:
-            never_set.set()
+            wedge.release.set()
 
-        # Bounded by the 0.2s timeout, not by the hang (which never resolves
-        # on its own within the test).
-        assert elapsed < 5.0
+        # run_job gave up on the init instead of waiting it out: the stand-in
+        # was still parked inside its wait() when run_job returned.
+        assert abandoned, (
+            "run_job waited out the wedged SessionDB init instead of "
+            "abandoning it at the 0.2s HERMES_CRON_SESSION_DB_TIMEOUT"
+        )
         # The run still completes successfully without a session store.
         assert success is True
         assert final_response == "ok"
@@ -131,7 +221,7 @@ class TestSessionDbInitTimeout:
         (tmp_path / "config.yaml").write_text(
             yaml.safe_dump({"cron": {"session_db_timeout_seconds": 0.2}})
         )
-        never_set = threading.Event()
+        wedge = _WedgedSessionDb()
         job = {"id": "config-timeout", "name": "test", "prompt": "hello"}
 
         try:
@@ -139,7 +229,7 @@ class TestSessionDbInitTimeout:
                  patch("cron.scheduler._resolve_origin", return_value=None), \
                  patch("hermes_cli.env_loader.load_hermes_dotenv"), \
                  patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-                 patch("hermes_state.SessionDB", side_effect=lambda: _hanging_session_db(never_set)), \
+                 patch("hermes_state.SessionDB", side_effect=wedge), \
                  patch(
                      "hermes_cli.runtime_provider.resolve_runtime_provider",
                      return_value={
@@ -154,14 +244,18 @@ class TestSessionDbInitTimeout:
                 mock_agent.run_conversation.return_value = {"final_response": "ok"}
                 mock_agent_cls.return_value = mock_agent
 
-                start = time.monotonic()
                 success, output, final_response, error = run_job(job)
-                elapsed = time.monotonic() - start
+                # Sample BEFORE the finally releases the wedge.
+                abandoned = not wedge.returned.is_set()
         finally:
-            never_set.set()
+            wedge.release.set()
 
-        # Config value 0.2s bounds the hang, not the 10s default.
-        assert elapsed < 5.0
+        # Config value 0.2s bounded the init, not the 10s default: run_job
+        # returned while the stand-in was still parked in its wait().
+        assert abandoned, (
+            "run_job waited out the wedged SessionDB init instead of "
+            "abandoning it at cron.session_db_timeout_seconds=0.2"
+        )
         assert success is True
         assert mock_agent_cls.call_args.kwargs["session_db"] is None
 
@@ -178,7 +272,7 @@ class TestDispatchGuardReleasedAfterHang:
         sched._parallel_pool_max_workers = None
         sched._running_job_ids.clear()
 
-        never_set = threading.Event()
+        wedge = _WedgedSessionDb()
         job = {
             "id": "guard-sessiondb-hang",
             "name": "guard-sessiondb-hang",
@@ -194,7 +288,7 @@ class TestDispatchGuardReleasedAfterHang:
                  patch("cron.scheduler._resolve_origin", return_value=None), \
                  patch("hermes_cli.env_loader.load_hermes_dotenv"), \
                  patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-                 patch("hermes_state.SessionDB", side_effect=lambda: _hanging_session_db(never_set)), \
+                 patch("hermes_state.SessionDB", side_effect=wedge), \
                  patch(
                      "hermes_cli.runtime_provider.resolve_runtime_provider",
                      return_value={
@@ -226,6 +320,6 @@ class TestDispatchGuardReleasedAfterHang:
                 n2 = sched.tick(verbose=False)
                 assert n2 == 1
         finally:
-            never_set.set()
+            wedge.release.set()
             sched._running_job_ids.discard("guard-sessiondb-hang")
             sched._shutdown_parallel_pool()

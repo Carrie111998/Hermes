@@ -27,6 +27,23 @@ import pytest
 
 from hermes_state import SessionDB
 
+# Warm ``run_agent`` HERE, at collection.
+#
+# ``_build_agent_with_db`` imports it lazily inside the test body, under the
+# same ``OPENROUTER_API_KEY`` patch used below so the module sees an identical
+# environment either way. That import is expensive (it pulls the agent stack
+# and runs plugin discovery), and paid inside the body it lands under the
+# gate's per-test ``--timeout``. Measured 2026-08-11 with a second suite
+# running alongside — i.e. the ordinary state of a 24-worker gate lane — the
+# 60s cap fired mid-``import run_agent`` in
+# ``test_concurrent_compressions_do_not_alias_sessions``, and pytest-timeout's
+# thread method kills the process, so the whole file reported as "no tests
+# ran". Collection is not covered by the per-test timeout, so this is the same
+# one-time cost moved to an untimed place. Same fix 671b38765 applied to
+# tests/gateway/test_feishu.py.
+with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+    from run_agent import AIAgent  # noqa: F401
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -62,6 +79,16 @@ def _build_agent_with_db(db: SessionDB, session_id: str):
             {"role": "user", "content": "tail"},
         ]
 
+    # Skip the lazy auxiliary-provider feasibility probe. ``_compress_context``
+    # runs it just-in-time on an agent's first compression, and it is a live
+    # probe: on this box it dialed OpenRouter and Nous, took the credit-error
+    # path, and ran full plugin discovery (54 plugins) — ~15s per agent of
+    # network-dependent latency inside the region these tests time. Nothing
+    # here needs it: the compressor is stubbed, so aux-LLM availability cannot
+    # change what either test asserts. Setting the flag is exactly what a
+    # completed probe does.
+    agent._compression_feasibility_checked = True
+
     compressor.compress.side_effect = _compress_with_overlap
     compressor.compression_count = 1
     compressor.last_prompt_tokens = 0
@@ -79,6 +106,31 @@ def _build_agent_with_db(db: SessionDB, session_id: str):
 
 
 _MESSAGES = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+
+# A worker that is still running when the assertions execute is not a lock-logic
+# result — it is an unfinished measurement, and reading ``results`` at that
+# point silently scores it as "did not compress".
+#
+# This file used ``join(timeout=15)`` and then asserted straight off ``results``.
+# Measured 2026-08-11 with the workers instrumented: the lock WINNER took 19.2s
+# and the LOSER 21.5s, so BOTH joins timed out, both entries were still None,
+# and ``test_concurrent_compressions_same_session_serialize`` failed with
+# "Expected exactly one agent to compress, got 0" — pointing at the lock while
+# the lock had in fact serialized them correctly (one rotated, one returned its
+# input unchanged). The gate's parallel workers make crossing 15s routine.
+#
+# So the deadline is now a hang-catcher, not a stopwatch: generous enough that
+# a correct-but-slow run always completes, and a worker that blows it fails
+# with what actually happened instead of masquerading as a lock defect.
+_JOIN_TIMEOUT = 180
+
+
+def _assert_all_finished(threads) -> None:
+    stuck = [t.name for t in threads if t.is_alive()]
+    assert not stuck, (
+        f"Compression worker(s) {stuck} still running after {_JOIN_TIMEOUT}s — "
+        "results below would be unfinished measurements, not lock-logic outcomes."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -114,8 +166,9 @@ def test_concurrent_compressions_do_not_alias_sessions(tmp_path: Path) -> None:
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=15)
+        t.join(timeout=_JOIN_TIMEOUT)
 
+    _assert_all_finished(threads)
     assert not errors, f"Compression raised exceptions: {errors}"
 
     # Every agent must have rotated to a new, unique session_id.
@@ -188,8 +241,9 @@ def test_concurrent_compressions_same_session_serialize(tmp_path: Path) -> None:
     t_b = threading.Thread(target=run, args=("b", agent_b), name="review_fork")
     t_a.start()
     t_b.start()
-    t_a.join(timeout=15)
-    t_b.join(timeout=15)
+    t_a.join(timeout=_JOIN_TIMEOUT)
+    t_b.join(timeout=_JOIN_TIMEOUT)
+    _assert_all_finished([t_a, t_b])
 
     # Restore the real method so the post-join lock-leak assertion below
     # (and any future call) hits the unwrapped implementation.
