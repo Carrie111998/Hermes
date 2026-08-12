@@ -97,6 +97,7 @@ matrix:
   session_scope: room             # auto|room|thread; room is recommended for project rooms
   auto_thread: true               # Auto-create threads for responses (default: true)
   dm_mention_threads: false       # Create thread when @mentioned in DM (default: false)
+  approval_controls: reactions    # reactions|text; text uses chat commands only
   max_message_length: 16000       # Outbound chunk size in chars (default: 16000, max: 65535)
 ```
 
@@ -118,6 +119,10 @@ MATRIX_ALLOW_ROOM_MENTIONS=false
 
 :::tip Disabling reactions
 `MATRIX_REACTIONS=false` turns off the processing-lifecycle emoji reactions (👀/✅/❌) the bot posts on inbound messages. Useful for rooms where reaction events are noisy or aren't supported by all participating clients.
+:::
+
+:::tip Text-only approvals
+Set `matrix.approval_controls: text` to replace Matrix's reaction-based dangerous-command approval card with a plain prompt. Approve or deny with `!approve`, `!approve session`, `!approve always`, or `!deny`. Text mode neither seeds approval reactions nor accepts them.
 :::
 
 :::tip Room-wide mentions

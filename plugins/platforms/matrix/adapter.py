@@ -1302,7 +1302,16 @@ class MatrixAdapter(BasePlatformAdapter):
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
 
-        # Matrix reaction-based dangerous command approvals.
+        # Matrix reaction-based dangerous command approvals. Set
+        # matrix.approval_controls to "text" for command-only prompts.
+        raw_approval_controls = str(
+            config.extra.get("approval_controls", "reactions")
+        ).strip().lower()
+        self._approval_controls = (
+            raw_approval_controls
+            if raw_approval_controls in {"reactions", "text"}
+            else "reactions"
+        )
         self._approval_reaction_map = {
             "✅": "once",
             "🌀": "session",
@@ -2623,27 +2632,44 @@ class MatrixAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         requester_user_id = str((metadata or {}).get("requester_user_id") or "") or None
-        scope_choices = ""
-        if smart_denied:
-            scope_choices = "Smart DENY: owner override applies to this one operation only.\n"
+        text_controls = getattr(self, "_approval_controls", "reactions") == "text"
+        if text_controls:
+            cmd_preview = self._truncate_preview(str(command or ""), self._EA_CMD_BUDGET)
+            choices = ["Reply `!approve` to run it once"]
+            if not smart_denied and allow_session:
+                choices.append("`!approve session` for this session")
+                if allow_permanent:
+                    choices.append("`!approve always` to remember it")
+            choices.append("`!deny` to cancel")
+            text = (
+                "I need your approval before running this command.\n\n"
+                f"```\n{self._ea_escape(cmd_preview)}\n```\n"
+                f"Reason: {self._ea_escape(description)}\n\n"
+                + ", or ".join(choices)
+                + "."
+            )
         else:
             scope_choices = ""
+            if smart_denied:
+                scope_choices = "Smart DENY: owner override applies to this one operation only.\n"
+            else:
+                scope_choices = ""
+                if allow_session:
+                    scope_choices += "Reply `!approve session` to approve this pattern for the session, "
+                if allow_permanent:
+                    scope_choices += "`!approve always` to approve permanently, "
+            reaction_legend_parts = ["✅ = approve once"]
             if allow_session:
-                scope_choices += "Reply `!approve session` to approve this pattern for the session, "
-            if allow_permanent:
-                scope_choices += "`!approve always` to approve permanently, "
-        reaction_legend_parts = ["✅ = approve once"]
-        if allow_session:
-            reaction_legend_parts.append("🌀 = approve for this session")
-            if allow_permanent:
-                reaction_legend_parts.append("♾️ = approve always")
-        reaction_legend_parts.append("❎ = deny")
-        text = (
-            f"{self._format_exec_approval(command, description)}\n\n"
-            f"{scope_choices}Reply `!approve` to execute once, or `!deny` to cancel.\n\n"
-            "You can also click the reaction to approve:\n"
-            + "\n".join(reaction_legend_parts)
-        )
+                reaction_legend_parts.append("🌀 = approve for this session")
+                if allow_permanent:
+                    reaction_legend_parts.append("♾️ = approve always")
+            reaction_legend_parts.append("❎ = deny")
+            text = (
+                f"{self._format_exec_approval(command, description)}\n\n"
+                f"{scope_choices}Reply `!approve` to execute once, or `!deny` to cancel.\n\n"
+                "You can also click the reaction to approve:\n"
+                + "\n".join(reaction_legend_parts)
+            )
 
         result = await self.send(chat_id, text, metadata=metadata)
         if not result.success or not result.message_id:
@@ -2662,20 +2688,21 @@ class MatrixAdapter(BasePlatformAdapter):
         self._approval_prompts_by_event[result.message_id] = prompt
         self._approval_prompt_by_session[session_key] = result.message_id
 
-        if not allow_session:
-            reactions = ("✅", "❌")
-        elif not allow_permanent:
-            reactions = ("✅", "🌀", "❌")
-        else:
-            reactions = ("✅", "🌀", "♾️", "❌")
-        for emoji in reactions:
-            try:
-                reaction_result = await self._send_reaction(chat_id, result.message_id, emoji)
-                # Save the bot's reaction event_id for later cleanup
-                if reaction_result:
-                    prompt.bot_reaction_events[emoji] = str(reaction_result)
-            except Exception as exc:
-                logger.debug("Matrix: failed to add approval reaction %s: %s", emoji, exc)
+        if not text_controls:
+            if not allow_session:
+                reactions = ("✅", "❌")
+            elif not allow_permanent:
+                reactions = ("✅", "🌀", "❌")
+            else:
+                reactions = ("✅", "🌀", "♾️", "❌")
+            for emoji in reactions:
+                try:
+                    reaction_result = await self._send_reaction(chat_id, result.message_id, emoji)
+                    # Save the bot's reaction event_id for later cleanup
+                    if reaction_result:
+                        prompt.bot_reaction_events[emoji] = str(reaction_result)
+                except Exception as exc:
+                    logger.debug("Matrix: failed to add approval reaction %s: %s", emoji, exc)
 
         return result
 
@@ -4002,6 +4029,8 @@ class MatrixAdapter(BasePlatformAdapter):
             # Check if this reaction resolves a pending approval prompt.
             prompt = self._approval_prompts_by_event.get(reacts_to)
             if prompt and not prompt.resolved:
+                if getattr(self, "_approval_controls", "reactions") == "text":
+                    return
                 if room_id != prompt.chat_id:
                     return
                 if self._matrix_prompt_expired(prompt):
@@ -5333,11 +5362,11 @@ def interactive_setup() -> None:
 
 
 def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
-    """Translate config.yaml matrix: keys into MATRIX_* env vars.
+    """Translate config.yaml Matrix keys into runtime configuration.
 
-    Implements the apply_yaml_config_fn contract (#24849). Mirrors the legacy
-    matrix_cfg block from gateway/config.py::load_gateway_config(). Env vars
-    take precedence over YAML. Returns None — everything flows through env.
+    Implements the apply_yaml_config_fn contract (#24849). Legacy environment
+    settings still flow through MATRIX_* variables; config-only settings are
+    returned for PlatformConfig.extra.
     """
     if "require_mention" in matrix_cfg and not os.getenv("MATRIX_REQUIRE_MENTION"):
         os.environ["MATRIX_REQUIRE_MENTION"] = str(matrix_cfg["require_mention"]).lower()
@@ -5371,6 +5400,8 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
         os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
     if "max_message_length" in matrix_cfg and not os.getenv("MATRIX_MAX_MESSAGE_LENGTH"):
         os.environ["MATRIX_MAX_MESSAGE_LENGTH"] = str(matrix_cfg["max_message_length"])
+    if "approval_controls" in matrix_cfg:
+        return {"approval_controls": matrix_cfg["approval_controls"]}
     return None
 
 
