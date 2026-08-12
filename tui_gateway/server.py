@@ -39,9 +39,42 @@ from tui_gateway.transport import (
 
 logger = logging.getLogger(__name__)
 
-_hermes_home = get_hermes_home()
+# Resolved per use, NOT baked into a module constant at import.  Under pytest
+# the autouse ``_hermetic_environment`` fixture redirects ``HERMES_HOME`` to a
+# per-test tempdir only AFTER collection has imported this module, so a constant
+# captured here holds the developer's REAL ``~/.hermes``.  Four use sites below
+# are writes — ``_save_cfg`` (the user's live config.yaml), the two ``images/``
+# sites, and ``paste.collapse`` — and nothing structural stopped a test from
+# reaching them.  See GBrain concepts/import-time-hermes-home-snapshot-bug.
+#
+# ``_hermes_home`` stays as an override seam so the existing
+# ``monkeypatch.setattr(server, "_hermes_home", tmp_path)`` tests keep working.
+_hermes_home: Optional[Path] = None
+
+
+def _resolve_hermes_home() -> Path:
+    """Return the gateway's Hermes home, resolved at call time.
+
+    ``get_process_hermes_home()`` rather than ``get_hermes_home()``, on purpose.
+    The import-time constant this replaces was evaluated with no context-local
+    override active, so the launch home is exactly what it captured, and every
+    use site below runs on the RPC dispatch thread — outside the per-turn
+    ``set_hermes_home_override`` scope opened by the turn dispatcher.  Following
+    the override would therefore be a behaviour change, not a fix.
+
+    ``_profile_home`` depends on this directly: it compares a candidate profile
+    against the LAUNCH home to decide whether an override is needed at all, so
+    resolving it through the override would make it answer "already the launch
+    profile" for whatever profile the caller was scoped to.
+    """
+    if _hermes_home is not None:
+        return Path(_hermes_home)
+    return get_process_hermes_home()
+
+
 load_hermes_dotenv(
-    hermes_home=_hermes_home, project_env=Path(__file__).parent.parent / ".env"
+    hermes_home=_resolve_hermes_home(),
+    project_env=Path(__file__).parent.parent / ".env",
 )
 
 
@@ -1110,7 +1143,7 @@ def _profile_home(profile: str | None) -> Path | None:
     except Exception:
         return None
     # Already the launch profile? No override needed.
-    if home.resolve() == Path(_hermes_home).resolve():
+    if home.resolve() == _resolve_hermes_home().resolve():
         return None
     return home if (home / "state.db").exists() or home.exists() else None
 
@@ -2276,7 +2309,7 @@ def _load_cfg() -> dict:
         # launch profile's _hermes_home. Cache is keyed on the resolved path, so
         # profiles don't clobber each other.
         override = get_hermes_home_override()
-        home = override if isinstance(override, str) and override else _hermes_home
+        home = override if isinstance(override, str) and override else _resolve_hermes_home()
         p = Path(home) / "config.yaml"
         mtime = p.stat().st_mtime if p.exists() else None
         with _cfg_lock:
@@ -2322,7 +2355,7 @@ def _save_cfg(cfg: dict):
 
     from hermes_cli.config import atomic_config_write
 
-    path = _hermes_home / "config.yaml"
+    path = _resolve_hermes_home() / "config.yaml"
     atomic_config_write(path, cfg)
     with _cfg_lock:
         _cfg_cache = copy.deepcopy(cfg)
@@ -10563,7 +10596,7 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5027, f"clipboard unavailable: {e}")
 
     session["image_counter"] = session.get("image_counter", 0) + 1
-    img_dir = _hermes_home / "images"
+    img_dir = _resolve_hermes_home() / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
     img_path = (
         img_dir
@@ -10711,7 +10744,7 @@ def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: 
     the existing native-image-attach pipeline. Returns the written path.
     """
     session["image_counter"] = session.get("image_counter", 0) + 1
-    img_dir = _hermes_home / "images"
+    img_dir = _resolve_hermes_home() / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     img_path = img_dir / f"{prefix}_{ts}_{session['image_counter']}{ext}"
@@ -12437,7 +12470,7 @@ def _(rid, params: dict) -> dict:
     if key == "profile":
         from hermes_constants import display_hermes_home
 
-        return _ok(rid, {"home": str(_hermes_home), "display": display_hermes_home()})
+        return _ok(rid, {"home": str(_resolve_hermes_home()), "display": display_hermes_home()})
     if key == "project":
         cfg_terminal = _load_cfg().get("terminal") or {}
         raw = str(params.get("cwd", "") or cfg_terminal.get("cwd", "") or "").strip()
@@ -12568,7 +12601,7 @@ def _(rid, params: dict) -> dict:
         display = _load_cfg().get("display")
         return _ok(rid, {"value": _display_mouse_tracking(display)})
     if key == "mtime":
-        cfg_path = _hermes_home / "config.yaml"
+        cfg_path = _resolve_hermes_home() / "config.yaml"
         try:
             return _ok(
                 rid, {"mtime": cfg_path.stat().st_mtime if cfg_path.exists() else 0}
@@ -13637,7 +13670,7 @@ def _(rid, params: dict) -> dict:
 
     _paste_counter += 1
     line_count = text.count("\n") + 1
-    paste_dir = _hermes_home / "pastes"
+    paste_dir = _resolve_hermes_home() / "pastes"
     paste_dir.mkdir(parents=True, exist_ok=True)
 
     from datetime import datetime
@@ -15521,7 +15554,7 @@ def _(rid, params: dict) -> dict:
                 "title": "Environment",
                 "rows": [
                     ["Working Dir", os.getcwd()],
-                    ["Config File", str(_hermes_home / "config.yaml")],
+                    ["Config File", str(_resolve_hermes_home() / "config.yaml")],
                 ],
             },
         ]
