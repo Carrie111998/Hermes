@@ -1,7 +1,7 @@
 import type { ToolPreset } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 
 import { SETTINGS_ROUTE } from '@/app/routes'
 import { STATUSBAR_ACTION_CLASS } from '@/app/shell/statusbar-controls'
