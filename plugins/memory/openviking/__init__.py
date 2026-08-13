@@ -454,6 +454,9 @@ class _VikingClient:
     def health_payload(self) -> dict:
         return self._anonymous_json("/health")
 
+    def authenticated_health_payload(self) -> dict:
+        return self.get("/health", timeout=3.0)
+
     def openapi_payload(self) -> dict:
         return self._anonymous_json("/openapi.json")
 
@@ -945,8 +948,18 @@ def _is_openviking_openapi_payload(payload: Any) -> bool:
 
 
 def _probe_openviking_identity(client: _VikingClient) -> tuple[str, Any]:
-    """Identify modern or legacy OpenViking before any authenticated request."""
-    health = client.health_payload()
+    """Identify OpenViking anonymously, with one pinned managed-service fallback."""
+    try:
+        health = client.health_payload()
+    except _OpenVikingHTTPError as exc:
+        # Only the pinned managed endpoint may receive credentials before identity is known.
+        is_pinned_managed_service = (
+            getattr(client, "_endpoint", "") == _OPENVIKING_SERVICE_ENDPOINT
+            and bool(getattr(client, "_api_key", ""))
+        )
+        if not is_pinned_managed_service or exc.status_code not in {401, 403}:
+            raise
+        health = client.authenticated_health_payload()
     if isinstance(health, dict) and health.get("healthy") is False:
         return _OPENVIKING_IDENTITY_UNHEALTHY, health
     if _is_openviking_health_payload(health):

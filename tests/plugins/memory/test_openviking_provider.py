@@ -786,6 +786,38 @@ def test_openviking_identity_probes_are_anonymous_before_authenticated_requests(
         assert headers["Authorization"] == "Bearer secret-key"
 
 
+def test_managed_service_retries_authenticated_health_after_anonymous_401(monkeypatch):
+    client = _VikingClient(
+        openviking_module._OPENVIKING_SERVICE_ENDPOINT,
+        api_key="service-key",
+    )
+    headers = []
+
+    def fake_get(_url, **kwargs):
+        request_headers = kwargs["headers"]
+        headers.append(request_headers)
+        authenticated = "X-API-Key" in request_headers
+        payload = (
+            {"status": "ok", "healthy": True, "version": "v0.4.11"}
+            if authenticated
+            else {"error": {"code": "AuthenticationError", "message": "API key required"}}
+        )
+        return SimpleNamespace(
+            status_code=200 if authenticated else 401,
+            text="",
+            json=lambda: payload,
+        )
+
+    monkeypatch.setattr(client._httpx, "get", fake_get)
+
+    state, health = openviking_module._probe_openviking_identity(client)
+
+    assert state == "modern"
+    assert health["healthy"] is True
+    assert headers[0] == {"Accept": "application/json"}
+    assert headers[1]["X-API-Key"] == "service-key"
+
+
 def test_repeated_openviking_health_probes_never_send_identity_headers(monkeypatch):
     captured_headers = []
     client = _VikingClient(
