@@ -1564,6 +1564,27 @@ def _launch_configured_cwd() -> str | None:
         return None
 
 
+def _active_project_cwd(profile_home: Path | None = None) -> str | None:
+    """Return the active project's existing primary folder for a profile."""
+    try:
+        from hermes_cli import projects_db
+
+        home = Path(profile_home) if profile_home is not None else Path(_hermes_home)
+        db_path = home / "projects.db"
+        if not db_path.is_file():
+            return None
+        with contextlib.closing(projects_db.connect(db_path)) as conn:
+            active_id = projects_db.get_active_id(conn)
+            project = projects_db.get_project(conn, active_id) if active_id else None
+        primary = str(project.primary_path or "").strip() if project else ""
+        if not primary:
+            return None
+        resolved = os.path.abspath(os.path.expanduser(primary))
+        return resolved if os.path.isdir(resolved) else None
+    except Exception:
+        return None
+
+
 def _default_session_cwd() -> str:
     """Fallback cwd for a session with no explicit / stored / profile cwd.
 
@@ -2412,17 +2433,23 @@ def _normalize_completion_path(path_part: str) -> str:
 
 def _completion_cwd(params: dict | None = None) -> str:
     params = params or {}
+    source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+    profile_home = _profile_home(params.get("profile"))
     raw = (
         params.get("cwd")
         or _sessions.get(params.get("session_id") or "", {}).get("cwd")
         # A session bound to another profile resolves its workspace from THAT
         # profile's config before falling back to the launch profile's env var.
-        or _profile_configured_cwd(_profile_home(params.get("profile")))
+        or _profile_configured_cwd(profile_home)
         # The launch profile's dashboard /chat attaches to the dashboard's
         # in-memory gateway, which does NOT inherit the PTY child's bridged
         # TERMINAL_CWD. Read the launch profile's config.yaml directly so a
         # configured terminal.cwd wins over a stale process env / launch dir.
         or _launch_configured_cwd()
+        # A Desktop backend may launch from the packaged install/source clone.
+        # Its bridged TERMINAL_CWD can carry the same launch artifact, so the
+        # profile's active project must win before that process-global fallback.
+        or (_active_project_cwd(profile_home) if source == "desktop" else None)
         or os.environ.get("TERMINAL_CWD")
         or os.getcwd()
     )
