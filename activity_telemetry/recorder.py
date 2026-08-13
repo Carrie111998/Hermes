@@ -1,8 +1,11 @@
 from collections.abc import Mapping
+from decimal import Decimal
 import logging
 from pathlib import Path
 import threading
-from typing import Any
+from typing import Any, Optional
+
+from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
 
 from .schema import (
     LogicalActivityStart,
@@ -50,6 +53,8 @@ class ActivityRecorder:
                 cache_write_tokens=int(usage.get("cache_write_tokens") or 0),
                 output_tokens=int(usage.get("output_tokens") or 0),
                 reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
+                recorded_provider_cost_usd=self._cost(provider, model, usage, False),
+                api_equivalent_cost_usd=self._cost(provider, model, usage, True),
             )
             with self._lock:
                 self.store.record_usage(
@@ -59,6 +64,43 @@ class ActivityRecorder:
                 )
         except Exception as exc:
             self._log_failure("record_response", exc)
+
+    @staticmethod
+    def _cost(
+        provider: str,
+        model: str,
+        usage: Mapping[str, Any],
+        ignore_subscription: bool,
+    ) -> Optional[Decimal]:
+        """Price one response, or return None meaning "unknown".
+
+        None and zero are different answers and the store keeps them apart:
+        None is "nobody could price this route", zero is "this route is
+        genuinely free at the margin" (a subscription). Returning zero on a
+        pricing miss would silently report the fleet as costless.
+
+        Pricing is an enrichment on top of the usage row, so every failure
+        here degrades to unknown rather than discarding the token counts.
+        """
+        try:
+            canonical = CanonicalUsage(
+                input_tokens=int(usage.get("input_tokens") or 0),
+                output_tokens=int(usage.get("output_tokens") or 0),
+                cache_read_tokens=int(usage.get("cache_read_tokens") or 0),
+                cache_write_tokens=int(usage.get("cache_write_tokens") or 0),
+                reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
+                request_count=int(usage.get("request_count") or 1),
+            )
+            result = estimate_usage_cost(
+                model,
+                canonical,
+                provider=provider,
+                ignore_subscription=ignore_subscription,
+            )
+        except Exception as exc:
+            ActivityRecorder._log_failure("estimate_cost", exc)
+            return None
+        return result.amount_usd
 
     def record_tool_call(self, count: int = 1) -> None:
         self._record_counter("record_tool_call", RouteUsageDelta(tool_calls=count))

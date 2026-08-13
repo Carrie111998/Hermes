@@ -183,6 +183,35 @@ def test_estimate_usage_cost_marks_subscription_routes_included():
     assert float(result.amount_usd) == 0.0
 
 
+def test_ignore_subscription_prices_a_codex_route_at_the_vendor_list_rate():
+    """What the same call would have cost had it been bought from OpenAI.
+
+    Without this, a subscription workload reports as free and beats every
+    metered alternative in a cost comparison by construction, rather than on
+    the merits.
+    """
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=100_000)
+
+    included = estimate_usage_cost("gpt-5.6-sol", usage, provider="openai-codex")
+    equivalent = estimate_usage_cost(
+        "gpt-5.6-sol", usage, provider="openai-codex", ignore_subscription=True
+    )
+    direct = estimate_usage_cost("gpt-5.6-sol", usage, provider="openai")
+
+    assert float(included.amount_usd) == 0.0
+    assert equivalent.amount_usd == direct.amount_usd
+    assert equivalent.amount_usd > 0
+
+
+def test_ignore_subscription_leaves_metered_routes_untouched():
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=100_000)
+    assert estimate_usage_cost(
+        "deepseek-v4-pro", usage, provider="deepseek", ignore_subscription=True
+    ).amount_usd == estimate_usage_cost(
+        "deepseek-v4-pro", usage, provider="deepseek"
+    ).amount_usd
+
+
 def test_estimate_usage_cost_refuses_cache_pricing_without_official_cache_rate(monkeypatch):
     monkeypatch.setattr(
         "agent.usage_pricing.fetch_model_metadata",

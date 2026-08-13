@@ -895,6 +895,12 @@ def _to_int(value: Any) -> int:
         return 0
 
 
+# Subscription routes bill nothing per token, but the same call has a published
+# list price under the vendor that actually serves it. Only routes whose tokens
+# are genuinely the vendor's own belong here.
+_SUBSCRIPTION_UNDERLYING_PROVIDER: Dict[str, str] = {"openai-codex": "openai"}
+
+
 def resolve_billing_route(
     model_name: str,
     provider: Optional[str] = None,
@@ -1079,8 +1085,19 @@ def get_pricing_entry(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    *,
+    ignore_subscription: bool = False,
 ) -> Optional[PricingEntry]:
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
+    if route.billing_mode == "subscription_included" and ignore_subscription:
+        # Price the tokens as if they had been bought at list. A subscription
+        # bills nothing at the margin, so without this a subscription workload
+        # reads as free and wins every cost comparison by construction.
+        route = resolve_billing_route(
+            model_name,
+            provider=_SUBSCRIPTION_UNDERLYING_PROVIDER.get(route.provider, route.provider),
+            base_url=base_url,
+        )
     if route.billing_mode == "subscription_included":
         return PricingEntry(
             input_cost_per_million=_ZERO,
@@ -1206,9 +1223,10 @@ def estimate_usage_cost(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    ignore_subscription: bool = False,
 ) -> CostResult:
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
-    if route.billing_mode == "subscription_included":
+    if route.billing_mode == "subscription_included" and not ignore_subscription:
         return CostResult(
             amount_usd=_ZERO,
             status="included",
@@ -1217,7 +1235,13 @@ def estimate_usage_cost(
             pricing_version="included-route",
         )
 
-    entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key)
+    entry = get_pricing_entry(
+        model_name,
+        provider=provider,
+        base_url=base_url,
+        api_key=api_key,
+        ignore_subscription=ignore_subscription,
+    )
     if not entry:
         return CostResult(amount_usd=None, status="unknown", source="none", label="n/a")
 
