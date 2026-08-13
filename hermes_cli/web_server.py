@@ -791,25 +791,58 @@ async def _dashboard_health_middleware(request: Request, call_next):
 # ---------------------------------------------------------------------------
 
 _ACCESS_LOG_PATH = os.path.expanduser("~/.hermes/logs/access.jsonl")
+_ACCESS_LOG_MAX_BYTES = 50 * 1024 * 1024
+_ACCESS_LOG_BACKUP = _ACCESS_LOG_PATH + ".1"
+_ACCESS_FIELD_MAX = 512
+
+_CRED_SHAPE_PATTERNS = (
+    re.compile(
+        r"(?i)(sk|pk|rk|ak|api[-_]?key|token|secret|password|passwd|bearer|"
+        r"client[-_]?secret)[-=_.:]\s*[A-Za-z0-9_\-\.=+/]{8,}"
+    ),
+    re.compile(r"\b[0-9a-fA-F]{32,}\b"),
+    re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
+)
 
 
-def _access_log_line(request: Request, status: int, t0: float) -> None:
+def _scrub_field(value: str) -> str:
+    value = value[:_ACCESS_FIELD_MAX]
+    for pat in _CRED_SHAPE_PATTERNS:
+        value = pat.sub("<redacted>", value)
+    return value
+
+
+def _rotate_access_log_if_needed() -> None:
+    try:
+        if os.path.getsize(_ACCESS_LOG_PATH) > _ACCESS_LOG_MAX_BYTES:
+            os.replace(_ACCESS_LOG_PATH, _ACCESS_LOG_BACKUP)
+    except OSError:
+        pass  # missing file (first write) or race — ignore
+
+
+def _access_log_line(request: Request, status: int, t0: float, unhandled: bool = False) -> None:
     """Append one JSONL access entry. Never raises — logging must not break serving."""
     import time as _time
+    from urllib.parse import urlparse
 
     try:
+        # Referer is a secondary token-leak channel: strip query + fragment.
+        ref = urlparse(request.headers.get("referer", "")).path
         entry = {
             "origin": "hermes-web",
             "ts": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "dur_ms": round((_time.time() - t0) * 1000, 1),
             "ip": request.client.host if request.client else "",
-            "host": request.headers.get("host", ""),
+            "host": _scrub_field(request.headers.get("host", "")),
             "method": request.method,
-            "path": request.url.path,
+            "path": _scrub_field(request.url.path),
             "status": status,
-            "ua": request.headers.get("user-agent", ""),
-            "ref": request.headers.get("referer", ""),
+            "ua": _scrub_field(request.headers.get("user-agent", "")),
+            "ref": _scrub_field(ref),
         }
+        if unhandled:
+            entry["unhandled_exception"] = True
+        _rotate_access_log_if_needed()
         with open(_ACCESS_LOG_PATH, "a") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception:
@@ -822,13 +855,18 @@ async def _access_log_middleware(request: Request, call_next):
     import time as _time
 
     t0 = _time.time()
-    status = 599
+    unhandled = False
+    status = 500
     try:
         response = await call_next(request)
         status = response.status_code
         return response
+    except Exception:
+        unhandled = True
+        status = 500  # matches what Starlette's ServerErrorMiddleware returns to the client
+        raise
     finally:
-        _access_log_line(request, status, t0)
+        _access_log_line(request, status, t0, unhandled)
 
 
 # ---------------------------------------------------------------------------
