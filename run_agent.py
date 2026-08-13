@@ -7917,6 +7917,8 @@ class AIAgent:
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
+            model=function_args.get("model"),
+            reasoning_effort=function_args.get("reasoning_effort"),
             background=(not _is_subagent),
             parent_agent=self,
         )
