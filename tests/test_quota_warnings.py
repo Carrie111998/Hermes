@@ -326,6 +326,32 @@ def test_cache_distinguishes_base_url(monkeypatch):
     assert ("openai-codex", "https://b") in calls
 
 
+def test_cache_distinguishes_api_key(monkeypatch):
+    # Two credentials for the same provider/base_url must NOT share a cached
+    # snapshot — a cross-account stale-data leak (cross-vendor review).
+    calls = []
+
+    def fake(provider, *, base_url=None, api_key=None):
+        calls.append((provider, base_url, api_key))
+        return _make_fake_snapshot()
+
+    monkeypatch.setattr("agent.quota_warnings.fetch_account_usage", fake)
+    clear_quota_cache()
+    # First credential → 1 fetch.
+    s1a = fetch_quota_snapshot("openai-codex", base_url="https://x", api_key="key-a")
+    s1b = fetch_quota_snapshot("openai-codex", base_url="https://x", api_key="key-a")
+    assert s1a is s1b  # same cached object for same key
+    assert len(calls) == 1
+    # Second credential → different key, must refetch (NOT a cache hit).
+    s2 = fetch_quota_snapshot("openai-codex", base_url="https://x", api_key="key-b")
+    assert s2 is not s1a
+    assert len(calls) == 2
+    # First credential still served from its own cache entry.
+    s1c = fetch_quota_snapshot("openai-codex", base_url="https://x", api_key="key-a")
+    assert s1c is s1a
+    assert len(calls) == 2
+
+
 def test_cache_does_not_cache_fetch_failures(monkeypatch):
     calls = []
     state = {"fail": True}

@@ -243,7 +243,7 @@ def startup_warning_lines(
 # ── TTL cache ─────────────────────────────────────────────────────────────
 
 
-# Cache: {(provider, base_url): (timestamp, snapshot)}
+# Cache: {(provider, base_url, api_key): (timestamp, snapshot)}
 _quota_cache: dict[tuple, tuple[float, AccountUsageSnapshot]] = {}
 _quota_cache_lock = threading.Lock()
 
@@ -257,9 +257,12 @@ def fetch_quota_snapshot(
 ) -> Optional[AccountUsageSnapshot]:
     """TTL-cached wrapper around :func:`agent.account_usage.fetch_account_usage`.
 
-    The cache key is ``(provider, base_url)`` (``api_key`` is intentionally
-    excluded — the same account is reused across turns).  A cached snapshot
-    younger than ``max_age`` seconds (default 600s = 10 min) is returned
+    The cache key is ``(provider, base_url, api_key)`` — ``api_key`` is part of
+    the key so two credentials for the same provider/base_url (e.g. two Codex
+    accounts in the credential pool) never share a cached snapshot,
+    eliminating a cross-account stale-data leak (cross-vendor review).
+    ``api_key`` never leaves this module: the dict is module-private and is
+    not logged or otherwise exposed.  A cached snapshot younger than ``max_age`` seconds (default 600s = 10 min) is returned
     without hitting the network.
 
     Fail-open: ``fetch_account_usage`` exceptions return ``None`` and are
@@ -267,7 +270,7 @@ def fetch_quota_snapshot(
     Likewise a ``None`` snapshot (unsupported provider / no creds) is not
     cached.
     """
-    key = (provider, base_url)
+    key = (provider, base_url, api_key)
     now = monotonic()
     with _quota_cache_lock:
         entry = _quota_cache.get(key)

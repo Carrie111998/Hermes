@@ -11871,7 +11871,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         Honors ``quota.suppress_warnings``: when set, emits nothing.  The probe
         is fail-open (never breaks a turn) and TTL-cached via the engine, so a
-        slow/unreachable provider can't hang the prompt.
+        slow/unreachable provider can't hang the prompt.  The provider fetch is
+        bounded to a 2s wait — this is advisory and runs on the main thread
+        before every turn, so a slow provider must not delay the prompt
+        (cross-vendor review finding).
         """
         try:
             agent = self.agent
@@ -11889,7 +11892,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 snapshot = _pool.submit(
                     fetch_quota_snapshot, provider,
                     base_url=base_url, api_key=api_key,
-                ).result(timeout=10.0)
+                ).result(timeout=2.0)  # 2s bound: the probe is advisory and runs on the main thread before every turn — a slow provider must not delay the prompt (cross-vendor review).
             except Exception:
                 snapshot = None
             finally:
