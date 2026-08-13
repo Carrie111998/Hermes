@@ -178,6 +178,7 @@ def test_claim_heals_legacy_worktree_path_and_records_resolution(
         task = kb.get_task(conn, task_id)
         created_after = _event(conn, task_id, "created")[0]
         resolved_events = _event(conn, task_id, "workspace_resolved")
+        events = kb.list_events(conn, task_id)
 
     expected_path = repo / ".worktrees" / task_id
     assert task is not None
@@ -191,6 +192,11 @@ def test_claim_heals_legacy_worktree_path_and_records_resolution(
             "branch_name": f"wt/{task_id}",
         }
     ]
+    event_kinds = [event.kind for event in events]
+    assert event_kinds.index("created") < event_kinds.index("claimed")
+    assert event_kinds.index("claimed") < event_kinds.index("workspace_resolved")
+    claimed = next(event for event in events if event.kind == "claimed")
+    assert resolved_events[0].run_id == claimed.run_id
 
 
 def test_repeated_resolution_does_not_duplicate_event(kanban_home: Path) -> None:
