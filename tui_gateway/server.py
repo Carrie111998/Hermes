@@ -859,6 +859,13 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     """
     if not session:
         return
+    try:
+        from tools.excalidraw_tools import set_focused_drawings
+
+        profile = Path(str(session["profile_home"])).name if session.get("profile_home") else _current_profile_name()
+        set_focused_drawings(str(session.get("session_key") or ""), profile, [])
+    except Exception:
+        pass
     _finalize_session(session, end_reason=end_reason)
     _announce_session_reclaimed(session, end_reason)
     try:
@@ -3218,6 +3225,7 @@ def _set_session_context(
         # fall back to the session_key (matching the id derivation used at
         # session-finalize), so an identified session is never left blank.
         session_id = session_key
+        profile = _current_profile_name()
         with _sessions_lock:
             for sess in list(_sessions.values()):
                 if sess.get("session_key") == session_key:
@@ -3225,6 +3233,8 @@ def _set_session_context(
                     session_id = (
                         getattr(sess.get("agent"), "session_id", None) or session_key
                     )
+                    if sess.get("profile_home"):
+                        profile = Path(str(sess["profile_home"])).name
                     break
         return set_session_vars(
             session_key=session_key,
@@ -3232,6 +3242,7 @@ def _set_session_context(
             source=source,
             cwd=resolved,
             ui_session_id=ui_session_id,
+            profile=profile,
             cron_session="",
         )
     except Exception:
@@ -4230,7 +4241,10 @@ def _gui_surface_toolsets(platform: str) -> set[str]:
     """
     surfaces = {"project"}
     if platform == "desktop":
-        surfaces.add("desktop_ui")
+        # Excalidraw can emit a drawing-pane event only to the Desktop renderer.
+        # Keep its schema off every non-Desktop session rather than paying the
+        # model-tool cost across the core bundle.
+        surfaces.update({"desktop_ui", "excalidraw"})
     return surfaces
 
 
@@ -14438,6 +14452,7 @@ def _browser_disconnect(rid) -> dict:
 from . import (  # noqa: E402
     methods_complete as _methods_complete,
     methods_config as _methods_config,
+    methods_excalidraw as _methods_excalidraw,
     methods_images as _methods_images,
     methods_profiles as _methods_profiles,
     methods_prompt as _methods_prompt,
@@ -14450,6 +14465,7 @@ for _m in (
     _methods_prompt,
     _methods_config,
     _methods_complete,
+    _methods_excalidraw,
     _methods_tools,
     _methods_profiles,
     _methods_images,

@@ -2797,6 +2797,7 @@ def save_permanent_allowlist(patterns: set):
 def prompt_dangerous_approval(command: str, description: str,
                               timeout_seconds: int | None = None,
                               allow_permanent: bool = True,
+                              allow_session: bool = True,
                               approval_callback=None,
                               *, smart_denied: bool = False) -> str:
     """Prompt the user to approve a dangerous command (CLI only).
@@ -2831,6 +2832,7 @@ def prompt_dangerous_approval(command: str, description: str,
             description,
             timeout_seconds,
             allow_permanent,
+            allow_session,
             approval_callback,
             smart_denied=smart_denied,
         )
@@ -2839,6 +2841,7 @@ def prompt_dangerous_approval(command: str, description: str,
 def _prompt_dangerous_approval_inner(command: str, description: str,
                                      timeout_seconds: int,
                                      allow_permanent: bool = True,
+                                     allow_session: bool = True,
                                      approval_callback=None,
                                      *, smart_denied: bool = False) -> str:
     # Redact secrets before any user-visible rendering. The original
@@ -2851,7 +2854,9 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
 
     if approval_callback is not None:
         try:
-            callback_kwargs = {"allow_permanent": allow_permanent}
+            callback_kwargs = {'allow_permanent': allow_permanent}
+            if not allow_session:
+                callback_kwargs['allow_session'] = False
             if smart_denied:
                 callback_kwargs["smart_denied"] = True
             return approval_callback(
@@ -2898,12 +2903,12 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
             print(f"  {t('approval.dangerous_header', description=display_description)}")
             print(f"      {display_command}")
             print()
-            if smart_denied:
-                print(t("approval.choose_smart_deny"))
+            if smart_denied or not allow_session:
+                print(t('approval.choose_smart_deny'))
             elif allow_permanent:
-                print(t("approval.choose_long"))
+                print(t('approval.choose_long'))
             else:
-                print(t("approval.choose_short"))
+                print(t('approval.choose_short'))
             print()
             sys.stdout.flush()
 
@@ -2911,10 +2916,10 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
 
             def get_input():
                 try:
-                    if smart_denied:
-                        prompt = t("approval.prompt_smart_deny")
+                    if smart_denied or not allow_session:
+                        prompt = t('approval.prompt_smart_deny')
                     else:
-                        prompt = t("approval.prompt_long") if allow_permanent else t("approval.prompt_short")
+                        prompt = t('approval.prompt_long') if allow_permanent else t('approval.prompt_short')
                     result["choice"] = input(prompt).strip().lower()
                 except (EOFError, OSError):
                     result["choice"] = ""
@@ -2931,19 +2936,19 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
                 return "timeout"
 
             choice = result["choice"]
-            if smart_denied:
+            if smart_denied or not allow_session:
                 choice_map = {
                     **{
-                        value: "once"
-                        for value in t("approval.smart_deny_once_inputs").split(",")
+                        value: 'once'
+                        for value in t('approval.smart_deny_once_inputs').split(',')
                     },
                     **{
-                        value: "deny"
-                        for value in t("approval.smart_deny_deny_inputs").split(",")
+                        value: 'deny'
+                        for value in t('approval.smart_deny_deny_inputs').split(',')
                     },
                 }
-                decision = choice_map.get(choice, "deny")
-                print(t("approval.allowed_once" if decision == "once" else "approval.denied"))
+                decision = choice_map.get(choice, 'deny')
+                print(t('approval.allowed_once' if decision == 'once' else 'approval.denied'))
                 return decision
 
             if choice in {'o', 'once'}:
@@ -3240,8 +3245,10 @@ def _run_approval_gate(
     approval_callback=None,
     cron_deny_message: str,
     autoapprove_log_prefix: str,
+    allow_permanent: bool = True,
+    allow_session: bool = True,
     fail_closed_when_no_human: bool = False,
-    no_human_block_message: str = "",
+    no_human_block_message: str = '',
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -3359,22 +3366,26 @@ def _run_approval_gate(
                 "pattern_key": pattern_key,
                 "pattern_keys": [pattern_key],
                 "description": redact_sensitive_text(description),
-                "allow_permanent": True,
-                "allow_session": True,
+                'allow_permanent': allow_permanent,
+                'allow_session': allow_session,
             }
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface="gateway"
             )
-            if decision.get("notify_failed"):
+            if decision.get('notify_failed'):
                 return {
-                    "approved": False,
-                    "message": "BLOCKED: Failed to send approval request to user. Do NOT retry.",
-                    "pattern_key": pattern_key,
-                    "description": description,
+                    'approved': False,
+                    'message': 'BLOCKED: Failed to send approval request to user. Do NOT retry.',
+                    'pattern_key': pattern_key,
+                    'description': description,
                 }
-            resolved = decision["resolved"]
-            choice = decision["choice"]
-            deny_reason = decision.get("reason")
+            resolved = decision['resolved']
+            choice = decision['choice']
+            deny_reason = decision.get('reason')
+            if choice == 'session' and not allow_session:
+                choice = 'deny'
+            elif choice == 'always' and not allow_permanent:
+                choice = 'deny'
 
             if not resolved or choice is None or choice == "deny":
                 if not resolved:
@@ -3399,9 +3410,9 @@ def _run_approval_gate(
                     "user_consent": False,
                 }
 
-            if choice == "session":
+            if choice == 'session' and allow_session:
                 approve_session(session_key, pattern_key)
-            elif choice == "always":
+            elif choice == 'always' and allow_permanent:
                 approve_session(session_key, pattern_key)
                 approve_permanent(pattern_key)
                 save_permanent_allowlist(_permanent_approved)
@@ -3435,8 +3446,10 @@ def _run_approval_gate(
         session_key=session_key,
         surface="cli",
     )
-    choice = prompt_dangerous_approval(display_target, description,
-                                       approval_callback=approval_callback)
+    choice = prompt_dangerous_approval(
+        display_target, description, approval_callback=approval_callback,
+        allow_permanent=allow_permanent, allow_session=allow_session,
+    )
     _fire_approval_hook(
         "post_approval_response",
         command=display_target,
@@ -3477,9 +3490,9 @@ def _run_approval_gate(
             "user_consent": False,
         }
 
-    if choice == "session":
+    if choice == 'session' and allow_session:
         approve_session(session_key, pattern_key)
-    elif choice == "always":
+    elif choice == 'always' and allow_permanent:
         approve_session(session_key, pattern_key)
         approve_permanent(pattern_key)
         save_permanent_allowlist(_permanent_approved)
@@ -3575,8 +3588,11 @@ def request_tool_approval(
     tool_name: str,
     reason: str,
     *,
-    rule_key: str = "",
+    rule_key: str = '',
     approval_callback=None,
+    allow_permanent: bool = True,
+    allow_session: bool = True,
+    display_target: str | None = None,
 ) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
@@ -3631,8 +3647,9 @@ def request_tool_approval(
     # to avoid ever colliding with a real command pattern key.
     pattern_key = f"plugin_rule:{key_suffix}"
     # A synthetic "command" string for the display/allowlist layer. It never
-    # executes; it only labels the gate. Namespaced identically.
-    display_target = f"<{tool_name}> (plugin approval rule)"
+    # executes; callers may supply a precise target when user confirmation
+    # needs to name a concrete action.
+    display_target = display_target or f'<{tool_name}> (plugin approval rule)'
 
     return _run_approval_gate(
         pattern_key=pattern_key,
@@ -3647,13 +3664,15 @@ def request_tool_approval(
         ),
         autoapprove_log_prefix=(
             f"plugin-escalated tool call '{tool_name}' in "
-            "non-interactive non-gateway context"
+            'non-interactive non-gateway context'
         ),
+        allow_permanent=allow_permanent,
+        allow_session=allow_session,
         fail_closed_when_no_human=True,
         no_human_block_message=(
             f"BLOCKED: Tool '{tool_name}' requires approval ({description}) "
-            "but no interactive user or gateway is present to approve it. "
-            "A plugin flagged this action for human confirmation."
+            'but no interactive user or gateway is present to approve it. '
+            'A plugin flagged this action for human confirmation.'
         ),
     )
 

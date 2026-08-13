@@ -60,6 +60,18 @@ def test_set_session_context_injects_agent_session_id(monkeypatch):
     assert get_session_env("HERMES_SESSION_ID") == "20260722_deadbeef"
 
 
+def test_set_session_context_injects_live_profile(monkeypatch):
+    """A tool call must inherit the profile selected by its live Desktop session."""
+    session = _install_session(
+        monkeypatch, session_key="skey-work", agent_session_id="session-work", source="desktop"
+    )
+    session["profile_home"] = "/tmp/profiles/work-a"
+
+    server._set_session_context("skey-work")
+
+    assert get_session_env("HERMES_SESSION_PROFILE") == "work-a"
+
+
 def test_set_session_context_falls_back_to_session_key(monkeypatch):
     """When the agent has no session_id yet, fall back to the session_key
     (never leave HERMES_SESSION_ID empty for an identified session)."""

@@ -90,6 +90,7 @@ describe('ModelPill per-surface model label', () => {
       $awaitingResponse: atom(false),
       $busy: atom(false),
       $cwd: atom(''),
+      $profile: atom(''),
       $fast: atom(false),
       $lastVisibleIsUser: atom(false),
       $messages: atom([]),
@@ -97,6 +98,7 @@ describe('ModelPill per-surface model label', () => {
       $model: atom('tile/claude-sonnet'),
       $provider: atom('anthropic'),
       $reasoningEffort: atom('high'),
+      $runtime: atom(''),
       $runtimeId: atom('tile-runtime'),
       $storedId: atom('stored-tile')
     }

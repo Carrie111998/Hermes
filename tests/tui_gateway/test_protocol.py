@@ -2,6 +2,7 @@
 
 import io
 import json
+import os
 import sys
 import threading
 import time
@@ -163,6 +164,77 @@ def test_session_interrupt_uses_explicit_stop_compatibility(server, monkeypatch,
 
     assert response["result"]["status"] == "interrupted"
     assert calls == ["hard" if kind == "hard-only" else "legacy"]
+
+
+def test_excalidraw_focus_rpc_replaces_a_session_profile_snapshot(server, monkeypatch):
+    one_path = os.path.realpath("/tmp/one.excalidraw")
+    two_path = os.path.realpath("/tmp/two.excalidraw")
+    calls = []
+    session = {"profile_home": None, "session_key": "durable-tool-session"}
+    monkeypatch.setattr(server, "_sess", lambda _params, _rid: (session, None))
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+    monkeypatch.setattr(
+        "tools.excalidraw_tools.set_focused_drawings",
+        lambda session_id, profile, paths: calls.append((session_id, profile, paths)),
+    )
+
+    one = server._methods["excalidraw.focus"]("one", {"session_id": "desktop-1", "profile": "default", "paths": ["/tmp/one.excalidraw"]})
+    zero = server._methods["excalidraw.focus"]("zero", {"session_id": "desktop-1", "profile": "default", "paths": []})
+    many = server._methods["excalidraw.focus"](
+        "many",
+        {"session_id": "desktop-1", "profile": "default", "paths": ["/tmp/one.excalidraw", "/tmp/two.excalidraw"]},
+    )
+
+    assert [response["result"]["paths"] for response in (one, zero, many)] == [
+        [one_path],
+        [],
+        [one_path, two_path],
+    ]
+    assert calls == [
+        ("durable-tool-session", "default", [one_path]),
+        ("durable-tool-session", "default", []),
+        ("durable-tool-session", "default", [one_path, two_path]),
+    ]
+
+
+def test_excalidraw_focus_rpc_rejects_invalid_or_foreign_profile_snapshots(server, monkeypatch):
+    session = {"profile_home": "/tmp/profiles/work"}
+    calls = []
+    monkeypatch.setattr(server, "_sess", lambda _params, _rid: (session, None))
+    monkeypatch.setattr(
+        "tools.excalidraw_tools.set_focused_drawings",
+        lambda *args: calls.append(args),
+    )
+
+    foreign = server._methods["excalidraw.focus"](
+        "foreign", {"session_id": "desktop-1", "profile": "other", "paths": []}
+    )
+    invalid = server._methods["excalidraw.focus"](
+        "invalid", {"session_id": "desktop-1", "profile": "work", "paths": ["relative.excalidraw"]}
+    )
+
+    assert foreign["error"]["code"] == 4001
+    assert invalid["error"]["code"] == 4001
+    assert calls == []
+
+
+def test_excalidraw_focus_rpc_uses_durable_tool_identity_and_teardown_clears_it(server, monkeypatch):
+    resolved_path = os.path.realpath("/tmp/one.excalidraw")
+    import tools.excalidraw_tools as excalidraw_tools
+
+    session = {"profile_home": None, "session_key": "durable-tool-session"}
+    monkeypatch.setattr(server, "_sess", lambda _params, _rid: (session, None))
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+
+    response = server._methods["excalidraw.focus"](
+        "focus", {"session_id": "desktop-live-id", "profile": "default", "paths": ["/tmp/one.excalidraw"]}
+    )
+
+    assert response["result"]["paths"] == [resolved_path]
+    assert excalidraw_tools._resolve_path(None, session_id="durable-tool-session", profile="default") == resolved_path
+    server._teardown_session(session)
+    with pytest.raises(Exception, match="no focused Desktop drawing"):
+        excalidraw_tools._resolve_path(None, session_id="durable-tool-session", profile="default")
 
 
 # ── write_json ────────────────────────────────────────────────

@@ -173,6 +173,9 @@ export interface SidebarNavItem {
 
 export interface ClientSessionState {
   storedSessionId: string | null
+  /** Immutable backend scope that owns this transcript and its file paths. */
+  profile: string
+  runtime: string
   messages: ChatMessage[]
   branch: string
   cwd: string

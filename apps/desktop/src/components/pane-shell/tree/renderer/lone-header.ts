@@ -6,6 +6,7 @@
  *  - a closeable `placement: 'main'` pane — every mirrored TILE (a session, a
  *    page, a preview) is one, so dragging a tile into a zone of its own keeps
  *    its tab and its ✕
+ *  - a pane with an app-owned close action
  *  - a collapse tool panel dragged into its own zone
  */
 
@@ -17,15 +18,17 @@ export interface LoneHeaderChrome {
 export function forceLoneHeaderForPanes(
   shown: readonly string[],
   chromeOf: (id: string) => LoneHeaderChrome,
-  isCollapsePane: (id: string) => boolean
+  isCollapsePane: (id: string) => boolean,
+  hasPaneCloser: (id: string) => boolean = () => false
 ): boolean {
   // "This pane can be closed, so it must expose the ✕." Only the uncloseable
-  // workspace is exempt; standing side chrome (files / sessions) isn't 'main'.
+  // workspace is exempt; standing side chrome (files / sessions) has neither
+  // main placement nor an app-owned close action.
   if (
     shown.some(id => {
       const chrome = chromeOf(id)
 
-      return !chrome.uncloseable && chrome.placement === 'main'
+      return !chrome.uncloseable && (chrome.placement === 'main' || hasPaneCloser(id))
     })
   ) {
     return true

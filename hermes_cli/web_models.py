@@ -220,7 +220,7 @@ class MoaConfigPayload(_MoaReferenceControls):
 class FsWriteText(BaseModel):
     path: str
     content: str
-
+    expected_fingerprint: Optional[str] = None
 
 # --- from web_server.py (originally lines 2826-2856) ---
 

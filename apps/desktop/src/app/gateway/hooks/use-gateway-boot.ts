@@ -4,7 +4,7 @@ import { useEffect, useRef } from 'react'
 import type { HermesConnection } from '@/global'
 import { HermesGateway } from '@/hermes'
 import { translateNow } from '@/i18n'
-import { desktopDefaultCwd } from '@/lib/desktop-fs'
+import { desktopDefaultCwd, desktopRuntimeIdentity } from '@/lib/desktop-fs'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import {
   $desktopBoot,
@@ -168,6 +168,8 @@ export function useGatewayBoot({
         }
 
         publish(conn)
+        sourceRuntime = desktopRuntimeIdentity(conn)
+        sourceProfile = normalizeProfileKey(conn.profile ?? $activeGatewayProfile.get())
         // Re-mint the WS URL before reconnecting. OAuth tickets are single-use
         // with a short TTL, so the ticket baked into the cached conn.wsUrl is
         // dead on every reconnect after the initial boot — reusing it surfaces
@@ -317,6 +319,8 @@ export function useGatewayBoot({
         }
 
         publish(conn)
+        sourceRuntime = desktopRuntimeIdentity(conn)
+        sourceProfile = normalizeProfileKey(conn.profile ?? $activeGatewayProfile.get())
         const wsUrl = await resolveGatewayWsUrl(desktop, conn)
         await gateway.connect(wsUrl)
 
@@ -423,10 +427,11 @@ export function useGatewayBoot({
       }
     })
 
-    const sourceProfile = normalizeProfileKey($activeGatewayProfile.get())
+    let sourceProfile = normalizeProfileKey(survivor?.connection?.profile ?? $activeGatewayProfile.get())
+    let sourceRuntime = survivor?.connection ? desktopRuntimeIdentity(survivor.connection) : ''
 
     const offEvent = gateway.onEvent(event =>
-      callbacksRef.current.handleGatewayEvent({ ...event, profile: sourceProfile })
+      callbacksRef.current.handleGatewayEvent({ ...event, profile: sourceProfile, runtime: sourceRuntime || undefined })
     )
 
     // Wake signals: power resume (macOS/Windows), network coming back, and the
@@ -515,6 +520,8 @@ export function useGatewayBoot({
           progress: 95
         })
         publish(conn)
+        sourceProfile = normalizeProfileKey(conn.profile ?? $activeGatewayProfile.get())
+        sourceRuntime = desktopRuntimeIdentity(conn)
 
         // Seed the workspace BEFORE the gateway opens: every session-restore
         // path is gated on gatewayState === 'open', so nothing can be active yet
@@ -528,7 +535,6 @@ export function useGatewayBoot({
         } catch (err) {
           console.warn('Failed to seed default workspace cwd pre-connect', err)
         }
-
         // Mint a fresh WS URL right before connecting. For OAuth gateways the
         // ticket is single-use with a short TTL, so the ticket baked into
         // conn.wsUrl is stale; resolveGatewayWsUrl() re-mints it rather than

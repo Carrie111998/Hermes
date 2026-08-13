@@ -26,6 +26,8 @@ export interface GatewayEvent<P = unknown> {
   payload?: P
   /** Renderer-side source tag added by the Desktop gateway registry. */
   profile?: string
+  /** Renderer-side source runtime identity added by the Desktop gateway socket. */
+  runtime?: string
   session_id?: string
   type: GatewayEventName
 }

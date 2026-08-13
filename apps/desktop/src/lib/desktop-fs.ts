@@ -16,9 +16,24 @@ export function setDesktopFsRemotePicker(next: DesktopFsRemotePicker | null) {
   remotePicker = next
 }
 
-function connectionCacheKey(connection: HermesConnection | null) {
-  if (!connection) {
-    return 'local:'
+export interface DesktopDrawingIdentity {
+  path: string
+  profile: string
+  runtime: string
+}
+
+export interface DesktopDrawingFileText extends HermesReadFileTextResult {
+  fingerprint: string
+}
+
+export interface DesktopDrawingWriteResult {
+  fingerprint: string
+  path: string
+}
+
+export function desktopRuntimeIdentity(connection: HermesConnection | null = $connection.get()): string {
+  if (!connection || connection.mode !== 'remote') {
+    return 'local'
   }
 
   const target =
@@ -26,11 +41,11 @@ function connectionCacheKey(connection: HermesConnection | null) {
       ? connection.remoteIdentity || connection.remoteHost || ''
       : connection.baseUrl || ''
 
-  return `${connection.mode || 'local'}:${connection.remoteKind || ''}:${connection.profile || ''}:${target}`
+  return `remote:${connection.remoteKind || ''}:${connection.profile || ''}:${target}`
 }
 
 export function desktopFsCacheKey(connection: HermesConnection | null = $connection.get()) {
-  return connectionCacheKey(connection)
+  return desktopRuntimeIdentity(connection)
 }
 
 export function isDesktopFsRemoteMode() {
@@ -61,6 +76,52 @@ function remoteFsApi<T>(path: string, body?: Record<string, unknown>): Promise<T
   return bridge().api<T>(
     body ? { body, method: 'POST', path, profile: desktopFsProfile() } : { path, profile: desktopFsProfile() }
   )
+}
+
+function drawingFsApi<T>(identity: DesktopDrawingIdentity, path: string, body?: Record<string, unknown>): Promise<T> {
+  const connection = $connection.get()
+  const profile = identity.profile.trim() || 'default'
+
+  if (
+    desktopRuntimeIdentity(connection) !== identity.runtime ||
+    profile !== (connection?.profile?.trim() || 'default')
+  ) {
+    throw new Error('Drawing filesystem is no longer active')
+  }
+
+  return bridge().api<T>(body ? { body, method: 'POST', path, profile } : { path, profile })
+}
+
+export async function readDesktopDrawingFileText(identity: DesktopDrawingIdentity): Promise<DesktopDrawingFileText> {
+  const result = await drawingFsApi<DesktopDrawingFileText>(identity, fsPath('read-text', identity.path))
+
+  if (!result.fingerprint) {
+    throw new Error('Drawing filesystem does not provide an authoritative fingerprint')
+  }
+
+  return result
+}
+
+export function isDesktopFsWriteConflict(error: unknown): boolean {
+  return error instanceof Error && /(?:^|\s)409:/.test(error.message)
+}
+
+export async function writeDesktopDrawingFileText(
+  identity: DesktopDrawingIdentity,
+  content: string,
+  expectedFingerprint: string | undefined
+): Promise<DesktopDrawingWriteResult> {
+  const result = await drawingFsApi<DesktopDrawingWriteResult>(identity, '/api/fs/write-text', {
+    content,
+    expected_fingerprint: expectedFingerprint,
+    path: identity.path
+  })
+
+  if (!result.fingerprint) {
+    throw new Error('Drawing filesystem did not confirm the saved fingerprint')
+  }
+
+  return result
 }
 
 export async function readDesktopDir(path: string): Promise<HermesReadDirResult> {

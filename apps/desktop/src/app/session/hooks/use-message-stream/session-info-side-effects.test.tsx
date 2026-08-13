@@ -22,10 +22,12 @@ let handleEvent: ((event: RpcEvent) => void) | null = null
 let refreshHermesConfig: ReturnType<typeof vi.fn<() => Promise<void>>>
 let refreshSessions: ReturnType<typeof vi.fn<() => Promise<void>>>
 let queryClient: QueryClient
+let sessionStates: Map<string, ClientSessionState>
 
 function Harness() {
   const activeSessionIdRef = useRef<string | null>(ACTIVE_SID)
   const sessionStateByRuntimeIdRef = useRef(new Map<string, ClientSessionState>())
+  sessionStates = sessionStateByRuntimeIdRef.current
 
   const stream = useMessageStream({
     activeGatewayProfile: ACTIVE_PROFILE,
@@ -56,8 +58,11 @@ async function mountStream() {
   await waitFor(() => expect(handleEvent).not.toBeNull())
 }
 
-const sessionInfo = (sessionId: string, payload: Record<string, unknown>) =>
-  act(() => handleEvent!({ payload, session_id: sessionId, type: 'session.info' }))
+const sessionInfo = (
+  sessionId: string,
+  payload: Record<string, unknown>,
+  scope?: { profile: string; runtime: string }
+) => act(() => handleEvent!({ payload, session_id: sessionId, type: 'session.info', ...scope }))
 
 beforeEach(() => {
   handleEvent = null
@@ -66,6 +71,7 @@ beforeEach(() => {
   queryClient = new QueryClient()
   setCurrentModel('')
   setCurrentProvider('')
+  sessionStates = new Map()
 })
 
 afterEach(() => {
@@ -107,6 +113,29 @@ describe('session.info config refetch gating', () => {
     })
 
     expect(refreshHermesConfig).not.toHaveBeenCalled()
+  })
+})
+
+describe('session.info transcript scope', () => {
+  it('captures the immutable profile and backend runtime that delivered the session', async () => {
+    await mountStream()
+
+    sessionInfo(
+      ACTIVE_SID,
+      { cwd: '/workspace/project', running: true },
+      { profile: 'design', runtime: 'remote:ssh:design:workstation' }
+    )
+    sessionInfo(
+      ACTIVE_SID,
+      { cwd: '/other/project', running: true },
+      { profile: 'other', runtime: 'remote:ssh:other:workstation' }
+    )
+
+    expect(sessionStates.get(ACTIVE_SID)).toMatchObject({
+      cwd: '/other/project',
+      profile: 'design',
+      runtime: 'remote:ssh:design:workstation'
+    })
   })
 })
 
