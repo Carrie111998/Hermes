@@ -2031,6 +2031,10 @@ def _(rid, params: dict) -> dict:
         _emit("session.info", sid, info)
         return _ok(rid, {"ok": True, "session": info})
     except Exception as e:
+        # rebuild_agent_toolsets mutates agent state before republishing tools,
+        # so a failure here can corrupt the live surface — log with a traceback
+        # (not just the terse RPC error) so it's diagnosable in production.
+        logger.error("tools.session_configure failed", exc_info=True)
         return _err(rid, 5036, str(e))
 
 

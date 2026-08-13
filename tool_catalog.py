@@ -3,7 +3,7 @@
 Powers the ``tools.catalog`` JSON-RPC method (the preset editor's per-item
 token badges + running total). Standalone (imported by ``tui_gateway/server.py``
 as a thin wrapper) so the estimation logic stays unit-testable and off the hot
-file. See ``.plans/per-chat-tools-contract.md`` §5.
+file.
 
 Token estimate rule mirrors Tool Search: ``len(json.dumps(schema)) / 4`` (the
 ``CHARS_PER_TOKEN`` rule in ``tools/tool_search.py``). Skill estimate is its
@@ -14,8 +14,11 @@ Token estimate rule mirrors Tool Search: ``len(json.dumps(schema)) / 4`` (the
 from __future__ import annotations
 
 import json
+import logging
 import math
 from typing import Any, Dict, List
+
+logger = logging.getLogger(__name__)
 
 try:
     from tools.tool_search import CHARS_PER_TOKEN
@@ -126,7 +129,7 @@ def build_catalog(profile: str | None = None) -> Dict[str, Any]:
                 "name": name,
                 "description": desc,
                 "est_tokens": grp["est_tokens"],
-                "tools": sorted(grp["tools"], key=lambda t: t["name"]),
+                "tools": sorted(grp["tools"], key=lambda tool_item: tool_item["name"]),
             }
         )
 
@@ -138,7 +141,7 @@ def build_catalog(profile: str | None = None) -> Dict[str, Any]:
                 "name": server,
                 "toolset": grp["toolset"],
                 "est_tokens": grp["est_tokens"],
-                "tools": sorted(grp["tools"], key=lambda t: t["name"]),
+                "tools": sorted(grp["tools"], key=lambda tool_item: tool_item["name"]),
             }
         )
 
@@ -161,6 +164,7 @@ def build_catalog(profile: str | None = None) -> Dict[str, Any]:
             )
         skills_out.sort(key=lambda s: (s["category"], s["name"]))
     except Exception:
+        logger.warning("tool_catalog: failed to enumerate skills", exc_info=True)
         skills_out = []
 
     return {

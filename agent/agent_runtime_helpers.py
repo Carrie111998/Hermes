@@ -2842,27 +2842,10 @@ def rebuild_agent_toolsets(
 ) -> None:
     """Rebuild a live agent's tool surface + system prompt for a new posture.
 
-    Sibling of :func:`switch_model` — the mid-chat plumbing for per-chat tool
-    presets. Callers (the ``tools.session_configure`` RPC) MUST only invoke this
-    at a turn boundary (``session["running"] is False``); swapping ``agent.tools``
-    mid-turn breaks the provider prompt cache.
-
-    Wraps :func:`tools.mcp_tool.refresh_agent_mcp_tools` (which recomputes
-    ``agent.tools`` / ``agent.valid_tool_names``, re-injects the post-build
-    memory/context-engine tool families, and republishes atomically under its
-    lock) then invalidates the cached system prompt so the per-tool guidance
-    blocks and the ``<available_skills>`` index shrink to match.
-
-    Empty-list-vs-None invariant: ``enabled=[]`` is a real posture (chat-only,
-    zero non-core tools) and must NOT be treated as "unset". A module-level
-    sentinel distinguishes "caller passed a value" (including ``[]`` / ``None``)
-    from "caller omitted it". ``allowed`` / ``denied`` / ``disabled_skills``
-    default to ``None`` (no filter) because that is the natural "no override"
-    value for those axes and every caller passes them explicitly.
-
-    Does NOT rely on ``refresh_agent_mcp_tools``'s return value (added names
-    only) — the caller always re-emits ``session.info`` after a user-initiated
-    rebuild.
+    Mid-chat plumbing for per-chat tool presets; call ONLY at a turn boundary
+    (swapping ``agent.tools`` mid-turn breaks the provider prompt cache). The
+    ``_TOOLSET_UNSET`` sentinel keeps an explicit ``enabled=[]`` (chat-only)
+    distinct from "caller omitted it", which a plain default would collapse.
     """
     from tools.mcp_tool import refresh_agent_mcp_tools
 
@@ -2878,6 +2861,19 @@ def rebuild_agent_toolsets(
         else disabled
     )
 
+    # Snapshot the posture attributes so a failure inside refresh_agent_mcp_tools
+    # can't leave the agent's metadata describing a surface that agent.tools /
+    # valid_tool_names never actually became; on failure we roll them back and
+    # re-raise so the live agent stays internally consistent.
+    _prev_posture = {
+        "enabled_toolsets": getattr(agent, "enabled_toolsets", None),
+        "disabled_toolsets": getattr(agent, "disabled_toolsets", None),
+        "allowed_tool_names": getattr(agent, "allowed_tool_names", None),
+        "denied_tool_names": getattr(agent, "denied_tool_names", None),
+        "disabled_skills": getattr(agent, "disabled_skills", None),
+        "tool_preset": getattr(agent, "tool_preset", None),
+    }
+
     # refresh_agent_mcp_tools ignores enabled_override/disabled_override when
     # BOTH are None (its "automatic refresh" path reuses the stored selection),
     # which would silently skip a deliberate Full→(enabled=None) rebuild. Set
@@ -2891,14 +2887,19 @@ def rebuild_agent_toolsets(
     if tool_preset is not _TOOLSET_UNSET:
         agent.tool_preset = tool_preset
 
-    refresh_agent_mcp_tools(
-        agent,
-        enabled_override=enabled_override,
-        disabled_override=disabled_override,
-        allowed_override=allowed,
-        denied_override=denied,
-        quiet_mode=quiet_mode,
-    )
+    try:
+        refresh_agent_mcp_tools(
+            agent,
+            enabled_override=enabled_override,
+            disabled_override=disabled_override,
+            allowed_override=allowed,
+            denied_override=denied,
+            quiet_mode=quiet_mode,
+        )
+    except Exception:
+        for _attr, _val in _prev_posture.items():
+            setattr(agent, _attr, _val)
+        raise
 
     # Shrink (or regrow) the system prompt: per-tool guidance + the skills
     # index are gated on agent.valid_tool_names / disabled_skills, so this is

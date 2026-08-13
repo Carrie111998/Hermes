@@ -84,7 +84,9 @@ def _(rid, params: dict) -> dict:
 
         _preset_name = str(params.get("tool_preset") or "").strip()
         if not _preset_name:
-            _preset_name = str(_load_cfg().get("default_tool_preset") or "").strip()
+            # Public accessor for the configured default (normalizes empty/
+            # unknown to None) — avoids reaching for server's private _load_cfg.
+            _preset_name = str(tool_presets.get_default_preset() or "").strip()
         if _preset_name:
             create_tool_preset = tool_presets.resolve_preset(_preset_name)
     except Exception:

@@ -136,8 +136,11 @@ export interface ToolPreset {
   builtin?: boolean
 }
 
-/** Params for `tools.session_configure`. */
-export interface ToolsSessionConfigureParams {
+/**
+ * Params for `tools.session_configure`. Extends `Record<string, unknown>` so it
+ * is directly assignable to `request()`'s params bag without a cast-through-unknown.
+ */
+export interface ToolsSessionConfigureParams extends Record<string, unknown> {
   session_id: string
   /** When a known preset name, backend resolves it and ignores the list fields. */
   preset?: string | null
@@ -149,7 +152,7 @@ export interface ToolsSessionConfigureParams {
 }
 
 /** Return shape of `tools.session_configure`. */
-export interface ToolsSessionConfigureResult<S = SessionToolInfo & Record<string, unknown>> {
+export interface ToolsSessionConfigureResult<S = SessionToolInfo> {
   ok: boolean
   /** Present when `ok === false` (e.g. "busy" — the session is generating). */
   reason?: string
@@ -470,13 +473,10 @@ export class JsonRpcGatewayClient {
    * gated server-side: resolves with `{ ok: false, reason: 'busy' }` when the
    * session is generating.
    */
-  toolsSessionConfigure<S = SessionToolInfo & Record<string, unknown>>(
+  toolsSessionConfigure<S = SessionToolInfo>(
     params: ToolsSessionConfigureParams
   ): Promise<ToolsSessionConfigureResult<S>> {
-    return this.request<ToolsSessionConfigureResult<S>>(
-      'tools.session_configure',
-      params as unknown as Record<string, unknown>
-    )
+    return this.request<ToolsSessionConfigureResult<S>>('tools.session_configure', params)
   }
 
   /** Fetch the full selectable catalog with per-item token estimates. */
@@ -491,9 +491,7 @@ export class JsonRpcGatewayClient {
 
   /** Upsert a user preset by name. Rejects reserved names ("Chat-only"/"Full"). */
   toolsPresetSave(preset: ToolPreset): Promise<ToolPresetsResult> {
-    return this.request<ToolPresetsResult>('tools.preset_save', {
-      preset: preset as unknown as Record<string, unknown>
-    })
+    return this.request<ToolPresetsResult>('tools.preset_save', { preset })
   }
 
   /** Delete a user preset by name. */

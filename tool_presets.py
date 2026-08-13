@@ -9,7 +9,7 @@ presets always exist even with zero user configuration:
 
 This module is deliberately standalone (imported by ``tui_gateway/server.py``
 as a thin wrapper) so the resolution logic stays unit-testable and off the
-632KB hot file. See ``.plans/per-chat-tools-contract.md`` §1.
+632KB hot file.
 
 Empty-list-vs-None invariant: ``enabled_toolsets: []`` (chat-only) is a real,
 falsy posture and must survive every round-trip. Nothing here uses
@@ -18,7 +18,10 @@ falsy posture and must survive every round-trip. Nothing here uses
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 # Reserved virtual preset names. These are synthesized, never persisted as rows.
 CHAT_ONLY = "Chat-only"
@@ -92,7 +95,16 @@ def _normalize_list(value: Any) -> Optional[List[str]]:
         value = [value]
     if not isinstance(value, (list, tuple, set)):
         return None
-    return [str(v).strip() for v in value if str(v).strip()]
+    cleaned = [str(v).strip() for v in value if str(v).strip()]
+    if value and not cleaned:
+        # A non-empty input that strips down to [] silently becomes the
+        # chat-only / whitelist-nothing posture — flag the likely accident.
+        logger.warning(
+            "tool_presets: list value %r resolved to [] after stripping whitespace; "
+            "treating as an explicit empty selection",
+            value,
+        )
+    return cleaned
 
 
 def _normalize_preset(entry: Dict[str, Any]) -> Dict[str, Any]:

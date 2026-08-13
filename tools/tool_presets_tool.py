@@ -4,7 +4,7 @@ Lets Hermes itself inspect the available tool/MCP/skill surface and
 create / update / delete the reusable presets a chat can adopt (the same
 presets the desktop "Tool Presets" settings panel manages). Thin wrapper over
 the standalone ``tool_presets`` (CRUD) and ``tool_catalog`` (selectable surface
-+ token estimates) modules — see ``.plans/per-chat-tools-contract.md``.
++ token estimates) modules.
 
 A preset is a named selection persisted to ``config.yaml``:
   - ``enabled_toolsets``: list of toolset names to turn on. ``[]`` = chat-only

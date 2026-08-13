@@ -476,7 +476,23 @@ export function ToolPresetsSettings() {
       const renamed = payload.name !== selected.name
 
       if (renamed) {
-        result = await gateway.toolsPresetDelete(selected.name)
+        // Rename = save-under-new-name then drop the old name. The save has
+        // already succeeded, so a delete failure must NOT surface as a save
+        // failure: the new preset exists and only the stale old name lingers.
+        // Report that accurately and adopt the new name rather than rolling the
+        // (successful) save back and risking losing the edited content.
+        try {
+          result = await gateway.toolsPresetDelete(selected.name)
+        } catch (deleteErr) {
+          setPresets(result.presets)
+          setSelectedName(payload.name)
+          notifyError(
+            deleteErr,
+            `Saved "${payload.name}", but couldn't remove the old "${selected.name}" — delete it manually.`
+          )
+
+          return
+        }
       }
 
       setPresets(result.presets)

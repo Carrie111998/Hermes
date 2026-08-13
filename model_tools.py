@@ -368,9 +368,11 @@ def get_tool_definitions(
                 profile_scope,
                 # Per-tool filters must key the memo distinctly — allowed_tool_names
                 # of ``[]`` (whitelist nothing but core) must NOT collide with None
-                # (no whitelist), so distinguish the two explicitly.
+                # (no whitelist), so distinguish the two explicitly. denied uses
+                # the same ``is not None`` discipline for consistency with the
+                # documented invariant, even though [] and None deny-nothing alike.
                 frozenset(allowed_tool_names) if allowed_tool_names is not None else None,
-                frozenset(denied_tool_names) if denied_tool_names else None,
+                frozenset(denied_tool_names) if denied_tool_names is not None else None,
             )
         with _tool_defs_cache_lock:
             cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None

@@ -129,7 +129,10 @@ export function ToolPostureStatus() {
           setDefaultPreset(result.name)
         }
       })
-      .catch(() => {
+      .catch((err: unknown) => {
+        // Distinguish a real fetch failure (connectivity / backend) from a
+        // genuinely-unset default; both fall back to null but only one is a bug.
+        console.warn('ToolPostureStatus: failed to fetch default preset', err)
         if (!cancelled) {
           setDefaultPreset(null)
         }
@@ -150,7 +153,12 @@ export function ToolPostureStatus() {
     gateway
       .toolsPresetsList()
       .then(result => setPresets(result.presets))
-      .catch(() => setPresets([]))
+      .catch((err: unknown) => {
+        // Log so an empty dropdown from a gateway error is distinguishable from
+        // a genuinely-empty preset list.
+        console.warn('ToolPostureStatus: failed to load presets', err)
+        setPresets([])
+      })
   }, [])
 
   const applyPreset = useCallback(
@@ -182,7 +190,12 @@ export function ToolPostureStatus() {
       setPending(true)
 
       try {
-        const result = await gateway.toolsSessionConfigure({ session_id: activeSessionId, preset })
+        // Request the loose record shape: `result.session` is fed to
+        // `toPosture`, which parses the same untyped `session.info` broadcast.
+        const result = await gateway.toolsSessionConfigure<Record<string, unknown>>({
+          session_id: activeSessionId,
+          preset
+        })
 
         if (!result.ok) {
           if (result.reason === 'busy') {
