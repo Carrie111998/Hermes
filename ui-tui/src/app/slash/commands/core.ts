@@ -221,6 +221,10 @@ export const coreCommands: SlashCommand[] = [
     help: 'clear visible scrollback without ending the session',
     name: 'cls',
     run: (_arg, ctx) => {
+      if (ctx.ui.busy) {
+        return ctx.transcript.sys('cannot clear scrollback while a turn is running')
+      }
+
       ctx.transcript.setHistoryItems([])
       queueMicrotask(() => {
         process.stdout.write(CLEAR_SCREEN_AND_SCROLLBACK)
