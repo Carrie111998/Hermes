@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import stat
 import subprocess
@@ -64,7 +65,90 @@ def test_service_signature_verifies_and_caller_signature_is_ignored():
     assert signed["signature"] != "caller-controlled"
     assert signed["digest"] != "caller-controlled"
     assert "signature" not in signed["contract"]
-    assert intake.verify_work_contract(signed, secret=secret)
+    assert intake.verify_work_contract(signed, secret=secret).valid
+
+
+@pytest.mark.parametrize(
+    ("mutator", "expected"),
+    [
+        (
+            lambda signed: {**signed, "contract": None},
+            "shape",
+        ),
+        (
+            lambda signed: {**signed, "canonical_json": "canonical-sentinel"},
+            "canonical_mismatch",
+        ),
+        (
+            lambda signed: {**signed, "digest": "digest-sentinel"},
+            "digest_mismatch",
+        ),
+        (
+            lambda signed: {**signed, "signature": "signature-sentinel"},
+            "signature_mismatch",
+        ),
+    ],
+)
+def test_verify_work_contract_returns_exact_failure(mutator, expected):
+    signed = intake.sign_work_contract(_contract(), secret=b"test-only-secret")
+
+    result = intake.verify_work_contract(
+        mutator(copy.deepcopy(signed)), secret=b"test-only-secret"
+    )
+
+    assert result == intake.WorkContractVerification(valid=False, failure=expected)
+
+
+def test_verify_work_contract_reports_unreadable_signing_key_without_checking_signature(
+    tmp_path,
+):
+    signed = intake.sign_work_contract(_contract(), secret=b"test-only-secret")
+
+    result = intake.verify_work_contract(signed, hermes_home=tmp_path)
+
+    assert result == intake.WorkContractVerification(valid=False, failure="key_unreadable")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX key permissions do not apply on Windows")
+def test_verify_work_contract_reports_unsafe_signing_key_as_unreadable(tmp_path):
+    signed = intake.sign_work_contract(_contract(), secret=b"test-only-secret")
+    key_path = tmp_path / intake.SIGNING_KEY_RELATIVE_PATH
+    key_path.parent.mkdir(parents=True)
+    key_path.write_bytes(b"x" * 32)
+    key_path.chmod(0o644)
+
+    result = intake.verify_work_contract(signed, hermes_home=tmp_path)
+
+    assert result == intake.WorkContractVerification(valid=False, failure="key_unreadable")
+
+
+def test_verify_work_contract_maps_non_key_oserror_to_io_error(monkeypatch):
+    signed = intake.sign_work_contract(_contract(), secret=b"test-only-secret")
+    monkeypatch.setattr(
+        intake,
+        "_service_secret",
+        lambda **_: (_ for _ in ()).throw(OSError("io-sentinel")),
+    )
+
+    result = intake.verify_work_contract(signed, secret=b"test-only-secret")
+
+    assert result == intake.WorkContractVerification(valid=False, failure="io_error")
+
+
+def test_verify_work_contract_does_not_report_signature_mismatch_for_key_read_error(
+    monkeypatch,
+):
+    signed = intake.sign_work_contract(_contract(), secret=b"test-only-secret")
+    monkeypatch.setattr(
+        intake,
+        "_service_secret",
+        lambda **_: (_ for _ in ()).throw(PermissionError("read-only-key")),
+    )
+
+    result = intake.verify_work_contract(signed, secret=b"test-only-secret")
+
+    assert result.failure != "signature_mismatch"
+    assert result == intake.WorkContractVerification(valid=False, failure="io_error")
 
 
 @pytest.mark.parametrize(
@@ -82,7 +166,7 @@ def test_mutating_governed_contract_fields_breaks_verification(section, field, v
     signed = intake.sign_work_contract(_contract(), secret=b"test-only-secret")
     signed["contract"][section][field] = value
 
-    assert not intake.verify_work_contract(signed, secret=b"test-only-secret")
+    assert not intake.verify_work_contract(signed, secret=b"test-only-secret").valid
 
 
 @pytest.mark.parametrize("version", [None, 0, 2, "1"])
@@ -98,7 +182,7 @@ def test_signing_secret_is_service_owned_private_and_in_quick_backup_manifest(tm
     signed = intake.sign_work_contract(_contract(), hermes_home=tmp_path)
     secret_path = tmp_path / intake.SIGNING_KEY_RELATIVE_PATH
 
-    assert intake.verify_work_contract(signed, hermes_home=tmp_path)
+    assert intake.verify_work_contract(signed, hermes_home=tmp_path).valid
     assert secret_path.is_file()
     assert stat.S_IMODE(secret_path.stat().st_mode) == 0o600
     assert intake.SIGNING_KEY_RELATIVE_PATH in backup._QUICK_STATE_FILES
