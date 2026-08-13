@@ -283,6 +283,84 @@ def test_delete_task(client):
 
 
 # ---------------------------------------------------------------------------
+# Decomposed parents on /board
+# ---------------------------------------------------------------------------
+
+
+def _find_card(board: dict, task_id: str) -> dict:
+    for col in board["columns"]:
+        for card in col["tasks"]:
+            if card["id"] == task_id:
+                return card
+    raise AssertionError(f"{task_id} not on board")
+
+
+def test_board_flags_decomposed_parent_waiting_on_children(client):
+    """A decomposed root sits in 'todo' looking exactly like an unstarted card.
+
+    The board needs ``is_decomposed_parent`` to tell the two apart; a plain
+    todo with no decomposed event must stay False.
+    """
+    conn = kb.connect()
+    try:
+        root = kb.create_task(conn, title="ship the thing", triage=True)
+        children = kb.decompose_triage_task(
+            conn,
+            root,
+            root_assignee="orchestrator",
+            children=[{"title": "part one"}, {"title": "part two"}],
+        )
+        assert children and len(children) == 2
+        plain = kb.create_task(conn, title="never started", initial_status="running")
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (plain,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    board = client.get("/api/plugins/kanban/board").json()
+
+    parent_card = _find_card(board, root)
+    assert parent_card["is_decomposed_parent"] is True
+    assert parent_card["progress"] == {"done": 0, "total": 2}
+
+    plain_card = _find_card(board, plain)
+    assert plain_card["is_decomposed_parent"] is False
+    assert plain_card["progress"] is None
+
+    # A child is an ordinary card — it was not decomposed itself.
+    assert _find_card(board, children[0])["is_decomposed_parent"] is False
+
+
+def test_decomposed_parent_flag_clears_once_the_root_is_done(client):
+    """Terminal roots aren't waiting on anything, so the badge must go away."""
+    conn = kb.connect()
+    try:
+        root = kb.create_task(conn, title="ship the thing", triage=True)
+        assert kb.decompose_triage_task(
+            conn,
+            root,
+            root_assignee="orchestrator",
+            children=[{"title": "only child"}],
+        )
+    finally:
+        conn.close()
+
+    assert _find_card(
+        client.get("/api/plugins/kanban/board").json(), root
+    )["is_decomposed_parent"] is True
+
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (root,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    done_card = _find_card(client.get("/api/plugins/kanban/board").json(), root)
+    assert done_card["is_decomposed_parent"] is False
+
+
+# ---------------------------------------------------------------------------
 # Comments + Links
 # ---------------------------------------------------------------------------
 

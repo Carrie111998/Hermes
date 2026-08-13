@@ -427,17 +427,44 @@ def get_board(
         }
 
         # Progress rollup: for each parent, how many children are done / total.
-        # One pass over task_links joined with child status — cheaper than
-        # N per-task queries and the plugin uses it to render "N/M".
+        # One pass over task_links joined with both endpoints' status —
+        # cheaper than N per-task queries and the plugin uses it to render
+        # "N/M".
+        #
+        # ``waiting_progress`` is the same count in the other direction (how
+        # many of a task's *dependencies* are done). Decomposition links the
+        # root as a child of every task it spawned — the root wakes when they
+        # all finish — so a decomposed root never appears in ``progress``;
+        # its real child progress only shows up here.
         progress: dict[str, dict[str, int]] = {}
+        waiting_progress: dict[str, dict[str, int]] = {}
         for row in conn.execute(
-            "SELECT l.parent_id AS pid, t.status AS cstatus "
-            "FROM task_links l JOIN tasks t ON t.id = l.child_id"
+            "SELECT l.parent_id AS pid, l.child_id AS cid, "
+            "p.status AS pstatus, c.status AS cstatus "
+            "FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "JOIN tasks c ON c.id = l.child_id"
         ).fetchall():
             p = progress.setdefault(row["pid"], {"done": 0, "total": 0})
             p["total"] += 1
             if row["cstatus"] == "done":
                 p["done"] += 1
+            w = waiting_progress.setdefault(row["cid"], {"done": 0, "total": 0})
+            w["total"] += 1
+            if row["pstatus"] == "done":
+                w["done"] += 1
+
+        # Tasks that were fanned out by the decomposer. A decomposed root
+        # sits in 'todo' while its children run, which is visually identical
+        # to a never-started card — the board uses this flag to say
+        # "waiting on children" instead. One aggregate query, same shape as
+        # the counts above.
+        decomposed_ids: set[str] = {
+            r["task_id"]
+            for r in conn.execute(
+                "SELECT DISTINCT task_id FROM task_events WHERE kind = 'decomposed'"
+            )
+        }
 
         # Diagnostics rollup for this board — see kanban_diagnostics.
         # We get the full structured list per task AND a compact
@@ -468,6 +495,16 @@ def get_board(
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
+            # Only meaningful while the root itself is still open — once it
+            # reaches a terminal status it is not waiting on anything.
+            is_decomposed_parent = (
+                t.id in decomposed_ids and t.status not in ("done", "archived")
+            )
+            d["is_decomposed_parent"] = is_decomposed_parent
+            if is_decomposed_parent and d["progress"] is None:
+                # The tasks a decomposed root is waiting on ARE its children;
+                # surface them as its progress so the card can show N/M.
+                d["progress"] = waiting_progress.get(t.id)
             diags = diagnostics_per_task.get(t.id)
             if diags:
                 # Full list goes into the payload so the drawer can render

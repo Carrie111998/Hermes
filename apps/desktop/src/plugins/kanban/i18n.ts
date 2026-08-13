@@ -40,6 +40,8 @@ type KanbanMessages = {
   wontRun: string
   wontRunTip: string
   noHeartbeat: string
+  waitingOnChildren: (done: number, total: number) => string
+  waitingOnChildrenTip: (done: number, total: number) => string
   expand: (label: string) => string
   collapse: (label: string) => string
   newTaskIn: (label: string) => string
@@ -229,6 +231,9 @@ const en: KanbanMessages = {
   wontRunTip:
     'Ready cards only run once a profile is assigned. Open the card and set an assignee, or configure a default assignee in orchestration settings.',
   noHeartbeat: 'no heartbeat',
+  waitingOnChildren: (done, total) => `waiting on children (${done}/${total} done)`,
+  waitingOnChildrenTip: (done, total) =>
+    `This card was decomposed into ${total} child tasks and is waiting on them — ${done} done so far. It wakes up on its own when every child completes; it is not an unstarted card.`,
   expand: label => `Expand ${label}`,
   collapse: label => `Collapse ${label}`,
   newTaskIn: label => `New task in ${label}`,
@@ -421,6 +426,9 @@ const ja: KanbanMessages = {
   wontRunTip:
     'Ready のカードはプロフィールが割り当てられて初めて実行されます。カードを開いて担当を設定するか、オーケストレーション設定でデフォルトの担当を設定してください。',
   noHeartbeat: 'ハートビートなし',
+  waitingOnChildren: (done, total) => `子タスク待ち (${done}/${total} 完了)`,
+  waitingOnChildrenTip: (done, total) =>
+    `このカードは ${total} 件の子タスクに分解され、その完了を待っています（現在 ${done} 件完了）。すべての子タスクが完了すると自動的に再開します — 未着手のカードではありません。`,
   expand: label => `${label} を展開`,
   collapse: label => `${label} を折りたたむ`,
   newTaskIn: label => `${label} に新しいタスク`,
@@ -611,6 +619,9 @@ const zh: KanbanMessages = {
   wontRun: '不会运行',
   wontRunTip: '就绪卡片只有在分配了配置档后才会运行。打开卡片设置负责人，或在编排设置中配置默认负责人。',
   noHeartbeat: '无心跳',
+  waitingOnChildren: (done, total) => `等待子任务 (${done}/${total} 已完成)`,
+  waitingOnChildrenTip: (done, total) =>
+    `此卡片已拆分为 ${total} 个子任务并正在等待它们完成（已完成 ${done} 个）。所有子任务完成后它会自动恢复 — 这不是一张未开始的卡片。`,
   expand: label => `展开 ${label}`,
   collapse: label => `折叠 ${label}`,
   newTaskIn: label => `在 ${label} 新建任务`,
@@ -799,6 +810,9 @@ const zhHant: KanbanMessages = {
   wontRun: '不會執行',
   wontRunTip: '就緒卡片只有在指派了設定檔後才會執行。開啟卡片設定負責人，或在編排設定中設定預設負責人。',
   noHeartbeat: '無心跳',
+  waitingOnChildren: (done, total) => `等待子任務 (${done}/${total} 已完成)`,
+  waitingOnChildrenTip: (done, total) =>
+    `此卡片已拆分為 ${total} 個子任務並正在等待它們完成（已完成 ${done} 個）。所有子任務完成後它會自動恢復 — 這不是一張未開始的卡片。`,
   expand: label => `展開 ${label}`,
   collapse: label => `摺疊 ${label}`,
   newTaskIn: label => `在 ${label} 新增任務`,

@@ -143,6 +143,30 @@ function Meta({ children, icon }: { children: ReactNode; icon: string }) {
   )
 }
 
+/** A decomposed root parked in todo/ready looks exactly like a card nobody has
+ *  started — but it is tracking live child work. Say so, in the "scheduled"
+ *  (waiting) tone the board already uses for cards that are deliberately idle. */
+function WaitingOnChildren({ done, total }: { done: number; total: number }) {
+  const k = useKanban()
+  const tone = columnMeta('scheduled').tone
+
+  return (
+    <Tip label={k.waitingOnChildrenTip(done, total)}>
+      <span
+        className="inline-flex shrink-0 cursor-help items-center gap-1 rounded-full border px-1.5 py-px text-[0.5625rem] font-medium uppercase tracking-wide"
+        style={{
+          backgroundColor: `color-mix(in srgb, ${tone} 14%, transparent)`,
+          borderColor: `color-mix(in srgb, ${tone} 45%, transparent)`,
+          color: tone
+        }}
+      >
+        <Codicon name="type-hierarchy-sub" size="0.7rem" />
+        {k.waitingOnChildren(done, total)}
+      </span>
+    </Tip>
+  )
+}
+
 function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
   const k = useKanban()
   const created = ago(task.created_at)
@@ -160,8 +184,13 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
 
   const meta = columnMeta(task.status)
 
+  // Decomposed root still tracking children: this is the card's status signal,
+  // so it leads the footer.
+  const waiting = task.is_decomposed_parent && task.progress && task.progress.total > 0 ? task.progress : null
+
   return (
     <div className="flex items-center gap-2 whitespace-nowrap text-[0.625rem] text-(--ui-text-tertiary)">
+      {waiting && <WaitingOnChildren done={waiting.done} total={waiting.total} />}
       {arc === 'queued' && attached ? (
         // WHO is coming for the card. The arc only animates once the agent is
         // actually working; while queued, the named chip carries "attached".
@@ -214,7 +243,8 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
             {task.priority}
           </span>
         )}
-        {task.progress && task.progress.total > 0 && (
+        {/* The waiting badge already carries N/M — don't print it twice. */}
+        {!waiting && task.progress && task.progress.total > 0 && (
           <Meta icon="checklist">
             {task.progress.done}/{task.progress.total}
           </Meta>

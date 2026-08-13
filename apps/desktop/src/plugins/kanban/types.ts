@@ -17,6 +17,9 @@ export interface KanbanTask {
   link_counts?: { parents: number; children: number }
   /** N-of-M child completion, or null when the task has no children. */
   progress?: null | { done: number; total: number }
+  /** True when the task was decomposed into children and is still open —
+   *  a 'todo'/'ready' parent tracking real child work, not an idle card. */
+  is_decomposed_parent?: boolean
   /** Compact diagnostics rollup — present only when a card has warnings. */
   warnings?: null | { count: number; highest_severity?: null | string }
   /** Worker liveness (present on running cards) — drives the arc + run clock. */
