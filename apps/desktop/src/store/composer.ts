@@ -494,3 +494,35 @@ export function terminalContextBlocksFromDraft(draft: string) {
   }
 
   const selections = $composerTerminalSelections.get()
+
+  return labels.flatMap(label => {
+    const text = selections[label]?.trim()
+
+    if (!text) {
+      return []
+    }
+
+    return `\`\`\`terminal\n${text}\n\`\`\``
+  })
+}
+
+export function clearComposerTerminalSelections() {
+  if (Object.keys($composerTerminalSelections.get()).length === 0) {
+    return
+  }
+
+  $composerTerminalSelections.set({})
+}
+
+function upsertAttachment(attachments: ComposerAttachment[], attachment: ComposerAttachment) {
+  const index = attachments.findIndex(item => item.id === attachment.id)
+
+  if (index < 0) {
+    return [...attachments, attachment]
+  }
+
+  const next = [...attachments]
+  next[index] = attachment
+
+  return next
+}

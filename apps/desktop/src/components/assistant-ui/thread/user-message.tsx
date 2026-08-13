@@ -3,8 +3,10 @@ import { type FC, type ReactNode, useCallback, useRef, useState } from 'react'
 
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
+import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
 import { MessageContextMenu } from '@/components/assistant-ui/thread/message-context-menu'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
+import { useMessageReactions } from '@/components/assistant-ui/thread/use-message-reactions'
 import { UserMessageText } from '@/components/assistant-ui/thread/user-message-text'
 import { Codicon } from '@/components/ui/codicon'
 import { useResizeObserver } from '@/hooks/use-resize-observer'
@@ -14,6 +16,13 @@ import { StopFilled } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { notifyThreadEditOpen } from '@/store/thread-scroll'
 import { isWatchWindow } from '@/store/windows'
+
+/** True when the user has a live text highlight (drag-select / triple-click). */
+export function hasTextSelection(): boolean {
+  const selection = window.getSelection()
+
+  return Boolean(selection && !selection.isCollapsed && selection.toString().length > 0)
+}
 
 export function StickyHumanMessageContainer({
   attachments,
@@ -145,6 +154,17 @@ export const UserMessage: FC<{
     return messageAttachmentRefs(custom.attachmentRefs)
   })
 
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const { enabled: reactionsEnabled, react, reactions: shownReactions } = useMessageReactions(messageId, 'user')
+
+  const pickEmoji = useCallback(
+    (emoji: null | string) => {
+      setPickerOpen(false)
+      react(emoji)
+    },
+    [react]
+  )
+
   // Sticky human bubbles clamp to ~2 lines with a soft fade so a long prompt
   // doesn't dominate the viewport while the response streams underneath; the
   // clamp lifts on hover / focus (see styles.css). We measure the *unclamped*
@@ -259,7 +279,13 @@ export const UserMessage: FC<{
         <ActionBarPrimitive.Root className="relative w-full max-w-full" data-slot="aui_user-bubble-actions">
           <MessageContextMenu messageId={messageId}>
             <div className="human-message-with-todos-wrapper flex w-full flex-col gap-0">
-              <div className="relative w-full">
+              <ReactionPicker
+                onOpenChange={setPickerOpen}
+                onSelect={pickEmoji}
+                open={pickerOpen}
+                selected={shownReactions.find(reaction => reaction.author === 'user')?.emoji}
+              >
+                <div className="relative w-full">
                 {readOnly ? (
                   // Spectator transcript: clicking only toggles the clamp so the
                   // full prompt is readable — never opens an edit composer.
@@ -267,7 +293,9 @@ export const UserMessage: FC<{
                     aria-expanded={bodyClamped ? expanded : undefined}
                     className={cn(bubbleClassName, !bodyClamped && 'cursor-default')}
                     onClick={() => {
-                      if (!bodyClamped) {
+                      // Drag-select ends on mouseup→click; don't collapse the
+                      // clamp just because the highlight finished.
+                      if (hasTextSelection() || !bodyClamped) {
                         return
                       }
 
@@ -282,13 +310,29 @@ export const UserMessage: FC<{
                 ) : (
                   // Always editable — clicking opens the edit composer even while a
                   // turn streams; sending the edit reverts (interrupt + rewind).
+                  // A live text highlight wins: finishing a drag-select must not
+                  // open the editor and throw the selection away.
                   <ActionBarPrimitive.Edit asChild>
                     <button
                       aria-label={copy.editMessage}
                       className={bubbleClassName}
-                      onClick={() => triggerHaptic('selection')}
-                      onPointerDown={() => notifyThreadEditOpen()}
-                      title={copy.editMessage}
+                      onClick={event => {
+                        if (hasTextSelection()) {
+                          event.preventDefault()
+                          event.stopPropagation()
+
+                          return
+                        }
+
+                        triggerHaptic('selection')
+                      }}
+                      onPointerDown={() => {
+                        if (hasTextSelection()) {
+                          return
+                        }
+
+                        notifyThreadEditOpen()
+                      }}
                       type="button"
                     >
                       {bubbleContent}
@@ -337,30 +381,39 @@ export const UserMessage: FC<{
                   </div>
                 )}
               </div>
-              <BranchPickerPrimitive.Root
-                className={cn(
-                  'checkpoint-container flex items-center gap-1 pb-0 pt-1 pl-1.5 text-[0.75rem] leading-none text-(--ui-text-tertiary)',
-                  readOnly && 'hidden'
-                )}
-                hideWhenSingleBranch
+            </ReactionPicker>
+            {/* Below the bubble, same register as the assistant action row:
+                same emoji size, same vertical padding, right-aligned to the
+                sent bubble. Overlaying the corner read badly in practice. */}
+            <ReactionBadge
+              className="justify-end gap-1.5 py-1.5 pr-1.5"
+              onRetract={() => react(null)}
+              reactions={shownReactions}
+            />
+            <BranchPickerPrimitive.Root
+              className={cn(
+                'checkpoint-container flex items-center gap-1 pb-0 pt-1 pl-1.5 text-[0.75rem] leading-none text-(--ui-text-tertiary)',
+                readOnly && 'hidden'
+              )}
+              hideWhenSingleBranch
+            >
+              <span aria-hidden className="checkpoint-icon size-1.5 rounded-full border border-current" />
+              <BranchPickerPrimitive.Previous
+                className="checkpoint-restore-text rounded-sm bg-transparent px-1 opacity-65 hover:opacity-100 disabled:hidden disabled:cursor-default"
+                title={copy.restorePrevious}
               >
-                <span aria-hidden className="checkpoint-icon size-1.5 rounded-full border border-current" />
-                <BranchPickerPrimitive.Previous
-                  className="checkpoint-restore-text rounded-sm bg-transparent px-1 opacity-65 hover:opacity-100 disabled:hidden disabled:cursor-default"
-                  title={copy.restorePrevious}
-                >
-                  {copy.restoreCheckpoint}
-                </BranchPickerPrimitive.Previous>
-                <span className="checkpoint-divider opacity-55">
-                  <BranchPickerPrimitive.Number />/<BranchPickerPrimitive.Count />
-                </span>
-                <BranchPickerPrimitive.Next
-                  className="checkpoint-restore-text rounded-sm bg-transparent px-1 opacity-65 hover:opacity-100 disabled:hidden disabled:cursor-default"
-                  title={copy.restoreNext}
-                >
-                  {copy.goForward}
-                </BranchPickerPrimitive.Next>
-              </BranchPickerPrimitive.Root>
+                {copy.restoreCheckpoint}
+              </BranchPickerPrimitive.Previous>
+              <span className="checkpoint-divider opacity-55">
+                <BranchPickerPrimitive.Number />/<BranchPickerPrimitive.Count />
+              </span>
+              <BranchPickerPrimitive.Next
+                className="checkpoint-restore-text rounded-sm bg-transparent px-1 opacity-65 hover:opacity-100 disabled:hidden disabled:cursor-default"
+                title={copy.restoreNext}
+              >
+                {copy.goForward}
+              </BranchPickerPrimitive.Next>
+            </BranchPickerPrimitive.Root>
             </div>
           </MessageContextMenu>
         </ActionBarPrimitive.Root>
