@@ -63,6 +63,21 @@ _log = logging.getLogger(__name__)
 
 _DRAIN_REQUEST_FILENAME = ".drain_request.json"
 
+# Max-age fallback for a *same-epoch* orphan (#85433). The epoch check only
+# catches a marker that outlived a machine restart; it cannot catch a marker
+# orphaned WITHOUT a restart (a maintenance action that finishes and whose
+# writer never clears the marker, e.g. a crash between "action done" and
+# "cancel drain"). Then the epoch still matches and the watcher honours the
+# orphan forever. Drain-gated lifecycle actions (auto-update / image migrate /
+# env edit / profile change) complete in minutes, so a marker whose
+# ``requested_at`` is older than this generous bound is treated as stale —
+# mirroring the neighbouring ``.restart_notify.json`` marker, which
+# ``gateway/run.py`` already guards with a ``requested_at`` staleness check so a
+# legitimately old marker cannot swallow a fresh action. A deliberately long
+# drain keeps itself alive by re-writing the marker (see
+# :func:`write_drain_request`, documented idempotent), which refreshes the stamp.
+_DRAIN_MARKER_MAX_AGE_SECONDS = 60 * 60  # 60 minutes
+
 
 @functools.lru_cache(maxsize=1)
 def current_instantiation_epoch() -> str:
@@ -207,6 +222,56 @@ def _marker_epoch_is_stale(body: dict[str, Any]) -> bool:
     return marker_epoch != current
 
 
+@functools.lru_cache(maxsize=32)
+def _warn_marker_age_stale(requested_at_iso: str) -> None:
+    """Log the orphaned-marker warning at most once per ``requested_at`` value.
+
+    The 1s drain watcher calls the reader every tick; memoising on the marker's
+    timestamp keeps a single WARNING per distinct orphan instead of one per
+    second while the file still sits on disk.
+    """
+    _log.warning(
+        "drain-control: ignoring drain marker stamped %s — its requested_at is "
+        "older than the %ds max-age, so it is almost certainly an orphan whose "
+        "writer never cleared it (#85433). Re-write the marker to keep a "
+        "deliberately long drain alive.",
+        requested_at_iso,
+        _DRAIN_MARKER_MAX_AGE_SECONDS,
+    )
+
+
+def _marker_age_is_stale(body: dict[str, Any]) -> bool:
+    """True iff the marker's ``requested_at`` is older than the max-age bound.
+
+    Lenient in the same spirit as :func:`_marker_epoch_is_stale`: a marker with
+    no ``requested_at``, a non-string one, or an unparseable timestamp returns
+    False (honour it), preserving the fail-safe-toward-quiescing contract for
+    legacy/corrupt markers. Only a present, parseable timestamp that is
+    definitively older than :data:`_DRAIN_MARKER_MAX_AGE_SECONDS` reads as stale
+    (#85433). A naive (tz-less) timestamp is assumed UTC, matching the writer.
+    """
+    raw = body.get("requested_at")
+    if not isinstance(raw, str) or not raw:
+        return False
+    try:
+        requested = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if requested.tzinfo is None:
+        requested = requested.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - requested).total_seconds()
+    if age > _DRAIN_MARKER_MAX_AGE_SECONDS:
+        _warn_marker_age_stale(raw)
+        return True
+    return False
+
+
+def _marker_is_inactive(body: dict[str, Any]) -> bool:
+    """True iff the marker should be ignored — a prior-instantiation epoch
+    (NS-570) or a same-epoch orphan past its max-age (#85433)."""
+    return _marker_epoch_is_stale(body) or _marker_age_is_stale(body)
+
+
 def drain_requested(*, home: Optional[Path] = None) -> bool:
     """True iff a begin-drain marker for THIS instantiation is present.
 
@@ -214,14 +279,17 @@ def drain_requested(*, home: Optional[Path] = None) -> bool:
     treated as absent: it survived a container/VM restart (HERMES_HOME is a
     durable Fly volume on Hermes Cloud) and the lifecycle action that triggered
     the drain has already completed — honouring it would wedge the
-    freshly-restarted gateway in ``draining`` (NS-570). The staleness check is
-    lenient (see :func:`_marker_epoch_is_stale`): a legacy/corrupt marker with
-    no epoch, or an environment without ``/proc``, still reads as drain-active.
+    freshly-restarted gateway in ``draining`` (NS-570). A same-epoch marker
+    whose ``requested_at`` is older than :data:`_DRAIN_MARKER_MAX_AGE_SECONDS`
+    is likewise treated as an orphan and read as absent (#85433). Both checks
+    are lenient (see :func:`_marker_epoch_is_stale` / :func:`_marker_age_is_stale`):
+    a legacy/corrupt marker with no epoch, an environment without ``/proc``, or a
+    marker with no/unparseable ``requested_at`` still reads as drain-active.
     """
     body = read_drain_request(home=home)
     if body is None:
         return False
-    if _marker_epoch_is_stale(body):
+    if _marker_is_inactive(body):
         return False
     return True
 
@@ -229,12 +297,12 @@ def drain_requested(*, home: Optional[Path] = None) -> bool:
 def drain_notification_suppressed(*, home: Optional[Path] = None) -> bool:
     """True iff an ACTIVE drain marker asks to suppress the shutdown broadcast.
 
-    "Active" means exactly what :func:`drain_requested` means — a marker present
-    AND stamped with the current instantiation epoch. A stale (other-epoch)
-    marker that survived a machine restart on the durable HERMES_HOME volume is
-    ignored here just as it is for drain state (NS-570): we must never let an
-    orphaned marker's flag silence a *fresh* gateway's legitimate shutdown
-    broadcast.
+    "Active" means exactly what :func:`drain_requested` means — a marker present,
+    stamped with the current instantiation epoch, AND within the max-age bound.
+    A stale marker (other-epoch survivor of a machine restart, NS-570, or a
+    same-epoch orphan past its max-age, #85433) is ignored here just as it is for
+    drain state: we must never let an orphaned marker's flag silence a *fresh*
+    gateway's legitimate shutdown broadcast.
 
     Only honours the flag when it is explicitly truthy in the marker body. A
     legacy marker without the field, a corrupt/contentless ``{}`` body, or an
@@ -246,7 +314,7 @@ def drain_notification_suppressed(*, home: Optional[Path] = None) -> bool:
     body = read_drain_request(home=home)
     if body is None:
         return False
-    if _marker_epoch_is_stale(body):
+    if _marker_is_inactive(body):
         return False
     return bool(body.get("suppress_notification"))
 

@@ -12,6 +12,7 @@ Q-B, exercises a real `hermes gateway run`); these lock the unit contract.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -119,6 +120,92 @@ class TestInstantiationEpoch:
             assert dc.current_instantiation_epoch() == ""
         finally:
             dc.current_instantiation_epoch.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# requested_at max-age fallback (#85433: same-epoch orphan with no restart)
+# ---------------------------------------------------------------------------
+
+
+def _restamp_requested_at(iso: str, *, home) -> None:
+    """Rewrite the on-disk marker's requested_at, preserving the live epoch."""
+    body = dc.read_drain_request(home=home)
+    assert body is not None
+    body["requested_at"] = iso
+    from utils import atomic_json_write
+
+    atomic_json_write(dc.drain_request_path(home), body)
+
+
+class TestRequestedAtMaxAge:
+    def setup_method(self):
+        dc._warn_marker_age_stale.cache_clear()
+
+    def test_fresh_marker_stays_active(self, home):
+        # A just-written marker (requested_at ≈ now, same epoch) is honoured.
+        dc.write_drain_request(principal="nas")
+        assert dc.drain_requested() is True
+
+    def test_same_epoch_orphan_past_max_age_reads_as_absent(self, home):
+        # THE #85433 REGRESSION. The marker keeps the CURRENT epoch (no restart
+        # happened, so NS-570 cannot catch it), but its requested_at is old:
+        # the maintenance action finished and its writer never cleared it.
+        dc.write_drain_request(principal="nas")
+        assert dc.drain_requested() is True  # epoch matches, fresh → active
+
+        stale = datetime.now(timezone.utc) - timedelta(
+            seconds=dc._DRAIN_MARKER_MAX_AGE_SECONDS + 60
+        )
+        _restamp_requested_at(stale.isoformat(), home=home)
+
+        # Same-epoch marker still physically present…
+        assert dc.drain_request_path(home).exists() is True
+        # …but ignored because it aged out (orphan defence).
+        assert dc.drain_requested() is False
+
+    def test_marker_just_within_max_age_stays_active(self, home):
+        dc.write_drain_request(principal="nas")
+        recent = datetime.now(timezone.utc) - timedelta(
+            seconds=dc._DRAIN_MARKER_MAX_AGE_SECONDS - 120
+        )
+        _restamp_requested_at(recent.isoformat(), home=home)
+        assert dc.drain_requested() is True
+
+    def test_missing_requested_at_stays_active(self, home):
+        # Fail-safe leniency: a marker with no requested_at is still honoured.
+        dc.write_drain_request(principal="nas")
+        body = dc.read_drain_request(home=home)
+        body.pop("requested_at", None)
+        from utils import atomic_json_write
+
+        atomic_json_write(dc.drain_request_path(home), body)
+        assert dc.drain_requested() is True
+
+    def test_unparseable_requested_at_stays_active(self, home):
+        dc.write_drain_request(principal="nas")
+        _restamp_requested_at("not-a-timestamp", home=home)
+        assert dc.drain_requested() is True
+
+    def test_naive_timestamp_is_treated_as_utc(self, home):
+        # Writer emits tz-aware UTC; a naive stamp (no offset) must still be
+        # comparable rather than raising — assume UTC.
+        dc.write_drain_request(principal="nas")
+        stale_naive = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=dc._DRAIN_MARKER_MAX_AGE_SECONDS + 60)
+        ).replace(tzinfo=None)
+        _restamp_requested_at(stale_naive.isoformat(), home=home)
+        assert dc.drain_requested() is False
+
+    def test_suppress_notification_ignored_on_aged_orphan(self, home):
+        # An aged-out orphan must not silence a fresh gateway's shutdown ping.
+        dc.write_drain_request(principal="nas", suppress_notification=True)
+        assert dc.drain_notification_suppressed() is True
+        stale = datetime.now(timezone.utc) - timedelta(
+            seconds=dc._DRAIN_MARKER_MAX_AGE_SECONDS + 60
+        )
+        _restamp_requested_at(stale.isoformat(), home=home)
+        assert dc.drain_notification_suppressed() is False
 
 
 # ---------------------------------------------------------------------------
