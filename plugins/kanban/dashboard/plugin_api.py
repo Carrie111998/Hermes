@@ -36,8 +36,11 @@ the port.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
+import re
 import sqlite3
 import time
 from dataclasses import asdict
@@ -50,6 +53,7 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli import projects_db
 
 log = logging.getLogger(__name__)
 
@@ -153,6 +157,84 @@ BOARD_COLUMNS: list[str] = [
 
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
+
+_PROJECT_FALLBACK_COLORS = (
+    "#4f8cff", "#8b5cf6", "#ec4899", "#e87924", "#d4a017",
+    "#2aa876", "#0891b2", "#64748b", "#dc5a5a", "#7c9a3d",
+)
+
+
+def _project_color(project: projects_db.Project) -> str:
+    """Return configured color or a stable slug-derived palette color."""
+    if project.color and re.fullmatch(r"#[0-9a-fA-F]{6}", project.color.strip()):
+        return project.color.strip()
+    digest = hashlib.sha256(project.slug.encode("utf-8")).digest()
+    return _PROJECT_FALLBACK_COLORS[int.from_bytes(digest[:2], "big") % len(_PROJECT_FALLBACK_COLORS)]
+
+
+def _project_paths(project: projects_db.Project) -> list[str]:
+    paths = [project.primary_path] + [folder.path for folder in project.folders]
+    return sorted({os.path.realpath(os.path.expanduser(p)) for p in paths if p}, key=len, reverse=True)
+
+
+def _path_is_within(candidate: str, root: str) -> bool:
+    try:
+        return os.path.commonpath((candidate, root)) == root
+    except ValueError:
+        return False
+
+
+def _metadata_matches(task: kanban_db.Task, project: projects_db.Project) -> bool:
+    """Conservatively match a complete project name or slug token sequence."""
+    haystack = " ".join(filter(None, (task.title, task.body))).lower()
+    normalized_haystack = " " + re.sub(r"[^a-z0-9]+", " ", haystack).strip() + " "
+    candidates = {project.name, project.slug}
+    for candidate in candidates:
+        normalized = re.sub(r"[^a-z0-9]+", " ", candidate.lower()).strip()
+        # Avoid guessing from generic short one-word project names ("os",
+        # "web", etc.). Multi-token identifiers such as "g8 nyc" remain
+        # eligible because the complete phrase is distinctive.
+        if len(normalized.split()) == 1 and len(normalized) < 4:
+            continue
+        if normalized and f" {normalized} " in normalized_haystack:
+            return True
+    return False
+
+
+def _attribute_project(
+    task: kanban_db.Task,
+    projects: list[projects_db.Project],
+) -> Optional[projects_db.Project]:
+    """Apply explicit > unique longest path > unique metadata precedence."""
+    by_id = {project.id: project for project in projects}
+    if task.project_id:
+        return by_id.get(task.project_id)
+
+    if task.workspace_path:
+        candidate_path = os.path.realpath(os.path.expanduser(task.workspace_path))
+        path_matches: list[tuple[int, projects_db.Project]] = []
+        for project in projects:
+            matched = [root for root in _project_paths(project) if _path_is_within(candidate_path, root)]
+            if matched:
+                path_matches.append((len(matched[0]), project))
+        if path_matches:
+            longest = max(length for length, _project in path_matches)
+            winners = [project for length, project in path_matches if length == longest]
+            if len(winners) == 1:
+                return winners[0]
+            return None
+
+    metadata_matches = [project for project in projects if _metadata_matches(task, project)]
+    return metadata_matches[0] if len(metadata_matches) == 1 else None
+
+
+def _project_payload(project: projects_db.Project) -> dict[str, Any]:
+    return {
+        "id": project.id,
+        "name": project.name,
+        "slug": project.slug,
+        "color": _project_color(project),
+    }
 
 
 def _task_dict(
@@ -459,12 +541,27 @@ def get_board(
         # preview here — the full text is available via /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
 
+        try:
+            project_conn = projects_db.connect()
+            try:
+                projects = projects_db.list_projects(project_conn)
+            finally:
+                project_conn.close()
+        except Exception as exc:
+            log.warning("kanban project attribution unavailable: %s", exc)
+            projects = []
+
         for t in tasks:
             full = summary_map.get(t.id)
             preview = (
                 full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
             )
             d = _task_dict(t, latest_summary=preview)
+            project = _attribute_project(t, projects)
+            d["project_id"] = project.id if project else None
+            d["project_name"] = project.name if project else None
+            d["project_slug"] = project.slug if project else None
+            d["project_color"] = _project_color(project) if project else None
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -503,6 +600,7 @@ def get_board(
             ],
             "tenants": tenants,
             "assignees": assignees,
+            "projects": [_project_payload(project) for project in projects],
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
         }

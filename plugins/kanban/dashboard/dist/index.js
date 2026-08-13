@@ -526,6 +526,7 @@
 
     const [tenantFilter, setTenantFilter] = useState("");
     const [assigneeFilter, setAssigneeFilter] = useState("");
+    const [projectFilter, setProjectFilter] = useState("");
     const [includeArchived, setIncludeArchived] = useState(false);
     const [search, setSearch] = useState("");
     const [laneByProfile, setLaneByProfile] = useState(true);
@@ -702,8 +703,10 @@
       const filterTask = function (t) {
         if (tenantFilter && t.tenant !== tenantFilter) return false;
         if (assigneeFilter && t.assignee !== assigneeFilter) return false;
+        if (projectFilter === "__unscoped__" && t.project_id) return false;
+        if (projectFilter && projectFilter !== "__unscoped__" && t.project_id !== projectFilter) return false;
         if (q) {
-          const hay = `${t.id} ${t.title || ""} ${t.body || ""} ${t.result || ""} ${t.latest_summary || ""} ${t.assignee || ""} ${t.tenant || ""}`.toLowerCase();
+          const hay = `${t.id} ${t.title || ""} ${t.body || ""} ${t.result || ""} ${t.latest_summary || ""} ${t.assignee || ""} ${t.tenant || ""} ${t.project_name || ""} ${t.project_slug || ""}`.toLowerCase();
           if (hay.indexOf(q) === -1) return false;
         }
         return true;
@@ -713,7 +716,7 @@
           return Object.assign({}, col, { tasks: col.tasks.filter(filterTask) });
         }),
       });
-    }, [boardData, tenantFilter, assigneeFilter, search]);
+    }, [boardData, tenantFilter, assigneeFilter, projectFilter, search]);
 
     // --- actions ------------------------------------------------------------
     const moveTask = useCallback(function (taskId, newStatus) {
@@ -955,6 +958,7 @@
       setSearch("");
       setTenantFilter("");
       setAssigneeFilter("");
+      setProjectFilter("");
       setIncludeArchived(false);
       clearSelected();
     }, [board, clearSelected]);
@@ -1075,6 +1079,7 @@
           board: boardData,
           tenantFilter, setTenantFilter,
           assigneeFilter, setAssigneeFilter,
+          projectFilter, setProjectFilter,
           includeArchived, setIncludeArchived,
           laneByProfile, setLaneByProfile,
           search, setSearch,
@@ -1085,6 +1090,7 @@
           },
           onRefresh: loadBoard,
         }),
+        h(ProjectStatusStrip, { board: boardData }),
        selectedIds.size > 0 ? h(BulkActionBar, {
          count: selectedIds.size,
          assignees: (boardData && boardData.assignees) || [],
@@ -2166,10 +2172,52 @@
   // Toolbar
   // -------------------------------------------------------------------------
 
+  function ProjectStatusStrip(props) {
+    const projects = (props.board && props.board.projects) || [];
+    const counts = {};
+    for (const project of projects) counts[project.id] = { running: 0, blocked: 0, actionable: 0, seen: false };
+    for (const column of ((props.board && props.board.columns) || [])) {
+      for (const task of column.tasks || []) {
+        if (!task.project_id || !counts[task.project_id]) continue;
+        counts[task.project_id].seen = true;
+        if (task.status === "running") counts[task.project_id].running += 1;
+        if (task.status === "blocked") counts[task.project_id].blocked += 1;
+        if (task.status === "ready" || task.status === "todo") counts[task.project_id].actionable += 1;
+      }
+    }
+    const attributed = projects.filter(function (project) { return counts[project.id].seen; });
+    if (attributed.length === 0) return null;
+    return h("section", {
+      className: "hermes-kanban-project-strip",
+      "aria-label": "Project status overview",
+      title: "Blocked projects are outlined in red; Clear means the project has no blocked tasks.",
+    },
+      h("span", { className: "hermes-kanban-project-strip-label" }, "Projects"),
+      attributed.map(function (project) {
+        const c = counts[project.id];
+        return h("span", {
+          key: project.id,
+          className: cn("hermes-kanban-project-chip", c.blocked ? "hermes-kanban-project-chip--blocked" : "hermes-kanban-project-chip--clear"),
+          style: { "--project-color": project.color },
+          title: `${project.name}: ${c.running} running, ${c.blocked} blocked, ${c.actionable} actionable. ${c.blocked ? "Blocked" : "Clear"}.`,
+        },
+          h("span", { className: "hermes-kanban-project-dot" }),
+          h("strong", null, project.name),
+          h("span", null, `R ${c.running}`),
+          h("span", null, `B ${c.blocked}`),
+          h("span", null, `A ${c.actionable}`),
+          h("span", { className: "hermes-kanban-project-state" }, c.blocked ? "Blocked" : "Clear"),
+        );
+      }),
+      h("span", { className: "hermes-kanban-project-legend" }, "R running · B blocked · A ready/todo"),
+    );
+  }
+
   function BoardToolbar(props) {
     const { t } = useI18n();
     const tenants = (props.board && props.board.tenants) || [];
     const assignees = (props.board && props.board.assignees) || [];
+    const projects = (props.board && props.board.projects) || [];
     return h("div", { className: "flex flex-wrap items-end gap-3" },
       h("div", { className: "flex flex-col gap-1",
                  title: "Fuzzy-match tasks by id, title, or description. Matches across all columns." },
@@ -2207,6 +2255,20 @@
           }),
         ),
       ),
+      h("div", { className: "flex flex-col gap-1",
+                 title: "Filter cards by attributed first-class Hermes project." },
+        h(Label, { className: "text-xs text-muted-foreground" }, "Project"),
+        h(Select, Object.assign({
+          value: props.projectFilter,
+          className: "h-8",
+        }, selectChangeHandler(props.setProjectFilter)),
+          h(SelectOption, { value: "" }, "All projects"),
+          projects.map(function (project) {
+            return h(SelectOption, { key: project.id, value: project.id }, project.name);
+          }),
+          h(SelectOption, { value: "__unscoped__" }, "Unscoped"),
+        ),
+      ),
       h("label", { className: "flex items-center gap-2 text-xs",
                    title: "Include archived tasks in the board view. Archived tasks are hidden by default." },
         h(Checkbox, {
@@ -2239,10 +2301,11 @@
           props.setSearch("");
           props.setTenantFilter("");
           props.setAssigneeFilter("");
+          props.setProjectFilter("");
           props.setIncludeArchived(false);
         },
         size: "sm",
-        title: "Clear all active filters (search, tenant, assignee, archived).",
+        title: "Clear all active filters (search, tenant, assignee, project, archived).",
       }, tx(t, "clearFilters", "Clear filters")),
     );
   }
@@ -2850,6 +2913,16 @@
               ? h(Badge, { variant: "outline", className: "hermes-kanban-tag",
                            title: `Tenant: ${t.tenant}. Free-form tag for grouping tasks (customer, project, team).` }, t.tenant)
               : null,
+            h("span", {
+              className: cn("hermes-kanban-project-badge", t.project_id ? "" : "hermes-kanban-project-badge--unscoped"),
+              style: t.project_id ? { "--project-color": t.project_color } : null,
+              title: t.project_id
+                ? `Project: ${t.project_name} (${t.project_slug})`
+                : "Unscoped: no explicit or unambiguous inferred project.",
+            },
+              h("span", { className: "hermes-kanban-project-dot" }),
+              t.project_name || "Unscoped",
+            ),
             progress
               ? h("span", {
                   className: cn(

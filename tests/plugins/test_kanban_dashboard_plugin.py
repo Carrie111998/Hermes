@@ -19,6 +19,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import projects_db
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +177,94 @@ def test_tenant_filter(client):
     assert total == 1
 
 
+def _board_tasks(client):
+    data = client.get("/api/plugins/kanban/board").json()
+    return {
+        task["title"]: task
+        for column in data["columns"]
+        for task in column["tasks"]
+    }, data
+
+
+def test_board_project_attribution_precedence_and_payload(client, tmp_path):
+    """Explicit project wins, then a unique workspace-path match."""
+    repo_a = tmp_path / "repos" / "alpha"
+    repo_b = tmp_path / "repos" / "beta"
+    repo_a.mkdir(parents=True)
+    repo_b.mkdir(parents=True)
+    pconn = projects_db.connect()
+    try:
+        alpha_id = projects_db.create_project(
+            pconn, name="Alpha App", slug="alpha-app",
+            primary_path=str(repo_a), color="#123456",
+        )
+        beta_id = projects_db.create_project(
+            pconn, name="Beta Service", slug="beta-service",
+            primary_path=str(repo_b),
+        )
+    finally:
+        pconn.close()
+
+    conn = kb.connect()
+    try:
+        kb.create_task(
+            conn, title="explicit wins", project_id=alpha_id,
+            workspace_kind="dir", workspace_path=str(repo_b),
+        )
+        kb.create_task(
+            conn, title="path inferred", workspace_kind="worktree",
+            workspace_path=str(repo_b / ".worktrees" / "feature"),
+        )
+    finally:
+        conn.close()
+
+    tasks, data = _board_tasks(client)
+    expected = {
+        "project_id": alpha_id,
+        "project_name": "Alpha App",
+        "project_slug": "alpha-app",
+        "project_color": "#123456",
+    }
+    assert {key: tasks["explicit wins"][key] for key in expected} == expected
+    assert tasks["path inferred"]["project_id"] == beta_id
+    assert tasks["path inferred"]["project_name"] == "Beta Service"
+    assert tasks["path inferred"]["project_slug"] == "beta-service"
+    assert tasks["path inferred"]["project_color"].startswith("#")
+    assert len(tasks["path inferred"]["project_color"]) == 7
+    assert {project["id"] for project in data["projects"]} == {alpha_id, beta_id}
+
+
+def test_board_project_metadata_inference_is_conservative(client, tmp_path):
+    """Metadata fallback attributes one unique match and rejects ambiguity."""
+    pconn = projects_db.connect()
+    try:
+        alpha_id = projects_db.create_project(
+            pconn, name="Alpha App", slug="alpha-app",
+            primary_path=str(tmp_path / "alpha-app"),
+        )
+        projects_db.create_project(
+            pconn, name="Beta Service", slug="beta-service",
+            primary_path=str(tmp_path / "beta-service"),
+        )
+    finally:
+        pconn.close()
+
+    client.post("/api/plugins/kanban/tasks", json={"title": "Ship Alpha App homepage"})
+    client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Coordinate Alpha App and Beta Service release"},
+    )
+    client.post("/api/plugins/kanban/tasks", json={"title": "Generic homepage cleanup"})
+
+    tasks, _data = _board_tasks(client)
+    assert tasks["Ship Alpha App homepage"]["project_id"] == alpha_id
+    ambiguous = tasks["Coordinate Alpha App and Beta Service release"]
+    assert ambiguous["project_id"] is None
+    assert tasks["Generic homepage cleanup"]["project_id"] is None
+    for field in ("project_name", "project_slug", "project_color"):
+        assert ambiguous[field] is None
+
+
 def test_dashboard_markdown_html_is_sanitized_before_render():
     """Markdown rendering must sanitize HTML before dangerouslySetInnerHTML."""
 
@@ -187,6 +276,20 @@ def test_dashboard_markdown_html_is_sanitized_before_render():
     assert "MARKDOWN_ALLOWED_TAGS" in js
     assert "sanitizeMarkdownHtml(renderMarkdown(props.source || \"\"))" in js
     assert "dangerouslySetInnerHTML: { __html: renderMarkdown(props.source || \"\") }" not in js
+
+
+def test_dashboard_bundle_includes_project_overview_filter_and_badge():
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    styles = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css").read_text()
+
+    assert "function ProjectStatusStrip(props)" in bundle
+    assert '"All projects"' in bundle
+    assert '"Unscoped"' in bundle
+    assert "t.project_name || \"Unscoped\"" in bundle
+    assert "${t.project_name || \"\"}" in bundle
+    assert ".hermes-kanban-project-chip--blocked" in styles
+    assert ".hermes-kanban-project-badge--unscoped" in styles
 
 
 # ---------------------------------------------------------------------------
