@@ -1455,6 +1455,26 @@ class TestCuaCliFallbackResolution:
             "/Users/example/.local/bin/cua-driver", "call", "click"
         ]
 
+    def test_cli_fallback_nonzero_exit_with_json_fails_closed(self):
+        from tools.computer_use.cua_backend import _AsyncBridge, _CuaDriverSession
+
+        proc = MagicMock(
+            stdout='{"error":"stale target"}',
+            stderr="",
+            returncode=1,
+        )
+        session = _CuaDriverSession(_AsyncBridge())
+        with patch(
+            "tools.computer_use.cua_backend.resolve_cua_driver_cmd",
+            return_value="/Users/example/.local/bin/cua-driver",
+        ), patch("subprocess.run", return_value=proc):
+            out = session._call_tool_via_cli(
+                "hotkey", {"pid": 42, "window_id": 7}, timeout=0.1,
+            )
+
+        assert out["isError"] is True
+        assert out["structuredContent"]["error"] == "stale target"
+
 
 class TestClickButtonPassthrough:
     """Surface 5 (NousResearch/hermes-agent#47072) — `middle_click` must

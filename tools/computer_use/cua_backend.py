@@ -1578,6 +1578,7 @@ class _CuaDriverSession:
         attempts = 4
         backoff = 0.5
         parsed: Any = None
+        parsed_returncode = 0
         last_err = ""
         try:
             for attempt in range(attempts):
@@ -1603,6 +1604,7 @@ class _CuaDriverSession:
                         candidate = None
                     if candidate is not None:
                         parsed = candidate
+                        parsed_returncode = int(proc.returncode or 0)
                         break
                 # No JSON (EAGAIN warning / empty) — retry with backoff.
                 if attempt < attempts - 1:
@@ -1624,12 +1626,16 @@ class _CuaDriverSession:
             images: List[str] = []
             data: Any = None
             structured: Optional[Dict] = parsed if isinstance(parsed, dict) else None
-            is_error = False
+            is_error = parsed_returncode != 0
             if isinstance(parsed, dict):
                 # Current cua-driver CLI responses may report logical failures
                 # in-band even when the subprocess itself exits successfully.
                 # Preserve that bit so stateful callers can fail closed.
-                is_error = parsed.get("isError") is True or parsed.get("is_error") is True
+                is_error = (
+                    is_error
+                    or parsed.get("isError") is True
+                    or parsed.get("is_error") is True
+                )
                 shot = parsed.get("screenshot_png_b64")
                 if not shot:
                     # Screenshot was routed to a file (ours or the daemon's choice).
@@ -2759,7 +2765,18 @@ class CuaDriverBackend(ComputerUseBackend):
             )
             if not focused.ok:
                 return focused
-        result = self._action(action, args)
+        # Foreground input is an explicit escalation for native apps that do
+        # not accept background delivery. Route that one rung over the
+        # driver's direct CLI/socket transport: the persistent stdio MCP
+        # bridge can acknowledge macOS global-input delivery without the
+        # event reaching the target, while `cua-driver call` uses the daemon's
+        # native socket and delivers the same exact pid/window-bound payload.
+        # Background input remains on MCP and retains the no-focus contract.
+        result = self._action(
+            action,
+            args,
+            cli_transport=delivery_mode == "foreground",
+        )
         if args.get("pid") is not None:
             result.meta.setdefault("pid", args["pid"])
         if args.get("window_id") is not None:
@@ -3430,6 +3447,7 @@ class CuaDriverBackend(ComputerUseBackend):
         args: Dict[str, Any],
         *,
         inject_session: bool = True,
+        cli_transport: bool = False,
     ) -> ActionResult:
         # Attach the snapshot's element_token whenever the call carries
         # an element_index and the target tool advertises support.
@@ -3441,7 +3459,10 @@ class CuaDriverBackend(ComputerUseBackend):
         if inject_session:
             args.setdefault("session", self._session_id)
         try:
-            out = self._session.call_tool(name, args)
+            if cli_transport:
+                out = self._session._call_tool_via_cli(name, args, 30.0)
+            else:
+                out = self._session.call_tool(name, args)
         except Exception as e:
             logger.exception("cua-driver %s call failed", name)
             return ActionResult(ok=False, action=name, message=f"cua-driver error: {e}")
