@@ -5659,6 +5659,14 @@ def release_stale_claims(
     for row in stale:
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
+        heartbeat_at = row["last_heartbeat_at"]
+        # Observer compatibility only: recovery is fenced by durable progress,
+        # but existing lifecycle consumers still receive heartbeat staleness.
+        heartbeat_stale = (
+            heartbeat_at is not None
+            and (now - int(heartbeat_at))
+            > DEFAULT_CLAIM_PROGRESS_MAX_STALE_SECONDS
+        )
         progress_baseline = row["last_progress_at"] or row["active_started_at"]
         progress_age = (
             now - int(progress_baseline) if progress_baseline is not None else None
