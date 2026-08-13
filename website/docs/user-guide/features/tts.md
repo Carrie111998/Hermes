@@ -109,7 +109,7 @@ tts:
     lang: en                                    # 31 languages + 'na' neutral (see list below)
     speed: 1.0                                  # 0.7 - 2.0 (higher = faster)
     total_steps: 8                              # 5 - 12 (higher = better quality, slower)
-    # voice_style_path: ''                      # custom voice style from the Supertonic Voice Builder
+    # voice_style_path: ''                      # previously exported custom voice style
     # max_chunk_length: 300                      # override internal text chunking (minimum: 10)
     # silence_duration: 0.0                      # silence between chunks (seconds)
 ```
@@ -275,6 +275,12 @@ Supertonic is a light, fully-local neural TTS engine built on ONNX Runtime (99M 
 
 On the first TTS call, Supertonic downloads its ~400MB model into `~/.cache/supertonic3/`. Subsequent calls reuse the cached model (loaded once per process).
 
+:::caution Upstream support ending
+Supertone [announced](https://github.com/supertone-inc/supertonic) that the open-source Supertonic repositories will be archived and official model support will end. Its Voice Builder will become unavailable after August 31, 2026. Local synthesis with downloaded models and built-in or previously exported voice styles does not depend on that service, but future upstream fixes should not be expected.
+:::
+
+The Python package and sample code use the MIT license. The downloaded model weights use the [OpenRAIL-M license](https://huggingface.co/Supertone/supertonic-3/blob/main/LICENSE), including its use restrictions and redistribution terms.
+
 **Switch to Supertonic:**
 
 ```yaml
@@ -295,7 +301,7 @@ tts:
 
 **Expression tags.** Embed `<laugh>`, `<breath>`, or `<sigh>` directly in the text to add non-verbal expression, e.g. `That's hilarious <laugh> - anyway, where were we?`
 
-**Custom voices.** If you built a voice with the Supertonic Voice Builder, point `tts.supertonic.voice_style_path` at the exported style file; it takes precedence over `voice`.
+**Existing custom voices.** Point `tts.supertonic.voice_style_path` at a previously exported style file; it takes precedence over `voice`. The hosted Voice Builder will not be available after August 31, 2026.
 
 **Polish example** (matches a known-good production setup):
 
