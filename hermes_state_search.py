@@ -1417,6 +1417,7 @@ class SessionSearchMixin:
         sort: str = None,
         include_inactive: bool = False,
         fields: Optional[Collection[str]] = None,
+        workspace_key: str = None,
     ) -> List[Dict[str, Any]]:
         """Instrumented wrapper around :meth:`_search_messages_impl`.
 
@@ -1439,6 +1440,7 @@ class SessionSearchMixin:
                 sort=sort,
                 include_inactive=include_inactive,
                 fields=fields,
+                workspace_key=workspace_key,
             )
             return rows
         finally:
@@ -1489,6 +1491,7 @@ class SessionSearchMixin:
         sort: str = None,
         include_inactive: bool = False,
         fields: Optional[Collection[str]] = None,
+        workspace_key: str = None,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -1575,6 +1578,20 @@ class SessionSearchMixin:
             role_placeholders = ",".join("?" for _ in role_filter)
             where_clauses.append(f"m.role IN ({role_placeholders})")
             params.extend(role_filter)
+
+        # Workspace scoping: when a workspace_key is supplied, restrict hits to
+        # sessions belonging to that workspace (git repo root, else cwd). Uses
+        # the same _workspace_key_clause semantics as list_sessions_rich.
+        ws_clause = None
+        ws_params: list = []
+        if workspace_key:
+            try:
+                from hermes_state import _workspace_key_clause
+                ws_clause, ws_params = _workspace_key_clause(workspace_key)
+                where_clauses.append(ws_clause)
+                params.extend(ws_params)
+            except Exception:
+                logging.debug("workspace_key clause build failed", exc_info=True)
 
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])
@@ -1669,6 +1686,9 @@ class SessionSearchMixin:
                 if role_filter:
                     cjk_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     cjk_params.extend(role_filter)
+                if workspace_key:
+                    cjk_where.append(f"({ws_clause})")
+                    cjk_params.extend(ws_params)
                 cjk_sql = f"""
                     SELECT
                         m.id,
@@ -1758,6 +1778,9 @@ class SessionSearchMixin:
                 if role_filter:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
+                if workspace_key:
+                    tri_where.append(f"({ws_clause})")
+                    tri_params.extend(ws_params)
                 tri_sql = f"""
                     SELECT
                         m.id,
@@ -1852,6 +1875,9 @@ class SessionSearchMixin:
                 if role_filter:
                     like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     like_params.extend(role_filter)
+                if workspace_key:
+                    like_where.append(f"({ws_clause})")
+                    like_params.extend(ws_params)
                 like_sql = f"""
                     SELECT m.id, m.session_id, m.role,
                            substr(m.content,
@@ -1911,6 +1937,7 @@ class SessionSearchMixin:
                     source_filter=source_filter,
                     exclude_sources=exclude_sources,
                     role_filter=role_filter,
+                    workspace_key=workspace_key,
                 )
                 seen_ids = {m["id"] for m in matches}
                 matches.extend(m for m in gap_matches if m["id"] not in seen_ids)
@@ -2060,6 +2087,7 @@ class SessionSearchMixin:
         source_filter: Optional[List[str]] = None,
         exclude_sources: Optional[List[str]] = None,
         role_filter: Optional[List[str]] = None,
+        workspace_key: str = None,
     ) -> List[Dict[str, Any]]:
         """LIKE-scan the rows the deferred rebuild hasn't indexed yet.
 
@@ -2105,6 +2133,14 @@ class SessionSearchMixin:
         if role_filter:
             where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
             params.extend(role_filter)
+        if workspace_key:
+            try:
+                from hermes_state import _workspace_key_clause
+                ws_clause, ws_params = _workspace_key_clause(workspace_key)
+                where.append(f"({ws_clause})")
+                params.extend(ws_params)
+            except Exception:
+                logging.debug("workspace_key clause build failed (gap)", exc_info=True)
 
         sql = f"""
             SELECT m.id, m.session_id, m.role,

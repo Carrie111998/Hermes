@@ -434,13 +434,38 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
     return json.dumps(response, ensure_ascii=False)
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_profile: str = None) -> str:
+def _resolve_workspace_key(db, workspace_target: str = None) -> Optional[str]:
+    """Resolve a workspace key for scoping, or None for no scoping.
+
+    ``workspace_target`` is whatever the agent knows about the current
+    workspace — typically the session's cwd or git repo root, as surfaced by
+    the desktop's "New Session In <workspace>" action and the agent's own
+    environment. We accept it verbatim and normalize it through the same
+    ``workspace_key`` semantics the DB uses for grouping (git root wins, else
+    cwd). A blank/absent target means "no workspace scope" → global search,
+    preserving today's behavior.
+    """
+    if not workspace_target or not str(workspace_target).strip():
+        return None
+    target = str(workspace_target).strip()
+    try:
+        from hermes_state import workspace_key
+        # workspace_key() picks git_repo_root when present; for an arbitrary
+        # path we feed it as a synthetic row so it applies the same
+        # git-root-over-cwd rule.
+        return workspace_key({"git_repo_root": "", "cwd": target})
+    except Exception:
+        return target or None
+
+
+def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_profile: str = None, workspace_key: str = None) -> str:
     """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
     try:
         sessions = db.list_sessions_rich(
             limit=limit + 5,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             order_by_last_active=True,
+            cwd_prefix=workspace_key,
         )  # fetch extra so we can skip current
 
         current_root = _resolve_lineage(db, current_session_id) if current_session_id else None
@@ -624,6 +649,7 @@ def _title_match_result(
     db,
     query: str,
     current_lineage_root: Optional[str],
+    workspace_key: str = None,
 ) -> Optional[Dict[str, Any]]:
     """Return a discovery-shaped result when the query matches a session title."""
     title_query = _normalize_title_query(query)
@@ -649,6 +675,20 @@ def _title_match_result(
         session_meta = {}
     if session_meta.get("source") in _HIDDEN_SESSION_SOURCES:
         return None
+
+    # Workspace scoping: a title-matched session outside the active workspace
+    # is not relevant when the caller asked to scope to one workspace.
+    if workspace_key:
+        try:
+            from hermes_state import workspace_key as _wskey_fn
+            row_ws = _wskey_fn({
+                "git_repo_root": session_meta.get("git_repo_root") or "",
+                "cwd": session_meta.get("cwd") or "",
+            })
+            if row_ws and row_ws != workspace_key:
+                return None
+        except Exception:
+            logging.debug("workspace title-match scope check failed", exc_info=True)
 
     try:
         messages = db.get_messages(session_id)
@@ -695,11 +735,12 @@ def _discover(
     sort: Optional[str],
     current_session_id: str = None,
     link_profile: str = None,
+    workspace_key: str = None,
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
-    title_result = _title_match_result(db, query, current_lineage_root)
+    title_result = _title_match_result(db, query, current_lineage_root, workspace_key=workspace_key)
 
     try:
         raw_results = db.search_messages(
@@ -712,6 +753,7 @@ def _discover(
             offset=0,
             sort=sort,
             fields=_DISCOVER_SEARCH_FIELDS,
+            workspace_key=workspace_key,
         )
     except Exception as e:
         logging.error("FTS5 search failed: %s", e, exc_info=True)
@@ -859,6 +901,10 @@ def session_search(
     sort: str = None,
     # Cross-profile (any shape)
     profile: str = None,
+    # Workspace scoping: when set (the current session's cwd / git repo root,
+    # as surfaced by "New Session In <workspace>"), restrict discovery + browse
+    # to that workspace only. None/blank = global (today's behavior).
+    workspace_target: str = None,
 ) -> str:
     """Single-shape tool. Mode inferred from which args are set.
 
@@ -943,9 +989,12 @@ def session_search(
             limit = 3
     limit = max(1, min(limit, 10))
 
+    # Workspace scoping — resolve the target into the DB's workspace key.
+    ws_key = _resolve_workspace_key(db, workspace_target)
+
     # Browse shape: no query → recent sessions.
     if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id, link_profile=profile)
+        return _list_recent_sessions(db, limit, current_session_id, link_profile=profile, workspace_key=ws_key)
 
     # Parse role_filter
     role_list: Optional[List[str]] = None
@@ -967,6 +1016,7 @@ def session_search(
         sort=sort_norm,
         current_session_id=current_session_id,
         link_profile=profile,
+        workspace_key=ws_key,
     )
 
 
