@@ -811,6 +811,15 @@ try:
 except Exception:
     pass
 
+# Initialize inline image preview from config
+try:
+    from agent.display import set_image_preview
+    _ip = CLI_CONFIG.get("display", {}).get("image_preview", True)
+    _ipw = CLI_CONFIG.get("display", {}).get("image_preview_max_width", 0)
+    set_image_preview(bool(_ip), int(_ipw) if _ipw else 0)
+except Exception:
+    pass
+
 # Initialize friendly tool labels from config (default on)
 try:
     from agent.display import set_friendly_tool_labels
@@ -12540,6 +12549,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             )
         except Exception:
             logger.debug("Edit diff preview failed for %s", function_name, exc_info=True)
+        try:
+            from agent.display import render_image_preview
+            render_image_preview(function_result, print_fn=_cprint)
+        except Exception:
+            logger.debug("Image preview failed for %s", function_name, exc_info=True)
 
     # ====================================================================
     # Voice mode methods
