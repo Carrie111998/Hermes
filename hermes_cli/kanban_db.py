@@ -9222,8 +9222,6 @@ def _codex_capability_failure(task: Task) -> Optional[str]:
         pool = load_pool_readonly("openai-codex")
         selected = pool.select_readonly()
         if selected is None:
-            if any(entry.last_status == STATUS_EXHAUSTED for entry in pool._entries):
-                return None
             raise AuthError(
                 "No usable Codex credentials remain after preflight",
                 provider="openai-codex", code="codex_auth_unavailable",
@@ -9242,6 +9240,30 @@ def _codex_capability_failure(task: Task) -> Optional[str]:
         if profile_token is not None:
             reset_hermes_home_override(profile_token)
     return None
+
+
+def _block_codex_capability_before_dispatch(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    assignee: str,
+    dry_run: bool,
+    result: "DispatchResult",
+) -> bool:
+    """Fail closed before any claim/run/spawn mutation for unsupported auth."""
+    reason = _codex_capability_failure(task)
+    if reason is None:
+        return False
+    result.skipped_capability.append((task.id, assignee, reason))
+    if not dry_run:
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind='capability', "
+                "last_failure_error=? WHERE id=? AND status IN ('ready', 'review')",
+                (reason, task.id),
+            )
+            _append_event(conn, task.id, "capability_blocked", {"reason": reason})
+    return True
 
 
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
@@ -9571,16 +9593,9 @@ def _dispatch_once_locked(
             result.skipped_nonspawnable.append(row["id"])
             continue
         capability_task = get_task(conn, row["id"])
-        capability_reason = _codex_capability_failure(capability_task) if capability_task else None
-        if capability_reason is not None:
-            result.skipped_capability.append((row["id"], row_assignee, capability_reason))
-            if not dry_run:
-                with write_txn(conn):
-                    conn.execute(
-                        "UPDATE tasks SET status='blocked', block_kind='capability', last_failure_error=? WHERE id=? AND status='ready'",
-                        (capability_reason, row["id"]),
-                    )
-                    _append_event(conn, row["id"], "capability_blocked", {"reason": capability_reason})
+        if capability_task and _block_codex_capability_before_dispatch(
+            conn, capability_task, assignee=row_assignee, dry_run=dry_run, result=result
+        ):
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -9722,6 +9737,11 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        capability_task = get_task(conn, row["id"])
+        if capability_task and _block_codex_capability_before_dispatch(
+            conn, capability_task, assignee=row["assignee"], dry_run=dry_run, result=result
+        ):
             continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
