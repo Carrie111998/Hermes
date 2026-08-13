@@ -13,6 +13,7 @@ import { af } from "./af";
 import { ko } from "./ko";
 import { it } from "./it";
 import { ga } from "./ga";
+import { ptBr } from "./pt-br";
 import { pt } from "./pt";
 import { ru } from "./ru";
 import { hu } from "./hu";
@@ -32,6 +33,7 @@ const TRANSLATIONS: Record<Locale, Translations> = {
   ko,
   it,
   ga,
+  "pt-br": ptBr,
   pt,
   ru,
   hu,
@@ -65,6 +67,7 @@ export const LOCALE_META: Record<Locale, { name: string }> = {
   ko: { name: "한국어" },
   it: { name: "Italiano" },
   ga: { name: "Gaeilge" },
+  "pt-br": {   name: "Português do Brasil" },
   pt: { name: "Português" },
   ru: { name: "Русский" },
   hu: { name: "Magyar" },
