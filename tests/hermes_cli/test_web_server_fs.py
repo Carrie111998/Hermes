@@ -55,6 +55,27 @@ def test_fs_read_data_url_rejects_over_cap(client, tmp_path, monkeypatch):
     assert response.status_code == 413
 
 
+@pytest.mark.parametrize("endpoint", ["read-text", "read-data-url"])
+def test_fs_read_resolves_persistent_docker_workspace_path(client, tmp_path, monkeypatch, endpoint):
+    sandbox = tmp_path / "sandboxes"
+    workspace = sandbox / "docker" / "default" / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "report.txt").write_text("sandbox output", encoding="utf-8")
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "true")
+    monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(sandbox))
+    monkeypatch.delenv("TERMINAL_DOCKER_VOLUMES", raising=False)
+    monkeypatch.delenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", raising=False)
+
+    response = client.get(f"/api/fs/{endpoint}", params={"path": "/workspace/report.txt"})
+
+    assert response.status_code == 200
+    if endpoint == "read-text":
+        assert response.json()["text"] == "sandbox output"
+    else:
+        assert response.json()["dataUrl"] == "data:text/plain;base64,c2FuZGJveCBvdXRwdXQ="
+
+
 def test_fs_endpoints_require_auth(tmp_path):
     client = TestClient(web_server.app)
     target = tmp_path / "secret.txt"
