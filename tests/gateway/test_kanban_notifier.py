@@ -55,6 +55,20 @@ def _make_runner(adapter):
     return runner
 
 
+def _make_runner_with_routes(adapter, routes, *, platform=Platform.DISCORD):
+    """Bare runner carrying a multiplex config with profile_routes (#84863)."""
+    from gateway.config import GatewayConfig
+    from gateway.profile_routing import parse_profile_routes
+
+    runner = _make_runner(adapter)
+    runner.adapters = {platform: adapter}
+    runner.config = GatewayConfig(
+        multiplex_profiles=True,
+        profile_routes=parse_profile_routes(routes),
+    )
+    return runner
+
+
 def _create_completed_subscription(summary="done once"):
     conn = kb.connect()
     try:
@@ -516,3 +530,81 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     finally:
         conn.close()
     assert remaining == []
+
+
+def test_kanban_notifier_routes_to_assigned_profile_discord_channel(tmp_path, monkeypatch):
+    """#84863: a task assigned to a routed profile notifies THAT profile's channel.
+
+    The task is created (subscribed) in a general chat, but the assignee
+    (sysadmin) owns a dedicated Discord channel via profile_routes — the
+    completed notification must land in the profile's channel, not the
+    general one.
+    """
+    db_path = tmp_path / "assigned-route.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="route to profile", assignee="sysadmin")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="discord", chat_id="general-chat",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner_with_routes(
+        adapter,
+        [
+            {"name": "sysadmin-channel", "platform": "discord",
+             "chat_id": "sysadmin-chat", "profile": "sysadmin"},
+        ],
+    )
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "sysadmin-chat"
+
+
+def test_kanban_notifier_keeps_subscription_channel_without_profile_route(tmp_path, monkeypatch):
+    """#84863: no routed channel for the assignee -> subscription channel wins.
+
+    Covers both an unassigned task and an assignee with no route: the
+    notification must fall back to the channel where the task was created
+    (the default/global channel).
+    """
+    db_path = tmp_path / "unrouted.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid_unassigned = kb.create_task(conn, title="no assignee", assignee=None)
+        kb.add_notify_sub(
+            conn, task_id=tid_unassigned, platform="discord", chat_id="general-chat",
+        )
+        kb.complete_task(conn, tid_unassigned, summary="done")
+        tid_unrouted = kb.create_task(conn, title="unrouted profile", assignee="ghost")
+        kb.add_notify_sub(
+            conn, task_id=tid_unrouted, platform="discord", chat_id="general-chat",
+        )
+        kb.complete_task(conn, tid_unrouted, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner_with_routes(
+        adapter,
+        [
+            # A route exists, but only for a DIFFERENT profile — "ghost" has
+            # no dedicated channel, so its notifications stay in general-chat.
+            {"name": "sysadmin-channel", "platform": "discord",
+             "chat_id": "sysadmin-chat", "profile": "sysadmin"},
+        ],
+    )
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 2
+    assert {d["chat_id"] for d in adapter.sent} == {"general-chat"}
