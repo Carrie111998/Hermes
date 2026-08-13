@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import os
 import sqlite3
@@ -18,6 +19,27 @@ import pytest
 import hermes_state
 from hermes_cli import kanban_db as kb
 from hermes_cli import auth as auth_mod
+
+
+def _tree_inventory(root: Path) -> dict:
+    """Capture every directory/file attribute relevant to read-only proofs."""
+    if not root.exists():
+        return {}
+    paths = [root, *sorted(root.rglob("*"))]
+    result = {}
+    for path in paths:
+        st = path.lstat()
+        digest = None
+        if path.is_file():
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        result[str(path.relative_to(root))] = (
+            "dir" if path.is_dir() else "file" if path.is_file() else "other",
+            st.st_mode,
+            st.st_size,
+            digest,
+            st.st_mtime_ns,
+        )
+    return result
 
 
 @pytest.fixture
@@ -1258,6 +1280,49 @@ def test_dispatch_once_capability_blocks_codex_before_claim_without_fallback_or_
     assert "codex_auth_unavailable" in task.last_failure_error and runs == []
     assert not (profile_home / "auth.json").exists()
     assert global_auth.read_bytes() == b'{"version": 1}'
+
+
+def test_dispatch_once_unreadable_codex_auth_fails_closed_without_disk_mutation(kanban_home, monkeypatch, tmp_path):
+    """An auth read failure blocks before claim and cannot create lock/repair files."""
+    import agent.credential_pool as credential_pool
+
+    profile_home = tmp_path / "profiles" / "programmer"
+    global_home = tmp_path / "root"
+    profile_auth = profile_home / "auth.json"
+    global_auth = global_home / "auth.json"
+    profile_home.mkdir(parents=True)
+    global_home.mkdir(parents=True)
+    profile_auth.write_text('{"providers": {}}', encoding="utf-8")
+    global_auth.write_text('{"providers": {}}', encoding="utf-8")
+    before = (_tree_inventory(profile_home), _tree_inventory(global_home))
+
+    monkeypatch.setattr(kb, "_profile_model_provider", lambda _: "openai-codex")
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda _: str(profile_home))
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    monkeypatch.setattr(auth_mod, "_auth_file_path", lambda: profile_auth)
+    monkeypatch.setattr(auth_mod, "_global_auth_file_path", lambda: global_auth)
+    monkeypatch.setattr(credential_pool, "_codex_read_json_readonly", lambda path: (_ for _ in ()).throw(PermissionError("denied")))
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="unreadable codex", assignee="programmer")
+        result = kb.dispatch_once(conn, dry_run=False, spawn_fn=lambda *args: pytest.fail("claim occurred"))
+        task = kb.get_task(conn, task_id)
+        runs = conn.execute("SELECT id FROM task_runs WHERE task_id = ?", (task_id,)).fetchall()
+        events = conn.execute("SELECT kind FROM task_events WHERE task_id = ?", (task_id,)).fetchall()
+
+    assert result.spawned == []
+    assert result.skipped_capability[0][0] == task_id
+    assert task.status == "blocked" and task.block_kind == "capability"
+    assert task.claim_lock is None and task.started_at is None
+    assert runs == []
+    assert [row["kind"] for row in events] == ["created", "capability_blocked"]
+    assert "denied" not in task.last_failure_error
+    assert _tree_inventory(profile_home) == before[0]
+    assert _tree_inventory(global_home) == before[1]
+    assert not list(profile_home.rglob("*.lock"))
+    assert not list(global_home.rglob("*.lock"))
+    assert not list(profile_home.rglob("*.corrupt"))
+    assert not list(global_home.rglob("*.corrupt"))
 
 
 def test_dispatch_once_healthy_codex_pool_claims_through_same_preflight(kanban_home, monkeypatch, tmp_path):

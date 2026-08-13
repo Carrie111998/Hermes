@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import random
 import secrets
+import stat
 import threading
 import time
 import uuid
@@ -48,6 +50,111 @@ logger = logging.getLogger(__name__)
 
 _CODEX_GRANT_ID_KEY = "shared_grant_id"
 _CODEX_TOKEN_FINGERPRINT_DOMAIN = b"hermes:openai-codex:grant-token:v1:\x00"
+_CODEX_PREFLIGHT_MAX_BYTES = 4 * 1024 * 1024
+
+
+class _CodexPreflightUnavailable(RuntimeError):
+    """Internal marker for sanitized, fail-closed preflight failures."""
+
+
+def _codex_read_json_readonly(path: Optional[Path]) -> Optional[Dict[str, Any]]:
+    """Read one existing auth file without invoking auth-store machinery.
+
+    This deliberately uses only ``lstat`` + bounded bytes + JSON parsing.  In
+    particular, it does not acquire the auth lock, create parents, repair
+    corrupt files, normalize data, or write any state.
+    """
+    if path is None:
+        return None
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _CODEX_PREFLIGHT_MAX_BYTES:
+            raise _CodexPreflightUnavailable
+        with path.open("rb") as handle:
+            raw = handle.read(_CODEX_PREFLIGHT_MAX_BYTES + 1)
+        if len(raw) > _CODEX_PREFLIGHT_MAX_BYTES:
+            raise _CodexPreflightUnavailable
+        value = json.loads(raw.decode("utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        if isinstance(exc, _CodexPreflightUnavailable):
+            raise
+        raise _CodexPreflightUnavailable from None
+    if not isinstance(value, dict):
+        raise _CodexPreflightUnavailable
+    return value
+
+
+def _codex_readonly_state(store: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if store is None:
+        return None
+    providers = store.get("providers")
+    if providers is None:
+        providers = {}
+    pool = store.get("credential_pool")
+    if pool is None:
+        pool = {}
+    if not isinstance(providers, dict) or not isinstance(pool, dict):
+        raise _CodexPreflightUnavailable
+    state = providers.get("openai-codex")
+    if state is not None and not isinstance(state, dict):
+        raise _CodexPreflightUnavailable
+    entries = pool.get("openai-codex", [])
+    if entries is None:
+        entries = []
+    if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
+        raise _CodexPreflightUnavailable
+    return {"state": state, "entries": entries}
+
+
+def _load_codex_pool_readonly() -> "CredentialPool":
+    """Load the minimum Codex state needed by dispatcher preflight, purely."""
+    profile_path = auth_mod._auth_file_path()
+    global_path = auth_mod._global_auth_file_path()
+    profile = _codex_readonly_state(_codex_read_json_readonly(profile_path))
+    global_store = (
+        _codex_readonly_state(_codex_read_json_readonly(global_path))
+        if global_path is not None and not _same_path(profile_path, global_path)
+        else None
+    )
+    profile = profile or {"state": None, "entries": []}
+    global_store = global_store or {"state": None, "entries": []}
+    # Profile entries shadow the root for this provider, matching runtime
+    # selection. A root singleton remains authoritative when the profile has
+    # no provider state and no pool entries.
+    source = profile if profile["entries"] or profile["state"] is not None else global_store
+    entries = list(source["entries"])
+    state = source["state"]
+    if isinstance(state, dict):
+        tokens = state.get("tokens")
+        if tokens is not None and not isinstance(tokens, dict):
+            raise _CodexPreflightUnavailable
+        if isinstance(tokens, dict) and tokens.get("access_token"):
+            entries.append({
+                "source": "device_code", "auth_type": AUTH_TYPE_OAUTH,
+                "access_token": tokens.get("access_token"),
+                "refresh_token": tokens.get("refresh_token"),
+                "shared_grant_id": state.get(_CODEX_GRANT_ID_KEY),
+            })
+        error = state.get("last_auth_error")
+        if error is not None and not isinstance(error, dict):
+            raise _CodexPreflightUnavailable
+        if isinstance(error, dict) and error.get("relogin_required"):
+            terminal_grant = str(state.get(_CODEX_GRANT_ID_KEY) or "").strip()
+            if terminal_grant:
+                entries = [
+                    item for item in entries
+                    if _codex_entry_grant_id(item) != terminal_grant
+                ]
+    parsed: List[PooledCredential] = []
+    for payload in entries:
+        access = payload.get("access_token")
+        refresh = payload.get("refresh_token")
+        if not isinstance(access, str) or not access.strip() or not isinstance(refresh, str) or not refresh.strip():
+            raise _CodexPreflightUnavailable
+        parsed.append(PooledCredential.from_dict("openai-codex", payload))
+    return CredentialPool("openai-codex", parsed)
 
 
 def _codex_token_fingerprint(token: Any) -> bytes:
@@ -3492,6 +3599,8 @@ def load_pool(provider: str) -> CredentialPool:
 
 def load_pool_readonly(provider: str) -> CredentialPool:
     """Load runtime credential semantics without writing auth or pool files."""
+    if (provider or "").strip().lower() == "openai-codex":
+        return _load_codex_pool_readonly()
     return _load_pool(provider, persist=False)
 
 
