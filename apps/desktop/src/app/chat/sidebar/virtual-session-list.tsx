@@ -152,13 +152,14 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   // just consume that context via useSortable.
   return (
     <div
-      // `scrollbar-overlay`, not `scrollbar-fade`: the themed (classic)
-      // scrollbar reserves a 4px gutter, which shaved this list's rows
-      // narrower than the pinned/non-virtual lists above it and left dead
-      // space along the right edge. Overlay keeps native macOS behavior —
-      // zero gutter, thumb draws over content only while scrolling.
+      // `scrollbar-fade`, not `scrollbar-overlay`: the native overlay
+      // scrollbar reserves zero gutter and draws its thumb over the row's
+      // flush-right age/tokens — permanently on macOS systems with
+      // always-visible scrollbars. The themed 4px gutter keeps content clear
+      // and matches every other sidebar list; the wrapper above no longer
+      // scrolls (index.tsx), so this is the only gutter.
       className={cn(
-        'scrollbar-overlay relative min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain',
+        'scrollbar-fade relative min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain',
         className
       )}
       ref={scrollerRef}
