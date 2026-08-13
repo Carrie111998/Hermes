@@ -141,6 +141,55 @@ def test_skill_reuse_and_post_patch_reuse_are_derived_atomically(
     assert record["patch_generation"] == 1
     assert record["last_reused_patch_generation"] == 1
 
+
+def test_bump_use_records_into_turn_accumulator_and_reuse_tracking_together(
+    skills_home,
+    monkeypatch,
+):
+    """The Layer 2 accumulator and reuse-after-patch tracking were merged into
+    one ``bump_use``; assert both fire on every call — the accumulated set gets
+    the skill AND the record/lifecycle facts still carry the reuse signal."""
+    from hermes_cli import lifecycle
+    from tools.skill_usage import (
+        _turn_skill_accumulator,
+        arm_turn_skill_accumulator,
+        bump_patch,
+        bump_use,
+        get_record,
+    )
+
+    events = []
+    monkeypatch.setattr(lifecycle, "has_hook", lambda name: True)
+    monkeypatch.setattr(
+        lifecycle,
+        "invoke_hook",
+        lambda name, **kwargs: events.append((name, kwargs)),
+    )
+
+    used = set()
+    token = arm_turn_skill_accumulator(used)
+    try:
+        bump_use("accumulated")
+        bump_use("accumulated")
+        bump_patch("accumulated")
+        bump_use("accumulated")
+    finally:
+        _turn_skill_accumulator.reset(token)
+
+    assert used == {"accumulated"}
+    assert _turn_skill_accumulator.get() is None
+    record = get_record("accumulated")
+    assert record["use_count"] == 3
+    assert record["patch_generation"] == 1
+    assert record["last_reused_patch_generation"] == 1
+    loaded = [event for _, event in events if event["action"] == "loaded"]
+    assert [event["reused"] for event in loaded] == [False, True, True]
+    assert [event["reuse_after_patch"] for event in loaded] == [
+        False,
+        False,
+        True,
+    ]
+
 def test_skill_state_events_emit_only_for_real_transitions(skills_home, monkeypatch):
     from hermes_cli import lifecycle
     from tools.skill_usage import (

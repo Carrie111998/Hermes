@@ -15,10 +15,20 @@ Mechanism:
      or when configured ``run: always``. The aux prompt is seeded with the
      verdict report so it can't ignore a mechanical fail line.
   3. Attribution is dumb-recorder: mechanical FAILs always land on their
-     skill; the eval's extra failure points merge in (union). Environmental
-     reads live in the reason string, never in the verdict — the curator
-     review is the arbiter, not this recorder.
+     skill; the eval's extra failure points merge in (union). Down-only
+     governs attribution too: once a mechanical FAIL is on the table, the
+     eval's ``failure_points`` are ignored so a low-context judge can't pin
+     extra blame on an unrelated skill that merely ran unverified.
+     Environmental reads live in the reason string, never in the verdict —
+     the curator review is the arbiter, not this recorder.
   4. Best-effort everywhere: any failure here must never break the turn.
+
+Known limitation (future work, not fixed here): the aux judge sees only the
+summarized final response + verdict report — no tool outputs, diffs, or file
+state — so its verdict over unverified residue is a thin signal. The
+down-only attribution rule above keeps that weakness from leaking into blame;
+feeding the judge real evidence (a distilled trace from the turn's tool
+results) is the lever to raise the signal's quality.
 
 The seam core exposes is the returned ``TurnOutcome`` (attached to the session
 result dict by ``finalize_turn``). The ACSS Hypothesize consumer reads that
@@ -160,6 +170,27 @@ def _record(skill_name: str, success: bool, reason: str = "") -> None:
         logger.debug("turn_outcome: failed to record %s: %s", skill_name, e, exc_info=True)
 
 
+def _resolve_task_cwd(task_cwd: Optional[Union[str, Path]]) -> Path:
+    """Resolve the directory verifiers run against.
+
+    ``task_cwd`` wins when the caller supplies it. Otherwise use the agent's
+    canonical working directory — ``agent.runtime_cwd.resolve_agent_cwd``, the
+    same resolver the system prompt and file tools use (honors the per-session
+    pin set by gateway/ACP sessions and the ``TERMINAL_CWD`` bridge). Falling
+    back to ``Path.cwd()`` would run gateway/server verifiers against the
+    backend process's cwd, not the session's worktree. Process cwd is used only
+    as a last resort.
+    """
+    if task_cwd is not None:
+        return Path(task_cwd)
+    try:
+        from agent.runtime_cwd import resolve_agent_cwd
+
+        return resolve_agent_cwd()
+    except Exception:
+        return Path.cwd()
+
+
 def evaluate_turn_outcome(
     *,
     skills_used_this_turn: Union[Iterable[str], Mapping[str, Path]] = (),
@@ -200,7 +231,7 @@ def evaluate_turn_outcome(
                 reason=f"infra failure: {exit_reason or 'unknown'}",
             )
 
-        cwd = Path(task_cwd) if task_cwd is not None else Path.cwd()
+        cwd = _resolve_task_cwd(task_cwd)
         run_mode = str(cfg.get("run") or "auto")
 
         # ── Mechanical layer first ──────────────────────────────────────────
@@ -265,6 +296,11 @@ def evaluate_turn_outcome(
             # Down-only: a mechanical FAIL is foreclosed regardless of the eval.
             task_succeeded = False
             confidence = 1.0
+            eval_points = []  # down-only covers attribution too: a mechanical FAIL
+                              # already explains the turn on its own evidence — don't
+                              # let a low-context judge pin extra blame on some other
+                              # skill this turn just because it also ran and nothing
+                              # mechanically checked it.
         elif eval_succeeded is not None:
             task_succeeded = eval_succeeded
             confidence = eval_confidence if eval_confidence is not None else 0.5

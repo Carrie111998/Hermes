@@ -1585,7 +1585,13 @@ def run_curator_review(
                 "needs_review": sum(1 for r in report if r.get("needs_review")),
             }
         except Exception:
-            counts = {"checked": 0, "marked_stale": 0, "archived": 0, "reactivated": 0}
+            counts = {
+                "checked": 0,
+                "marked_stale": 0,
+                "archived": 0,
+                "reactivated": 0,
+                "needs_review": 0,
+            }
     else:
         # Pre-mutation snapshot — best-effort, never blocks the run. A
         # failed snapshot logs at debug and continues (the alternative is
@@ -1611,8 +1617,8 @@ def run_curator_review(
         auto_summary_parts.append(f"{counts['archived']} archived")
     if counts["reactivated"]:
         auto_summary_parts.append(f"{counts['reactivated']} reactivated")
-    if counts["needs_review"]:
-        auto_summary_parts.append(f"{counts['needs_review']} needs review")
+    if counts.get("needs_review", 0):
+        auto_summary_parts.append(f"{counts.get('needs_review', 0)} needs review")
     auto_summary = ", ".join(auto_summary_parts) if auto_summary_parts else "no changes"
 
     # Persist state before the LLM pass so a crash mid-review still records

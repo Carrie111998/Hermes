@@ -920,7 +920,7 @@ def bump_use(
 
     Tracks every skill regardless of provenance.
     """
-# Layer 2 attribution: when a turn has armed the accumulator, remember the
+    # Layer 2 attribution: when a turn has armed the accumulator, remember the
     # skill so finalize_turn can attribute the turn's outcome to it. Pure
     # sidecar bookkeeping — never raises, never mutates context.
     _acc = _turn_skill_accumulator.get()

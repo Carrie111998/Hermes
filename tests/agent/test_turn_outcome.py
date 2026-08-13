@@ -139,6 +139,37 @@ def test_down_only_verifier_fail_wins_over_llm_success(turn_env):
     assert get_record("bad")["recent_outcomes"] == [False]
 
 
+def test_down_only_blocks_eval_blaming_unverified_sibling(turn_env):
+    """Down-only covers attribution too: a mechanical FAIL on skill A forecloses
+    the turn, so the eval's ``failure_points`` must not pin blame on an
+    unrelated, unverified skill B that also ran. Only A gets bump_outcome(False);
+    B's record stays untouched even though the eval named it."""
+    from agent.turn_outcome import evaluate_turn_outcome
+    from tools.skill_usage import get_record, set_verify_enabled
+
+    da = _write_skill_with_verify(
+        turn_env / "skills", "mechfail", _verify_script(False, "verifier says no")
+    )
+    set_verify_enabled("mechfail", True)
+    db = _write_plain_skill(turn_env / "skills", "unverified_sibling")
+
+    outcome = evaluate_turn_outcome(
+        skills_used_this_turn={"mechfail": da, "unverified_sibling": db},
+        outcome_config={"enabled": True},
+        _aux_eval=_eval(
+            task_succeeded=False,
+            confidence=0.9,
+            failure_points=["mechfail", "unverified_sibling"],
+            reason="wrong change committed",
+        ),
+    )
+    assert outcome is not None
+    assert outcome.task_succeeded is False
+    assert outcome.failure_points == ["mechfail"]
+    assert get_record("mechfail")["recent_outcomes"] == [False]
+    assert get_record("unverified_sibling").get("recent_outcomes") == []
+
+
 def test_pass_is_not_success_when_eval_flags_semantics(turn_env):
     """Verifier PASS never confirms success; the eval's semantic fail is recorded.
 
@@ -361,3 +392,38 @@ def test_infra_failure_reports_outcome_without_blaming_a_skill(turn_env):
     assert outcome.failure_points == []
     assert "session_persistence_failed" in outcome.reason
     assert get_record("open").get("recent_outcomes") == []
+
+
+def test_verifier_runs_in_agent_cwd_not_process_cwd(turn_env):
+    """Verifiers run against the agent's working directory — the same resolver
+    the system prompt advertises — not the backend process's cwd. A gateway
+    session pinned to its worktree must verify that tree, or a passing check
+    certifies the wrong directory."""
+    from agent.runtime_cwd import clear_session_cwd, set_session_cwd
+    from agent.turn_outcome import evaluate_turn_outcome
+    from tools.skill_usage import set_verify_enabled
+
+    session_cwd = turn_env.parent / "session-cwd"
+    session_cwd.mkdir()
+    d = _write_skill_with_verify(
+        turn_env / "skills", "cwdcheck", _verify_script(True, "ok")
+    )
+    set_verify_enabled("cwdcheck", True)
+    # Overwrite the script to drop a sentinel into whatever cwd it runs in.
+    (d / "scripts" / "verify.py").write_text(
+        "from pathlib import Path\n"
+        "Path('ran-here').write_text('ran')\n"
+        + _verify_script(True, "ok"),
+        encoding="utf-8",
+    )
+    set_session_cwd(str(session_cwd))
+    try:
+        evaluate_turn_outcome(
+            skills_used_this_turn={"cwdcheck": d},
+            outcome_config={"enabled": True},
+            _aux_eval=_eval(task_succeeded=True, confidence=0.9, failure_points=[], reason="ok"),
+        )
+    finally:
+        clear_session_cwd()
+    assert (session_cwd / "ran-here").exists()
+    assert not (Path.cwd() / "ran-here").exists()
