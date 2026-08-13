@@ -93,7 +93,9 @@ describe('ModelEditSubmenu reports edits without performing them', () => {
     })
 
     expect(screen.queryByRole('switch')).toBeNull()
-    expect(screen.getAllByRole('menuitemradio').map(row => row.textContent)).toEqual(['Low', 'High', 'Max'])
+    const rows = screen.getAllByRole('menuitemradio')
+    expect(rows.map(row => row.textContent)).toEqual(['Low', 'High', 'Max'])
+    expect(rows[0].getAttribute('aria-checked')).toBe('true')
   })
 
   it('thinking: toggling back on restores the row level, not the hardcoded default', () => {

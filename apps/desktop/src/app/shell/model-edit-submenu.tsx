@@ -168,7 +168,7 @@ function ModelEditSubmenuBody({
         <>
           <DropdownMenuSeparator className="mx-0" />
           <DropdownMenuLabel className={dropdownMenuSectionLabel}>{copy.effort}</DropdownMenuLabel>
-          <DropdownMenuRadioGroup onValueChange={value => onSetOptions({ effort: value })} value={effortValue}>
+          <DropdownMenuRadioGroup onValueChange={value => onSetOptions({ effort: value })} value={enabledEffort}>
             {effortValues.map(value => (
               <DropdownMenuRadioItem
                 className={dropdownMenuRow}
