@@ -138,6 +138,57 @@ class GatewayKanbanWatchersMixin:
         self._kanban_dispatcher_lock_handle = None
         _release_singleton_lock(handle)
 
+    def _kanban_assignee_notify_route(
+        self,
+        assignee: Optional[str],
+        platform_str: str,
+    ):
+        """Resolve the configured channel for a task's assigned profile (#84863).
+
+        In multiplex deployments each profile owns a dedicated channel,
+        expressed as a ``gateway.profile_routes`` entry (e.g. a Discord
+        ``chat_id`` routed to profile ``sysadmin``). Kanban notifications
+        must land in THAT profile's channel, not the global/default channel
+        where the task happened to be created.
+
+        Returns the most specific route for ``(platform, profile=assignee)``
+        that declares a ``chat_id``, or ``None`` when the assignee is not a
+        routed profile (unassigned tasks, the default profile, multiplexing
+        off, or no route configured) — callers then keep the subscription's
+        original chat. Routes are pre-sorted most-specific-first by
+        :func:`gateway.profile_routing.parse_profile_routes`, so the first
+        match wins.
+        """
+        if not assignee or str(assignee).strip().lower() in {"", "default"}:
+            return None
+        config = getattr(self, "config", None)
+        if config is None:
+            return None
+        if not getattr(config, "multiplex_profiles", False):
+            return None
+        routes = getattr(config, "profile_routes", None) or []
+        if not routes:
+            return None
+        # config.load() stores parsed ProfileRoute objects; bare runners (and
+        # tests) may carry raw dicts — normalize defensively.
+        if isinstance(routes[0], dict):
+            try:
+                from gateway.profile_routing import parse_profile_routes
+
+                routes = parse_profile_routes(routes)
+            except Exception:
+                return None
+        platform_l = (platform_str or "").lower()
+        assignee_l = str(assignee).strip().lower()
+        for route in routes:
+            if (route.platform or "").lower() != platform_l:
+                continue
+            if (route.profile or "").lower() != assignee_l:
+                continue
+            if route.chat_id:
+                return route
+        return None
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
@@ -559,9 +610,48 @@ class GatewayKanbanWatchersMixin:
                             # so the counter is resolved (reset or bumped) by
                             # the self-post outcome, not by skipping the send.
                             continue
+                        # #84863: route the notification to the ASSIGNED
+                        # profile's configured channel. With multiplexing on,
+                        # each profile's dedicated channel is declared in
+                        # ``gateway.profile_routes``; a task assigned to a
+                        # routed profile must notify that profile's channel,
+                        # not the global/default channel the task was created
+                        # in. Unassigned tasks / unrouted assignees keep the
+                        # subscription's original chat.
+                        send_chat_id = sub["chat_id"]
+                        _assignee = (task.assignee if task else None) or None
+                        _assignee_route = (
+                            self._kanban_assignee_notify_route(
+                                _assignee, platform_str,
+                            )
+                            if _assignee
+                            else None
+                        )
+                        if (
+                            _assignee_route is not None
+                            and _assignee_route.chat_id
+                            and _assignee_route.chat_id != sub["chat_id"]
+                        ):
+                            send_chat_id = _assignee_route.chat_id
+                            logger.info(
+                                "kanban notifier: routing %s event for %s to "
+                                "assigned profile %r channel %s "
+                                "(subscription channel %s)",
+                                kind, sub["task_id"], _assignee,
+                                send_chat_id, sub["chat_id"],
+                            )
+                            # Thread-scoped delivery metadata belongs to the
+                            # original channel; drop it when redirecting (or
+                            # replace it with the route's own thread when the
+                            # route pins one).
+                            if "thread_id" in metadata or _assignee_route.thread_id:
+                                metadata = dict(metadata)
+                                metadata.pop("thread_id", None)
+                                if _assignee_route.thread_id:
+                                    metadata["thread_id"] = _assignee_route.thread_id
                         try:
                             _send_res = await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
+                                send_chat_id, msg, metadata=metadata,
                             )
                             # A SendResult(success=False) without an exception
                             # (returned by push-capable adapters on a genuine
@@ -577,7 +667,7 @@ class GatewayKanbanWatchersMixin:
                                 )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
-                                kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
+                                kind, sub["task_id"], platform_str, send_chat_id, board_slug,
                             )
                             # After delivering the text notification, surface
                             # any artifact paths the worker referenced in
@@ -592,7 +682,7 @@ class GatewayKanbanWatchersMixin:
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,
-                                        chat_id=sub["chat_id"],
+                                        chat_id=send_chat_id,
                                         metadata=metadata,
                                         event_payload=getattr(ev, "payload", None),
                                         task=task,
