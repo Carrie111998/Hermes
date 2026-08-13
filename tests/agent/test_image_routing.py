@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -537,12 +538,19 @@ class TestExtractImageRefs:
         assert urls == []
 
     def test_finds_home_relative_path(self, tmp_path: Path, monkeypatch):
-        # Simulate ~/foo.png by pointing HOME at tmp_path and creating the file
+        # Simulate ~/foo.png by pointing home at tmp_path and creating the file.
+        # HOME alone is not enough: ntpath.expanduser reads USERPROFILE, so on
+        # Windows this test expanded to the real profile and found nothing.
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         img = tmp_path / "foo.png"
         img.write_bytes(_png_bytes())
         paths, urls = extract_image_refs("see ~/foo.png please")
-        assert paths == [str(img)]
+        # expanduser joins with a forward slash even on Windows, so compare
+        # normalised rather than byte-for-byte.
+        assert [os.path.normcase(os.path.normpath(p)) for p in paths] == [
+            os.path.normcase(os.path.normpath(str(img)))
+        ]
         assert urls == []
 
     def test_skips_nonexistent_paths(self, tmp_path: Path):
@@ -846,3 +854,63 @@ class TestFormatCompatibility:
         img_path.write_bytes(b'<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"/>')
         url = _file_to_data_url(img_path)
         assert url is None
+
+
+class TestWindowsAbsolutePaths:
+    r"""The extractor was POSIX-only and therefore inert on Windows.
+
+    `_LOCAL_IMAGE_PATH_RE` anchored on `~/` or `/` and walked forward-slash
+    segments, so a real `C:\Users\...\shot.png` never matched — verified
+    against a file that existed on disk. Hermes runs on Windows, so pasting a
+    screenshot path attached nothing, silently.
+
+    The fix deliberately grants Windows exactly what POSIX already had —
+    ABSOLUTE paths to files that exist — and nothing more. The tests below pin
+    that boundary, because widening a path extractor changes which files get
+    read out of arbitrary user text.
+    """
+
+    def test_finds_a_windows_absolute_path(self, tmp_path: Path):
+        img = tmp_path / "shot.png"
+        img.write_bytes(_png_bytes())
+        win = str(img)
+        paths, urls = extract_image_refs(f"Look at {win} and tell me what is wrong.")
+        assert paths == [win]
+        assert urls == []
+
+    def test_a_windows_path_that_does_not_exist_is_ignored(self, tmp_path: Path):
+        missing = str(tmp_path / "absent.png")
+        assert extract_image_refs(f"see {missing}") == ([], [])
+
+    def test_a_bare_relative_windows_path_is_not_matched(self, tmp_path, monkeypatch):
+        """Relative paths were never reachable on POSIX and must stay unreachable."""
+        img = tmp_path / "rel.png"
+        img.write_bytes(_png_bytes())
+        monkeypatch.chdir(tmp_path)
+        assert extract_image_refs("see rel.png") == ([], [])
+        assert extract_image_refs("see .\rel.png") == ([], [])
+
+    def test_a_windows_path_inside_a_url_is_not_matched(self):
+        body = "https://example.com/C:/Users/x/shot.png"
+        paths, _ = extract_image_refs(body)
+        assert paths == []
+
+    def test_a_windows_path_in_a_code_block_is_ignored(self, tmp_path: Path):
+        img = tmp_path / "fenced.png"
+        img.write_bytes(_png_bytes())
+        body = "```\n" + str(img) + "\n```"
+        assert extract_image_refs(body) == ([], [])
+
+    def test_windows_and_posix_paths_coexist(self, tmp_path: Path):
+        img = tmp_path / "both.png"
+        img.write_bytes(_png_bytes())
+        paths, _ = extract_image_refs(f"{img} and /nonexistent/other.png")
+        assert paths == [str(img)]
+
+    def test_a_forward_slash_windows_path_also_matches(self, tmp_path: Path):
+        """Windows accepts C:/x/y.png too, and callers paste it."""
+        img = tmp_path / "fwd.png"
+        img.write_bytes(_png_bytes())
+        as_fwd = str(img).replace("\\", "/")
+        paths, _ = extract_image_refs(f"see {as_fwd}")
+        assert paths and os.path.normcase(paths[0]) == os.path.normcase(str(img))

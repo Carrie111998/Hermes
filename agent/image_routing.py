@@ -63,10 +63,35 @@ _IMAGE_EXTS = (
 _IMAGE_EXT_PATTERN = "|".join(e.lstrip(".") for e in _IMAGE_EXTS)
 
 # Absolute / home-relative local image path. Matches the same shape gateway's
-# extract_local_files() uses: anchors to ``~/`` or ``/``, ignores matches inside
-# URLs (the ``(?<![/:\w.])`` lookbehind), and case-insensitive on the extension.
+# extract_local_files() uses: anchors to ``~/``, ``/`` or a drive letter,
+# ignores matches inside URLs (the ``(?<![/:\w.])`` lookbehind), and
+# case-insensitive on the extension.
+#
+# The Windows branch was missing until 2026-08-13, which made this function
+# inert on the platform Hermes actually runs on: every absolute path here is
+# ``C:\...``, the pattern only walked forward-slash segments, and a pasted
+# screenshot path silently attached nothing.
+#
+# It grants Windows exactly what POSIX already had — ABSOLUTE paths to files
+# that exist — and deliberately no more. Relative paths stay unreachable on
+# both, because widening a path extractor changes which files get read out of
+# arbitrary user text.
+#
+# The Windows alternative is tried FIRST so that ``C:/Users/x/shot.png`` is
+# consumed whole rather than having the POSIX branch bite at ``/Users/...``.
+# (That sub-match is separately blocked by the lookbehind, since the character
+# before the slash is ``:`` — but relying on ordering as well keeps the two
+# defences independent.)
+_WINDOWS_ABS_PATH = r"[A-Za-z]:[\\/](?:[\w.\-]+[\\/])*[\w.\-]+"
+_POSIX_ABS_PATH = r"(?:~/|/)(?:[\w.\-]+/)*[\w.\-]+"
 _LOCAL_IMAGE_PATH_RE = re.compile(
-    r"(?<![/:\w.])(?:~/|/)(?:[\w.\-]+/)*[\w.\-]+\.(?:" + _IMAGE_EXT_PATTERN + r")\b",
+    r"(?<![/:\w.])(?:"
+    + _WINDOWS_ABS_PATH
+    + r"|"
+    + _POSIX_ABS_PATH
+    + r")\.(?:"
+    + _IMAGE_EXT_PATTERN
+    + r")\b",
     re.IGNORECASE,
 )
 
