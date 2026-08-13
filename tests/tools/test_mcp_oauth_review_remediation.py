@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import threading
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -12,6 +13,34 @@ import pytest
 
 
 pytest.importorskip("mcp.client.auth.oauth2", reason="MCP SDK OAuth support required")
+
+
+def test_callback_skip_completed_at_deadline_wins_over_timeout(monkeypatch):
+    """Final arbitration observes an already-started delayed paste reader."""
+    import tools.mcp_oauth as mod
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    monkeypatch.setattr(mod, "_is_interactive", lambda: True)
+    reader_started = threading.Event()
+    release_reader = threading.Event()
+
+    def delayed_reader(result, _stop_event):
+        reader_started.set()
+        release_reader.wait()
+        result["error"] = mod._USER_SKIPPED_SENTINEL
+
+    monkeypatch.setattr(mod, "_paste_callback_reader", delayed_reader)
+
+    async def expire_after_reader_starts(_seconds):
+        assert reader_started.wait(1.0)
+        release_reader.set()
+
+    monkeypatch.setattr(mod.asyncio, "sleep", expire_after_reader_starts)
+    with pytest.raises(mod.OAuthNonInteractiveError, match="user_skipped"):
+        asyncio.run(mod._make_callback_waiter(port, timeout=0.5)())
 
 
 async def _noop_redirect(_url: str) -> None:

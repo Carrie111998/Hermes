@@ -946,6 +946,7 @@ def _make_callback_waiter(port: int, timeout: float = 300.0):
         # whichever fills it first wins.
         paste_thread: threading.Thread | None = None
         paste_stop = threading.Event()
+        paste_done = threading.Event()
         if _is_interactive():
             print(
                 "\n  Or paste the redirect URL here (or the ``?code=...&state=...`` "
@@ -954,9 +955,14 @@ def _make_callback_waiter(port: int, timeout: float = 300.0):
                 file=sys.stderr,
                 flush=True,
             )
-            paste_thread = threading.Thread(
-                target=_paste_callback_reader, args=(result, paste_stop), daemon=False
-            )
+
+            def _run_paste_reader() -> None:
+                try:
+                    _paste_callback_reader(result, paste_stop)
+                finally:
+                    paste_done.set()
+
+            paste_thread = threading.Thread(target=_run_paste_reader, daemon=False)
             paste_thread.start()
 
         callback_timeout = max(0.0, float(timeout))
@@ -979,6 +985,13 @@ def _make_callback_waiter(port: int, timeout: float = 300.0):
             server_thread.join(timeout=2.0)
             if server_thread.is_alive():
                 raise RuntimeError("OAuth callback listener did not terminate")
+            if paste_thread is not None and not paste_done.is_set():
+                # The timeout loop may advance faster than the OS can schedule
+                # the already-started paste reader (especially in tests or on a
+                # saturated runner). Give an immediately available stdin value
+                # one bounded final arbitration window before cancellation so
+                # a completed ``skip`` cannot be misreported as a timeout.
+                paste_done.wait(0.1)
             paste_stop.set()
             if paste_thread is not None:
                 # The reader is restricted to stop-aware polling below.  A
