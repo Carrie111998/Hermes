@@ -331,6 +331,51 @@ def test_remote_scan_failure_merges_instead_of_replacing_cache(tmp_path, monkeyp
     assert seed in joined
 
 
+def test_remote_scan_missing_root_does_not_wipe_cache(tmp_path):
+    """A configured discovery root missing on disk must NOT wipe the cache.
+
+    ``os.walk`` on a non-existent root silently yields nothing instead of
+    raising, so a temporarily unavailable root (unmounted volume, moved path)
+    would otherwise make the scan look like a genuinely empty authoritative
+    set and DELETE-replace every cached repo that lived under it. The missing
+    root must contribute nothing, and the scan must merge — never wipe.
+    """
+    from hermes_cli import projects_db as pdb
+    import tui_gateway.server as server
+
+    def _git_repo(path):
+        repo = path
+        repo.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        return str(repo)
+
+    # A cached repo the scan never visits, parked OUTSIDE the scan roots.
+    seed = _git_repo(tmp_path / "elsewhere" / "seed-repo")
+    with pdb.connect_closing() as conn:
+        pdb.record_discovered_repos(conn, [(seed, "seed-repo")])
+        seeded = [r["root"] for r in pdb.list_discovered_repos(conn)]
+    assert seed in seeded
+
+    good = _git_repo(tmp_path / "good-repo")
+
+    # This root is configured but does NOT exist on disk. os.walk on it yields
+    # nothing silently — without the guard the scan would stay authoritative
+    # and wipe the cache.
+    missing_root = str(tmp_path / "missing-root")
+
+    policy = {"enabled": True, "roots": [good, missing_root], "exclude_paths": []}
+
+    with pdb.connect_closing() as conn:
+        authoritative = server._scan_discovered_repos_remote(conn, policy)
+        joined = [r["root"] for r in pdb.list_discovered_repos(conn)]
+
+    # The missing root is not authoritative, so the scan must merge, not wipe.
+    assert not authoritative
+    assert good in joined
+    # The seeded repo the missing root would have wiped is still cached.
+    assert seed in joined
+
+
 def test_remote_scan_full_authoritative_replaces_cache(tmp_path):
     """Only a fully-walked scan may replace the stale cache."""
     from hermes_cli import projects_db as pdb

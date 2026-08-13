@@ -11634,6 +11634,16 @@ def _scan_discovered_repos_remote(conn, policy: dict) -> bool:
         return any(path == ex or path.startswith(ex.rstrip("/\\") + os.sep) for ex in excludes if ex)
 
     for root in roots:
+        if not os.path.isdir(root):
+            # `os.walk` on a missing root silently yields nothing instead of
+            # raising, so a temporarily unavailable root (unmounted volume,
+            # moved path) would otherwise look like a genuinely empty scan and
+            # let `authoritative` stay True — letting the replace wipe every
+            # cached repo that lived under the missing root. A missing root
+            # contributes nothing and must not be treated as authoritative.
+            authoritative = False
+            logger.debug("discover_repos scan root missing, skipping: %s", root)
+            continue
         try:
             for dirpath, dirnames, _filenames in os.walk(root):
                 if _is_excluded(dirpath):
