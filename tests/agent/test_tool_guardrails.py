@@ -240,3 +240,63 @@ def test_no_progress_streak_survives_turn_boundary_until_real_work_lands():
         failed=False,
     )
     assert controller.before_call("todo", args).action == "allow"
+
+
+# ── Arg jitter + duplicate-stub hashing ────────────────────────────────────
+#
+# Signature counting (bcb9e0374) closes the result-hash hole, but the signature
+# is still derived from canonical args -- so jittering an irrelevant field
+# mints a fresh signature and restarts the streak at 1. Observed live on
+# ``todo``: alternating ``merge`` while re-asserting a byte-identical list.
+
+
+_DUPLICATE_STUB = "[Duplicate tool output — same content as a more recent call]"
+
+
+def test_cosmetic_todo_jitter_does_not_mint_a_fresh_signature():
+    items = [
+        {"id": "1", "content": "convert skill", "status": "completed"},
+        {"id": "2", "content": "open PR", "status": "pending"},
+    ]
+    a = {"todos": items, "merge": True}
+    b = {"todos": list(reversed(items)), "merge": False}
+
+    assert canonical_tool_args(a) == canonical_tool_args(b)
+    assert ToolCallSignature.from_call("todo", a) == ToolCallSignature.from_call("todo", b)
+
+
+def test_jittered_todo_payloads_still_reach_the_no_progress_block():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=3,
+        )
+    )
+    items = [{"id": "1", "content": "convert skill", "status": "pending"}]
+
+    for i in range(3):
+        # Flip an irrelevant field every call; the asserted end state is identical.
+        args = {"todos": items, "merge": bool(i % 2)}
+        assert controller.before_call("todo", args).action == "allow"
+        controller.after_call("todo", args, "same-list", failed=False)
+
+    blocked = controller.before_call("todo", {"todos": items, "merge": True})
+    assert blocked.action == "block"
+    assert blocked.code == "no_progress_block"
+
+
+def test_non_declarative_args_are_untouched_by_normalization():
+    # Normalization must not collapse genuinely different calls.
+    a = {"path": "/tmp/a", "content": "x"}
+    b = {"path": "/tmp/b", "content": "x"}
+    assert canonical_tool_args(a) != canonical_tool_args(b)
+    # A todos payload that is not a list is passed through unchanged.
+    assert canonical_tool_args({"todos": "not-a-list"}) == canonical_tool_args({"todos": "not-a-list"})
+
+
+def test_duplicate_stub_hashes_to_a_stable_sentinel():
+    from agent.tool_guardrails import _result_hash
+
+    assert _result_hash(_DUPLICATE_STUB) == _result_hash(f"  {_DUPLICATE_STUB} trailing text")
+    assert _result_hash(_DUPLICATE_STUB) != _result_hash('{"todos":[]}')

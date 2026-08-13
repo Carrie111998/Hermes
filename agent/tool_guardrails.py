@@ -17,6 +17,15 @@ from utils import safe_json_loads
 from agent.tool_result_classification import file_mutation_result_landed
 
 
+# Prefix the context compressor writes over an older duplicate tool result
+# (agent/context_compressor.py). Prefix match because it appends explanatory
+# text after the marker.
+_DUPLICATE_OUTPUT_MARKER = "[Duplicate tool output"
+# Stable stand-in hash for any duplicate-stub body, so a stubbed repeat keys to
+# the same bucket as the body it replaced.
+_DUPLICATE_RESULT_SENTINEL = "duplicate-tool-output-stub"
+
+
 IDEMPOTENT_TOOL_NAMES = frozenset(
     {
         "read_file",
@@ -227,12 +236,51 @@ def canonical_tool_args(args: Mapping[str, Any]) -> str:
     if not isinstance(args, Mapping):
         raise TypeError(f"tool args must be a mapping, got {type(args).__name__}")
     return json.dumps(
-        args,
+        _normalize_declarative_args(args),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
         default=str,
     )
+
+
+def _normalize_declarative_args(args: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Collapse cosmetic variation in declarative payloads.
+
+    Counting identical *signatures* closes the result-hash hole, but the
+    signature itself is still derived from canonical args -- so a loop can mint
+    a fresh signature every iteration by jittering one irrelevant field, and
+    the streak restarts at 1. Observed live: alternating ``merge: true`` /
+    ``merge: false`` on ``todo`` while re-asserting a byte-identical list.
+
+    Some tools take a *desired end state* rather than an operation. For those
+    the world effect is the state, so two calls asserting the same state are
+    the same call. Only ``todo`` is normalized today: item order carries no
+    meaning for repeat-detection purposes, and ``merge`` only selects how the
+    same target list is reached.
+    """
+    todos = args.get("todos")
+    if not isinstance(todos, list) or not todos:
+        return args
+
+    normalized_items: list[Any] = []
+    for item in todos:
+        if isinstance(item, Mapping):
+            normalized_items.append(
+                json.dumps(
+                    {k: item[k] for k in sorted(item) if k != "merge"},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                )
+            )
+        else:
+            normalized_items.append(str(item))
+
+    normalized = {k: v for k, v in args.items() if k not in {"todos", "merge"}}
+    normalized["todos"] = sorted(normalized_items)
+    return normalized
 
 
 def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]:
@@ -582,6 +630,13 @@ def _coerce_args(args: Mapping[str, Any] | None) -> Mapping[str, Any]:
 
 
 def _result_hash(result: str | None) -> str:
+    # The context compressor rewrites an older duplicate tool body to a fixed
+    # "[Duplicate tool output ...]" marker. Signature counting already stops
+    # the loop this masks, but the stored hash is still used to describe the
+    # streak, so collapse the stub to a stable sentinel rather than letting a
+    # rewritten body look like a genuinely new result.
+    if result is not None and result.lstrip().startswith(_DUPLICATE_OUTPUT_MARKER):
+        return _DUPLICATE_RESULT_SENTINEL
     parsed = safe_json_loads(result or "")
     if parsed is not None:
         try:
