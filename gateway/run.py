@@ -613,6 +613,48 @@ def _redact_gateway_user_facing_secrets(text: str) -> str:
     return redacted
 
 
+def _redact_tool_progress_args(args: Any) -> Any:
+    """Redact credential-shaped values from tool-call args before chat display.
+
+    The gateway's tool-progress bubble is an egress boundary (it renders
+    verbatim tool-call arguments into the chat on Discord/Telegram/etc.), so
+    a secret that slips into any tool argument (e.g. ``mem0_search(query=
+    \"sk-...\")`` or a ``terminal`` command echoing an API key) must be masked
+    before it can reach any render path (verbose JSON dump, human preview, or
+    terminal code block). Uses the same ``redact_sensitive_text(force=True)``
+    primitive as the outbound response redaction, so the echo is redacted even
+    when the operator has the global ``security.redact_secrets`` toggle off.
+
+    Recursively walks nested dicts and lists so a credential at any depth
+    (e.g. ``headers: {\"Authorization\": ...}``) is redacted, not just
+    top-level string values. Dict keys are never touched; non-string,
+    non-container values (ints, floats, bools, None) pass through unchanged.
+    Fail-soft: if ``redact_sensitive_text`` itself throws (raises an
+    exception) for any value, the original args are returned unchanged so a
+    progress bubble is never broken by a redactor error.
+    """
+    def _walk(value: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                return redact_sensitive_text(value, force=True)
+            except Exception:
+                return value
+        if isinstance(value, dict):
+            return {k: _walk(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_walk(v) for v in value]
+        return value
+
+    if not isinstance(args, dict) or not args:
+        return args
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return _walk(args)
+    except Exception:
+        return args
+
+
 def _redact_approval_command(cmd: "str | None") -> str:
     """Redact credentials from a command before it goes into an approval prompt.
 
@@ -3935,6 +3977,16 @@ class TurnRunner:
         if ctx.progress_mode == "new" and tool_name == ctx.last_tool[0]:
             return
         ctx.last_tool[0] = tool_name
+
+        # Redact credential-shaped values from tool-call args BEFORE they can
+        # reach any chat-rendered surface (verbatim JSON dump in verbose
+        # mode, human preview, or terminal command block).  The progress
+        # bubble is an egress boundary, the same class as the gateway's
+        # outbound response redaction, so secrets must never render even
+        # when the operator has the global logging toggle off.  Redact the
+        # args dict once, up front, so every render path below sees the
+        # sanitized copy.
+        args = _redact_tool_progress_args(args)
 
         # Build progress message with primary argument preview
         from agent.display import get_tool_emoji
