@@ -1034,14 +1034,25 @@ Duplicate delivery across gateways is prevented by the atomic per-event claim
 in the board DB. No relays, credential sharing, or extra dispatchers are
 needed — each profile gateway simply delivers through its own adapters.
 
-Push-capable platform adapters receive Kanban terminal wakes as internal
-`MessageEvent` objects. In addition to the localized wake text, adapters can
-identify these events through `event.metadata["hermes_kanban_wake"]`, a
-versioned envelope containing only `board`, `task_id`, deterministically ordered
-`event_kinds`, and the claimed event `cursor`. Delivery metadata, event payloads,
-task content, and profile details are intentionally excluded. Stateless API
-self-post wakes keep their existing request shape and do not receive this
-adapter-only metadata.
+Push-capable platform adapters receive structured identity on both Kanban
+terminal delivery planes. Each direct, user-visible `send()` merges the
+subscription's existing chat/thread routing fields with a separate
+`metadata["hermes_kanban_notification"]` envelope. Version 1 contains only
+`board`, `task_id`, that notification's `event_kind`, and the claimed batch
+`cursor`. The later internal `MessageEvent` wake carries
+`event.metadata["hermes_kanban_wake"]`; version 1 contains only `board`,
+`task_id`, deterministically ordered aggregate `event_kinds`, and the same
+claimed `cursor`.
+
+These names are intentionally distinct: a direct notification represents one
+visible event, while a synthetic wake can aggregate several claimed events.
+Both envelopes are privacy allowlists. Task content, summaries/results/reasons,
+arbitrary event payloads, assignee/profile names, paths, credentials, secrets,
+and subscription delivery metadata are excluded from the envelopes. Existing
+routing metadata remains alongside (not inside) the notification envelope and
+is not mutated. Localized visible text and ordinary adapter sends remain
+unchanged. Stateless API self-post wakes keep their existing request shape and
+receive neither adapter-only envelope.
 
 ## Runs — one row per attempt
 

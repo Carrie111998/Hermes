@@ -146,6 +146,13 @@ def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, m
         "telegram_dm_topic_reply_fallback": True,
         "telegram_reply_to_message_id": "462",
         "thread_id": "20197",
+        "hermes_kanban_notification": {
+            "version": 1,
+            "board": "default",
+            "task_id": tid,
+            "event_kind": "completed",
+            "cursor": adapter.handled[0].metadata["hermes_kanban_wake"]["cursor"],
+        },
     }
     assert len(adapter.handled) == 1
     assert adapter.handled[0].source.chat_type == "dm"
@@ -434,6 +441,16 @@ def test_notifier_wake_exposes_terminal_event_identity(
     adapter = RecordingAdapter()
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
 
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["metadata"] == {
+        "hermes_kanban_notification": {
+            "version": 1,
+            "board": "default",
+            "task_id": task_id,
+            "event_kind": event_kind,
+            "cursor": cursor,
+        }
+    }
     assert len(adapter.handled) == 1
     assert adapter.handled[0].metadata == {
         "hermes_kanban_wake": {
@@ -467,6 +484,19 @@ def test_notifier_wake_metadata_is_ordered_and_privacy_bounded(
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
 
     assert len(adapter.handled) == 1
+    assert [
+        item["metadata"]["hermes_kanban_notification"]
+        for item in adapter.sent
+    ] == [
+        {
+            "version": 1,
+            "board": "default",
+            "task_id": task_id,
+            "event_kind": kind,
+            "cursor": cursor,
+        }
+        for kind in ["timed_out", "completed", "blocked", "crashed", "gave_up"]
+    ]
     assert adapter.handled[0].metadata == {
         "hermes_kanban_wake": {
             "version": 1,
@@ -489,6 +519,122 @@ def test_notifier_wake_metadata_is_ordered_and_privacy_bounded(
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
     assert len(adapter.sent) == 5
     assert len(adapter.handled) == 1
+
+
+class FailOnceRecordingAdapter(RecordingAdapter):
+    def __init__(self):
+        super().__init__()
+        self.attempted_metadata = []
+
+    async def send(self, chat_id, text, metadata=None):
+        import copy
+
+        self.attempted_metadata.append(copy.deepcopy(metadata or {}))
+        if len(self.attempted_metadata) == 1:
+            raise RuntimeError("simulated transient failure")
+        await super().send(chat_id, text, metadata=metadata)
+
+
+def test_notifier_retry_preserves_notification_identity_without_duplicates(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "retry-identity.db"))
+    kb.init_db()
+    task_id, cursor = _create_wake_subscription(
+        ["blocked"],
+        payload={"reason": "visible reason", "secret": "must-not-leak"},
+    )
+
+    adapter = FailOnceRecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert adapter.sent == []
+    assert adapter.handled == []
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    expected = {
+        "hermes_kanban_notification": {
+            "version": 1,
+            "board": "default",
+            "task_id": task_id,
+            "event_kind": "blocked",
+            "cursor": cursor,
+        }
+    }
+    assert adapter.attempted_metadata == [expected, expected]
+    assert [item["metadata"] for item in adapter.sent] == [expected]
+    assert len(adapter.handled) == 1
+
+    # A successful cursor advance is the exact-once boundary for both planes.
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert adapter.attempted_metadata == [expected, expected]
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+
+
+def test_notifier_does_not_mutate_stored_subscription_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "metadata-copy.db"))
+    kb.init_db()
+    original = {
+        "chat_type": "dm",
+        "thread_id": "thread-7",
+        "delivery_secret": "routing-value",
+    }
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="copy metadata", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="thread-7",
+            delivery_metadata=original,
+        )
+        kb._append_event(
+            conn,
+            task_id,
+            kind="crashed",
+            payload={
+                "summary": "must-not-leak",
+                "result": "must-not-leak",
+                "reason": "must-not-leak",
+                "assignee": "private-profile",
+                "workspace": "/private/worktree",
+                "api_token": "must-not-leak",
+            },
+        )
+        cursor = kb.list_events(conn, task_id)[-1].id
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert original == {
+        "chat_type": "dm",
+        "thread_id": "thread-7",
+        "delivery_secret": "routing-value",
+    }
+    assert adapter.sent[0]["metadata"] == {
+        **original,
+        "hermes_kanban_notification": {
+            "version": 1,
+            "board": "default",
+            "task_id": task_id,
+            "event_kind": "crashed",
+            "cursor": cursor,
+        },
+    }
+    conn = kb.connect()
+    try:
+        stored = kb.list_notify_subs(conn, task_id)[0]["delivery_metadata"]
+    finally:
+        conn.close()
+    assert stored == original
 
 
 def _unseen_terminal_events_for(tid, chat_id):

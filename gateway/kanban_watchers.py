@@ -532,6 +532,20 @@ class GatewayKanbanWatchersMixin:
                         )
                         if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+                        # Preserve subscription routing metadata while adding
+                        # a separate, privacy-bounded identity contract for
+                        # this specific user-visible notification. Build a new
+                        # nested mapping for every event: callers can reconcile
+                        # retries from the claimed cursor without parsing the
+                        # localized text, and neither the stored subscription
+                        # dict nor arbitrary event/task data is exposed.
+                        metadata["hermes_kanban_notification"] = {
+                            "version": 1,
+                            "board": board_slug,
+                            "task_id": sub["task_id"],
+                            "event_kind": kind,
+                            "cursor": d["cursor"],
+                        }
                         # Adapters with no push channel (the API server —
                         # ``supports_async_delivery = False``) can NEVER
                         # satisfy a text-send: ``send()`` always reports
