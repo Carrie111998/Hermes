@@ -187,6 +187,15 @@ export function spawnUpdaterProcess(
     ? deps.spawnProcess(updater, updaterArgs, spawnOptions)
     : spawn(updater, updaterArgs, spawnOptions)
 
+  // A failed spawn emits 'error' asynchronously; with no listener it becomes
+  // an uncaught exception and takes the whole app down with no trace (most
+  // call sites use stdio: 'ignore'). Log it instead so an update surfaces as
+  // a logged failure, not a silent quit. Optional-chained for test mocks
+  // that may not be EventEmitters.
+  child.on?.('error', err => {
+    console.error(`[updates] updater spawn failed: ${err.message}`)
+  })
+
   child.unref()
 
   return child
