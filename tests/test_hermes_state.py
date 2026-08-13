@@ -3,6 +3,7 @@
 import sqlite3
 import time
 import json
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -115,7 +116,7 @@ class TestConnectionLifecycle:
 
         assert not any("wal_checkpoint" in sql.lower() for sql in executed)
 
-    def test_writable_close_retains_truncate_checkpoint(self, tmp_path):
+    def test_writable_close_uses_passive_checkpoint(self, tmp_path):
         db_path = tmp_path / "state.db"
         writable = SessionDB(db_path=db_path)
         executed = []
@@ -123,8 +124,15 @@ class TestConnectionLifecycle:
 
         writable.close()
 
-        assert any(
+        # close() must NOT TRUNCATE: transient per-cron-run connections firing
+        # full WAL resets race the gateway's live writer and corrupt B-tree
+        # pages (issue #45383). It uses PASSIVE instead.
+        assert not any(
             "pragma wal_checkpoint(truncate)" == " ".join(sql.lower().split())
+            for sql in executed
+        )
+        assert any(
+            "pragma wal_checkpoint(passive)" == " ".join(sql.lower().split())
             for sql in executed
         )
 
@@ -2281,6 +2289,45 @@ class TestVacuum:
         assert vacuum_calls == [True, True]
         assert db.get_meta("last_vacuum") is not None
 
+    def test_wal_size_limit_is_bounded(self, db):
+        """journal_size_limit must be a finite bound, not SQLite's -1 default.
+
+        Contract, not a snapshot: assert the limit is positive (so the WAL is
+        truncated back at checkpoints) rather than pinning the exact byte
+        count, which is a tunable.
+        """
+        mode = db._conn.execute("PRAGMA journal_mode").fetchone()[0]
+        if str(mode).lower() != "wal":
+            pytest.skip("WAL unavailable on this filesystem")
+        limit = db._conn.execute("PRAGMA journal_size_limit").fetchone()[0]
+        assert limit > 0, "unbounded WAL: state.db-wal never returns disk to the OS"
+
+    def test_vacuum_leaves_wal_truncated(self, db, tmp_path):
+        """VACUUM must not strand a giant WAL beside the database.
+
+        VACUUM rewrites every page through the write-ahead log. Without a
+        checkpoint *after* it, a 3 GB database leaves a 3 GB state.db-wal
+        behind — `sessions optimize` then consumes far more disk than it
+        frees, which is the opposite of its purpose.
+        """
+        mode = db._conn.execute("PRAGMA journal_mode").fetchone()[0]
+        if str(mode).lower() != "wal":
+            pytest.skip("WAL unavailable on this filesystem")
+
+        db.create_session(session_id="s1", source="cli")
+        for i in range(500):
+            db.append_message(
+                session_id="s1", role="user", content=f"padding message {i} " * 20
+            )
+        db.vacuum()
+
+        wal = Path(str(db.db_path) + "-wal")
+        if wal.exists():
+            limit = db._conn.execute("PRAGMA journal_size_limit").fetchone()[0]
+            assert wal.stat().st_size <= max(limit, 0) or wal.stat().st_size == 0, (
+                f"WAL left at {wal.stat().st_size} bytes after VACUUM"
+            )
+
 
 class TestOptimizeFts:
     def test_optimize_returns_index_count(self, db):
@@ -3494,6 +3541,41 @@ def test_gateway_session_peer_round_trip_and_recovery(db):
         chat_type="dm",
     )
     assert recovered["id"] == "gw-session"
+
+
+@pytest.mark.parametrize(
+    "persisted_session_key",
+    ["agent:main:telegram:dm:chat-1", None],
+    ids=["exact-key", "peer-fallback"],
+)
+def test_gateway_session_recovery_does_not_cross_newer_reset_boundary(
+    db, persisted_session_key
+):
+    """A newer session_reset row fences recovery for the peer (#68539).
+
+    Recovery must never reach *behind* an intentional /new boundary and
+    resurrect an older still-open row — if the newest boundary row for the
+    peer is reset-ended, recovery returns nothing.
+    """
+    peer = {
+        "user_id": "user-1",
+        "session_key": persisted_session_key,
+        "chat_id": "chat-1",
+        "chat_type": "dm",
+    }
+    db.create_session("gw-before-reset", "telegram", **peer)
+    db.append_message("gw-before-reset", "user", "old context")
+    db.create_session("gw-reset", "telegram", **peer)
+    db.append_message("gw-reset", "user", "/new")
+    db.end_session("gw-reset", "session_reset")
+
+    assert db.find_latest_gateway_session_for_peer(
+        source="telegram",
+        user_id="user-1",
+        session_key="agent:main:telegram:dm:chat-1",
+        chat_id="chat-1",
+        chat_type="dm",
+    ) is None
 
 
 
