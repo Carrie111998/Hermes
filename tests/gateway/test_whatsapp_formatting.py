@@ -130,6 +130,76 @@ class TestMessageLimits:
 
 
 # ---------------------------------------------------------------------------
+# edit_message() formatting tests (#80061)
+# ---------------------------------------------------------------------------
+
+def _edit_adapter():
+    """Adapter wired so edit_message reaches the bridge POST."""
+    adapter = _make_adapter()
+    adapter._running = True
+    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+    resp = MagicMock(status=200)
+    resp.json = AsyncMock(return_value={"messageId": "msg1"})
+    adapter._http_session.post = MagicMock(return_value=_AsyncCM(resp))
+    return adapter
+
+
+def _posted_message(adapter):
+    return adapter._http_session.post.call_args.kwargs["json"]["message"]
+
+
+class TestEditMessageFormatting:
+    """Streaming replies are delivered as edits, so edits must format too.
+
+    ``send()`` converts markdown to WhatsApp syntax before posting; before
+    #80061 ``edit_message`` posted the raw model output, so every progressive
+    frame of a streamed reply showed literal ``**asterisks`` until (and unless)
+    a plain send happened to replace it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_edit_converts_markdown_to_whatsapp_syntax(self):
+        adapter = _edit_adapter()
+
+        result = await adapter.edit_message("chat1", "msg1", "**bold** and *italic*")
+
+        assert result.success
+        assert _posted_message(adapter) == "*bold* and _italic_"
+
+    @pytest.mark.asyncio
+    async def test_edit_matches_send_formatting_exactly(self):
+        """The two paths must not disagree, or a streamed reply changes
+        appearance the moment it is finalized by a send."""
+        raw = "# Title\n**bold** `code` ~~struck~~"
+        adapter = _edit_adapter()
+
+        await adapter.edit_message("chat1", "msg1", raw)
+        edited = _posted_message(adapter)
+
+        assert edited == adapter.format_message(raw)
+
+    @pytest.mark.asyncio
+    async def test_edit_preserves_code_fences(self):
+        """Fenced blocks are protected by format_message and must survive."""
+        adapter = _edit_adapter()
+        raw = "before\n```\n**not bold**\n```\nafter"
+
+        await adapter.edit_message("chat1", "msg1", raw)
+
+        assert "```\n**not bold**\n```" in _posted_message(adapter)
+
+    @pytest.mark.asyncio
+    async def test_edit_does_not_double_convert(self):
+        """format_message is not idempotent (*x* -> _x_), so the adapter must
+        format exactly once. Text already in WhatsApp italic stays italic."""
+        adapter = _edit_adapter()
+
+        await adapter.edit_message("chat1", "msg1", "_italic_")
+
+        assert _posted_message(adapter) == "_italic_"
+
+
+# ---------------------------------------------------------------------------
 # send() chunking tests
 # ---------------------------------------------------------------------------
 
