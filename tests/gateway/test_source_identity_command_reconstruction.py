@@ -80,7 +80,7 @@ async def test_steer_reconstruction_preserves_ambiguous_source_metadata(state):
 class _GoalSessionStore:
     entry = SimpleNamespace(session_id="source-identity-goal-session")
 
-    def get_or_create_session(self, source):
+    def get_or_create_session(self, source, *, touch_activity=True):
         return self.entry
 
     def _generate_session_key(self, source):
@@ -102,6 +102,7 @@ async def test_goal_kickoff_preserves_ambiguous_source_metadata(tmp_path, monkey
     )
     runner.session_store = _GoalSessionStore()
     runner.adapters = {Platform.DISCORD: object()}
+    runner._session_key_for_source = lambda source: "agent:main:discord:dm:chat-1"
     captured = []
     runner._enqueue_fifo = lambda _key, event, _adapter: captured.append(event)
 
