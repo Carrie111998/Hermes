@@ -246,6 +246,18 @@ def test_dashboard_markdown_html_is_sanitized_before_render():
     assert "dangerouslySetInnerHTML: { __html: renderMarkdown(props.source || \"\") }" not in js
 
 
+def test_dashboard_submits_explicit_scratch_workspace_kind():
+    """The UI must not collapse explicit scratch into an omitted workspace."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text(encoding="utf-8")
+
+    assert 'if (workspaceKind) {' in js
+    assert 'body.workspace_kind = workspaceKind;' in js
+    assert 'if (workspaceKind && workspaceKind !== "scratch") {' not in js
+
+
 # ---------------------------------------------------------------------------
 # GET /tasks/:id returns body + comments + events + links
 # ---------------------------------------------------------------------------
