@@ -23,6 +23,7 @@ import base64
 import json
 import sys
 import time
+from urllib.parse import parse_qsl, urlsplit
 
 from playwright.sync_api import sync_playwright
 
@@ -64,7 +65,12 @@ def _har_entry(req, resp):
             "method": req.method,
             "url": req.url,
             "headers": [{"name": k, "value": v} for k, v in req.headers.items()],
-            "queryString": [],  # har_to_client.py re-parses the URL, so leave empty
+            "queryString": [
+                {"name": name, "value": value}
+                for name, value in parse_qsl(
+                    urlsplit(req.url).query, keep_blank_values=True
+                )
+            ],
             "postData": {"mimeType": req.headers.get("content-type", ""),
                          "text": post} if post else {},
         },
