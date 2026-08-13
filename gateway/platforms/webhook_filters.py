@@ -236,7 +236,7 @@ class WebhookRouteProcessor:
         """Run a route script and return its outcome and transformed payload."""
         path, error = _resolve_script_path(script_value)
         if error or path is None:
-            logger.warning("[webhook] script ignored webhook: %s", error)
+            logger.warning("[webhook] script execution failed: %s", error)
             return "failed", None
 
         suffix = path.suffix.lower()
@@ -245,7 +245,7 @@ class WebhookRouteProcessor:
                 "/bin/bash" if os.path.isfile("/bin/bash") else None
             )
             if bash is None:
-                logger.warning("[webhook] script ignored webhook: bash not found")
+                logger.warning("[webhook] script execution failed: bash not found")
                 return "failed", None
             argv = [bash, str(path)]
         else:
@@ -288,7 +288,7 @@ class WebhookRouteProcessor:
             stderr = "[REDACTED - redaction failed]"
         if result.returncode != 0:
             logger.info(
-                "[webhook] script ignored webhook path=%s code=%s stderr=%s",
+                "[webhook] script execution failed path=%s code=%s stderr=%s",
                 path.name,
                 result.returncode,
                 stderr[:200],
