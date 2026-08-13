@@ -3016,12 +3016,16 @@ async function applyUpdates(opts = {}) {
           HERMES_HOME,
           PATH: pathWithHermesManagedNode(venvBin)
         },
-        // Windows: DO NOT use detached:true here. Node's detached on Windows
-        // spawns with DETACHED_PROCESS + NULL stdio, and PowerShell 5.1 then
-        // exits(0) immediately WITHOUT executing the -File script (silent
-        // no-op — no hand-off log, no update, marker left to expire). The
-        // child survives the parent's exit without detached on Windows
-        // anyway; POSIX keeps detached for the bash/other updaters.
+        // Windows: DO NOT use detached:true here — Node's detached on
+        // Windows spawns with DETACHED_PROCESS + NULL stdio and PowerShell
+        // 5.1 then exits(0) immediately WITHOUT executing the -File script
+        // (silent no-op — no hand-off log, no update, marker left to
+        // expire). A plain child would ALSO die with us: the Chromium Job
+        // Object reaps it when the main process exits (kill-on-close).
+        // spawnUpdaterProcess re-shapes the Windows hand-off into
+        // `cmd /c start /min` (see updater-process.ts), which creates a
+        // fresh console process outside the Job that outlives this exit.
+        // POSIX keeps detached for the bash/other updaters.
         ...(IS_WINDOWS ? {} : { detached: true }),
         stdio: 'ignore'
       })
