@@ -113,6 +113,27 @@ class TestBindSessionContext:
         srv._set_session_context("no-such-key")
         assert desktop_connection_mode() is None
 
+    def test_explicit_mode_wins_for_ephemeral_ids(self, monkeypatch):
+        """bg_*/preview_* task IDs aren't session keys; the caller-supplied
+        parent mode must bind instead of the (empty) lookup result."""
+        from gateway.session_context import desktop_connection_mode
+
+        srv = _srv()
+        monkeypatch.setattr(srv, "_sessions", {}, raising=False)
+        srv._set_session_context("bg_abc123", connection_mode="remote")
+        assert desktop_connection_mode() == "remote"
+
+    def test_explicit_none_is_not_second_guessed(self, monkeypatch):
+        """An explicit None ('parent has no Desktop mode') must not be
+        overridden by a coincidental session-map hit."""
+        from gateway.session_context import desktop_connection_mode
+
+        srv = _srv()
+        session = _desktop_session(connection_mode="remote")
+        monkeypatch.setattr(srv, "_sessions", {"s1": session}, raising=False)
+        srv._set_session_context("k", connection_mode=None)
+        assert desktop_connection_mode() is None
+
 
 def test_new_session_records_carry_a_connection_mode_slot():
     """Both live-session record shapes must have the field _set_session_context reads."""
@@ -244,3 +265,108 @@ class TestComputeHostBoundary:
         monkeypatch.setattr(srv, "_sessions", {"s1": child_session}, raising=False)
         host._ensure_server_session(srv, {"sid": "s1", "session_key": "k"})
         assert child_session["connection_mode"] == "remote"
+
+
+class TestEphemeralAgentInheritance:
+    """Background and preview agents must inherit the parent Desktop mode.
+
+    prompt.background and preview.restart bind fresh ``bg_*`` / ``preview_*``
+    task IDs that are not in ``_sessions``, so the lookup-based derivation in
+    ``_set_session_context`` finds nothing; the handlers must hand the parent
+    session's resolved mode across explicitly (#82187 follow-up review, item 1).
+    Each probe reads all three surfaces INSIDE the detached agent thread: the
+    Python accessor, the subprocess env stamp, and the MCP per-call ``_meta``.
+    """
+
+    def _capture_inside_detached_agent(self, monkeypatch, method_name, params, session):
+        import queue
+
+        import run_agent
+
+        srv = _srv()
+        captured: queue.Queue = queue.Queue()
+
+        class _ProbeAgent:
+            def __init__(self, **kwargs):
+                pass
+
+            def run_conversation(self, **kwargs):
+                from gateway.session_context import (
+                    DESKTOP_CONNECTION_MODE_ENV,
+                    desktop_connection_mode,
+                )
+                from tools.environments.local import _make_run_env
+                from tools.mcp_tool import _call_tool_meta
+
+                captured.put(
+                    {
+                        "accessor": desktop_connection_mode(),
+                        "env": _make_run_env({}).get(DESKTOP_CONNECTION_MODE_ENV),
+                        "meta": _call_tool_meta(),
+                    }
+                )
+                return {"final_response": "done"}
+
+        monkeypatch.setattr(run_agent, "AIAgent", _ProbeAgent)
+        monkeypatch.setattr(srv, "_sessions", {"s1": session}, raising=False)
+        monkeypatch.setattr(
+            srv, "_background_agent_kwargs", lambda agent, task_id: {}, raising=False
+        )
+        monkeypatch.setattr(
+            srv, "_ephemeral_preview_agent_kwargs", lambda agent, task_id: {}, raising=False
+        )
+        monkeypatch.setattr(
+            srv, "_preview_restart_callbacks", lambda parent, task_id: {}, raising=False
+        )
+        monkeypatch.setattr(srv, "_emit", lambda *a, **k: None, raising=False)
+        resp = srv._methods[method_name]("rid", {"session_id": "s1", **params})
+        assert resp.get("error") is None, resp
+        return captured.get(timeout=15)
+
+    def _parent(self, **extra) -> dict:
+        return {
+            "session_key": "k",
+            "source": "desktop",
+            "agent": object(),
+            "history": [],
+            "history_lock": threading.Lock(),
+            "cwd": "",
+            **extra,
+        }
+
+    def test_background_agent_sees_the_parent_mode(self, monkeypatch):
+        from tools.mcp_tool import MCP_DESKTOP_CONNECTION_MODE_META_KEY
+
+        seen = self._capture_inside_detached_agent(
+            monkeypatch,
+            "prompt.background",
+            {"text": "hi"},
+            self._parent(connection_mode="remote"),
+        )
+        assert seen["accessor"] == "remote"
+        assert seen["env"] == "remote"
+        assert seen["meta"] == {MCP_DESKTOP_CONNECTION_MODE_META_KEY: "remote"}
+
+    def test_preview_agent_sees_the_parent_mode(self, monkeypatch):
+        from tools.mcp_tool import MCP_DESKTOP_CONNECTION_MODE_META_KEY
+
+        seen = self._capture_inside_detached_agent(
+            monkeypatch,
+            "preview.restart",
+            {"url": "http://localhost:3000"},
+            self._parent(connection_mode="remote"),
+        )
+        assert seen["accessor"] == "remote"
+        assert seen["env"] == "remote"
+        assert seen["meta"] == {MCP_DESKTOP_CONNECTION_MODE_META_KEY: "remote"}
+
+    def test_non_desktop_parent_spawns_modeless_children(self, monkeypatch):
+        """A TUI parent's stray connection_mode must not leak into children."""
+        seen = self._capture_inside_detached_agent(
+            monkeypatch,
+            "prompt.background",
+            {"text": "hi"},
+            self._parent(source="tui", connection_mode="local"),
+        )
+        assert seen["accessor"] is None
+        assert seen["meta"] is None

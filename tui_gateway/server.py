@@ -3461,11 +3461,18 @@ def _cwd_for_session_key(session_key: str) -> str:
     return ""
 
 
+# Sentinel for _set_session_context: "caller did not supply a mode, derive it
+# from the live session map". Distinct from None, which is a real answer
+# ("no Desktop mode") that must not be second-guessed by the lookup.
+_DERIVE_CONNECTION_MODE = object()
+
+
 def _set_session_context(
     session_key: str,
     cwd: str | None = None,
     *,
     ui_session_id: str = "",
+    connection_mode: object = _DERIVE_CONNECTION_MODE,
 ) -> list:
     try:
         from gateway.session_context import set_session_vars
@@ -3486,7 +3493,11 @@ def _set_session_context(
         # fall back to the session_key (matching the id derivation used at
         # session-finalize), so an identified session is never left blank.
         session_id = session_key
-        connection_mode = None
+        # Ephemeral task IDs (background, preview) aren't in `_sessions` either,
+        # so the loop below can't find a mode for them. Callers that hold the
+        # parent session pass its resolved mode explicitly (#82140); the
+        # session-map derivation only runs when nothing was supplied.
+        mode = None if connection_mode is _DERIVE_CONNECTION_MODE else connection_mode
         with _sessions_lock:
             for sess in list(_sessions.values()):
                 if sess.get("session_key") == session_key:
@@ -3494,7 +3505,8 @@ def _set_session_context(
                     session_id = (
                         getattr(sess.get("agent"), "session_id", None) or session_key
                     )
-                    connection_mode = _session_connection_mode(sess)
+                    if connection_mode is _DERIVE_CONNECTION_MODE:
+                        mode = _session_connection_mode(sess)
                     break
         return set_session_vars(
             session_key=session_key,
@@ -3503,7 +3515,7 @@ def _set_session_context(
             cwd=resolved,
             ui_session_id=ui_session_id,
             cron_session="",
-            desktop_connection_mode=connection_mode,
+            desktop_connection_mode=mode,
         )
     except Exception:
         return []

@@ -1214,7 +1214,14 @@ def _(rid, params: dict) -> dict:
     task_id = f"bg_{uuid.uuid4().hex[:6]}"
 
     def run():
-        session_tokens = _set_session_context(task_id, cwd=_session_cwd(session))
+        # task_id is ephemeral (not in _sessions), so the context bind cannot
+        # derive the Desktop connection mode by lookup — inherit the parent
+        # session's resolved mode explicitly (#82140).
+        session_tokens = _set_session_context(
+            task_id,
+            cwd=_session_cwd(session),
+            connection_mode=_session_connection_mode(session),
+        )
         try:
             from run_agent import AIAgent
 
@@ -1327,7 +1334,13 @@ def _(rid, params: dict) -> dict:
     def run():
         # Pin the validated preview cwd, else the parent workspace — never an
         # invalid client path, which would silently fall back to the launch dir.
-        session_tokens = _set_session_context(task_id, cwd=(preview_cwd or _session_cwd(session)))
+        # Ephemeral preview task: inherit the parent's Desktop connection mode
+        # explicitly, same as prompt.background (#82140).
+        session_tokens = _set_session_context(
+            task_id,
+            cwd=(preview_cwd or _session_cwd(session)),
+            connection_mode=_session_connection_mode(session),
+        )
         try:
             from run_agent import AIAgent
             from tools.terminal_tool import register_task_env_overrides
