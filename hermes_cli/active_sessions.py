@@ -261,6 +261,14 @@ class ActiveSessionLease:
     surface: str
     enabled: bool = True
     released: bool = False
+    # Registry + lock paths resolved at acquire time. A lease is created against
+    # the root HERMES_HOME, but release/transfer may run inside a named-profile
+    # scope (``_profile_runtime_scope``) where ``get_hermes_home()`` points at
+    # the profile — re-resolving there would look in the wrong registry and leak
+    # the slot (#85431). Pinning the paths keeps release/transfer on the same
+    # registry the lease was written to. ``None`` for a disabled/no-op lease.
+    state_path: Optional[Path] = None
+    lock_path: Optional[Path] = None
 
     def release(self) -> None:
         if self.released or not self.enabled:
@@ -306,7 +314,8 @@ def try_acquire_active_session(
         }
 
     state_path = _state_path()
-    with _FileLock(_lock_path()):
+    lock_path = _lock_path()
+    with _FileLock(lock_path):
         raw_entries = _read_entries(state_path)
         entries = _prune_dead(raw_entries)
         pruned = len(raw_entries) - len(entries)
@@ -331,13 +340,18 @@ def try_acquire_active_session(
         lease_id=lease_id,
         session_id=str(session_id),
         surface=str(surface),
+        state_path=state_path,
+        lock_path=lock_path,
     ), None
 
 
 def release_active_session(lease: ActiveSessionLease) -> None:
-    state_path = _state_path()
+    # Use the registry the lease was acquired against, not whatever HERMES_HOME
+    # is current now — release can run inside a named-profile scope (#85431).
+    state_path = lease.state_path or _state_path()
+    lock_path = lease.lock_path or _lock_path()
     try:
-        with _FileLock(_lock_path()):
+        with _FileLock(lock_path):
             entries = _prune_dead(_read_entries(state_path))
             kept = [
                 entry
@@ -366,8 +380,10 @@ def transfer_active_session(
         lease.session_id = new_session_id
         return True
 
-    state_path = _state_path()
-    with _FileLock(_lock_path()):
+    # Pinned to the acquire-time registry for the same reason as release (#85431).
+    state_path = lease.state_path or _state_path()
+    lock_path = lease.lock_path or _lock_path()
+    with _FileLock(lock_path):
         entries = _prune_dead(_read_entries(state_path))
         updated = False
         for entry in entries:

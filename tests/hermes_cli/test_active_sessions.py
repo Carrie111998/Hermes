@@ -46,6 +46,86 @@ def test_resolve_max_concurrent_sessions_values(caplog):
 
 
 
+def test_release_under_named_profile_scope_frees_the_root_slot(tmp_path, monkeypatch):
+    """#85431: a lease acquired against the root HERMES_HOME must release from
+    that same registry even when release runs inside a named-profile scope.
+
+    In a native multiplex gateway the cleanup path calls release() inside
+    ``_profile_runtime_scope(profile_home)``; before the fix, release re-resolved
+    the registry from the (profile) HERMES_HOME, left the root entry alive, and
+    the slot leaked until the gateway restarted."""
+    import json
+
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    root = tmp_path / "hermes"
+    profile = root / "profiles" / "worker"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    lease, error = active_sessions.try_acquire_active_session(
+        session_id="agent:worker:telegram:dm:synthetic",
+        surface="gateway:telegram",
+        config={"max_concurrent_sessions": 2},
+    )
+    assert lease is not None and error is None
+    root_registry = root / "runtime" / "active_sessions.json"
+    assert len(json.loads(root_registry.read_text(encoding="utf-8"))["entries"]) == 1
+
+    # Release while a named-profile scope is active — get_hermes_home() now
+    # points at the profile, not the root the lease was written to.
+    token = set_hermes_home_override(str(profile))
+    try:
+        lease.release()
+    finally:
+        reset_hermes_home_override(token)
+
+    assert lease.released is True
+    # The root entry is gone (slot freed) and no stray profile registry leaked.
+    assert json.loads(root_registry.read_text(encoding="utf-8"))["entries"] == []
+    assert not (profile / "runtime" / "active_sessions.json").exists()
+
+
+def test_transfer_under_named_profile_scope_updates_the_root_registry(tmp_path, monkeypatch):
+    """transfer_active_session shares release's acquire-time registry pinning."""
+    import json
+
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    root = tmp_path / "hermes"
+    profile = root / "profiles" / "worker"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    lease, error = active_sessions.try_acquire_active_session(
+        session_id="agent:worker:telegram:dm:old",
+        surface="gateway:telegram",
+        config={"max_concurrent_sessions": 2},
+    )
+    assert lease is not None and error is None
+    root_registry = root / "runtime" / "active_sessions.json"
+
+    token = set_hermes_home_override(str(profile))
+    try:
+        ok = active_sessions.transfer_active_session(
+            lease, session_id="agent:worker:telegram:dm:new"
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert ok is True
+    entries = json.loads(root_registry.read_text(encoding="utf-8"))["entries"]
+    assert len(entries) == 1
+    assert entries[0]["session_id"] == "agent:worker:telegram:dm:new"
+    assert not (profile / "runtime" / "active_sessions.json").exists()
+
+
 def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     monkeypatch.setenv("HERMES_HOME", str(home))
