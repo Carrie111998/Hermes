@@ -144,9 +144,19 @@ a "weekly digest" contains a digest. Two mitigations, no new infrastructure:
 The evidence gate keys on file mutations and detected verify commands, and
 caps at 2 attempts. Research/writing/analysis turns have no equivalent. The
 `pre_verify` hook surface (`agent/verify_hooks.py`) ships empty — it is the
-designed extension point. **Build (optional, later):** a `pre_verify` hook
-that enforces per-task rubrics for non-code deliverables (accounting workpapers
-already have this culturally via the audit-QC skill; the hook mechanizes it).
+designed extension point.
+
+**Built (this branch):** a rubric verify-on-stop gate for non-code
+deliverables. `agent/verify_hooks.py` gains `build_rubric_verify_nudge` — a
+*mechanical* check (marker/regex presence per criterion, "a check that can
+fail," not the model grading itself), and `agent/conversation_loop.py` gains a
+stop-guard block (modeled on the existing kanban stop guard) that nudges the
+agent to complete missing rubric elements before finishing. It is **off by
+default**: a deployment activates it by naming one `agent.verify_rubrics` entry
+in `agent.verify_rubric`. Coding turns and any turn that mutated files are never
+gated — the code evidence gate above owns those. This mechanizes what
+accounting workpapers already do culturally via the audit-QC skill. Per-turn
+nudges are bounded (`max_nudges`, default 2) so the gate can never trap the loop.
 
 ### Gap 4 — Delegation defaults are conservative for this hardware
 

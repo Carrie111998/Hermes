@@ -7157,6 +7157,65 @@ def run_conversation(
                     final_response = None
                     continue
 
+                # ── Rubric verify stop guard (non-code deliverables) ───
+                # Off by default. When a deployment names an active rubric
+                # (agent.verify_rubric), a non-code finish turn whose output
+                # misses required rubric elements is nudged to complete them
+                # first — the audit-QC "deliverable meets its rubric" check as a
+                # gate that can actually fail, extending the code evidence gate to
+                # research/writing/analysis. See docs/agents-loops-graphs.md Gap 3.
+                _rubric_nudge = None
+                _rubric = getattr(agent, "_resolved_verify_rubric", False)
+                try:
+                    if _rubric is False:
+                        from agent.verify_hooks import active_verify_rubric
+                        _rubric = active_verify_rubric(None)
+                        agent._resolved_verify_rubric = _rubric
+                    if _rubric:
+                        from agent.verify_hooks import build_rubric_verify_nudge
+                        _coding = getattr(agent, "_resolved_is_coding", None)
+                        if _coding is None:
+                            from agent.coding_context import is_coding_context
+                            _coding = bool(is_coding_context(
+                                platform=getattr(agent, "platform", "") or ""))
+                            agent._resolved_is_coding = _coding
+                        _rubric_nudge = build_rubric_verify_nudge(
+                            final_response=final_response,
+                            rubric=_rubric,
+                            attempt=getattr(agent, "_rubric_verify_nudges", 0),
+                            coding=_coding,
+                            changed_paths=_edited,
+                        )
+                except Exception:
+                    logger.debug("rubric verify check failed", exc_info=True)
+                    _rubric_nudge = None
+
+                if _rubric_nudge:
+                    agent._rubric_verify_nudges = (
+                        getattr(agent, "_rubric_verify_nudges", 0) + 1
+                    )
+                    final_msg["finish_reason"] = "rubric_verify_continue"
+                    agent._emit_interim_assistant_message(final_msg)
+                    messages.append(final_msg)
+                    try:
+                        agent._flush_messages_to_session_db(messages, conversation_history)
+                    except Exception:
+                        logger.debug("rubric verify interim flush failed", exc_info=True)
+                    messages.append({
+                        "role": "user",
+                        "content": _rubric_nudge,
+                        "_pre_verify_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    logger.debug("rubric verify nudge issued (attempt %d)",
+                                 agent._rubric_verify_nudges)
+                    _pending_verification_response = final_response
+                    _pending_verification_response_previewed = (
+                        agent._interim_content_was_streamed(final_response or "")
+                    )
+                    final_response = None
+                    continue
+
                 # ── Kanban worker terminal-tool stop guard ─────────────
                 # Workers must end with kanban_complete / kanban_block.
                 # Models sometimes narrate the next step ("Let me write the

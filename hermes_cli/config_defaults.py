@@ -154,6 +154,16 @@ DEFAULT_CONFIG = {
         # Upper bound on consecutive `pre_verify` "continue" nudges in a single
         # turn, so a user/plugin hook can never trap the loop.
         "max_verify_nudges": 3,
+        # Rubric verify-on-stop for NON-code deliverables (Gap 3). verify_on_stop
+        # gates edited code on verification evidence; this gates research/writing/
+        # analysis output on a mechanical rubric — a check that can actually fail.
+        # OFF by default: name one `verify_rubrics` entry here to activate it.
+        # Each rubric is {max_nudges, case_insensitive, nudge_intro, criteria:
+        # [{name, any_of: [markers], hint, regex}]}; a criterion is met when any
+        # marker appears in the deliverable. Coding turns and file-mutation turns
+        # are never gated (the code evidence gate owns those).
+        "verify_rubric": "",
+        "verify_rubrics": {},
         # Verification closure: after the agent edits files in a code workspace,
         # do not accept a final answer until fresh verification evidence exists
         # or the agent explains why it cannot run checks. The loop is bounded

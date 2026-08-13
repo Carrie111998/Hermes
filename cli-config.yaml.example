@@ -894,6 +894,27 @@ agent:
   # Default 3.
   # max_verify_nudges: 3
 
+  # Rubric verify-on-stop for NON-code deliverables (research/writing/analysis).
+  # verify_on_stop gates edited code on verification evidence; this gates a
+  # deliverable on a mechanical rubric — a check that can actually fail, not the
+  # model grading its own homework. OFF by default: name one verify_rubrics entry
+  # in verify_rubric to activate. Coding turns and file-mutation turns are never
+  # gated. Each criterion is met when any of its markers (substrings, or regexes
+  # when regex: true) appears in the deliverable.
+  # verify_rubric: ""            # name of the active rubric, "" = disabled
+  # verify_rubrics:
+  #   workpaper:
+  #     max_nudges: 2            # per-turn cap so the gate can't trap the loop
+  #     case_insensitive: true
+  #     nudge_intro: "This workpaper is missing required elements:"
+  #     criteria:
+  #       - name: privilege-header
+  #         any_of: ["PRIVILEGED AND CONFIDENTIAL"]
+  #         hint: "Start with the privilege header."
+  #       - name: sources
+  #         any_of: ["SOURCE:", "Source:"]
+  #         hint: "Every figure needs a SOURCE: line."
+
   # Enable verbose logging
   verbose: false
   
