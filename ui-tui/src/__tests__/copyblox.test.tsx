@@ -5,7 +5,7 @@
 import { PassThrough } from 'stream'
 
 import type * as HermesInk from '@hermes/ink'
-import { Box, renderSync, Text } from '@hermes/ink'
+import { Box, renderSync, stringWidth, Text } from '@hermes/ink'
 import React from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -47,7 +47,9 @@ const renderPlain = (node: React.ReactNode) => {
   Object.assign(stdout, { columns: 80, isTTY: false, rows: 24 })
   Object.assign(stdin, { isTTY: false })
   Object.assign(stderr, { isTTY: false })
-  stdout.on('data', chunk => { output += chunk.toString() })
+  stdout.on('data', chunk => {
+    output += chunk.toString()
+  })
 
   const instance = renderSync(node, {
     patchConsole: false,
@@ -73,7 +75,13 @@ describe('CopyBlox', () => {
 
   it('renders language label and idle COPY button for empty block', () => {
     const lines = renderPlain(
-      React.createElement(CopyBlox, { closed: true, language: 'python', rawContent: '', theme: DEFAULT_THEME, cols: 80 })
+      React.createElement(CopyBlox, {
+        closed: true,
+        language: 'python',
+        rawContent: '',
+        theme: DEFAULT_THEME,
+        cols: 80
+      })
     )
 
     const output = lines.join('\n')
@@ -86,9 +94,7 @@ describe('CopyBlox', () => {
       React.createElement(
         CopyBlox,
         { closed: true, language: 'ts', rawContent: 'x = 1', theme: DEFAULT_THEME, cols: 80 },
-        React.createElement(Box, null,
-          React.createElement(Text, null, 'x = 1')
-        )
+        React.createElement(Box, null, React.createElement(Text, null, 'x = 1'))
       )
     )
 
@@ -98,7 +104,13 @@ describe('CopyBlox', () => {
 
   it('defaults language to "text" when empty', () => {
     const lines = renderPlain(
-      React.createElement(CopyBlox, { closed: true, language: '', rawContent: 'content', theme: DEFAULT_THEME, cols: 80 })
+      React.createElement(CopyBlox, {
+        closed: true,
+        language: '',
+        rawContent: 'content',
+        theme: DEFAULT_THEME,
+        cols: 80
+      })
     )
 
     const output = lines.join('\n')
@@ -126,9 +138,36 @@ describe('CopyBlox', () => {
     expect(output).toContain('⧉⧉⧉')
   })
 
+  it('uses a width-safe left accent for narrow code blocks', () => {
+    const lines = renderPlain(
+      React.createElement(
+        CopyBlox,
+        {
+          closed: true,
+          cols: 12,
+          compact: false,
+          language: '한국어_😀_very_long',
+          rawContent: 'x'.repeat(30),
+          theme: DEFAULT_THEME
+        },
+        React.createElement(Text, null, 'x')
+      )
+    )
+
+    expect(lines.some(line => line.includes('┌'))).toBe(false)
+    expect(lines.flatMap(line => line.split('│').filter(Boolean)).every(line => stringWidth(line) <= 11)).toBe(true)
+    expect(lines.join('\n')).toContain('…')
+  })
+
   it('does not register a clickable copy control for an unclosed streaming fence', () => {
     const output = renderPlain(
-      React.createElement(CopyBlox, { closed: false, language: 'py', rawContent: 'partial code', theme: DEFAULT_THEME, cols: 80 })
+      React.createElement(CopyBlox, {
+        closed: false,
+        language: 'py',
+        rawContent: 'partial code',
+        theme: DEFAULT_THEME,
+        cols: 80
+      })
     ).join('\n')
 
     expect(output).toContain('⟳')
@@ -145,10 +184,10 @@ describe('CopyBlox', () => {
       React.createElement(
         CopyBlox,
         { closed: true, language: 'python', rawContent: rawContent, theme: DEFAULT_THEME, cols: 80 },
-        React.createElement(Box, { flexDirection: 'column' },
-          ...codeLines.map(line =>
-            React.createElement(Text, { key: line }, line)
-          )
+        React.createElement(
+          Box,
+          { flexDirection: 'column' },
+          ...codeLines.map(line => React.createElement(Text, { key: line }, line))
         )
       )
     )
@@ -165,9 +204,7 @@ describe('CopyBlox', () => {
         React.createElement(
           CopyBlox,
           { closed: true, language: 'text', rawContent: specialContent, theme: DEFAULT_THEME, cols: 80 },
-          React.createElement(Box, { flexDirection: 'column' },
-            React.createElement(Text, null, specialContent)
-          )
+          React.createElement(Box, { flexDirection: 'column' }, React.createElement(Text, null, specialContent))
         )
       )
     }).not.toThrow()

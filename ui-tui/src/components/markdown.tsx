@@ -838,7 +838,7 @@ function MdImpl({ cols, compact, t, text }: MdProps) {
         const codeChildren: ReactNode[] = block.map((l, j) => {
           if (highlighted) {
             return (
-              <Text key={j}>
+              <Text key={j} wrap="wrap-char">
                 {highlightLine(l, lang, t).map(([color, text], kk) =>
                   color ? (
                     <Text color={color} key={kk}>
@@ -862,6 +862,7 @@ function MdImpl({ cols, compact, t, text }: MdProps) {
               color={add ? t.color.diffAddedWord : del ? t.color.diffRemovedWord : hunk ? t.color.muted : undefined}
               dimColor={isDiff && !add && !del && !hunk && l.startsWith(' ')}
               key={j}
+              wrap="wrap-char"
             >
               {l}
             </Text>
@@ -872,6 +873,7 @@ function MdImpl({ cols, compact, t, text }: MdProps) {
           <CopyBlox
             closed={closed}
             cols={cols ?? 80}
+            compact={compact}
             key={key}
             language={isDiff ? 'diff' : lang}
             rawContent={rawContent}

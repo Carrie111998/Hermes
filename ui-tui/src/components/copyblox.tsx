@@ -25,13 +25,50 @@ const FAIL_FEEDBACK_MS = 1500
 interface CopyBloxProps {
   children: React.ReactNode
   closed: boolean
+  compact?: boolean
   language: string
   rawContent: string
   theme: Theme
   cols: number
 }
 
-export const CopyBlox = memo(function CopyBlox({ children, closed, language, rawContent, theme, cols }: CopyBloxProps) {
+const NARROW_CODE_BLOCK_COLS = 20
+
+const truncateToWidth = (value: string, maxWidth: number): string => {
+  if (stringWidth(value) <= maxWidth) {
+    return value
+  }
+
+  const ellipsis = '…'
+  const budget = Math.max(0, maxWidth - stringWidth(ellipsis))
+
+  const segments =
+    typeof Intl !== 'undefined' && 'Segmenter' in Intl
+      ? [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(value)].map(({ segment }) => segment)
+      : Array.from(value)
+
+  let result = ''
+
+  for (const segment of segments) {
+    if (stringWidth(result + segment) > budget) {
+      break
+    }
+
+    result += segment
+  }
+
+  return result + ellipsis
+}
+
+export const CopyBlox = memo(function CopyBlox({
+  children,
+  closed,
+  compact = false,
+  language,
+  rawContent,
+  theme,
+  cols
+}: CopyBloxProps) {
   const [copyState, setCopyState] = useState<CopyState>('idle')
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const rawContentRef = useRef(rawContent)
@@ -84,6 +121,7 @@ export const CopyBlox = memo(function CopyBlox({ children, closed, language, raw
   const t = theme.color
   const label = language || 'text'
   const isStreaming = !closed
+  const isNarrow = compact || cols < NARROW_CODE_BLOCK_COLS
 
   const w = (s: string) => stringWidth(s)
   const fill = (n: number) => '─'.repeat(Math.max(1, n))
@@ -97,10 +135,10 @@ export const CopyBlox = memo(function CopyBlox({ children, closed, language, raw
     }
 
     codeRows.push(
-      <Box key={codeIdx++}>
-        <Text color={t.border}>{'\u2502'}</Text>
+      <Box key={codeIdx++} width={isNarrow ? Math.max(1, cols - 2) : cols}>
+        {!isNarrow && <Text color={t.border}>{'\u2502'}</Text>}
         {child}
-        <Text color={t.border}>{'\u2502'}</Text>
+        {!isNarrow && <Text color={t.border}>{'\u2502'}</Text>}
       </Box>
     )
   })
@@ -112,8 +150,44 @@ export const CopyBlox = memo(function CopyBlox({ children, closed, language, raw
   // All headers are single-row: ┌─label─spacer─icon─┐
   // The 3-cell icon (⧉⧉⧉) is wide enough to be clearly visible.
 
-  const labelW = w(label)
+  const suffixW = isStreaming || copyState !== 'idle' ? 1 : 3
+  const displayLabel = truncateToWidth(label, Math.max(1, cols - (isNarrow ? 2 : 3) - suffixW))
+  const labelW = w(displayLabel)
   const iconW = 3 // 3 cells wide
+
+  if (isNarrow) {
+    const onClick = isStreaming
+      ? undefined
+      : (e: ClickEvent) => {
+          e.stopImmediatePropagation()
+          void doCopy()
+        }
+
+    return (
+      <Box
+        borderBottom={false}
+        borderColor={t.border}
+        borderLeft
+        borderRight={false}
+        borderStyle="single"
+        borderTop={false}
+        flexDirection="column"
+        paddingLeft={1}
+        width={cols}
+      >
+        <NoSelect onClick={onClick}>
+          <Box>
+            <Text color={t.accent}>{displayLabel}</Text>
+            <Text color={isStreaming ? t.muted : t.accent}>
+              {isStreaming ? '\u27f3' : copyState === 'idle' ? COPY_ICON : FEEDBACK[copyState]}
+            </Text>
+          </Box>
+        </NoSelect>
+
+        <Box flexDirection="column">{codeRows}</Box>
+      </Box>
+    )
+  }
 
   if (isStreaming) {
     // ── Single-row streaming header ──────────────────────────────────
@@ -121,16 +195,16 @@ export const CopyBlox = memo(function CopyBlox({ children, closed, language, raw
     const spacerW = Math.max(0, cols - fixed)
 
     return (
-      <Box flexDirection="column">
+      <Box flexDirection="column" width={cols}>
         <NoSelect>
-        <Box>
-          <Text color={t.border}>{'\u250c'}</Text>
-          <Text color={t.border}>{'\u2500'}</Text>
-          <Text color={t.accent}>{label}</Text>
-          {spacerW > 0 ? <Text color={t.border}>{fill(spacerW)}</Text> : null}
-          <Text color={t.muted}>{'\u27f3'}</Text>
-          <Text color={t.border}>{'\u2510'}</Text>
-        </Box>
+          <Box>
+            <Text color={t.border}>{'\u250c'}</Text>
+            <Text color={t.border}>{'\u2500'}</Text>
+            <Text color={t.accent}>{displayLabel}</Text>
+            {spacerW > 0 ? <Text color={t.border}>{fill(spacerW)}</Text> : null}
+            <Text color={t.muted}>{'\u27f3'}</Text>
+            <Text color={t.border}>{'\u2510'}</Text>
+          </Box>
         </NoSelect>
 
         <Box flexDirection="column">{codeRows}</Box>
@@ -150,18 +224,23 @@ export const CopyBlox = memo(function CopyBlox({ children, closed, language, raw
     const spacerW = Math.max(0, cols - fixed)
 
     return (
-      <Box flexDirection="column">
-        <NoSelect onClick={(e: ClickEvent) => { e.stopImmediatePropagation(); doCopy() }}>
-        <Box>
-          <Text color={t.border}>{'\u250c'}</Text>
-          <Text color={t.border}>{'\u2500'}</Text>
-          <Text color={t.accent}>{label}</Text>
-          {spacerW > 0 ? <Text color={t.border}>{fill(spacerW)}</Text> : null}
-          <Text color={t.border}>{' '}</Text>
-          <Text color={t.accent}>{FEEDBACK[copyState]}</Text>
-          <Text color={t.border}>{' '}</Text>
-          <Text color={t.border}>{'\u2510'}</Text>
-        </Box>
+      <Box flexDirection="column" width={cols}>
+        <NoSelect
+          onClick={(e: ClickEvent) => {
+            e.stopImmediatePropagation()
+            doCopy()
+          }}
+        >
+          <Box>
+            <Text color={t.border}>{'\u250c'}</Text>
+            <Text color={t.border}>{'\u2500'}</Text>
+            <Text color={t.accent}>{displayLabel}</Text>
+            {spacerW > 0 ? <Text color={t.border}>{fill(spacerW)}</Text> : null}
+            <Text color={t.border}> </Text>
+            <Text color={t.accent}>{FEEDBACK[copyState]}</Text>
+            <Text color={t.border}> </Text>
+            <Text color={t.border}>{'\u2510'}</Text>
+          </Box>
         </NoSelect>
 
         <Box flexDirection="column">{codeRows}</Box>
@@ -180,16 +259,21 @@ export const CopyBlox = memo(function CopyBlox({ children, closed, language, raw
   const spacerW = Math.max(0, cols - fixed)
 
   return (
-    <Box flexDirection="column">
-      <NoSelect onClick={(e: ClickEvent) => { e.stopImmediatePropagation(); doCopy() }}>
-      <Box>
-        <Text color={t.border}>{'\u250c'}</Text>
-        <Text color={t.border}>{'\u2500'}</Text>
-        <Text color={t.accent}>{label}</Text>
-        {spacerW > 0 ? <Text color={t.border}>{fill(spacerW)}</Text> : null}
-        <Text color={t.accent}>{COPY_ICON}</Text>
-        <Text color={t.border}>{'\u2510'}</Text>
-      </Box>
+    <Box flexDirection="column" width={cols}>
+      <NoSelect
+        onClick={(e: ClickEvent) => {
+          e.stopImmediatePropagation()
+          doCopy()
+        }}
+      >
+        <Box>
+          <Text color={t.border}>{'\u250c'}</Text>
+          <Text color={t.border}>{'\u2500'}</Text>
+          <Text color={t.accent}>{displayLabel}</Text>
+          {spacerW > 0 ? <Text color={t.border}>{fill(spacerW)}</Text> : null}
+          <Text color={t.accent}>{COPY_ICON}</Text>
+          <Text color={t.border}>{'\u2510'}</Text>
+        </Box>
       </NoSelect>
 
       {/* Code body with side borders — not inside click target */}
