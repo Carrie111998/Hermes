@@ -1784,6 +1784,11 @@ def _compute_host_turn_frame(
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session),
+        # Resolved Desktop connection mode (#82140). The compute-host child
+        # rebuilds the session from this frame, so without it an isolated turn
+        # would bind None and skills/MCP would lose the mode the Desktop
+        # announced to the parent.
+        "connection_mode": _session_connection_mode(session),
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
     }

@@ -9,6 +9,8 @@ The helpers under test are pure dict/param transforms, so they run without
 standing up a gateway.
 """
 
+import threading
+
 import pytest
 
 from gateway.session_context import _DESKTOP_CONNECTION_MODE, _UNSET, _VAR_MAP
@@ -120,3 +122,125 @@ def test_new_session_records_carry_a_connection_mode_slot():
         connection_mode="remote",
     )
     assert record["connection_mode"] == "remote"
+
+
+def _host():
+    import io
+
+    from tui_gateway.compute_host import ComputeHost
+
+    return ComputeHost(stdout=io.StringIO(), heartbeat_secs=0)
+
+
+def _live_session(**extra) -> dict:
+    return {
+        "session_key": "k",
+        "source": "desktop",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "attached_images": [],
+        "cols": 80,
+        "cwd": "/w",
+        **extra,
+    }
+
+
+class TestComputeHostBoundary:
+    """Dashboard turn isolation must not erase the Desktop connection mode.
+
+    The compute-host child rebuilds the session from the ``turn.start`` frame,
+    so the frame must carry the parent's resolved mode and
+    ``_ensure_server_session`` must apply it on create and refresh it on reuse
+    — otherwise every isolated Desktop turn binds ``None`` and skills/MCP lose
+    the announcement (#82140).
+    """
+
+    def test_turn_frame_carries_the_resolved_mode(self):
+        frame = _srv()._compute_host_turn_frame(
+            "rid", "s1", _live_session(connection_mode="remote"), "hi"
+        )
+        assert frame["connection_mode"] == "remote"
+
+    def test_turn_frame_for_non_desktop_session_carries_none(self):
+        """A stray mode on a non-Desktop session must not cross the boundary."""
+        frame = _srv()._compute_host_turn_frame(
+            "rid", "s1", _live_session(source="tui", connection_mode="local"), "hi"
+        )
+        assert frame["connection_mode"] is None
+
+    def test_child_new_session_receives_the_frame_mode(self, monkeypatch):
+        """The create path hands the frame mode to _init_session."""
+        srv = _srv()
+        host = _host()
+        received = {}
+
+        def _fake_init_session(sid, key, agent, history, **kwargs):
+            received.update(kwargs)
+            srv._sessions[sid] = {
+                "agent": agent,
+                "session_key": key,
+                "history": list(history),
+                "history_lock": threading.Lock(),
+                "source": srv._resolve_session_source(kwargs.get("source")),
+                "connection_mode": kwargs.get("connection_mode"),
+            }
+
+        monkeypatch.setattr(srv, "_sessions", {}, raising=False)
+        monkeypatch.setattr(srv, "_make_agent", lambda *a, **k: object())
+        monkeypatch.setattr(srv, "_transfer_db_to_agent", lambda *a, **k: False)
+        monkeypatch.setattr(srv, "_init_session", _fake_init_session)
+        frame = _srv()._compute_host_turn_frame(
+            "rid", "s1", _live_session(connection_mode="remote"), "hi"
+        )
+        session = host._ensure_server_session(srv, frame)
+        assert received["connection_mode"] == "remote"
+        assert session["connection_mode"] == "remote"
+
+    def test_child_fallback_session_keeps_the_frame_mode(self, monkeypatch):
+        """The minimal host-owned session (init machinery unavailable) too."""
+        srv = _srv()
+        host = _host()
+
+        def _boom(*a, **k):
+            raise RuntimeError("slash worker unavailable")
+
+        monkeypatch.setattr(srv, "_sessions", {}, raising=False)
+        monkeypatch.setattr(srv, "_make_agent", lambda *a, **k: object())
+        monkeypatch.setattr(srv, "_transfer_db_to_agent", lambda *a, **k: False)
+        monkeypatch.setattr(srv, "_init_session", _boom)
+        frame = _srv()._compute_host_turn_frame(
+            "rid", "s1", _live_session(connection_mode="remote"), "hi"
+        )
+        session = host._ensure_server_session(srv, frame)
+        assert session["connection_mode"] == "remote"
+
+    def test_child_reuse_refreshes_the_mode_and_binds_it(self, monkeypatch):
+        """A remote turn, then a switch to local: the reused child session must
+        refresh and the child's own turn context must observe the new mode."""
+        from gateway.session_context import desktop_connection_mode
+
+        srv = _srv()
+        host = _host()
+        child_session = _live_session(connection_mode="remote")
+        monkeypatch.setattr(srv, "_sessions", {"s1": child_session}, raising=False)
+
+        frame = srv._compute_host_turn_frame(
+            "rid", "s1", _live_session(connection_mode="local"), "hi"
+        )
+        reused = host._ensure_server_session(srv, frame)
+        assert reused is child_session
+        assert reused["connection_mode"] == "local"
+
+        # What _run_prompt_submit's context bind now sees in the child.
+        srv._set_session_context("k")
+        assert desktop_connection_mode() == "local"
+
+    def test_child_reuse_with_an_older_parent_frame_keeps_the_mode(self, monkeypatch):
+        """A frame without the key (older parent) must not erase the mode."""
+        srv = _srv()
+        host = _host()
+        child_session = _live_session(connection_mode="remote")
+        monkeypatch.setattr(srv, "_sessions", {"s1": child_session}, raising=False)
+        host._ensure_server_session(srv, {"sid": "s1", "session_key": "k"})
+        assert child_session["connection_mode"] == "remote"
