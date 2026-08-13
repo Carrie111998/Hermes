@@ -127,6 +127,45 @@ def resolve_module_source(module_name: str, limit: int = 8192) -> str:
         return ""
 
 
+def resolve_submodule_sources(module_name: str, limit: int = 8192) -> list:
+    """Return the source of a package's direct submodules (without importing).
+
+    Handles the thin-``__init__`` re-export case: a package whose entry-point
+    module is ``__init__.py`` containing only ``from .core import register``
+    while the actual ``register_provider(ProviderProfile(...))`` call lives in
+    a submodule. Resolves the package's top-level location and reads each
+    direct ``.py`` submodule (and nested ``__init__.py``), bounded, so a
+    provider re-exported from a submodule is still classified. Returns ``[]``
+    when the module is not a package or nothing readable is found. Never
+    imports the package (import-free top-level resolution only).
+    """
+    parts = [p for p in module_name.split(".") if p]
+    if not parts:
+        return []
+    out: list = []
+    try:
+        spec = importlib.util.find_spec(parts[0])
+        if spec is None or not spec.submodule_search_locations:
+            return []
+        search_root = Path(spec.submodule_search_locations[0])
+        if not search_root.is_dir():
+            return []
+        for child in sorted(search_root.iterdir()):
+            if child.name.startswith(("_", ".")):
+                continue
+            if child.is_file() and child.suffix == ".py":
+                src = read_source_from_origin(str(child), limit)
+                if src:
+                    out.append(src)
+            elif child.is_dir() and (child / "__init__.py").is_file():
+                src = read_source_from_origin(str(child / "__init__.py"), limit)
+                if src:
+                    out.append(src)
+    except Exception:
+        return []
+    return out
+
+
 def classify_entrypoint(ep):
     """Classify one entry point by its module source, without importing it.
 
@@ -163,7 +202,22 @@ def classify_entrypoint(ep):
         # provider. Not "standalone": that verdict must be earned by reading
         # the source and finding no provider markers.
         return "unknown"
-    return detect_kind_from_source(source_text) or "standalone"
+    kind = detect_kind_from_source(source_text)
+    if kind is not None:
+        return kind
+    # The entry-point module's own source had no provider markers, but it may
+    # be a thin package that re-exports its register hook from a submodule
+    # (e.g. ``__init__.py`` is just ``from .core import register`` while the
+    # ``register_provider(ProviderProfile(...))`` call lives in ``core.py``).
+    # Scan the package's submodules too so such a provider is classified
+    # ``model-provider`` rather than ``standalone`` (which would silently
+    # deregister a provider of the documented shape on main).
+    sub = resolve_submodule_sources(module_name)
+    for sub_source in sub:
+        sub_kind = detect_kind_from_source(sub_source)
+        if sub_kind is not None:
+            return sub_kind
+    return "standalone"
 
 
 def kind_is_provider(kind: str) -> bool:

@@ -38,13 +38,23 @@ def _write_module(tmp_path, name, source):
     return mod
 
 
-def _stub_find_spec(monkeypatch, mapping):
-    """Point importlib.util.find_spec at fixture files for given module names."""
+def _stub_find_spec(monkeypatch, mapping, packages=None):
+    """Point importlib.util.find_spec at fixture files for given module names.
+
+    ``mapping`` maps top-level names to a module file. ``packages`` maps a
+    name to a package directory (for the submodule-scan / re-export tests).
+    """
     real_find_spec = ek.importlib.util.find_spec
 
     def fake_find_spec(name):
         if name in mapping:
             return types.SimpleNamespace(origin=str(mapping[name]), name=name)
+        if packages and name in packages:
+            pkgdir = packages[name]
+            return types.SimpleNamespace(
+                origin=str(pkgdir / "__init__.py"),
+                submodule_search_locations=[str(pkgdir)],
+            )
         return real_find_spec(name)
 
     monkeypatch.setattr(ek.importlib.util, "find_spec", fake_find_spec)
@@ -99,6 +109,28 @@ def test_classifier_unresolvable_is_unknown(monkeypatch):
 def test_classifier_non_string_value_is_unknown():
     # An entry point whose value is a bare callable (not module:func) → unknown
     assert ek.classify_entrypoint(_FakeEntryPoint("c", object())) == "unknown"
+
+
+def test_classifier_thin_package_reexport_is_model_provider(monkeypatch, tmp_path):
+    """A package whose __init__ re-exports register from a submodule is a provider.
+
+    Regression for the triage finding: a thin ``__init__.py`` containing only
+    ``from .core import register`` has no provider markers itself, but the
+    ``register_provider(ProviderProfile(...))`` call lives in ``core.py``. It
+    must classify as model-provider (not standalone, which would silently
+    deregister a provider of the documented shape on main).
+    """
+    pkgdir = tmp_path / "thinpkg"
+    pkgdir.mkdir()
+    (pkgdir / "__init__.py").write_text("from .core import register\n")
+    (pkgdir / "core.py").write_text(
+        "from providers import register_provider, ProviderProfile\n"
+        "def register():\n"
+        "    register_provider(ProviderProfile(name='x'))\n"
+    )
+    _stub_find_spec(monkeypatch, {}, packages={"thinpkg": pkgdir})
+
+    assert ek.classify_entrypoint(_FakeEntryPoint("t", "thinpkg:register")) == "model-provider"
 
 
 # ── general manager side ────────────────────────────────────────────────
