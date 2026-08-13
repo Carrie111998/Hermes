@@ -53,6 +53,14 @@ from tui_gateway.transport import (
 
 logger = logging.getLogger(__name__)
 
+
+def _notify_session_open(session_id: object, platform: object = "tui") -> bool:
+    """Public plugin lifecycle bridge used by session RPC handlers."""
+    from hermes_cli.plugins import notify_session_open
+
+    return notify_session_open(session_id, platform)
+
+
 _hermes_home = get_hermes_home()
 load_hermes_dotenv(
     hermes_home=_hermes_home, project_env=Path(__file__).parent.parent / ".env"
@@ -7619,6 +7627,70 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
     threading.Thread(target=interrupt, daemon=True, name=f"busy-interrupt-{sid}").start()
 
 
+def inject_external_message(
+    content: str,
+    role: str = "user",
+    *,
+    mode: str = "queue",
+    session_key: str | None = None,
+    plugin_id: str = "",
+) -> bool:
+    """Host-owned plugin message injection into an exact dashboard session.
+
+    Public counterpart of ``PluginContext.inject_message`` for the
+    TUI/dashboard surface.  Idle sessions start a new turn; busy sessions
+    queue at the safe boundary (never interrupting the active turn).
+    ``mode="steer"`` uses ``agent.steer()`` where supported; ``mode="interrupt"``
+    preserves the legacy hard-interrupt path.
+
+    ``session_key`` is the dashboard session id (or an exact
+    ``session_key``).  Unknown, finalised or missing targets fail closed
+    (``False``); invalid modes are rejected.
+    """
+    if mode not in ("queue", "steer", "interrupt"):
+        return False
+    if not session_key:
+        return False
+
+    text = content if role == "user" else f"[{role}] {content}"
+
+    with _sessions_lock:
+        session = _sessions.get(session_key)
+        sid = session_key
+        if session is None:
+            # Fall back to an exact session_key match (gateway-style keys).
+            for _sid, _s in _sessions.items():
+                if (
+                    str(_s.get("session_key") or "") == session_key
+                    and not _s.get("_finalized")
+                ):
+                    session, sid = _s, _sid
+                    break
+        if session is None or session.get("_finalized"):
+            return False
+        running = bool(session.get("running"))
+        agent = session.get("agent")
+        transport = session.get("transport")
+
+    if running:
+        if mode == "steer" and agent is not None and hasattr(agent, "steer"):
+            try:
+                if agent.steer(text):
+                    return True
+            except Exception:
+                pass  # fall through to the safe queue
+        elif mode == "interrupt":
+            _enqueue_prompt(session, text, transport)
+            _interrupt_busy_session(sid, session, agent)
+            return True
+        _enqueue_prompt(session, text, transport)
+        return True
+
+    # Idle: start a new turn through the host-owned submit path.
+    _run_prompt_submit(None, sid, session, text)
+    return True
+
+
 def _handle_busy_submit(
     rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
 ) -> dict | None:
@@ -14456,3 +14528,17 @@ for _m in (
 ):
     _m.register(sys.modules[__name__])
 del _m
+
+
+# ---------------------------------------------------------------------------
+# Host injection router registration (headless plugin contexts)
+# ---------------------------------------------------------------------------
+# Registers this surface with PluginContext.inject_message so plugins in a
+# serving process (hermes serve / desktop app) can target exact dashboard
+# sessions. Registration is host-owned; failure to register is non-fatal.
+try:
+    from hermes_cli.plugins import register_injection_router as _register_injection_router
+
+    _register_injection_router("tui", inject_external_message)
+except Exception:
+    pass

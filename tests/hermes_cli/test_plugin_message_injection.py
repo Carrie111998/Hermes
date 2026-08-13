@@ -30,12 +30,15 @@ def test_cli_idle_injection_keeps_existing_queue_behaviour():
         _agent_running=False,
         _pending_input=SimpleQueue(),
         _interrupt_queue=SimpleQueue(),
+        session_id="sess-1",
     )
+    cli.inject_message = MagicMock(return_value=True)
     manager._cli_ref = cli
 
     assert context.inject_message("new input") is True
-    assert cli._pending_input.get_nowait() == "new input"
-    assert cli._interrupt_queue.empty()
+    cli.inject_message.assert_called_once_with(
+        "new input", role="user", mode="queue", session_key=None
+    )
 
 
 def test_cli_running_injection_keeps_existing_interrupt_behaviour():
@@ -44,12 +47,15 @@ def test_cli_running_injection_keeps_existing_interrupt_behaviour():
         _agent_running=True,
         _pending_input=SimpleQueue(),
         _interrupt_queue=SimpleQueue(),
+        session_id="sess-1",
     )
+    cli.inject_message = MagicMock(return_value=True)
     manager._cli_ref = cli
 
     assert context.inject_message("status", "system") is True
-    assert cli._interrupt_queue.get_nowait() == "[system] status"
-    assert cli._pending_input.empty()
+    cli.inject_message.assert_called_once_with(
+        "status", role="system", mode="queue", session_key=None
+    )
 
 
 def test_gateway_injection_requires_session_key(tmp_path, monkeypatch):
