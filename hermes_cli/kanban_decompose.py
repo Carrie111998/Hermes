@@ -293,7 +293,6 @@ def decompose_task(
     configured, API error, malformed response, decomposer returned
     fanout=true with empty task list) — those surface via ``ok=False``.
     """
-    recover_after = False
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
         if task is None:
@@ -303,31 +302,23 @@ def decompose_task(
                 task_id, False, f"task is not in triage (status={task.status!r})"
             )
         escalated = kb.is_block_loop_escalated(conn, task_id)
-        if author == AUTO_DECOMPOSER_AUTHOR and not kb.is_auto_decomposable_triage(
-            conn, task_id,
-        ):
+        if not kb.is_auto_decomposable_triage(conn, task_id):
             if escalated:
-                # Block-loop escalations are waiting on a human decision; the
-                # breaker exists precisely to stop automated unblock↔re-block
-                # loops, so re-specifying one from the dispatcher would undo
-                # the human-in-the-loop gate (#79738, #79728).
+                # There is no authenticated owner-only recovery primitive in
+                # V1. Treat every caller, including the manual CLI, as
+                # untrusted for this transition. The owner must retire the
+                # escalated root and create a newly reviewed intake instead.
                 return DecomposeOutcome(
                     task_id, False,
                     "task escalated to triage after repeated blocks; "
-                    "waiting on human input — refusing to re-specify",
+                    "authenticated owner recovery is unavailable — "
+                    "refusing to re-specify",
                 )
             return DecomposeOutcome(
                 task_id, False,
-                "triage provenance is unclassified; explicit operator "
-                "decomposition is required",
+                "triage provenance is unclassified; create a newly reviewed "
+                "fresh-intake root",
             )
-        if escalated:
-            # Explicit manual decomposition IS the operator's human-in-the-loop
-            # decision, but the escalation is acknowledged (audited) only when
-            # the decomposition actually succeeds. A failed attempt must leave
-            # the card escalated and out of the auto-decompose feed, otherwise
-            # the next dispatcher tick would re-specify it (#81353 review).
-            recover_after = True
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)
@@ -410,8 +401,7 @@ def decompose_task(
                     assignee=assignee_val,
                     author=audit_author,
                     auto_promote=auto_promote,
-                    recover_escalation=recover_after,
-                    reject_open_descendants=True,
+                    validate_assignee=True,
                 )
         except ValueError as exc:
             return DecomposeOutcome(task_id, False, f"DB rejected spec: {exc}")
@@ -495,8 +485,7 @@ def decompose_task(
                 children=children,
                 author=audit_author,
                 auto_promote=auto_promote,
-                recover_escalation=recover_after,
-                reject_open_descendants=True,
+                validate_assignees=True,
             )
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
@@ -517,10 +506,10 @@ def decompose_task(
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Return auto-decomposable task ids currently in the triage column.
 
-    A durable ``triage_fresh_intake`` or ``triage_escalation_recovered``
-    marker must be newer than any block-loop/decomposition/specification that
-    consumed it. Legacy or otherwise unclassified rows fail closed and require
-    explicit operator decomposition.
+    A durable ``triage_fresh_intake`` marker (or a historical recovery marker)
+    must be newer than any block-loop/decomposition/specification that consumed
+    it. Legacy or otherwise unclassified rows fail closed; V1 does not expose
+    an unauthenticated recovery path.
     """
     query = (
         "SELECT id FROM tasks "

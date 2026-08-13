@@ -77,12 +77,9 @@ The gateway's auto-decomposer treats escalated triage differently from fresh tri
 
 - **Fresh triage** (a card created via `kanban_create` / the Triage column) receives a durable `triage_fresh_intake` event and is auto-decomposed on the dispatcher tick when `kanban.auto_decompose` is enabled.
 - **Escalated triage** (a card that reached triage via `block_loop_detected`) is skipped by the auto-decomposer feed (`list_triage_ids`) and refused by `decompose_task` on the automated path — re-specifying it would re-dispatch the very worker that keeps blocking.
-- **Unclassified triage** (including legacy rows without an intake/recovery marker) also stays out of the automatic feed. An operator must inspect and decompose it explicitly; upgrades never assume an ambiguous backlog is fresh work.
+- **Unclassified triage** (including legacy rows without an intake marker) also stays out of the automatic feed. Upgrades never assume an ambiguous backlog is fresh work.
 
-The operator recovery paths, both audited via a `triage_escalation_recovered` event:
-
-- `hermes kanban unblock --recover-escalated <task_id>` acknowledges the escalation explicitly: it clears `block_kind`, resets `block_recurrences` (fresh loop budget), and returns the card to the auto-decompose feed.
-- `hermes kanban decompose <task_id>` on an escalated card is itself the human-in-the-loop decision. Its recovery receipt and successful spec/graph transition commit in one transaction; a failed attempt leaves the escalation intact.
+V1 deliberately provides no escalation-recovery command. A profile name, CLI author string, or manual invocation is not authenticated owner authority. Retire the escalated root and create a newly reviewed fresh-intake root; this preserves the incident record and prevents an automation identity from laundering recovery into a second graph.
 
 Decomposition also refuses a task with any open downstream child graph. The check runs in the same write transaction as child creation, so a link added while the decomposer model is running cannot race into a duplicate graph.
 
