@@ -118,4 +118,62 @@ describe('createPluginContext.connection', () => {
     expect(listener).toHaveBeenCalledTimes(1)
     expect($connection.get()?.mode).toBe('remote')
   })
+
+  it('contains a throw from the immediate notification', () => {
+    // The immediate call runs inside the plugin's register; a throw must not
+    // escape into the loader.
+    setConnection(conn('local'))
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    let unsubscribe = () => {}
+
+    try {
+      expect(() => {
+        unsubscribe = createPluginContext('demo').connection.onModeChange(() => {
+          throw new Error('plugin bug')
+        })
+      }).not.toThrow()
+      expect(error).toHaveBeenCalledWith(expect.stringContaining('demo'), expect.any(Error))
+    } finally {
+      unsubscribe()
+      error.mockRestore()
+    }
+  })
+
+  it('contains a throw on a real transition and keeps other listeners running', () => {
+    // The subscription fires inside core setConnection (boot, reconnect,
+    // profile switch); a plugin throw escaping there would abort profile
+    // synchronization. It must be contained, attributed, and must not starve
+    // sibling listeners — including the thrower staying subscribed for
+    // later transitions.
+    setConnection(conn('local'))
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const unsubscribes: Array<() => void> = []
+
+    try {
+      const seen: Array<'local' | 'remote' | null> = []
+      unsubscribes.push(
+        createPluginContext('bad').connection.onModeChange(mode => {
+          if (mode === 'remote') {
+            throw new Error('plugin bug')
+          }
+        })
+      )
+      unsubscribes.push(createPluginContext('good').connection.onModeChange(mode => seen.push(mode)))
+
+      expect(() => setConnection(conn('remote'))).not.toThrow()
+      expect(seen).toEqual(['local', 'remote'])
+      expect(error).toHaveBeenCalledWith(expect.stringContaining('bad'), expect.any(Error))
+
+      // The throwing listener is still subscribed and hears later transitions
+      // (a non-throwing one this time — nothing new is reported).
+      error.mockClear()
+      expect(() => setConnection(conn('local'))).not.toThrow()
+      expect(seen).toEqual(['local', 'remote', 'local'])
+      expect(error).not.toHaveBeenCalled()
+    } finally {
+      unsubscribes.forEach(unsubscribe => unsubscribe())
+      error.mockRestore()
+    }
+  })
 })

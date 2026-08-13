@@ -183,16 +183,29 @@ function createPluginOs(pluginId: string): PluginOs {
 
 // Reads the resolved mode off the live connection atom rather than calling the
 // Electron bridge: the atom is what stays in lockstep with the ACTIVE profile
-// (syncConnectionToActiveProfile), so a plugin sees the same mode the session
+// (published atomically with a profile switch), so a plugin sees the same mode the session
 // RPCs announce. A raw bridge.getConnection() would describe the primary window
 // backend, which is the wrong answer whenever a background profile is active.
-function createPluginConnection(track: (dispose: () => void) => () => void): PluginConnection {
+function createPluginConnection(pluginId: string, track: (dispose: () => void) => () => void): PluginConnection {
+  // Isolate every listener call: the subscription below runs inside core
+  // connection updates (setConnection during boot, reconnect, and profile
+  // switches), so a plugin throw escaping here would abort profile
+  // synchronization/reconnect code — one bad plugin destabilizing the
+  // renderer. Same containment contract as gateway event listeners.
+  const invoke = (listener: (mode: HermesConnectionMode | null) => void, mode: HermesConnectionMode | null) => {
+    try {
+      listener(mode)
+    } catch (error) {
+      console.error(`[plugins] ${pluginId}: connection mode listener failed`, error)
+    }
+  }
+
   return {
     mode: () => resolveConnectionMode($connection.get()),
     onModeChange: listener => {
       let previous = resolveConnectionMode($connection.get())
 
-      listener(previous)
+      invoke(listener, previous)
 
       // $connection changes on every reconnect and descriptor refresh, most of
       // which don't move the mode. Only forward real transitions so a plugin
@@ -203,7 +216,7 @@ function createPluginConnection(track: (dispose: () => void) => () => void): Plu
 
           if (next !== previous) {
             previous = next
-            listener(next)
+            invoke(listener, next)
           }
         })
       )
@@ -231,7 +244,7 @@ export function createPluginContext(pluginId: string, onDispose?: (dispose: () =
     rest: <T>(path: string, opts?: PluginRestOptions) => pluginRest<T>(pluginId, path, opts),
     socket: (path, onMessage) => track(pluginSocket(pluginId, path, onMessage)),
     os: createPluginOs(pluginId),
-    connection: createPluginConnection(track),
+    connection: createPluginConnection(pluginId, track),
     storage: createPluginStorage(pluginId),
     i18n: createPluginI18n(pluginId, track)
   }
