@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -100,6 +101,90 @@ def _tail(text: str, limit: int = _TAIL_CHARS) -> str:
     return text[-limit:] if len(text) > limit else text
 
 
+def _assign_windows_kill_job(proc: subprocess.Popen) -> int | None:
+    """Put ``proc`` in a Windows job whose close kills all descendants."""
+    if os.name != "nt":
+        return None
+
+    import ctypes
+    from ctypes import wintypes
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [
+            (name, ctypes.c_ulonglong)
+            for name in (
+                "ReadOperationCount",
+                "WriteOperationCount",
+                "OtherOperationCount",
+                "ReadTransferCount",
+                "WriteTransferCount",
+                "OtherTransferCount",
+            )
+        ]
+
+    class _BasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _ExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _BasicLimitInformation),
+            ("IoInfo", _IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    limits = _ExtendedLimitInformation()
+    limits.BasicLimitInformation.LimitFlags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    configured = kernel32.SetInformationJobObject(
+        job, 9, ctypes.byref(limits), ctypes.sizeof(limits)
+    )
+    assigned = configured and kernel32.AssignProcessToJobObject(job, wintypes.HANDLE(proc._handle))
+    if not assigned:
+        kernel32.CloseHandle(job)
+        return None
+    return int(job)
+
+
+def _close_windows_kill_job(proc: subprocess.Popen) -> bool:
+    job = getattr(proc, "_hermes_kill_job", None)
+    if job is None:
+        return False
+    proc._hermes_kill_job = None
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle(wintypes.HANDLE(job))
+    return True
+
+
 def _run_phase_command(
     phase: str,
     command: str,
@@ -163,9 +248,38 @@ def _terminate_process_group(proc: subprocess.Popen) -> None:
     """Terminate the started app and its whole process group cleanly.
 
     On POSIX the child is spawned with ``start_new_session=True`` so we can
-    signal the whole group; on Windows (no ``os.killpg``) we fall back to
-    terminating just the direct child.
+    signal the whole group.  On Windows, ``shell=True`` commonly adds a shell
+    between us and the service, so taskkill's tree mode is required to reach
+    descendants such as npm-launched Node processes.
     """
+    if os.name == "nt":
+        if _close_windows_kill_job(proc):
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            return
+        if proc.poll() is not None:
+            return
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        return
     if proc.poll() is not None:
         return
     killpg = getattr(os, "killpg", None)
@@ -209,26 +323,23 @@ def _run_start_phase(
     port = port_override or recipe.port or 8000
     url = f"http://127.0.0.1:{port}{recipe.readiness_path}"
     started = time.monotonic()
-    proc = subprocess.Popen(
-        recipe.start,
-        shell=True,  # project-authored command; see module docstring
-        cwd=str(root),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,  # own process group for clean teardown
-        text=True,
-        errors="replace",
-    )
-    output = ""
-    try:
-        ready, status, error = _poll_readiness(url, ready_timeout)
-    finally:
-        _terminate_process_group(proc)
+    with tempfile.TemporaryFile() as output_file:
+        proc = subprocess.Popen(
+            recipe.start,
+            shell=True,  # project-authored command; see module docstring
+            cwd=str(root),
+            stdout=output_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,  # own process group for clean teardown
+        )
+        proc._hermes_kill_job = None
         try:
-            if proc.stdout is not None:
-                output = proc.stdout.read() or ""
-        except (OSError, ValueError):
-            output = ""
+            proc._hermes_kill_job = _assign_windows_kill_job(proc)
+            ready, status, error = _poll_readiness(url, ready_timeout)
+        finally:
+            _terminate_process_group(proc)
+        output_file.seek(0)
+        output = output_file.read().decode("utf-8", errors="replace")
     return ReadinessResult(
         url=url,
         ready=ready,
