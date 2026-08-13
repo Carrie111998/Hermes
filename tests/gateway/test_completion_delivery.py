@@ -112,6 +112,41 @@ def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registr
     adapter.handle_message.assert_awaited_once()
 
 
+def test_duplicate_approve_transition_replay_injects_once(
+    monkeypatch, isolated_registry,
+):
+    """A replayed APPROVE wakes the parent exactly once, without new authority."""
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    event = _async_event("deleg_approve_once")
+    event.update({
+        "goal": "Independent exact-SHA review and formal APPROVE or CHANGES_REQUIRED",
+        "summary": "APPROVE — BLOCKER 0 · MAJOR 0 · MINOR 0",
+        "terminal_transition": {
+            "kind": "review",
+            "verdict": "approve",
+            "transition": "resume_parent",
+            "resume_parent": True,
+            "grants_authority": False,
+            "requires_existing_authority": True,
+            "stop_at_human_gate": True,
+        },
+    })
+    isolated.put(dict(event))
+    isolated.put(dict(event))
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_awaited_once()
+    delivered = adapter.handle_message.await_args.args[0]
+    assert "Transition: resume_parent" in delivered.text
+    assert "does not grant authority" in delivered.text
+
+
 def test_unroutable_async_event_is_not_requeued_forever(
     monkeypatch, isolated_registry,
 ):
