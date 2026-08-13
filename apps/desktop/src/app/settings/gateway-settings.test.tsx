@@ -118,4 +118,33 @@ describe('GatewaySettings', () => {
       )
     )
   })
+
+  it('warns that SSH connection reuse is unavailable when the OS keyring is missing', async () => {
+    getConnectionConfig.mockResolvedValue({
+      ...localConnection,
+      mode: 'ssh',
+      sshHost: 'remote-box',
+      secureTokenStorage: false
+    })
+    const { GatewaySettings } = await import('./gateway-settings')
+
+    render(<GatewaySettings />)
+
+    expect(await screen.findByText('Connection reuse unavailable')).toBeTruthy()
+  })
+
+  it('does not warn about SSH connection reuse when the OS keyring is available', async () => {
+    getConnectionConfig.mockResolvedValue({
+      ...localConnection,
+      mode: 'ssh',
+      sshHost: 'remote-box',
+      secureTokenStorage: true
+    })
+    const { GatewaySettings } = await import('./gateway-settings')
+
+    render(<GatewaySettings />)
+
+    expect(await screen.findByText('Identity file')).toBeTruthy()
+    expect(screen.queryByText('Connection reuse unavailable')).toBeNull()
+  })
 })

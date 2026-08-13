@@ -801,6 +801,9 @@ export const ja = defineLocale({
       sshHermesPathPlaceholder: '自動検出',
       sshRemoteProfileTitle: 'リモートプロファイル（任意）',
       sshRemoteProfileDesc: 'リモートホスト上のプロファイル名。空欄 = Desktop のプロファイル名を使用。',
+      sshTokenReuseUnavailableTitle: '接続の再利用は利用できません',
+      sshTokenReuseUnavailableDesc:
+        'このマシンには OS のキーリングサービスが見つからないため、各 SSH 接続で発行されるダッシュボードトークンを安全に保存できず、保存されません。起動のたびに前回の接続を再利用せず、新しい接続を開きます。再利用を復元するには GNOME Keyring または KWallet をインストールまたは有効化してください。',
       sshTestConnection: 'SSH をテスト',
       sshConnect: '接続',
       sshButtonsHint: '「保存」は次回起動時に適用され、「接続」は今すぐ再接続します。',
