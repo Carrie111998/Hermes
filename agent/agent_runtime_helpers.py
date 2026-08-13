@@ -2992,6 +2992,21 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 from hermes_state import format_session_db_unavailable
                 return _finish_agent_tool(json.dumps({"success": False, "error": format_session_db_unavailable()}), next_args)
             from tools.session_search_tool import session_search as _session_search
+            # Workspace-scoped recall: when the user opts in via
+            # agent.workspace_scoped_recall (config.yaml), scope memory recall
+            # to the current workspace (the session's cwd / git repo root) so a
+            # "New Session In <workspace>" session doesn't mix other workspaces'
+            # history. Opt-in (default off) so global recall stays the default
+            # for everyone else. When off we pass an empty target → global.
+            _ws_target = ""
+            try:
+                from hermes_cli.config import load_config_readonly
+                _cfg = load_config_readonly() or {}
+                if ((_cfg.get("agent", {}) or {}).get("workspace_scoped_recall", False)):
+                    from agent.runtime_cwd import resolve_agent_cwd
+                    _ws_target = str(resolve_agent_cwd())
+            except Exception:
+                _ws_target = ""
             return _finish_agent_tool(
                 _session_search(
                     query=next_args.get("query", ""),
@@ -3003,6 +3018,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     sort=next_args.get("sort"),
                     db=session_db,
                     current_session_id=agent.session_id,
+                    workspace_target=_ws_target,
                 ),
                 next_args,
             )
