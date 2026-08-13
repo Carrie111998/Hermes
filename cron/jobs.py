@@ -237,6 +237,52 @@ def _oneshot_run_claim_ttl_seconds() -> float:
     )
 
 
+# Recurring jobs that fail this many times in a row are auto-paused instead
+# of firing (and alerting) on every subsequent tick forever — the classic
+# failure mode being a rotated credential. Operators fix the cause and
+# `hermes cron resume <id>`; resume/trigger reset the streak. Precedence:
+# per-job "failure_limit" > HERMES_CRON_FAILURE_LIMIT env > this default.
+# 0 or negative disables auto-pause.
+DEFAULT_CONSECUTIVE_FAILURE_LIMIT = 3
+
+
+def _consecutive_failure_limit(job: Dict[str, Any]) -> int:
+    raw = job.get("failure_limit")
+    if raw is None:
+        raw = os.getenv("HERMES_CRON_FAILURE_LIMIT", "").strip() or None
+    if raw is None:
+        return DEFAULT_CONSECUTIVE_FAILURE_LIMIT
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_CONSECUTIVE_FAILURE_LIMIT
+
+
+def _auto_pause_pending(job: Dict[str, Any], additional_failures: int = 0) -> bool:
+    """True when the job's failure streak (plus ``additional_failures`` not
+    yet recorded) has reached the auto-pause limit.
+
+    Only recurring schedules qualify — one-shots reach a terminal state on
+    their own and must not be re-labeled "paused".
+    """
+    if job.get("schedule", {}).get("kind") not in {"cron", "interval"}:
+        return False
+    limit = _consecutive_failure_limit(job)
+    if limit <= 0:
+        return False
+    return int(job.get("consecutive_failures") or 0) + additional_failures >= limit
+
+
+def failure_would_pause(job: Dict[str, Any]) -> bool:
+    """Return True when recording one more failure would auto-pause ``job``.
+
+    The scheduler uses this to fold the auto-pause notice into the failure
+    delivery of the run that trips the limit, so the operator gets one
+    escalation instead of an unexplained silence.
+    """
+    return _auto_pause_pending(job, additional_failures=1)
+
+
 def _job_running_in_this_process(job_id: str) -> bool:
     """Return True when the scheduler in THIS process is still running ``job_id``.
 
@@ -1422,6 +1468,7 @@ def create_job(
         "last_status": None,
         "last_error": None,
         "last_delivery_error": None,
+        "consecutive_failures": 0,
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
@@ -1655,6 +1702,9 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
             "state": "scheduled",
             "paused_at": None,
             "paused_reason": None,
+            # Resuming is an operator statement that the cause is fixed —
+            # restart the auto-pause streak from zero.
+            "consecutive_failures": 0,
             "next_run_at": next_run_at,
         },
     )
@@ -1672,6 +1722,8 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
             "state": "scheduled",
             "paused_at": None,
             "paused_reason": None,
+            # Manual trigger, like resume, resets the auto-pause streak.
+            "consecutive_failures": 0,
             "next_run_at": _hermes_now().isoformat(),
         },
     )
@@ -1719,6 +1771,13 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_run_at"] = now
                 job["last_status"] = "ok" if success else "error"
                 job["last_error"] = error if not success else None
+                # Consecutive-failure streak: reset on success, else grow.
+                # Absent key (pre-existing records) reads as 0. Drives the
+                # recurring-job auto-pause below.
+                if success:
+                    job["consecutive_failures"] = 0
+                else:
+                    job["consecutive_failures"] = int(job.get("consecutive_failures") or 0) + 1
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
                 # Clear any external-fire claim so a re-armed recurring job can
@@ -1798,7 +1857,23 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         job["enabled"] = False
                         job["state"] = "completed"
                 elif job.get("state") != "paused":
-                    job["state"] = "scheduled"
+                    if not success and _auto_pause_pending(job):
+                        job["enabled"] = False
+                        job["state"] = "paused"
+                        job["paused_at"] = now
+                        job["paused_reason"] = (
+                            f"auto-paused after {job['consecutive_failures']} "
+                            "consecutive failures"
+                        )
+                        logger.warning(
+                            "Job '%s' (%s) auto-paused after %d consecutive "
+                            "failures; fix the cause and resume with "
+                            "`hermes cron resume %s`.",
+                            job.get("name", "?"), job["id"],
+                            job["consecutive_failures"], job["id"],
+                        )
+                    else:
+                        job["state"] = "scheduled"
 
                 save_jobs(jobs)
                 return

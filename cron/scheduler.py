@@ -282,7 +282,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim, failure_would_pause
 from cron.jobs import get_ticker_heartbeat_age
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
@@ -4035,6 +4035,17 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # If the agent responded with [SILENT], skip delivery (but
             # output is already saved above).  Failed jobs always deliver.
             deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
+            # When this failure trips the consecutive-failure limit,
+            # mark_job_run below will auto-pause the job — say so in the
+            # same delivery, so the operator gets one escalation instead of
+            # per-tick failure spam followed by unexplained silence.
+            if not success and failure_would_pause(job):
+                streak = int(job.get("consecutive_failures") or 0) + 1
+                deliver_content += (
+                    f"\n⏸️ Auto-pausing this job after {streak} consecutive "
+                    f"failures. It will not run again until resumed: "
+                    f"`hermes cron resume {job['id']}`"
+                )
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.

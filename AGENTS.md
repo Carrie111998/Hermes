@@ -1184,6 +1184,11 @@ Hardening invariants:
   across processes.
 - Cron sessions pass `skip_memory=True` by default; memory providers
   intentionally do not run during cron.
+- **Consecutive-failure auto-pause**: a recurring job that fails N times
+  in a row (per-job `failure_limit` > `HERMES_CRON_FAILURE_LIMIT` env >
+  default 3; `0` disables) is paused instead of failing forever, with the
+  auto-pause notice folded into the final failure delivery. `resume` /
+  `trigger` and any successful run reset the streak. One-shots are exempt.
 
 Cron deliveries are **not** mirrored into the target gateway session —
 they land in their own cron session with a header/footer frame so the
