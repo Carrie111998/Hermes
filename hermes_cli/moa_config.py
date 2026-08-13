@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 from copy import deepcopy
 from typing import Any
 
@@ -20,6 +21,12 @@ DEFAULT_MOA_AGGREGATOR: dict[str, str] = {
     "model": "anthropic/claude-opus-4.8",
 }
 
+DEFAULT_MOA_REFERENCE_TIMEOUT: float | None = None
+
+
+def _default_reference_models() -> list[dict[str, Any]]:
+    return [{**slot, "enabled": True} for slot in deepcopy(DEFAULT_MOA_REFERENCE_MODELS)]
+
 
 def _coerce_float_or_none(value: Any) -> float | None:
     """Coerce to a float, or None when unset/blank/invalid.
@@ -35,6 +42,53 @@ def _coerce_float_or_none(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _coerce_reference_timeout(value: Any) -> float | None:
+    """Return a finite positive advisor timeout, or None to inherit.
+
+    ``None`` (the default) means "no per-preset override": the reference
+    fan-out inherits the ``auxiliary.moa_reference.timeout`` config value
+    (900s by default) via ``call_llm``'s own resolution, exactly like every
+    other auxiliary task. An explicit finite positive per-preset value is
+    honored as-is — no artificial cap, since long-thinking advisor models
+    legitimately run far beyond five minutes.
+    """
+    if value is None or value == "" or isinstance(value, bool):
+        return DEFAULT_MOA_REFERENCE_TIMEOUT
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_MOA_REFERENCE_TIMEOUT
+    if not math.isfinite(timeout) or timeout <= 0:
+        return DEFAULT_MOA_REFERENCE_TIMEOUT
+    return timeout
+
+
+def _coerce_degraded_reference_policy(value: Any) -> str:
+    """Normalize failed-advisor disclosure policy; unknown values fail loud."""
+    policy = str(value or "loud").strip().lower()
+    return policy if policy in {"loud", "silent"} else "loud"
+
+
+def coerce_synthesis_style(value: Any) -> str:
+    """Normalize the MoA synthesis style; unknown values degrade to 'guidance'.
+
+    - ``'guidance'`` (default): the classic MoA shape — advisor responses are
+      synthesized into PRIVATE context for the acting model, which then
+      answers the user normally. Advisor perspectives never surface as a
+      deliverable.
+    - ``'council'``: multi-model deliberation shape (inspired by Perplexity
+      Computer's Model Council, Aug 2026): each reference model weighs in
+      independently and the acting model becomes the council *chair*,
+      producing a USER-FACING report that explicitly surfaces where the
+      models agree, where they disagree (and why — differing starting
+      assumptions), what each uniquely contributes, and a recommended
+      position with confidence. Built for ambiguous judgment calls where
+      disagreement between frontier models is itself the signal.
+    """
+    style = str(value or "guidance").strip().lower()
+    return style if style in {"guidance", "council"} else "guidance"
 
 
 def _coerce_int(value: Any, default: int) -> int:
@@ -68,9 +122,64 @@ def _coerce_int_or_none(value: Any) -> int | None:
 
 
 def _coerce_fanout(value: Any) -> str:
-    """Normalize the fan-out cadence; unknown values fall back to default."""
+    """Normalize the fan-out cadence; unknown values fall back to default.
+
+    Canonical values are the strings ``per_iteration``, ``user_turn``, and
+    ``every_n:<N>`` (N >= 2). The ``every_n`` cadence also accepts the mapping
+    form ``{mode: every_n, n: N}`` from hand-edited YAML and normalizes it to
+    the canonical string, so the rest of the pipeline (presets, flattened
+    view, runtime) only ever sees one shape. ``every_n:1`` semantically means
+    "run every iteration" and collapses to ``per_iteration``; anything
+    unparseable falls back to ``user_turn`` (the default — cheapest cadence;
+    see #67199).
+    """
+    if isinstance(value, dict):
+        # Mapping form: {mode: every_n, n: 3}. Non-every_n mapping modes fall
+        # through to the string path below (e.g. {mode: user_turn}).
+        mode = str(value.get("mode") or "").strip().lower()
+        if mode == "every_n":
+            n = _coerce_int(value.get("n"), 0)
+            if n >= 2:
+                return f"every_n:{n}"
+            return "per_iteration" if n == 1 else "user_turn"
+        value = mode
     mode = str(value or "").strip().lower()
-    return mode if mode in {"per_iteration", "user_turn"} else "per_iteration"
+    if mode in {"per_iteration", "user_turn"}:
+        return mode
+    if mode.startswith("every_n"):
+        _, sep, rest = mode.partition(":")
+        n = _coerce_int(rest.strip(), 0) if sep else 0
+        if n >= 2:
+            return f"every_n:{n}"
+        if n == 1:
+            return "per_iteration"
+    return "user_turn"
+
+
+def coerce_privacy_filter(value: Any) -> str:
+    """Normalize ``moa.privacy_filter`` to '' (off), 'display', or 'full'.
+
+    - ``''`` (empty string): filter off — the default. ``false``/``None``/
+      unknown values land here so a hand-edited config degrades to prior
+      behavior (tolerant-read contract).
+    - ``'display'``: redact user-visible surfaces only — the reference blocks
+      shown in the UI and the saved MoA trace records. The aggregator still
+      sees raw advisor text, so answer quality is unaffected.
+    - ``'full'``: additionally redact the advisor text injected into the
+      aggregator prompt (issue #59959's literal ask). A hand-edited boolean
+      ``true`` maps here because the issue framed the toggle as "redact
+      before passing to the aggregator".
+    """
+    if value is True:
+        return "full"
+    if value is None or value is False:
+        return ""
+    mode = str(value).strip().lower()
+    if mode in {"display", "full"}:
+        return mode
+    if mode in {"true", "on", "yes", "1"}:
+        return "full"
+    return ""
 
 
 def _clean_reasoning_effort(value: Any) -> str | None:
@@ -87,7 +196,22 @@ def _clean_reasoning_effort(value: Any) -> str | None:
     return parsed.get("effort")
 
 
-def _clean_slot(slot: Any) -> dict[str, Any] | None:
+def _coerce_bool(value: Any, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"0", "false", "no", "off"}:
+            return False
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        return default
+    return bool(value)
+
+
+def _clean_slot(slot: Any, *, include_enabled: bool = False) -> dict[str, Any] | None:
     if not isinstance(slot, dict):
         return None
     provider = str(slot.get("provider") or "").strip()
@@ -105,6 +229,16 @@ def _clean_slot(slot: Any) -> dict[str, Any] | None:
     effort = _clean_reasoning_effort(slot.get("reasoning_effort"))
     if effort:
         clean["reasoning_effort"] = effort
+    # Optional per-slot max_tokens: overrides the preset-level
+    # reference_max_tokens for this specific reference model. None (the
+    # default) = no cap, so existing slots are unaffected. Allows tuning
+    # each advisor's output length independently — useful when one model
+    # is verbose and another is terse.
+    slot_mt = _coerce_int_or_none(slot.get("max_tokens"))
+    if slot_mt is not None:
+        clean["max_tokens"] = slot_mt
+    if include_enabled:
+        clean["enabled"] = _coerce_bool(slot.get("enabled"), True)
     return clean
 
 
@@ -181,15 +315,18 @@ def validate_moa_payload(raw: Any) -> list[str]:
 
 def _default_preset() -> dict[str, Any]:
     return {
-        "reference_models": deepcopy(DEFAULT_MOA_REFERENCE_MODELS),
+        "reference_models": _default_reference_models(),
         "aggregator": deepcopy(DEFAULT_MOA_AGGREGATOR),
         # None = temperature omitted from API calls (provider default),
         # matching single-model agent behavior.
         "reference_temperature": None,
         "aggregator_temperature": None,
+        "reference_timeout": DEFAULT_MOA_REFERENCE_TIMEOUT,
+        "degraded_reference_policy": "loud",
         "max_tokens": 4096,
         "reference_max_tokens": None,
-        "fanout": "per_iteration",
+        "fanout": "user_turn",
+        "synthesis_style": "guidance",
         "enabled": True,
     }
 
@@ -199,24 +336,34 @@ def _normalize_preset(raw: Any) -> dict[str, Any]:
         raw = {}
 
     raw_refs = raw.get("reference_models")
+    # reference_models may be a JSON string (hand-edited config.yaml) or a list.
+    if isinstance(raw_refs, str):
+        try:
+            raw_refs = json.loads(raw_refs)
+        except (json.JSONDecodeError, ValueError):
+            raw_refs = []
     if not isinstance(raw_refs, list):
         # A hand-edited scalar / single mapping (or a bad type) must degrade to
         # defaults instead of crashing the iteration, mirroring the tolerance
         # for the scalar fields below (reference_temperature / max_tokens).
         raw_refs = [raw_refs] if isinstance(raw_refs, dict) else []
-    refs = [_clean_slot(item) for item in raw_refs]
+    refs = [_clean_slot(item, include_enabled=True) for item in raw_refs]
     refs = [item for item in refs if item is not None]
     if not refs:
-        refs = deepcopy(DEFAULT_MOA_REFERENCE_MODELS)
+        refs = _default_reference_models()
 
     aggregator = _clean_slot(raw.get("aggregator")) or deepcopy(DEFAULT_MOA_AGGREGATOR)
 
     return {
-        "enabled": bool(raw.get("enabled", True)),
+        "enabled": _coerce_bool(raw.get("enabled"), True),
         "reference_models": refs,
         "aggregator": aggregator,
         "reference_temperature": _coerce_float_or_none(raw.get("reference_temperature")),
         "aggregator_temperature": _coerce_float_or_none(raw.get("aggregator_temperature")),
+        "reference_timeout": _coerce_reference_timeout(raw.get("reference_timeout")),
+        "degraded_reference_policy": _coerce_degraded_reference_policy(
+            raw.get("degraded_reference_policy")
+        ),
         "max_tokens": _coerce_int(raw.get("max_tokens"), 4096),
         # Optional cap on how much each reference ADVISOR may generate per turn.
         # None (default) = uncapped: advisors write full-length advice, matching
@@ -227,13 +374,24 @@ def _normalize_preset(raw: Any) -> dict[str, Any]:
         # judgement, so capping roughly halves per-turn wall time. Does NOT cap
         # the acting aggregator (its output is the user-visible answer).
         "reference_max_tokens": _coerce_int_or_none(raw.get("reference_max_tokens")),
-        # When the reference fan-out runs. "per_iteration" (default) re-runs
-        # the advisors whenever the advisory view changes — i.e. every tool
-        # iteration, so advice tracks live task state. "user_turn" runs the
-        # advisors ONCE per user turn (the original MoA shape): the
-        # aggregator gets their upfront plan-level advice, then acts alone
-        # for the rest of the tool loop.
+        # When the reference fan-out runs. "user_turn" (default) runs the
+        # advisors ONCE per user turn (the original MoA shape, and the
+        # cheapest cadence — #67199): the aggregator gets their upfront
+        # plan-level advice, then acts alone for the rest of the tool loop.
+        # "per_iteration" re-runs the advisors whenever the advisory view
+        # changes — i.e. every tool iteration, so advice tracks live task
+        # state at the cost of multiplying advisor spend by tool-loop depth.
+        # "every_n:<N>" (N >= 2) is the middle ground: advisors run on the
+        # first iteration of each user turn and every Nth tool iteration
+        # after it; in-between iterations reuse the cached guidance from the
+        # last advisor run. Also accepts the mapping form
+        # {mode: every_n, n: N}, normalized to the canonical string.
         "fanout": _coerce_fanout(raw.get("fanout")),
+        # How advisor output is synthesized for the acting model. "guidance"
+        # (default) keeps advisor perspectives as private context; "council"
+        # turns the acting model into a council chair producing a user-facing
+        # agree/disagree report (see coerce_synthesis_style).
+        "synthesis_style": coerce_synthesis_style(raw.get("synthesis_style")),
     }
 
 
@@ -278,10 +436,17 @@ def normalize_moa_config(raw: Any) -> dict[str, Any]:
         "aggregator": deepcopy(active["aggregator"]),
         "reference_temperature": active["reference_temperature"],
         "aggregator_temperature": active["aggregator_temperature"],
+        "reference_timeout": active["reference_timeout"],
+        "degraded_reference_policy": active["degraded_reference_policy"],
         "max_tokens": active["max_tokens"],
         "reference_max_tokens": active.get("reference_max_tokens"),
-        "fanout": active.get("fanout", "per_iteration"),
+        "fanout": active.get("fanout", "user_turn"),
+        "synthesis_style": active.get("synthesis_style", "guidance"),
         "enabled": active["enabled"],
+        # MoA-level (not per-preset) toggles ride at the top level alongside
+        # save_traces. privacy_filter: '' (off, default) | 'display' | 'full'
+        # — see coerce_privacy_filter for the semantics of each mode.
+        "privacy_filter": coerce_privacy_filter(raw.get("privacy_filter")),
     }
 
 
@@ -337,11 +502,24 @@ def set_active_moa_preset(config: Any, name: str | None) -> dict[str, Any]:
     return cfg
 
 
-def encode_moa_turn(prompt: str, config: Any = None, preset: str | None = None) -> str:
-    """Encode a /moa one-shot turn for frontends that can only send text."""
+def encode_moa_turn(
+    prompt: str,
+    config: Any = None,
+    preset: str | None = None,
+    synthesis_style: str | None = None,
+) -> str:
+    """Encode a /moa one-shot turn for frontends that can only send text.
+
+    ``synthesis_style``, when given, overrides the resolved preset's style for
+    this one turn (used by ``/council`` to force a council deliberation over
+    the default preset without touching config).
+    """
+    turn_config = resolve_moa_preset(config or {}, preset)
+    if synthesis_style is not None:
+        turn_config["synthesis_style"] = coerce_synthesis_style(synthesis_style)
     payload = {
         "prompt": str(prompt or ""),
-        "config": resolve_moa_preset(config or {}, preset),
+        "config": turn_config,
     }
     encoded = base64.urlsafe_b64encode(
         json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -362,9 +540,16 @@ def decode_moa_turn(message: Any) -> tuple[str, dict[str, Any] | None]:
     return prompt, _normalize_preset(payload.get("config") or {})
 
 
-def build_moa_turn_prompt(user_prompt: str, config: Any = None, preset: str | None = None) -> str:
+def build_moa_turn_prompt(
+    user_prompt: str,
+    config: Any = None,
+    preset: str | None = None,
+    synthesis_style: str | None = None,
+) -> str:
     """Build the hidden one-shot payload used by TUI/gateway routing."""
-    return encode_moa_turn(user_prompt, config, preset=preset)
+    return encode_moa_turn(
+        user_prompt, config, preset=preset, synthesis_style=synthesis_style
+    )
 
 
 def moa_usage() -> str:
