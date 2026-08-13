@@ -5365,7 +5365,11 @@ class BasePlatformAdapter(ABC):
         return live_adapter
 
     _SCRATCH_LINE_RE = re.compile(
-        r"(?im)^(?:\s*(?:[-*]\s*)?)Need\s+(?:install|commit|push|verify|status|todo|objective|maybe)\b.*$"
+        r"(?im)^(?:\s*(?:[-*]\s*)?)(?:"
+        r"Need\s+(?:install|commit|push|verify|status|todo|objective|maybe)\b.*"
+        r"|Updated the skill library\.\s*"
+        r"|Session restored successfully\.\s*"
+        r")$"
     )
     _CODE_SPAN_RE = re.compile(r"`[^`]*`")
     _CODE_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)

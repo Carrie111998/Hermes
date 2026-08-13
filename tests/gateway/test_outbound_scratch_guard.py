@@ -71,3 +71,17 @@ async def test_send_with_retry_allows_quoted_scratch_diagnosis():
 
     assert result.success is True
     assert adapter.sent == ["The screenshot showed quoted scratch text: `Need commit push.`"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    ["Updated the skill library.", "Session restored successfully."],
+)
+async def test_send_with_retry_blocks_internal_lifecycle_messages(content):
+    adapter = DummyAdapter()
+
+    result = await adapter._send_with_retry("chat1", content)
+
+    assert result.success is False
+    assert adapter.sent == []
