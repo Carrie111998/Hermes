@@ -32,7 +32,10 @@ say()  { printf '\033[1;36m[build]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[build]\033[0m ERROR: %s\n' "$*" >&2; exit 1; }
 
 ensure_cert() {
-  if security find-identity -v -p codesigning 2>/dev/null | grep -q "$CERT"; then
+  # Self-signed identities often do not show up in `find-identity -v`
+  # (Apple policy store). Presence of the cert is the real check; codesign
+  # itself fails closed if the private key is missing.
+  if security find-certificate -c "$CERT" >/dev/null 2>&1; then
     return 0
   fi
   cat >&2 <<EOF
@@ -42,7 +45,7 @@ Create it once (do not use ad-hoc 'codesign -s -' — Screen Recording TCC
 is bound to the signing identity and is lost on every ad-hoc rebuild):
 
   1. Open Keychain Access
-  2. Certificate Assistant → Create a Certificate…
+  2. Certificate Assistant → Create a Certificate...
   3. Name: $CERT
   4. Identity Type: Self Signed Root
   5. Certificate Type: Code Signing
@@ -164,7 +167,7 @@ mkdir -p "$APP_DIR" "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
 HOST_ARCH="$(uname -m)"
 ARM_T="arm64-apple-macos14.0"
 X86_T="x86_64-apple-macos14.0"
-say "compiling $SOURCE…"
+say "compiling ${SOURCE}..."
 if [ "$HOST_ARCH" = "arm64" ]; then
   compile_one "$ARM_T" "$BINARY-arm64"
   if compile_one "$X86_T" "$BINARY-x86_64" 2>/tmp/agent-screen-x86-build.log; then
@@ -182,7 +185,7 @@ else
 fi
 
 # 2) Assemble the bundle
-say "assembling bundle…"
+say "assembling bundle..."
 cp "$BINARY" "$BUNDLE/Contents/MacOS/agent-screen-app"
 chmod +x "$BUNDLE/Contents/MacOS/agent-screen-app"
 write_info_plist
@@ -195,14 +198,14 @@ if [ -f "$ICNS" ]; then
 fi
 
 # 3) Sign (named identity — never ad-hoc)
-say "signing with '$CERT'…"
+say "signing with '$CERT'..."
 codesign --force --sign "$CERT" --timestamp=none "$BUNDLE"
 
 # 4) Refresh Launch Services so the Dock/Finder pick up the icon + id
 LSREG="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 "$LSREG" -f "$BUNDLE" >/dev/null 2>&1 || true
 
-say "verifying…"
+say "verifying..."
 check
 echo
 say "done. start: $PROJECT_DIR/agent-screen.sh"
