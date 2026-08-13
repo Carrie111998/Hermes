@@ -549,21 +549,21 @@ class SignalAdapter(BasePlatformAdapter):
     # Message Handling
     # ------------------------------------------------------------------
 
-    def _signal_source_is_authorized(self, source: SessionSource) -> bool:
-        """Authorize passive context against the source's resolved profile."""
-        if getattr(source, "profile_route_rejected", False) is True:
-            return False
+    def _signal_observation_profile_matches(self, source: SessionSource) -> bool:
+        """Whether passive context can use this transport's auth callback."""
+        routed_profile = str(getattr(source, "profile", "") or "").strip()
+        transport_profile = str(
+            getattr(self, "_signal_transport_profile_name", "") or ""
+        ).strip()
+        return not routed_profile or routed_profile == transport_profile
 
-        runner = getattr(self, "gateway_runner", None)
-        if runner is not None:
-            try:
-                return bool(runner._is_user_authorized_for_source(source))
-            except Exception:
-                logger.warning(
-                    "Signal: routed passive-context authorization failed; denying",
-                    exc_info=True,
-                )
-                return False
+    def _signal_source_is_authorized(self, source: SessionSource) -> bool:
+        """Authorize passive context without crossing a profile boundary."""
+        if (
+            getattr(source, "profile_route_rejected", False) is True
+            or not self._signal_observation_profile_matches(source)
+        ):
+            return False
 
         authorized = self._is_sender_authorized(
             source.user_id, source.chat_type, source.chat_id
@@ -829,16 +829,22 @@ class SignalAdapter(BasePlatformAdapter):
             and self.observe_unmentioned_group_messages
             and not (text or "").lstrip().startswith("/")
         ):
-            # The normal gateway authorization still runs in the handler. This
-            # early check prevents an unauthorized addressed message from
-            # consuming the group's context window before that gate rejects it.
-            if not self._signal_source_is_authorized(source):
+            # The normal gateway hook and authorization path still owns
+            # addressed ingress. This early check only decides whether the
+            # optional passive context may be consumed.
+            if getattr(source, "profile_route_rejected", False) is True:
+                return
+            if not self._signal_observation_profile_matches(source):
+                # Normal addressed ingress still owns cross-profile routing;
+                # only the optional passive context is unavailable here.
+                observed_context = None
+            elif not self._signal_source_is_authorized(source):
                 logger.debug(
-                    "Signal: ignoring observed-context trigger from unauthorized sender %s",
+                    "Signal: withholding observed context from unauthorized sender %s",
                     redact_phone(sender),
                 )
-                return
-            observed_context = self._consume_observed_group_context(group_id)
+            else:
+                observed_context = self._consume_observed_group_context(group_id)
 
         # Determine message type from media
         msg_type = MessageType.TEXT

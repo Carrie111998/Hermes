@@ -163,6 +163,10 @@ then becomes context on that normal addressed turn. Attachments from unmentioned
 messages are not downloaded, and messages from senders outside the configured
 user allowlist are not buffered.
 
+When one primary Signal transport is shared across multiplexed profile routes,
+passive buffering is skipped for chats routed to another profile. Addressed
+messages continue through the normal profile-routing path.
+
 ---
 
 ## Features
