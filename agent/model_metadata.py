@@ -21,7 +21,7 @@ import yaml
 if TYPE_CHECKING:  # pragma: no cover — runtime import is lazy (see below)
     import requests
 
-from utils import atomic_json_write, base_url_host_matches, base_url_hostname
+from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, base_url_hostname
 
 from hermes_constants import OPENROUTER_MODELS_URL
 
@@ -602,6 +602,14 @@ def grok_supports_reasoning_effort(model: str) -> bool:
         if sep in name:
             name = name.rsplit(sep, 1)[-1]
     return any(name.startswith(prefix) for prefix in _GROK_EFFORT_CAPABLE_PREFIXES)
+
+
+def is_grok_46_family(model: str) -> bool:
+    """Return whether *model* is a Grok 4.6 family identifier."""
+    name = (model or "").strip().lower().replace("_", "-")
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
+    return name == "grok-4.6" or name.startswith("grok-4.6-")
 
 
 _CONTEXT_LENGTH_KEYS = (
@@ -1452,6 +1460,15 @@ def save_context_length(model: str, base_url: str, length: int) -> None:
     Cache key is ``model@base_url`` so the same model name served from
     different providers can have different limits.
     """
+    # Never persist non-positive values — a 0 or negative context length
+    # is always a bug and would poison the cache, causing downstream
+    # `get_model_context_length()` to return 0 (since `0 is not None`).
+    if length <= 0:
+        logger.warning(
+            "Refusing to cache non-positive context length %s -> %s tokens",
+            f"{model}@{base_url}", length,
+        )
+        return
     key = _context_cache_key(model, base_url)
     cache = _load_context_cache()
     if cache.get(key) == length:
@@ -1459,9 +1476,13 @@ def save_context_length(model: str, base_url: str, length: int) -> None:
     cache[key] = length
     path = _get_context_cache_path()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.dump({"context_lengths": cache}, f, default_flow_style=False)
+        # Atomic write (temp file + fsync + os.replace): a plain truncating
+        # ``open(path, "w")`` leaves the file empty/partial if the process is
+        # killed mid-dump, and the next _load_context_cache() swallows the
+        # resulting YAML error and returns {} — silently wiping EVERY cached
+        # context length. It also exposes torn reads to a concurrent process
+        # reading between truncate and dump-complete.
+        atomic_yaml_write(path, {"context_lengths": cache})
         logger.info("Cached context length %s -> %s tokens", key, f"{length:,}")
     except Exception as e:
         logger.debug("Failed to save context length cache: %s", e)
@@ -1508,9 +1529,9 @@ def _invalidate_cached_context_length(model: str, base_url: str) -> None:
         cache.pop(k, None)
     path = _get_context_cache_path()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.dump({"context_lengths": cache}, f, default_flow_style=False)
+        # Atomic write — see save_context_length() for why a plain truncating
+        # open() here risks wiping the entire cache on an interrupted dump.
+        atomic_yaml_write(path, {"context_lengths": cache})
     except Exception as e:
         logger.debug("Failed to invalidate context length cache entry %s: %s", key, e)
 
@@ -2061,6 +2082,22 @@ def _stale_pre_catalog_cache_entry(model: str, cached: int) -> bool:
     return cached <= threshold
 
 
+def _model_name_suggests_minimax(model: str) -> bool:
+    """Return True if the model name looks like a MiniMax-family model.
+
+    Catches ``MiniMax-M2.7``, ``minimax-m2.5``, ``MiniMaxAI/MiniMax-M2.5``,
+    and similar variants. Used as a guard against stale 32K metadata that
+    underreports the MiniMax M2 family, whose real context window is 204.8K.
+    """
+    lower = model.lower()
+    return lower.startswith("minimax") or "minimaxai/" in lower
+
+
+def _model_name_suggests_stale_32k_underreport(model: str) -> bool:
+    """Return True for model families known to be wrongly underreported as 32K."""
+    return _model_name_suggests_kimi(model) or _model_name_suggests_minimax(model)
+
+
 def _query_local_context_length(model: str, base_url: str, api_key: str = "") -> Optional[int]:
     """Query a local server for the model's context length (short-TTL cached).
 
@@ -2483,13 +2520,18 @@ def _resolve_nous_context_length(
     metadata = fetch_model_metadata()
 
     def _safe_ctx(or_id: str, entry: dict) -> Optional[int]:
+        """Return context length, but reject known stale 32K underreports.
+
+        Apply the same guard used for the generic OpenRouter path (step 6 in
+        resolve_context_length) so the Nous portal path does not short-circuit it.
+        """
         ctx = entry.get("context_length")
         if ctx is None:
             return None
-        if ctx <= 32768 and _model_name_suggests_kimi(or_id):
+        if ctx <= 32768 and _model_name_suggests_stale_32k_underreport(or_id):
             logger.info(
                 "Rejecting OpenRouter metadata context=%s for %r "
-                "(Kimi-family underreport, Nous path); falling through to hardcoded defaults",
+                "(known 32K underreport, Nous path); falling through to hardcoded defaults",
                 ctx, or_id,
             )
             return None
@@ -2535,6 +2577,7 @@ def get_model_context_length(
 
     Resolution order:
     0. Explicit config override (model.context_length or custom_providers per-model)
+    0b. model_overrides config (per-provider+model context_window override)
     0c. Endpoint-scoped metadata for models validated on one multiplexed endpoint
     1. Persistent cache (previously discovered via probing).  Nous URLs,
        LM Studio, and Codex OAuth bypass the cache here so their provider
@@ -2596,7 +2639,23 @@ def get_model_context_length(
             logger.debug("MoA aggregator context-length resolution failed", exc_info=True)
         # Fall through to the generic default if aggregator resolution failed.
 
-    # 0b. custom_providers per-model override — check before any probe.
+    # 0b. model_overrides config — EXPLICIT per-provider+model context_window
+    # override only (fill-gap _default entries are applied later, inside
+    # lookup_models_dev_context at step 5f, once the catalog has actually
+    # missed — so a _default can never preempt custom_providers or live
+    # probes). This is the supported self-unblock path for models with
+    # wrong context in models.dev (#84482) and for custom/local models
+    # (#8731). Config-read only; never blocks on the network.
+    if provider and model:
+        try:
+            from agent.models_dev import _override_context_window
+            mo_ctx = _override_context_window(provider, model)
+            if mo_ctx is not None and mo_ctx > 0:
+                return mo_ctx
+        except Exception:
+            pass  # fall through to other resolution paths
+
+    # 0c. custom_providers per-model override — check before any probe.
     # This closes the gap where /model switch and display paths used to fall
     # back to 128K despite the user having a per-model context_length set.
     # See #15779.
@@ -2664,10 +2723,22 @@ def get_model_context_length(
     if base_url and not _skip_persistent_context_cache(base_url, provider):
         cached = get_cached_context_length(model, base_url)
         if cached is not None:
-            # Invalidate stale 32k cache entries for Kimi-family models.
-            if cached <= 32768 and _model_name_suggests_kimi(model):
+            # Reject non-positive cached values — a 0 or negative value
+            # is always a bug (corrupted cache, probe failure, or manual
+            # edit).  Without this guard, `0 is not None` short-circuits
+            # the resolution chain and the compressor gets context_length=0,
+            # breaking every status-bar and /usage display downstream.
+            if cached <= 0:
+                logger.warning(
+                    "Dropping non-positive cache entry %s@%s -> %s; re-resolving",
+                    model, base_url, cached,
+                )
+                _invalidate_cached_context_length(model, base_url)
+            # Invalidate stale 32k cache entries for model families known to
+            # be underreported by stale third-party metadata (Kimi, MiniMax).
+            elif cached <= 32768 and _model_name_suggests_stale_32k_underreport(model):
                 logger.info(
-                    "Dropping stale Kimi cache entry %s@%s -> %s (OpenRouter underreport); "
+                    "Dropping stale cached context entry %s@%s -> %s (known 32K underreport); "
                     "re-resolving via hardcoded defaults",
                     model, base_url, f"{cached:,}",
                 )
@@ -2985,11 +3056,12 @@ def get_model_context_length(
         metadata = fetch_model_metadata()
         if model in metadata:
             or_ctx = metadata[model].get("context_length", DEFAULT_FALLBACK_CONTEXT)
-            # Guard against stale OpenRouter metadata for Kimi-family models.
-            if or_ctx == 32768 and _model_name_suggests_kimi(model):
+            # Guard against stale OpenRouter metadata for model families
+            # known to be underreported as 32K.
+            if or_ctx == 32768 and _model_name_suggests_stale_32k_underreport(model):
                 logger.info(
                     "Rejecting OpenRouter metadata context=%s for %r "
-                    "(Kimi-family underreport); falling through to hardcoded defaults",
+                    "(known 32K underreport); falling through to hardcoded defaults",
                     or_ctx, model,
                 )
             else:
