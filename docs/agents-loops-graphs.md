@@ -41,14 +41,18 @@ progressively disclosed instead of burning context.
 
 ### Loops — several already in production
 
-- **Cron jobs** (`cron/`): four schedule shapes, per-job model pinning,
+- **Cron jobs** (`cron/`): three schedule shapes (`once`/`interval`/`cron`), per-job model pinning,
   script pre-injection, `no_agent` script-only watchdog mode, `context_from`
   chaining, model-policy guard for legal/finance workloads, prompt-injection
   scan of assembled prompts.
-- **verify-on-stop** (`agent/verification_stop.py`): a *real* check — edited
-  code must have fresh passing verification evidence (exit code 0 recorded in
-  SQLite) before the agent may finish. This is the article's "check that can
-  actually fail," already built.
+- **verify-on-stop** (`agent/verification_stop.py`): a *real* evidence
+  ledger — exit-code-0 verification results are recorded in SQLite, and when
+  the model tries to finish right after editing code without fresh passing
+  evidence it gets a **bounded (≤2) policy-only nudge** to verify first. It's
+  the closest thing here to the article's "check that can actually fail" —
+  but note the honest limits: it's a nudge, not a hard completion block, it
+  never runs the checks itself, and it's off on messaging surfaces and for
+  doc-only edits.
 - **CI auto-healer / auto-fix / escalation detector** (`.github/workflows/`):
   a production fix-until-green loop on this fork.
 - **Fleet loops**: vault healer, env-guard watchdog, config-integrity
@@ -66,7 +70,9 @@ scheduler.** The Kanban subsystem (`tools/kanban_tools.py`,
 - a dispatcher inside the gateway that spawns one OS subprocess per task,
   with `max_in_progress`, per-profile caps, per-task `max_runtime_seconds`,
   and auto-block after `failure_limit` consecutive failures
-- per-task model/provider/toolset overrides (cheap models for cheap nodes)
+- per-task model/provider overrides plus per-task `skills` (cheap models for
+  cheap nodes) — but **toolsets** are resolved from the assignee *profile*, not
+  per task (there is no `--toolset` on `kanban create`)
 - git-worktree workspaces for parallel code mutation without conflicts
 - **`hermes kanban swarm`** — a prebuilt diamond: parallel workers → verifier
   → synthesizer, with a shared blackboard on the root task
@@ -103,8 +109,10 @@ Known seams to respect (verified in code, not guesses):
   Kanban or a PTC script.
 - `execute_code` RPC calls are serialized (global lock) — no tool-call
   parallelism inside a script, and it cannot spawn subagents.
-- Cron sessions get a hard interrupt and skip memory providers by design —
-  do not put memory-dependent reasoning in cron prompts.
+- Cron sessions **skip memory providers by design** (intrinsic — cron system
+  prompts would corrupt user representations); they also get a hard interrupt,
+  but only on the conditional timeout/shutdown path, not as an intrinsic
+  property. Do not put memory-dependent reasoning in cron prompts.
 
 ---
 
