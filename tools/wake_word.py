@@ -594,20 +594,29 @@ class _OpenWakeWordEngine(_Engine):
         # openwakeword`` with lazy installs disabled) leaves the runtime
         # missing; openwakeword's own import then raises a bare
         # ModuleNotFoundError. Surface the real fix instead (#81560, #81577).
-        try:
-            import onnxruntime  # noqa: F401
-        except ImportError:
-            # Lazy installs were disabled or the ensure above couldn't fetch the
-            # runtime; point at the correct per-platform feature so a manual
-            # install gets the wheel that actually exists here.
-            feature = "wake.openwakeword.slim" if _is_macos_intel() else "wake.openwakeword"
-            hint = "Run `hermes tools` (Voice section) to install it, or manually: " + (
-                lazy_deps.feature_install_command(feature) or ""
-            )
-            raise ImportError(
-                "The wake word needs onnxruntime (openWakeWord's inference "
-                f"runtime), which is not installed. {hint}"
-            ) from None
+        #
+        # Only the ONNX backend needs onnxruntime: on macOS ARM64 the
+        # effective framework is tflite, which runs on ai-edge-litert (bridged
+        # below), not onnxruntime. A user who manually installed only the
+        # tflite runtime must not be hard-blocked here demanding onnxruntime
+        # (#81560).
+        if framework != "tflite":
+            try:
+                import onnxruntime  # noqa: F401
+            except ImportError:
+                # Lazy installs were disabled or the ensure above couldn't fetch
+                # the runtime; point at the correct per-platform feature so a
+                # manual install gets the wheel that actually exists here.
+                feature = (
+                    "wake.openwakeword.slim" if _is_macos_intel() else "wake.openwakeword"
+                )
+                hint = "Run `hermes tools` (Voice section) to install it, or manually: " + (
+                    lazy_deps.feature_install_command(feature) or ""
+                )
+                raise ImportError(
+                    "The wake word needs onnxruntime (openWakeWord's inference "
+                    f"runtime), which is not installed. {hint}"
+                ) from None
 
         import openwakeword
         from openwakeword.model import Model

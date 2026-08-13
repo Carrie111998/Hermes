@@ -414,6 +414,39 @@ def test_non_intel_macos_engine_ensures_default_stack(monkeypatch):
     assert "wake.openwakeword.tflite" not in ensured
 
 
+def test_tflite_framework_skips_onnxruntime_preflight(monkeypatch):
+    # Regression (#81560): the effective framework on macOS ARM64 is tflite,
+    # which runs on ai-edge-litert (bridged by ensure_tflite_runtime), NOT
+    # onnxruntime. A user who manually installed only the tflite runtime —
+    # a previously-working setup — must not be hard-blocked by the engine's
+    # onnxruntime preflight (which #81577 made unconditional).
+    _install_fake_openwakeword(monkeypatch)
+    # Make onnxruntime genuinely un-importable: if the preflight ran for the
+    # tflite path, construction would raise the "needs onnxruntime" ImportError.
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "onnxruntime":
+            raise ImportError("No module named 'onnxruntime'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.delitem(sys.modules, "onnxruntime", raising=False)
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure", lambda feature, prompt=False: None
+    )
+    monkeypatch.setattr(ww, "ensure_tflite_runtime", lambda: True)
+    monkeypatch.setattr(ww.sys, "platform", "darwin")
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+    # Explicit "onnx" is coerced to tflite on macOS ARM64; the engine must
+    # build on the tflite runtime alone, with no onnxruntime anywhere.
+    ww._OpenWakeWordEngine(
+        {"provider": "openwakeword", "openwakeword": {"inference_framework": "onnx"}}
+    )
+
+
 def test_empty_framework_falls_back_to_platform_default(monkeypatch):
     """Empty/missing config defers to ``default_inference_framework()``.
 
