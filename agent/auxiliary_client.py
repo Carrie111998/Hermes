@@ -9170,6 +9170,13 @@ def _call_llm_impl(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
+    # Normalize empty/invalid tool_calls ONCE up front so the SAME cleaned
+    # list reaches the primary send AND every fallback candidate
+    # (_call_fallback_candidate_sync/_async rebuild their own kwargs from
+    # this parameter; per-kwargs stripping below would leave them poisoned).
+    # Strict providers reject tool_calls: [] with HTTP 400 (#84169).
+    messages = _strip_empty_tool_calls(messages)
+
     effective_timeout = _effective_aux_timeout(task, timeout)
     request_provider = effective_provider or resolved_provider
     _set_relay_auxiliary_route(
@@ -9964,6 +9971,13 @@ async def _async_call_llm_impl(
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
+
+    # Normalize empty/invalid tool_calls ONCE up front so the SAME cleaned
+    # list reaches the primary send AND every fallback candidate
+    # (_call_fallback_candidate_sync/_async rebuild their own kwargs from
+    # this parameter; per-kwargs stripping below would leave them poisoned).
+    # Strict providers reject tool_calls: [] with HTTP 400 (#84169).
+    messages = _strip_empty_tool_calls(messages)
 
     effective_timeout = _effective_aux_timeout(task, timeout)
     request_provider = effective_provider or resolved_provider

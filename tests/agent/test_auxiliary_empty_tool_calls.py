@@ -186,7 +186,158 @@ def test_call_llm_strips_empty_tool_calls_before_wire(monkeypatch):
     assert poison[1]["tool_calls"] == []
 
 
-# ── Async wiring (async_call_llm applies the strip before the wire) ───────
+# ── Fallback candidates must receive stripped messages (triage finding) ────
+
+def test_call_llm_fallback_candidate_gets_stripped_messages(monkeypatch):
+    """Regression: the empty-tool_calls strip used to apply only to the
+    primary send path's kwargs. Fallback candidates received the raw
+    unstripped ``messages`` parameter, so a strict fallback provider still
+    rejected ``tool_calls: []``. The strip must happen once up front so
+    every send site (primary + fallback chain) shares the cleaned list."""
+    from types import SimpleNamespace
+    from openai import APIConnectionError
+    import agent.auxiliary_client as ac
+
+    captured = {}
+
+    class FailingCompletions:
+        def create(self, **kwargs):
+            raise APIConnectionError(request=SimpleNamespace())
+
+    class FakeChat:
+        completions = FailingCompletions()
+
+    class FakeClient:
+        base_url = "http://fake/v1"
+        chat = FakeChat()
+
+    def fake_get_client(*args, **kwargs):
+        return FakeClient(), "fake-model"
+
+    def fake_relay(client, kwargs, *, provider=None, api_mode=None, create=None):
+        return create(kwargs)  # primary raises -> triggers fallback
+
+    def fake_try_chain(task, provider, **kwargs):
+        fb = SimpleNamespace(base_url="http://fb/v1")
+        return fb, "fb-model", "fb-label"
+
+    def fake_fallback(fb_client, fb_model, fb_label, *, task, messages, **kwargs):
+        captured["messages"] = messages
+        return SimpleNamespace(
+            id="x", model="fb-model", object="chat.completion",
+            choices=[SimpleNamespace(
+                index=0,
+                message=SimpleNamespace(
+                    role="assistant", content="ok", tool_calls=None, reasoning=None,
+                ),
+                finish_reason="stop",
+            )],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+
+    monkeypatch.setattr(ac, "_get_cached_client", fake_get_client)
+    monkeypatch.setattr(ac, "_relay_sync_completion", fake_relay)
+    monkeypatch.setattr(ac, "_try_configured_fallback_chain", fake_try_chain)
+    monkeypatch.setattr(ac, "_call_fallback_candidate_sync", fake_fallback)
+
+    poison = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "poisoned", "tool_calls": []},
+    ]
+    ac.call_llm(
+        task="test_verify", messages=poison,
+        provider="custom", base_url="http://fake/v1", model="fake-model",
+    )
+
+    assert "messages" in captured, "fallback candidate was never called"
+    bad = [
+        m for m in captured["messages"]
+        if isinstance(m, dict) and m.get("role") == "assistant"
+        and "tool_calls" in m
+        and not (isinstance(m["tool_calls"], list) and m["tool_calls"])
+    ]
+    assert not bad, f"fallback candidate received empty tool_calls: {bad}"
+    # caller list is never mutated
+    assert poison[1]["tool_calls"] == []
+
+
+def test_async_call_llm_fallback_candidate_gets_stripped_messages(monkeypatch):
+    """Async counterpart: the same fallback gap existed on the async path
+    (_call_fallback_candidate_async rebuilds kwargs from the raw messages
+    parameter). The up-front strip must protect both paths."""
+    import asyncio
+    from types import SimpleNamespace
+    from openai import APIConnectionError
+    import agent.auxiliary_client as ac
+
+    captured = {}
+
+    class FailingAsyncCompletions:
+        async def create(self, **kwargs):
+            raise APIConnectionError(request=SimpleNamespace())
+
+    class FakeAsyncChat:
+        completions = FailingAsyncCompletions()
+
+    class FakeAsyncClient:
+        base_url = "http://fake/v1"
+        chat = FakeAsyncChat()
+
+    monkeypatch.setattr(
+        ac, "_get_cached_client",
+        lambda *a, **kw: (FakeAsyncClient(), "fake-model"),
+    )
+    monkeypatch.setattr(ac, "_acquire_async_aux_semaphore", lambda task: None)
+
+    async def fake_relay(client, kwargs, *, provider=None, api_mode=None, create=None):
+        return await create(kwargs)  # primary raises -> triggers fallback
+
+    monkeypatch.setattr(ac, "_relay_async_completion", fake_relay)
+
+    def fake_try_chain(task, provider, **kwargs):
+        fb = SimpleNamespace(base_url="http://fb/v1")
+        return fb, "fb-model", "fb-label"
+
+    async def fake_fallback(fb_client, fb_model, fb_label, *, task, messages, **kwargs):
+        captured["messages"] = messages
+        return SimpleNamespace(
+            id="x", model="fb-model", object="chat.completion",
+            choices=[SimpleNamespace(
+                index=0,
+                message=SimpleNamespace(
+                    role="assistant", content="ok", tool_calls=None, reasoning=None,
+                ),
+                finish_reason="stop",
+            )],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+
+    monkeypatch.setattr(ac, "_try_configured_fallback_chain", fake_try_chain)
+    monkeypatch.setattr(ac, "_call_fallback_candidate_async", fake_fallback)
+    # Skip the sync->async client conversion (fake clients have no api_key)
+    monkeypatch.setattr(
+        ac, "_to_async_client",
+        lambda sync_client, model, **kw: (FakeAsyncClient(), "fb-model"),
+    )
+
+    poison = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "poisoned", "tool_calls": []},
+    ]
+    asyncio.run(ac.async_call_llm(
+        task="test_verify", messages=poison,
+        provider="custom", base_url="http://fake/v1", model="fake-model",
+    ))
+
+    assert "messages" in captured, "async fallback candidate was never called"
+    bad = [
+        m for m in captured["messages"]
+        if isinstance(m, dict) and m.get("role") == "assistant"
+        and "tool_calls" in m
+        and not (isinstance(m["tool_calls"], list) and m["tool_calls"])
+    ]
+    assert not bad, f"async fallback candidate received empty tool_calls: {bad}"
+    assert poison[1]["tool_calls"] == []
 
 def test_async_call_llm_strips_empty_tool_calls_before_wire(monkeypatch):
     """Async counterpart of the sync wiring test: async_call_llm (used by
