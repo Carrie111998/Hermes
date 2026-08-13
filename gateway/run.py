@@ -103,6 +103,9 @@ _USER_BOUNDARY_END_REASONS = (
 # transport cannot block the session-stall watcher pass (notify-only path;
 # on timeout the latch stays clear and the next tick retries).
 _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
+# Cap on the quoted text injected by the reply-to pointer. Long quotes are cut
+# to this and the elision is marked explicitly — see _prepare_inbound_message_text.
+_REPLY_SNIPPET_LIMIT = 500
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
@@ -16727,7 +16730,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # is referencing. History can contain the same or similar text
             # multiple times, and without an explicit pointer the agent has to
             # guess (or answer for both subjects). Token overhead is minimal.
-            reply_snippet = event.reply_to_text[:500]
+            reply_snippet = event.reply_to_text[:_REPLY_SNIPPET_LIMIT]
+            if len(event.reply_to_text) > _REPLY_SNIPPET_LIMIT:
+                # Mark the cut. Truncating silently leaves the agent unable to
+                # tell a genuinely short quote from a long one that was clipped
+                # — and when the quote is a long report the agent itself just
+                # delivered, it has been observed concluding its *outbound*
+                # message was truncated and re-sending the "missing" remainder.
+                # Same "...[N more chars]" convention as api_server.py.
+                _elided = len(event.reply_to_text) - _REPLY_SNIPPET_LIMIT
+                reply_snippet += f"...[{_elided} more chars]"
             if getattr(event, "reply_to_is_own_message", False):
                 message_text = (
                     f'[Replying to your previous message: "{reply_snippet}"]\n\n'
