@@ -163,6 +163,38 @@ class TestNoAuthProvider:
         client, model = resolve_provider_client("keyed-preview", "keyed-model")
         assert (client, model) == (None, None)
 
+    def test_noauth_transport_omits_authorization_header(self, noauth_profile):
+        """The OpenAI SDK must not emit an Authorization header for auth_type=none.
+
+        The endpoint rejects any credential, so an empty api_key alone is not
+        enough — the transport must omit the header entirely. Captures the
+        outgoing request to prove it.
+        """
+        from openai import OpenAI
+        import httpx
+
+        captured = {}
+
+        class CapturingTransport(httpx.BaseTransport):
+            def handle_request(self, request):
+                captured["headers"] = dict(request.headers)
+                captured["has_authorization"] = (
+                    "authorization" in request.headers
+                )
+                return httpx.Response(200, json={"choices": []})
+
+        client = OpenAI(
+            api_key="",
+            base_url="https://preview.example.com/v1",
+            http_client=httpx.Client(transport=CapturingTransport()),
+        )
+        client.chat.completions.create(
+            model="noauth-model",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1,
+        )
+        assert captured["has_authorization"] is False
+
     def test_status_shows_configured_for_noauth(self, noauth_profile):
         from hermes_cli.auth import get_api_key_provider_status
 
