@@ -9,6 +9,7 @@ import contextvars
 import json
 import logging
 import os
+import sys
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -272,7 +273,9 @@ def _path_from_file_uri(uri: str) -> Path | None:
 
     Zed may send POSIX file URIs from Linux/WSL workspaces or Windows-ish paths
     when launched through wsl.exe. Translate the common Windows drive form to
-    /mnt/<drive>/... so Hermes running in WSL can read it.
+    /mnt/<drive>/... so Hermes running in WSL can read it. Skip that translation
+    when Hermes itself is running natively on Windows, where the real file
+    lives at the drive-letter path, not under /mnt.
     """
     raw = (uri or "").strip()
     if not raw:
@@ -293,10 +296,14 @@ def _path_from_file_uri(uri: str) -> Path | None:
     if len(path_text) >= 3 and path_text[0] == "/" and path_text[2] == ":" and path_text[1].isalpha():
         drive = path_text[1].lower()
         rest = path_text[3:].lstrip("/\\").replace("\\", "/")
+        if sys.platform == "win32":
+            return Path(f"{drive.upper()}:/{rest}")
         return Path("/mnt") / drive / rest
     if len(path_text) >= 2 and path_text[1] == ":" and path_text[0].isalpha():
         drive = path_text[0].lower()
         rest = path_text[2:].lstrip("/\\").replace("\\", "/")
+        if sys.platform == "win32":
+            return Path(f"{drive.upper()}:/{rest}")
         return Path("/mnt") / drive / rest
 
     return Path(path_text)
@@ -308,10 +315,17 @@ def _decode_text_bytes(data: bytes, mime_type: str | None) -> str | None:
         return None
     for encoding in ("utf-8-sig", "utf-8", "latin-1"):
         try:
-            return data.decode(encoding)
+            text = data.decode(encoding)
+            break
         except UnicodeDecodeError:
             continue
-    return data.decode("utf-8", errors="replace")
+    else:
+        text = data.decode("utf-8", errors="replace")
+    # Normalize CRLF/CR to LF. Files written natively on Windows (including
+    # pytest's tmp_path.write_text without an explicit newline="") pick up
+    # the platform line ending, so a byte-for-byte read here would otherwise
+    # embed \r into text that was authored/asserted against as \n-only.
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _format_resource_text(
