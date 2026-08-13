@@ -35,6 +35,11 @@ class TestOpenRouterModels:
             assert isinstance(mid, str) and len(mid) > 0
             assert isinstance(desc, str)
 
+    def test_deepseek_v4_pro_uses_current_dated_snapshot(self):
+        ids = [mid for mid, _ in OPENROUTER_MODELS]
+        assert "deepseek/deepseek-v4-pro-0813" in ids
+        assert "deepseek/deepseek-v4-pro" not in ids
+
 
 class TestFetchOpenRouterModels:
 
