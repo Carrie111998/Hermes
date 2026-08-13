@@ -45,6 +45,10 @@ models, fallback routes, or the next adapter added tomorrow.
 
 ## Migration
 
+0. Land AGC-377 as a separate addon prerequisite: preserve the stateful tool
+   dispatcher while normalizing and authorizing browse-produced session
+   locators before upstream dispatch. Keep its issue, PR, and verification
+   independent from this broader architecture.
 1. Land and exercise the contracts without changing existing provider paths.
 2. Compile the normal loop's already-sanitized request through this boundary.
 3. Move Codex app-server behind the same compiler; serialize the compiled turn
@@ -53,6 +57,14 @@ models, fallback routes, or the next adapter added tomorrow.
 5. Add optional continuation reuse only after restart/model-switch tests pass
    with provider state forcibly disabled.
 6. Delete provider-specific history-preamble and client-side budget compilers.
+
+The addon `ScopedSessionDB` / `session_search_scope.py` is explicitly a
+migration bridge during these slices. It reads SQLite internals, infers
+compression lineage, and substitutes a discovery identity so today's Desktop
+compatibility path can fail closed. Its deletion condition is a canonical
+Hermes session snapshot/reader plus authorization contract that native
+stateful tools consume directly. Once that contract exists, this proxy must be
+removed; tool authorization must not remain coupled to raw database internals.
 
 ## Compatibility and caching
 
