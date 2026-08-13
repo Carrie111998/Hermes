@@ -26,7 +26,7 @@ import json
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -576,13 +576,26 @@ def _extract_context(entry: Dict[str, Any]) -> Optional[int]:
 
 @dataclass
 class ModelCapabilities:
-    """Structured capability metadata for a model from models.dev."""
+    """Provider-neutral capabilities used to compile a model request.
+
+    The original fields are populated from models.dev.  The remaining fields
+    describe request-shape capabilities and have conservative, backwards-
+    compatible defaults so callers can use one typed value at the context
+    compiler / transport boundary instead of rediscovering provider behavior.
+    """
 
     supports_tools: bool = True
     supports_vision: bool = False
     supports_reasoning: bool = False
+    supports_parallel_tool_calls: bool = False
+    supports_streaming: bool = True
+    supported_roles: frozenset[str] = field(
+        default_factory=lambda: frozenset({"system", "user", "assistant", "tool"})
+    )
     context_window: int = 200000
     max_output_tokens: int = 8192
+    fixed_input_overhead_tokens: int = 0
+    capacity_source: str = "models_dev"
     model_family: str = ""
 
 
