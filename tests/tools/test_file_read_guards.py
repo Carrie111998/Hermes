@@ -449,6 +449,47 @@ class TestFileDedup(unittest.TestCase):
         r2 = json.loads(read_file_tool(self._tmpfile, task_id="task_b"))
         self.assertNotEqual(r2.get("dedup"), True)
 
+    @patch("tools.file_tools._get_file_ops")
+    def test_different_paths_same_content_not_deduped(self, mock_ops):
+        """Two different file paths with identical content must NOT trigger
+        a dedup stub for each other.  This covers git worktrees, clones, and
+        any case where the same file content exists at two distinct paths.
+
+        Regression test for #85333: previously the dedup key used the
+        resolved path string without realpath, which could match across
+        worktrees when both paths had identical content.
+        """
+        mock_ops.return_value = _make_fake_ops(
+            content="line one\\nline two\\n", file_size=20,
+        )
+
+        # Create two separate temp files with identical content (simulating
+        # a git worktree or clone where file content is the same but paths
+        # are different).
+        tmpdir2 = tempfile.mkdtemp()
+        tmpfile2 = os.path.join(tmpdir2, "dedup_test.txt")
+        with open(tmpfile2, "w") as f:
+            f.write("line one\\nline two\\n")
+
+        try:
+            # First read — populates dedup cache for path A.
+            r1 = json.loads(read_file_tool(self._tmpfile, task_id="cross_path"))
+            self.assertNotIn("dedup", r1)
+
+            # Read the SAME content at a DIFFERENT path — should NOT dedup.
+            r2 = json.loads(read_file_tool(tmpfile2, task_id="cross_path"))
+            self.assertNotEqual(
+                r2.get("dedup"), True,
+                "Different file path with same content must not trigger dedup stub",
+            )
+            self.assertIn("content", r2)
+        finally:
+            try:
+                os.unlink(tmpfile2)
+                os.rmdir(tmpdir2)
+            except OSError:
+                pass
+
 
 # ---------------------------------------------------------------------------
 # Dedup stub-loop guard (issue #15759)

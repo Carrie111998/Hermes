@@ -1777,7 +1777,16 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         # file hasn't been modified since, return a lightweight stub
         # instead of re-sending the same content.  Saves context tokens.
         resolved_str = str(_resolved)
-        dedup_key = (resolved_str, offset, limit)
+        # Use realpath for dedup identity so different physical files at
+        # different paths (e.g. git worktrees, clones, symlinks) never dedup
+        # against each other even when their content is identical.  Falls
+        # back to the normalized path when realpath is unavailable (remote
+        # backends, missing files).  See issue #85333.
+        try:
+            _dedup_path = os.path.realpath(resolved_str)
+        except (OSError, ValueError):
+            _dedup_path = resolved_str
+        dedup_key = (_dedup_path, offset, limit)
         with _read_tracker_lock:
             task_data = _read_tracker.setdefault(task_id, {
                 "last_key": None, "consecutive": 0,
@@ -2050,6 +2059,14 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
     """
     try:
         resolved = str(_resolve_path(filepath, task_id))
+        # Match the realpath-based identity used in read_file_tool's dedup_key
+        # so that _invalidate_dedup_for_path correctly evicts entries created
+        # by reads through symlinks/junctions (e.g. worktree paths).  Falls
+        # back to the resolved path when realpath is unavailable #85333.
+        try:
+            resolved = os.path.realpath(resolved)
+        except (OSError, ValueError):
+            pass
     except (OSError, ValueError):
         return
     with _read_tracker_lock:
