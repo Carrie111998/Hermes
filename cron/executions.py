@@ -7,7 +7,9 @@ proved gone. Terminal states are immutable.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -18,6 +20,8 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
+
+logger = logging.getLogger(__name__)
 
 EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
 MAX_TERMINAL_EXECUTIONS = 1000
@@ -204,6 +208,152 @@ def recover_interrupted_executions() -> int:
             changed += cur.rowcount
         if changed:
             _prune_unlocked(conn)
+    return changed
+
+
+# Per-tick sweep of stale execution rows whose owning pid is provably dead.
+# ``recover_interrupted_executions`` only runs once per gateway/process restart,
+# so a ``source=direct`` (or any) row created AFTER the current process's last
+# restart — and whose owner process died without finishing it — was never
+# terminalized: it sat ``running`` forever (the fleet-analyst 85bc89e5241f
+# class, see t_84b68726). This sweep closes that gap by re-running the same
+# dead-pid terminalization on every tick, gated by a ``started_at`` age so we
+# only touch rows that have been running well past a healthy window (and never
+# a row still owned by a live pid). Idempotent: terminal states are immutable
+# and the UPDATE WHERE guard makes a no-op on already-terminal rows.
+_STALE_DIRECT_MIN_AGE_HOURS = 2
+_STALE_TERMINALIZED_LOG = "cron.executions.stale_terminalized"
+
+# Module-level counter for probe visibility. Exposed for unified-health / the
+# jarvis watchdog to read via ``cron.executions.stale_terminalized_count()`` so
+# a stale row that gets reclaimed mid-cycle is observable out-of-process.
+_stale_terminalized_counter = 0
+
+
+def _record_stale_terminalization(record: Dict[str, Any]) -> None:
+    """Mirror a terminalized stale row to a JSONL probe (best-effort).
+
+    Surface only a count + opaque job_key — not raw pids/job ids — matching
+    cron_health's content-free contract. The row id is included only to
+    disambiguate within a single tick's batch.
+    """
+    try:
+        key = "sha256:" + hashlib.sha256(
+            str(record.get("job_id") or "unknown").encode("utf-8", errors="replace")
+        ).hexdigest()[:24]
+        entry = {
+            "job_key": key,
+            "source": record.get("source"),
+            "status": record.get("status"),
+            "row": str(record.get("id")),
+            "at": _hermes_now().isoformat(),
+        }
+        path = EXECUTIONS_FILE.parent / "stale_terminalized.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+    except Exception as e:  # telemetry must never break a tick
+        logger.debug("stale terminalization probe write failed: %s", e)
+
+
+def stale_terminalized_count() -> int:
+    """Probe-visible monotonic count of stale rows terminalized this process."""
+    return _stale_terminalized_counter
+
+
+def stale_terminalization_stats() -> dict:
+    """Probe-visible snapshot of the per-tick stale-row terminalizer.
+
+    Mirrors ``cron.scheduler.get_inflight_guard_stats`` for the DB-row class:
+    a monotonic ``terminalized`` counter plus the most recent terminalization
+    records read from the ``stale_terminalized.jsonl`` probe file (best-effort,
+    content-free — opaque job_key, never raw pids or job ids).
+    """
+    recent: List[Dict[str, Any]] = []
+    try:
+        path = EXECUTIONS_FILE.parent / "stale_terminalized.jsonl"
+        if path.exists():
+            lines = path.read_text(encoding="utf-8").splitlines()
+            for line in lines[-20:]:
+                line = line.strip()
+                if line:
+                    recent.append(json.loads(line))
+    except Exception as e:  # probe must never break a tick
+        logger.debug("stale terminalization probe read failed: %s", e)
+    return {
+        "terminalized": _stale_terminalized_counter,
+        "recent_terminalizations": recent,
+    }
+
+
+def terminalize_stale_executions(
+    *, min_age_hours: float = _STALE_DIRECT_MIN_AGE_HOURS,
+) -> int:
+    """Terminalize running/claimed rows whose owner pid is provably dead.
+
+    Runs on the ticker's per-tick path (NOT only at gateway restart) so a
+    ``source=direct`` execution row created after the current process last
+    restarted cannot wedge forever. Matches the fleet-wide zombie scan
+    predicate: ``status='running' AND started_at > <min_age> AND finished_at IS
+    NULL``. Uses ``_owner_is_live`` (pid liveness + PID-reuse start-time guard)
+    so a row still owned by a live pid is never touched.
+
+    Returns the number of rows terminalized to ``unknown``.
+    """
+    from datetime import timedelta
+
+    now = _hermes_now()
+    age_cutoff = (now - timedelta(hours=min_age_hours)).isoformat()
+    terminalization_error = (
+        "Execution owner process exited before a durable terminal state was "
+        "written and was not reclaimed at the owner's gateway restart; "
+        "side effects are unknown (stale source=direct/claimed sweep)."
+    )
+    changed = 0
+    terminalized: List[Dict[str, Any]] = []
+    with _transaction() as conn:
+        rows = conn.execute(
+            """SELECT id, process_id, pid, process_started_at,
+                      job_id, source, status, started_at, finished_at
+               FROM executions
+               WHERE status IN ('claimed','running')
+                 AND finished_at IS NULL AND started_at IS NOT NULL
+                 AND datetime(started_at) < datetime(?)""",
+            (age_cutoff,),
+        ).fetchall()
+        for row in rows:
+            if row["process_id"] == _PROCESS_ID:
+                continue
+            if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+                continue
+            cur = conn.execute(
+                """UPDATE executions SET status='unknown', finished_at=?, error=?
+                   WHERE id=? AND status IN ('claimed','running')
+                     AND finished_at IS NULL""",
+                (now.isoformat(), terminalization_error, row["id"]),
+            )
+            changed += cur.rowcount
+            if cur.rowcount:
+                record = _record(conn.execute(
+                    "SELECT * FROM executions WHERE id=?", (row["id"],)
+                ).fetchone())
+                if record is not None:
+                    terminalized.append(record)
+        if changed:
+            _prune_unlocked(conn)
+    global _stale_terminalized_counter
+    _stale_terminalized_counter += changed
+    for record in terminalized:
+        _record_stale_terminalization(record)
+        logger.warning(
+            "%s: terminalized stale execution row id=%s job_id=%s source=%s "
+            "pid=%s (owner process dead; not reclaimed at restart)",
+            _STALE_TERMINALIZED_LOG,
+            record.get("id"),
+            record.get("job_id"),
+            record.get("source"),
+            record.get("pid"),
+        )
     return changed
 
 
