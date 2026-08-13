@@ -40,6 +40,7 @@ import sys
 import signal
 import threading
 import time
+from urllib.parse import unquote
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -3471,6 +3472,8 @@ def _parse_session_key(session_key: str) -> "dict | None":
     thread_id, so we leave ``thread_id`` out to avoid mis-routing.
     """
     parts = session_key.split(":")
+    if parts and parts[0] == "agent-v2":
+        parts = ["agent", *(unquote(part) for part in parts[1:])]
     if len(parts) >= 5 and parts[0] == "agent" and parts[1] == "main":
         result = {
             "platform": parts[2],

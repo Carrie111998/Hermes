@@ -39,6 +39,7 @@ import mimetypes
 import os
 import time
 import uuid
+from urllib.parse import unquote
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -1105,6 +1106,8 @@ class QQAdapter(BasePlatformAdapter):
     def _parse_gateway_session_key(session_key: str) -> Optional[Dict[str, str]]:
         """Parse ``agent:main:<platform>:<chat_type>:<chat_id>[:<user_id>]``."""
         parts = str(session_key or "").split(":")
+        if parts and parts[0] == "agent-v2":
+            parts = ["agent", *(unquote(part) for part in parts[1:])]
         if len(parts) < 5 or parts[0] != "agent" or parts[1] != "main":
             return None
         parsed = {

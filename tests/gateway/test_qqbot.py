@@ -613,6 +613,18 @@ class TestChunkedUploaderFlow:
 # ---------------------------------------------------------------------------
 
 class TestApprovalButtonData:
+    def test_collision_safe_session_key_decodes_components(self):
+        from gateway.platforms.qqbot.adapter import QQAdapter
+
+        assert QQAdapter._parse_gateway_session_key(
+            "agent-v2:main:qqbot:group:group%3Aone:user%3Atwo"
+        ) == {
+            "platform": "qqbot",
+            "chat_type": "group",
+            "chat_id": "group:one",
+            "user_id": "user:two",
+        }
+
     def test_parse_allow_once(self):
         from gateway.platforms.qqbot.keyboards import parse_approval_button_data
         result = parse_approval_button_data("approve:agent:main:qqbot:c2c:UID:allow-once")
