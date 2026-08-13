@@ -92,13 +92,10 @@ _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 _DB_LOCK = threading.Lock()
 
 # Review outcomes are advisory control-state, never executable authority.
-# Classification is deliberately gated by the original delegated goal so an
-# ordinary research/build child that happens to say "approved" cannot be
-# mistaken for an independent reviewer.
-_REVIEW_GOAL_RE = re.compile(
-    r"\b(review|reviewer|audit|verdict|approve|changes[_ -]?required)\b",
-    re.IGNORECASE,
-)
+# Free-form goal/context text is model-authored and therefore cannot select
+# review control semantics. The caller must persist this exact typed contract
+# at dispatch; unknown or absent contracts fail closed as ordinary completions.
+_REVIEW_COMPLETION_CONTRACT = "review_verdict_v1"
 _FORMAL_VERDICT_RE = re.compile(
     r"(?im)^\s*(?:formal\s+)?(?:verdict\s*:\s*)?"
     r"(APPROVE|CHANGES[_ ]REQUIRED|NO\s+VERDICT)\b",
@@ -115,8 +112,8 @@ _REVIEW_TRANSITIONS = {
 }
 
 
-def _is_review_delegation(goal: Any) -> bool:
-    return bool(_REVIEW_GOAL_RE.search(str(goal or "")))
+def _is_review_delegation(completion_contract: Any) -> bool:
+    return completion_contract == _REVIEW_COMPLETION_CONTRACT
 
 
 def _build_terminal_transition(
@@ -323,6 +320,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         key: record.get(key)
         for key in (
             "goal", "goals", "context", "toolsets", "role", "model", "is_batch",
+            "completion_contract",
             # Routing origin (scope_id/user_id/user_name): persisted so a
             # restart-recovered completion can reconstruct a full
             # SessionSource — see _capture_routing_origin.
@@ -844,6 +842,7 @@ def dispatch_async_delegation(
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    completion_contract: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -896,6 +895,7 @@ def dispatch_async_delegation(
         "toolsets": list(toolsets) if toolsets else None,
         "role": role,
         "model": model,
+        "completion_contract": completion_contract,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
@@ -1064,7 +1064,9 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
-    if _is_review_delegation(record.get("goal")):
+    if record.get("completion_contract") is not None:
+        evt["completion_contract"] = record["completion_contract"]
+    if _is_review_delegation(record.get("completion_contract")):
         evt["terminal_transition"] = _build_terminal_transition(
             status=status,
             summary=summary,
@@ -1114,6 +1116,7 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    completion_contract: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -1150,6 +1153,7 @@ def dispatch_async_delegation_batch(
         "toolsets": list(toolsets) if toolsets else None,
         "role": role,
         "model": model,
+        "completion_contract": completion_contract,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
@@ -1291,7 +1295,12 @@ def _push_batch_completion_event(
     # reviewer outcome only when the batch represents exactly one review task;
     # multi-review fan-outs can disagree and must remain uncollapsed.
     results = combined.get("results") or []
-    if _is_review_delegation(event_record.get("goal")) and len(results) == 1:
+    if event_record.get("completion_contract") is not None:
+        evt["completion_contract"] = event_record["completion_contract"]
+    if (
+        _is_review_delegation(event_record.get("completion_contract"))
+        and len(results) == 1
+    ):
         child = results[0] if isinstance(results[0], dict) else {}
         evt["terminal_transition"] = _build_terminal_transition(
             status=child.get("status") or status,

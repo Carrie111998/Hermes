@@ -140,6 +140,41 @@ def test_apiserver_session_with_id_dispatches_background(monkeypatch):
     assert evt["origin_session_id"] == "raw-sid-7"
 
 
+def test_delegate_task_propagates_explicit_review_completion_contract(monkeypatch):
+    """The public one-goal path persists the typed contract on its batch event."""
+    dt = _patch_delegate(monkeypatch)
+    monkeypatch.setenv("HERMES_SESSION_ID", "review-sid-8")
+    set_session_vars(
+        platform="api_server",
+        chat_id="review-sid-8",
+        session_key="review-sid-8",
+        session_id="review-sid-8",
+        async_delivery=False,
+    )
+
+    out = dt.delegate_task(
+        goal="Inspect candidate and return a formal verdict",
+        context="Exact immutable candidate supplied by the parent.",
+        completion_contract="review_verdict_v1",
+        background=True,
+        parent_agent=_fake_parent(),
+    )
+
+    assert json.loads(out)["status"] == "dispatched"
+    evt = _drain_one()
+    assert evt is not None
+    assert evt["completion_contract"] == "review_verdict_v1"
+
+
+def test_delegate_schema_exposes_only_the_versioned_review_contract():
+    from tools.delegate_tool import DELEGATE_TASK_SCHEMA
+
+    contract = DELEGATE_TASK_SCHEMA["parameters"]["properties"][
+        "completion_contract"
+    ]
+    assert contract["enum"] == ["review_verdict_v1"]
+
+
 # ---------------------------------------------------------------------------
 # _current_origin_session_id — the clobber-proof origin capture helper
 # ---------------------------------------------------------------------------

@@ -225,6 +225,7 @@ def test_batch_reviewer_approve_builds_one_safe_resume_transition():
         "goals": ["Independent exact-SHA review and formal APPROVE or CHANGES_REQUIRED"],
         "role": "leaf",
         "model": "reviewer",
+        "completion_contract": "review_verdict_v1",
         "status": "running",
         "dispatched_at": time.time(),
     }
@@ -274,6 +275,69 @@ def test_non_review_child_does_not_get_review_transition():
     assert "terminal_transition" not in evt
 
 
+def test_audit_goal_with_approve_text_requires_explicit_review_contract():
+    """Free-form goal prose cannot opt an ordinary child into review control-state."""
+    record = {
+        "delegation_id": "deleg_audit_logging",
+        "goal": "Audit logging performance and report findings",
+        "status": "running",
+        "dispatched_at": time.time(),
+    }
+    result = {
+        "status": "completed",
+        "summary": "APPROVE\nThe logging approach is sound.",
+        "exit_reason": "completed",
+    }
+
+    ad._push_completion_event(record, result, "completed")
+    evt = process_registry.completion_queue.get_nowait()
+
+    assert "terminal_transition" not in evt
+
+
+def test_explicit_review_contract_enables_transition_without_goal_heuristics():
+    """A persisted typed contract, not model prose, selects verdict semantics."""
+    record = {
+        "delegation_id": "deleg_typed_review",
+        "goal": "Inspect candidate f00ba4 and report findings",
+        "completion_contract": "review_verdict_v1",
+        "status": "running",
+        "dispatched_at": time.time(),
+    }
+    result = {
+        "status": "completed",
+        "summary": "APPROVE — BLOCKER 0 · MAJOR 0 · MINOR 0",
+        "exit_reason": "completed",
+    }
+
+    ad._push_completion_event(record, result, "completed")
+    evt = process_registry.completion_queue.get_nowait()
+
+    assert evt["completion_contract"] == "review_verdict_v1"
+    assert evt["terminal_transition"]["transition"] == "resume_parent"
+
+
+def test_unknown_completion_contract_fails_closed_as_ordinary_completion():
+    record = {
+        "delegation_id": "deleg_unknown_contract",
+        "goal": "Inspect candidate",
+        "completion_contract": "review_verdict_v2",
+        "status": "running",
+        "dispatched_at": time.time(),
+    }
+    result = {
+        "status": "completed",
+        "summary": "APPROVE",
+        "exit_reason": "completed",
+    }
+
+    ad._push_completion_event(record, result, "completed")
+    evt = process_registry.completion_queue.get_nowait()
+
+    assert evt["completion_contract"] == "review_verdict_v2"
+    assert "terminal_transition" not in evt
+
+
 def test_approve_transition_is_persisted_and_restored_without_action_authority(
     tmp_path, monkeypatch,
 ):
@@ -286,6 +350,7 @@ def test_approve_transition_is_persisted_and_restored_without_action_authority(
         "goal": "Review immutable candidate",
         "role": "leaf",
         "model": "reviewer",
+        "completion_contract": "review_verdict_v1",
         "status": "running",
         "dispatched_at": time.time(),
     }
@@ -700,6 +765,79 @@ assert ad.mark_completion_delivered({delegation_id!r})
     )
     probe = subprocess.run(
         [sys.executable, "-c", "from tools.process_registry import process_registry; print(process_registry.completion_queue.qsize())"],
+        cwd=repo, env=env, text=True, capture_output=True, timeout=15, check=True,
+    )
+    assert probe.stdout.strip().splitlines()[-1] == "0"
+
+
+def test_real_process_restart_restores_review_transition_and_acks_once(tmp_path):
+    """Typed review completion survives process death and converges after ACK."""
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    env = {
+        **os.environ,
+        "HERMES_HOME": str(tmp_path),
+        "PYTHONPATH": repo,
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    producer = r'''
+import time
+from tools import async_delegation as ad
+r = ad.dispatch_async_delegation(
+    goal="Inspect immutable candidate", context=None, toolsets=None,
+    role="leaf", model="m", session_key="owner-session",
+    parent_session_id="durable-parent",
+    completion_contract="review_verdict_v1",
+    runner=lambda: {
+        "status": "completed",
+        "summary": "APPROVE — BLOCKER 0 · MAJOR 0 · MINOR 0",
+        "exit_reason": "completed",
+    },
+)
+deadline = time.time() + 5
+while ad.active_count() and time.time() < deadline:
+    time.sleep(.01)
+print(r["delegation_id"])
+'''
+    first = subprocess.run(
+        [sys.executable, "-c", producer], cwd=repo, env=env,
+        text=True, capture_output=True, timeout=15, check=True,
+    )
+    delegation_id = first.stdout.strip().splitlines()[-1]
+
+    consumer = r'''
+import json
+from tools import async_delegation as ad
+from tools.process_registry import process_registry
+evt = process_registry.completion_queue.get_nowait()
+claim = ad.claim_event_delivery(evt, "restarted-parent")
+assert claim
+assert ad.complete_completion_delivery(evt["delegation_id"], claim)
+print(json.dumps(evt, sort_keys=True))
+'''
+    second = subprocess.run(
+        [sys.executable, "-c", consumer], cwd=repo, env=env,
+        text=True, capture_output=True, timeout=15, check=True,
+    )
+    evt = json.loads(second.stdout.strip().splitlines()[-1])
+    assert evt["delegation_id"] == delegation_id
+    assert evt["completion_contract"] == "review_verdict_v1"
+    assert evt["terminal_transition"] == {
+        "kind": "review",
+        "verdict": "approve",
+        "transition": "resume_parent",
+        "resume_parent": True,
+        "grants_authority": False,
+        "requires_existing_authority": True,
+        "stop_at_human_gate": True,
+    }
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from tools.process_registry import process_registry; "
+            "print(process_registry.completion_queue.qsize())",
+        ],
         cwd=repo, env=env, text=True, capture_output=True, timeout=15, check=True,
     )
     assert probe.stdout.strip().splitlines()[-1] == "0"
