@@ -67,7 +67,7 @@ describe('Excalidraw pane layout integration', () => {
     return { drawings, model, tree }
   }
 
-  it('creates a 50/50 root-edge drawing zone, preserves resized weights, and stacks later drawings', async () => {
+  it('minimizes a drawing zone without closing its document and preserves resized weights', async () => {
     const { drawings, model, tree } = await setup()
     const { excalidrawPaneId } = await import('./identity')
     const firstPaneId = excalidrawPaneId(first)
@@ -88,7 +88,7 @@ describe('Excalidraw pane layout integration', () => {
 
     const resizedWeights = [0.2, 0.7, 0.3, 2]
     tree.setTreeSplitWeights(opened.id, resizedWeights)
-    tree.closeTreePane(firstPaneId)
+    tree.collapseTreePane(firstPaneId)
 
     const minimized = tree.$layoutTree.get()!
     expect(model.findGroupOfPane(minimized, firstPaneId)?.minimized).toBe(true)
@@ -107,7 +107,7 @@ describe('Excalidraw pane layout integration', () => {
     )
   })
 
-  it('minimizes the shared drawing zone when an inactive tab is closed', async () => {
+  it('closes only the requested drawing tab and leaves its active sibling visible', async () => {
     const { drawings, model, tree } = await setup()
     const { excalidrawPaneId } = await import('./identity')
     const firstPaneId = excalidrawPaneId(first)
@@ -115,14 +115,23 @@ describe('Excalidraw pane layout integration', () => {
 
     drawings.openDrawing(first, 'fp1')
     drawings.openDrawing(second, 'fp2')
+    drawings.setDrawingController(first, {
+      canCloseCleanly: vi.fn().mockReturnValue(true),
+      reconcileExternalChange: vi.fn(),
+      waitForSave: vi.fn().mockResolvedValue(undefined)
+    })
     tree.closeTreePane(firstPaneId)
 
-    expect(model.findGroupOfPane(tree.$layoutTree.get()!, firstPaneId)).toMatchObject({
+    await vi.waitFor(() => expect(model.findGroupOfPane(tree.$layoutTree.get()!, firstPaneId)).toBeNull())
+    const siblingGroup = model.findGroupOfPane(tree.$layoutTree.get()!, secondPaneId)
+    expect(siblingGroup).toMatchObject({
       active: secondPaneId,
-      minimized: true,
-      panes: [firstPaneId, secondPaneId]
+      panes: [secondPaneId]
     })
-    expect(drawings.$excalidrawDocuments.get()).toHaveLength(2)
+    expect(siblingGroup?.minimized).not.toBe(true)
+    expect(drawings.$excalidrawDocuments.get()).toEqual([
+      expect.objectContaining({ identity: second })
+    ])
   })
 
   it('keeps a persisted custom drawing zone authoritative during restoration', async () => {

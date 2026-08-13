@@ -1,6 +1,6 @@
 import { createElement } from 'react'
 
-import { collapseTreePane, registerPaneCloser, removeTreePane, revealTreePane } from '@/components/pane-shell/tree/store'
+import { registerPaneCloser, removeTreePane, revealTreePane } from '@/components/pane-shell/tree/store'
 import { registry } from '@/contrib/registry'
 import { Codecs, persistentAtom } from '@/lib/persisted'
 
@@ -85,7 +85,7 @@ function registerDrawingPane(identity: ExcalidrawDocumentIdentity) {
     title: drawingName(identity.path)
   })
   registered.set(key, { dispose, paneId })
-  registerPaneCloser(paneId, () => collapseTreePane(paneId))
+  registerPaneCloser(paneId, () => void requestDrawingClose(identity))
 }
 
 export function openDrawing(identity: ExcalidrawDocumentIdentity, fingerprint: string): void {
@@ -114,9 +114,15 @@ export async function handleChangedDocument(identity: ExcalidrawDocumentIdentity
 
 export async function requestDrawingClose(identity: ExcalidrawDocumentIdentity, confirmDiscard: () => boolean | Promise<boolean> = () => false): Promise<boolean> {
   const controller = controllers.get(excalidrawDocumentKey(identity))
-  await controller?.waitForSave()
+  if (!controller) {
+    closeDrawing(identity)
 
-  if (!controller?.canCloseCleanly() && !(await confirmDiscard())) {return false}
+    return true
+  }
+
+  await controller.waitForSave()
+
+  if (!controller.canCloseCleanly() && !(await confirmDiscard())) {return false}
   closeDrawing(identity)
 
   return true
