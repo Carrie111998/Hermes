@@ -675,6 +675,59 @@ class TestNousPortalContextResolution:
 
 
 # =========================================================================
+# OpenRouter metadata — version-separator (dot↔dash) matching
+# =========================================================================
+
+class TestOpenRouterVersionNormalizedContextLookup:
+    """OpenRouter catalog rows use dotted GPT point releases (gpt-5.4).
+
+    Some routers hand Hermes hyphenated slugs (gpt-5-4). Exact dict lookup
+    misses those and falls through to the generic gpt-5 400k default, which
+    under-reports the real window and can trip false compression warnings.
+    """
+
+    _OR_METADATA = {
+        "openai/gpt-5.4": {"context_length": 1_050_000},
+    }
+
+    def _resolve(self, model: str, *, provider: str = "openrouter", base_url: str = ""):
+        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.fetch_model_metadata", return_value=self._OR_METADATA), \
+             patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             patch("agent.model_metadata._query_local_context_length", return_value=None), \
+             patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
+             patch("agent.models_dev.lookup_models_dev_context", return_value=None), \
+             patch("agent.model_metadata._resolve_endpoint_context_length", return_value=None):
+            return get_model_context_length(
+                model,
+                provider=provider,
+                base_url=base_url or "https://openrouter.ai/api/v1",
+            )
+
+    def test_openrouter_provider_hyphenated_point_release_matches_dotted_metadata(self):
+        assert self._resolve("gpt-5-4", provider="openrouter") == 1_050_000
+
+    def test_openrouter_provider_prefixed_hyphenated_slug(self):
+        assert self._resolve("openai/gpt-5-4", provider="openrouter") == 1_050_000
+
+    def test_openrouter_provider_exact_dotted_slug_still_works(self):
+        assert self._resolve("gpt-5.4", provider="openrouter") == 1_050_000
+        assert self._resolve("openai/gpt-5.4", provider="openrouter") == 1_050_000
+
+    def test_provider_unaware_fallback_hyphenated_slug(self):
+        """No effective provider: step-6 OpenRouter fallback must normalize too."""
+        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.fetch_model_metadata", return_value=self._OR_METADATA), \
+             patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             patch("agent.model_metadata._query_local_context_length", return_value=None), \
+             patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
+             patch("agent.models_dev.lookup_models_dev_context", return_value=None), \
+             patch("agent.model_metadata._resolve_endpoint_context_length", return_value=None), \
+             patch("agent.model_metadata._infer_provider_from_url", return_value=None):
+            assert get_model_context_length("gpt-5-4", provider="", base_url="") == 1_050_000
+
+
+# =========================================================================
 # get_model_context_length — resolution order
 # =========================================================================
 

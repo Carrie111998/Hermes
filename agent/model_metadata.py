@@ -2184,6 +2184,45 @@ def _normalize_model_version(model: str) -> str:
     return model.replace(".", "-")
 
 
+def _match_openrouter_metadata_entry(
+    model: str,
+    metadata: Dict[str, Dict[str, Any]],
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Find an OpenRouter metadata entry for *model*.
+
+    Match order mirrors ``_resolve_nous_context_length``:
+
+    1. Exact catalog key (``openai/gpt-5.4``)
+    2. Bare-id equality after stripping a vendor prefix
+    3. Version-separator equality (dot↔dash), so ``gpt-5-4`` resolves the
+       ``gpt-5.4`` / ``openai/gpt-5.4`` catalog row instead of falling through
+       to the generic ``gpt-5`` hardcoded default
+
+    Returns ``(or_id, entry)`` or ``None``.
+    """
+    if not model or not isinstance(metadata, dict):
+        return None
+
+    entry = metadata.get(model)
+    if isinstance(entry, dict):
+        return model, entry
+
+    # Strip a vendor prefix from the query so openai/gpt-5-4 can still match
+    # openai/gpt-5.4 or bare gpt-5.4.
+    query = model.split("/", 1)[1] if "/" in model else model
+    query_lower = query.lower()
+    normalized = _normalize_model_version(query).lower()
+
+    for or_id, entry in metadata.items():
+        if not isinstance(entry, dict):
+            continue
+        bare = or_id.split("/", 1)[1] if "/" in or_id else or_id
+        if bare.lower() == query_lower or _normalize_model_version(bare).lower() == normalized:
+            return or_id, entry
+
+    return None
+
+
 def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> Optional[int]:
     """Query Anthropic's /v1/models endpoint for context length.
 
@@ -2906,13 +2945,16 @@ def get_model_context_length(
     # the dedicated Nous/Copilot/GMI branches above.
     if effective_provider == "openrouter":
         metadata = fetch_model_metadata()
-        entry = metadata.get(model)
-        if entry:
+        matched = _match_openrouter_metadata_entry(model, metadata)
+        if matched:
+            or_id, entry = matched
             or_ctx = entry.get("context_length")
             # Guard against the known OpenRouter Kimi-family 32k underreport
             # (same class the hardcoded overrides exist to mitigate).
             if isinstance(or_ctx, int) and or_ctx > 0 and not (
-                or_ctx == 32768 and _model_name_suggests_kimi(model)
+                or_ctx == 32768 and (
+                    _model_name_suggests_kimi(model) or _model_name_suggests_kimi(or_id)
+                )
             ):
                 return or_ctx
 
@@ -2939,10 +2981,14 @@ def get_model_context_length(
     # for models that belong to known providers with curated defaults.
     if not effective_provider:
         metadata = fetch_model_metadata()
-        if model in metadata:
-            or_ctx = metadata[model].get("context_length", DEFAULT_FALLBACK_CONTEXT)
+        matched = _match_openrouter_metadata_entry(model, metadata)
+        if matched:
+            or_id, entry = matched
+            or_ctx = entry.get("context_length", DEFAULT_FALLBACK_CONTEXT)
             # Guard against stale OpenRouter metadata for Kimi-family models.
-            if or_ctx == 32768 and _model_name_suggests_kimi(model):
+            if or_ctx == 32768 and (
+                _model_name_suggests_kimi(model) or _model_name_suggests_kimi(or_id)
+            ):
                 logger.info(
                     "Rejecting OpenRouter metadata context=%s for %r "
                     "(Kimi-family underreport); falling through to hardcoded defaults",
