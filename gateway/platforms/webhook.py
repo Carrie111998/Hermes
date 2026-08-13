@@ -241,6 +241,13 @@ class WebhookAdapter(BasePlatformAdapter):
             script_timeout_seconds=self._script_timeout_seconds
         )
 
+        # Execution registry: replaces fire-and-forget task loss with an
+        # observable per-delivery execution record. Keyed by delivery_id;
+        # TTL-pruned on each POST so a stuck record cannot grow unbounded.
+        self._executions: Dict[str, Dict[str, Any]] = {}
+        self._execution_tasks: Dict[str, "asyncio.Task"] = {}
+        self._executions_ttl: int = 3600
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -289,6 +296,14 @@ class WebhookAdapter(BasePlatformAdapter):
         app = web.Application(client_max_size=self._max_body_bytes)
         app.router.add_get("/health", self._handle_health)
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
+        app.router.add_get(
+            "/webhooks/{route_name}/executions/{delivery_id}",
+            self._handle_execution_status,
+        )
+        app.router.add_post(
+            "/webhooks/{route_name}/executions/{delivery_id}/cancel",
+            self._handle_execution_cancel,
+        )
         # Multi-profile multiplexing: a /p/<profile>/webhooks/<route> prefix
         # routes the inbound event to that profile. Same handler; the profile is
         # captured from the path and stamped onto the SessionSource so the agent
@@ -957,9 +972,32 @@ class WebhookAdapter(BasePlatformAdapter):
         # once the agent run actually finishes (``handle_message`` itself is
         # fire-and-forget: it spawns ``_process_message_background`` and
         # returns before the run starts, so nothing can be closed here).
+        #
+        # The execution registry replaces fire-and-forget task loss: the
+        # delivery gets an observable record (status/cancel) bound to its
+        # asyncio task, and the done-callback advances it to completed/failed.
+        self._record_execution(delivery_id, route_name, profile)
         task = asyncio.create_task(self.handle_message(event))
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        self._execution_tasks[delivery_id] = task
+
+        def _finalize(t: "asyncio.Task") -> None:
+            self._background_tasks.discard(t)
+            self._execution_tasks.pop(delivery_id, None)
+            record = self._executions.get(delivery_id)
+            if record is None or record["state"] in {"cancelled"}:
+                return
+            try:
+                exc = t.exception()
+            except (asyncio.CancelledError, Exception):
+                exc = None
+            if exc is not None:
+                record["state"] = "failed"
+                record["error"] = str(exc)
+            else:
+                record["state"] = "completed"
+
+        task.add_done_callback(_finalize)
 
         return web.json_response(
             {
@@ -994,6 +1032,67 @@ class WebhookAdapter(BasePlatformAdapter):
         row, so this never clobbers a ``compression``/``agent_close`` reason.
         """
         await self._end_webhook_session(event, event.source.chat_id)
+
+    def _record_execution(self, delivery_id: str, route_name: str, profile: str | None) -> dict:
+        """Create an observable execution record for a delivery."""
+        record = {
+            "delivery_id": delivery_id,
+            "route": route_name,
+            "profile": profile or "default",
+            "state": "accepted",
+            "created_at": time.time(),
+            "error": None,
+        }
+        self._executions[delivery_id] = record
+        self._prune_executions(time.time())
+        return record
+
+    def _mark_execution(self, delivery_id: str, state: str, error: str | None = None) -> None:
+        record = self._executions.get(delivery_id)
+        if record is not None:
+            record["state"] = state
+            record["error"] = error
+
+    def _prune_executions(self, now: float) -> None:
+        cutoff = now - self._executions_ttl
+        stale = [k for k, r in self._executions.items() if r["created_at"] < cutoff]
+        for k in stale:
+            self._executions.pop(k, None)
+            task = self._execution_tasks.pop(k, None)
+            if task is not None and not task.done():
+                task.cancel()
+
+    async def _handle_execution_status(self, request: "web.Request") -> "web.Response":
+        delivery_id = request.match_info.get("delivery_id", "")
+        record = self._executions.get(delivery_id)
+        if record is None:
+            return web.json_response({"error": "Unknown execution"}, status=404)
+        return web.json_response(
+            {
+                "delivery_id": record["delivery_id"],
+                "route": record["route"],
+                "profile": record["profile"],
+                "state": record["state"],
+            },
+            status=200,
+        )
+
+    async def _handle_execution_cancel(self, request: "web.Request") -> "web.Response":
+        delivery_id = request.match_info.get("delivery_id", "")
+        record = self._executions.get(delivery_id)
+        if record is None:
+            return web.json_response({"error": "Unknown execution"}, status=404)
+        if record["state"] in {"completed", "failed", "cancelled"}:
+            return web.json_response(
+                {"status": record["state"], "delivery_id": delivery_id}, status=200
+            )
+        task = self._execution_tasks.get(delivery_id)
+        if task is not None and not task.done():
+            task.cancel()
+        record["state"] = "cancelled"
+        return web.json_response(
+            {"status": "cancelled", "delivery_id": delivery_id}, status=200
+        )
 
     async def _end_webhook_session(
         self, event: "MessageEvent", session_chat_id: str
