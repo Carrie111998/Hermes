@@ -181,6 +181,22 @@ def read_install_method() -> str | None:
 
 
 def print_fast_version_info() -> None:
+    auth_home = None
+    if "HERMES_AUTH_HOME" in os.environ:
+        # Keep the fast path aligned with every other operational entry point
+        # without pulling config/provider modules across the import wall.
+        # hermes_constants is deliberately stdlib-only and import-safe.
+        from hermes_constants import (
+            HermesAuthHomeError,
+            get_hermes_auth_home_strict,
+        )
+
+        try:
+            auth_home = get_hermes_auth_home_strict()
+        except HermesAuthHomeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+
     from hermes_cli import __release_date__, __version__
 
     print(f"Hermes Agent v{__version__} ({__release_date__})")
@@ -188,6 +204,8 @@ def print_fast_version_info() -> None:
     install_method = read_install_method()
     if install_method:
         print(f"Install method: {install_method}")
+    if auth_home is not None:
+        print(f"Auth home: {auth_home} (HERMES_AUTH_HOME)")
 
     print(f"Python: {sys.version.split()[0]}")
 
