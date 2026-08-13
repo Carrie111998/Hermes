@@ -1,4 +1,9 @@
-"""Nostr platform adapter for Hermes Agent — plugin."""
+"""Nostr platform adapter for Hermes Agent — plugin.
+
+Encryption uses the modern NIP-44 (v2) scheme combined with NIP-17
+gift-wrapped direct messages (kind 1059), replacing the legacy NIP-04
+(kind 4) scheme.
+"""
 
 import asyncio
 import hashlib
@@ -8,7 +13,18 @@ import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from nostr_sdk import Kind, Keys, Filter, Tag, EventBuilder, Client, NostrSigner
+from nostr_sdk import (
+    Kind,
+    Keys,
+    Filter,
+    Tag,
+    PublicKey,
+    EventBuilder,
+    Client,
+    NostrSigner,
+    HandleNotification,
+    gift_wrap,
+)
 
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.platforms.base import Platform
@@ -22,6 +38,30 @@ DEFAULT_RELAYS = [
     "wss://relay.primal.net",
     "wss://relay.snort.social",
 ]
+
+
+class _NotificationHandler(HandleNotification):
+    """Nostr SDK notification handler bridging sync callbacks to the adapter.
+
+    nostr_sdk 0.44+ invokes ``handle``/``handle_msg`` synchronously from the
+    notification loop for every relay message; ``handle`` receives each
+    ``Event`` and defers async processing to the adapter's event loop via a
+    task, so a slow handler never blocks the SDK loop.
+    """
+
+    def __init__(self, adapter: "NostrAdapter"):
+        self._adapter = adapter
+
+    def handle_msg(self, relay_url, msg):  # noqa: ARG002 - SDK callback signature
+        # Raw relay messages are not events; we only care about events.
+        return None
+
+    def handle(self, relay_url, subscription_id, event):  # noqa: ARG002
+        adapter = self._adapter
+        if not adapter._listening:
+            return
+        # Defer to the async event loop; failures are contained in _process_event.
+        asyncio.create_task(adapter._process_event(event))
 
 
 class NostrAdapter(BasePlatformAdapter):
@@ -39,6 +79,7 @@ class NostrAdapter(BasePlatformAdapter):
 
         self.client: Optional[Client] = None
         self.keys: Optional[Keys] = None
+        self.signer: Optional[NostrSigner] = None
         self.pubkey: Optional[str] = None
         self._listening = False
         self._lock_key: Optional[str] = None
@@ -62,10 +103,11 @@ class NostrAdapter(BasePlatformAdapter):
             self._lock_key = None
 
         try:
-            self.keys = Keys.from_nsec(self.nsec)
+            self.keys = Keys.parse(self.nsec)
             self.pubkey = self.keys.public_key().to_hex()
 
             signer = NostrSigner.keys(self.keys)
+            self.signer = signer
             self.client = Client(signer)
 
             for relay in self.relays:
@@ -104,6 +146,7 @@ class NostrAdapter(BasePlatformAdapter):
             await self.client.disconnect()
             self.client = None
         self.keys = None
+        self.signer = None
         self.nsec = None
         self.pubkey = None
         logger.info("Disconnected from Nostr relays")
@@ -112,42 +155,71 @@ class NostrAdapter(BasePlatformAdapter):
         if not self.client:
             return
 
-        filter_obj = Filter().kind([4, 1])
-
-        async def message_handler(message):
-            if not self._listening:
-                return
-            try:
-                event_dict = message.as_json_dict()
-                await self._process_event(event_dict)
-            except Exception:
-                pass
-
-        await self.client.handle_notifications(message_handler)
-
-    async def _process_event(self, event_dict: dict):
+        # NIP-17 gift-wrapped DMs (kind 1059) plus NIP-44 direct DMs (kind 44).
+        filter_obj = Filter().kinds([Kind(1059), Kind(44)])
         try:
-            event_id = event_dict.get("id")
-            pubkey = event_dict.get("pubkey")
-            kind = event_dict.get("kind")
-            content = event_dict.get("content")
-            tags = event_dict.get("tags", [])
-            created_at = event_dict.get("created_at")
+            await self.client.subscribe(filter_obj)
+        except Exception as e:
+            logger.warning("Nostr subscribe failed: %s", e)
 
-            if kind == 4:
-                if not self.keys:
-                    return
-                try:
-                    decrypted = self.keys.decrypt(content, pubkey)
-                    await self._handle_incoming_message(pubkey, decrypted, event_id, created_at)
-                except Exception as e:
-                    logger.warning("Failed to decrypt Nostr event %s: %s", event_id, e)
-            elif kind == 1:
-                our_pubkey_tag = [t for t in tags if t[0] == 'p' and t[1] == self.pubkey]
-                if our_pubkey_tag:
-                    await self._handle_incoming_message(pubkey, content, event_id, created_at)
+        handler = _NotificationHandler(self)
+        try:
+            await self.client.handle_notifications(handler)
+        except Exception as e:
+            logger.exception("Nostr notification handler terminated: %s", e)
+
+    async def _process_event(self, event):
+        try:
+            kind = event.kind().as_u16()
+
+            if kind == 1059:
+                await self._handle_gift_wrap(event)
+            elif kind == 44:
+                await self._handle_nip44_dm(event)
+            else:
+                logger.debug("Ignoring unsupported Nostr event kind %s", kind)
         except Exception as e:
             logger.exception("Error in _process_event: %s", e)
+
+    async def _handle_gift_wrap(self, event):
+        """Unwrap a NIP-17 gift wrap (kind 1059) and decrypt its NIP-44 payload."""
+        if not self.client or not self.signer:
+            logger.warning("Nostr: cannot unwrap gift wrap without client/signer")
+            return
+        try:
+            unwrapped = await self.client.unwrap_gift_wrap(event)
+            sender_pk = unwrapped.sender()          # real author of the wrapped DM
+            rumor = unwrapped.rumor()                # kind-14 rumor carrying the payload
+            ciphertext = rumor.content()
+            plaintext = await self.signer.nip44_decrypt(sender_pk, ciphertext)
+            sender_hex = sender_pk.to_hex()
+            event_id = rumor.id().to_hex()
+            created_at = rumor.created_at().as_secs()
+            await self._handle_incoming_message(sender_hex, plaintext, event_id, created_at)
+        except Exception as e:
+            event_id = None
+            try:
+                event_id = event.id().to_hex()
+            except Exception:
+                pass
+            logger.warning("Failed to unwrap/decrypt Nostr gift wrap %s: %s",
+                           event_id or "unknown", e)
+
+    async def _handle_nip44_dm(self, event):
+        """Decrypt a direct NIP-44 DM (kind 44)."""
+        if not self.signer:
+            logger.warning("Nostr: cannot decrypt NIP-44 DM without signer")
+            return
+        try:
+            sender_pk = event.author()
+            plaintext = await self.signer.nip44_decrypt(sender_pk, event.content())
+            sender_hex = sender_pk.to_hex()
+            event_id = event.id().to_hex()
+            created_at = event.created_at().as_secs()
+            await self._handle_incoming_message(sender_hex, plaintext, event_id, created_at)
+        except Exception as e:
+            logger.warning("Failed to decrypt Nostr NIP-44 DM %s: %s",
+                           event.id().to_hex(), e)
 
     async def _handle_incoming_message(self, sender_pubkey: str, content: str, event_id: str, timestamp: int):
         try:
@@ -174,15 +246,23 @@ class NostrAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
-        if not self.client or not self.keys:
+        if not self.client or not self.keys or not self.signer:
             return SendResult(success=False, error="Not connected to Nostr relays")
         try:
-            ciphertext = self.keys.encrypt(chat_id, content)
-            event_builder = EventBuilder(Kind.EncryptedDirectMessage, ciphertext)
-            event_builder.tag(Tag.pubkey(chat_id))
-            signed_event = event_builder.sign_with_keys(self.keys)
-            await self.client.send_event(signed_event)
-            return SendResult(success=True, message_id=signed_event.id().to_hex())
+            recipient_pk = PublicKey.parse(chat_id)
+            # NIP-44 encrypt the DM payload to the recipient.
+            ciphertext = await self.signer.nip44_encrypt(recipient_pk, content)
+            # Build the inner kind-14 rumor (NIP-17).
+            rumor = EventBuilder.private_msg_rumor(recipient_pk, ciphertext).build(self.keys.public_key())
+            # Gift-wrap the rumor into a kind-1059 event (NIP-17/NIP-59).
+            wrapped = await gift_wrap(
+                self.signer,
+                recipient_pk,
+                rumor,
+                [Tag.public_key(recipient_pk)],
+            )
+            output = await self.client.send_event(wrapped)
+            return SendResult(success=True, message_id=output.id.to_hex())
         except Exception as e:
             logger.exception("Failed to send Nostr message: %s", e)
             return SendResult(success=False, error=f"Failed to send message: {str(e)}")
@@ -198,10 +278,12 @@ class NostrAdapter(BasePlatformAdapter):
         if not self.client:
             return {"name": chat_id, "type": "user", "chat_id": chat_id}
         try:
-            filter_obj = Filter().author(chat_id).kind(0)
-            events = await self.client.query(filter_obj, timeout=5)
-            if events:
-                event = events[0]
+            from datetime import timedelta
+            filter_obj = Filter().author(PublicKey.parse(chat_id)).kind(Kind(0))
+            events = await self.client.fetch_events(filter_obj, timedelta(seconds=5))
+            event_list = events.to_vec()
+            if event_list:
+                event = event_list[0]
                 profile = json.loads(event.content())
                 name = profile.get("display_name", profile.get("name", chat_id))
                 return {"name": name, "type": "user", "chat_id": chat_id, "profile": profile}
@@ -253,7 +335,7 @@ def interactive_setup() -> None:
         if not prompt_yes_no("Reconfigure Nostr?", False):
             return
 
-    print_info("Connect Hermes to the Nostr protocol (NIP-04 encrypted DMs).")
+    print_info("Connect Hermes to the Nostr protocol (NIP-44 / NIP-17 gift-wrapped DMs).")
     print_info("   Requires a Nostr nsec private key and relay URLs.")
     print()
 
@@ -316,7 +398,7 @@ async def _standalone_send(
     media_files: Optional[List[str]] = None,
     force_document: bool = False,
 ) -> Dict[str, Any]:
-    """Open an ephemeral Nostr connection, send a NIP-04 DM, and disconnect.
+    """Open an ephemeral Nostr connection, send a NIP-44 + NIP-17 DM, disconnect.
 
     Used by ``hermes cron`` when the gateway runner is not in the same
     process.  Without this hook, ``deliver=nostr`` cron jobs fail with
@@ -324,6 +406,8 @@ async def _standalone_send(
     """
     import os
     from nostr_sdk import Keys as StandaloneKeys, Client as StandaloneClient, NostrSigner as StandaloneSigner
+    from nostr_sdk import PublicKey as StandalonePublicKey, Tag as StandaloneTag
+    from nostr_sdk import EventBuilder as StandaloneEventBuilder, gift_wrap as standalone_gift_wrap
 
     extra = getattr(pconfig, "extra", {}) or {}
     nsec = os.getenv("NOSTR_NSEC") or extra.get("nsec", "")
@@ -340,7 +424,7 @@ async def _standalone_send(
         return {"error": "Nostr standalone send: no relays configured"}
 
     try:
-        keys = StandaloneKeys.from_nsec(nsec)
+        keys = StandaloneKeys.parse(nsec)
         signer = StandaloneSigner.keys(keys)
         client = StandaloneClient(signer)
 
@@ -349,14 +433,22 @@ async def _standalone_send(
 
         await client.connect()
 
-        ciphertext = keys.encrypt(chat_id, message)
-        event_builder = EventBuilder(Kind.EncryptedDirectMessage, ciphertext)
-        event_builder.tag(Tag.pubkey(chat_id))
-        signed_event = event_builder.sign_with_keys(keys)
-        await client.send_event(signed_event)
+        recipient_pk = StandalonePublicKey.parse(chat_id)
+        # NIP-44 encrypt the DM payload to the recipient.
+        ciphertext = await signer.nip44_encrypt(recipient_pk, message)
+        # Build the inner kind-14 rumor (NIP-17).
+        rumor = StandaloneEventBuilder.private_msg_rumor(recipient_pk, ciphertext).build(keys.public_key())
+        # Gift-wrap the rumor into a kind-1059 event (NIP-17/NIP-59).
+        wrapped = await standalone_gift_wrap(
+            signer,
+            recipient_pk,
+            rumor,
+            [StandaloneTag.public_key(recipient_pk)],
+        )
+        output = await client.send_event(wrapped)
         await client.disconnect()
 
-        return {"success": True, "message_id": signed_event.id().to_hex()}
+        return {"success": True, "message_id": output.id.to_hex()}
 
     except Exception as e:
         return {"error": f"Nostr standalone send failed: {e}"}
@@ -380,7 +472,7 @@ def register(ctx):
         pii_safe=False,
         allow_update_command=True,
         platform_hint=(
-            "You are chatting via Nostr. Messages are sent as encrypted "
-            "direct messages (NIP-04). Keep responses concise."
+            "You are chatting via Nostr. Messages are sent as NIP-44 encrypted "
+            "gift-wrapped direct messages (NIP-17). Keep responses concise."
         ),
     )
