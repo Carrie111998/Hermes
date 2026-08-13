@@ -1566,30 +1566,38 @@ def _drain_gateway_pids(pids: list[int], drain_timeout: float) -> bool:
     Every PID shares one deadline so total stop latency stays bounded by the
     configured drain timeout rather than growing to ``len(pids) *
     drain_timeout`` -- ``_windows_stop_drain_timeout()`` exists precisely
-    because "Windows CLI stop must not wedge forever".
+    because "Windows CLI stop must not wedge forever". The budget still left
+    is split across the PIDs still to be drained, so one process that never
+    exits cannot consume the whole window and leave its siblings with no
+    drain request at all; a PID that exits early hands its unused share back
+    to the ones after it.
 
     Returns True only when every live PID exited within the shared deadline,
     so the caller can honestly report a clean drain rather than claiming one
     while a sibling process is still being hard-killed.
     """
     own_pid = os.getpid()
-    deadline = time.monotonic() + max(drain_timeout, 1.0)
     seen: set[int] = set()
-    attempted = False
-    all_drained = True
+    targets: list[int] = []
     for pid in pids:
         if pid <= 0 or pid == own_pid or pid in seen:
             continue
         seen.add(pid)
+        targets.append(pid)
+    if not targets:
+        return False
+
+    deadline = time.monotonic() + max(drain_timeout, 1.0)
+    all_drained = True
+    for index, pid in enumerate(targets):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             # Out of budget: the caller still hard-kills this PID below.
             all_drained = False
             continue
-        attempted = True
-        if not _drain_gateway_pid(pid, remaining):
+        if not _drain_gateway_pid(pid, remaining / (len(targets) - index)):
             all_drained = False
-    return attempted and all_drained
+    return all_drained
 
 
 def _force_terminate_known_gateway_pids(pids: list[int]) -> int:
