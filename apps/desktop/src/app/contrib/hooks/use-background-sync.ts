@@ -1,6 +1,7 @@
 import { useStore } from '@nanostores/react'
 import { useEffect } from 'react'
 
+import { sealOpenToolParts } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $changeEventsAvailable, $cronChangeTick, $sessionsChangeTick } from '@/store/live-sync'
 import { $onBattery, batteryPollInterval } from '@/store/power'
@@ -150,14 +151,19 @@ export function rehydrateLiveSessionStatuses(
 
       const existing = $sessionStates.get()[runtimeSessionId]
 
-      if (existing?.busy || existing?.needsInput) {
+      if (existing?.busy || existing?.needsInput || existing?.awaitingResponse) {
         publishSessionState(runtimeSessionId, {
           ...existing,
           awaitingResponse: false,
           busy: false,
           needsInput: false,
           streamId: null,
-          turnStartedAt: null
+          turnStartedAt: null,
+          // The turn ended without its completion events reaching us — a lost
+          // `tool.complete` would otherwise leave a spinning tool row in an
+          // idle session. Seal open tool parts the same way the settle path
+          // does, so the transcript matches the state.
+          messages: sealOpenToolParts(existing.messages)
         })
       }
     }

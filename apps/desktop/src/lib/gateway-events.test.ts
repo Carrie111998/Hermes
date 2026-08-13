@@ -37,6 +37,7 @@ describe('gateway event routing', () => {
     expect(started).toEqual({
       drop: false,
       nextUnscopedStreamSessionId: 'session-a',
+      pinned: false,
       sessionId: 'session-a'
     })
 
@@ -50,6 +51,7 @@ describe('gateway event routing', () => {
     expect(delta).toEqual({
       drop: false,
       nextUnscopedStreamSessionId: 'session-a',
+      pinned: true,
       sessionId: 'session-a'
     })
 
@@ -63,6 +65,7 @@ describe('gateway event routing', () => {
     expect(completed).toEqual({
       drop: false,
       nextUnscopedStreamSessionId: null,
+      pinned: true,
       sessionId: 'session-a'
     })
   })
@@ -78,6 +81,27 @@ describe('gateway event routing', () => {
     expect(routed).toEqual({
       drop: false,
       nextUnscopedStreamSessionId: 'session-b',
+      pinned: false,
+      sessionId: 'session-b'
+    })
+  })
+
+  it('attributes an unpinned stream event to the active session without the pin flag', () => {
+    // A late straggler (no pin left after the previous turn completed) falls
+    // back to the active session. The handler drops this case when the target
+    // session has no live turn — the straggler belongs to a turn that already
+    // ended elsewhere (#43142 family).
+    const routed = resolveGatewayEventSessionId({
+      activeSessionId: 'session-b',
+      eventType: 'thinking.delta',
+      explicitSessionId: '',
+      unscopedStreamSessionId: null
+    })
+
+    expect(routed).toEqual({
+      drop: false,
+      nextUnscopedStreamSessionId: null,
+      pinned: false,
       sessionId: 'session-b'
     })
   })
@@ -93,6 +117,7 @@ describe('gateway event routing', () => {
     expect(routed).toEqual({
       drop: false,
       nextUnscopedStreamSessionId: null,
+      pinned: true,
       sessionId: 'session-a'
     })
   })
