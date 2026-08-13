@@ -2494,6 +2494,11 @@ def run_conversation(
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
+                # Same story for role adjacency: Mistral rejects a user turn
+                # that directly follows a tool result (#20154), and a fallback
+                # can land on it mid-conversation. No-op for every other
+                # provider, so the shape stays untouched where it is legal.
+                agent._bridge_tool_to_user_for_provider(api_messages)
                 # Same story for prompt-cache decoration (#72626): try_activate_
                 # fallback refreshes the policy flags, but the decorated list
                 # still carries the primary's breakpoints (or none). Strip and

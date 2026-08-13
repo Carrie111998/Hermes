@@ -850,6 +850,76 @@ def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool) -> int:
 
 
 # ---------------------------------------------------------------------------
+# tool → user adjacency policy — Mistral-family strictness
+# ---------------------------------------------------------------------------
+#
+# Mistral rejects a ``user`` turn that directly follows a ``tool`` result with
+# HTTP 400 "Unexpected role 'user' after role 'tool'" (#20154); the same
+# family's chat templates raise a Jinja alternation error on the shape (see
+# ``_template_visible_role`` in agent/context_compressor.py for the template
+# side). Every other provider accepts it, and the shape itself is legitimate —
+# the user redirected before the model got its continuation turn — so
+# ``repair_message_sequence`` deliberately preserves it in the stored history.
+# Only the per-call wire copy is bridged, and only for the family that rejects
+# it. Model substrings carry the match because Mistral models are served from
+# NIM / OpenRouter / self-hosted vLLM as often as from api.mistral.ai.
+
+_TOOL_ROLE_STRICT_PROVIDERS = frozenset({"mistral"})
+_TOOL_ROLE_STRICT_MODEL_SUBSTRINGS = (
+    "mistral", "mixtral", "magistral", "ministral", "codestral", "devstral",
+    "pixtral",
+)
+_TOOL_ROLE_STRICT_HOSTS = ("api.mistral.ai",)
+
+# Wire-only stand-in for the continuation turn the model never got. Non-empty
+# because strict providers reject empty mid-transcript content too, and a
+# fixed string so the bridged prefix stays byte-stable across turns (prompt
+# caching).
+TOOL_TO_USER_BRIDGE_CONTENT = "[response interrupted]"
+
+
+def requires_assistant_after_tool(provider: Any, model: Any, base_url: Any) -> bool:
+    """True when the endpoint rejects a ``user`` turn straight after a ``tool``."""
+    from utils import base_url_host_matches
+
+    if (provider or "").strip().lower() in _TOOL_ROLE_STRICT_PROVIDERS:
+        return True
+    model_lower = (model or "").lower()
+    if any(sub in model_lower for sub in _TOOL_ROLE_STRICT_MODEL_SUBSTRINGS):
+        return True
+    return any(
+        base_url_host_matches(base_url, host) for host in _TOOL_ROLE_STRICT_HOSTS
+    )
+
+
+def bridge_tool_to_user_turns(api_messages: list) -> int:
+    """Insert a minimal assistant turn between a ``tool`` result and a ``user`` turn.
+
+    Mutates ``api_messages`` (the per-call copy) in place and returns the
+    number of bridges inserted. Idempotent — a second pass finds no remaining
+    adjacency, so it is safe to call on every retry attempt.
+    """
+    inserted = 0
+    idx = 1
+    while idx < len(api_messages):
+        prev = api_messages[idx - 1]
+        current = api_messages[idx]
+        if (
+            isinstance(prev, dict)
+            and isinstance(current, dict)
+            and prev.get("role") == "tool"
+            and current.get("role") == "user"
+        ):
+            api_messages.insert(
+                idx, {"role": "assistant", "content": TOOL_TO_USER_BRIDGE_CONTENT}
+            )
+            inserted += 1
+            idx += 1
+        idx += 1
+    return inserted
+
+
+# ---------------------------------------------------------------------------
 # Image / multimodal parts — evaluated, NOT consolidated (verdict: syntax)
 # ---------------------------------------------------------------------------
 #

@@ -3690,6 +3690,45 @@ def reapply_reasoning_echo_for_provider(agent, api_messages: list) -> int:
     )
 
 
+def bridge_tool_to_user_for_provider(agent, api_messages: list) -> int:
+    """Bridge ``tool`` → ``user`` adjacencies for providers that reject them.
+
+    Mistral answers HTTP 400 "Unexpected role 'user' after role 'tool'" when a
+    user turn directly follows a tool result (#20154), which strands every
+    subsequent request in the session once the shape is in history. The shape
+    is legitimate — the user redirected before the model got its continuation
+    turn — so ``repair_message_sequence`` keeps it in the stored transcript and
+    the repair happens here instead, on the per-call copy, and only when the
+    *current* provider is one that rejects it.
+
+    Called alongside ``reapply_reasoning_echo_for_provider`` so a
+    mid-conversation fallback onto Mistral is covered too.
+
+    Returns the number of bridging assistant turns inserted.
+    """
+    from agent.message_sanitization import (
+        bridge_tool_to_user_turns,
+        requires_assistant_after_tool,
+    )
+
+    if not requires_assistant_after_tool(
+        agent.provider,
+        agent.model,
+        getattr(agent, "_base_url_lower", agent.base_url),
+    ):
+        return 0
+
+    bridged = bridge_tool_to_user_turns(api_messages)
+    if bridged:
+        logger.debug(
+            "Bridged %d tool->user adjacency/adjacencies with an assistant "
+            "turn for strict provider (model=%s)",
+            bridged,
+            agent.model,
+        )
+    return bridged
+
+
 def _iter_httpx_pool_objects(http_client: Any):
     """Yield httpcore pool objects reachable from an httpx client.
 
