@@ -51,10 +51,10 @@ def test_exact_literal_masked(patterns_file):
 
 def test_key_pattern_masked_keeps_separator(patterns_file):
     _write(patterns_file, [], ["PIN", "GITHUB_PAT"])
-    out = redact_sensitive_text("PIN=1234 and GITHUB_PAT=xYzQwEr" + "12345AbCd")
+    out = redact_sensitive_text("PIN=1234 and GITHUB_PAT=abcdefgh" + "12345678")
     assert "PIN=1234" not in out
     assert "PIN=***" in out
-    assert "xYzQwEr12345AbCd" not in out
+    assert "abcdefgh" + "12345678" not in out
     assert "GITHUB_PAT=***" in out
 
 
