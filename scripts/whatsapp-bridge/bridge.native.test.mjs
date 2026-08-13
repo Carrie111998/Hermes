@@ -20,9 +20,29 @@ import {
   extractBridgeEvent,
   inboundReadReceiptKeys,
   mediaPayloadForFile,
+  normalizeWhatsAppId,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
+
+// -- bot id normalization (multi-device suffix) ---------------------------
+{
+  // sock.user.id / sock.user.lid arrive with a device index; mentionedJid
+  // and contextInfo.participant arrive without one. Both must normalize to
+  // the same clean JID or botIds set-membership checks can never match.
+  assert.equal(
+    normalizeWhatsAppId('15551234567:17@s.whatsapp.net'),
+    '15551234567@s.whatsapp.net',
+  );
+  assert.equal(normalizeWhatsAppId('98765432101112:5@lid'), '98765432101112@lid');
+  assert.equal(
+    normalizeWhatsAppId('15551234567@s.whatsapp.net'),
+    '15551234567@s.whatsapp.net',
+  );
+  assert.equal(normalizeWhatsAppId('120363001234567890@g.us'), '120363001234567890@g.us');
+  assert.equal(normalizeWhatsAppId(''), '');
+  console.log('  ✓ normalizeWhatsAppId strips the multi-device suffix so bot ids match mention/quote ids');
+}
 
 // -- inbound read receipts ------------------------------------------------
 {

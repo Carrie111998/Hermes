@@ -15,7 +15,15 @@ export const MIME_MAP = {
 
 export function normalizeWhatsAppId(value) {
   if (!value) return '';
-  return String(value).replace(':', '@');
+  // Baileys multi-device JIDs embed a device index between the user part and
+  // the server ("<user>:<device>@<server>" — e.g. sock.user.id arrives as
+  // "15551234567:17@s.whatsapp.net"), while mentionedJid / contextInfo
+  // participants arrive without it. The device part is not identity — strip
+  // it so the same account compares equal across both shapes. (The owner
+  // message gate already does this inline via .replace(/:.*@/, '@'); the
+  // old ':'→'@' fold here instead produced a malformed two-@ id, which
+  // broke botIds set-membership checks against mention/quote ids.)
+  return String(value).replace(/:[^@]*@/, '@');
 }
 
 export function getMessageContent(msg) {

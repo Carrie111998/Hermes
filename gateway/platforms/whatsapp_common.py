@@ -183,7 +183,16 @@ class WhatsAppBehaviorMixin:
             return ""
         normalized = str(value).strip()
         if ":" in normalized and "@" in normalized:
-            normalized = normalized.replace(":", "@", 1)
+            # Baileys multi-device JIDs embed a device index between the user
+            # part and the server ("<user>:<device>@<server>" — e.g. the
+            # bridge's sock.user.id arrives as "15551234567:17@s.whatsapp.net"),
+            # while mentionedIds / quotedParticipant arrive without it. The
+            # device part is not identity — strip it, the same way the authz
+            # path's normalize_whatsapp_identifier does. (Folding the colon
+            # into an "@" here, as this used to do, produced a malformed
+            # two-@ id that could never match the clean inbound form, which
+            # silently broke bot-mention and reply-to-bot set matching.)
+            normalized = re.sub(r":[^@]*@", "@", normalized, count=1)
         return normalized
 
     @staticmethod
