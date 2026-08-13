@@ -2012,29 +2012,27 @@ def transfer_file_dedup(
 ) -> bool:
     """Move the per-task read tracker from ``old_task_id`` to ``new_task_id``.
 
-    Resuming a session in the middle of a turn (``/resume <other>``) rotates
-    ``self.session_id`` from one ID to another.  ``read_file_tool`` keys its
-    dedup cache on that same id, so the freshly-resumed session starts with
-    an empty cache and the agent re-reads files it already has in its
-    rehydrated transcript — pulling every attachment through the gateway
-    again (issue #81725).
+    Resuming a session with ``/resume <other>`` rotates the session id and
+    rebuilds the per-turn task id; ``read_file_tool`` keys its dedup cache
+    on that per-turn task id, so the freshly-resumed session would otherwise
+    start with an empty cache and the agent re-reads files it already has in
+    its rehydrated transcript — pulling every attachment through the gateway
+    again (issue #81725).  Transferring the tracker forward preserves the
+    dedup behaviour across the boundary: a ``read_file`` for a path the
+    agent already saw in the previous session returns the cheap "File
+    unchanged" stub instead of re-fetching the bytes.  The ``mtime`` guard
+    inside ``read_file_tool`` still invalidates a stale entry if the file
+    changed on disk between sessions.
 
-    Moving the cache forward preserves the dedup behaviour across the
-    boundary: a ``read_file`` for a path the agent already saw in the
-    previous session returns the cheap "File unchanged" stub instead of
-    re-fetching the bytes.  The ``mtime`` guard inside ``read_file_tool``
-    still invalidates a stale entry if the file changed on disk between
-    sessions.
-
-    Scope: this is intended for a mid-chat ``/resume`` of the *same* session
-    (restart, reconnect), where the rehydrated transcript already holds the
-    file's content so a cache hit is correct.  For ``/resume <other_session>``
-    the carried cache can also suppress a read for a file whose content is
-    NOT in the resumed transcript — the mtime guard does not catch that
-    (the file is unchanged on disk), so after enough such stubs the tool's
-    repeated-read throttle can block the agent until it re-reads.  Callers
-    that resume a *different* session and want a clean cache should call
-    ``reset_file_dedup`` on the new id rather than transferring.
+    Scope: this is for a ``/resume`` to a *different* session — the
+    transfer only fires when the old and new session ids differ, and a
+    same-session resume is rejected before this runs.  A carried cache entry
+    suppresses a re-read for a file whose content is NOT in the resumed
+    transcript (the mtime guard does not catch that — the file is unchanged
+    on disk), so after enough such stubs the tool's repeated-read throttle
+    can block the agent until it re-reads.  Callers that resume a different
+    session and want a clean cache should call ``reset_file_dedup`` on the
+    new id rather than transferring.
 
     Returns ``True`` if a non-empty tracker was moved, ``False`` otherwise
     (no source tracker, missing ids, or the target already has its own
