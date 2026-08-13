@@ -6,6 +6,7 @@ import pytest
 
 from tools.delegate_tool import (
     DELEGATE_TASK_SCHEMA,
+    _SELECTION_UNSET,
     _build_dynamic_schema_overrides,
     _resolve_task_execution_overrides,
     _strip_model_hidden_task_fields,
@@ -150,7 +151,7 @@ class TestSafeSelectionValidation:
 
         creds, _ = _resolve_task_execution_overrides(
             "anthropic/claude-sonnet-4.6",
-            None,
+            _SELECTION_UNSET,
             cfg,
             inherited,
             parent_api_mode="chat_completions",
@@ -183,18 +184,20 @@ class TestSafeSelectionValidation:
             "allowed_models": ["gpt-5.6-luna", "gpt-5.6-sol"],
         }
         if model == "":
-            creds, reasoning = _resolve_task_execution_overrides(None, None, cfg, BASE_CREDS)
+            creds, reasoning = _resolve_task_execution_overrides(
+                _SELECTION_UNSET, _SELECTION_UNSET, cfg, BASE_CREDS
+            )
             assert creds is BASE_CREDS
             assert reasoning is None
         else:
             with pytest.raises(ValueError, match="not allowed"):
-                _resolve_task_execution_overrides(model, None, cfg, BASE_CREDS)
+                _resolve_task_execution_overrides(model, _SELECTION_UNSET, cfg, BASE_CREDS)
 
     def test_selection_is_rejected_when_operator_flag_is_off(self):
         with pytest.raises(ValueError, match="disabled"):
-            _resolve_task_execution_overrides("gpt-5.6-sol", None, {}, BASE_CREDS)
+            _resolve_task_execution_overrides("gpt-5.6-sol", _SELECTION_UNSET, {}, BASE_CREDS)
 
-    @pytest.mark.parametrize("value", ["", "   ", False, 0, [], {}])
+    @pytest.mark.parametrize("value", [None, "", "   ", False, 0, [], {}])
     def test_explicit_malformed_model_is_rejected(self, value):
         cfg = {
             "allow_model_selection": True,
@@ -203,7 +206,7 @@ class TestSafeSelectionValidation:
         with pytest.raises(ValueError, match="model must be a non-empty string"):
             _resolve_task_execution_overrides(value, None, cfg, BASE_CREDS)
 
-    @pytest.mark.parametrize("value", ["", "   ", False, 0, [], {}])
+    @pytest.mark.parametrize("value", [None, "", "   ", False, 0, [], {}])
     def test_explicit_malformed_reasoning_effort_is_rejected(self, value):
         cfg = {
             "allow_model_selection": True,
@@ -212,7 +215,7 @@ class TestSafeSelectionValidation:
         with pytest.raises(
             ValueError, match="reasoning effort must be a non-empty string"
         ):
-            _resolve_task_execution_overrides(None, value, cfg, BASE_CREDS)
+            _resolve_task_execution_overrides(_SELECTION_UNSET, value, cfg, BASE_CREDS)
 
     def test_unlisted_reasoning_effort_is_rejected(self):
         cfg = {
@@ -290,7 +293,10 @@ class TestPerTaskSelectionIntegration:
 
     def test_omitted_fields_preserve_delegation_defaults(self):
         creds, reasoning = _resolve_task_execution_overrides(
-            None, None, {"allow_model_selection": True}, BASE_CREDS
+            _SELECTION_UNSET,
+            _SELECTION_UNSET,
+            {"allow_model_selection": True},
+            BASE_CREDS,
         )
 
         assert creds is BASE_CREDS

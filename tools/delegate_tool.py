@@ -787,6 +787,9 @@ def _selection_allowlists(cfg: dict) -> tuple[List[str], List[str]]:
     )
 
 
+_SELECTION_UNSET = object()
+
+
 def _resolve_task_execution_overrides(
     model: Any,
     reasoning_effort: Any,
@@ -795,18 +798,20 @@ def _resolve_task_execution_overrides(
     parent_api_mode: Optional[str] = None,
 ) -> tuple[dict, Optional[dict]]:
     """Resolve task-local compute without changing transport or credentials."""
-    if model is not None and (not isinstance(model, str) or not model.strip()):
+    model_provided = model is not _SELECTION_UNSET
+    effort_provided = reasoning_effort is not _SELECTION_UNSET
+    if model_provided and (not isinstance(model, str) or not model.strip()):
         raise ValueError("model must be a non-empty string when provided")
-    if reasoning_effort is not None and (
+    if effort_provided and (
         not isinstance(reasoning_effort, str) or not reasoning_effort.strip()
     ):
         raise ValueError(
             "reasoning effort must be a non-empty string when provided"
         )
 
-    requested_model = model if model is not None else ""
-    requested_effort = reasoning_effort if reasoning_effort is not None else ""
-    if model is None and reasoning_effort is None:
+    requested_model = model if model_provided else ""
+    requested_effort = reasoning_effort if effort_provided else ""
+    if not model_provided and not effort_provided:
         return base_creds, None
     if not is_truthy_value(cfg.get("allow_model_selection"), default=False):
         raise ValueError("per-task model selection is disabled")
@@ -3284,8 +3289,8 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
-    model: Optional[str] = None,
-    reasoning_effort: Optional[str] = None,
+    model: Any = _SELECTION_UNSET,
+    reasoning_effort: Any = _SELECTION_UNSET,
     parent_agent=None,
 ) -> str:
     """
@@ -3388,9 +3393,11 @@ def delegate_task(
             "goal": goal,
             "context": context,
             "role": top_role,
-            "model": model,
-            "reasoning_effort": reasoning_effort,
         }
+        if model is not _SELECTION_UNSET:
+            single_task["model"] = model
+        if reasoning_effort is not _SELECTION_UNSET:
+            single_task["reasoning_effort"] = reasoning_effort
         if output_schema is not None:
             single_task["output_schema"] = output_schema
         task_list = [single_task]
@@ -3443,8 +3450,8 @@ def delegate_task(
         try:
             task_execution.append(
                 _resolve_task_execution_overrides(
-                    task.get("model"),
-                    task.get("reasoning_effort"),
+                    task.get("model", _SELECTION_UNSET),
+                    task.get("reasoning_effort", _SELECTION_UNSET),
                     cfg,
                     creds,
                     parent_api_mode=getattr(parent_agent, "api_mode", None),
