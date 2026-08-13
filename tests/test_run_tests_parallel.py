@@ -35,7 +35,7 @@ import pytest
 # verifier reads here. We park it in $TMPDIR with a unique-per-run name
 # so concurrent invocations of the suite don't clobber each other.
 _HANDOFF_DIR = Path(os.environ.get("TMPDIR", "/tmp")) / "hermes-isolation-probe"
-_HANDOFF_DIR.mkdir(exist_ok=True)
+_HANDOFF_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _handoff_path_for(nonce: str) -> Path:
