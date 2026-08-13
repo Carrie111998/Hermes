@@ -783,6 +783,55 @@ async def _dashboard_health_middleware(request: Request, call_next):
 
 
 # ---------------------------------------------------------------------------
+# Outermost access log — records every request (including unauthenticated
+# probes / spoofed-bot traffic) to ~/.hermes/logs/access.jsonl.
+# Registered AFTER the health middleware so it wraps everything (Starlette
+# middleware is outermost-last). Query strings are NEVER logged (token
+# redaction); only user-agent + referer headers are captured.
+# ---------------------------------------------------------------------------
+
+_ACCESS_LOG_PATH = os.path.expanduser("~/.hermes/logs/access.jsonl")
+
+
+def _access_log_line(request: Request, status: int, t0: float) -> None:
+    """Append one JSONL access entry. Never raises — logging must not break serving."""
+    import time as _time
+
+    try:
+        entry = {
+            "origin": "hermes-web",
+            "ts": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "dur_ms": round((_time.time() - t0) * 1000, 1),
+            "ip": request.client.host if request.client else "",
+            "host": request.headers.get("host", ""),
+            "method": request.method,
+            "path": request.url.path,
+            "status": status,
+            "ua": request.headers.get("user-agent", ""),
+            "ref": request.headers.get("referer", ""),
+        }
+        with open(_ACCESS_LOG_PATH, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+@app.middleware("http")
+async def _access_log_middleware(request: Request, call_next):
+    """Outermost middleware: log every request's method/path/IP/UA/status."""
+    import time as _time
+
+    t0 = _time.time()
+    status = 599
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        _access_log_line(request, status, t0)
+
+
+# ---------------------------------------------------------------------------
 # Authenticated-route self-test: every minute, make one in-process request
 # against a cheap DB-touching authenticated route with the real session
 # token.  Catches the class of failure where liveness looks fine but every
