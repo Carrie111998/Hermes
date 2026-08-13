@@ -59,6 +59,10 @@ function generateSessions(count: number): SessionInfo[] {
 
 const noop = () => {}
 
+// Shared-scroll owner required to virtualize (otherwise the section stays
+// flat so it cannot nest an overflow-y-auto port — see #84964).
+const sharedScroll = { getScrollElement: () => null }
+
 describe('SidebarSessionsSection memoization & virtualizer stability', () => {
   it('memoizes flatRows and passes the exact same rows array reference across parent re-renders', () => {
     mockVirtualListPropsHistory.length = 0
@@ -78,6 +82,7 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
         open={true}
         pinned={false}
         sessions={sessions}
+        {...sharedScroll}
       />
     )
 
@@ -99,6 +104,7 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
         open={true}
         pinned={false}
         sessions={sessions}
+        {...sharedScroll}
       />
     )
 
@@ -128,6 +134,7 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
         open={true}
         pinned={false}
         sessions={initialSessions}
+        {...sharedScroll}
       />
     )
 
@@ -148,6 +155,7 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
         open={true}
         pinned={false}
         sessions={initialSessions}
+        {...sharedScroll}
       />
     )
 
@@ -170,6 +178,7 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
         open={true}
         pinned={false}
         sessions={updatedSessions}
+        {...sharedScroll}
       />
     )
 
