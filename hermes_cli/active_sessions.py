@@ -4,7 +4,6 @@ The session database records persisted conversations.  This module records
 currently open chat surfaces, including idle CLI/TUI sessions that have not
 written a transcript row yet.
 """
-
 from __future__ import annotations
 
 import json
@@ -101,7 +100,7 @@ def format_age(seconds: float) -> str:
 
 
 def summarize_holders(entries: list[dict[str, Any]]) -> str:
-    """Compact "who is holding the slots" phrase, e.g. ``desktop x4, cli``."""
+    """Compact "who is holding the slots" phrase, e.g. `desktop x4, cli`."""
     if not entries:
         return ""
     counts: dict[str, int] = {}
@@ -244,6 +243,36 @@ def _optional_float(value: Any) -> Optional[float]:
         return None
 
 
+def _resolve_pid_exists():
+    """Lazy import of the authoritative cross-platform PID-existence check.
+
+    Imported once at first call and cached as a module-global so subsequent
+    calls skip the import machinery entirely. On a transient import failure
+    in ``gateway.status`` (circular import, syntax error, missing transitive
+    dep, scaffold race) the ``RuntimeError`` is raised and then caught by
+    ``_pid_alive``'s own ``except Exception``, which returns ``False`` — same
+    behaviour as the old per-call import. The registry can still be wiped by
+    ``_prune_dead`` either way. The real benefit is that ``_resolve_pid_exists``
+    is now independently callable, so unit tests can exercise the import-failure
+    path without mocking inside ``_pid_alive``.
+    """
+
+    global _PID_EXISTS  # noqa: F823
+
+    try:
+        from gateway.status import _pid_exists as _pid_exists_fn
+    except ImportError as exc:
+        raise RuntimeError(
+            "active_sessions._pid_alive requires gateway.status._pid_exists; "
+            f"import failed: {exc}"
+        ) from exc
+
+    _PID_EXISTS = _pid_exists_fn
+
+
+_PID_EXISTS: Any = None  # noqa: F821
+
+
 def _pid_alive(pid: Any, process_start_time: Any = None) -> bool:
     try:
         pid_int = int(pid)
@@ -252,9 +281,9 @@ def _pid_alive(pid: Any, process_start_time: Any = None) -> bool:
     if pid_int <= 0:
         return False
     try:
-        from gateway.status import _pid_exists
-
-        exists = bool(_pid_exists(pid_int))
+        if _PID_EXISTS is None:
+            _resolve_pid_exists()
+        exists = bool(_PID_EXISTS(pid_int))
     except Exception:
         return False
     if not exists:
