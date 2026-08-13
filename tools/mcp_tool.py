@@ -5659,13 +5659,32 @@ def call_mcp_app_request(
             name = params.get("name")
             # Validate the tool is registered on this server — prevents a
             # sandboxed card from calling arbitrary or internal methods.
+            # _registered_tool_names stores namespaced names (e.g.
+            # "mcp__utp__utp_device_authorization"), but MCP Apps cards
+            # send the raw tool name the server advertises (e.g.
+            # "utp_device_authorization"). Accept both forms so cards
+            # don't need to know about the host's namespacing scheme.
             registered = getattr(server, "_registered_tool_names", None)
-            if name and (registered is None or name not in registered):
-                return {"error": {"code": -32601,
-                        "message": f"tool '{name}' not registered on server '{server_name}'"}}
+            if name:
+                namespaced = f"mcp__{server_name}__{name}"
+                if registered is None or (
+                    name not in registered and namespaced not in registered
+                ):
+                    logger.warning(
+                        "MCP bridge: tool '%s' not registered on server '%s' "
+                        "(checked raw + '%s')",
+                        name, server_name, namespaced,
+                    )
+                    return {"error": {"code": -32601,
+                            "message": f"tool '{name}' not registered on server '{server_name}'"}}
             arguments = params.get("arguments") or {}
-            async with server._rpc_lock:
-                result = await session.call_tool(name, arguments=arguments)
+            # ponytail: no _rpc_lock here — MCP SDK's ClientSession already
+            # serializes JSON-RPC requests by unique ID. Sharing the lock with
+            # model tool calls (which can hold it for 35s+ during utp_login etc.)
+            # starves bridge calls, eating most of their 60s timeout on lock
+            # wait alone. The SDK matches responses by request ID, so a bridge
+            # call and a model call on the same session are safe concurrently.
+            result = await session.call_tool(name, arguments=arguments)
             return _serialize_call_tool_result(result)
         if method == "resources/read":
             uri = params.get("uri")
@@ -5675,8 +5694,7 @@ def call_mcp_app_request(
             if not isinstance(uri, str) or not uri.startswith("ui://"):
                 return {"error": {"code": -32601,
                         "message": f"resource not accessible from a card: {uri}"}}
-            async with server._rpc_lock:
-                res = await session.read_resource(uri)
+            res = await session.read_resource(uri)
             contents = []
             for c in (getattr(res, "contents", None) or []):
                 try:
@@ -5697,6 +5715,10 @@ def call_mcp_app_request(
     except InterruptedError:
         return {"error": {"code": -32000, "message": "interrupted"}}
     except Exception as exc:
+        logger.warning(
+            "MCP bridge call failed (server='%s' method='%s'): %s: %s",
+            server_name, method, type(exc).__name__, _exc_str(exc),
+        )
         return {"error": {"code": -32000,
                           "message": _sanitize_error(
                               f"{type(exc).__name__}: {_exc_str(exc)}")}}

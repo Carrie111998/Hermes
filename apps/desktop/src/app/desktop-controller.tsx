@@ -568,7 +568,8 @@ export function DesktopController() {
               // assistant errors and MCP Apps ui cards (never persisted; D1).
               messages: preserveMcpUiCards(
                 preserveLocalAssistantErrors(toChatMessages(latest.messages), state.messages),
-                state.messages
+                state.messages,
+                storedSessionId
               )
             }),
             storedSessionId
@@ -752,7 +753,9 @@ export function DesktopController() {
     }
 
     clearMcpAppUserMessage()
-    void submitText(mcpAppUserMessage.text)
+    // `fromQueue` bypasses the busy guard: a card button click is an explicit
+    // user action, not a stray Enter — the gateway queues the turn internally.
+    void submitText(mcpAppUserMessage.text, { fromQueue: true })
   }, [mcpAppUserMessage, submitText])
 
   useGatewayBoot({

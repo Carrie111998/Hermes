@@ -198,6 +198,15 @@ export function McpAppCard({ result, toolCallId }: ToolCallMessagePartProps) {
     //     the gateway `mcp.app.request` method.
     // Method names + shapes were confirmed against the live utp card (L3).
     const server = ui?.server ?? ''
+
+    // Keep the latest result accessible inside the stable onMessage closure
+    // without putting `result` in the effect deps. Tool call results in
+    // @assistant-ui/react are replaced on every streaming update; if `result`
+    // were a dep, the listener would be torn down and rebuilt on each chunk,
+    // and any postMessage arriving in that synchronous gap is lost.
+    const resultRef = useRef(result)
+    resultRef.current = result
+
     useEffect(() => {
         if (!server) {
             return
@@ -207,6 +216,26 @@ export function McpAppCard({ result, toolCallId }: ToolCallMessagePartProps) {
             const iframe = iframeRef.current
 
             if (!iframe || event.source !== iframe.contentWindow) {
+                if (import.meta.env.DEV) {
+                    // Debug: identify which component is dropping and why
+                    const domIframes = document.querySelectorAll('iframe')
+                    let domIdx = -1
+                    for (let i = 0; i < domIframes.length; i++) {
+                        if (domIframes[i] === iframe) { domIdx = i; break }
+                    }
+                    let sourceIdx = -1
+                    for (let i = 0; i < domIframes.length; i++) {
+                        try { if (event.source === domIframes[i].contentWindow) { sourceIdx = i; break } } catch {}
+                    }
+                    console.warn('[mcp-app] dropped message: source mismatch', {
+                        toolCallId,
+                        hasIframe: !!iframe,
+                        iframeInDom: domIdx >= 0,
+                        domIdx,
+                        sourceIdx,
+                        iframeTitle: iframe?.title?.substring(0, 40) || null,
+                    })
+                }
                 return
             }
 
@@ -271,8 +300,8 @@ export function McpAppCard({ result, toolCallId }: ToolCallMessagePartProps) {
                     const params = (msg.params ?? {}) as Record<string, unknown>
 
                     if (method === 'ui/initialize') {
-                        const lastToolResult = buildLastToolResult(result)
-                        const sessionId = readSessionId(result)
+                        const lastToolResult = buildLastToolResult(resultRef.current)
+                        const sessionId = readSessionId(resultRef.current)
 
                         reply({
                             result: {
@@ -320,6 +349,7 @@ export function McpAppCard({ result, toolCallId }: ToolCallMessagePartProps) {
                         iframe.contentWindow?.postMessage(response, '*')
                     }
                 } catch (error) {
+                    console.warn('[mcp-app] gateway request failed:', toMessage(error))
                     reply({ error: { code: -32000, message: toMessage(error) } })
                 }
             })()
@@ -328,7 +358,8 @@ export function McpAppCard({ result, toolCallId }: ToolCallMessagePartProps) {
         window.addEventListener('message', onMessage)
 
         return () => window.removeEventListener('message', onMessage)
-    }, [server, requestGateway, result, toolCallId, ui?.uri])
+        // `result` is intentionally excluded — see resultRef comment above.
+    }, [server, requestGateway, toolCallId, ui?.uri])
 
     if (!ui) {
         return null
@@ -343,6 +374,7 @@ export function McpAppCard({ result, toolCallId }: ToolCallMessagePartProps) {
                 srcDoc={srcDoc}
                 style={{ border: 'none', height }}
                 title={ui.uri}
+                data-tool-call-id={toolCallId}
             />
         </div>
     )

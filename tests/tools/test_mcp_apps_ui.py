@@ -430,6 +430,27 @@ class TestBridgeSecurity:
         session.call_tool.assert_called_once_with(
             "utp_cart_add", arguments={"product_id": "p1"})
 
+    def test_tools_call_permits_raw_name_when_registered_namespaced(self, _patch_mcp_server):
+        """Cards send raw MCP tool names (e.g. "utp_device_authorization"), but
+        _registered_tool_names stores namespaced names (e.g.
+        "mcp__utp__utp_device_authorization"). The bridge must accept both.
+        """
+        session = _patch_mcp_server
+        session.call_tool = AsyncMock(
+            return_value=_FakeCallToolResult(
+                content=[_FakeContentBlock("ok")]))
+        server = mcp_tool._servers["test-server"]
+        server._registered_tool_names = ["mcp__test-server__utp_device_authorization"]
+
+        out = mcp_tool.call_mcp_app_request(
+            "test-server", "tools/call",
+            {"name": "utp_device_authorization", "arguments": {}}
+        )
+
+        assert "error" not in out
+        session.call_tool.assert_called_once_with(
+            "utp_device_authorization", arguments={})
+
     def test_resources_read_blocks_non_ui_uri(self, _patch_mcp_server):
         """P0 (fixed): resources/read rejects non-ui:// URIs through the bridge.
 
