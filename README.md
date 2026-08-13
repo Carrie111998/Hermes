@@ -3,10 +3,11 @@
 `novkien/hermes-agent` is the application fork at the center of Le Kien's distributed
 Jarvis/Hermes agent system.
 
-This repository contains the Hermes runtime. The complete system also includes a
-Telegram interaction layer, AgentOS browser control plane, an external read-only data
-adapter, two LLM routing services, a private skills registry, profile-selectable skill
-packs, and multiple manager/worker agents.
+This repository contains the Hermes application runtime. The complete system also
+includes Telegram and browser control surfaces, an external AgentOS adapter, separate
+LLM routing services, a private shared-skills registry, a private gateway-plugin
+registry, a private profile-SOUL registry, profile-selectable skill packs, and the
+CEO/Manager/Worker multi-agent hierarchy.
 
 > **Base project:** Hermes Agent by Nous Research. This fork retains the upstream
 > application architecture while adding Jarvis-owned instruction layers, runtime
@@ -19,10 +20,12 @@ Jarvis/Hermes is designed as an owner-directed multi-agent operating environment
 - Le Kien interacts primarily through Telegram.
 - Hermes coordinates CEO, Manager, Worker, Skill Lab, System Prompt Lab, Bridge, and
   specialist roles.
-- AgentOS provides a browser dashboard for observing and controlling the wider system.
+- AgentOS provides a browser control and observability plane for the wider system.
 - 9router and llama-proxy provide separate LLM/API routing paths.
-- Skills and profile packs are maintained in a private Git repository and deployed by
-  fast-forward pull.
+- Shared skills/profile packs, external gateway plugins, and profile `SOUL.md` files
+  are maintained in separate canonical repositories.
+- Repository state, deployed bytes, cache/session refresh, and observed behavior are
+  separate evidence layers.
 - LAN is the preferred network path; Tailnet is the resilient fallback for distributed
   hosts and LAN failure.
 
@@ -42,8 +45,10 @@ flowchart TB
       HDA[Hermes Dashboard API :9119]
       CORE[Hermes Agent Core]
       CTX[Context system<br/>SOUL · AGENTS · skills · memory · sessions]
-      AD[Temporary AgentOS data adapter :8643]
+      PLUG[External gateway/runtime plugins<br/>~/.hermes/plugins]
+      AD[Temporary AgentOS adapter :8643]
       LIVE[Live skill roots<br/>~/.hermes/skills<br/>~/.hermes/workspace/skills-pack]
+      SOUL[Profile SOUL files<br/>~/.hermes/agents/&lt;profile&gt;/SOUL.md]
     end
 
     subgraph PiHost[Pi control/routing host]
@@ -55,6 +60,8 @@ flowchart TB
     subgraph GitHub[GitHub sources]
       HA[(novkien/hermes-agent)]
       HS[(novkien/hermes-skills · private)]
+      HP[(novkien/hermes-plugins · private)]
+      AG[(novkien/agents · private)]
       HM[(novkien/agent-mission-control)]
       HL[(novkien/llama-proxy · private)]
       UP[(NousResearch/hermes-agent)]
@@ -64,7 +71,10 @@ flowchart TB
     OWNER <--> AOS
     TG <--> GW
     GW <--> CORE
+    PLUG --> GW
     CORE <--> CTX
+    LIVE --> CTX
+    SOUL --> CTX
     CORE --> R9
     CORE --> LP
 
@@ -75,8 +85,9 @@ flowchart TB
     AMC --> R9
     AMC --> LP
 
-    HS -->|Bridge: pull --ff-only| LIVE
-    LIVE --> CTX
+    HS --> LIVE
+    HP --> PLUG
+    AG --> SOUL
     HA --> CORE
     HM --> AMC
     HL --> LP
@@ -88,19 +99,57 @@ flowchart TB
     TAIL -.-> PiHost
 ```
 
+GitHub arrows above express **source ownership**, not automatic deployment. A commit in
+a canonical repository does not prove the corresponding runtime bytes were deployed or
+loaded by a running session.
+
 ## Component inventory
 
 | Component | Responsibility | Current source/deployment evidence |
 |---|---|---|
-| Hermes Agent | Agent loop, tools, gateway, profiles, sessions, memory, skills integration and user interfaces | Repository `novkien/hermes-agent`; deployed checkout normally `/home/jarvis/.hermes/hermes-agent` |
+| Hermes Agent | Agent loop, tools, gateway, profiles, sessions, memory, plugin/skills integration and user interfaces | [`novkien/hermes-agent`](https://github.com/novkien/hermes-agent); deployed checkout normally `/home/jarvis/.hermes/hermes-agent` |
 | Telegram gateway | Primary owner conversation channel and thread/topic routing | `gateway/` plus Telegram platform implementation in this repository |
-| AgentOS Mission Control | Browser control plane for system state, health, governance, logs, chat and proxy dashboards | `novkien/agent-mission-control`; deployed on the Pi |
-| AgentOS data adapter | Temporary read-only API over Hermes-owned stores used by AgentOS | External Jarvis-host service; planned for a future owner-authorized merge into `hermes-agent` |
-| 9router | General model/provider router used by Hermes auxiliary and model paths | External source on the Pi |
-| llama-proxy | OpenAI-compatible local-model router, model lifecycle controller, dashboard and ComfyUI passthrough | `novkien/llama-proxy`; deployed on the Pi |
-| Hermes skills registry | Canonical Git source for shared skills and profile packs | Private `novkien/hermes-skills` |
+| AgentOS Mission Control | Browser BFF/control plane for system state, health, governance, chat, events and proxy surfaces | [`novkien/agent-mission-control`](https://github.com/novkien/agent-mission-control); deployed on the Pi |
+| AgentOS external adapter | Temporary external API for AgentOS-owned access to Hermes data surfaces and bounded supported mutations | External Jarvis-host service; remains separate until a future owner-authorized merge changes that boundary |
+| 9router | General model/provider router | External project on the Pi |
+| llama-proxy | OpenAI-compatible local-model router, model lifecycle controller, dashboard and ComfyUI passthrough | [`novkien/llama-proxy`](https://github.com/novkien/llama-proxy); deployed on the Pi |
+| Hermes skills registry | Canonical Git source for shared skills and profile-selectable skill packs | Private [`novkien/hermes-skills`](https://github.com/novkien/hermes-skills) |
+| Hermes plugin registry | Canonical Git source for owner-managed gateway/runtime plugin packages | Private [`novkien/hermes-plugins`](https://github.com/novkien/hermes-plugins); deployed packages live under `/home/jarvis/.hermes/plugins/` |
+| Agent SOUL registry | Canonical reviewed Git source for profile `SOUL.md` definitions | Private [`novkien/agents`](https://github.com/novkien/agents); deployed files live under `/home/jarvis/.hermes/agents/<profile>/SOUL.md` |
+| Upstream Hermes | Base application project | [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent) |
 
-### Current network convention
+## Canonical behavior-source boundaries
+
+Hermes behavior is intentionally split across several repositories rather than treating
+the application fork as a monolith:
+
+```text
+novkien/hermes-agent
+  → executable Hermes application, gateway, plugin framework, tools and integrations
+
+novkien/hermes-skills
+  → shared skills, focused references and profile-selectable skill packs
+
+novkien/hermes-plugins
+  → owner-managed external gateway/runtime plugin packages
+
+novkien/agents
+  → reviewed <profile>/SOUL.md definitions
+```
+
+These sources are complementary:
+
+- `hermes-agent/plugins/` is the application plugin framework and bundled/built-in
+  plugin surface. It is **not** the canonical repository for the owner's external
+  plugin packages.
+- `hermes-skills` owns reusable skills and profile skill packs. It does **not** own the
+  canonical profile `SOUL.md` files.
+- `agents` tracks reviewed `SOUL.md` definitions; profile import code and runtime
+  configuration remain separate unless explicitly added to that repository.
+- `hermes-plugins` tracks plugin source packages; plugin runtime data and mutable state
+  remain outside the repository.
+
+## Current network convention
 
 The owner-declared current Pi LAN route is:
 
@@ -123,7 +172,7 @@ sequenceDiagram
     participant Telegram
     participant Gateway as Hermes Gateway
     participant Agent as AIAgent
-    participant Context as Context/Skills/Memory
+    participant Context as Context/Skills/SOUL/Memory
     participant Router as 9router or llama-proxy
 
     Owner->>Telegram: Message in a bound topic/thread
@@ -138,29 +187,50 @@ sequenceDiagram
     Telegram-->>Owner: Result
 ```
 
-Telegram is the owner conversation surface. AgentOS is an additional control plane;
-it does not replace Telegram as the primary human-agent conversation contract.
+Telegram is the primary owner conversation surface. AgentOS is an additional browser
+control plane and chat surface; it does not replace the Telegram routing contract.
+
+## Multi-agent execution topology
+
+The core responsibility chain is:
+
+```text
+Le Kien
+  → CEO: mission intake, planning, routing, recovery, integration and terminal return
+      → Level-2 Manager: domain ownership, decomposition, supervision and evidence assessment
+          → Kanban Worker(s): substantive specialist execution
+```
+
+Governance destinations such as Skill Lab and System Prompt Lab are separate A2A
+surfaces rather than ordinary Kanban workers. A2A messaging is used for inter-agent
+coordination and mission handoff; native Kanban is the durable execution backbone for
+Manager-dispatched Worker work.
+
+The exact active role contracts live in the private instruction sources and current
+runtime context. This README describes the topology, not every behavioral rule.
 
 ## AgentOS control plane
 
-AgentOS Mission Control runs on the Pi and presents the browser dashboard. It acts as a
-BFF/control surface over several sources:
+AgentOS Mission Control runs on the Pi and presents the browser dashboard. Current
+source implements it as a FastAPI BFF plus a committed zero-build SPA, with separate
+clients for the Hermes dashboard API, Hermes gateway API, and the temporary external
+adapter:
 
 ```text
 AgentOS browser
   → AgentOS Mission Control on Pi
       → Hermes Dashboard API on Jarvis
       → Hermes Gateway API on Jarvis
-      → external AgentOS data adapter on Jarvis
-      → direct/proxied 9router dashboard
-      → direct/proxied llama-proxy dashboard
+      → external AgentOS adapter on Jarvis
+      → direct/proxied 9router dashboard/API
+      → direct/proxied llama-proxy dashboard/API
 ```
 
-The external adapter currently exists as a separate service. It supplies read-only
-views for data such as Kanban, permits, issues, bindings, and related provenance. The
-owner intends to replace this temporary split with a later explicit plan that merges
-the adapter capability into `hermes-agent`. That future merge is **planned**, not a
-claim about the current source tree.
+The BFF keeps bounded allowlists for upstream reads and supported mutation surfaces.
+The external adapter currently supplies Hermes-related data such as Kanban, permits,
+issues, timeline/fingerprint information and memory-file surfaces. It remains a
+separate transitional component; any merge into `hermes-agent` requires a later
+explicit implementation change.
 
 ## LLM routing
 
@@ -179,12 +249,12 @@ Jarvis/Hermes has two distinct routing surfaces:
 - OpenAI-compatible local-model endpoint.
 - Routes public model aliases to remote/local llama-server services.
 - Controls wake, availability, model switching, idle unload and shutdown behavior.
-- Provides `/v1/models`, `/v1/chat/completions`, `/dashboard`, and ComfyUI passthrough
-  routes in the published source snapshot.
+- Provides model/chat and dashboard surfaces according to current proxy source.
 - Canonical sanitized source is stored in private `novkien/llama-proxy`.
 
-A configured URL is not proof that a service is active. Runtime state must be checked
-from listeners, service state, and a safe health/model-list request.
+9router and llama-proxy are sibling routing paths, not mandatory serial stages. A
+configured URL is not proof that a service is active. Runtime state must be checked
+from current listeners, service state, and safe health/model-list requests.
 
 ## Context system
 
@@ -207,13 +277,15 @@ flowchart TD
 | `AGENTS.md` | Compact repository-wide owner authority, scope boundary, topology and routing instructions |
 | `README.md` | Human-readable system overview and topology |
 | `hermes-agent/SKILL.md` | Broad private Jarvis/Hermes context authority and reference router |
-| Skill references | Focused details loaded only when relevant |
-| Current source | Authoritative for present implementation |
-| Current runtime evidence | Authoritative for deployed paths, services, bindings and behavior |
+| Profile `SOUL.md` | Profile-specific behavioral/identity instruction layer, canonically reviewed in `novkien/agents` |
+| Shared skills/profile packs | Reusable procedures and profile-selectable capability context from `novkien/hermes-skills` |
+| External plugins | Runtime/gateway extension packages from `novkien/hermes-plugins` |
+| Current source | Authoritative for present implementation in the repository being discussed |
+| Current runtime evidence | Authoritative for deployed paths, services, bindings and observed behavior |
 
 The system distinguishes stable design from volatile facts. IPs, ports, models,
-branches, SHAs, service state, topic bindings, and active skill versions must be
-reverified instead of silently trusted from an old document.
+branches, SHAs, service state, topic bindings, deployed plugin/SOUL bytes, and active
+skill versions must be reverified instead of silently trusted from an old document.
 
 ## Skills and profile packs
 
@@ -224,29 +296,22 @@ The live skill estate is intentionally split:
 ~/.hermes/workspace/skills-pack/     # profile-selectable packs
 ```
 
-Current pack names observed during the registry bootstrap are:
-
-```text
-coder
-creative
-general
-office-work
-research
-```
-
 Hermes discovers the shared skill root and configured external pack directories. Topic
-and profile configuration may further preload or allowlist specific skills.
+and profile configuration may further preload or allowlist specific skills. Inventory
+counts and exact pack/profile bindings are volatile and should be read from the current
+private registry/runtime state rather than frozen into this overview.
 
-### Canonical Git workflow
+### Canonical skills Git workflow
 
-The private repository maps directly to the existing runtime paths:
+The private repository maps directly to the existing runtime skill paths:
 
 | Git path | Runtime path |
 |---|---|
 | `skills/` | `/home/jarvis/.hermes/skills/` |
 | `workspace/skills-pack/` | `/home/jarvis/.hermes/workspace/skills-pack/` |
 
-Bridge deploys a committed change using:
+Normal repository-tracked skill work uses a branch and pull request. After an
+authorized merge, Bridge deploys the selected `main` commit using:
 
 ```bash
 git \
@@ -256,12 +321,29 @@ git \
 ```
 
 The linked worktree must be clean and the update must be a fast-forward. Bridge must
-not repair divergence with reset, clean, stash, merge, or rebase.
+not repair divergence with reset, clean, stash, merge, rebase, or force-push.
 
 For Git-tracked skill paths, this workflow supersedes apply-ZIP unless the owner
 explicitly chooses apply-ZIP for a particular operation. A pull deploys files only;
 `/reload-skills`, session reset, service reload, and behavioral validation are separate
 facts/actions.
+
+## Plugin and profile-SOUL source workflow
+
+The two additional owner repositories are canonical reviewed source planes:
+
+```text
+novkien/hermes-plugins
+  → /home/jarvis/.hermes/plugins/<plugin>/
+
+novkien/agents
+  → /home/jarvis/.hermes/agents/<profile>/SOUL.md
+```
+
+Use the current repository branch/PR workflow for source changes. Do not infer an
+automatic deployment path from the GitHub repository alone. When deployment is part of
+a task, separately verify the exact runtime write/pull/sync operation, live-byte
+readback, required reload/reset, and behavior.
 
 ## Source-change boundary
 
@@ -269,15 +351,27 @@ Primary ChatGPT and agents may inspect this repository to understand current beh
 They may not modify executable source from a general or ambiguous request.
 
 ```text
-General request about behavior/context/prompt/skill
+General request about behavior/context/prompt/skill/SOUL
   → instruction-layer target by default
 
-Explicit request to change a named code/runtime surface
-  → code/runtime work authorized for that scope
+Explicit request to change a named code/runtime/plugin/service/dashboard surface
+  → executable work authorized for that scope
 ```
 
-This boundary prevents a documentation or agent-behavior request from drifting into an
-unrequested code redesign. It does not block owner-authorized runtime work.
+Once a target is selected, write it in its owning repository rather than collapsing
+all behavior into `hermes-agent`:
+
+```text
+application/runtime documentation or code → novkien/hermes-agent
+shared skill/profile pack                 → novkien/hermes-skills
+external gateway/runtime plugin           → novkien/hermes-plugins
+profile SOUL.md                            → novkien/agents
+AgentOS                                    → novkien/agent-mission-control
+llama-proxy                                → novkien/llama-proxy
+```
+
+This boundary prevents an instruction request from drifting into an unrequested code
+redesign while still allowing exact owner-authorized executable changes.
 
 ## Repository structure
 
@@ -289,7 +383,7 @@ hermes-agent/
 ├── toolsets.py           # toolset definitions
 ├── tools/                # tool implementations and registry
 ├── gateway/              # messaging gateway runtime
-├── plugins/              # plugin ecosystem
+├── plugins/              # plugin framework and bundled/built-in plugin surface
 ├── hermes_cli/           # commands, setup, profiles, web server
 ├── cli.py                # classic CLI
 ├── ui-tui/               # Ink/React terminal UI
@@ -306,18 +400,15 @@ deep deployment context.
 
 ## Evidence snapshot
 
-The initial context survey on **2026-08-11** observed:
+A context survey on **2026-08-11** observed the Jarvis/Pi deployment and the original
+set of application, skills, AgentOS, router, and proxy repositories. On **2026-08-13**
+the owner established two additional canonical source repositories:
 
-- Jarvis host on LAN `192.168.1.128`;
-- Pi on LAN `192.168.1.140`;
-- AgentOS Mission Control active on the Pi;
-- the external AgentOS data adapter active on the Jarvis host;
-- 9router and llama-proxy active on the Pi;
-- Telegram gateway bindings present in Hermes configuration;
-- `novkien/hermes-skills` bootstrapped as a private repository;
-- `novkien/llama-proxy` published as a private sanitized source repository.
+- `novkien/hermes-plugins` for owner-managed gateway/runtime plugin packages; and
+- `novkien/agents` for profile `SOUL.md` definitions.
 
-This section is a dated snapshot, not a permanent guarantee. Reverify live facts before
+These dates document source-map evolution, not permanent runtime guarantees. Reverify
+live hosts, listeners, bindings, active models, deployed bytes, and service state before
 an operational action.
 
 ## Security and publication rules
@@ -326,6 +417,8 @@ an operational action.
   sessions, logs, runtime state, model weights, or unreviewed backups.
 - Keep exact Tailnet addressing and private thread bindings in private context sources.
 - Do not assume a repository is private; verify GitHub metadata.
+- Treat plugin source, SOUL files, and skills as code/instruction assets: review them for
+  secret material before publication or cross-repository movement.
 - Report suspected secret locations without reproducing the secret value.
 - Historical credentials in Git history require rotation and a separate owner-directed
   history-remediation decision.
@@ -335,4 +428,4 @@ an operational action.
 This fork is based on the Nous Research Hermes Agent project. Consult the repository's
 license and upstream documentation for licensing, installation, and generic product
 usage. Jarvis-specific deployment and instruction-layer behavior are governed by the
-owner context documented here and in the private skills repository.
+owner context documented here and in the private canonical repositories above.
