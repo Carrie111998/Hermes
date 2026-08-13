@@ -56,6 +56,7 @@ from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
+    compression_failure_cause,
 )
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
@@ -18211,14 +18212,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 time.monotonic() - _hyg_wait_started,
                                                 _hyg_total_ceiling_seconds,
                                             )
+                                            _known_cause = compression_failure_cause(
+                                                getattr(
+                                                    _hyg_agent,
+                                                    "context_compressor",
+                                                    None,
+                                                )
+                                            )
+                                            _timeout_detail = (
+                                                f"because {_known_cause} before producing "
+                                                "a summary. "
+                                                if _known_cause
+                                                else "with no output from the summary model. "
+                                            )
                                             _timeout_msg = (
                                                 "⚠️ Context compression timed out "
                                                 f"after {_hyg_timeout_seconds:.1f}s "
-                                                "with no output from the summary model. "
+                                                f"{_timeout_detail}"
                                                 "No messages were dropped — continuing without "
                                                 "compression. Run /compress to retry, /reset for "
-                                                "a clean session, or check your "
-                                                "auxiliary.compression model configuration."
+                                                "a clean session, or check "
+                                                "`compression.hygiene_timeout_seconds` in "
+                                                "config.yaml and your auxiliary compression "
+                                                "provider."
                                             )
                                             try:
                                                 _adapter = self._adapter_for_source(source)
@@ -18484,8 +18500,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         )
 
                     except Exception as e:
+                        _failure_reason = " ".join(str(e).split()) or type(e).__name__
                         logger.warning(
-                            "Session hygiene auto-compress failed: %s", e
+                            "Session hygiene auto-compress failed: %s",
+                            _failure_reason,
                         )
 
         # First-message onboarding -- only on the very first interaction ever.

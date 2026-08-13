@@ -4005,6 +4005,20 @@ def _is_payment_error(exc: Exception) -> bool:
             "weekly usage limit", "weekly limit",  # OpenCode Go weekly subscription cap
         )):
             return True
+    # Some Anthropic-compatible load balancers wrap upstream billing failures
+    # in a 5xx response. Keep unambiguous credit/billing exhaustion in the
+    # payment bucket so the body-aware 5xx rate-limit detector below cannot
+    # claim it merely because the payload also recommends retrying later.
+    wrapped_status = status or getattr(
+        getattr(exc, "response", None), "status_code", None
+    )
+    if isinstance(wrapped_status, int) and 500 <= wrapped_status < 600:
+        if any(kw in err_lower for kw in (
+            "credits", "insufficient funds", "can only afford", "billing",
+            "payment required", "out of funds", "run out of funds",
+            "balance_depleted", "no usable credits",
+        )):
+            return True
     return False
 
 
@@ -4054,6 +4068,24 @@ def _is_rate_limit_error(exc: Exception) -> bool:
             "not available on the free tier",
         )):
             return True
+    # A few Anthropic-compatible load balancers signal an upstream capacity
+    # limit as HTTP 5xx rather than 429. Only accept explicit payload signals;
+    # a bare server error remains a transient transport failure. Payment owns
+    # unambiguous billing/credit exhaustion even when the wrapper status is 5xx.
+    wrapped_status = status or getattr(
+        getattr(exc, "response", None), "status_code", None
+    )
+    if (
+        isinstance(wrapped_status, int)
+        and 500 <= wrapped_status < 600
+        and not _is_payment_error(exc)
+        and any(kw in err_lower for kw in (
+            "rate limit", "rate_limit", "rate-limited",
+            "quota exceeded", "quota_exceeded", "quota-exhausted",
+            "try again in",
+        ))
+    ):
+        return True
     return False
 
 
@@ -4127,6 +4159,8 @@ def _is_transient_transport_error(exc: Exception) -> bool:
     ``_is_auth_error`` / ``_is_rate_limit_error`` which the except-chain
     handles by switching provider, refreshing creds, or rotating the pool.
     """
+    if _is_payment_error(exc) or _is_rate_limit_error(exc):
+        return False
     if _is_connection_error(exc):
         return True
     status = getattr(exc, "status_code", None) or getattr(
@@ -9200,22 +9234,29 @@ def _call_llm_impl(
                 task,
                 provider=request_provider, base_url=_base_info)
         except Exception as transient_err:
-            if not _is_transient_transport_error(transient_err):
-                raise
             # Compression is on the critical preflight path: a user cannot
             # continue or resume an oversized session until it compacts. A
             # same-provider retry on a timeout means another full ``timeout``-
             # long wall-clock block before the except-chain below can fall
             # back — doubling the user-visible stall (issue #54465). Skip the
-            # same-provider retry for compression on a full-budget timeout and
-            # fall straight through to provider/model fallback; fast blips (a
-            # streaming-close or a 5xx) still retry, since those are cheap.
-            if task == "compression" and _is_timeout_error(transient_err):
+            # same-provider retry for compression on a full-budget timeout or
+            # a provider-signalled rate limit and fall straight through to
+            # provider/model fallback; fast blips (a streaming-close or a
+            # genuine 5xx) still retry, since those are cheap.
+            _critical_path_reason = (
+                "timeout" if _is_timeout_error(transient_err)
+                else "rate limit" if _is_rate_limit_error(transient_err)
+                else None
+            )
+            if task == "compression" and _critical_path_reason:
                 logger.info(
-                    "Auxiliary compression: timeout on the critical path; "
+                    "Auxiliary compression: %s on the critical path; "
                     "skipping same-provider retry and falling back: %s",
+                    _critical_path_reason,
                     transient_err,
                 )
+                raise
+            if not _is_transient_transport_error(transient_err):
                 raise
             _max_transient_retries = _transient_retry_count()
             _last_transient = transient_err
@@ -9942,17 +9983,24 @@ async def _async_call_llm_impl(
                 task,
                 provider=request_provider, base_url=_client_base)
         except Exception as transient_err:
-            if not _is_transient_transport_error(transient_err):
-                raise
             # See call_llm(): compression is on the critical preflight path,
-            # so skip the same-provider retry on a full-budget timeout and
-            # fall straight through to fallback (issue #54465).
-            if task == "compression" and _is_timeout_error(transient_err):
+            # so skip the same-provider retry on a full-budget timeout or a
+            # provider-signalled rate limit and fall straight through to
+            # fallback (issue #54465).
+            _critical_path_reason = (
+                "timeout" if _is_timeout_error(transient_err)
+                else "rate limit" if _is_rate_limit_error(transient_err)
+                else None
+            )
+            if task == "compression" and _critical_path_reason:
                 logger.info(
-                    "Auxiliary compression (async): timeout on the critical "
+                    "Auxiliary compression (async): %s on the critical "
                     "path; skipping same-provider retry and falling back: %s",
+                    _critical_path_reason,
                     transient_err,
                 )
+                raise
+            if not _is_transient_transport_error(transient_err):
                 raise
             logger.info(
                 "Auxiliary %s (async): transient transport error; retrying "

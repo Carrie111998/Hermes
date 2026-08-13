@@ -7573,6 +7573,7 @@ class AIAgent:
         """
         from agent.conversation_compression import (
             CompressionCommitFence,
+            compression_failure_cause,
             compress_context,
             resolve_context_compression_timeouts,
             run_compress_context_with_progress_timeout,
@@ -7724,12 +7725,21 @@ class AIAgent:
                             )
                 emit = getattr(self, "_emit_warning", None)
                 if callable(emit):
+                    known_cause = compression_failure_cause(
+                        getattr(self, "context_compressor", None)
+                    )
+                    timeout_detail = (
+                        f"because {known_cause} before producing a summary. "
+                        if known_cause
+                        else "with no output from the summary model. "
+                    )
                     emit(
                         "⚠ Context compression timed out "
-                        f"after {idle:.1f}s with no output from the summary "
-                        "model. No messages were dropped — continuing without "
+                        f"after {idle:.1f}s {timeout_detail}"
+                        "No messages were dropped — continuing without "
                         "compression. Run /compress to retry, /new for a clean "
-                        "session, or check auxiliary.compression."
+                        "session, or check `compression.context_timeout_seconds` "
+                        "in config.yaml and your auxiliary compression provider."
                     )
 
             def _on_commit_overrun(waited, ceiling):

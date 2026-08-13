@@ -507,6 +507,10 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
                 bind_session_state=MagicMock(),
                 _last_compress_aborted=False,
                 _last_aux_model_failure_model=None,
+                _last_aux_model_failure_error=(
+                    "Rate limit exceeded for account secret-account-id; "
+                    "try again in 4h"
+                ),
             )
             self.shutdown_memory_provider = MagicMock()
             self.close = MagicMock(side_effect=cleanup_done.set)
@@ -620,6 +624,10 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     assert _cd_args[1] > time.time()
     timeout_warnings = [s for s in adapter.sent if "Context compression timed out" in s["content"]]
     assert len(timeout_warnings) == 1
+    timeout_warning = timeout_warnings[0]["content"]
+    assert "rate limit" in timeout_warning
+    assert "compression.hygiene_timeout_seconds" in timeout_warning
+    assert "secret-account-id" not in timeout_warning
     fake_db.archive_and_compact.assert_not_called()
     SlowCompressAgent.last_instance.close.assert_not_called()
 

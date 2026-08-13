@@ -695,6 +695,44 @@ class CompressionCommitFence:
 DEFAULT_CONTEXT_TIMEOUT_SECONDS = 120.0
 DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS = 600.0
 
+
+def compression_failure_cause(compressor: Any) -> Optional[str]:
+    """Return a safe user-facing category for a known summary-provider failure.
+
+    Compressor error fields can contain full provider payloads, including
+    account or request identifiers. This deliberately returns only fixed text.
+    """
+    if compressor is None:
+        return None
+    try:
+        state = vars(compressor)
+    except TypeError:
+        return None
+    details = " ".join(
+        str(state.get(name) or "")
+        for name in ("_last_summary_error", "_last_aux_model_failure_error")
+    ).lower()
+    if any(marker in details for marker in (
+        "insufficient credits", "insufficient funds", "payment required",
+        "billing", "credits exhausted", "out of credits", "out of funds",
+        "run out of funds", "balance_depleted", "no usable credits",
+    )):
+        return "the summary provider reported a payment or credit error"
+    if any(marker in details for marker in (
+        "rate limit", "rate_limit", "rate-limited", "too many requests",
+        "try again in", "retry after", "resets in",
+    )):
+        return "the summary provider reported a rate limit"
+    if any(marker in details for marker in (
+        "error code: 401", "authentication", "authenticationerror",
+        "unauthenticated", "invalid api key", "api key is invalid",
+        "bad-credentials",
+    )):
+        return "the summary provider reported an authentication error"
+    if state.get("_last_summary_auth_failure") is True:
+        return "the summary provider reported an access or quota error"
+    return None
+
 # Shared daemon pool for sync compress_context timeout wraps — analogous to
 # asyncio's default executor used by gateway session hygiene's
 # ``loop.run_in_executor(None, ...)``, but daemon so a fence-cancelled hung

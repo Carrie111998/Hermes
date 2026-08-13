@@ -376,6 +376,9 @@ class TestCompressContextForwarderOwnsTimeout:
         agent._conversation_root_id = MagicMock(return_value=None)
         agent.context_compressor = MagicMock()
         agent.context_compressor._consecutive_timeout_failures = 0
+        agent.context_compressor._last_aux_model_failure_error = (
+            "Rate limit exceeded for account secret-account-id; try again in 4h"
+        )
         # Use the real record_timeout_failure method so the cooldown ladder
         # is exercised end-to-end (not auto-mocked by MagicMock).
         from agent.context_compressor import ContextCompressor
@@ -424,6 +427,10 @@ class TestCompressContextForwarderOwnsTimeout:
         assert out_prompt == "sys"
         assert calls["n"] == 1
         agent._emit_warning.assert_called_once()
+        warning = agent._emit_warning.call_args.args[0]
+        assert "rate limit" in warning
+        assert "compression.context_timeout_seconds" in warning
+        assert "secret-account-id" not in warning
         assert agent.context_compressor._consecutive_timeout_failures == 1
         agent.context_compressor._record_compression_failure_cooldown.assert_called_once()
         cooldown_args = (
