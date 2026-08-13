@@ -146,18 +146,18 @@ def test_commit_lock_preserves_cron_directory_owner(jobs_env, monkeypatch):
 
 
 @pytest.mark.linux_only
-def test_commit_lock_refuses_symlink_before_chmod(jobs_env):
+def test_commit_lock_symlink_degrades_without_chmod(jobs_env, caplog):
     jobs = jobs_env
     victim = jobs._current_cron_store().cron_dir / "victim"
     victim.write_text("unchanged", encoding="utf-8")
     victim.chmod(0o644)
     jobs._jobs_commit_lock_file().symlink_to(victim)
 
-    with pytest.raises(RuntimeError, match="Unable to open"):
-        with jobs._jobs_commit_lock():
-            pass
+    with jobs._jobs_commit_lock() as acquired:
+        assert acquired is False
 
     assert victim.stat().st_mode & 0o777 == 0o644
+    assert "process-local locking and generation checks only" in caplog.text
 
 
 @pytest.mark.windows_only
@@ -214,7 +214,7 @@ def test_missing_commit_lock_backend_still_publishes(
 
 
 @pytest.mark.linux_only
-def test_unsupported_flock_degrades_with_warning(jobs_env, monkeypatch, caplog):
+def test_unavailable_flock_degrades_with_warning(jobs_env, monkeypatch, caplog):
     jobs = jobs_env
 
     def unsupported(_fd, _operation):
@@ -233,11 +233,11 @@ def test_unsupported_flock_degrades_with_warning(jobs_env, monkeypatch, caplog):
     "lock_errno_name",
     [
         name
-        for name in ("ENOSYS", "ENOTSUP", "EOPNOTSUPP")
+        for name in ("ENOSYS", "ENOTSUP", "EOPNOTSUPP", "ENOLCK")
         if getattr(errno, name, None) is not None
     ],
 )
-def test_unsupported_commit_lock_still_publishes(
+def test_unavailable_commit_lock_still_publishes(
     jobs_env, monkeypatch, caplog, replace, lock_errno_name
 ):
     jobs = jobs_env
@@ -322,30 +322,26 @@ def test_generation_churn_fails_closed_without_final_unchecked_write(
 
 
 @pytest.mark.linux_only
-@pytest.mark.parametrize(
-    "lock_error",
-    [BlockingIOError(), OSError(errno.ENOLCK, "lock records unavailable")],
-    ids=["contended", "enolck"],
-)
-def test_commit_lock_contention_fails_closed(jobs_env, monkeypatch, lock_error):
+def test_commit_lock_timeout_degrades_with_warning(jobs_env, monkeypatch, caplog):
     jobs = jobs_env
     seed = _job(jobs, "a")
     jobs.save_jobs([seed], replace=True)
-    before = jobs._current_cron_store().jobs_file.read_bytes()
     real_flock = jobs.fcntl.flock
 
     def contend(fd, operation):
         if operation & jobs.fcntl.LOCK_NB:
-            raise lock_error
+            raise BlockingIOError()
         return real_flock(fd, operation)
 
     with jobs._jobs_lock():
+        desired = jobs.load_jobs()
+        desired[0]["prompt"] = "degraded-save"
         monkeypatch.setattr(jobs.fcntl, "flock", contend)
         monkeypatch.setattr(jobs, "_JOBS_COMMIT_LOCK_TIMEOUT_SECONDS", 0.0)
-        with pytest.raises(RuntimeError, match="Timed out"):
-            jobs._save_jobs_unlocked([_job(jobs, "b")])
+        jobs._save_jobs_unlocked(desired)
 
-    assert jobs._current_cron_store().jobs_file.read_bytes() == before
+    assert jobs.load_jobs()[0]["prompt"] == "degraded-save"
+    assert "process-local locking and generation checks only" in caplog.text
 
 
 @pytest.mark.linux_only

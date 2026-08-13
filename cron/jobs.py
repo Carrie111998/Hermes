@@ -116,9 +116,9 @@ _jobs_lock_state = threading.local()
 _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
 _JOBS_COMMIT_LOCK_TIMEOUT_SECONDS = 5.0
 _JOBS_GENERATION_MAX_ATTEMPTS = 3
-_UNSUPPORTED_LOCK_ERRNOS = frozenset(
+_UNAVAILABLE_LOCK_ERRNOS = frozenset(
     value
-    for name in ("ENOSYS", "ENOTSUP", "EOPNOTSUPP")
+    for name in ("ENOSYS", "ENOTSUP", "EOPNOTSUPP", "ENOLCK")
     if (value := getattr(errno, name, None)) is not None
 )
 OUTPUT_DIR = CRON_DIR / "output"
@@ -346,12 +346,27 @@ def _jobs_commit_lock():
         handle = os.fdopen(fd, "r+b")
         fd = None
     except OSError as exc:
-        raise RuntimeError("Unable to open the cron jobs commit lock") from exc
+        logger.warning(
+            "Cron jobs commit lock is unavailable; publishing with "
+            "process-local locking and generation checks only: %s",
+            exc,
+        )
+        yield False
+        return
     finally:
         if fd is not None:
             os.close(fd)
     try:
         _prepare_commit_lock_file(handle, owner_source)
+    except OSError as exc:
+        handle.close()
+        logger.warning(
+            "Cron jobs commit lock is unavailable; publishing with "
+            "process-local locking and generation checks only: %s",
+            exc,
+        )
+        yield False
+        return
     except BaseException:
         handle.close()
         raise
@@ -378,19 +393,19 @@ def _jobs_commit_lock():
                 acquired = True
                 break
             except (BlockingIOError, OSError) as exc:
-                if getattr(exc, "errno", None) in _UNSUPPORTED_LOCK_ERRNOS:
+                if getattr(exc, "errno", None) in _UNAVAILABLE_LOCK_ERRNOS:
                     backend_error = exc
                     break
                 if time.monotonic() >= deadline:
-                    raise RuntimeError(
-                        "Timed out waiting for the cron jobs commit lock; "
-                        "refusing to publish a potentially stale snapshot"
+                    backend_error = RuntimeError(
+                        "timed out waiting for the cron jobs commit lock"
                     )
+                    break
                 time.sleep(0.01)
 
         if backend_error is not None:
             logger.warning(
-                "Cron jobs commit lock is unsupported; publishing with "
+                "Cron jobs commit lock is unavailable; publishing with "
                 "process-local locking and generation checks only: %s",
                 backend_error,
             )
