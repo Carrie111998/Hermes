@@ -150,6 +150,15 @@ class TestFalsePositives:
         )
         assert scan_for_threats(text, scope="all") == []
 
+    def test_common_word_havoc_does_not_trip_known_c2(self):
+        # "havoc" is a common English word (see the "praxis" precedent —
+        # both were removed from the known_c2_framework alternation).
+        # A legitimate persona/value file quoting prose like "wreaks havoc"
+        # must not be blocked from the system prompt.
+        text = "Thoughtlessness — not malice — is what wreaks havoc."
+        findings = scan_for_threats(text, scope="context")
+        assert findings == []
+
 
 # =========================================================================
 # Classic injection still works (regression for the migration)
