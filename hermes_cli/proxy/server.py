@@ -19,7 +19,6 @@ import asyncio
 import json
 import logging
 import signal
-from collections import Counter
 from typing import Optional
 
 try:
@@ -108,15 +107,17 @@ def _translate_models_payload(raw: bytes) -> bytes:
     return json.dumps(payload).encode("utf-8")
 
 
-def _balance_responses_input(raw: bytes) -> bytes:
-    """Drop orphaned ``function_call`` / ``function_call_output`` items.
+def _normalize_responses_input(raw: bytes) -> bytes:
+    """Interleave tool calls with their matching outputs; drop orphans.
 
     Some portal providers reject Responses API requests whose tool-call
-    history items are unbalanced — a ``function_call`` without its matching
-    ``function_call_output`` (or vice versa) — with a generic 400. Resumed
-    Codex sessions replay compacted history that trips this. Complete pairs
-    are kept verbatim; orphans are removed (an incomplete pair carries no
-    usable tool result anyway).
+    history groups calls separately from outputs — the shape Codex emits
+    for parallel tool calls (``function_call, function_call, …,
+    function_call_output, function_call_output, …``) — with a generic 400
+    "Provider returned error". They require each call to be immediately
+    followed by its matching output. Complete pairs are reordered to that
+    canonical interleaved form; orphaned calls/outputs are dropped (an
+    incomplete pair carries no usable tool result anyway).
     """
     try:
         payload = json.loads(raw)
@@ -125,30 +126,42 @@ def _balance_responses_input(raw: bytes) -> bytes:
     items = payload.get("input")
     if not isinstance(items, list):
         return raw
-    calls: Counter = Counter()
-    outputs: Counter = Counter()
+    call_types = ("function_call", "custom_tool_call")
+    out_types = ("function_call_output", "custom_tool_call_output")
+    outputs_by_call: dict = {}
+    for it in items:
+        if isinstance(it, dict) and it.get("type") in out_types:
+            cid = it.get("call_id")
+            if cid is not None:
+                outputs_by_call.setdefault(cid, []).append(it)
+    normalized: list = []
+    emitted: set = set()
+    changed = False
     for it in items:
         if not isinstance(it, dict):
+            normalized.append(it)
             continue
         it_type = it.get("type")
-        call_id = it.get("call_id")
-        if it_type == "function_call" and call_id is not None:
-            calls[call_id] += 1
-        elif it_type == "function_call_output" and call_id is not None:
-            outputs[call_id] += 1
-    paired = {cid for cid in set(calls) | set(outputs)
-              if calls.get(cid, 0) > 0 and outputs.get(cid, 0) > 0}
-    if not paired and not calls and not outputs:
+        if it_type in call_types:
+            outs = outputs_by_call.get(it.get("call_id"), [])
+            if not outs:
+                changed = True  # orphan call: drop (providers reject it)
+                continue
+            normalized.append(it)
+            for out in outs:
+                if id(out) not in emitted:
+                    normalized.append(out)
+                    emitted.add(id(out))
+                    changed = True
+        elif it_type in out_types:
+            if id(it) not in emitted:
+                changed = True  # orphan output: drop
+                continue
+        else:
+            normalized.append(it)
+    if not changed:
         return raw
-    balanced = [
-        it for it in items
-        if not isinstance(it, dict)
-        or it.get("type") not in ("function_call", "function_call_output")
-        or it.get("call_id") in paired
-    ]
-    if len(balanced) == len(items):
-        return raw
-    payload["input"] = balanced
+    payload["input"] = normalized
     return json.dumps(payload).encode("utf-8")
 
 # Headers we strip when forwarding to the upstream. ``host``/``content-length``
@@ -256,12 +269,11 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         body = await request.read()
 
         # Some portal providers reject Responses requests whose tool-call
-        # history is unbalanced (a function_call without its matching
-        # function_call_output, or vice versa) with a generic 400. Resumed
-        # Codex sessions replay compacted history that trips this. Balance
-        # the pairs before forwarding; complete pairs are untouched.
+        # history groups calls separately from outputs (Codex's parallel-call
+        # shape) with a generic 400. Interleave each call with its matching
+        # output and drop orphans before forwarding.
         if rel_path == "/responses" and request.method.upper() == "POST" and body:
-            body = _balance_responses_input(body)
+            body = _normalize_responses_input(body)
 
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300)
 
