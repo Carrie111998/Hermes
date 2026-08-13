@@ -7897,6 +7897,7 @@ class AIAgent:
         """
         from tools.delegate_tool import (
             _strip_model_hidden_task_fields,
+            _strip_workflow_model_hidden_fields,
             delegate_task as _delegate_task,
         )
         # Delegations from the top-level MODEL always run in the background —
@@ -7918,6 +7919,7 @@ class AIAgent:
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
             background=(not _is_subagent),
+            workflow=_strip_workflow_model_hidden_fields(function_args.get("workflow")),
             parent_agent=self,
         )
 

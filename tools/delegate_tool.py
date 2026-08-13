@@ -3215,14 +3215,22 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    workflow: Optional[Dict[str, Any]] = None,
     parent_agent=None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
 
-    Supports two modes:
-      - Single: provide goal (+ optional context and role)
-      - Batch:  provide tasks array [{goal, context, role}, ...]
+    Supports three modes:
+      - Single:   provide goal (+ optional context and role)
+      - Batch:    provide tasks array [{goal, context, role}, ...]
+      - Workflow: provide workflow object with ordered 'steps', each
+                  step a 'parallel' fan-out or a 'pipeline' of sequential
+                  stages (output of stage N feeds the context of stage
+                  N+1). Runs under a semaphore (max_concurrent) with a
+                  total item cap (max_items); a failed item becomes a
+                  structured error entry and the rest of the batch
+                  continues. See tools.delegation_workflow for the caps.
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
@@ -3293,6 +3301,58 @@ def delegate_task(
         creds = _resolve_delegation_credentials(cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
+
+    # ----- Workflow mode (batch orchestration: parallel/pipeline steps) -----
+    # Design decision (PR feat(delegation) workflow-batch): EXTEND the existing
+    # delegate_task with a workflow mode instead of adding a new core tool —
+    # the batch (tasks=[]) already accepts parallel item lists and runs them
+    # through a thread pool, so a workflow is a superset reusing the exact
+    # child build/run/finalize machinery. v1 runs SYNCHRONOUSLY: pipeline
+    # stages depend on each other's output, so the whole workflow joins on
+    # itself and returns ONE consolidated result (same contract as a sync
+    # batch). The deprecated `background` flag is ignored here.
+    if workflow is not None:
+        from tools.delegation_workflow import run_workflow
+
+        if isinstance(workflow, str):
+            try:
+                parsed_workflow = json.loads(workflow)
+            except json.JSONDecodeError as exc:
+                return tool_error(
+                    "workflow must be a JSON object; received a string that "
+                    f"could not be parsed ({exc.msg})."
+                )
+            if not isinstance(parsed_workflow, dict):
+                return tool_error(
+                    "workflow must be a JSON object with a 'steps' array."
+                )
+            workflow = parsed_workflow
+
+        # Capture the originating session BEFORE any child construction
+        # (AIAgent clobbers HERMES_SESSION_ID; see the batch path).
+        _wf_ui_session_id = ""
+        try:
+            from gateway.session_context import get_session_env
+
+            _wf_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
+        except Exception:
+            _wf_ui_session_id = ""
+        _wf_transport, _wf_record = _capture_gateway_steer_authority(
+            _wf_ui_session_id
+        )
+        wf_result = run_workflow(
+            workflow,
+            parent_agent=parent_agent,
+            creds=creds,
+            effective_max_iter=effective_max_iter,
+            top_role=top_role,
+            origin_ui_session_id=_wf_ui_session_id or None,
+            origin_owner_transport=_wf_transport,
+            origin_owner_session_record=_wf_record,
+        )
+        if isinstance(wf_result, dict) and wf_result.get("error"):
+            return tool_error(wf_result["error"])
+        return json.dumps(wf_result, ensure_ascii=False)
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -4162,12 +4222,14 @@ def _build_top_level_description() -> str:
     return (
         "Spawn subagents in isolated contexts; each gets its own conversation, "
         "terminal session, and toolset, and only its final summary returns to "
-        "you. Provide 'goal' for a single task or 'tasks' for a parallel batch "
-        "(limits and nesting rules are in the parameter descriptions).\n\n"
+        "you. Provide 'goal' for a single task, 'tasks' for a parallel batch, "
+        "or 'workflow' for ordered parallel/pipeline orchestration (caps and "
+        "semantics are in the parameter descriptions).\n\n"
         "Runs in the background: dispatch returns immediately with live "
         "transcript paths, and the completed result (one consolidated message "
-        "for a batch) re-enters the conversation on its own. Do NOT wait or "
-        "poll; continue other work.\n\n"
+        "for a batch) re-enters the conversation on its own. The exception is "
+        "'workflow', which returns its consolidated result synchronously in "
+        "this turn. Do NOT wait or poll; continue other work.\n\n"
         "USE FOR: reasoning-heavy subtasks, work that would flood your context "
         "with intermediate data, or independent parallel workstreams.\n"
         "DO NOT USE FOR (use these instead):\n"
@@ -4207,6 +4269,30 @@ def _build_tasks_param_description() -> str:
         f"user, set via delegation.max_concurrent_children). Each gets "
         "its own subagent with isolated context and terminal session. "
         "When provided, top-level goal/context/role are ignored."
+    )
+
+
+def _build_workflow_param_description() -> str:
+    """Compose the 'workflow' parameter description with current limits."""
+    from tools.delegation_workflow import WORKFLOW_MAX_ITEMS
+
+    try:
+        max_concurrent = min(8, _get_max_concurrent_children())
+    except Exception:
+        max_concurrent = min(8, _DEFAULT_MAX_CONCURRENT_CHILDREN)
+    return (
+        "Workflow mode: ordered batch orchestration instead of one flat "
+        "fan-out. 'steps' is an array; each step defines EXACTLY ONE of:\n"
+        "- parallel: N independent tasks run concurrently under a semaphore "
+        f"(up to {max_concurrent} at a time for this user). A failing task "
+        "becomes an error entry; the other tasks continue.\n"
+        "- pipeline: strictly sequential stages; the output of each stage "
+        "is appended to the context of the next stage's prompts.\n"
+        f"Total items across all steps are capped at {WORKFLOW_MAX_ITEMS}. "
+        "Results come back as one flat array, one entry per item, status "
+        "completed or error, in input order. Runs synchronously (v1) — the "
+        "consolidated result returns in this turn. When provided, "
+        "top-level goal/context/tasks/role are ignored."
     )
 
 
@@ -4263,11 +4349,39 @@ def _build_dynamic_schema_overrides() -> dict:
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+    if "workflow" in overrides_params["properties"]:
+        overrides_params["properties"]["workflow"]["description"] = (
+            _build_workflow_param_description()
+        )
 
     return {
         "description": _build_top_level_description(),
         "parameters": overrides_params,
     }
+
+
+# Item schema shared by workflow 'parallel' and 'pipeline' step arrays.
+# Same shape as tasks[] items (minus output_schema — workflow items are
+# goal/context/role only in v1; see PR limitations).
+_WORKFLOW_STEP_ITEM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "goal": {"type": "string", "description": "Task goal"},
+        "context": {
+            "type": "string",
+            "description": (
+                "Task-specific context. For pipeline stages, the previous "
+                "stage's output is appended here automatically."
+            ),
+        },
+        "role": {
+            "type": "string",
+            "enum": ["leaf", "orchestrator"],
+            "description": "Per-task role override. See top-level 'role' for semantics.",
+        },
+    },
+    "required": ["goal"],
+}
 
 
 DELEGATE_TASK_SCHEMA = {
@@ -4365,6 +4479,40 @@ DELEGATE_TASK_SCHEMA = {
                     "backward compatibility."
                 ),
             },
+            "workflow": {
+                "type": "object",
+                "description": "(rebuilt at get_definitions() time)",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "parallel": {
+                                    "type": "array",
+                                    "items": _WORKFLOW_STEP_ITEM_SCHEMA,
+                                    "description": (
+                                        "Independent tasks for this step; run "
+                                        "concurrently under the workflow "
+                                        "semaphore. A failing task becomes an "
+                                        "error entry; the others continue."
+                                    ),
+                                },
+                                "pipeline": {
+                                    "type": "array",
+                                    "items": _WORKFLOW_STEP_ITEM_SCHEMA,
+                                    "description": (
+                                        "Sequential stages for this step; the "
+                                        "output of each stage is appended to "
+                                        "the context of the next stage's "
+                                        "prompts."
+                                    ),
+                                },
+                            },
+                        },
+                    },
+                },
+            },
         },
         "required": [],
     },
@@ -4414,6 +4562,17 @@ def _strip_model_hidden_task_fields(tasks: Any) -> Any:
     return stripped_tasks if changed else tasks
 
 
+def _strip_workflow_model_hidden_fields(workflow: Any) -> Any:
+    """Lazy wrapper around tools.delegation_workflow's nested strip.
+
+    Kept here (not imported at module level) to avoid a circular import:
+    tools.delegation_workflow imports this module at top level.
+    """
+    from tools.delegation_workflow import _strip_workflow_model_hidden_fields as _impl
+
+    return _impl(workflow)
+
+
 registry.register(
     name="delegate_task",
     toolset="delegation",
@@ -4426,6 +4585,7 @@ registry.register(
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
+        workflow=_strip_workflow_model_hidden_fields(args.get("workflow")),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
