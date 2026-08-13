@@ -409,6 +409,37 @@ class TestSkillView:
             allowed = json.loads(skill_view("active-skill"))
         assert allowed["success"] is True
 
+    def test_disabled_check_uses_directory_name_not_frontmatter_name(self, tmp_path):
+        # #81839: the disabled set keys on the directory name, so the disable
+        # gate in skill_view must check the directory name too. A skill whose
+        # frontmatter ``name:`` differs from its directory name must still be
+        # blocked when the *directory* name is disabled — resolving the
+        # frontmatter name here would let it slip past the gate.
+        alias_dir = tmp_path / "alias-dir"
+        alias_dir.mkdir(parents=True, exist_ok=True)
+        (alias_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: real-skill-name\n"
+            "description: A skill whose directory name differs from its name.\n"
+            "---\n\n"
+            "# real-skill-name\n\n"
+            "Step 1: Do the thing.\n"
+        )
+        disabled_names = {"alias-dir"}
+
+        def _fake_disabled(name, platform=None):
+            return name in disabled_names
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch("tools.skills_tool._is_skill_disabled", side_effect=_fake_disabled),
+        ):
+            blocked = json.loads(skill_view("alias-dir"))
+        assert blocked["success"] is False
+        assert "disabled" in blocked["error"].lower()
+        # The error names the directory, not the frontmatter name.
+        assert "alias-dir" in blocked["error"]
+
     def test_view_finds_skill_in_symlinked_category_dir(self, tmp_path):
         external_root = tmp_path / "repo"
         skills_root = tmp_path / "skills"

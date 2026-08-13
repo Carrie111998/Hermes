@@ -1375,8 +1375,13 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        # Check if the skill is disabled by the user
-        resolved_name = parsed_frontmatter.get("name", skill_md.parent.name)
+        # Check if the skill is disabled by the user. The disabled set keys on
+        # the directory name (the canonical identifier this PR establishes for
+        # _find_all_skills / _find_skill / skills_list), so the disable check
+        # must use the directory name too — resolving the frontmatter ``name:``
+        # here would let a disabled skill with a mismatched frontmatter name
+        # slip past the gate (#81839).
+        resolved_name = skill_md.parent.name
         if _is_skill_disabled(resolved_name):
             return json.dumps(
                 {
