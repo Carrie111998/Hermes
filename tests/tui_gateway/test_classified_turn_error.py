@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import types
 
-from tui_gateway.server import _classify_turn_error_message, _fail_inflight_turn
+from tui_gateway.server import _fail_inflight_turn, _summarize_turn_error_message
 
 
-def test_classify_enriches_exception_with_agent_route():
+def test_summarize_enriches_exception_with_agent_route():
     class _Boom(Exception):
         status_code = 429
 
@@ -17,20 +17,20 @@ def test_classify_enriches_exception_with_agent_route():
         base_url="https://api.x.ai/v1",
         _summarize_api_error=lambda e: "rate limited",
     )
-    msg = _classify_turn_error_message(_Boom("request failed"), agent)
+    msg = _summarize_turn_error_message(_Boom("request failed"), agent)
     assert "rate limited" in msg
     assert "HTTP 429" in msg
     assert "provider=xai" in msg
     assert "model=grok-4.5" in msg
 
 
-def test_classify_result_dict_keeps_failure_reason():
+def test_summarize_result_dict_keeps_failure_reason():
     agent = types.SimpleNamespace(
         provider="openrouter",
         model="foo",
         base_url="https://openrouter.ai/api/v1",
     )
-    msg = _classify_turn_error_message(
+    msg = _summarize_turn_error_message(
         {
             "error": "credits exhausted",
             "failure_reason": "billing",
@@ -43,7 +43,7 @@ def test_classify_result_dict_keeps_failure_reason():
     assert "provider=openrouter" in msg
 
 
-def test_fail_inflight_uses_classified_message():
+def test_fail_inflight_uses_summarized_message():
     session = {
         "agent": types.SimpleNamespace(
             provider="ollama",
@@ -57,3 +57,18 @@ def test_fail_inflight_uses_classified_message():
     err = session["inflight_turn"]["error"]
     assert "connection refused" in err
     assert "provider=ollama" in err
+
+
+def test_summarize_renders_fallback_chain_not_list_repr():
+    agent = types.SimpleNamespace(
+        provider="nous",
+        model="deepseek-v4-flash",
+        _fallback_chain=[
+            {"provider": "xai", "model": "grok-4.5"},
+            {"provider": "openrouter", "model": "foo"},
+        ],
+    )
+    msg = _summarize_turn_error_message(RuntimeError("request failed"), agent)
+    assert "fallback=grok-4.5 (xai) → foo (openrouter)" in msg
+    assert "[{" not in msg
+    assert "'provider'" not in msg

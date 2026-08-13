@@ -7354,7 +7354,7 @@ def _fail_inflight_turn(session: dict, error: Any) -> None:
 
     Caller must hold ``session["history_lock"]``.
     """
-    message = _classify_turn_error_message(error, session.get("agent"))
+    message = _summarize_turn_error_message(error, session.get("agent"))
     now = time.time()
     turn = session.get("inflight_turn")
     if not isinstance(turn, dict):
@@ -7369,13 +7369,41 @@ def _fail_inflight_turn(session: dict, error: Any) -> None:
     session["inflight_turn"] = turn
 
 
-def _classify_turn_error_message(error: Any, agent: Any = None) -> str:
+def _format_fallback_chain(chain: Any) -> str:
+    """Render a fallback chain the same way agent_init.py does.
+
+    List-of-dicts → ``model (provider) → model (provider)``. A single
+    dict uses the same shape. Anything else falls back to ``str(chain)``
+    so a legacy string/model name still prints something readable.
+    """
+    entries: list[Any]
+    if isinstance(chain, dict):
+        entries = [chain]
+    elif isinstance(chain, (list, tuple)):
+        entries = list(chain)
+    else:
+        return str(chain).strip()
+
+    parts: list[str] = []
+    for item in entries:
+        if isinstance(item, dict) and item.get("model") and item.get("provider"):
+            parts.append(f"{item['model']} ({item['provider']})")
+        elif isinstance(item, dict) and item.get("model"):
+            parts.append(str(item["model"]))
+        elif item:
+            parts.append(str(item))
+    return " → ".join(parts)
+
+
+def _summarize_turn_error_message(error: Any, agent: Any = None) -> str:
     """Build a human-readable turn-error summary for TUI/desktop frames.
 
-    Bare ``str(exc)`` / generic ``request failed`` strings hide the classified
-    detail that already exists in logs (provider, model, base_url, HTTP
-    status, fallback chain). Prefer agent._summarize_api_error when present,
-    then decorate with route context from the live agent. Never raises.
+    Does not classify — only surfaces facts that already exist (result
+    fields, agent._summarize_api_error, route attrs). Bare ``str(exc)`` /
+    generic ``request failed`` strings hide the classified detail that
+    already exists in logs (provider, model, base_url, HTTP status,
+    fallback chain). Prefer agent._summarize_api_error when present, then
+    decorate with route context from the live agent. Never raises.
     """
     try:
         if isinstance(error, dict):
@@ -7431,7 +7459,9 @@ def _classify_turn_error_message(error: Any, agent: Any = None) -> str:
                 agent, "fallback_model", None
             )
             if chain and "fallback" not in msg.lower():
-                route_bits.append(f"fallback={chain}")
+                rendered = _format_fallback_chain(chain)
+                if rendered:
+                    route_bits.append(f"fallback={rendered}")
             if route_bits:
                 msg = f"{msg} ({', '.join(route_bits)})"
         return msg or "turn failed"
@@ -10289,7 +10319,7 @@ def _run_prompt_submit(
                     # the failed turn for resume replay instead of clearing it.
                     # If this terminal frame is lost to a disconnect, resume's
                     # inflight payload is the only carrier of the failure.
-                    # Pass the full result dict so _classify_turn_error_message
+                    # Pass the full result dict so _summarize_turn_error_message
                     # can keep failure_reason / route facts when present.
                     _fail_inflight_turn(
                         session,

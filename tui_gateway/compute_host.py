@@ -433,9 +433,9 @@ class ComputeHost:
             # Prefer classified summary when the agent is available (provider /
             # model / HTTP status), not a bare str(exc).
             try:
-                from tui_gateway.server import _classify_turn_error_message
+                from tui_gateway.server import _summarize_turn_error_message
 
-                _msg = _classify_turn_error_message(exc, getattr(session, "agent", None))
+                _msg = _summarize_turn_error_message(exc, getattr(session, "agent", None))
             except Exception:
                 _msg = str(exc)
             self.emit({"type": "turn.error", "sid": session.sid, "request_id": request_id, "message": _msg})
@@ -529,7 +529,7 @@ class ComputeHost:
             except Exception:
                 pass
             try:
-                from tui_gateway.server import _classify_turn_error_message
+                from tui_gateway.server import _summarize_turn_error_message
 
                 _sess = None
                 try:
@@ -539,7 +539,7 @@ class ComputeHost:
                 except Exception:
                     _sess = None
                 _agent = (_sess or {}).get("agent") if isinstance(_sess, dict) else None
-                _msg = _classify_turn_error_message(exc, _agent)
+                _msg = _summarize_turn_error_message(exc, _agent)
             except Exception:
                 _msg = str(exc)
             self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "reason": "exception", "message": _msg})
