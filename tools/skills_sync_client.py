@@ -530,7 +530,9 @@ def _all_local_skill_names() -> List[str]:
     try:
         if not root.exists():
             return []
-        for skill_md in root.rglob("SKILL.md"):
+        from agent.skill_utils import iter_skill_index_files
+
+        for skill_md in iter_skill_index_files(root, "SKILL.md"):
             if skill_md.is_symlink():
                 continue
             name: Optional[str] = None
@@ -1702,7 +1704,7 @@ def list_org_skill_names() -> List[str]:
     """Skill names present in the local org mirror (empty when none pulled)."""
     names: List[str] = []
     try:
-        from agent.skill_utils import read_active_org_id
+        from agent.skill_utils import iter_skill_index_files, read_active_org_id
 
         org_id = read_active_org_id(_skills_dir())
         if not org_id:
@@ -1710,7 +1712,7 @@ def list_org_skill_names() -> List[str]:
         root = _org_dir() / org_id
         if not root.is_dir():
             return names
-        for skill_md in root.rglob("SKILL.md"):
+        for skill_md in iter_skill_index_files(root, "SKILL.md"):
             rel = skill_md.parent.relative_to(root)
             if rel.parts:
                 names.append(str(rel).replace("\\", "/"))

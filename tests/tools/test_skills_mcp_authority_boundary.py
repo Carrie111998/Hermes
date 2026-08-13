@@ -371,3 +371,74 @@ def test_mcp_configuration_is_not_a_native_skill_source(authority_env, tmp_path)
     assert _names(skills_list()) == {"mcp-adapter"}
     assert json.loads(skill_view("mcp-adapter"))["success"] is True
     assert load_config()["mcp_servers"]["canonical"]["command"] == "example-mcp"
+
+
+@pytest.mark.parametrize("boundary", ["equal", "nested", "containing", "symlink_alias"])
+def test_sync_status_and_opt_out_inventory_never_enumerate_authority_skills(
+    authority_env, tmp_path, monkeypatch, boundary
+):
+    """Sync status and opt-out discovery share the native authority boundary."""
+    from tools import skills_sync_client as sync_client
+
+    skills_root = authority_env / "skills"
+    org_root = skills_root / "_org" / "org-1"
+    _write_skill(skills_root, "mcp-adapter", "mcp-adapter")
+    _write_skill(org_root, "public", "public-skill")
+    private_dir = _write_skill(org_root, f"private/{PRIVATE_ID}", PRIVATE_ID)
+    (skills_root / "_org" / ".active_org").write_text("org-1\n", encoding="utf-8")
+
+    if boundary == "equal":
+        authority = org_root
+    elif boundary == "nested":
+        authority = private_dir
+    elif boundary == "containing":
+        authority = skills_root / "_org"
+    else:
+        authority = tmp_path / "authority-alias"
+        authority.symlink_to(private_dir, target_is_directory=True)
+    _write_config(authority_env, authority_roots=[authority])
+
+    monkeypatch.setattr(sync_client, "resolve_identity", lambda: {"owner": "owner"})
+    monkeypatch.setattr(
+        sync_client,
+        "resolve_org_identity",
+        lambda: {"org_id": "org-1", "org_role": "MEMBER"},
+    )
+    monkeypatch.setattr(sync_client, "list_locally_modified_org_skills", lambda _org_id: [])
+
+    status = sync_client.sync_status()
+    local_names = sync_client._all_local_skill_names()
+
+    assert PRIVATE_ID not in "\n".join(status["org_skills"])
+    assert PRIVATE_ID not in local_names
+    assert "mcp-adapter" in local_names
+    if boundary == "nested" or boundary == "symlink_alias":
+        assert status["org_skills"] == ["public"]
+    else:
+        assert status["org_skills"] == []
+
+
+def test_sync_local_enumeration_tracks_authority_config_and_profile_switch(
+    authority_env, tmp_path, monkeypatch
+):
+    """Authority roots are reloaded when config changes or the profile changes."""
+    from tools import skills_sync_client as sync_client
+
+    private_dir = _write_skill(authority_env / "skills", PRIVATE_ID, PRIVATE_ID)
+    _write_skill(authority_env / "skills", "mcp-adapter", "mcp-adapter")
+    _write_config(authority_env, authority_roots=[private_dir])
+    assert PRIVATE_ID not in sync_client._all_local_skill_names()
+
+    _write_config(authority_env, authority_roots=[])
+    config_path = authority_env / "config.yaml"
+    stat = config_path.stat()
+    os.utime(config_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
+    assert PRIVATE_ID in sync_client._all_local_skill_names()
+
+    other_home = tmp_path / "other-profile"
+    other_private_dir = _write_skill(other_home / "skills", "other-private", "other-private")
+    _write_skill(other_home / "skills", "other-adapter", "other-adapter")
+    _write_config(other_home, authority_roots=[other_private_dir])
+    monkeypatch.setenv("HERMES_HOME", str(other_home))
+
+    assert sync_client._all_local_skill_names() == ["other-adapter"]

@@ -13903,10 +13903,12 @@ def _disable_unselected_skills(profile_dir: Path, keep: List[str]) -> int:
     disabled_count = 0
     token = set_hermes_home_override(str(profile_dir))
     try:
+        from agent.skill_utils import iter_skill_index_files
+
         installed: List[str] = []
         skills_root = profile_dir / "skills"
         if skills_root.is_dir():
-            for md in skills_root.rglob("SKILL.md"):
+            for md in iter_skill_index_files(skills_root, "SKILL.md"):
                 installed.append(md.parent.name)
         cfg = load_config()
         disabled = get_disabled_skills(cfg)
