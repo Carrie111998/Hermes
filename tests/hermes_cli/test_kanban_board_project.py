@@ -8,6 +8,7 @@ metadata round-trip and the create-time inheritance.
 from __future__ import annotations
 
 import sys
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,12 @@ if str(_WORKTREE) not in sys.path:
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import projects_db as pdb
+
+
+def _init_repo(path: Path) -> Path:
+    path.mkdir()
+    subprocess.run(["git", "init", str(path)], check=True, capture_output=True)
+    return path
 
 
 @pytest.fixture
@@ -57,8 +64,7 @@ def test_create_board_accepts_project_id(fresh_home):
 
 
 def test_create_task_inherits_board_project(fresh_home, tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
+    repo = _init_repo(tmp_path / "repo")
     with pdb.connect_closing() as pconn:
         proj_id = pdb.create_project(pconn, name="Widget", primary_path=str(repo))
 
@@ -72,8 +78,8 @@ def test_create_task_inherits_board_project(fresh_home, tmp_path):
 
 
 def test_create_task_explicit_project_beats_board(fresh_home, tmp_path):
-    (tmp_path / "a").mkdir()
-    (tmp_path / "b").mkdir()
+    _init_repo(tmp_path / "a")
+    _init_repo(tmp_path / "b")
     with pdb.connect_closing() as pconn:
         board_proj = pdb.create_project(pconn, name="BoardProj", primary_path=str(tmp_path / "a"))
         task_proj = pdb.create_project(pconn, name="TaskProj", primary_path=str(tmp_path / "b"))

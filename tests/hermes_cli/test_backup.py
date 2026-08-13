@@ -494,6 +494,73 @@ class TestRoundTrip:
         # PID files should NOT be present
         assert not (dst_home / "gateway.pid").exists()
 
+    def test_nested_kanban_board_wal_snapshot_round_trips_through_import(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """A canonical board DB is archived and restored with committed WAL data."""
+        src_home = tmp_path / "source" / ".hermes"
+        board_rel = Path("kanban/boards/product/kanban.db")
+        board_db = src_home / board_rel
+        board_db.parent.mkdir(parents=True)
+        (src_home / "config.yaml").write_text("model:\n  provider: openrouter\n")
+
+        writer = sqlite3.connect(str(board_db))
+        try:
+            assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT)")
+            writer.commit()
+            writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            writer.execute(
+                "INSERT INTO tasks VALUES (?, ?)",
+                ("t_wal", "Committed only after the checkpoint"),
+            )
+            writer.commit()
+            wal_path = board_db.with_name("kanban.db-wal")
+            assert wal_path.exists() and wal_path.stat().st_size > 0
+
+            monkeypatch.setenv("HERMES_HOME", str(src_home))
+            monkeypatch.setattr(Path, "home", lambda: tmp_path / "source")
+            out_zip = tmp_path / "nested-board-roundtrip.zip"
+
+            from hermes_cli.backup import run_backup, run_import
+
+            run_backup(Namespace(output=str(out_zip)))
+
+            extracted = tmp_path / "archive"
+            with zipfile.ZipFile(out_zip, "r") as zf:
+                names = set(zf.namelist())
+                assert board_rel.as_posix() in names
+                assert f"{board_rel.as_posix()}-wal" not in names
+                assert f"{board_rel.as_posix()}-shm" not in names
+                zf.extract(board_rel.as_posix(), extracted)
+
+            with sqlite3.connect(str(extracted / board_rel)) as archived:
+                assert archived.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+                assert archived.execute("SELECT id, title FROM tasks").fetchall() == [
+                    ("t_wal", "Committed only after the checkpoint")
+                ]
+
+            dst_home = tmp_path / "dest" / ".hermes"
+            dst_home.mkdir(parents=True)
+            monkeypatch.setenv("HERMES_HOME", str(dst_home))
+            monkeypatch.setattr(Path, "home", lambda: tmp_path / "dest")
+            run_import(Namespace(zipfile=str(out_zip), force=True))
+
+            restored_db = dst_home / board_rel
+            assert restored_db.exists()
+            assert not restored_db.with_name("kanban.db-wal").exists()
+            assert not restored_db.with_name("kanban.db-shm").exists()
+            with sqlite3.connect(str(restored_db)) as restored:
+                assert restored.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+                assert restored.execute("SELECT id, title FROM tasks").fetchall() == [
+                    ("t_wal", "Committed only after the checkpoint")
+                ]
+        finally:
+            writer.close()
+
 
 # ---------------------------------------------------------------------------
 # Validate / detect-prefix unit tests
@@ -1328,7 +1395,3 @@ class TestMemoryProviderExternalPaths:
         assert (restored.stat().st_mode & 0o777) == 0o600
         # External state did NOT leak into HERMES_HOME.
         assert not (hermes_home / "_external").exists()
-
-
-
-

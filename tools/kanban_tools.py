@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -64,9 +65,9 @@ def _profile_has_kanban_toolset() -> bool:
 
 def _is_delegated_child_context() -> bool:
     try:
-        from agent.delegation_context import is_delegated_child_context
+        from agent.delegation_context import is_delegated_child_process_context
 
-        return is_delegated_child_context()
+        return is_delegated_child_process_context()
     except Exception:
         return False
 
@@ -130,9 +131,14 @@ def _check_kanban_orchestrator_mode() -> bool:
     """
     if _is_delegated_child_context():
         return False
-    if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
+    if os.environ.get("HERMES_KANBAN_TASK"):
         return False
     return _profile_has_kanban_toolset()
+
+
+def _check_kanban_board_admin_mode() -> bool:
+    """Expose board administration only to an unscoped orchestrator."""
+    return _check_kanban_orchestrator_mode()
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +218,45 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
+def _enforce_worker_lifecycle_fence(
+    conn: Any,
+    tid: str,
+    tool_name: str,
+) -> Optional[str]:
+    """Require a dispatcher worker's task, run, and claim identities to match.
+
+    The run-id CAS in each DB transition closes reclaim races. This preflight
+    also authenticates the process's claim token and returns one deterministic
+    error before goal judging or any other lifecycle side effect occurs.
+    """
+    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not env_tid or not _is_dispatcher_owned_worker():
+        return None
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+    claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    try:
+        run_id = int(raw_run_id) if raw_run_id else None
+    except (TypeError, ValueError):
+        run_id = None
+    row = conn.execute(
+        "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
+        (tid,),
+    ).fetchone()
+    if (
+        row is None
+        or row["status"] != "running"
+        or run_id is None
+        or row["current_run_id"] != run_id
+        or not claim_lock
+        or row["claim_lock"] != claim_lock
+    ):
+        return tool_error(
+            f"{tool_name} refused: stale worker lifecycle fence for {tid}; "
+            "the dispatcher task, current run, and claim token must all match."
+        )
+    return None
+
+
 def _connect(board: Optional[str] = None):
     """Import + connect lazily so the module imports cleanly in non-kanban
     contexts (e.g. test rigs that import every tool module).
@@ -227,7 +272,9 @@ def _connect(board: Optional[str] = None):
     return kb, kb.connect(board=board)
 
 
-_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
+_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset(
+    {"dependency", "needs_input", "authority", "integrity"}
+)
 
 
 def _goal_judge_available() -> bool:
@@ -480,6 +527,128 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
             "kanban_comment for their assigned task."
         )
     return None
+
+
+def _require_board_admin_tool(tool_name: str) -> Optional[str]:
+    if not _check_kanban_board_admin_mode():
+        return tool_error(
+            f"{tool_name} is orchestrator-only; task-scoped workers and "
+            "delegate_task children cannot administer boards, and the active "
+            "unscoped profile must explicitly enable the kanban toolset"
+        )
+    return None
+
+
+def _native_board_summary(kb, meta: dict[str, Any]) -> dict[str, Any]:
+    slug = str(meta["slug"])
+    with kb.connect(board=slug) as conn:
+        counts = {
+            row["status"]: int(row["n"])
+            for row in conn.execute(
+                "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
+            ).fetchall()
+        }
+        nonterminal = conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks "
+            "WHERE status NOT IN ('done', 'archived')"
+        ).fetchone()["n"]
+    return {**meta, "counts": counts, "nonterminal_tasks": int(nonterminal)}
+
+
+def _handle_boards_list(args: dict, **kw) -> str:
+    guard = _require_board_admin_tool("kanban_boards_list")
+    if guard:
+        return guard
+    include_archived, bool_error = _parse_bool_arg(
+        args, "include_archived", default=False
+    )
+    if bool_error:
+        return tool_error(bool_error)
+    try:
+        from hermes_cli import kanban_db as kb
+
+        boards = [
+            _native_board_summary(kb, meta)
+            for meta in kb.list_boards(include_archived=include_archived)
+        ]
+        return _ok(boards=boards, count=len(boards))
+    except Exception as exc:
+        logger.exception("kanban_boards_list failed")
+        return tool_error(f"kanban_boards_list: {exc}")
+
+
+def _validated_board_workdir(kb, raw: Any) -> Optional[str]:
+    if raw is None:
+        return None
+    path = Path(str(raw)).expanduser()
+    if not path.is_absolute():
+        raise ValueError("default_workdir must be an absolute path")
+    repo = kb._git_toplevel(path)
+    if repo is None:
+        raise ValueError(
+            f"default_workdir {str(path)!r} is not inside a git repository"
+        )
+    return str(repo)
+
+
+def _handle_board_create(args: dict, **kw) -> str:
+    guard = _require_board_admin_tool("kanban_board_create")
+    if guard:
+        return guard
+    slug = args.get("slug")
+    if not slug or not str(slug).strip():
+        return tool_error("slug is required")
+    try:
+        from hermes_cli import kanban_db as kb
+
+        normed = kb._normalize_board_slug(str(slug))
+        if not normed:
+            return tool_error("slug is required")
+        existed = kb.board_exists(normed)
+        default_workdir = _validated_board_workdir(kb, args.get("default_workdir"))
+        meta = kb.create_board(
+            normed,
+            name=args.get("name"),
+            description=args.get("description"),
+            icon=args.get("icon"),
+            color=args.get("color"),
+            default_workdir=default_workdir,
+        )
+        return _ok(created=not existed, board=_native_board_summary(kb, meta))
+    except ValueError as exc:
+        return tool_error(f"kanban_board_create: {exc}")
+    except Exception as exc:
+        logger.exception("kanban_board_create failed")
+        return tool_error(f"kanban_board_create: {exc}")
+
+
+def _handle_board_archive(args: dict, **kw) -> str:
+    guard = _require_board_admin_tool("kanban_board_archive")
+    if guard:
+        return guard
+    slug = args.get("slug")
+    if not slug or not str(slug).strip():
+        return tool_error("slug is required")
+    try:
+        from hermes_cli import kanban_db as kb
+
+        normed = kb._normalize_board_slug(str(slug))
+        if not normed or not kb.board_exists(normed):
+            return tool_error(f"kanban_board_archive: board {slug!r} does not exist")
+        try:
+            return _ok(**kb.remove_board(normed, archive=True))
+        except OSError:
+            # remove_board normally owns rollback. Keep this fallback for
+            # injected failures that occur before its rollback path.
+            if kb.board_exists(normed):
+                with kb.connect(board=normed) as conn:
+                    kb.cancel_board_archive(conn)
+            raise
+    except ValueError as exc:
+        return tool_error(f"kanban_board_archive: {exc}")
+    except Exception as exc:
+        logger.exception("kanban_board_archive failed")
+        return tool_error(f"kanban_board_archive: {exc}")
 
 
 def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
@@ -746,6 +915,9 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            fence_err = _enforce_worker_lifecycle_fence(conn, tid, "kanban_complete")
+            if fence_err:
+                return fence_err
             # Goal-mode pre-completion judge gate (Issue #38367).
             # Prevent workers from bypassing the auxiliary judge by
             # calling kanban_complete before acceptance criteria are met.
@@ -835,6 +1007,10 @@ def _handle_block(args: dict, **kw) -> str:
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
+        fence_err = _enforce_worker_lifecycle_fence(conn, tid, "kanban_block")
+        if fence_err:
+            conn.close()
+            return fence_err
         if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
             conn.close()
             return tool_error(
@@ -936,6 +1112,11 @@ def _handle_request_review(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            fence_err = _enforce_worker_lifecycle_fence(
+                conn, tid, "kanban_request_review"
+            )
+            if fence_err:
+                return fence_err
             task = kb.get_task(conn, tid)
             rejection = _goal_mode_handoff_rejection(task, summary)
             if rejection is not None:
@@ -994,6 +1175,11 @@ def _handle_request_changes(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            fence_err = _enforce_worker_lifecycle_fence(
+                conn, tid, "kanban_request_changes"
+            )
+            if fence_err:
+                return fence_err
             ok, detail = kb.request_changes(
                 conn,
                 tid,
@@ -1047,6 +1233,9 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            fence_err = _enforce_worker_lifecycle_fence(conn, tid, "kanban_heartbeat")
+            if fence_err:
+                return fence_err
             # Extend the claim TTL first. The dispatcher pins
             # HERMES_KANBAN_CLAIM_LOCK in the worker env at spawn time
             # (see _default_spawn in kanban_db.py); falling back to the
@@ -1073,6 +1262,48 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_heartbeat failed")
         return tool_error(f"kanban_heartbeat: {e}")
+
+
+def _handle_progress(args: dict, **kw) -> str:
+    """Record concrete, run-fenced progress without conflating liveness."""
+    delegated_err = _reject_delegated_child_mutation("kanban_progress")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    evidence = str(args.get("evidence") or "").strip()
+    if not evidence:
+        return tool_error("evidence is required")
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            fence_err = _enforce_worker_lifecycle_fence(conn, tid, "kanban_progress")
+            if fence_err:
+                return fence_err
+            seq = kb.record_progress(
+                conn,
+                tid,
+                evidence=evidence,
+                expected_run_id=_worker_run_id(tid),
+            )
+            if seq is None:
+                return tool_error(
+                    f"could not record progress for {tid} (unknown id or not running)"
+                )
+            return _ok(task_id=tid, progress_seq=seq)
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_progress: {e}")
+    except Exception as e:
+        logger.exception("kanban_progress failed")
+        return tool_error(f"kanban_progress: {e}")
 
 
 def _handle_comment(args: dict, **kw) -> str:
@@ -1461,6 +1692,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                board=board,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1862,9 +2094,15 @@ KANBAN_BLOCK_SCHEMA = {
         "Stop work on this task and route it according to WHY you're stuck. "
         "Set ``kind`` to say which: 'dependency' (waiting on another task — "
         "goes to todo and auto-resumes when that task finishes, no human "
-        "needed), 'needs_input' (you need a human decision/answer), "
+        "needed), 'needs_input' (an implementation worker needs a human "
+        "decision/answer), "
         "'capability' (a hard wall: no access, missing credentials, an action "
-        "no agent can do), or 'transient' (a flaky failure that may clear). "
+        "no agent can do), 'transient' (a flaky failure that may clear), "
+        "'authority' (review requires a decision by a human authority), or "
+        "'integrity' (review found a trust/integrity concern requiring human "
+        "judgment). Reviewers must use kanban_request_changes for routine "
+        "findings; an active review run may wait on a dependency, but only "
+        "authority/integrity may create a human block. "
         "``reason`` is shown to the human on the board. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
@@ -1887,10 +2125,20 @@ KANBAN_BLOCK_SCHEMA = {
             },
             "kind": {
                 "type": "string",
-                "enum": ["dependency", "needs_input", "capability", "transient"],
+                "enum": [
+                    "dependency",
+                    "needs_input",
+                    "capability",
+                    "transient",
+                    "authority",
+                    "integrity",
+                ],
                 "description": (
                     "Why you're blocked. 'dependency' waits in todo and "
                     "resumes automatically; the others surface to a human. "
+                    "From an active review run, 'dependency' may wait in todo, "
+                    "while only 'authority' and 'integrity' may create a human "
+                    "block; routine findings must use kanban_request_changes. "
                     "Omit only if none apply."
                 ),
             },
@@ -2002,6 +2250,30 @@ KANBAN_HEARTBEAT_SCHEMA = {
             "board": _board_schema_prop(),
         },
         "required": [],
+    },
+}
+
+KANBAN_PROGRESS_SCHEMA = {
+    "name": "kanban_progress",
+    "description": (
+        "Record one concrete work-progress receipt for the current run. "
+        "Unlike kanban_heartbeat, this advances the stale-recovery progress "
+        "clock and therefore requires specific, externally checkable evidence."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "evidence": {
+                "type": "string",
+                "description": (
+                    "Specific completed change or verification, such as a test "
+                    "result, artifact checksum, commit, or durable state transition."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["evidence"],
     },
 }
 
@@ -2224,9 +2496,9 @@ KANBAN_CREATE_SCHEMA = {
             "idempotency_key": {
                 "type": "string",
                 "description": (
-                    "If a non-archived task with this key already "
-                    "exists, return that task's id instead of creating "
-                    "a duplicate. Useful for retry-safe automation."
+                    "Permanent board-local source-event key. Every replay "
+                    "returns the original task id, including after completion "
+                    "or archival. Use for retry-safe automation."
                 ),
             },
             "max_runtime_seconds": {
@@ -2309,6 +2581,63 @@ KANBAN_CREATE_SCHEMA = {
     },
 }
 
+KANBAN_BOARDS_LIST_SCHEMA = {
+    "name": "kanban_boards_list",
+    "description": (
+        "List native Kanban boards with metadata and task counts. "
+        "Orchestrator-only; unavailable to task workers and delegated children."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "include_archived": {
+                "type": "boolean",
+                "description": "Include boards marked archived in metadata.",
+            }
+        },
+        "required": [],
+    },
+}
+
+KANBAN_BOARD_CREATE_SCHEMA = {
+    "name": "kanban_board_create",
+    "description": (
+        "Idempotently create or update one native Kanban board using only "
+        "display metadata and an exact git repository default workdir. "
+        "Orchestrator-only; does not create tasks or dispatch work."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "slug": {"type": "string", "description": "Exact native board slug."},
+            "name": {"type": "string", "description": "Optional display name."},
+            "description": {"type": "string"},
+            "icon": {"type": "string"},
+            "color": {"type": "string"},
+            "default_workdir": {
+                "type": "string",
+                "description": "Absolute path inside the board's git repository.",
+            },
+        },
+        "required": ["slug", "default_workdir"],
+    },
+}
+
+KANBAN_BOARD_ARCHIVE_SCHEMA = {
+    "name": "kanban_board_archive",
+    "description": (
+        "Archive exactly one native board by slug. Refuses the default board "
+        "and any board containing a nonterminal task. Orchestrator-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "slug": {"type": "string", "description": "Exact native board slug."}
+        },
+        "required": ["slug"],
+    },
+}
+
 KANBAN_UNBLOCK_SCHEMA = {
     "name": "kanban_unblock",
     "description": (
@@ -2372,6 +2701,33 @@ registry.register(
 )
 
 registry.register(
+    name="kanban_boards_list",
+    toolset="kanban",
+    schema=KANBAN_BOARDS_LIST_SCHEMA,
+    handler=_handle_boards_list,
+    check_fn=_check_kanban_board_admin_mode,
+    emoji="📋",
+)
+
+registry.register(
+    name="kanban_board_create",
+    toolset="kanban",
+    schema=KANBAN_BOARD_CREATE_SCHEMA,
+    handler=_handle_board_create,
+    check_fn=_check_kanban_board_admin_mode,
+    emoji="📋",
+)
+
+registry.register(
+    name="kanban_board_archive",
+    toolset="kanban",
+    schema=KANBAN_BOARD_ARCHIVE_SCHEMA,
+    handler=_handle_board_archive,
+    check_fn=_check_kanban_board_admin_mode,
+    emoji="📦",
+)
+
+registry.register(
     name="kanban_complete",
     toolset="kanban",
     schema=KANBAN_COMPLETE_SCHEMA,
@@ -2414,6 +2770,15 @@ registry.register(
     handler=_handle_heartbeat,
     check_fn=_check_kanban_mode,
     emoji="💓",
+)
+
+registry.register(
+    name="kanban_progress",
+    toolset="kanban",
+    schema=KANBAN_PROGRESS_SCHEMA,
+    handler=_handle_progress,
+    check_fn=_check_kanban_mode,
+    emoji="📈",
 )
 
 registry.register(

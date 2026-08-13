@@ -148,6 +148,10 @@ def test_delegate_child_execute_code_env_bridges_contextvar_and_scrubs_kanban(
     monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path / "parent-workspace"))
     monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "lock")
+    monkeypatch.setenv("HERMES_KANBAN_BRANCH", "wt/parent")
+    monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+    monkeypatch.setenv("HERMES_KANBAN_GOAL_MAX_TURNS", "20")
+    monkeypatch.setenv("HERMES_KANBAN_FUTURE_FENCE", "must-not-leak")
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
 
     from agent.delegation_context import delegated_child_context
@@ -168,6 +172,82 @@ def test_delegate_child_execute_code_env_bridges_contextvar_and_scrubs_kanban(
     assert "HERMES_KANBAN_DB" not in env
     assert "HERMES_KANBAN_WORKSPACE" not in env
     assert "HERMES_KANBAN_CLAIM_LOCK" not in env
+    assert "HERMES_KANBAN_BRANCH" not in env
+    assert "HERMES_KANBAN_GOAL_MODE" not in env
+    assert "HERMES_KANBAN_GOAL_MAX_TURNS" not in env
+    assert "HERMES_KANBAN_FUTURE_FENCE" not in env
+
+
+def test_delegated_child_process_marker_rejects_parent_lifecycle_mutation(
+    monkeypatch,
+    tmp_path,
+):
+    """A nested subprocess remains non-authoritative after ContextVars are lost."""
+    kb, tid, workspace, _attachments_root = _make_running_kanban_task(
+        monkeypatch,
+        tmp_path,
+    )
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+
+    from tools import kanban_tools
+
+    payload = json.loads(
+        kanban_tools._handle_block(
+            {"task_id": tid, "reason": "forged child block", "kind": "needs_input"}
+        )
+    )
+
+    assert "delegate_task child" in payload["error"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "running"
+        assert kb.latest_run(conn, tid).status == "running"
+    assert workspace.is_dir()
+
+
+def test_stale_worker_run_and_claim_cannot_mutate_reclaimed_task(monkeypatch, tmp_path):
+    """Lifecycle writes require both the current run id and claim fence."""
+    kb, tid, workspace, _attachments_root = _make_running_kanban_task(
+        monkeypatch,
+        tmp_path,
+    )
+    with kb.connect() as conn:
+        first = kb.get_task(conn, tid)
+        old_run = first.current_run_id
+        old_claim = first.claim_lock
+        conn.execute(
+            "UPDATE task_runs SET status='released', ended_at=unixepoch() WHERE id=?",
+            (old_run,),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+        second = kb.claim_task(conn, tid, claimer="fresh-owner:2")
+        assert second is not None and second.id != old_run
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(old_run))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(old_claim))
+    from tools import kanban_tools
+
+    complete = json.loads(
+        kanban_tools._handle_complete({"task_id": tid, "summary": "stale completion"})
+    )
+    block = json.loads(
+        kanban_tools._handle_block(
+            {"task_id": tid, "reason": "stale block", "kind": "needs_input"}
+        )
+    )
+    heartbeat = json.loads(kanban_tools._handle_heartbeat({"task_id": tid}))
+
+    for payload in (complete, block, heartbeat):
+        assert "stale worker lifecycle fence" in payload["error"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "running"
+        assert kb.get_task(conn, tid).current_run_id == second.current_run_id
+        assert kb.latest_run(conn, tid).status == "running"
+    assert workspace.is_dir()
 
 
 def test_delegate_child_kanban_cli_cannot_delete_parent_board(

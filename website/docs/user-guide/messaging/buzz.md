@@ -107,6 +107,14 @@ By default the allow-list is empty, which means every community member who menti
 
 Cron jobs and notifications (`deliver=buzz`) are delivered to the **home channel** — `BUZZ_HOME_CHANNEL` if set, otherwise the first watched channel — and work even when cron runs outside the gateway process.
 
+Kanban's optional operations alerts can route dispatcher stalls to `#alerts`
+and actionable task blockers to `#blockers`. Configure those under
+`kanban.alerts` rather than changing the Buzz home channel; see
+[Kanban operations alerts](../features/kanban.md#operations-alerts-for-stalls-and-blockers).
+The Buzz adapter publishes its discovered channel names and UUIDs to the
+gateway channel directory, so these routes resolve to a real joined channel
+and fail closed when a name is unknown.
+
 ## Run the gateway
 
 ```bash

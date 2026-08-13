@@ -62,6 +62,7 @@ Update semantics:
 from __future__ import annotations
 
 import re
+import json
 import shutil
 import subprocess
 import tempfile
@@ -745,12 +746,82 @@ def update_distribution(
         )
         plan.preserves_config = not force_config
 
-        _copy_dist_payload(
-            plan.staged_dir,
-            plan.target_dir,
-            plan.manifest,
-            preserve_config=plan.preserves_config,
+        staged_skills = _count_skills(plan.staged_dir)
+        expected_skills = _count_skills(target)
+        # A dedicated Reader-style profile must remain skill-bearing; a
+        # Luna-style tool-free profile must remain exactly tool-free. This
+        # catches a source mix-up before any live profile bytes are replaced.
+        if expected_skills > 0 and staged_skills == 0:
+            raise DistributionError(
+                f"Profile '{canon}' canary failed: update would remove all skills."
+            )
+        if expected_skills == 0 and staged_skills > 0:
+            raise DistributionError(
+                f"Profile '{canon}' canary failed: tool-free profile would gain "
+                f"{staged_skills} skill(s)."
+            )
+
+        rollback_root = target.parent / ".deployment-rollbacks"
+        rollback_root.mkdir(parents=True, exist_ok=True)
+        backup = Path(tempfile.mkdtemp(prefix=f"{canon}-", dir=rollback_root))
+        manifest_path = backup / "rollback-manifest.json"
+        owned = [p.strip().strip("/") for p in plan.manifest.distribution_owned if p.strip()]
+        if not owned:
+            owned = [
+                entry.name for entry in target.iterdir()
+                if entry.name not in USER_OWNED_EXCLUDE
+            ]
+        for rel in owned:
+            src = target / rel
+            if not src.exists():
+                continue
+            dst = backup / "payload" / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if src.is_dir():
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "profile": canon,
+                    "target": str(target),
+                    "source": existing_manifest.source,
+                    "owned_paths": owned,
+                    "pre_update_skill_count": expected_skills,
+                    "staged_skill_count": staged_skills,
+                    "restore": (
+                        f"copy payload paths from {backup / 'payload'} back to "
+                        f"{target}; remove newly introduced owned paths first"
+                    ),
+                },
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
         )
+        try:
+            _copy_dist_payload(
+                plan.staged_dir,
+                plan.target_dir,
+                plan.manifest,
+                preserve_config=plan.preserves_config,
+            )
+            if _count_skills(target) != staged_skills:
+                raise DistributionError("post-deploy skill canary did not match staging")
+        except Exception:
+            for rel in owned:
+                live = target / rel
+                saved = backup / "payload" / rel
+                if live.is_dir():
+                    shutil.rmtree(live)
+                elif live.exists():
+                    live.unlink()
+                if saved.is_dir():
+                    shutil.copytree(saved, live)
+                elif saved.exists():
+                    live.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(saved, live)
+            raise
         return plan
 
 

@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -99,11 +100,22 @@ class TestPathResolution:
 
 
     def test_env_var_db_override_still_wins(self, fresh_home, tmp_path, monkeypatch):
-        """``HERMES_KANBAN_DB`` pins the file regardless of board= arg."""
+        """The DB override applies only when no board is explicitly selected."""
         forced = tmp_path / "custom.db"
         monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
         assert kb.kanban_db_path() == forced
-        assert kb.kanban_db_path(board="ignored") == forced
+        assert kb.kanban_db_path(board="selected") == (
+            fresh_home / "kanban" / "boards" / "selected" / "kanban.db"
+        )
+
+    def test_scoped_board_overrides_env_pinned_db(self, fresh_home, tmp_path, monkeypatch):
+        forced = tmp_path / "custom.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
+
+        with kb.scoped_current_board("selected"):
+            assert kb.kanban_db_path() == (
+                fresh_home / "kanban" / "boards" / "selected" / "kanban.db"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +151,39 @@ class TestCurrentBoard:
 
 class TestBoardCRUD:
 
+    def test_archived_board_rejects_env_pinned_managed_db(self, fresh_home, monkeypatch):
+        kb.create_board("sealed")
+        db_path = kb.kanban_db_path(board="sealed")
+        kb.remove_board("sealed", archive=True)
+
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+        with pytest.raises(ValueError, match="archived"):
+            kb.connect()
+        assert not db_path.exists()
+
+    def test_concurrent_archives_do_not_resurrect_board(self, fresh_home):
+        kb.create_board("single-flight")
+        outcomes: list[str] = []
+
+        def archive() -> None:
+            try:
+                outcomes.append(kb.remove_board("single-flight")["action"])
+            except ValueError as exc:
+                outcomes.append(str(exc))
+
+        threads = [threading.Thread(target=archive) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert outcomes.count("archived") == 1
+        assert any("already archived" in outcome for outcome in outcomes)
+        assert kb.board_is_archived("single-flight")
+        assert not kb.board_dir("single-flight").exists()
+        with pytest.raises(ValueError, match="archived"):
+            kb.connect(board="single-flight")
+
 
 
 
@@ -154,17 +199,24 @@ class TestBoardCRUD:
         kb.create_board("recycle")
         # First connect populates _INITIALIZED_PATHS for this DB.
         with kb.connect(board="recycle") as conn:
-            kb.create_task(conn, title="t1", assignee="dev")
+            task_id = kb.create_task(conn, title="t1", assignee="dev")
         db_path = kb.board_dir("recycle") / "kanban.db"
         assert str(db_path.resolve()) in kb._INITIALIZED_PATHS
 
+        with kb.connect(board="recycle") as conn:
+            assert kb.complete_task(conn, task_id, result="done")
         kb.remove_board("recycle", archive=archive)
         # remove_board must drop the cache entry so a re-create through
         # connect() gets a fresh schema-init pass.
         assert str(db_path.resolve()) not in kb._INITIALIZED_PATHS
 
-        # Simulate the event-stream poll: re-open the same slug. connect()
-        # recreates the directory + empty .db; the schema must be re-applied.
+        if archive:
+            with pytest.raises(ValueError, match="archived"):
+                kb.connect(board="recycle")
+            return
+
+        # Hard deletion intentionally permits reusing the slug. Simulate the
+        # event-stream poll: the schema must be re-applied to the fresh DB.
         with kb.connect(board="recycle") as conn:
             tables = {
                 row[0]
@@ -341,6 +393,3 @@ class TestCLI:
         assert titlesA == ["Task A"]
         assert titlesB == ["Task B"]
         assert titlesD == []
-
-
-

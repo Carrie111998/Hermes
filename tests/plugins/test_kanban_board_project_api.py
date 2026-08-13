@@ -9,6 +9,7 @@ on a scoped board inheriting the project.
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -51,6 +52,7 @@ def client(kanban_home):
 def project(tmp_path):
     repo = tmp_path / "widget-repo"
     repo.mkdir()
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
     with pdb.connect_closing() as conn:
         pid = pdb.create_project(conn, name="Widget", primary_path=str(repo))
     return {"id": pid, "primary_path": str(repo)}

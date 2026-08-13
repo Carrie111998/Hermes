@@ -59,7 +59,7 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   (e.g. one per project, repo, or domain); see [Boards (multi-project)](#boards-multi-project)
   below. Single-project users stay on the `default` board and never see the
   word "board" outside this docs section.
-- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | review | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
+- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | review | done | archived`), optional tenant namespace, optional permanent board-local idempotency key (dedup for retried automation, including late replay after completion or archival).
 - **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`.
 - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
 - **Workspace** — the directory a worker operates in. Three kinds:
@@ -249,12 +249,20 @@ a gateway-embedded dispatcher AND a standalone daemon against the same
 
 ```bash
 # First call creates the task. Any subsequent call with the same key
-# returns the existing task id instead of duplicating.
+# returns the original task id instead of duplicating, even after the
+# original task reaches done or archived.
 hermes kanban create "nightly ops review" \
     --assignee ops \
     --idempotency-key "nightly-ops-$(date -u +%Y-%m-%d)" \
     --json
 ```
+
+Keys are permanent source-event reservations within one board. A keyed task may
+be archived but not purged or hard-deleted, so every replay continues to resolve
+to the canonical task. Different boards remain independent and may use the same
+key. For event-driven intake, prefer stable keys such as
+`intake:<board>:<source>:<source-id>`; a materially different event needs a new
+source ID rather than reuse of an old key.
 
 ### Bulk CLI verbs
 
@@ -299,7 +307,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
 | `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
-| `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
+| `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (implementation blockers), or `authority`/`integrity` (genuine human review escalations). An active review run accepts dependency wait plus authority/integrity; every other kind is rejected with an instruction to use `kanban_request_changes` for routine findings. Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
@@ -398,7 +406,7 @@ Every profile that works kanban tasks automatically gets the worker lifecycle �
 
 1. On spawn, call `kanban_show()` to read title + body + parent handoffs + prior attempts + full comment thread.
 2. `cd $HERMES_KANBAN_WORKSPACE` (via the terminal tool) and do the work there.
-3. Call `kanban_heartbeat(note="...")` every few minutes during long operations. **If your work may run longer than 1 hour, call `kanban_heartbeat` at least once an hour** — the dispatcher reclaims tasks that have been running past `kanban.dispatch_stale_timeout_seconds` (default 4 h) with no heartbeat in the last hour, on the assumption the worker crashed without cleanup. A reclaim is benign (the task goes back to `ready` for re-dispatch without a failure-counter tick) but you lose your current run's progress.
+3. Call `kanban_heartbeat(note="...")` every few minutes during long operations. **If your work may run longer than 1 hour, call `kanban_heartbeat` at least once an hour** so humans and crash detection see liveness. Heartbeats are liveness only: progress-stale recovery uses durable evidenced progress receipts from real tool, file, or board activity. A run beyond `kanban.dispatch_stale_timeout_seconds` (default 4 h) with no recent progress receipt is reclaimed without ticking the failure counter.
 4. Complete with `kanban_complete(summary="...", metadata={...})`, or `kanban_block(reason="...")` if stuck.
 
 That final `kanban_complete` / `kanban_block` call is part of the worker
@@ -1031,6 +1039,56 @@ A "wake" forges a synthetic inbound message to the destination gateway agent so 
 
 `--chat-type` (`dm` | `group` | `channel` | `thread`) records the originating chat's type so a woken turn resolves the operator's **real** session: `build_session_key` keys groups, channels, and threads differently from DMs, so an inaccurate `chat_type` would route the wake into a separate, context-less session. The `/kanban` auto-subscribe and slash-command paths capture this automatically — you only set it by hand when subscribing a chat from a script or cron. Omit it to leave an existing subscription unchanged (new subscriptions default to `dm`).
 
+### Operations alerts for stalls and blockers
+
+Per-task subscriptions report a task's lifecycle to its originating chat. For
+an unattended fleet, the dispatcher-owning gateway can also publish a bounded
+operations feed to dedicated channels:
+
+- `automation_channel` receives a single opening alert when spawnable ready
+  work launches no workers for the configured health window, or when a running
+  task has no recent evidenced progress and is reclaimed. It receives one recovery when
+  work launches again. A stale worker reclaimed and respawned in the same tick
+  produces one combined auto-recovery notice.
+- `blockers_channel` receives `needs_input`, `capability`, and explicit
+  `dependency` blockers, plus one recovery when each clears. `transient` waits
+  stay off this channel because no human decision or tracked prerequisite is
+  involved.
+- Stable incidents are de-duplicated; rapid close/re-open flaps use the
+  cooldown. Multiple incidents in one tick are batched and truncated with a
+  `+N more` summary. Delivery failures remain pending but retry no faster than
+  `retry_seconds`. State is persisted across gateway restarts.
+
+```yaml
+kanban:
+  alerts:
+    enabled: true
+    platform: buzz
+    profile: ""                    # optional adapter-owning profile
+    automation_channel: "#alerts" # or a discovered Buzz channel UUID
+    blockers_channel: "#blockers"
+    health_window_ticks: 6
+    cooldown_seconds: 900
+    retry_seconds: 60
+    max_items_per_message: 10
+```
+
+Restart the gateway after changing these settings. Channel names are resolved
+through the gateway channel directory (or the selected profile adapter's live
+channel list) to real platform IDs; Hermes fails closed instead of guessing an
+unknown or ambiguous destination. A name must match exactly one visible
+channel; use a discovered channel ID when multiple workspaces or guilds expose
+the same name. The adapter must therefore have discovered the channel (for
+Buzz, join it and let the gateway connect). Automation and dependency alerts
+are never sent to a destination classified as a DM. Human-actionable
+`needs_input` and `capability` openings may use a DM; informational recovery
+notices remain channel-only.
+Dedicated `#alerts` and `#blockers` channels are recommended.
+
+Operations alerts run only in the gateway that owns the singleton Kanban
+dispatcher lock, so multi-profile deployments do not duplicate them. This is
+separate from profile-owned per-task subscription delivery described below.
+
 ### Multi-profile setups: delivery is profile-owned
 
 In a one-gateway-per-profile deployment (one dispatcher, separate gateway
@@ -1121,7 +1179,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `promoted` | — | `todo → ready` because all parents hit `done`. `run_id` is `NULL`. |
 | `claimed` | `{lock, expires, run_id}` | Dispatcher atomically claimed a `ready` task for spawn. |
 | `completed` | `{result_len, summary?}` | Worker wrote `--result` / `--summary` and task hit `done`. `summary` is the first-line handoff (400-char cap); full version lives on the run row. If `complete_task` is called on a never-claimed task with handoff fields, a zero-duration run is synthesized so `run_id` still points at something. |
-| `blocked` | `{reason, kind, recurrences}` | Worker or human flipped the task to `blocked`. `kind` is the typed block reason (`needs_input`, `capability`, `transient`, or `null` for a generic block); `recurrences` is the unblock-loop counter. Synthesizes a zero-duration run when called on a never-claimed task with `--reason`. |
+| `blocked` | `{reason, kind, recurrences}` | Worker or human flipped the task to `blocked`. `kind` is the typed block reason (`needs_input`, `capability`, `transient`, `authority`, `integrity`, or `null` for a generic block); `authority` and `integrity` are the only kinds accepted from an active review run. `recurrences` is the unblock-loop counter. Synthesizes a zero-duration run when called on a never-claimed task with `--reason`. |
 | `dependency_wait` | `{reason, kind}` | Worker blocked with `kind=dependency` — the task is only waiting on another task, so it routes to `todo` (parent-gated, auto-promoted) instead of `blocked`. No human needed. |
 | `block_loop_detected` | `{reason, kind, recurrences, limit}` | A task was unblocked and re-blocked for the same reason `BLOCK_RECURRENCE_LIMIT` times (default 2). Instead of landing in `blocked` again — where a cron would keep unblocking it — it routes to `triage` for a human decision, breaking the unblock↔re-block loop. |
 | `unblocked` | — | `blocked → ready` (or `todo` if parents are still open), either manually or via `/unblock`. Resets the dispatcher's `consecutive_failures` but deliberately preserves `block_recurrences` so the loop breaker keeps its memory. `run_id` is `NULL`. |
@@ -1145,7 +1203,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `reclaimed` | `{stale_lock}` | Claim TTL expired without a completion; task goes back to `ready`. |
 | `crashed` | `{pid, claimer}` | Worker PID no longer alive but TTL hadn't expired yet. |
 | `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | `max_runtime_seconds` exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. |
-| `stale` | `{elapsed_seconds, last_heartbeat_at, heartbeat_age_seconds, timeout_seconds, pid, terminated}` | Task ran longer than `kanban.dispatch_stale_timeout_seconds` (default 4 h) AND no `kanban_heartbeat` arrived in the last hour. Dispatcher SIGTERM'd the host-local worker (if any), reset the task to `ready` for re-dispatch. Does NOT tick the failure counter (stale is dispatcher-side absence detection, not a worker fault). Workers running long operations should call `kanban_heartbeat` at least once an hour to avoid this. |
+| `stale` | `{elapsed_seconds, last_heartbeat_at, last_progress_at, progress_age_seconds, progress_seq, timeout_seconds, pid, terminated}` | Task ran longer than `kanban.dispatch_stale_timeout_seconds` (default 4 h) and had no evidenced progress receipt within the bounded progress window. Dispatcher SIGTERM'd the host-local worker (if any) and reset the task to its source phase for re-dispatch. Heartbeats remain liveness telemetry and cannot reset progress staleness. This does not tick the failure counter. |
 | `reconciled` | `{reason, claim_lock, claim_expires, worker_pid}` | Orphaned-card reconciliation: the card was `running` with broken claim bookkeeping (`claim_lock` or `claim_expires` NULL — crash mid-claim, manual SQL, DB restore) and no live worker, so none of the TTL/crash/stale paths could ever recover it. The dispatcher requeued it to `ready` with an explanatory comment. Gated by `kanban.reconcile_orphans` in config.yaml (default `true`). |
 | `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |
 | `spawn_failed` | `{error, failures}` | One spawn attempt failed (missing PATH, workspace unmountable, …). Counter increments; task returns to `ready` for retry. |

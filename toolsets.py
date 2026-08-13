@@ -81,9 +81,10 @@ _HERMES_CORE_TOOLS = [
     # profile explicitly enables the kanban toolset. Gated via check_fn in
     # tools/kanban_tools.py.
     "kanban_show", "kanban_list",
+    "kanban_boards_list", "kanban_board_create", "kanban_board_archive",
     "kanban_complete", "kanban_block", "kanban_request_review",
     "kanban_request_changes",
-    "kanban_heartbeat",
+    "kanban_heartbeat", "kanban_progress",
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
@@ -106,6 +107,12 @@ _HERMES_WEBHOOK_SAFE_TOOLS = [
 # These can include individual tools or reference other toolsets
 TOOLSETS = {
     # Basic toolsets - individual tool categories
+    "no_tools": {
+        "description": "Explicitly expose no tools for stateless interpretation",
+        "tools": [],
+        "includes": [],
+    },
+
     "web": {
         "description": "Web research and content extraction tools",
         "tools": ["web_search", "web_extract"],
@@ -323,9 +330,11 @@ TOOLSETS = {
             "(for orchestrators) list, unblock, and fan out tasks."
         ),
         "tools": [
-            "kanban_show", "kanban_list", "kanban_complete", "kanban_block",
+            "kanban_show", "kanban_list",
+            "kanban_boards_list", "kanban_board_create", "kanban_board_archive",
+            "kanban_complete", "kanban_block",
             "kanban_request_review", "kanban_request_changes",
-            "kanban_heartbeat", "kanban_comment",
+            "kanban_heartbeat", "kanban_progress", "kanban_comment",
             "kanban_create", "kanban_link",
             "kanban_unblock",
             "kanban_attach", "kanban_attach_url", "kanban_attachments",
@@ -674,6 +683,15 @@ def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[st
             (they have no static counterpart).
     """
     toolset = TOOLSETS.get(name)
+
+    # Security posture toolset: unlike normal built-ins it must stay empty even
+    # if a plugin tries to register into the same namespace.
+    if name == "no_tools":
+        return {
+            **TOOLSETS["no_tools"],
+            "tools": [],
+            "includes": [],
+        }
 
     if not include_registry:
         # Static view only: return the built-in definition (copying the nested

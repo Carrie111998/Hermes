@@ -34,14 +34,23 @@ _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar(
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 
+KANBAN_ENV_PREFIX = "HERMES_KANBAN_"
+
+# Canonical dispatcher identity surface. Prefix scrubbing below remains the
+# fail-closed mechanism; this tuple also gives tests and non-prefix consumers a
+# stable invariant against the variables `_default_spawn` intentionally emits.
 KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK",
     "HERMES_KANBAN_RUN_ID",
-    "HERMES_KANBAN_WORKSPACE",
-    "HERMES_KANBAN_WORKSPACES_ROOT",
-    "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_BOARD",
     "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_HOME",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_KANBAN_WORKSPACE",
+    "HERMES_KANBAN_BRANCH",
+    "HERMES_KANBAN_CLAIM_LOCK",
+    "HERMES_KANBAN_GOAL_MODE",
+    "HERMES_KANBAN_GOAL_MAX_TURNS",
 )
 
 
@@ -131,10 +140,18 @@ def is_delegated_child_process_context() -> bool:
 
 
 def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[str, str]:
-    """Return *env* with dispatcher-only Kanban variables removed."""
-    cleaned = dict(env)
-    for key in KANBAN_ENV_KEYS:
-        cleaned.pop(key, None)
+    """Return *env* with every dispatcher-owned Kanban variable removed.
+
+    Prefix scrubbing is intentional: dispatcher identity has grown beyond the
+    original fixed list (branch and goal-loop fences are examples), and a new
+    ``HERMES_KANBAN_*`` key must fail closed without waiting for every child
+    launcher to learn its name.
+    """
+    cleaned = {
+        key: value
+        for key, value in env.items()
+        if not key.startswith(KANBAN_ENV_PREFIX)
+    }
     cleaned[DELEGATED_CHILD_ENV_MARKER] = "1"
     return cleaned
 

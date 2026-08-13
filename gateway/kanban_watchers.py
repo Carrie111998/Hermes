@@ -19,6 +19,11 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.i18n import t
+from gateway.kanban_alerts import (
+    collect_routed_blocker_incidents,
+    reconcile_stale_task_incidents,
+    record_dispatch_alerts,
+)
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
@@ -71,6 +76,25 @@ def _kanban_dispatch_allowed() -> bool:
     except ImportError:
         return True
     return not check_paused("kanban", logger)
+
+
+def _rotate_board_slugs(slugs: list[str], cursor: int) -> list[str]:
+    """Return a stable round-robin view without mutating the board list."""
+    if not slugs:
+        return []
+    offset = int(cursor) % len(slugs)
+    return [*slugs[offset:], *slugs[:offset]]
+
+
+def _external_profile_counts(
+    total: dict[str, int], current_board: dict[str, int],
+) -> dict[str, int]:
+    """Return running counts owned by boards other than the current one."""
+    return {
+        assignee: count - current_board.get(assignee, 0)
+        for assignee, count in total.items()
+        if count - current_board.get(assignee, 0) > 0
+    }
 
 
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
@@ -181,8 +205,7 @@ class GatewayKanbanWatchersMixin:
 
         For each subscription row, fetches ``task_events`` newer than the
         stored cursor with kind in the terminal set (``completed``,
-        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``,
-        ``review_requested``, ``block_loop_detected``). Sends one
+        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``). Sends one
         message per new event to ``(platform, chat_id, thread_id)``,
         then advances the cursor. The subscription is removed only when the
         task is ``archived``. A ``done`` task can be reopened for review or
@@ -217,7 +240,11 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        TERMINAL_KINDS = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+            "status", "archived", "unblocked", "block_loop_detected",
+            "review_requested",
+        )
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -324,13 +351,27 @@ class GatewayKanbanWatchersMixin:
                     # HERMES_KANBAN_DB pins the board path; without this guard
                     # one gateway could collect the same subscription/event
                     # more than once before advancing the cursor.
-                    try:
-                        boards = _kb.list_boards(include_archived=False)
-                    except Exception:
-                        boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+                    pinned_db = os.environ.get("HERMES_KANBAN_DB", "").strip()
+                    if pinned_db:
+                        # A dispatcher worker/gateway may be pinned directly to
+                        # one DB. Do not reinterpret that as an explicit
+                        # ``board=default`` override: explicit board selection
+                        # intentionally beats HERMES_KANBAN_DB, while this path
+                        # must poll the pinned DB and no other board.
+                        boards = [{
+                            "slug": _kb.get_current_board(),
+                            "db_path": pinned_db,
+                            "connect_board": None,
+                        }]
+                    else:
+                        try:
+                            boards = _kb.list_boards(include_archived=False)
+                        except Exception:
+                            boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
                     seen_db_paths: set[str] = set()
                     for board_meta in boards:
                         slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                        connect_board = board_meta.get("connect_board", slug)
                         db_path = board_meta.get("db_path")
                         try:
                             resolved_db_path = str(Path(db_path).expanduser().resolve()) if db_path else str(_kb.kanban_db_path(slug).resolve())
@@ -352,7 +393,7 @@ class GatewayKanbanWatchersMixin:
                         # this skip avoids.
                         try:
                             if _kb.count_notify_subs(
-                                board=slug,
+                                board=connect_board,
                                 notifier_profiles=notifier_profiles,
                                 include_unowned=include_unowned,
                             ) == 0:
@@ -368,7 +409,7 @@ class GatewayKanbanWatchersMixin:
                                 slug, exc,
                             )
                         try:
-                            conn = _kb.connect(board=slug)
+                            conn = _kb.connect(board=connect_board)
                         except Exception as exc:
                             logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
                             continue
@@ -581,21 +622,19 @@ class GatewayKanbanWatchersMixin:
                                 f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
                                 f"(max_runtime={limit}s); will retry"
                             )
+                        elif kind == "review_requested":
+                            summary = ""
+                            if ev.payload and ev.payload.get("summary"):
+                                summary = f"\n{str(ev.payload['summary'])[:200]}"
+                            msg = (
+                                f"🔎 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
+                                f" — {title}{summary}"
+                            )
                         elif kind == "status":
                             new_status = ""
                             if ev.payload and ev.payload.get("status"):
                                 new_status = str(ev.payload["status"])
                             msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
-                        elif kind == "review_requested":
-                            # Implementation complete; task moved to the
-                            # first-class review lane. Wake the origin thread.
-                            handoff = ""
-                            if ev.payload and ev.payload.get("summary"):
-                                handoff = f"\n{str(ev.payload['summary'])[:200]}"
-                            msg = (
-                                f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
-                                f" — {title}{handoff}"
-                            )
                         elif kind == "block_loop_detected":
                             # A task re-blocked for the same cause past the
                             # recurrence limit and was routed to `triage` for a
@@ -1254,6 +1293,54 @@ class GatewayKanbanWatchersMixin:
                 "on config control alone.", _lock_path,
             )
 
+        alert_notifier = None
+        alert_settings = None
+        try:
+            from gateway.channel_directory import (
+                load_directory,
+                lookup_channel_type,
+                resolve_channel_name,
+            )
+            from gateway.config import Platform as _AlertPlatform
+            from gateway.kanban_alerts import (
+                KanbanAlertNotifier,
+                KanbanAlertSettings,
+            )
+
+            alert_settings = KanbanAlertSettings.from_config(cfg)
+            if alert_settings.enabled:
+
+                def _alert_adapter(platform: str, profile: Optional[str]):
+                    try:
+                        resolved_platform = _AlertPlatform(platform)
+                    except ValueError:
+                        return None
+                    return getattr(self, "_authorization_adapter")(
+                        resolved_platform, profile
+                    )
+
+                def _alert_known_channels(platform: str) -> list[dict[str, Any]]:
+                    directory = load_directory()
+                    channels = directory.get("platforms", {}).get(platform)
+                    return list(channels) if isinstance(channels, list) else []
+
+                alert_notifier = KanbanAlertNotifier(
+                    alert_settings,
+                    state_path=_kb.kanban_home() / "kanban" / ".alerts-state.json",
+                    adapter_lookup=_alert_adapter,
+                    resolve_channel=resolve_channel_name,
+                    lookup_channel_type=lookup_channel_type,
+                    list_known_channels=_alert_known_channels,
+                )
+                logger.info(
+                    "kanban alerts enabled: platform=%s automation=%r blockers=%r",
+                    alert_settings.platform,
+                    alert_settings.automation_channel,
+                    alert_settings.blockers_channel,
+                )
+        except Exception:
+            logger.exception("kanban alerts: initialization failed; alerts disabled")
+
         try:
             interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
         except (ValueError, TypeError):
@@ -1381,7 +1468,9 @@ class GatewayKanbanWatchersMixin:
         # Health telemetry mirrored from `_cmd_daemon`: warn when ready
         # queue is non-empty but spawns are 0 for N consecutive ticks —
         # usually means broken PATH, missing venv, or credential loss.
-        HEALTH_WINDOW = 6
+        HEALTH_WINDOW = (
+            alert_settings.health_window_ticks if alert_settings is not None else 6
+        )
         bad_ticks = 0
         last_warn_at = 0
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
@@ -1416,7 +1505,12 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
-        def _tick_once_for_board(slug: str) -> "Optional[object]":
+        def _tick_once_for_board(
+            slug: str,
+            *,
+            spawn_budget: Optional[int] = None,
+            in_progress_by_profile: Optional[dict[str, int]] = None,
+        ) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
             Runs in a worker thread via `asyncio.to_thread`. `board=slug`
@@ -1457,15 +1551,29 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
+                effective_max_spawn = max_spawn
+                if spawn_budget is not None:
+                    board_running = int(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                        ).fetchone()[0]
+                    )
+                    admission_limit = board_running + max(0, int(spawn_budget))
+                    effective_max_spawn = (
+                        admission_limit
+                        if effective_max_spawn is None
+                        else min(int(effective_max_spawn), admission_limit)
+                    )
                 return _kb.dispatch_once(
                     conn,
                     board=slug,
-                    max_spawn=max_spawn,
+                    max_spawn=effective_max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    in_progress_by_profile=in_progress_by_profile,
                     reconcile_orphans=reconcile_orphans,
                 )
             except sqlite3.DatabaseError as exc:
@@ -1505,6 +1613,8 @@ class GatewayKanbanWatchersMixin:
                     except Exception:
                         pass
 
+        board_admission_cursor = 0
+
         def _tick_once() -> "list[tuple[str, Optional[object]]]":
             """Run one dispatch_once per board. Returns (slug, result) pairs.
 
@@ -1516,13 +1626,77 @@ class GatewayKanbanWatchersMixin:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            nonlocal board_admission_cursor
+            slugs = [b.get("slug") or _kb.DEFAULT_BOARD for b in boards]
+            slugs = _rotate_board_slugs(slugs, board_admission_cursor)
+            if slugs:
+                board_admission_cursor = (board_admission_cursor + 1) % len(slugs)
+
+            # max_spawn/max_in_progress are machine-wide admission caps, not
+            # per-board allowances. Reserve at most one opening per board per
+            # tick in rotating order so the first board on disk cannot consume
+            # every free worker slot forever.
+            global_limit = max_spawn
+            if max_in_progress is not None and (
+                global_limit is None or max_in_progress < global_limit
+            ):
+                global_limit = max_in_progress
+            total_running = 0
+            total_by_profile: dict[str, int] = {}
+            board_by_profile: dict[str, dict[str, int]] = {}
+            if global_limit is not None or max_in_progress_per_profile is not None:
+                for slug in slugs:
+                    conn = None
+                    try:
+                        conn = _kb.connect(board=slug)
+                        rows = conn.execute(
+                            "SELECT assignee, COUNT(*) AS n FROM tasks "
+                            "WHERE status = 'running' GROUP BY assignee"
+                        ).fetchall()
+                        current: dict[str, int] = {}
+                        for row in rows:
+                            count = int(row["n"])
+                            total_running += count
+                            assignee = row["assignee"]
+                            if assignee:
+                                current[assignee] = count
+                                total_by_profile[assignee] = (
+                                    total_by_profile.get(assignee, 0) + count
+                                )
+                        board_by_profile[slug] = current
+                    except Exception:
+                        continue
+                    finally:
+                        if conn is not None:
+                            conn.close()
+            remaining: Optional[int] = None
+            if global_limit is not None:
+                remaining = max(0, int(global_limit) - total_running)
+
             out: list[tuple[str, "Optional[object]"]] = []
-            for b in boards:
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
-                out.append((slug, _tick_once_for_board(slug)))
+            for slug in slugs:
+                budget = None if remaining is None else (1 if remaining > 0 else 0)
+                result = _tick_once_for_board(
+                    slug,
+                    spawn_budget=budget,
+                    in_progress_by_profile=_external_profile_counts(
+                        total_by_profile, board_by_profile.get(slug, {})
+                    ),
+                )
+                out.append((slug, result))
+                if remaining is not None and result is not None:
+                    spawned_now = len(getattr(result, "spawned", None) or [])
+                    remaining = max(0, remaining - spawned_now)
+                if result is not None:
+                    for _task_id, assignee, _workspace in (
+                        getattr(result, "spawned", None) or []
+                    ):
+                        total_by_profile[assignee] = (
+                            total_by_profile.get(assignee, 0) + 1
+                        )
             return out
 
-        def _ready_nonempty() -> bool:
+        def _ready_nonempty() -> Optional[bool]:
             """Cheap probe: is there at least one ready+assigned+unclaimed
             task on ANY board whose assignee maps to a real Hermes profile
             (i.e. one the dispatcher would actually spawn for)?
@@ -1533,18 +1707,16 @@ class GatewayKanbanWatchersMixin:
             of those is "correctly idle", not "stuck". Filtering them out
             here keeps the stuck-warn fire only on real failures (broken
             PATH, missing venv, credential loss for a real Hermes profile).
+            A failed board probe returns ``None`` rather than reporting a
+            healthy empty queue.
             """
-            # Only probe the review column when autonomous review dispatch is
-            # actually on. With ``review_dispatch`` off (the default — no
-            # sdlc-review agent), a task parked in 'review' is "correctly idle"
-            # waiting for a human, not a stuck dispatcher; probing it here would
-            # fire a false "dispatcher stuck" warning that never clears. Shares
-            # the exact gate the dispatcher uses so the two can't drift.
-            _review_probe = _kb.review_dispatch_enabled()
+            enumeration_failed = False
             try:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
+                enumeration_failed = True
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            probe_failed = enumeration_failed
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 conn = None
@@ -1552,9 +1724,10 @@ class GatewayKanbanWatchersMixin:
                     conn = _kb.connect(board=slug)
                     if _kb.has_spawnable_ready(conn):
                         return True
-                    if _review_probe and _kb.has_spawnable_review(conn):
+                    if _kb.has_spawnable_review(conn):
                         return True
                 except Exception:
+                    probe_failed = True
                     continue
                 finally:
                     if conn is not None:
@@ -1562,7 +1735,7 @@ class GatewayKanbanWatchersMixin:
                             conn.close()
                         except Exception:
                             pass
-            return False
+            return None if probe_failed else False
 
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
@@ -1681,7 +1854,12 @@ class GatewayKanbanWatchersMixin:
                 # Global emergency stop (`hermes pause`): skip auto-decompose
                 # and dispatch entirely — no new workers while paused. Running
                 # workers finish naturally; zombie reaping above still runs.
-                if not _kanban_dispatch_allowed():
+                results = []
+                any_spawned = False
+                capacity_deferred = False
+                ready_probe: Optional[bool] = None
+                dispatch_allowed = _kanban_dispatch_allowed()
+                if not dispatch_allowed:
                     ready_pending = False
                     bad_ticks = 0
                 else:
@@ -1692,8 +1870,13 @@ class GatewayKanbanWatchersMixin:
                     if _ad_enabled:
                         await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
                     results = await asyncio.to_thread(_tick_once)
-                    any_spawned = False
                     for slug, res in (results or []):
+                        if res is not None and (
+                            getattr(res, "skipped_locked", False)
+                            or getattr(res, "skipped_global_capped", False)
+                            or bool(getattr(res, "skipped_per_profile_capped", None))
+                        ):
+                            capacity_deferred = True
                         if res is not None and getattr(res, "spawned", None):
                             any_spawned = True
                             # Quiet by default — only log when something actually
@@ -1710,12 +1893,13 @@ class GatewayKanbanWatchersMixin:
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                             )
                     # Health telemetry (aggregate across boards)
-                    ready_pending = await asyncio.to_thread(_ready_nonempty)
-                    if ready_pending and not any_spawned:
+                    ready_probe = await asyncio.to_thread(_ready_nonempty)
+                    ready_pending = ready_probe is True
+                    if ready_pending and not any_spawned and not capacity_deferred:
                         bad_ticks += 1
-                    else:
+                    elif any_spawned or capacity_deferred or ready_probe is False:
                         bad_ticks = 0
-                if bad_ticks >= HEALTH_WINDOW:
+                if ready_pending and bad_ticks >= HEALTH_WINDOW:
                     now = int(time.time())
                     if now - last_warn_at >= 300:
                         logger.warning(
@@ -1726,6 +1910,64 @@ class GatewayKanbanWatchersMixin:
                             bad_ticks,
                         )
                         last_warn_at = now
+
+                if alert_notifier is not None:
+                    try:
+                        board_listing_authoritative = True
+                        try:
+                            board_meta = await asyncio.to_thread(
+                                _kb.list_boards, include_archived=False
+                            )
+                        except Exception:
+                            board_listing_authoritative = False
+                            board_meta = [
+                                await asyncio.to_thread(
+                                    _kb.read_board_metadata, _kb.DEFAULT_BOARD
+                                )
+                            ]
+                        alert_boards = [
+                            board.get("slug") or _kb.DEFAULT_BOARD
+                            for board in board_meta
+                        ]
+                        if board_listing_authoritative:
+                            alert_notifier.retire_missing_scopes(
+                                "blockers:",
+                                {f"blockers:{board}" for board in alert_boards},
+                            )
+                        failed_boards: set[str] = set()
+                        blockers = await asyncio.to_thread(
+                            collect_routed_blocker_incidents,
+                            _kb,
+                            boards=alert_boards,
+                            failed_boards=failed_boards,
+                        )
+                        for board in alert_boards:
+                            if board in failed_boards:
+                                continue
+                            alert_notifier.sync_scope(
+                                f"blockers:{board}",
+                                [incident for incident in blockers if incident.board == board],
+                            )
+                        if dispatch_allowed:
+                            record_dispatch_alerts(
+                                alert_notifier,
+                                results,
+                                ready_stalled=bad_ticks >= HEALTH_WINDOW,
+                                ready_healthy=(
+                                    ready_probe is False
+                                    or any_spawned
+                                    or capacity_deferred
+                                ),
+                                health_window=HEALTH_WINDOW,
+                            )
+                            await asyncio.to_thread(
+                                reconcile_stale_task_incidents,
+                                alert_notifier,
+                                _kb,
+                            )
+                        await alert_notifier.flush()
+                    except Exception:
+                        logger.exception("kanban alerts: tick failed")
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 self._release_kanban_dispatcher_lock()

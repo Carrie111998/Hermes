@@ -429,6 +429,35 @@ class TestBuzzAdapterLifecycle:
 
 
     @pytest.mark.asyncio
+    async def test_list_channels_exposes_names_and_dm_types_for_directory(self):
+        adapter = _make_adapter()
+        adapter._channel_names = {CHANNEL: "alerts", DM_CHANNEL: "DM"}
+        adapter._channel_meta = {
+            CHANNEL: {
+                "channel_id": CHANNEL,
+                "name": "alerts",
+                "description": "Operations alerts",
+            },
+            DM_CHANNEL: {
+                "channel_id": DM_CHANNEL,
+                "name": "DM",
+                "description": "",
+            },
+        }
+        adapter._channel_state = {
+            CHANNEL: {"chat_type": "group", "last_ts": 0, "seen": {}},
+            DM_CHANNEL: {"chat_type": "dm", "last_ts": 0, "seen": {}},
+        }
+
+        channels = await adapter.list_channels()
+
+        assert channels == [
+            {"id": DM_CHANNEL, "name": "DM", "type": "dm"},
+            {"id": CHANNEL, "name": "alerts", "type": "channel"},
+        ]
+
+
+    @pytest.mark.asyncio
     async def test_disconnect_releases_scoped_lock(self, monkeypatch):
         """The identity lock taken in connect() must be released on disconnect."""
         import gateway.status as gateway_status
@@ -536,5 +565,3 @@ class TestStandaloneSend:
         assert captured["input_text"] == "cron says hi"
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
-
-

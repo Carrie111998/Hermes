@@ -56,6 +56,40 @@ def kanban_home(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_idempotency_key_is_board_local_and_replay_order_independent(
+    kanban_home,
+):
+    key = "intake:shared-source:github:42"
+    kb.create_board("other")
+
+    with kb.connect() as default_conn:
+        original = kb.create_task(
+            default_conn, title="first arrival", idempotency_key=key
+        )
+        replay_titles = [f"reordered replay {index}" for index in reversed(range(100))]
+        assert {
+            kb.create_task(default_conn, title=title, idempotency_key=key)
+            for title in replay_titles
+        } == {original}
+
+    with kb.connect(board="other") as other_conn:
+        other = kb.create_task(
+            other_conn, title="same source on another board", idempotency_key=key
+        )
+        assert other != original
+        assert kb.create_task(other_conn, title="replay", idempotency_key=key) == other
+
+
+def test_task_id_collision_retries_without_masking_idempotency_conflict(
+    kanban_home, monkeypatch
+):
+    generated = iter(["t_collision", "t_collision", "t_fresh"])
+    monkeypatch.setattr(kb, "_new_task_id", lambda: next(generated))
+    with kb.connect() as conn:
+        assert kb.create_task(conn, title="existing") == "t_collision"
+        assert kb.create_task(conn, title="new") == "t_fresh"
+
+
 
 # ---------------------------------------------------------------------------
 # Spawn-failure circuit breaker
@@ -432,6 +466,88 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
         assert kb.get_task(conn, tid).status == "blocked"
     finally:
         conn.close()
+
+
+def test_progress_receipts_are_distinct_from_liveness_and_run_fenced(kanban_home):
+    """Heartbeat-only activity cannot masquerade as durable work progress."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="separate progress evidence")
+        first = kb.claim_task(conn, tid)
+        assert first is not None
+
+        assert kb.heartbeat_worker(
+            conn, tid, note="still alive", expected_run_id=first.current_run_id
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.last_heartbeat_at is not None
+        assert task.last_progress_at is None
+        assert task.progress_seq == 0
+
+        receipt = kb.record_progress(
+            conn,
+            tid,
+            evidence="focused regression test is now red",
+            expected_run_id=first.current_run_id,
+        )
+        assert receipt == 1
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.last_progress_at is not None
+        assert task.progress_seq == 1
+
+        assert kb.reclaim_task(conn, tid, reason="retry")
+        second = kb.claim_task(conn, tid)
+        assert second is not None
+        assert second.current_run_id != first.current_run_id
+        assert kb.record_progress(
+            conn,
+            tid,
+            evidence="late receipt from old run",
+            expected_run_id=first.current_run_id,
+        ) is None
+        current = kb.get_task(conn, tid)
+        assert current is not None
+        assert current.last_progress_at is None
+        assert current.progress_seq == 0
+
+
+def test_stale_recovery_uses_progress_not_heartbeat(kanban_home, monkeypatch):
+    """Recent liveness alone cannot indefinitely suppress bounded recovery."""
+    now = 10_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        no_progress = kb.create_task(conn, title="heartbeats only")
+        claimed = kb.claim_task(conn, no_progress)
+        assert claimed is not None
+        recent_progress = kb.create_task(conn, title="progress without heartbeat")
+        progress_claim = kb.claim_task(conn, recent_progress)
+        assert progress_claim is not None
+
+        with kb.write_txn(conn):
+            for task_id in (no_progress, recent_progress):
+                conn.execute(
+                    "UPDATE tasks SET started_at = ?, last_heartbeat_at = ? WHERE id = ?",
+                    (now - 8_000, now, task_id),
+                )
+                conn.execute(
+                    "UPDATE task_runs SET started_at = ?, last_heartbeat_at = ? "
+                    "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                    (now - 8_000, now, task_id),
+                )
+        assert kb.record_progress(
+            conn,
+            recent_progress,
+            evidence="artifact checksum changed",
+            expected_run_id=progress_claim.current_run_id,
+        ) == 1
+
+        reclaimed = kb.detect_stale_running(
+            conn, stale_timeout_seconds=7_200, signal_fn=lambda *_args: None
+        )
+        assert reclaimed == [no_progress]
+        assert kb.get_task(conn, no_progress).status == "ready"
+        assert kb.get_task(conn, recent_progress).status == "running"
 
 
 
@@ -1406,5 +1522,3 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
-

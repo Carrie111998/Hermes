@@ -2444,6 +2444,28 @@ DEFAULT_CONFIG = {
         # so stale rows don't accumulate and get scanned on every notifier
         # tick forever. Set 0 to disable the sweep.
         "done_sub_retention_days": 30,
+        # Optional operations alerts, delivered directly to grounded channel
+        # identifiers by the dispatch-owning gateway. This is independent of
+        # per-task subscriptions: automation incidents route to the alerts
+        # channel, while needs_input/capability/dependency blockers route to the
+        # blockers channel. Disabled until explicitly configured.
+        "alerts": {
+            "enabled": False,
+            "platform": "buzz",
+            "profile": "",
+            "automation_channel": "",
+            "blockers_channel": "",
+            # A stable incident alerts once and recovers once. This cooldown
+            # suppresses rapid close/re-open flapping for the same incident key.
+            "cooldown_seconds": 900,
+            # Failed sends remain pending but cannot retry more often than this.
+            "retry_seconds": 60,
+            # Ready-but-unspawned ticks before the dispatcher is considered stuck.
+            "health_window_ticks": 6,
+            # New/recovered incidents are batched; only this many details are
+            # rendered before a bounded "+N more" summary.
+            "max_items_per_message": 10,
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

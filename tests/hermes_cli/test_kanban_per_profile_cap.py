@@ -98,3 +98,20 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
     assert res2.spawned[0][0] != spawned_id  # different task this time
 
 
+def test_external_board_running_counts_apply_to_profile_cap(
+    isolated_kanban_home_with_profiles,
+):
+    """The gateway's cross-board count must consume this board's profile cap."""
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="second board", assignee="alpha")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            max_in_progress_per_profile=1,
+            in_progress_by_profile={"alpha": 1},
+        )
+
+    assert result.spawned == []
+    assert result.skipped_per_profile_capped == [(task_id, "alpha", 1)]

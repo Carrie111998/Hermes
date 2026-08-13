@@ -35,6 +35,13 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for profile in ("worker", "reviewer"):
+        skill_dir = home / "profiles" / profile / "skills" / "sdlc-review"
+        skill_dir.mkdir(parents=True)
+        skill_dir.joinpath("SKILL.md").write_text(
+            "---\nname: sdlc-review\ndescription: review\nplatforms: [linux]\n---\n",
+            encoding="utf-8",
+        )
     kb.init_db()
     return home
 
@@ -663,6 +670,59 @@ def test_review_cycle_end_to_end(kanban_home: Path) -> None:
         assert row["status"] == "done"
         assert (row["block_recurrences"] or 0) == 0
         assert _events(conn, tid, kind="block_loop_detected") == []
+
+
+def test_routine_findings_atomically_return_to_implementer_then_same_reviewer(
+    kanban_home: Path,
+) -> None:
+    """The canonical unattended remediation loop needs no operator poll."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="continuity", assignee="implementer")
+        implementation = kb.claim_task(conn, task_id, claimer="implementer:one")
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="candidate one",
+            reviewer="verifier",
+            expected_run_id=implementation.current_run_id,
+        )
+
+        review = kb.claim_review_task(conn, task_id, claimer="verifier:one")
+        assert review is not None
+        finding = "Use evidenced progress instead of heartbeat age."
+        assert kb.request_changes(
+            conn,
+            task_id,
+            reason=finding,
+            expected_run_id=review.current_run_id,
+        ) == (True, "implementer")
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.get_task(conn, task_id).assignee == "implementer"
+
+        duplicate = kb.request_changes(
+            conn,
+            task_id,
+            reason=finding,
+            expected_run_id=review.current_run_id,
+        )
+        assert duplicate == (False, "task is not in an active review run")
+        assert len(_events(conn, task_id, kind="changes_requested")) == 1
+        assert _events(conn, task_id, kind="blocked") == []
+
+        remediation = kb.claim_task(conn, task_id, claimer="implementer:two")
+        assert remediation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="candidate two fixes the finding",
+            expected_run_id=remediation.current_run_id,
+        )
+        task = kb.get_task(conn, task_id)
+        assert task.status == "review"
+        assert task.assignee == "verifier"
+        assert len(_events(conn, task_id, kind="review_requested")) == 2
+        assert _events(conn, task_id, kind="block_loop_detected") == []
 
 
 # ---------------------------------------------------------------------------

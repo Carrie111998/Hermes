@@ -9,8 +9,9 @@ import logging
 import os
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from hermes_constants import get_config_path, get_skills_dir, is_termux
 
@@ -48,6 +49,17 @@ EXCLUDED_SKILL_DIRS = frozenset(
 # be scanned for active SKILL.md/DESCRIPTION.md entries, even if a Curator or
 # archive workflow preserves a complete old skill package under references/.
 SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
+
+
+@dataclass(frozen=True)
+class PinnedSkillPreflight:
+    """Filesystem-only availability verdict for one explicitly pinned skill."""
+
+    identifier: str
+    status: str
+    resolved_name: Optional[str] = None
+    path: Optional[Path] = None
+    reason: Optional[str] = None
 
 # ── Org-shared skills (sync contract) ───────────────────────────
 # Org mirrors live under ~/.hermes/skills/_org/<org_id>/. Resolution is
@@ -932,3 +944,126 @@ def is_valid_namespace(candidate: Optional[str]) -> bool:
     if not candidate:
         return False
     return bool(_NAMESPACE_RE.match(candidate))
+
+
+def preflight_pinned_skills(
+    profile_home: Path,
+    identifiers: Iterable[str],
+    *,
+    platform: Optional[str] = "cli",
+) -> List[PinnedSkillPreflight]:
+    """Resolve task-pinned skills without installs, network, or global env changes.
+
+    The dispatcher runs in the default profile but launches workers in the
+    assignee's profile.  Skill resolution therefore takes an explicit profile
+    home instead of consulting the dispatcher's ``HERMES_HOME``.  Local roots
+    take precedence only when a name is unique; collisions fail closed, matching
+    ``skill_view`` rather than silently loading a different package.
+    """
+    profile_home = Path(profile_home)
+    config_path = profile_home / "config.yaml"
+    try:
+        parsed = yaml_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+    except Exception as exc:
+        return [
+            PinnedSkillPreflight(
+                identifier=str(identifier),
+                status="unreadable",
+                reason=f"profile skill config is unreadable: {exc}",
+            )
+            for identifier in identifiers
+        ]
+    if not isinstance(parsed, dict):
+        parsed = {}
+    raw_skills_cfg = parsed.get("skills")
+    skills_cfg: Dict[str, Any] = raw_skills_cfg if isinstance(raw_skills_cfg, dict) else {}
+    disabled = _normalize_string_set(skills_cfg.get("disabled"))
+    platform_disabled = skills_cfg.get("platform_disabled") or {}
+    if platform and isinstance(platform_disabled, dict):
+        disabled |= _normalize_string_set(platform_disabled.get(platform))
+
+    roots = [profile_home / "skills"]
+    raw_external = skills_cfg.get("external_dirs")
+    if isinstance(raw_external, str):
+        raw_external = [raw_external]
+    if isinstance(raw_external, list):
+        for entry in raw_external:
+            expanded = Path(os.path.expanduser(os.path.expandvars(str(entry))))
+            root = expanded if expanded.is_absolute() else profile_home / expanded
+            try:
+                root = root.resolve()
+            except OSError:
+                continue
+            if root.is_dir() and root not in roots:
+                roots.append(root)
+
+    indexed: List[Tuple[Path, Dict[str, Any]]] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for skill_md in iter_skill_index_files(root, "SKILL.md"):
+            try:
+                frontmatter, _ = parse_frontmatter(
+                    skill_md.read_text(encoding="utf-8-sig", errors="replace")[:4000]
+                )
+            except OSError:
+                continue
+            indexed.append((skill_md, frontmatter))
+
+    verdicts: List[PinnedSkillPreflight] = []
+    for raw_identifier in identifiers:
+        identifier = str(raw_identifier).strip()
+        if not identifier or Path(identifier).is_absolute() or ".." in Path(identifier).parts:
+            verdicts.append(
+                PinnedSkillPreflight(identifier, "invalid", reason="invalid skill identifier")
+            )
+            continue
+        category_path = identifier.replace(":", "/", 1) if ":" in identifier else identifier
+        candidates: List[Tuple[Path, Dict[str, Any]]] = []
+        for skill_md, frontmatter in indexed:
+            skill_dir = skill_md.parent
+            declared = str(frontmatter.get("name") or skill_dir.name)
+            relative_matches = False
+            for root in roots:
+                try:
+                    relative = skill_dir.relative_to(root).as_posix()
+                except ValueError:
+                    continue
+                relative_matches = relative in {identifier, category_path}
+                if relative_matches:
+                    break
+            if declared == identifier or skill_dir.name == identifier or relative_matches:
+                candidates.append((skill_md, frontmatter))
+        if not candidates:
+            verdicts.append(
+                PinnedSkillPreflight(identifier, "missing", reason="skill is not installed")
+            )
+            continue
+        unique = {path.resolve(): (path, fm) for path, fm in candidates}
+        if len(unique) != 1:
+            verdicts.append(
+                PinnedSkillPreflight(identifier, "ambiguous", reason="skill name resolves to multiple packages")
+            )
+            continue
+        skill_md, frontmatter = next(iter(unique.values()))
+        resolved_name = str(frontmatter.get("name") or skill_md.parent.name)
+        disabled_keys = {identifier, resolved_name, category_path.replace("/", ":", 1)}
+        if disabled_keys & disabled:
+            verdicts.append(
+                PinnedSkillPreflight(
+                    identifier, "disabled", resolved_name, skill_md,
+                    "skill is disabled in the assignee profile",
+                )
+            )
+        elif not skill_matches_platform(frontmatter):
+            verdicts.append(
+                PinnedSkillPreflight(
+                    identifier, "unsupported_platform", resolved_name, skill_md,
+                    "skill is not supported on this host platform",
+                )
+            )
+        else:
+            verdicts.append(
+                PinnedSkillPreflight(identifier, "available", resolved_name, skill_md)
+            )
+    return verdicts

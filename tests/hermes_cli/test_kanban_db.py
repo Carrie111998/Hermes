@@ -171,6 +171,174 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_concurrent_idempotent_create_returns_one_task(kanban_home):
+    key = "intake:default:webhook:event-100"
+
+    def create(index: int) -> str:
+        with kb.connect() as conn:
+            return kb.create_task(
+                conn,
+                title=f"delivery replay {index}",
+                assignee="executor",
+                idempotency_key=key,
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
+        task_ids = list(pool.map(create, range(100)))
+
+    assert len(set(task_ids)) == 1
+    with kb.connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ?", (key,)
+        ).fetchall()
+        assert [row["id"] for row in rows] == [task_ids[0]]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'created'",
+            (task_ids[0],),
+        ).fetchone()[0] == 1
+
+
+def test_replay_after_done_and_archive_returns_original_task(kanban_home):
+    key = "intake:default:github:delivery-55"
+    with kb.connect() as conn:
+        original = kb.create_task(conn, title="original", idempotency_key=key)
+        assert kb.complete_task(conn, original, result="delivered")
+        assert kb.create_task(conn, title="late done replay", idempotency_key=key) == original
+        assert kb.archive_task(conn, original)
+        assert kb.create_task(conn, title="late archived replay", idempotency_key=key) == original
+        archived = kb.get_task(conn, original)
+        assert archived is not None
+        assert archived.status == "archived"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?", (key,)
+        ).fetchone()[0] == 1
+
+
+def test_archived_keyed_task_cannot_be_purged(kanban_home):
+    key = "intake:default:github:delivery-preserved"
+    with kb.connect() as conn:
+        original = kb.create_task(conn, title="original", idempotency_key=key)
+        assert kb.archive_task(conn, original)
+        assert not kb.delete_archived_task(conn, original)
+        assert kb.get_task(conn, original) is not None
+        assert kb.create_task(conn, title="very late replay", idempotency_key=key) == original
+        assert conn.execute(
+            "SELECT task_id FROM idempotency_keys WHERE key = ?", (key,)
+        ).fetchone()["task_id"] == original
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?", (key,)
+        ).fetchone()[0] == 1
+
+
+def test_legacy_whitespace_key_replay_preserves_exact_key(kanban_home):
+    raw_key = " intake:default:legacy:spaced-event "
+    with kb.connect() as conn:
+        original = kb.create_task(conn, title="legacy", idempotency_key="seed")
+        conn.execute(
+            "UPDATE tasks SET idempotency_key = ? WHERE id = ?", (raw_key, original)
+        )
+        conn.execute(
+            "UPDATE idempotency_keys SET key = ? WHERE task_id = ?", (raw_key, original)
+        )
+        assert kb.create_task(conn, title="replay", idempotency_key=raw_key) == original
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key IN (?, ?)",
+            (raw_key, raw_key.strip()),
+        ).fetchone()[0] == 1
+
+
+def test_keyed_task_cannot_be_hard_deleted(kanban_home):
+    key = "intake:default:github:delivery-hard-delete"
+    with kb.connect() as conn:
+        original = kb.create_task(conn, title="original", idempotency_key=key)
+        assert not kb.delete_task(conn, original)
+        assert kb.create_task(conn, title="replay", idempotency_key=key) == original
+        assert kb.get_task(conn, original) is not None
+
+
+def test_duplicate_key_migration_requires_explicit_canonical_and_is_idempotent(
+    kanban_home,
+):
+    db_path = kb.kanban_db_path()
+    key = "intake:default:legacy:event-9"
+    with kb.connect() as conn:
+        conn.execute("DROP INDEX idx_tasks_idempotency_unique")
+        first = kb.create_task(conn, title="first")
+        second = kb.create_task(conn, title="second")
+        conn.execute(
+            "UPDATE tasks SET idempotency_key = ? WHERE id IN (?, ?)",
+            (key, first, second),
+        )
+
+    with pytest.raises(kb.DuplicateIdempotencyKeyError) as exc_info:
+        kb.reconcile_duplicate_idempotency_keys(db_path, {})
+    assert set(exc_info.value.duplicates) == {key}
+    assert set(exc_info.value.duplicates[key]) == {first, second}
+
+    result = kb.reconcile_duplicate_idempotency_keys(
+        db_path, {key: first}
+    )
+    assert result == {key: {"canonical_task_id": first, "aliased_task_ids": [second]}}
+
+    # An interrupted/retried operator run sees no duplicates and makes no
+    # further changes. The durable audit row preserves the source key because
+    # the task's rewritten alias is intentionally opaque and collision-safe.
+    assert kb.reconcile_duplicate_idempotency_keys(db_path, {key: first}) == {}
+    with kb.connect() as conn:
+        rows = conn.execute(
+            "SELECT id, idempotency_key FROM tasks WHERE id IN (?, ?) ORDER BY id",
+            (first, second),
+        ).fetchall()
+        keys_by_task = {row["id"]: row["idempotency_key"] for row in rows}
+        assert keys_by_task[first] == key
+        assert keys_by_task[second].startswith("legacy:")
+        audit = conn.execute(
+            "SELECT original_key, canonical_task_id, aliased_task_id, legacy_alias "
+            "FROM idempotency_key_migrations"
+        ).fetchone()
+        assert dict(audit) == {
+            "original_key": key,
+            "canonical_task_id": first,
+            "aliased_task_id": second,
+            "legacy_alias": keys_by_task[second],
+        }
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE tasks SET idempotency_key = ? WHERE id = ?", (key, second)
+            )
+
+
+def test_duplicate_migration_alias_never_claims_an_existing_source_key(kanban_home):
+    db_path = kb.kanban_db_path()
+    duplicate_key = "intake:default:legacy:alias-collision"
+    with kb.connect() as conn:
+        conn.execute("DROP INDEX idx_tasks_idempotency_unique")
+        canonical = kb.create_task(conn, title="canonical")
+        duplicate = kb.create_task(conn, title="duplicate")
+        colliding_alias = kb._legacy_idempotency_alias(duplicate_key, duplicate)
+        owner = kb.create_task(
+            conn, title="legitimate alias owner", idempotency_key=colliding_alias
+        )
+        conn.execute(
+            "UPDATE tasks SET idempotency_key = ? WHERE id IN (?, ?)",
+            (duplicate_key, canonical, duplicate),
+        )
+
+    result = kb.reconcile_duplicate_idempotency_keys(
+        db_path, {duplicate_key: canonical}
+    )
+    assert result[duplicate_key]["aliased_task_ids"] == [duplicate]
+    with kb.connect() as conn:
+        alias = conn.execute(
+            "SELECT legacy_alias FROM idempotency_key_migrations "
+            "WHERE original_key = ? AND aliased_task_id = ?",
+            (duplicate_key, duplicate),
+        ).fetchone()["legacy_alias"]
+        assert alias != colliding_alias
+        assert kb.create_task(conn, title="owner replay", idempotency_key=colliding_alias) == owner
+        assert kb.create_task(conn, title="source replay", idempotency_key=duplicate_key) == canonical
+
+
 
 # ---------------------------------------------------------------------------
 # Links + dependency resolution
@@ -242,6 +410,181 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
         assert payload["last_heartbeat_at"] == hb_at
         assert payload["worker_pid"] == 12345
         assert payload["host_local"] is True
+
+
+def test_expired_claim_with_fresh_progress_and_stale_heartbeat_is_extended(
+    kanban_home, monkeypatch,
+):
+    """Fresh evidenced progress protects a live run after its lease expires."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="fresh progress", assignee="worker")
+        host = kb._claimer_id().split(":", 1)[0]
+        claimed = kb.claim_task(conn, task_id, claimer=f"{host}:fixture")
+        assert claimed is not None
+        kb._set_worker_pid(conn, task_id, 424242)
+        now = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? WHERE id = ?",
+            (
+                now - 1,
+                now - kb.DEFAULT_CLAIM_PROGRESS_MAX_STALE_SECONDS - 1,
+                task_id,
+            ),
+        )
+        assert kb.record_progress(
+            conn,
+            task_id,
+            evidence="fixture wrote a verified output chunk",
+            expected_run_id=claimed.current_run_id,
+        ) == 1
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+
+        assert kb.release_stale_claims(conn) == 0
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.claim_expires is not None and task.claim_expires > now
+        events = kb.list_events(conn, task_id)
+        assert not any(event.kind == "reclaimed" for event in events)
+        extended = [event for event in events if event.kind == "claim_extended"]
+        assert len(extended) == 1
+        assert extended[0].payload["reason"] == "evidenced_progress_fresh"
+        assert extended[0].payload["last_progress_at"] == task.last_progress_at
+        assert extended[0].payload["progress_stale"] is False
+
+
+def test_expired_foreign_claim_with_fresh_progress_is_extended_without_pid(
+    kanban_home, monkeypatch,
+):
+    """Durable progress protects remote workers whose PID is not observable."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="remote progress", assignee="worker")
+        claimed = kb.claim_task(conn, task_id, claimer="remote-host:fixture")
+        assert claimed is not None
+        now = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, worker_pid = NULL WHERE id = ?",
+            (now - 1, task_id),
+        )
+        assert kb.record_progress(
+            conn,
+            task_id,
+            evidence="remote fixture persisted a verified output",
+            expected_run_id=claimed.current_run_id,
+        ) == 1
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+        assert kb.release_stale_claims(conn) == 0
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.claim_expires is not None and task.claim_expires > now
+        extended = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "claim_extended"
+        ]
+        assert len(extended) == 1
+        assert extended[0].payload["reason"] == "evidenced_progress_fresh"
+        assert extended[0].payload["host_local"] is False
+
+
+def test_expired_claim_with_real_live_pid_and_fresh_progress_keeps_one_run(
+    kanban_home,
+):
+    """An expired lease must not signal or duplicate a real progressing worker."""
+    import subprocess
+
+    worker = subprocess.Popen(["sleep", "30"])
+    try:
+        with kb.connect() as conn:
+            task_id = kb.create_task(conn, title="real live worker", assignee="worker")
+            host = kb._claimer_id().split(":", 1)[0]
+            claimed = kb.claim_task(conn, task_id, claimer=f"{host}:real-pid")
+            assert claimed is not None
+            kb._set_worker_pid(conn, task_id, worker.pid)
+            now = int(time.time())
+            conn.execute(
+                "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? WHERE id = ?",
+                (now - 1, now - 7200, task_id),
+            )
+            assert kb.record_progress(
+                conn,
+                task_id,
+                evidence="real worker produced a verified fixture result",
+                expected_run_id=claimed.current_run_id,
+            ) == 1
+            signals = []
+
+            assert kb.release_stale_claims(
+                conn, signal_fn=lambda pid, sig: signals.append((pid, sig))
+            ) == 0
+            assert signals == []
+            assert worker.poll() is None
+            task = kb.get_task(conn, task_id)
+            assert task is not None and task.status == "running"
+            assert kb.claim_task(conn, task_id, claimer=f"{host}:duplicate") is None
+            active_runs = conn.execute(
+                "SELECT COUNT(*) FROM task_runs WHERE task_id = ? AND ended_at IS NULL",
+                (task_id,),
+            ).fetchone()[0]
+            assert active_runs == 1
+    finally:
+        worker.terminate()
+        worker.wait(timeout=5)
+
+
+def test_fresh_run_fenced_heartbeat_defers_transient_false_crash(
+    kanban_home, monkeypatch,
+):
+    """A fresh liveness receipt must survive one contradictory PID probe."""
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="transient pid miss", assignee="worker")
+        host = kb._claimer_id().split(":", 1)[0]
+        claimed = kb.claim_task(conn, task_id, claimer=f"{host}:fixture")
+        assert claimed is not None
+        kb._set_worker_pid(conn, task_id, 434343)
+        conn.execute(
+            "UPDATE tasks SET started_at = started_at - 3600 WHERE id = ?",
+            (task_id,),
+        )
+        assert kb.heartbeat_worker(
+            conn,
+            task_id,
+            note="active immediately before the liveness probe",
+            expected_run_id=claimed.current_run_id,
+        )
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+        assert kb.detect_crashed_workers(conn) == []
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "running"
+        assert not any(event.kind == "crashed" for event in kb.list_events(conn, task_id))
+        active_runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ? AND ended_at IS NULL",
+            (task_id,),
+        ).fetchone()[0]
+        assert active_runs == 1
+
+        # Recovery remains bounded: once the liveness receipt is stale, the
+        # same dead-PID observation closes the sole run and requeues the task.
+        conn.execute(
+            "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
+            (
+                int(time.time()) - kb.DEFAULT_CRASH_LIVENESS_GRACE_SECONDS - 1,
+                task_id,
+            ),
+        )
+        assert kb.detect_crashed_workers(conn) == [task_id]
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        active_runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ? AND ended_at IS NULL",
+            (task_id,),
+        ).fetchone()[0]
+        assert active_runs == 0
 
 
 
@@ -519,6 +862,20 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 # ---------------------------------------------------------------------------
 # Workspace resolution
 # ---------------------------------------------------------------------------
+
+
+def test_worktree_creation_without_resolvable_repo_writes_no_card(kanban_home):
+    with kb.connect() as conn:
+        before = len(kb.list_tasks(conn, include_archived=True))
+        with pytest.raises(ValueError, match="before publishing.*default_workdir"):
+            kb.create_task(
+                conn,
+                title="unpublishable worktree",
+                workspace_kind="worktree",
+            )
+        after = len(kb.list_tasks(conn, include_archived=True))
+
+    assert after == before
 
 
 

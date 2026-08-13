@@ -58,6 +58,26 @@ class TestGetToolset:
 
 
 class TestResolveToolset:
+    def test_no_tools_is_a_valid_explicit_empty_toolset(self, monkeypatch):
+        from hermes_cli.oneshot import _validate_explicit_toolsets
+        from model_tools import get_tool_definitions
+
+        reg = ToolRegistry()
+        reg.register(
+            name="must_not_leak",
+            toolset="no_tools",
+            schema=_make_schema("must_not_leak"),
+            handler=_dummy_handler,
+        )
+        monkeypatch.setattr("tools.registry.registry", reg)
+
+        assert validate_toolset("no_tools") is True
+        assert resolve_toolset("no_tools") == []
+        assert _validate_explicit_toolsets(["no_tools"]) == (["no_tools"], None)
+        assert get_tool_definitions(
+            enabled_toolsets=["no_tools"], quiet_mode=True
+        ) == []
+
     def test_leaf_toolset(self):
         tools = resolve_toolset("web")
         assert set(tools) == {"web_search", "web_extract"}

@@ -441,6 +441,27 @@ class BuzzAdapter(BasePlatformAdapter):
     def name(self) -> str:
         return "Buzz"
 
+    async def list_channels(self) -> List[dict]:
+        """Expose discovered conversations to the gateway channel directory."""
+        channel_ids = set(self._channel_names) | set(self._channel_meta) | set(self._channel_state)
+        channels = []
+        for channel_id in sorted(channel_ids):
+            state = self._channel_state.get(channel_id) or {}
+            is_dm = state.get("chat_type") == "dm" or self._may_reclassify_as_dm(channel_id)
+            meta = self._channel_meta.get(channel_id) or {}
+            channels.append(
+                {
+                    "id": channel_id,
+                    "name": str(
+                        self._channel_names.get(channel_id)
+                        or meta.get("name")
+                        or channel_id
+                    ),
+                    "type": "dm" if is_dm else "channel",
+                }
+            )
+        return channels
+
     # ── buzz-cli plumbing ─────────────────────────────────────────────────
 
     async def _run_cli(self, args: List[str], *, input_text: Optional[str] = None) -> Tuple[int, str, str]:

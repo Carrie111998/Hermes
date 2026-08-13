@@ -356,7 +356,7 @@ def test_interrupted_review_runs_retry_in_review_phase(
     elif reclaim_kind == "manual_reclaim":
         assert kb.reclaim_task(conn, task_id, reason="operator retry")
     else:
-        old = int(time.time()) - 1_000
+        old = int(time.time()) - 4_000
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET started_at = ?, last_heartbeat_at = NULL "
@@ -398,17 +398,39 @@ def test_review_retry_still_trips_the_failure_breaker(conn) -> None:
     assert unblocked.status == "review"
 
 
-def test_review_escalation_unblocks_back_to_review(conn) -> None:
+def test_review_routine_block_is_rejected_at_db_boundary(conn) -> None:
+    task_id, review = _claimed_review(conn, "Routine review finding")
+    with pytest.raises(ValueError, match="kanban_request_changes"):
+        kb.block_task(
+            conn,
+            task_id,
+            reason="Add a missing boundary assertion.",
+            kind="needs_input",
+            expected_run_id=review.current_run_id,
+        )
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == review.current_run_id
+    assert not any(
+        event.kind in {"blocked", "dependency_wait", "block_loop_detected"}
+        for event in kb.list_events(conn, task_id)
+    )
+
+
+@pytest.mark.parametrize("kind", ["authority", "integrity"])
+def test_review_escalation_unblocks_back_to_review(conn, kind: str) -> None:
     task_id, review = _claimed_review(conn, "External review escalation")
     assert kb.block_task(
         conn,
         task_id,
-        reason="needs_input: maintainer decision required",
-        kind="needs_input",
+        reason=f"{kind}: maintainer decision required",
+        kind=kind,
         expected_run_id=review.current_run_id,
     )
     blocked_event = _event(kb.list_events(conn, task_id), "blocked")
     assert blocked_event.payload is not None
+    assert blocked_event.payload["kind"] == kind
     assert blocked_event.payload["source_status"] == "review"
     assert kb.unblock_task(conn, task_id)
     resumed = kb.get_task(conn, task_id)

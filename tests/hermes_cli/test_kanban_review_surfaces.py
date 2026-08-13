@@ -27,7 +27,30 @@ def review_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
         assert task is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(task.claim_lock))
     return task_id
+
+
+def _claim_review_run(
+    task_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from tools import kanban_tools as tools
+
+    requested = json.loads(
+        tools._handle_request_review({
+            "summary": "Implementation ready for independent review.",
+            "reviewer": "reviewer",
+        })
+    )
+    assert requested["ok"] is True
+    with kb.connect() as conn:
+        review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
+        assert review is not None
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(review.claim_lock))
+    return review
 
 
 def test_review_tools_redact_handoff_and_route_changes(
@@ -60,6 +83,7 @@ def test_review_tools_redact_handoff_and_route_changes(
 
     monkeypatch.setenv("HERMES_PROFILE", "reviewer")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(review.claim_lock))
     change_secret = "sk-" + "B" * 32
     changed = json.loads(
         tools._handle_request_changes({
@@ -84,6 +108,74 @@ def test_review_tools_redact_handoff_and_route_changes(
         assert event.payload["reason"] != (
             "Add a boundary assertion; leaked=" + change_secret
         )
+
+
+def test_review_tool_rejects_routine_needs_input_without_ending_run(
+    review_worker: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import kanban_tools as tools
+
+    review = _claim_review_run(review_worker, monkeypatch)
+    rejected = json.loads(
+        tools._handle_block({
+            "kind": "needs_input",
+            "reason": "The implementation needs another boundary assertion.",
+        })
+    )
+    assert rejected.get("ok") is not True
+    assert "kanban_request_changes" in rejected["error"]
+    assert "authority" in rejected["error"]
+    assert "integrity" in rejected["error"]
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, review_worker)
+        assert task is not None
+        assert task.status == "running"
+        assert task.current_run_id == review.current_run_id
+        run = kb.latest_run(conn, review_worker)
+        assert run is not None
+        assert run.id == review.current_run_id
+        assert run.status == "running"
+        assert run.outcome is None
+        assert not any(
+            event.kind in {"blocked", "dependency_wait", "block_loop_detected"}
+            for event in kb.list_events(conn, review_worker)
+        )
+
+
+@pytest.mark.parametrize("kind", ["authority", "integrity"])
+def test_review_tool_allows_explicit_human_escalation_blocks(
+    review_worker: str,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    from tools import kanban_tools as tools
+
+    review = _claim_review_run(review_worker, monkeypatch)
+    blocked = json.loads(
+        tools._handle_block({
+            "kind": kind,
+            "reason": f"Human {kind} decision is required before approval.",
+        })
+    )
+    assert blocked["ok"] is True
+    assert blocked["status"] == "blocked"
+    assert blocked["block_kind"] == kind
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, review_worker)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.current_run_id is None
+        event = [
+            item for item in kb.list_events(conn, review_worker)
+            if item.kind == "blocked"
+        ][-1]
+        assert event.run_id == review.current_run_id
+        assert event.payload is not None
+        assert event.payload["kind"] == kind
+        assert event.payload["source_status"] == "review"
 
 
 def test_review_tools_are_gated_and_visible_to_kanban_workers(
@@ -111,6 +203,11 @@ def test_review_tools_are_gated_and_visible_to_kanban_workers(
     assert "kanban_request_changes" in _POLISHED_TOOLS
     assert "kanban_request_changes" in EXPOSED_TOOLS
     assert "kanban_request_changes" in resolve_toolset("kanban")
+    block_kinds = tools.kanban_tools.KANBAN_BLOCK_SCHEMA[
+        "parameters"
+    ]["properties"]["kind"]["enum"]
+    assert "authority" in block_kinds
+    assert "integrity" in block_kinds
 
 
 def test_review_cli_round_trip_preserves_handoff(
@@ -236,6 +333,12 @@ def test_worker_guidance_distinguishes_same_card_and_downstream_review() -> None
     assert "Never sticky-block that parent for `review-required`" in KANBAN_GUIDANCE
     assert "`kanban_request_changes`" in KANBAN_GUIDANCE
     assert "metadata=..." in KANBAN_GUIDANCE
+    guidance = KANBAN_GUIDANCE.lower()
+    assert "evidenced progress" in guidance
+    assert "heartbeats are liveness only" in guidance
+    assert "no heartbeat has arrived" not in guidance
+    assert "routine review findings" in guidance
+    assert "authority" in guidance or "integrity" in guidance
     kanban_defaults = DEFAULT_CONFIG["kanban"]
     assert isinstance(kanban_defaults, dict)
     assert kanban_defaults["review_dispatch"] is True
@@ -304,6 +407,7 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
         assert claimed is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", tool_task)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(claimed.claim_lock))
 
     from tools import kanban_tools as tools
 

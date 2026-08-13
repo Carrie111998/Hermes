@@ -50,7 +50,7 @@ This skill is loaded automatically by the review dispatcher. Start with `kanban_
 |---|---|---|
 | Approve | Acceptance criteria and verification pass | `kanban_complete` |
 | Request changes | Correctable implementation defects remain | `kanban_comment`, then `kanban_request_changes` |
-| Escalate | A human decision or external prerequisite is required | `kanban_block` |
+| Escalate | Human authority or integrity judgment is required | `kanban_block(kind="authority" | "integrity")` |
 
 A requested-changes transition returns the task to its original implementer. When that implementer requests review again without naming a reviewer, the persisted reviewer provenance routes the re-review back to the same reviewer profile.
 
@@ -142,11 +142,12 @@ State where the defect is, how it reproduces, why it violates the task, and what
 
 #### Escalate
 
-Use escalation only when the reviewer and implementer cannot resolve the problem without a human decision or external prerequisite:
+Use escalation only when the reviewer and implementer cannot proceed without human authority or integrity judgment:
 
 ```text
 kanban_block(
-    reason="escalation: <decision or prerequisite required>"
+    kind="<authority or integrity>",
+    reason="escalation: <human decision required>"
 )
 ```
 
@@ -163,7 +164,7 @@ Do not edit the implementation while acting as reviewer. Request changes and let
 - **Vague findings:** “Needs work” does not give the implementer a reproducible correction target.
 - **Style-only blocking:** Do not request changes for preference-level nits when behavior and repository standards are satisfied.
 - **Skipping prior rounds:** Re-review must confirm both the requested corrections and preservation of previously passing behavior.
-- **Using blockers for ordinary rework:** Correctable defects belong in `kanban_request_changes`; reserve `kanban_block` for genuine external blockers or human decisions.
+- **Using blockers for ordinary rework:** Correctable defects belong in `kanban_request_changes`; review runs may use `kanban_block` only with `kind="authority"` or `kind="integrity"` for genuine human escalation.
 - **Completing without evidence:** Every approval summary must name the checks or artifacts actually inspected.
 
 ## Verification

@@ -11,6 +11,8 @@ mocking git would just test the mock.
 from __future__ import annotations
 
 import sys
+import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -374,6 +376,30 @@ class TestInstall:
 
 
 class TestUpdate:
+
+    def test_update_fails_closed_when_skill_role_changes(self, profile_env):
+        staged = _make_staging_dir(profile_env, "reader_src")
+        install_distribution(str(staged), name="reader")
+        shutil.rmtree(staged / "skills")
+
+        with pytest.raises(DistributionError, match="remove all skills"):
+            update_distribution("reader")
+
+        from hermes_cli.profiles import get_profile_dir
+        assert (get_profile_dir("reader") / "skills" / "demo" / "SKILL.md").exists()
+
+    def test_update_writes_restore_manifest(self, profile_env):
+        staged = _make_staging_dir(profile_env, "manifest_src")
+        plan = install_distribution(str(staged), name="manifested")
+        update_distribution("manifested")
+
+        rollback_root = plan.target_dir.parent / ".deployment-rollbacks"
+        manifests = list(rollback_root.glob("manifested-*/rollback-manifest.json"))
+        assert len(manifests) == 1
+        payload = json.loads(manifests[0].read_text(encoding="utf-8"))
+        assert payload["profile"] == "manifested"
+        assert payload["pre_update_skill_count"] == payload["staged_skill_count"]
+        assert "restore" in payload
 
     def test_update_preserves_user_data(self, profile_env):
         # 1. Build staging dir, install
@@ -758,4 +784,3 @@ class TestManifestCrashDurability:
 
         mode = stat.S_IMODE(mf.stat().st_mode)
         assert mode == 0o644, f"new manifest created as {oct(mode)}"
-
