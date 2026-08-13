@@ -71,10 +71,11 @@ class TestPermissionsDenyPathMatching:
         assert match is not None
 
     def test_local_msys_drive_path_matches_windows_drive_rule(self):
-        match = deny_policy.match_permissions_deny_path(
-            "/c/Users/alice/obsidian/Daedalus/capsule.md",
-            patterns=["C:/Users/alice/obsidian/Daedalus/**"],
-        )
+        with patch("agent.deny_policy.os.name", "nt"):
+            match = deny_policy.match_permissions_deny_path(
+                "/c/Users/alice/obsidian/Daedalus/capsule.md",
+                patterns=["C:/Users/alice/obsidian/Daedalus/**"],
+            )
 
         assert match is not None
 
