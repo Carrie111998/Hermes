@@ -36,6 +36,12 @@ import type { SessionInfo } from '@/types/hermes'
 import { $activeGatewayProfile, normalizeProfileKey } from './profile'
 import { clearAllProviderWaits, clearSessionProviderWait } from './provider-wait'
 import {
+  clearRuntimeStores,
+  dropRuntimeStores,
+  publishRuntimeState,
+  releaseRuntimeTranscript
+} from './runtime-session-stores'
+import {
   $activeSessionId,
   $lastReadAtBySessionId,
   $selectedStoredSessionId,
@@ -292,23 +298,46 @@ function evictable(runtimeId: string, state: ClientSessionState): boolean {
  *  effects still fire, so lightweight status and the unread dot survive. A
  *  FIRST publish always lands in full because a resume can publish its idle
  *  state a beat before `$activeSessionId` / the tile binding points at it. */
-export function publishSessionState(runtimeId: string, state: ClientSessionState) {
+export function publishSessionState(
+  runtimeId: string,
+  state: ClientSessionState,
+  previousState?: ClientSessionState | null
+) {
   const current = $sessionStates.get()
-  const prev = current[runtimeId] ?? null
+  const published = current[runtimeId] ?? null
+  const prev = previousState === undefined ? published : previousState
 
   if (prev === state) {
     return
   }
 
-  if (prev && evictable(runtimeId, state)) {
+  publishRuntimeState(runtimeId, prev, state)
+
+  if (published && prev && evictable(runtimeId, state)) {
     handleTransition(prev, state, runtimeId)
     releaseSessionTranscript(runtimeId, state)
 
     return
   }
 
-  $sessionStates.set({ ...current, [runtimeId]: state })
-  handleTransition(prev, state, runtimeId)
+  // Compatibility/status index. Do not republish it for a transcript-only
+  // update: lifecycle consumers wake only on actual status edges, while the
+  // target runtime's transcript channel above receives every token delta.
+  const statusChanged =
+    !published ||
+    !prev ||
+    Object.keys(state).some(
+      key => key !== 'messages' && state[key as keyof ClientSessionState] !== prev[key as keyof ClientSessionState]
+    )
+
+  if (statusChanged) {
+    $sessionStates.set({ ...current, [runtimeId]: state })
+    handleTransition(prev, state, runtimeId)
+  } else if (state.busy) {
+    // Stream activity refreshes only this runtime's silence watchdog. Global
+    // lifecycle memberships do not recompute until a real status edge.
+    armWatchdog(runtimeId)
+  }
 }
 
 /** Keep the cheap status projection for a cold session while releasing its
@@ -332,6 +361,7 @@ export function releaseSessionTranscript(runtimeId: string, state?: ClientSessio
   const lightweight =
     Array.isArray(retained.messages) && retained.messages.length === 0 ? retained : { ...retained, messages: [] }
 
+  releaseRuntimeTranscript(runtimeId)
   $sessionStates.set({ ...current, [runtimeId]: lightweight })
 }
 
@@ -343,6 +373,7 @@ export function dropSessionState(runtimeId: string) {
   clearWatchdog(runtimeId)
   clearSessionProviderWait(runtimeId)
   sessionScopeByRuntimeId.delete(runtimeId)
+  dropRuntimeStores(runtimeId)
 
   const current = $sessionStates.get()
   setSessionStalled(current[runtimeId]?.storedSessionId, false)
@@ -370,6 +401,7 @@ export function clearAllSessionStates() {
   clearAllProviderWaits()
   sessionScopeByRuntimeId.clear()
   $stalledSessionIds.set([])
+  clearRuntimeStores()
   $sessionStates.set({})
 }
 

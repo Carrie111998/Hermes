@@ -19,20 +19,17 @@ import {
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { useStore } from '@nanostores/react'
-import { useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
 
-import { CodeEditor } from '@/components/chat/code-editor'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { ColorSwatches } from '@/components/ui/color-swatches'
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from '@/components/ui/context-menu'
-import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Popover, PopoverAnchor, PopoverContent } from '@/components/ui/popover'
 import { ProfileGlyph } from '@/components/ui/profile-glyph'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tip, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import { getProfileSoul, updateProfileSoul } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { PROFILE_SWATCHES, profileColorSoft, resolveProfileColor } from '@/lib/profile-color'
@@ -43,7 +40,6 @@ import {
   reorderStepHaptic
 } from '@/lib/reorder'
 import { cn } from '@/lib/utils'
-import { notify, notifyError } from '@/store/notifications'
 import {
   $activeGatewayProfile,
   $profileColors,
@@ -60,16 +56,17 @@ import {
   setShowAllProfiles,
   sortByProfileOrder
 } from '@/store/profile'
-import { runExportProfileFlow, runImportProfileFlow } from '@/store/profile-share'
 import type { ProfileInfo } from '@/types/hermes'
 
-import { CreateProfileDialog } from '../../profiles/create-profile-dialog'
-import { DeleteProfileDialog } from '../../profiles/delete-profile-dialog'
-import { RenameProfileDialog } from '../../profiles/rename-profile-dialog'
 import { PROFILES_ROUTE, SETTINGS_ROUTE } from '../../routes'
 
 import { useProfilePrewarm } from './use-profile-prewarm'
 import { useProfileRailRefreshOnActive } from './use-profile-rail-refresh-on-active'
+
+const CreateProfileDialog = lazy(() => import('../../profiles/create-profile-dialog').then(m => ({ default: m.CreateProfileDialog })))
+const DeleteProfileDialog = lazy(() => import('../../profiles/delete-profile-dialog').then(m => ({ default: m.DeleteProfileDialog })))
+const RenameProfileDialog = lazy(() => import('../../profiles/rename-profile-dialog').then(m => ({ default: m.RenameProfileDialog })))
+const EditSoulDialog = lazy(() => import('./edit-soul-dialog').then(m => ({ default: m.EditSoulDialog })))
 
 const RAIL_GAP = 4 // px — matches gap-1 between squares.
 
@@ -332,109 +329,27 @@ export function ProfileRail() {
 
       {/* Land in the new profile on a fresh chat (selectProfile triggers the
           new-session reset), not stuck on the session you were just in. */}
-      <CreateProfileDialog
-        onClose={() => setCreateOpen(false)}
-        onCreated={async name => {
-          await refreshActiveProfile()
-          selectProfile(name)
-        }}
-        open={createOpen}
-        profiles={profiles}
-      />
-
-      <RenameProfileDialog
-        currentName={pendingRename?.name ?? ''}
-        onClose={() => setPendingRename(null)}
-        onRenamed={refreshActiveProfile}
-        open={pendingRename !== null}
-      />
-
-      <DeleteProfileDialog
-        onClose={() => setPendingDelete(null)}
-        onDeleted={refreshActiveProfile}
-        open={pendingDelete !== null}
-        profile={pendingDelete}
-      />
-
-      <EditSoulDialog onClose={() => setPendingSoul(null)} profileName={pendingSoul} />
+      <Suspense fallback={null}>
+        {createOpen && (
+          <CreateProfileDialog
+            onClose={() => setCreateOpen(false)}
+            onCreated={async name => {
+              await refreshActiveProfile()
+              selectProfile(name)
+            }}
+            open
+            profiles={profiles}
+          />
+        )}
+        {pendingRename && (
+          <RenameProfileDialog currentName={pendingRename.name} onClose={() => setPendingRename(null)} onRenamed={refreshActiveProfile} open />
+        )}
+        {pendingDelete && (
+          <DeleteProfileDialog onClose={() => setPendingDelete(null)} onDeleted={refreshActiveProfile} open profile={pendingDelete} />
+        )}
+        {pendingSoul && <EditSoulDialog onClose={() => setPendingSoul(null)} profileName={pendingSoul} />}
+      </Suspense>
     </div>
-  )
-}
-
-// Right-click → Edit SOUL.md for a sidebar profile — the same in-app markdown
-// editor as the memory-graph node edit, so a profile's persona is editable
-// without opening the Manage overlay.
-function EditSoulDialog({ onClose, profileName }: { onClose: () => void; profileName: null | string }) {
-  const { t } = useI18n()
-  const p = t.profiles
-  const [content, setContent] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [saving, setSaving] = useState(false)
-
-  useEffect(() => {
-    if (!profileName) {
-      return
-    }
-
-    let cancelled = false
-    setLoading(true)
-    setContent('')
-
-    getProfileSoul(profileName)
-      .then(soul => !cancelled && setContent(soul.content))
-      .catch(err => !cancelled && notifyError(err, p.failedLoadSoul))
-      .finally(() => !cancelled && setLoading(false))
-
-    return () => void (cancelled = true)
-  }, [p, profileName])
-
-  const save = async () => {
-    if (!profileName) {
-      return
-    }
-
-    setSaving(true)
-
-    try {
-      await updateProfileSoul(profileName, content)
-      notify({ kind: 'success', title: p.soulSaved, message: profileName })
-      onClose()
-    } catch (err) {
-      notifyError(err, p.failedSaveSoul)
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  return (
-    <Dialog onOpenChange={open => !open && !saving && onClose()} open={profileName !== null}>
-      <DialogContent className="max-w-2xl">
-        <DialogHeader>
-          <DialogTitle>{profileName} · SOUL.md</DialogTitle>
-        </DialogHeader>
-        <div className="h-80">
-          {!loading && profileName && (
-            <CodeEditor
-              filePath="SOUL.md"
-              framed
-              initialValue={content}
-              key={profileName}
-              onCancel={() => !saving && onClose()}
-              onChange={setContent}
-              onSave={() => void save()}
-            />
-          )}
-        </div>
-        <DialogFooter>
-          <Button disabled={saving} onClick={onClose} type="button" variant="ghost">
-            {t.common.cancel}
-          </Button>
-          <Button disabled={saving || loading} onClick={() => void save()}>
-            {saving ? p.saving : p.saveSoul}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
   )
 }
 
@@ -463,7 +378,7 @@ function ImportProfileButton({ label }: { label: string }) {
       <button
         aria-label={label}
         className="grid size-5 shrink-0 place-items-center rounded-[3px] text-(--ui-text-tertiary) opacity-55 transition hover:bg-(--ui-control-hover-background) hover:text-foreground hover:opacity-100"
-        onClick={() => void runImportProfileFlow()}
+        onClick={() => void import('@/store/profile-share').then(m => m.runImportProfileFlow())}
         type="button"
       >
         <Codicon name="cloud-download" size="0.75rem" />
@@ -722,7 +637,7 @@ function ProfileSquare({
             <Codicon name="edit" size="0.875rem" />
             <span>{p.editSoul}</span>
           </ContextMenuItem>
-          <ContextMenuItem onSelect={() => void runExportProfileFlow(label)}>
+          <ContextMenuItem onSelect={() => void import('@/store/profile-share').then(m => m.runExportProfileFlow(label))}>
             <Codicon name="package" size="0.875rem" />
             <span>{p.exportProfile}</span>
           </ContextMenuItem>

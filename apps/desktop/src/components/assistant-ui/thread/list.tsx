@@ -32,12 +32,13 @@ import { isSecondaryWindow } from '@/store/windows'
 
 import { MessageRenderBoundary } from '../message-render-boundary'
 
+import { useTranscriptLayout } from './transcript-layout'
 import { resolveShowEarlierAction, useTranscriptWindow } from './transcript-window'
 
 type ThreadMessageComponents = ComponentProps<typeof ThreadPrimitive.MessageByIndex>['components']
 
-export type MessageGroup = { id: string; weight: number } & (
-  { index: number; kind: 'standalone' } | { indices: number[]; kind: 'turn' }
+export type MessageGroup = { endIndex: number; id: string; weight: number } & (
+  { kind: 'standalone'; messageId: string } | { kind: 'turn'; messageIds: string[] }
 )
 
 // DOM is bounded by a render-cost budget, not a message/turn count. The
@@ -96,10 +97,10 @@ const MIN_VISIBLE_GROUPS = 8
 // interruptibly, so the only thing a smaller budget changes is how much work
 // blocks the click-to-paint path.
 const FIRST_PAINT_BUDGET = 20
-// A hot-hidden transcript is retained for instant tab return, but keeping its
-// full scrollback mounted defeats the bounded pane cache. Preserve only the
-// live tail while hidden; revealing it resumes stepped backfill.
-export const HIDDEN_TRANSCRIPT_RENDER_BUDGET = 40
+// Chat panes retain their lightweight shell while hidden, but mount no
+// transcript rows. The owning ChatView unmounts Thread; this zero is the
+// defensive budget if a nonstandard surface keeps the list mounted.
+export const HIDDEN_TRANSCRIPT_RENDER_BUDGET = 0
 
 export const transcriptPaneBudget = (mountedPanes: number, hidden: boolean): number =>
   hidden
@@ -195,20 +196,20 @@ export function buildGroups(signature: string): MessageGroup[] {
     const message = messages[i]
 
     if (message.role !== 'user') {
-      groups.push({ id: message.id, index: message.index, kind: 'standalone', weight: message.weight })
+      groups.push({ endIndex: message.index, id: message.id, kind: 'standalone', messageId: message.id, weight: message.weight })
 
       continue
     }
 
-    const indices = [message.index]
+    const messageIds = [message.id]
     let weight = message.weight
 
     while (i + 1 < messages.length && messages[i + 1].role !== 'user') {
       weight += messages[++i].weight
-      indices.push(messages[i].index)
+      messageIds.push(messages[i].id)
     }
 
-    groups.push({ id: message.id, indices, kind: 'turn', weight })
+    groups.push({ endIndex: messages[i].index, id: message.id, kind: 'turn', messageIds, weight })
   }
 
   return groups
@@ -344,12 +345,12 @@ const TurnRow = memo(function TurnRow({ components, group, resetKey, virtualized
             className="composer-human-ai-pair-container relative flex min-w-0 flex-col gap-(--conversation-turn-gap)"
             data-slot="aui_turn-pair"
           >
-            {group.indices.map(index => (
-              <ThreadPrimitive.MessageByIndex components={components} index={index} key={index} />
+            {group.messageIds.map(messageId => (
+              <ThreadPrimitive.Unstable_MessageById components={components} key={messageId} messageId={messageId} />
             ))}
           </div>
         ) : (
-          <ThreadPrimitive.MessageByIndex components={components} index={group.index} />
+          <ThreadPrimitive.Unstable_MessageById components={components} messageId={group.messageId} />
         )}
       </MessageRenderBoundary>
     </div>
@@ -363,27 +364,22 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   loadingIndicator,
   sessionKey
 }) => {
-  // TWO signatures, deliberately split. The STRUCTURAL one (ids/roles/count)
-  // changes only when messages are added/removed/swapped — it keys the error
-  // boundaries and the row identity. The WEIGHT one (parts + character cost)
-  // ticks while a streaming turn appends content — it feeds only the render
-  // budget. Folding weights into the structural key handed every boundary a
-  // new resetKey per appended part, which reconciled every turn's subtree on
-  // every tick (measured: 540 wasted Block renders per explain() sample with
-  // two threads streaming).
-  const structuralSignature = useAuiState(s =>
-    s.thread.messages.map((message, index) => `${index}:${message.id}:${message.role}`).join('\n')
+  const transcriptLayout = useTranscriptLayout()
+
+  // Standalone Thread tests and third-party surfaces do not install Hermes'
+  // projection provider. Keep a compatibility projection there; production
+  // chat always receives the incremental layout and never runs this selector.
+  const fallbackSignature = useAuiState(s =>
+    transcriptLayout
+      ? ''
+      : s.thread.messages
+          .map((message, index) => `${index}:${message.id}:${message.role}:${messagePaintWeight(message.content)}`)
+          .join('\n')
   )
 
-  const weightSignature = useAuiState(s =>
-    s.thread.messages.map(message => messagePaintWeight(message.content)).join(',')
-  )
-
+  const fallbackGroups = useMemo(() => buildGroups(fallbackSignature), [fallbackSignature])
+  const groups = transcriptLayout?.groups ?? fallbackGroups
   const { t } = useI18n()
-  // Row structure is memoized on the STRUCTURAL signature only, so streaming
-  // part-appends can't churn group identity (that would defeat the rows memo
-  // below on every tick). Weights are folded in separately for the budget.
-  const groups = useMemo(() => buildGroups(structuralSignature), [structuralSignature])
   const renderEmpty = groups.length === 0 && Boolean(emptyPlaceholder)
 
   // use-stick-to-bottom owns scrollTop (single writer): follow while locked,
@@ -504,20 +500,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     return () => cancelAnimationFrame(rafId)
   }, [anchorBeforePrepend, paneBudget, renderBudget])
 
-  // Weights (part count + visible character cost) fold into the BUDGET only.
-  // Group identity stays structural, so a streaming append re-runs this cheap
-  // sum — not the row JSX. Settled content hits messagePaintWeight's WeakMap.
-  const weightedGroups = useMemo(() => {
-    const weights = weightSignature.split(',').map(w => Number(w) || 1)
-
-    return groups.map(group => ({
-      ...group,
-      weight:
-        group.kind === 'turn'
-          ? group.indices.reduce((sum, index) => sum + (weights[index] ?? 1), 0)
-          : (weights[group.index] ?? 1)
-    }))
-  }, [groups, weightSignature])
+  const weightedGroups = groups
 
   // The turn floor applies to a real page only. During the first-paint budget
   // the point is a small synchronous commit; forcing 8 turns into it would put
@@ -727,11 +710,13 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
           components={components}
           group={group}
           key={group.id}
-          resetKey={structuralSignature}
+          resetKey={
+            group.kind === 'turn' ? `${group.id}:${group.messageIds.join(',')}` : group.id
+          }
           virtualized={indexInVisible < tailStart}
         />
       )),
-    [visibleGroups, components, structuralSignature, tailStart]
+    [visibleGroups, components, tailStart]
   )
 
   return (

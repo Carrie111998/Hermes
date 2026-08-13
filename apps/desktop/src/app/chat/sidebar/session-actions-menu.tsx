@@ -35,7 +35,6 @@ import { renameSession } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { PROFILE_SWATCHES } from '@/lib/profile-color'
-import { exportSession } from '@/lib/session-export'
 import { activeGateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $projectTree, moveSessionToProject, projectIdForCwd, projectRootCwd } from '@/store/projects'
@@ -360,7 +359,7 @@ function useSessionActions({
       label: r.export,
       onSelect: () => {
         triggerHaptic('selection')
-        void exportSession(sessionId, { profile, title })
+        void import('@/lib/session-export').then(({ exportSession }) => exportSession(sessionId, { profile, title }))
       }
     })
   ]

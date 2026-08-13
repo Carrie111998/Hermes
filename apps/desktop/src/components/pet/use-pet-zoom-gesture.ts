@@ -1,7 +1,7 @@
 import { type RefObject, useEffect } from 'react'
 
 import { $petInfo } from '@/store/pet'
-import { nextScaleFromWheel, PET_SCALE_DEFAULT } from '@/store/pet-gallery'
+import { nextScaleFromWheel, PET_SCALE_DEFAULT } from '@/store/pet-scale'
 
 /** Where the gesture happened + how much it scaled — lets callers zoom toward the
  *  cursor (keep the pixel under it fixed) instead of growing from a corner. */

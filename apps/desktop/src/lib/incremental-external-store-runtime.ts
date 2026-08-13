@@ -48,29 +48,65 @@ const getThreadListAdapter = (store: ExternalStoreAdapter) => store.adapters?.th
  * incoming message has no repository entry yet), so the caller falls back to
  * the full rebuild rather than guessing.
  */
-function applyChangedMessages(
-  repository: ExternalStoreThreadRuntimeCore['repository'],
-  existing: readonly { message: ThreadMessage; parentId: string | null }[],
+interface RepositorySyncState {
   incoming: readonly { message: ThreadMessage; parentId: string | null }[]
+}
+
+type OperationRepository = NonNullable<ExternalStoreAdapter['messageRepository']> & {
+  operation?: 'append' | 'finalize-tail' | 'replace-tail' | 'reset'
+}
+
+const syncStates = new WeakMap<object, RepositorySyncState>()
+
+/** The explicit steady-state operations: append one row or replace the live
+ * tail. Both are O(1); resets/reparents/compression intentionally use rebuild. */
+function applyTailOperation(
+  repository: ExternalStoreThreadRuntimeCore['repository'],
+  previous: RepositorySyncState | undefined,
+  incoming: readonly { message: ThreadMessage; parentId: string | null }[],
+  operation: OperationRepository['operation']
 ): boolean {
-  if (existing.length !== incoming.length) {
+  const before = previous?.incoming
+
+  if (!before) {
     return false
   }
 
-  const existingById = new Map(existing.map(item => [item.message.id, item]))
+  if (
+    operation === 'append' &&
+    incoming.length === before.length + 1 &&
+    incoming.at(-2)?.message === before.at(-1)?.message
+  ) {
+    const appended = incoming.at(-1)!
+    repository.addOrUpdateMessage(appended.parentId, appended.message)
 
-  for (const item of incoming) {
-    const current = existingById.get(item.message.id)
+    return true
+  }
 
-    if (!current) {
-      return false
-    }
+  if (
+    (operation !== 'replace-tail' && operation !== 'finalize-tail') ||
+    incoming.length !== before.length ||
+    incoming.length === 0
+  ) {
+    return false
+  }
 
-    // Reference identity, not deep equality: the conversion cache guarantees a
-    // stable object for an unchanged turn, and a changed turn is a new object.
-    if (current.message !== item.message || current.parentId !== item.parentId) {
-      repository.addOrUpdateMessage(item.parentId, item.message)
-    }
+  const oldTail = before.at(-1)!
+  const nextTail = incoming.at(-1)!
+
+  // Endpoint identity proves this is the same branch. Structural operations
+  // (reset/compression/reparent) change an endpoint/parent and take the safe
+  // rebuild path; token/tool/error settlement replaces only this tail object.
+  if (
+    before[0]?.message.id !== incoming[0]?.message.id ||
+    oldTail.message.id !== nextTail.message.id ||
+    oldTail.parentId !== nextTail.parentId
+  ) {
+    return false
+  }
+
+  if (oldTail.message !== nextTail.message) {
+    repository.addOrUpdateMessage(nextTail.parentId, nextTail.message)
   }
 
   return true
@@ -82,8 +118,24 @@ export function syncRepositoryIncrementally(
 ): readonly ThreadMessage[] {
   const repository = (runtime as unknown as { repository: ExternalStoreThreadRuntimeCore['repository'] }).repository
   const incoming = messageRepository.messages
-  const existing = repository.export().messages
+  const operation = (messageRepository as OperationRepository).operation
+  const previous = syncStates.get(runtime as unknown as object)
   const headId = messageRepository.headId ?? incoming.at(-1)?.message.id ?? null
+
+  // The steady path must not call export(): assistant-ui's export walks the
+  // complete repository. Persistent incoming indexes tell us exactly whether
+  // this publication is a tail patch/append before any whole-transcript work.
+  if (applyTailOperation(repository, previous, incoming, operation)) {
+    syncStates.set(runtime as unknown as object, { incoming })
+
+    if (repository.headId !== headId) {
+      repository.resetHead(headId)
+    }
+
+    return repository.getMessages()
+  }
+
+  const existing = repository.export().messages
 
   // A thread switch swaps in a fully-DISJOINT transcript (no id carries over).
   // Reconciling two unrelated trees in place — grafting the new chain onto the
@@ -91,17 +143,6 @@ export function syncRepositoryIncrementally(
   // to preserve: clear the tree first (leaves→root), then rebuild clean.
   const incomingIds = new Set(incoming.map(({ message }) => message.id))
   const disjoint = existing.length > 0 && !existing.some(({ message }) => incomingIds.has(message.id))
-
-  // Steady-state streaming: same message set, one item changed. Skip the
-  // whole-transcript rewrite, the prune scan, and the second export. resetHead
-  // deletes the head's descendants, so it only runs when the head really moved.
-  if (!disjoint && applyChangedMessages(repository, existing, incoming)) {
-    if (repository.headId !== headId) {
-      repository.resetHead(headId)
-    }
-
-    return repository.getMessages()
-  }
 
   if (disjoint) {
     for (const { message } of [...existing].reverse()) {
@@ -120,6 +161,7 @@ export function syncRepositoryIncrementally(
   }
 
   repository.resetHead(headId)
+  syncStates.set(runtime as unknown as object, { incoming })
 
   return repository.getMessages()
 }

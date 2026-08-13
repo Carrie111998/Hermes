@@ -91,9 +91,10 @@ const signature = (rows: [string, string, number][]) =>
   rows.map(([id, role, weight], index) => `${index}:${id}:${role}:${weight}`).join('\n')
 
 describe('transcriptPaneBudget', () => {
-  it('uses a fixed live-tail budget while hidden instead of charging every mounted transcript', () => {
+  it('gives hidden transcripts zero mounted budget', () => {
     expect(transcriptPaneBudget(1, true)).toBe(HIDDEN_TRANSCRIPT_RENDER_BUDGET)
     expect(transcriptPaneBudget(4, true)).toBe(HIDDEN_TRANSCRIPT_RENDER_BUDGET)
+    expect(HIDDEN_TRANSCRIPT_RENDER_BUDGET).toBe(0)
     expect(transcriptPaneBudget(1, false)).toBeGreaterThan(HIDDEN_TRANSCRIPT_RENDER_BUDGET)
   })
 })
@@ -115,8 +116,8 @@ describe('buildGroups', () => {
     )
 
     expect(groups).toEqual([
-      { id: 'u1', indices: [0, 1, 2], kind: 'turn', weight: 7 },
-      { id: 'u2', indices: [3, 4], kind: 'turn', weight: 4 }
+      { endIndex: 2, id: 'u1', kind: 'turn', messageIds: ['u1', 'a1', 'a2'], weight: 7 },
+      { endIndex: 4, id: 'u2', kind: 'turn', messageIds: ['u2', 'a3'], weight: 4 }
     ])
   })
 
@@ -131,16 +132,16 @@ describe('buildGroups', () => {
     )
 
     expect(groups).toEqual([
-      { id: 's1', index: 0, kind: 'standalone', weight: 1 },
-      { id: 'a0', index: 1, kind: 'standalone', weight: 2 },
-      { id: 'u1', indices: [2, 3], kind: 'turn', weight: 6 }
+      { endIndex: 0, id: 's1', kind: 'standalone', messageId: 's1', weight: 1 },
+      { endIndex: 1, id: 'a0', kind: 'standalone', messageId: 'a0', weight: 2 },
+      { endIndex: 3, id: 'u1', kind: 'turn', messageIds: ['u1', 'a1'], weight: 6 }
     ])
   })
 
   it('defaults a missing/zero weight to 1', () => {
     const groups = buildGroups('0:a:assistant:0')
 
-    expect(groups).toEqual([{ id: 'a', index: 0, kind: 'standalone', weight: 1 }])
+    expect(groups).toEqual([{ endIndex: 0, id: 'a', kind: 'standalone', messageId: 'a', weight: 1 }])
   })
 })
 
@@ -192,7 +193,13 @@ describe('resolveThreadScrollTarget', () => {
 })
 
 describe('firstVisibleGroupIndex', () => {
-  const group = (id: string, weight: number): MessageGroup => ({ id, index: 0, kind: 'standalone', weight })
+  const group = (id: string, weight: number): MessageGroup => ({
+    endIndex: 0,
+    id,
+    kind: 'standalone',
+    messageId: id,
+    weight
+  })
 
   it('shows everything when total weight fits the budget', () => {
     const groups = [group('a', 10), group('b', 10), group('c', 10)]
@@ -234,7 +241,13 @@ describe('firstVisibleGroupIndex', () => {
 })
 
 describe('liveTailStart', () => {
-  const group = (id: string, weight: number): MessageGroup => ({ id, index: 0, kind: 'standalone', weight })
+  const group = (id: string, weight: number): MessageGroup => ({
+    endIndex: 0,
+    id,
+    kind: 'standalone',
+    messageId: id,
+    weight
+  })
 
   it('keeps the newest turns rendered until the parts budget is spent', () => {
     // 10 turns x 10 parts. A 40-part tail covers the newest 4-5 turns.

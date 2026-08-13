@@ -1,9 +1,10 @@
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-import tailwindcss from '@tailwindcss/vite'
-import path from 'path'
 import fs from 'fs'
 import { createRequire } from 'module'
+import path from 'path'
+
+import tailwindcss from '@tailwindcss/vite'
+import react from '@vitejs/plugin-react'
+import { defineConfig } from 'vite'
 
 // `hgui` symlinks a worktree's node_modules to the main checkout. Vite realpaths
 // those before enforcing server.fs.allow, so codicon/font assets resolve outside
@@ -68,9 +69,10 @@ const emojibaseAssets = () => ({
   }) {
     server.middlewares.use('/emojibase', (req, res, next) => {
       const rel = (req.url ?? '').split('?')[0].replace(/^\/+/, '')
-      if (!emojibaseDir || !EMOJIBASE_PATH.test(rel)) return next()
+
+      if (!emojibaseDir || !EMOJIBASE_PATH.test(rel)) {return next()}
       fs.readFile(path.join(emojibaseDir, rel), (err: unknown, buf: Buffer) => {
-        if (err) return next()
+        if (err) {return next()}
         res.setHeader('Content-Type', 'application/json')
         res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
         res.end(buf)
@@ -78,7 +80,8 @@ const emojibaseAssets = () => ({
     })
   },
   generateBundle(this: { emitFile: (asset: { type: 'asset'; fileName: string; source: Uint8Array }) => void }) {
-    if (!emojibaseDir) return
+    if (!emojibaseDir) {return}
+
     for (const rel of ['en/data.json', 'en/messages.json', 'en/shortcodes/emojibase.json']) {
       this.emitFile({
         type: 'asset',
@@ -118,6 +121,22 @@ export default defineConfig(({ command }) => ({
     // a handful of named vendor chunks loaded on first use, app-level dynamic
     // imports stay lazy, and the file count stays in the tens.
     chunkSizeWarningLimit: 25000,
+    manifest: true,
+    // Electron loads the renderer from file://. Keep Vite's relative dependency
+    // paths untouched (rather than resolving them as web URLs), while avoiding
+    // speculative boot fetches for interaction-only feature chunks. Dynamic
+    // imports still receive their normal dependency preloads on first use.
+    modulePreload: {
+      resolveDependencies: (filename, dependencies, context) =>
+        context.hostId.endsWith('index.html')
+          ? dependencies.filter(
+              dependency =>
+                !/(?:^|\/)(?:katex|shiki|mermaid|code-editor|session-export|(?:create|rename|delete)-profile-dialog|edit-soul-dialog|pet-gallery)-/i.test(
+                  dependency
+                )
+            )
+          : dependencies
+    },
     rolldownOptions: {
       output: {
         advancedChunks: {

@@ -371,55 +371,7 @@ export function setPetEnabled(
   })
 }
 
-// Pet scale bounds — mirror `agent/pet/constants.py` (MIN_SCALE / MAX_SCALE) so
-// the slider and the server clamp to the same range.
-export const PET_SCALE_MIN = 0.1
-export const PET_SCALE_MAX = 3.0
-export const PET_SCALE_DEFAULT = 0.33
-export const clampPetScale = (n: number) => Math.max(PET_SCALE_MIN, Math.min(PET_SCALE_MAX, n))
-
-// Wheel → scale. Multiplicative so one notch feels the same at any size. Tuned
-// for a discrete mouse-wheel notch (deltaY ≈ ±100); trackpad two-finger scroll
-// (smaller deltas) just resizes more gently, which is fine.
-const WHEEL_SCALE_K = 0.0015
-
-/**
- * Next pet scale for one mouse-wheel step over the pet. Scrolling up (deltaY < 0)
- * grows it, scrolling down shrinks it; the result is clamped to the slider's range.
- */
-export function nextScaleFromWheel(current: number | undefined, deltaY: number): number {
-  const base = current ?? PET_SCALE_DEFAULT
-
-  return clampPetScale(base * Math.exp(-deltaY * WHEEL_SCALE_K))
-}
-
-let scalePersist: ReturnType<typeof setTimeout> | undefined
-
-/**
- * Resize the floating pet. Updates `$petInfo` synchronously so the on-screen pet
- * (and the slider) react on the same frame, then debounce-persists to
- * `display.pet.scale` so a slider drag fires one RPC, not one per pixel. No poll
- * or event needed — the pet already renders from `$petInfo.scale`.
- */
-export function setPetScale(request: GatewayRequest, scale: number): void {
-  const next = clampPetScale(scale)
-
-  setPetInfo({ ...$petInfo.get(), scale: next })
-
-  clearTimeout(scalePersist)
-  scalePersist = setTimeout(() => {
-    petRpc<{ ok: boolean; scale?: number }>(request, 'pet.scale', { scale: next })
-      .then(result => {
-        // Reconcile with the server's clamp (cheap; only matters at the bounds).
-        if (typeof result?.scale === 'number' && result.scale !== $petInfo.get().scale) {
-          setPetInfo({ ...$petInfo.get(), scale: result.scale })
-        }
-      })
-      .catch(() => {
-        // Cosmetic — the pet already resized; persistence self-heals next write.
-      })
-  }, 200)
-}
+export { clampPetScale, nextScaleFromWheel, PET_SCALE_DEFAULT, PET_SCALE_MAX, PET_SCALE_MIN, setPetScale } from './pet-scale'
 
 /** Export a pet as a `.zip` (pet.json + spritesheet) and save it via the browser. */
 export async function exportPet(request: GatewayRequest, slug: string, fallback: string): Promise<boolean> {

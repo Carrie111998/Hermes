@@ -8,10 +8,14 @@ import { useLocation } from 'react-router'
 
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import { Thread } from '@/components/assistant-ui/thread'
+import {
+  TranscriptLayoutProvider,
+  useTranscriptLayoutIndex
+} from '@/components/assistant-ui/thread/transcript-layout'
 import { TranscriptWindowProvider } from '@/components/assistant-ui/thread/transcript-window'
 import { Backdrop } from '@/components/Backdrop'
 import { COMPOSER_HEART_CONFIG, HeartField } from '@/components/chat/vibe-hearts'
-import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
+import { usePaneLifecycle, usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { $sessionTileDragging, $sessionTileEdgeHover } from '@/components/pane-shell/tree/store'
 import { PromptOverlays } from '@/components/prompt-overlays'
 import { Button } from '@/components/ui/button'
@@ -30,6 +34,7 @@ import { $pinnedSessionIds } from '@/store/layout'
 import { $petActive } from '@/store/pet'
 import { $petOverlayActive } from '@/store/pet-overlay'
 import { $activeGatewayProfile, $gatewaySwapTarget, $profiles } from '@/store/profile'
+import { useRuntimeTranscript } from '@/store/runtime-session-stores'
 import {
   $contextSuggestions,
   $freshDraftReady,
@@ -233,8 +238,12 @@ function ChatRuntimeBoundary({
 }: ChatRuntimeBoundaryProps) {
   const view = useSessionView()
   const runtimeId = useStore(view.$runtimeId)
+  const visible = usePaneVisible()
+  const runtimeTranscript = useRuntimeTranscript(runtimeId, visible)
   const storeMessages = useMessagesWhileVisible(view.$messages)
-  const messages = suppressMessages ? NO_MESSAGES : storeMessages
+  // A bound runtime reads its independently publishable transcript channel.
+  // The view atom remains the draft/cold-resume fallback before that binding.
+  const messages = suppressMessages ? NO_MESSAGES : runtimeId ? runtimeTranscript.messages : storeMessages
 
   const [windowPages, setWindowPages] = useState(1)
   const [windowSessionKey, setWindowSessionKey] = useState(runtimeId)
@@ -258,7 +267,12 @@ function ChatRuntimeBoundary({
     return next.window
   }, [messages, windowPages])
 
-  const runtimeMessageRepository = useRuntimeMessageRepository(windowedMessages)
+  const runtimeMessageRepository = useRuntimeMessageRepository(windowedMessages, runtimeTranscript.operation.kind)
+
+  const transcriptLayout = useTranscriptLayoutIndex(
+    runtimeMessageRepository.messages.map(item => item.message),
+    runtimeMessageRepository.operation
+  )
 
   const storedId = useStore(view.$storedId)
   // Subscribed (not read imperatively) so the "Show earlier" affordance
@@ -312,7 +326,9 @@ function ChatRuntimeBoundary({
 
   return (
     <TranscriptWindowProvider value={transcriptWindow}>
-      <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
+      <TranscriptLayoutProvider value={transcriptLayout}>
+        <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
+      </TranscriptLayoutProvider>
     </TranscriptWindowProvider>
   )
 }
@@ -354,6 +370,7 @@ export const ChatView = memo(function ChatView({
   // The view this surface renders: the primary route-driven session (global
   // atoms) or a tile's session slice — same component either way.
   const view = useSessionView()
+  const paneLifecycle = usePaneLifecycle()
   const composerScope = useComposerScope()
   const isPrimary = view.kind === 'primary'
   const activeSessionId = useStore(view.$runtimeId)
@@ -592,19 +609,21 @@ export const ChatView = memo(function ChatView({
           data-slot="composer-bounds"
           {...dropHandlers}
         >
-          <Thread
-            clampToComposer={showChatBar}
-            cwd={currentCwd}
-            gateway={gateway}
-            intro={showIntro ? { personality: introPersonality, seed: introSeed } : undefined}
-            loading={threadLoading}
-            onBranchInNewChat={onBranchInNewChat}
-            onCancel={haltRun}
-            onDismissError={onDismissError}
-            onRestoreToMessage={onRestoreToMessage}
-            sessionId={activeSessionId}
-            sessionKey={threadKey}
-          />
+          {paneLifecycle === 'visible' && (
+            <Thread
+              clampToComposer={showChatBar}
+              cwd={currentCwd}
+              gateway={gateway}
+              intro={showIntro ? { personality: introPersonality, seed: introSeed } : undefined}
+              loading={threadLoading}
+              onBranchInNewChat={onBranchInNewChat}
+              onCancel={haltRun}
+              onDismissError={onDismissError}
+              onRestoreToMessage={onRestoreToMessage}
+              sessionId={activeSessionId}
+              sessionKey={threadKey}
+            />
+          )}
           {resumeExhausted && routedSessionId && (
             <div className="absolute inset-0 z-10 grid place-items-center bg-(--ui-chat-surface-background) px-8 py-10">
               <ErrorState
