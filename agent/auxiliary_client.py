@@ -4904,7 +4904,10 @@ def _replan_synchronous_cache_sections(
     destination: _FallbackDestination,
 ) -> tuple[list, list]:
     """Strip source decoration and plan one synchronous destination locally."""
-    from agent.agent_runtime_helpers import plan_cache_sections_for_destination
+    from agent.agent_runtime_helpers import (
+        configured_cache_ttl,
+        plan_cache_sections_for_destination,
+    )
 
     return plan_cache_sections_for_destination(
         messages,
@@ -4913,6 +4916,12 @@ def _replan_synchronous_cache_sections(
         base_url=destination.base_url,
         api_mode=destination.api_mode or "",
         model=destination.model or "",
+        # Thread the operator's configured tier so auxiliary fallback
+        # requests stop regressing a configured 1h to the 5m default
+        # (#84733); the planner clamps per-destination (Qwen → 5m). There
+        # is no live agent here, so read the same config key agent_init
+        # snapshots into agent._cache_ttl.
+        cache_ttl=configured_cache_ttl(),
     )
 
 
@@ -6272,8 +6281,18 @@ def resolve_provider_client(
     if provider == "custom":
         custom_base = ""
         custom_key = ""
+        # Base passed to _wrap_if_needed for the Anthropic-wrap decision.  It
+        # normally equals custom_base, but anthropic_messages talks to the
+        # /anthropic surface directly, so it must keep the raw /anthropic base
+        # while the plain OpenAI client (created from custom_base below, and the
+        # OpenAI-wire fallback taken when the anthropic SDK is unavailable) still
+        # uses the /v1-rewritten base so it never lands on
+        # /anthropic/chat/completions.  Empty means "use custom_base". See #16254.
+        wrap_base = ""
         if explicit_base_url:
             custom_base = _to_openai_base_url(explicit_base_url).strip()
+            if api_mode == "anthropic_messages":
+                wrap_base = (explicit_base_url or "").strip().rstrip("/")
             custom_key = (
                 (explicit_api_key or "").strip()
                 or _scoped_key_env("OPENAI_API_KEY")
@@ -6330,7 +6349,7 @@ def resolve_provider_client(
             if _merged_custom:
                 extra["default_headers"] = _merged_custom
             client = _create_openai_client(api_key=custom_key, base_url=_clean_base, **extra)
-            client = _wrap_if_needed(client, final_model, custom_base, custom_key)
+            client = _wrap_if_needed(client, final_model, wrap_base or custom_base, custom_key)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                     else (client, final_model))
         # Try custom first, then API-key providers (Codex excluded here:
