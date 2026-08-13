@@ -5,10 +5,14 @@ broker secret is read from a root-owned file only while minting that lease.
 It is never persisted in the manager, included in errors, or exposed to MCP
 tool/model surfaces.
 
-The mint request carries only ``{action, app_slug}``: the per-user Pipedream
-identity is resolved SERVER-SIDE by the desktop-runtime-session edge function
-from the profile that owns the broker secret.  No per-app grant handle,
-catalog, alias or client-side identity key is sent or required.
+The mint request carries ``{action, app_slug}`` plus, when the profile's
+managed server entry configures them, the profile's own Pipedream identity —
+``external_user_id`` and ``account_id`` straight from Pipedream's developer
+docs (``x-pd-external-user-id`` / ``x-pd-account-id``).  Under multiplex every
+profile owns its MCP entries, so this identity is per-profile by construction.
+No grant handle, catalog, alias, registry or evaOS-invented identity key is
+involved; without the configured identity the server rejects the mint (the
+legacy grant-header path is server-side back-compat only).
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ import httpx
 
 _APP_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _ACCOUNT_ID_RE = re.compile(r"^apn_[A-Za-z0-9_-]+$")
+_EXTERNAL_USER_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,180}$")
 _CREDENTIAL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _LEASE_ENDPOINT_PATH = "/functions/v1/desktop-runtime-session"
 _MCP_ORIGIN = ("https", "remote.mcp.pipedream.net")
@@ -52,6 +57,8 @@ class _LeaseSourceMaterial:
     endpoint: str
     broker_secret: str
     app_slug: str
+    external_user_id: Optional[str] = None
+    account_id: Optional[str] = None
 
 
 @dataclass(frozen=True, repr=False)
@@ -94,6 +101,8 @@ class EvaosLeaseSource:
         *,
         profile_key: str,
         app_slug: str,
+        external_user_id: Optional[str] = None,
+        account_id: Optional[str] = None,
         secret_reader: Optional[Callable[[str], Optional[str]]] = None,
         profile_resolver: Optional[Callable[[], str]] = None,
         root_uid: int = 0,
@@ -103,8 +112,21 @@ class EvaosLeaseSource:
             raise EvaosLeaseError("managed MCP profile authority is missing")
         if not isinstance(app_slug, str) or not _APP_SLUG_RE.fullmatch(app_slug):
             raise EvaosLeaseError("managed MCP app slug is invalid")
+        if (external_user_id is None) != (account_id is None):
+            raise EvaosLeaseError(
+                "managed MCP external_user_id and account_id must be configured together"
+            )
+        if external_user_id is not None:
+            if not isinstance(external_user_id, str) or not _EXTERNAL_USER_ID_RE.fullmatch(
+                external_user_id
+            ):
+                raise EvaosLeaseError("managed MCP external user id is invalid")
+            if not isinstance(account_id, str) or not _ACCOUNT_ID_RE.fullmatch(account_id):
+                raise EvaosLeaseError("managed MCP account id is invalid")
         self._profile_key = profile_key
         self._app_slug = app_slug
+        self._external_user_id = external_user_id
+        self._account_id = account_id
         self._secret_reader = secret_reader or _default_secret_reader
         self._profile_resolver = profile_resolver or _default_profile_resolver
         self._root_uid = root_uid
@@ -271,6 +293,8 @@ class EvaosLeaseSource:
             endpoint=self._endpoint(),
             broker_secret=self._broker_secret(),
             app_slug=self._app_slug,
+            external_user_id=self._external_user_id,
+            account_id=self._account_id,
         )
 
 
@@ -362,6 +386,9 @@ class EvaosLeaseManager:
             "action": "pipedream_mcp_lease",
             "app_slug": material.app_slug,
         }
+        if material.external_user_id is not None:
+            request_body["external_user_id"] = material.external_user_id
+            request_body["account_id"] = material.account_id
         try:
             response = await self._transport(
                 material.endpoint, request_headers, request_body
@@ -385,10 +412,20 @@ class EvaosLeaseManager:
             payload = response.json()
         except Exception as exc:
             raise EvaosLeaseError("managed MCP lease response is malformed") from exc
-        return self._parse_lease(payload, expected_app_slug=material.app_slug)
+        return self._parse_lease(
+            payload,
+            expected_app_slug=material.app_slug,
+            expected_external_user_id=material.external_user_id,
+            expected_account_id=material.account_id,
+        )
 
     def _parse_lease(
-        self, payload: Any, *, expected_app_slug: str
+        self,
+        payload: Any,
+        *,
+        expected_app_slug: str,
+        expected_external_user_id: Optional[str] = None,
+        expected_account_id: Optional[str] = None,
     ) -> EvaosMcpLease:
         if not isinstance(payload, dict) or set(payload) != {
             "mcp_url",
@@ -429,6 +466,14 @@ class EvaosLeaseManager:
             or len(headers["Authorization"]) <= len("Bearer ")
             or headers.get("x-pd-app-slug") != expected_app_slug
             or _ACCOUNT_ID_RE.fullmatch(headers.get("x-pd-account-id", "")) is None
+            or (
+                expected_external_user_id is not None
+                and headers.get("x-pd-external-user-id") != expected_external_user_id
+            )
+            or (
+                expected_account_id is not None
+                and headers.get("x-pd-account-id") != expected_account_id
+            )
         ):
             raise EvaosLeaseError("managed MCP lease response is malformed")
         raw_expiry = payload.get("expires_at")

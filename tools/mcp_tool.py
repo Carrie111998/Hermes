@@ -2006,6 +2006,23 @@ class MCPServerTask:
             or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", app_slug) is None
         ):
             raise EvaosLeaseError("managed MCP app slug is invalid")
+        external_user_id = config.get("external_user_id")
+        account_id = config.get("account_id")
+        if (external_user_id is None) != (account_id is None):
+            raise EvaosLeaseError(
+                "managed MCP external_user_id and account_id must be configured together"
+            )
+        if external_user_id is not None:
+            if (
+                not isinstance(external_user_id, str)
+                or re.fullmatch(r"[A-Za-z0-9._:-]{1,180}", external_user_id) is None
+            ):
+                raise EvaosLeaseError("managed MCP external user id is invalid")
+            if (
+                not isinstance(account_id, str)
+                or re.fullmatch(r"apn_[A-Za-z0-9_-]+", account_id) is None
+            ):
+                raise EvaosLeaseError("managed MCP account id is invalid")
 
     def _warn_evaos_lease_failure(self, exc: Exception) -> None:
         if self._evaos_lease_warning_emitted:
@@ -2869,6 +2886,8 @@ class MCPServerTask:
                 source = EvaosLeaseSource(
                     profile_key=self.registration_home,
                     app_slug=config["app_slug"],
+                    external_user_id=config.get("external_user_id"),
+                    account_id=config.get("account_id"),
                 )
                 self._evaos_lease_manager = EvaosLeaseManager(
                     source=source, on_mint_failure=self._warn_evaos_lease_failure
