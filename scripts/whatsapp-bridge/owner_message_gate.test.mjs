@@ -38,6 +38,20 @@ test('configured owner command in a direct customer chat bypasses the self-chat 
   assert.deepEqual(decision, { action: 'forward_owner', command: 'foto' });
 });
 
+test('configured owner command accepts an exact bare command', () => {
+  const decision = classifySelfChatOwnerCommand({
+    fromMe: true,
+    chatId: '111600547700784@lid',
+    isSelfChat: false,
+    messageId: 'M-COMMAND-BARE-1',
+    recentlySent: makeRecentlySent(),
+    ownerCommands: ['v'],
+    messageContent: { conversation: '/v' },
+  });
+
+  assert.deepEqual(decision, { action: 'forward_owner', command: 'v' });
+});
+
 test('bridge mode gate routes only a matching self-chat owner command as owner', () => {
   const decision = classifyOwnerMessageGate({
     mode: 'self-chat',
@@ -100,7 +114,7 @@ test('self-chat owner command gate rejects every non-command ingress shape', asy
     ['broadcast', { chatId: '12345@broadcast' }],
     ['newsletter', { chatId: '12345@newsletter' }],
     ['empty config', { ownerCommands: [] }],
-    ['command without args', { messageContent: { conversation: '/foto' } }],
+    ['unconfigured bare command', { messageContent: { conversation: '/v' } }],
     ['command prefix collision', { messageContent: { conversation: '/fotoextra X' } }],
     ['command embedded in prose', { messageContent: { conversation: 'please /foto X' } }],
     ['image caption', { messageContent: { imageMessage: { caption: '/foto X' } } }],

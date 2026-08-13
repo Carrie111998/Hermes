@@ -113,7 +113,7 @@ export function classifySelfChatOwnerCommand({
     return { action: 'drop' };
   }
 
-  const match = text.trim().match(/^\/([^\s/]+)\s+(\S(?:.*\S)?)$/u);
+  const match = text.trim().match(/^\/([^\s/]+)(?:\s+(\S(?:.*\S)?))?$/u);
   if (!match) return { action: 'drop' };
 
   const command = match[1].toLowerCase();

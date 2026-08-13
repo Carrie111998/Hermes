@@ -34,6 +34,12 @@ import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate, parseOwnerCommands } from './owner_message_gate.js';
 import {
+  captureUpsertChatContext,
+  createRecentChatContextStore,
+  installChatContextRoute,
+  isDirectChatId,
+} from './chat_context.js';
+import {
   buildPollPayload,
   createReconnectScheduler,
   createVersionResolver,
@@ -272,6 +278,7 @@ const logger = pino({ level: 'warn' });
 // Message queue for polling
 const messageQueue = [];
 const MAX_QUEUE_SIZE = 100;
+const recentChatContext = createRecentChatContextStore();
 
 // Track recently sent message IDs.  Two purposes:
 //   1. Prevent echo-back loops with media in self-chat mode.
@@ -557,6 +564,28 @@ async function startSocket() {
         messageKeys: Object.keys(msg.message || {}),
       });
 
+      // Record direct-chat context before self-chat/allowlist ingress gates. This
+      // is local bridge state only: customer DMs remain blocked from Hermes,
+      // while standalone plugins can inspect recent text and downloaded media.
+      let event = null;
+      if (isDirectChatId(chatId)) {
+        event = await extractBridgeEvent({
+          msg,
+          chatId,
+          senderId,
+          senderNumber,
+          botIds,
+          isGroup: false,
+          downloadMedia: async (mediaMsg) => downloadMediaMessage(mediaMsg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage }),
+          cacheDirs: {
+            image: IMAGE_CACHE_DIR,
+            document: DOCUMENT_CACHE_DIR,
+            audio: AUDIO_CACHE_DIR,
+          },
+        });
+        captureUpsertChatContext(recentChatContext, event, msg);
+      }
+
       // Handle fromMe messages based on mode
       let fromOwner = false;
       let ownerCommand = false;
@@ -737,7 +766,7 @@ async function startSocket() {
         continue;
       }
 
-      const event = await extractBridgeEvent({
+      event ??= await extractBridgeEvent({
         msg,
         chatId,
         senderId,
@@ -831,6 +860,8 @@ app.use((req, res, next) => {
   }
   next();
 });
+
+installChatContextRoute(app, recentChatContext);
 
 // Poll for new messages (long-poll style)
 app.get('/messages', (req, res) => {
