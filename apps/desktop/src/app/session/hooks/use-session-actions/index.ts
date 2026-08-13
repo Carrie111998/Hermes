@@ -63,6 +63,7 @@ import {
 import {
   $sessionTiles,
   closeSessionTile,
+  discardSessionTile,
   dropSessionState,
   openSessionTile,
   patchSessionTile,
@@ -1702,16 +1703,25 @@ export function useSessionActions({
   )
 
   const archiveSession = useCallback(
-    async (storedSessionId: string) => {
+    async (storedSessionId: string, options?: { profile?: null | string }) => {
       clearNotifications()
 
       const archived = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
-      const wasSelected = selectedStoredSessionId === storedSessionId
+      // Callers may hold the stable lineage root while the backend row has
+      // rotated to a newer tip. Normalize every mutation/cleanup operation to
+      // that current row id when the row is cached.
+      const archivedStoredSessionId = archived?.id ?? storedSessionId
+
+      const wasSelected = archived
+        ? Boolean(selectedStoredSessionId && sessionMatchesStoredId(archived, selectedStoredSessionId))
+        : selectedStoredSessionId === storedSessionId
+
       const previousPinned = $pinnedSessionIds.get()
+
       // Pins are keyed on the durable lineage-root id; the stored id may be the
       // live tip after compression. Drop both so the pin can't linger.
       const archivedPinId = archived ? sessionPinId(archived) : storedSessionId
-      const archivedIds = [storedSessionId, archived?.id, archived?._lineage_root_id]
+      const archivedIds = [storedSessionId, archivedStoredSessionId, archived?._lineage_root_id]
 
       // Soft-hide: drop from the sidebar immediately, keep the data.
       setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
@@ -1719,23 +1729,38 @@ export function useSessionActions({
       beginSessionMutation(archivedIds)
       $pinnedSessionIds.set(previousPinned.filter(id => id !== storedSessionId && id !== archivedPinId))
 
-      if (wasSelected) {
-        startFreshSessionDraft(true)
-      }
-
       try {
-        await setSessionArchived(storedSessionId, true, archived?.profile)
+        const profile = options && 'profile' in options ? options.profile : archived?.profile
+        const cleanupProfiles = [...new Set([profile, archived?.profile])]
+
+        await setSessionArchived(archivedStoredSessionId, true, profile)
+
         // Archived rows never reach the sidebar, so their persisted unread can
         // only rot. Dropped after the RPC so a failed archive keeps it.
-        forgetSessionUnread(archivedIds, archived?.profile)
-        // An archived session is hidden from the sidebar; its tile must go too.
-        const tiledRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
-        closeSessionTile(storedSessionId)
+        cleanupProfiles.forEach(cleanupProfile => forgetSessionUnread(archivedIds, cleanupProfile))
 
-        if (tiledRuntimeId) {
-          runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
-          sessionStateByRuntimeIdRef.current.delete(tiledRuntimeId)
-          dropSessionState(tiledRuntimeId)
+        if (wasSelected) {
+          // Keep the foreground intact until the authoritative write succeeds;
+          // a rejected archive therefore needs no unsafe whole-view rollback.
+          startFreshSessionDraft(true)
+        }
+
+        // An archived session is hidden from the sidebar; its tile must go too.
+        const tileIds = [...new Set(archivedIds.filter((id): id is string => Boolean(id)))]
+
+        const tiledRuntimeIds = new Set(
+          tileIds.map(id => runtimeIdByStoredSessionIdRef.current.get(id)).filter((id): id is string => Boolean(id))
+        )
+
+        for (const cleanupProfile of cleanupProfiles) {
+          tileIds.forEach(id => discardSessionTile(id, cleanupProfile))
+        }
+
+        tileIds.forEach(id => runtimeIdByStoredSessionIdRef.current.delete(id))
+
+        for (const runtimeId of tiledRuntimeIds) {
+          sessionStateByRuntimeIdRef.current.delete(runtimeId)
+          dropSessionState(runtimeId)
         }
 
         notify({ durationMs: 2_000, kind: 'success', message: copy.archived })
@@ -1747,6 +1772,7 @@ export function useSessionActions({
         untombstoneSessions(archivedIds)
         $pinnedSessionIds.set(previousPinned)
         notifyError(err, copy.archiveFailed)
+        throw err
       } finally {
         endSessionMutation(archivedIds)
       }

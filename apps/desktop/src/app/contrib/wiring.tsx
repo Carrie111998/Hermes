@@ -843,7 +843,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       return
     }
 
-    void archiveSession(sessionId)
+    void archiveSession(sessionId).catch(() => undefined)
   }, [archiveSession])
 
   // Single global listener for every rebindable hotkey plus the on-screen
@@ -883,7 +883,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const nextActions: WiringActions = {
     onAddContextRef: composer.addContextRefAttachment,
     onAddUrl: url => composer.addContextRefAttachment(`@url:${formatRefValue(url)}`, url),
-    onArchiveSession: sessionId => void archiveSession(sessionId),
+    onArchiveSession: sessionId => void archiveSession(sessionId).catch(() => undefined),
     onAttachDroppedItems: composer.attachDroppedItems,
     onAttachImageBlob: composer.attachImageBlob,
     onAttachPrCommentUrl: composer.attachPrCommentUrl,

@@ -11,7 +11,8 @@ import {
   getLatestSessionMessages,
   getSession,
   type SessionInfo,
-  type SessionResumeResponse
+  type SessionResumeResponse,
+  setSessionArchived
 } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
@@ -29,6 +30,7 @@ import {
   $newChatWorkspaceTarget,
   $resumeFailedSessionId,
   $selectedStoredSessionId,
+  $sessions,
   $turnStartedAt,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
@@ -46,7 +48,7 @@ import {
   setSessions,
   setTurnStartedAt
 } from '@/store/session'
-import { $sessionTiles } from '@/store/session-states'
+import { $sessionTiles, openSessionTile } from '@/store/session-states'
 
 import sessionResumeActiveTurn from '../../../../../../tests/fixtures/session-resume-active-turn.json'
 import { sessionRoute } from '../../routes'
@@ -91,7 +93,7 @@ function deferred<T>() {
 
 type HarnessHandle = Pick<
   ReturnType<typeof useSessionActions>,
-  'createBackendSessionForSend' | 'selectSidebarItem' | 'startFreshSessionDraft'
+  'archiveSession' | 'createBackendSessionForSend' | 'selectSidebarItem' | 'startFreshSessionDraft'
 >
 
 function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
@@ -116,11 +118,13 @@ function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
 function Harness({
   navigate = vi.fn(),
   onReady,
-  requestGateway
+  requestGateway,
+  selectedStoredSessionId = null
 }: {
   navigate?: ReturnType<typeof vi.fn>
   onReady: (handle: HarnessHandle) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  selectedStoredSessionId?: string | null
 }) {
   const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
 
@@ -136,8 +140,8 @@ function Harness({
     requestGateway,
     resetViewSync: vi.fn(),
     runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
-    selectedStoredSessionId: null,
-    selectedStoredSessionIdRef: ref<string | null>(null),
+    selectedStoredSessionId,
+    selectedStoredSessionIdRef: ref<string | null>(selectedStoredSessionId),
     sessionStateByRuntimeIdRef: ref(new Map<string, ClientSessionState>()),
     syncSessionStateToView: vi.fn(),
     updateSessionState: () => ({}) as ClientSessionState
@@ -149,6 +153,76 @@ function Harness({
 
   return null
 }
+
+describe('archiveSession', () => {
+  afterEach(() => {
+    cleanup()
+    setActiveSessionId(null)
+    setSelectedStoredSessionId(null)
+    setSessions([])
+    $activeGatewayProfile.set('default')
+    $sessionTiles.set([])
+    vi.mocked(setSessionArchived).mockReset()
+  })
+
+  it('keeps the selected session in place when archive fails', async () => {
+    let handle: HarnessHandle | null = null
+    const session = storedSession({ id: 'tip-1', _lineage_root_id: 'root-1' })
+
+    setSessions([session])
+    setSelectedStoredSessionId('root-1')
+    setActiveSessionId('runtime-1')
+    vi.mocked(setSessionArchived).mockRejectedValueOnce(new Error('archive failed'))
+
+    render(
+      <Harness
+        onReady={value => (handle = value)}
+        requestGateway={async () => ({}) as never}
+        selectedStoredSessionId="root-1"
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await expect(handle!.archiveSession('root-1')).rejects.toThrow('archive failed')
+    expect($selectedStoredSessionId.get()).toBe('root-1')
+    expect($activeSessionId.get()).toBe('runtime-1')
+    expect($sessions.get()).toContainEqual(session)
+  })
+
+  it.each([
+    ['omitted', undefined, 'cached-profile'],
+    ['explicit null', { profile: null }, null],
+    ['empty', { profile: '' }, ''],
+    ['named', { profile: 'work' }, 'work']
+  ] as const)('preserves %s profile routing', async (_label, options, expectedProfile) => {
+    let handle: HarnessHandle | null = null
+
+    setSessions([storedSession({ profile: 'cached-profile' })])
+    vi.mocked(setSessionArchived).mockResolvedValueOnce({ ok: true })
+    render(<Harness onReady={value => (handle = value)} requestGateway={async () => ({}) as never} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await handle!.archiveSession('stored-1', options)
+    expect(setSessionArchived).toHaveBeenCalledWith('stored-1', true, expectedProfile)
+  })
+
+  it('cleans a cached named-profile tile when explicit null routes the mutation to default', async () => {
+    let handle: HarnessHandle | null = null
+
+    $activeGatewayProfile.set('work')
+    openSessionTile('stored-1')
+    $activeGatewayProfile.set('default')
+    setSessions([storedSession({ profile: 'work' })])
+    vi.mocked(setSessionArchived).mockResolvedValueOnce({ ok: true })
+    render(<Harness onReady={value => (handle = value)} requestGateway={async () => ({}) as never} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await handle!.archiveSession('stored-1', { profile: null })
+    $activeGatewayProfile.set('work')
+
+    expect($sessionTiles.get().some(tile => tile.storedSessionId === 'stored-1')).toBe(false)
+  })
+})
 
 function StoredIdRotationHarness({
   activeSessionIdRef,

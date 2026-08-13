@@ -24,6 +24,7 @@ import {
   listSidebarSessions,
   resetSidebarBatchCapability,
   setApiRequestProfile,
+  setSessionArchived,
   speakText,
   transcribeAudio,
   triggerCronJob
@@ -65,6 +66,23 @@ describe('Hermes REST helpers', () => {
         timeoutMs: 60_000
       })
     )
+  })
+
+  it.each([
+    ['omitted', undefined, false],
+    ['explicit null', null, true],
+    ['empty', '', true],
+    ['named', 'work', true]
+  ] as const)('preserves %s archive profile routing at the IPC boundary', async (_label, profile, hasProfile) => {
+    await setSessionArchived('stored-1', true, profile)
+
+    const request = api.mock.calls.at(-1)?.[0]
+
+    expect(Object.hasOwn(request, 'profile')).toBe(hasProfile)
+
+    if (hasProfile) {
+      expect(request.profile).toBe(profile)
+    }
   })
 
   it('uses a longer timeout for the all-profile session list', async () => {

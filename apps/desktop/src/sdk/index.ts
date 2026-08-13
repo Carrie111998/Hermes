@@ -49,7 +49,8 @@ import {
   $focusedRuntimeId,
   $focusedSessionState,
   $focusedStoredSessionId,
-  $sessionStates
+  $sessionStates,
+  sessionTileDelegate
 } from '@/store/session-states'
 import { runGatewayRestart } from '@/store/system-actions'
 import type { UsageStats } from '@/types/hermes'
@@ -312,6 +313,19 @@ export const host = {
   newChat: (profile?: null | string): void => {
     newSessionInProfile((profile ?? '').trim() || $activeGatewayProfile.get())
     window.location.hash = '#/'
+  },
+
+  /** Archive a durable stored session through Desktop's canonical action path.
+   *  This preserves optimistic list updates, pin/tile cleanup, selected-session
+   *  replacement, profile routing, rollback, and native user feedback. */
+  archiveSession: async (storedSessionId: string, options?: { profile?: null | string }): Promise<void> => {
+    const delegate = sessionTileDelegate()
+
+    if (!delegate) {
+      throw new Error('Hermes session actions unavailable')
+    }
+
+    await delegate.archiveSession(storedSessionId, options)
   },
 
   /** HEAR the gateway stream (message deltas, session lifecycle, tool
