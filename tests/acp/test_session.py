@@ -17,6 +17,35 @@ def _mock_agent():
     return MagicMock(name="MockAIAgent")
 
 
+def _construct_acp_agent(monkeypatch):
+    constructor_default = object()
+    calls = []
+
+    def fake_agent(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            model=kwargs.get("model"),
+            max_iterations=kwargs.get("max_iterations", constructor_default),
+        )
+
+    monkeypatch.setattr("run_agent.AIAgent", fake_agent)
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda requested=None: {},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda *args: None)
+
+    agent = SessionManager(db=MagicMock())._make_agent(
+        session_id="test-session",
+        cwd="/tmp/project",
+    )
+    return agent, calls[0], constructor_default
+
+
 @pytest.fixture()
 def manager():
     """SessionManager with a mock agent factory (avoids needing API keys)."""
@@ -109,6 +138,45 @@ class TestCreateSession:
         state = SessionManager(db=None).create_session(cwd="/tmp/project")
 
         assert state.agent.session_cwd == "/tmp/project"
+
+
+    def test_make_agent_uses_configured_max_turns(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "agent:\n  max_turns: 137\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        agent, kwargs, _ = _construct_acp_agent(monkeypatch)
+
+        assert kwargs["max_iterations"] == 137
+        assert agent.max_iterations == 137
+
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {},
+            {"agent": None},
+            {"agent": {"max_turns": None}},
+            {"agent": {"max_turns": "invalid"}},
+            {"agent": {"max_turns": 0}},
+            {"agent": {"max_turns": -1}},
+            {"agent": {"max_turns": True}},
+            {"agent": {"max_turns": 1.5}},
+        ],
+    )
+    def test_make_agent_preserves_constructor_default_for_missing_or_invalid_max_turns(
+        self,
+        monkeypatch,
+        config,
+    ):
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+
+        agent, kwargs, constructor_default = _construct_acp_agent(monkeypatch)
+
+        assert "max_iterations" not in kwargs
+        assert agent.max_iterations is constructor_default
 
 
 

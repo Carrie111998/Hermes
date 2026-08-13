@@ -144,6 +144,19 @@ def _expand_acp_enabled_toolsets(
     return expanded
 
 
+def _coerce_positive_int(value: Any) -> int | None:
+    """Return a positive integer config value, or ``None`` when invalid."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, float) and not value.is_integer():
+            return None
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 def _clear_task_cwd(task_id: str) -> None:
     """Remove task-specific cwd overrides for an ACP session."""
     if not task_id:
@@ -632,6 +645,12 @@ class SessionManager:
             "session_db": self._get_db(),
             "model": model or default_model,
         }
+        agent_cfg = config.get("agent")
+        max_iterations = _coerce_positive_int(
+            agent_cfg.get("max_turns") if isinstance(agent_cfg, dict) else None
+        )
+        if max_iterations is not None:
+            kwargs["max_iterations"] = max_iterations
 
         try:
             runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
