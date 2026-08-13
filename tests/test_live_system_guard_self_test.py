@@ -24,6 +24,8 @@ import types
 
 import pytest
 
+from tests.conftest import PROJECT_ROOT
+
 # A guaranteed-foreign PID: PID 1 (init).  Owned by root, not us, and
 # always exists. A sane guard refuses to signal it.
 FOREIGN_PID = 1
@@ -275,9 +277,188 @@ def test_subprocess_killall_hermes_blocked():
         subprocess.run(["killall", "hermes"])
 
 
+# ──────────────── destructive git vs. PROJECT_ROOT ─────────────
+#
+# A test that forgets to mock subprocess for a raw ``git checkout`` /
+# ``reset`` / ``clean`` / ``switch`` call must never let it run for real
+# against PROJECT_ROOT — this repo's own live checkout. That flips the
+# developer's actual branch or discards real uncommitted work; it happened
+# for real on 2026-08-11 (see Operations.md's isolated-clone-first rule).
+# The ``hermes update`` check above only catches commands that go through
+# ``hermes update`` itself — this catches the raw git command directly.
+
+
+def test_subprocess_run_git_checkout_project_root_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["git", "checkout", "main"], cwd=PROJECT_ROOT)
+
+
+def test_subprocess_run_git_reset_hard_project_root_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["git", "reset", "--hard"], cwd=PROJECT_ROOT)
+
+
+def test_subprocess_run_git_clean_project_root_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["git", "clean", "-fd"], cwd=PROJECT_ROOT)
+
+
+def test_subprocess_run_git_switch_project_root_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["git", "switch", "main"], cwd=PROJECT_ROOT)
+
+
+def test_subprocess_run_bash_c_git_reset_project_root_blocked():
+    """``bash -c "git reset --hard"`` must also be caught."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(
+            ["bash", "-c", "git reset --hard"], cwd=PROJECT_ROOT
+        )
+
+
+def test_subprocess_run_git_reset_no_cwd_kwarg_uses_process_cwd(monkeypatch):
+    """No explicit ``cwd=`` means git runs against the process's actual
+    cwd — must still be caught when that happens to be PROJECT_ROOT."""
+    monkeypatch.chdir(PROJECT_ROOT)
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["git", "reset", "--hard"])
+
+
+def test_subprocess_popen_git_checkout_project_root_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.Popen(["git", "checkout", "main"], cwd=PROJECT_ROOT)
+
+
+# ``git stash push`` is the verb that actually caused BOTH real incidents
+# (2026-08-11 and 2026-08-12), via `hermes update`'s autostash reaching
+# PROJECT_ROOT from inside a test. It leaves `git status` clean and writes
+# `reset: moving to HEAD` to the reflog, so it reads exactly like a hard
+# reset — the work is recoverable from `git stash list`, but only if you
+# know to look. It was missing from the original verb list.
+
+
+def test_subprocess_run_git_stash_push_project_root_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(
+            ["git", "stash", "push", "--include-untracked", "-m", "x"],
+            cwd=PROJECT_ROOT,
+        )
+
+
+def test_subprocess_run_bare_git_stash_project_root_blocked():
+    """Bare ``git stash`` is ``git stash push`` — must be caught."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["git", "stash"], cwd=PROJECT_ROOT)
+
+
+def test_subprocess_run_git_stash_pop_project_root_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["git", "stash", "pop"], cwd=PROJECT_ROOT)
+
+
+def test_subprocess_run_git_restore_project_root_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["git", "restore", "."], cwd=PROJECT_ROOT)
+
+
+# `git -C <path> ...` retargets the command regardless of cwd. A cwd-only
+# check misses it entirely — and hermes_cli/mcp_catalog.py genuinely builds
+# `git -C <dest> checkout <ref>`, so this shape exists in production code.
+
+
+def test_git_dash_c_checkout_targeting_project_root_blocked(tmp_path):
+    """cwd is an innocent tmp dir; `-C` aims it at PROJECT_ROOT."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "checkout", "main"], cwd=tmp_path
+        )
+
+
+def test_git_work_tree_flag_targeting_project_root_blocked(tmp_path):
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(
+            ["git", f"--work-tree={PROJECT_ROOT}", "reset", "--hard"], cwd=tmp_path
+        )
+
+
+def test_git_dash_c_stash_targeting_project_root_blocked(tmp_path):
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "stash", "push"], cwd=tmp_path
+        )
+
+
 # ──────────────────── pass-through cases (must NOT raise) ──────
 
 
+def test_git_dash_c_checkout_isolated_dir_allowed(tmp_path):
+    """`-C` aimed somewhere harmless must still pass through."""
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    result = subprocess.run(
+        ["git", "-C", str(tmp_path), "checkout", "-b", "throwaway"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_git_stash_list_project_root_allowed():
+    """``git stash list``/``show`` only READ — blocking them would break
+    legitimate tests and diagnostics for no safety gain."""
+    result = subprocess.run(
+        ["git", "stash", "list"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_git_stash_push_allowed_when_cwd_is_isolated(tmp_path):
+    # A real repo WITH an initial commit: `git stash` refuses outright on a
+    # repo that has none ("You do not have the initial commit yet"), which
+    # would pass the guard for the wrong reason.
+    def git(*args, **kwargs):
+        return subprocess.run(["git", *args], cwd=tmp_path, **kwargs)
+
+    git("init", "-q", check=True)
+    git("config", "user.email", "test@example.com", check=True)
+    git("config", "user.name", "Test", check=True)
+    (tmp_path / "f.txt").write_text("x")
+    git("add", "f.txt", check=True)
+    git("commit", "-qm", "initial", check=True)
+
+    (tmp_path / "f.txt").write_text("modified")
+    result = git("stash", "push", "-m", "throwaway", capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def test_git_checkout_allowed_when_cwd_is_isolated(tmp_path):
+    # Real git repo at tmp_path so the underlying command runs cleanly
+    # instead of just failing with "not a git repository" — that proves
+    # the GUARD let it through, not that git itself refused for some
+    # unrelated reason.
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    result = subprocess.run(
+        ["git", "checkout", "-b", "throwaway"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_git_rev_parse_project_root_allowed():
+    # Read-only git commands (status, rev-parse, log, ...) are not the
+    # risk this guard exists for — only checkout/reset/clean/switch are.
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 
