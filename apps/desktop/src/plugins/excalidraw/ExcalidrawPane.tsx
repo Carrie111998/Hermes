@@ -151,6 +151,17 @@ export function ExcalidrawPane({ identity }: ExcalidrawPaneProps) {
     })
   }, [controller])
 
+  if (state?.status === 'error') {
+    return (
+      <div className="flex size-full min-h-0 flex-col items-center justify-center gap-2 p-6 text-center">
+        <strong>Could not load drawing</strong>
+        <span className="text-muted-foreground text-sm">
+          {state.error instanceof Error ? state.error.message : String(state.error || 'Unknown error')}
+        </span>
+      </div>
+    )
+  }
+
   if (!controller || !initialData || !state) {
     return <div>Loading drawing…</div>
   }
