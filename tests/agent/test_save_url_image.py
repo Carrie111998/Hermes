@@ -104,7 +104,9 @@ class TestSaveUrlImage:
         assert path.read_bytes() == PNG_1PX
         # The cache directory must be under HERMES_HOME — gateway cleanup
         # relies on this being the canonical location.
-        assert "cache/images" in str(path)
+        # Compare path components, not a "/"-joined substring: on Windows the
+        # separator is "\\" and the substring check fails on a correct path.
+        assert path.parent.parts[-2:] == ("cache", "images")
         assert path.suffix == ".png"
 
     def test_extension_inferred_from_content_type(self, http_server):

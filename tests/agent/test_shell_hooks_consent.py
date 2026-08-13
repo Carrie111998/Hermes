@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import os
 import pytest
 
 from agent import shell_hooks
@@ -200,7 +201,15 @@ class TestAllowlistOps:
 
     def test_tilde_path_approval_records_resolvable_mtime(self, tmp_path, monkeypatch):
         """If the command uses ~ the approval must still find the file."""
+        # `ntpath.expanduser` resolves `~` from USERPROFILE (then
+        # HOMEDRIVE+HOMEPATH) and never consults HOME, so setting HOME alone
+        # leaves `~` pointing at the real profile on Windows and the fixture
+        # script is nowhere near it. Set whatever this platform actually reads.
         monkeypatch.setenv("HOME", str(tmp_path))
+        if os.name == "nt":
+            monkeypatch.setenv("USERPROFILE", str(tmp_path))
+            monkeypatch.delenv("HOMEDRIVE", raising=False)
+            monkeypatch.delenv("HOMEPATH", raising=False)
         target = tmp_path / "hook.sh"
         target.write_text("#!/usr/bin/env bash\n")
         target.chmod(0o755)

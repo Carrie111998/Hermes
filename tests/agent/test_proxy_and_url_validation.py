@@ -45,7 +45,16 @@ def test_proxy_env_normalizes_socks_alias(monkeypatch):
 ])
 def test_proxy_env_rejects_malformed_port(monkeypatch, key):
     monkeypatch.setenv(key, "http://127.0.0.1:6153export")
-    with pytest.raises(RuntimeError, match=rf"Malformed proxy environment variable {key}=.*6153export"):
+    # Windows environment names are case-insensitive and `os.environ`
+    # canonicalizes them to upper case, so `http_proxy` and `HTTP_PROXY` are one
+    # variable there and the error can only name the canonical spelling. On
+    # POSIX they are genuinely distinct and the exact spelling must be echoed,
+    # otherwise the message points the user at a variable they have not set.
+    expected_key = key.upper() if os.name == "nt" else key
+    with pytest.raises(
+        RuntimeError,
+        match=rf"Malformed proxy environment variable {expected_key}=.*6153export",
+    ):
         _validate_proxy_env_urls()
 
 

@@ -134,6 +134,16 @@ def test_resolve_workspace_falls_back_to_file_location(tmp_path: Path, monkeypat
 
 
 def test_normalize_path_expands_tilde(monkeypatch):
-    monkeypatch.setenv("HOME", "/home/user")
+    # `ntpath.expanduser` reads USERPROFILE (then HOMEDRIVE+HOMEPATH) and
+    # ignores HOME entirely, so on Windows setting HOME alone leaves `~`
+    # pointing at the real profile. Set what this platform actually reads and
+    # assert against that same value.
+    home = "/home/user"
+    monkeypatch.setenv("HOME", home)
+    if os.name == "nt":
+        home = r"C:\home\user"
+        monkeypatch.setenv("USERPROFILE", home)
+        monkeypatch.delenv("HOMEDRIVE", raising=False)
+        monkeypatch.delenv("HOMEPATH", raising=False)
     p = normalize_path("~/x.py")
-    assert p == os.path.abspath("/home/user/x.py")
+    assert p == os.path.abspath(os.path.join(home, "x.py"))

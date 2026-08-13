@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Set
 
 from agent.prompt_builder import _scan_context_content
+from agent.shell_tokens import split_command
 
 logger = logging.getLogger(__name__)
 
@@ -149,8 +150,13 @@ class SubdirectoryHintTracker:
 
     def _extract_paths_from_command(self, cmd: str, candidates: Set[Path]):
         """Extract path-like tokens from a shell command string."""
+        # Uses `split_command`, not `shlex.split`: the latter runs in POSIX
+        # mode, where a backslash is an escape and is consumed, so on Windows
+        # ``cat C:\\proj\\app\\index.ts`` tokenises to ``C:projappindex.ts``.
+        # That resolves to nothing, and no hint was ever extracted from a shell
+        # command on the only platform Hermes runs on.
         try:
-            tokens = shlex.split(cmd)
+            tokens = split_command(cmd)
         except ValueError:
             tokens = cmd.split()
 
@@ -158,8 +164,8 @@ class SubdirectoryHintTracker:
             # Skip flags
             if token.startswith("-"):
                 continue
-            # Must look like a path (contains / or .)
-            if "/" not in token and "." not in token:
+            # Must look like a path (contains a separator or a dot)
+            if not any(c in token for c in ("/", ".", "\\")):
                 continue
             # Skip URLs
             if token.startswith(("http://", "https://", "git@")):
