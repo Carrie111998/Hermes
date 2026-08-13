@@ -69,6 +69,17 @@ def run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
     raising, so one bad snippet can't wreck the whole skill message.
     """
     _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
+    # Same central env factory as every other spawn surface: the snippet gets
+    # the session-context stamps (HERMES_SESSION_*, the write-only Desktop
+    # connection-mode stamp) and passes through the inherited-value scrub —
+    # a value inherited from the user's shell is stripped, never honored.
+    try:
+        from tools.environments.local import build_subprocess_env
+
+        _run_env = build_subprocess_env()
+    except Exception:
+        logger.debug("build_subprocess_env unavailable for inline shell", exc_info=True)
+        _run_env = None
     try:
         completed = subprocess.run(
             ["bash", "-c", command],
@@ -78,6 +89,7 @@ def run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
             timeout=max(1, int(timeout)),
             check=False,
             stdin=subprocess.DEVNULL,
+            env=_run_env,
             **_popen_kwargs,
         )
     except subprocess.TimeoutExpired:
