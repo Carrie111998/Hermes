@@ -4981,6 +4981,24 @@ def _provider_field_entry(field: ProviderField) -> Dict[str, Any]:
     }
 
 
+def _stored_select_option(value: str) -> Dict[str, Any]:
+    """Represent a stored value that this surface deliberately cannot select.
+
+    Older versions, another Hermes surface, or a hand-edited provider config
+    can contain a valid runtime value outside the Desktop declaration. Showing
+    that value honestly is read-only: the declared options still remain the
+    write allow-list enforced by ``_coerce_field_value``.
+    """
+
+    label = value.replace("_", " ").replace("-", " ").title()
+    return {
+        "value": value,
+        "label": label,
+        "description": "This stored value is not selectable in Desktop.",
+        "disabled": True,
+    }
+
+
 # Sentinel: remove this key so it falls back to the host or built-in default.
 _UNSET: Any = object()
 
@@ -5180,7 +5198,10 @@ def _declared_provider_payload(provider: ProviderConfigSchema) -> Dict[str, Any]
 
         value = _serialize_field_value(field, native)
         if field.kind == "select" and value not in field.allowed_values():
-            value = field.default
+            if native is None:
+                value = field.default
+            else:
+                entry["options"].append(_stored_select_option(value))
         entry["value"] = value
         # Presence, not truthiness — a stored False/0 is still "set".
         entry["is_set"] = native is not None if is_honcho else bool(value)
