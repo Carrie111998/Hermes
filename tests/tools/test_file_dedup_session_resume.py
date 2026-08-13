@@ -263,7 +263,9 @@ class TestResumeDedupHandoffRealTurns(unittest.TestCase):
         # Turn 1 — old session reads the file (real dispatch).
         tid1, _ = _run_turn(self._agent, self._tmpfile, self._ops)
         self.assertIn(tid1, _read_tracker)
-        self.assertNotIn("dedup_hits", _read_tracker[tid1].get("dedup_hits", {}) or {})
+        # First read: no dedup hits yet (the file was fetched, not served from
+        # cache). Assert the hit count is zero rather than a vacuous key check.
+        self.assertEqual(len(_read_tracker[tid1].get("dedup_hits", {})), 0)
         # One real content fetch so far.
         self.assertEqual(self._ops.refetch_count, 1)
 

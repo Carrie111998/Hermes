@@ -2024,7 +2024,17 @@ def transfer_file_dedup(
     previous session returns the cheap "File unchanged" stub instead of
     re-fetching the bytes.  The ``mtime`` guard inside ``read_file_tool``
     still invalidates a stale entry if the file changed on disk between
-    sessions, so correctness is preserved.
+    sessions.
+
+    Scope: this is intended for a mid-chat ``/resume`` of the *same* session
+    (restart, reconnect), where the rehydrated transcript already holds the
+    file's content so a cache hit is correct.  For ``/resume <other_session>``
+    the carried cache can also suppress a read for a file whose content is
+    NOT in the resumed transcript — the mtime guard does not catch that
+    (the file is unchanged on disk), so after enough such stubs the tool's
+    repeated-read throttle can block the agent until it re-reads.  Callers
+    that resume a *different* session and want a clean cache should call
+    ``reset_file_dedup`` on the new id rather than transferring.
 
     Returns ``True`` if a non-empty tracker was moved, ``False`` otherwise
     (no source tracker, missing ids, or the target already has its own
