@@ -2493,7 +2493,7 @@ DEFAULT_CONFIG = {
         # lets the host CLI pick its own default. A card's model_override
         # wins only when it names a Claude model; a card pinned to another
         # vendor's model falls back here rather than routing off-lane.
-        "claude_cli_permission_mode": "bypassPermissions",
+        "claude_cli_model": "",
         # --permission-mode for the run, used only when claude_cli_extra_args
         # carries no permission flag of its own. A detached worker has no
         # terminal and nobody to approve a tool call, so the default matches
@@ -2501,7 +2501,7 @@ DEFAULT_CONFIG = {
         # empty string to add no flag at all (read-only lane) — note the
         # lifecycle protocol needs shell access to run `hermes kanban
         # complete` / `block`, which is granted separately via --allowedTools.
-        "claude_cli_model": "",
+        "claude_cli_permission_mode": "bypassPermissions",
         # Extra argv appended before the prompt. YAML list, or a shell-quoted
         # string. For operator escape hatches (--add-dir, --settings, ...).
         "claude_cli_extra_args": [],

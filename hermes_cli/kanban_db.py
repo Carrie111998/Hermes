@@ -10651,6 +10651,39 @@ def _claude_cli_goal_mode_prompt(task: Task) -> str:
     )
 
 
+def _claude_cli_skills_prompt(task: Task) -> str:
+    """Return the force-loaded-skills section for the prompt, or ``""``.
+
+    The native lane forwards ``task.skills`` as ``--skills X`` pairs, which
+    Hermes resolves into the worker's system prompt before the first turn.
+    The host CLI has no equivalent flag, so while this lane was opt-in the
+    field was simply dropped and documented as native-only.
+
+    That became load-bearing when the review handoff lifecycle landed: a
+    claimed review card has ``sdlc-review`` force-appended to ``task.skills``
+    because that skill *is* the review logic (AC verification, merge). With
+    this lane global, dropping the field would hand every review card a
+    worker that does not know how to review — and it would look like a
+    normal run, not a misconfiguration.
+
+    Naming the skills in the prompt is the closest honest equivalent: the
+    worker loads them itself via its Skill tool. That is weaker than the
+    native lane's guarantee — it is an instruction, not an injection, so a
+    worker can ignore it where a native worker could not.
+    """
+    names = [str(sk).strip() for sk in (task.skills or []) if str(sk).strip()]
+    if not names:
+        return ""
+    listed = ", ".join(f"`{n}`" for n in names)
+    return (
+        f"\n\nRequired skills: {listed}. Load each one with your Skill tool "
+        "before you start, and follow it — these carry the procedure this "
+        "card is expected to follow, not background reading. If a skill will "
+        "not load, block with `--kind capability` naming it rather than "
+        "improvising the procedure yourself."
+    )
+
+
 def _claude_cli_worker_prompt(task: Task, workspace: str) -> str:
     """Build the self-contained worker prompt for the direct-CLI lane.
 
@@ -10719,6 +10752,7 @@ def _claude_cli_worker_prompt(task: Task, workspace: str) -> str:
         "board rows are durable. The board, profile, and workspace are already "
         "pinned in your environment; do not pass --board and do not edit the "
         "board database directly."
+        + _claude_cli_skills_prompt(task)
         + _claude_cli_goal_mode_prompt(task)
     )
 
@@ -11024,12 +11058,12 @@ def _default_spawn(
     from. Workers cannot accidentally see other boards.
 
     The command the child runs depends on ``kanban.worker_executor``
-    (see :func:`resolve_worker_executor`). The default is the native
-    ``hermes`` lane; ``claude_cli`` runs the Claude Code CLI directly. Both
-    lanes get the identical environment — same board / profile / tenant /
-    task / workspace pins, same TUI suppression, same log file, same PID
-    return for crash detection — so only the argv and the credential
-    routing differ.
+    (see :func:`resolve_worker_executor`). The default is ``claude_cli``,
+    which runs the Claude Code CLI directly; ``hermes``/``native`` is the
+    deliberate opt-out back onto the provider stack. Both lanes get the
+    identical environment — same board / profile / tenant / task / workspace
+    pins, same TUI suppression, same log file, same PID return for crash
+    detection — so only the argv and the credential routing differ.
     """
     import subprocess
     if not task.assignee:
@@ -11145,10 +11179,10 @@ def _default_spawn(
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    # Executor selection. The native lane is the default and the only one a
-    # board gets without an explicit `kanban.worker_executor` opt-in; when the
-    # operator does select the direct Claude Code CLI, a missing binary is a
-    # hard error rather than a quiet downgrade back onto the native provider.
+    # Executor selection. The direct Claude Code CLI is the default for every
+    # board and profile; `kanban.worker_executor: native` is the deliberate
+    # opt-out. A missing binary on the direct lane is a hard error rather than
+    # a quiet downgrade back onto the native provider pool.
     kanban_cfg = _load_kanban_config()
     executor = resolve_worker_executor(kanban_cfg)
     stripped_env_vars: list[str] = []

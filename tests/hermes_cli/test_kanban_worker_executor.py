@@ -157,6 +157,44 @@ class TestResolveWorkerExecutor:
         assert resolved == kb.WORKER_EXECUTOR_CLAUDE_CLI
         assert "worker_executor" in caplog.text
 
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "anthropic", "anthropic_api", "provider=anthropic",
+            "openai", "codex", "gpt", "chatgpt", "openai_codex",
+            "gemini", "bedrock", "vertex", "  ", "0", "false", "none",
+        ],
+    )
+    def test_offlane_and_unknown_values_fail_closed_to_the_direct_lane(
+        self, value, caplog
+    ):
+        """No spelling but `hermes`/`native` may route a worker off this lane.
+
+        The values that matter most here are the plausible ones. `anthropic`
+        reads like "use the Anthropic lane" and `openai`/`codex` read like a
+        vendor selector, so an operator could reasonably type either — and
+        the first is exactly the metered provider path that wedged the board,
+        while the second is a stack a kanban worker must never reach. Neither
+        is a recognized executor, so both resolve to the direct CLI rather
+        than being honored as a routing instruction.
+        """
+        from hermes_cli import kanban_db as kb
+
+        with caplog.at_level("WARNING"):
+            assert kb.resolve_worker_executor({"worker_executor": value}) == (
+                kb.WORKER_EXECUTOR_CLAUDE_CLI
+            )
+
+    def test_only_hermes_and_native_reach_the_native_lane(self):
+        """Pin the full opt-out surface, so a new alias is a deliberate edit."""
+        from hermes_cli import kanban_db as kb
+
+        native_spellings = {
+            key for key, lane in kb._WORKER_EXECUTOR_ALIASES.items()
+            if lane == kb.WORKER_EXECUTOR_HERMES
+        }
+        assert native_spellings == {"hermes", "native"}
+
     def test_env_override_beats_config(self, monkeypatch):
         from hermes_cli import kanban_db as kb
 
@@ -284,6 +322,57 @@ class TestSpawnCommand:
         kb._default_spawn(_make_task(kb), str(spawn_env["workspace"]))
 
         assert "GOAL MODE" not in spawn_env["captured"]["cmd"][-1]
+
+    def test_task_skills_reach_the_prompt(self, spawn_env, monkeypatch):
+        """The native lane's `--skills X` has no host-CLI flag equivalent.
+
+        Dropping the field silently was tolerable while the lane was opt-in.
+        It stopped being tolerable when the review handoff lifecycle began
+        force-appending `sdlc-review` to a claimed review card: that skill is
+        the review procedure, so a worker without it reviews nothing while
+        looking like a normal run.
+        """
+        kb = spawn_env["kb"]
+        _select(monkeypatch, kb, worker_executor="claude_cli")
+
+        kb._default_spawn(
+            _make_task(kb, skills=["sdlc-review", "tdd"]),
+            str(spawn_env["workspace"]),
+        )
+
+        prompt = spawn_env["captured"]["cmd"][-1]
+        assert "Required skills" in prompt
+        assert "`sdlc-review`" in prompt
+        assert "`tdd`" in prompt
+        # An unloadable skill must block, not be improvised around.
+        assert "--kind capability" in prompt
+
+    def test_review_card_worker_is_told_to_load_sdlc_review(
+        self, spawn_env, monkeypatch
+    ):
+        """The exact shape the review lane produces when it claims a card."""
+        kb = spawn_env["kb"]
+        _select(monkeypatch, kb, worker_executor="claude_cli")
+        task = _make_task(kb, skills=None)
+        # Mirrors dispatch_once's review branch.
+        task.skills = list(dict.fromkeys([*(task.skills or []), "sdlc-review"]))
+
+        kb._default_spawn(task, str(spawn_env["workspace"]))
+
+        assert "`sdlc-review`" in spawn_env["captured"]["cmd"][-1]
+
+    @pytest.mark.parametrize("skills", [None, [], ["", "   "]])
+    def test_cards_without_skills_get_no_skills_section(
+        self, spawn_env, monkeypatch, skills
+    ):
+        kb = spawn_env["kb"]
+        _select(monkeypatch, kb, worker_executor="claude_cli")
+
+        kb._default_spawn(
+            _make_task(kb, skills=skills), str(spawn_env["workspace"])
+        )
+
+        assert "Required skills" not in spawn_env["captured"]["cmd"][-1]
 
     def test_permission_mode_defaults_so_the_worker_can_act(
         self, spawn_env, monkeypatch

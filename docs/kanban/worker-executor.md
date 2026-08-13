@@ -259,9 +259,23 @@ header in the task's worker log.
   rather than complete on a partial result. `goal_max_turns` is passed through
   as a soft round budget. This is weaker than the native judge loop — run
   goal-critical cards on `native` if you need the real thing.
-- **Per-task `--toolsets`, `--skills`, and `--reasoning` pins do not apply** —
-  they are Hermes CLI flags. Use `claude_cli_extra_args` for the CLI's own
-  equivalents.
+- **Per-task `--toolsets` and `--reasoning` pins do not apply** — they are
+  Hermes CLI flags. Use `claude_cli_extra_args` for the CLI's own equivalents.
+- **Per-task `skills` are named in the prompt, not injected.** The native lane
+  passes `--skills X` and Hermes resolves each into the worker's system prompt
+  before its first turn. The host CLI has no equivalent flag, so this lane
+  lists the required skills in the prompt and asks the worker to load them
+  with its own Skill tool, blocking `--kind capability` if one will not load.
+  That is an instruction, not an injection: a direct-lane worker *can* ignore
+  it where a native worker could not.
+
+  This stopped being a cosmetic gap when the review handoff lifecycle landed.
+  `dispatch_once` force-appends `sdlc-review` to a claimed review card because
+  that skill *is* the review procedure (AC verification, merge). With this
+  lane global, silently dropping the field would hand every review card a
+  worker that does not know how to review — and the run would look normal, not
+  misconfigured. If you need the hard guarantee for review cards, run them on
+  `native`.
 - A task `model_override` is forwarded only when it names a Claude model on the
   Anthropic lane; anything else is dropped with a warning rather than passed to
   a CLI that cannot resolve it.
