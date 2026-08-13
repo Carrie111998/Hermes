@@ -219,7 +219,10 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Idempotency: TTL cache of recently processed delivery IDs.
         # Prevents duplicate agent runs when webhook providers retry.
-        self._seen_deliveries: Dict[str, float] = {}
+        # Keyed by (profile, route, delivery_id); bound to a body hash so a
+        # conflicting replay (same key, different body) can be reported as 409.
+        self._seen_deliveries: Dict[tuple, float] = {}
+        self._seen_delivery_bodies: Dict[tuple, str] = {}
         self._idempotency_ttl: int = 3600  # 1 hour
         self._seen_deliveries_next_prune_at: float = 0.0
 
@@ -431,6 +434,7 @@ class WebhookAdapter(BasePlatformAdapter):
         stale = [k for k, t in self._seen_deliveries.items() if t < cutoff]
         for k in stale:
             self._seen_deliveries.pop(k, None)
+            self._seen_delivery_bodies.pop(k, None)
         self._seen_deliveries_next_prune_at = now + min(60.0, max(1.0, self._idempotency_ttl / 10))
 
     def _record_rate_limit_hit(self, route_name: str, now: float) -> bool:
@@ -448,14 +452,60 @@ class WebhookAdapter(BasePlatformAdapter):
         window.append(now)
         return True
 
-    def _record_delivery_id(self, delivery_id: str, now: float) -> bool:
-        """Return True when this delivery should be processed."""
-        seen_at = self._seen_deliveries.get(delivery_id)
-        if seen_at is not None and now - seen_at < self._idempotency_ttl:
+    def _profile_scope_key(self) -> str:
+        """Return the current profile scope (or 'default') for idempotency keys."""
+        runner = getattr(self, "gateway_runner", None)
+        active = getattr(runner, "_active_profile_name", None)
+        if callable(active):
+            try:
+                val = active()
+            except Exception:
+                val = None
+            if val:
+                return str(val)
+        return getattr(self, "_webhook_profile", "default")
+
+    def _active_route_key(self) -> str:
+        """Return the active route name (or '') for idempotency keys."""
+        return getattr(self, "_webhook_active_route", "")
+
+    def _record_delivery_id(
+        self,
+        delivery_id: str,
+        now: float,
+        body_hash: str = "",
+        *,
+        profile: str | None = None,
+        route: str | None = None,
+    ) -> bool:
+        """Return True when this delivery should be processed.
+
+        Idempotency is keyed by ``(profile, route, provider, delivery_id)``
+        and bound to a body hash. A retry of the SAME delivery on the same
+        route is suppressed; the same provider delivery intentionally sent to
+        DIFFERENT routes executes each route once (#7448). Conflicting reuse
+        (same key, different body) is reported via the return sentinel so the
+        handler can emit 409.
+        """
+        key = (
+            profile or self._profile_scope_key(),
+            route or self._active_route_key(),
+            delivery_id,
+        )
+        entry = self._seen_deliveries.get(key)
+        if entry is not None and now - entry < self._idempotency_ttl:
+            # Same key replayed. If a body hash was bound and differs, the
+            # caller should treat this as a conflict (409), not a duplicate.
+            if entry_body := self._seen_delivery_bodies.get(key):
+                if body_hash and entry_body != body_hash:
+                    return "conflict"  # type: ignore[return-value]
             return False
-        if seen_at is not None:
-            self._seen_deliveries.pop(delivery_id, None)
-        self._seen_deliveries[delivery_id] = now
+        if entry is not None:
+            self._seen_deliveries.pop(key, None)
+            self._seen_delivery_bodies.pop(key, None)
+        self._seen_deliveries[key] = now
+        if body_hash:
+            self._seen_delivery_bodies[key] = body_hash
         if len(self._seen_deliveries) > max(self._rate_limit * 2, 128):
             self._prune_seen_deliveries(now)
         return True
@@ -715,7 +765,9 @@ class WebhookAdapter(BasePlatformAdapter):
         now = time.time()
         if not self._record_rate_limit_hit(route_name, now):
             return web.json_response(
-                {"error": "Rate limit exceeded"}, status=429
+                {"error": "Rate limit exceeded"},
+                status=429,
+                headers={"Retry-After": str(_RATE_WINDOW_SECONDS)},
             )
 
         # Parse payload
@@ -838,9 +890,29 @@ class WebhookAdapter(BasePlatformAdapter):
         )
 
         # ── Idempotency ─────────────────────────────────────────
-        # Skip duplicate deliveries (webhook retries).
+        # Skip duplicate deliveries (webhook retries). Keyed by
+        # (profile, route, delivery_id) and bound to a body hash so the same
+        # provider delivery sent to different routes executes each route once
+        # (#7448), while a conflicting replay on the same route returns 409.
         now = time.time()
-        if not self._record_delivery_id(delivery_id, now):
+        body_hash = hashlib.sha256(raw_body).hexdigest()
+        idem_result = self._record_delivery_id(
+            delivery_id,
+            now,
+            body_hash,
+            profile=profile or "default",
+            route=route_name,
+        )
+        if idem_result == "conflict":
+            return web.json_response(
+                {
+                    "status": "conflict",
+                    "delivery_id": delivery_id,
+                    "error": "Idempotency key reused with a different body",
+                },
+                status=409,
+            )
+        if not idem_result:
             logger.info(
                 "[webhook] Skipping duplicate delivery %s", delivery_id
             )
@@ -1244,9 +1316,12 @@ class WebhookAdapter(BasePlatformAdapter):
         Supports dot-notation access into nested dicts:
         ``{pull_request.title}`` → ``payload["pull_request"]["title"]``
 
-        Special token ``{__raw__}`` dumps the entire payload as indented
-        JSON (truncated to 4000 chars).  Useful for monitoring alerts or
-        any webhook where the agent needs to see the full payload.
+        Special token ``{__raw__}`` dumps the entire payload as a valid JSON
+        envelope ``{"payload": <value>, "truncated": <bool>,
+        "original_bytes": <N>}``.  When the payload exceeds the bounded cap,
+        the envelope is still structurally valid JSON so a downstream agent or
+        tool can parse it without hitting a truncated/raw character slice
+        (#55829).
         """
         if not template:
             truncated = json.dumps(payload, indent=2)[:4000]
@@ -1257,9 +1332,9 @@ class WebhookAdapter(BasePlatformAdapter):
 
         def _resolve(match: re.Match) -> str:
             key = match.group(1)
-            # Special token: dump the entire payload as JSON
+            # Special token: dump the entire payload as a valid JSON envelope
             if key == "__raw__":
-                return json.dumps(payload, indent=2)[:4000]
+                return self._render_raw_payload(payload)
             if key == "event_type":
                 return event_type
             value: Any = payload
@@ -1273,6 +1348,26 @@ class WebhookAdapter(BasePlatformAdapter):
             return str(value)
 
         return re.sub(r"\{([a-zA-Z0-9_.]+)\}", _resolve, template)
+
+    def _render_raw_payload(self, payload: dict, cap: int = 4000) -> str:
+        """Render ``{__raw__}`` as a structurally valid JSON envelope.
+
+        ``original_bytes`` is the serialized payload length; when the payload
+        exceeds ``cap`` the ``payload`` field holds the bounded truncated
+        value and ``truncated`` is True, so the output always parses.
+        """
+        serialized = json.dumps(payload, indent=2, ensure_ascii=False)
+        original_bytes = len(serialized)
+        truncated = original_bytes > cap
+        bounded = serialized[:cap]
+        return json.dumps(
+            {
+                "payload": bounded,
+                "truncated": truncated,
+                "original_bytes": original_bytes,
+            },
+            ensure_ascii=False,
+        )
 
     def _render_delivery_extra(
         self, extra: dict, payload: dict
