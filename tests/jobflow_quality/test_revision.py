@@ -161,3 +161,127 @@ class TestStaleRenderingDoesNotWarrantRegeneration:
 
         assert QCFinding.STALE_RENDERING.value in NO_REGENERATION_CODES
         assert QCFinding.UNFILLED_PLACEHOLDER.value not in NO_REGENERATION_CODES
+
+
+class TestEmission:
+    """Writing the request into the tailor inbox.
+
+    Two hazards beyond building the message. First, the ready sweep runs every
+    3 hours, so a duplicate check that only looks at `inbox/` would re-emit the
+    moment the tailor moves the file to `processed/` — asking for the same
+    regeneration forever. Second, the tailor reads that directory on its own
+    schedule, so a half-written file is a file it can read.
+    """
+
+    def _pkg_result(self):
+        return _revise(QCFinding.UNFILLED_PLACEHOLDER)
+
+    def test_a_request_is_written_to_the_tailor_inbox(self, tmp_path):
+        from jobflow_quality.revision import emit_revision_request
+
+        mailbox = tmp_path / "mailbox"
+        path = emit_revision_request("job-1", self._pkg_result(), mailbox_root=mailbox)
+        assert path is not None
+        assert path.parent == mailbox / "tailor" / "inbox"
+        assert path.exists()
+
+    def test_the_filename_follows_the_mailbox_convention(self, tmp_path):
+        from jobflow_quality.revision import emit_revision_request
+
+        path = emit_revision_request("job-1", self._pkg_result(),
+                                     mailbox_root=tmp_path / "mailbox")
+        assert "_TAILOR_REVISION_applier_" in path.name
+        assert path.name.endswith(".json")
+
+    def test_the_written_file_is_the_built_message(self, tmp_path):
+        import json as _json
+        from jobflow_quality.revision import emit_revision_request
+
+        path = emit_revision_request("job-1", self._pkg_result(),
+                                     mailbox_root=tmp_path / "mailbox")
+        body = _json.loads(path.read_text(encoding="utf-8"))
+        assert body["type"] == "TAILOR_REVISION"
+        assert body["payload"]["changes"]
+
+    def test_a_second_call_for_the_same_artifacts_writes_nothing(self, tmp_path):
+        from jobflow_quality.revision import emit_revision_request
+
+        mailbox = tmp_path / "mailbox"
+        first = emit_revision_request("job-1", self._pkg_result(), mailbox_root=mailbox)
+        second = emit_revision_request("job-1", self._pkg_result(), mailbox_root=mailbox)
+        assert first is not None
+        assert second is None
+        assert len(list((mailbox / "tailor" / "inbox").glob("*.json"))) == 1
+
+    def test_an_already_processed_request_is_not_re_emitted(self, tmp_path):
+        """The tailor moves handled messages to processed/. Looking only at
+        inbox/ would ask for the same regeneration on the next sweep."""
+        from jobflow_quality.revision import emit_revision_request
+
+        mailbox = tmp_path / "mailbox"
+        first = emit_revision_request("job-1", self._pkg_result(), mailbox_root=mailbox)
+        processed = mailbox / "tailor" / "processed"
+        processed.mkdir(parents=True, exist_ok=True)
+        first.rename(processed / first.name)
+
+        assert emit_revision_request("job-1", self._pkg_result(), mailbox_root=mailbox) is None
+
+    def test_changed_artifacts_emit_again(self, tmp_path):
+        from jobflow_quality.revision import emit_revision_request
+
+        mailbox = tmp_path / "mailbox"
+        emit_revision_request("job-1", self._pkg_result(), mailbox_root=mailbox)
+        changed = _result(QCStatus.REVISE,
+                          [Finding(QCFinding.UNFILLED_PLACEHOLDER, "resume.md", "d")],
+                          hashes={"resume.md": "z" * 64})
+        assert emit_revision_request("job-1", changed, mailbox_root=mailbox) is not None
+
+    def test_nothing_is_written_when_no_request_is_warranted(self, tmp_path):
+        from jobflow_quality.revision import emit_revision_request
+
+        mailbox = tmp_path / "mailbox"
+        assert emit_revision_request("job-1", _revise(QCFinding.STALE_RENDERING),
+                                     mailbox_root=mailbox) is None
+        assert not (mailbox / "tailor" / "inbox").exists() or \
+            not list((mailbox / "tailor" / "inbox").glob("*.json"))
+
+    def test_no_partial_file_is_left_for_the_tailor_to_read(self, tmp_path):
+        """No temp file survives a successful emission."""
+        from jobflow_quality.revision import emit_revision_request
+
+        mailbox = tmp_path / "mailbox"
+        emit_revision_request("job-1", self._pkg_result(), mailbox_root=mailbox)
+        leftovers = [p.name for p in (mailbox / "tailor" / "inbox").iterdir()
+                     if not p.name.endswith(".json")]
+        assert leftovers == []
+
+    def test_the_file_arrives_by_rename_not_by_direct_write(self, tmp_path, monkeypatch):
+        """Arms atomicity, which the leftovers check above cannot.
+
+        A direct `final.write_text` also leaves no temp file, so that test
+        passes either way. Whether the tailor can observe a half-written
+        message depends on HOW the bytes arrive, and the only observable
+        difference is the rename — so this asserts the mechanism rather than
+        the outcome, deliberately.
+        """
+        import jobflow_quality.revision as mod
+
+        calls = []
+        real_replace = mod.os.replace
+
+        def _spy(src, dst):
+            calls.append((src, dst))
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(mod.os, "replace", _spy)
+        path = emit_revision_request_local = mod.emit_revision_request(
+            "job-1", self._pkg_result(), mailbox_root=tmp_path / "mailbox")
+        assert path is not None
+        assert calls, "message was written directly; a reader can see it half-formed"
+
+    def test_an_unwritable_mailbox_returns_none_rather_than_raising(self, tmp_path):
+        from jobflow_quality.revision import emit_revision_request
+
+        blocker = tmp_path / "mailbox"
+        blocker.write_text("not a directory", encoding="utf-8")
+        assert emit_revision_request("job-1", self._pkg_result(), mailbox_root=blocker) is None

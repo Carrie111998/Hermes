@@ -24,6 +24,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
+from pathlib import Path
 from typing import Any, Mapping
 import uuid
 
@@ -127,3 +129,68 @@ def build_revision_request(
             "source": "deterministic_qc",
         },
     }
+
+
+DEFAULT_MAILBOX_ROOT = Path.home() / ".hermes" / "mailbox"
+
+
+def _dedupe_token(idempotency_key: str) -> str:
+    """The part of the key that goes in the filename.
+
+    Encoding it in the name turns the duplicate check into a glob instead of
+    opening and parsing every message in two directories.
+    """
+    return idempotency_key.rsplit(":", 1)[-1][:16]
+
+
+def emit_revision_request(
+    job_id: Any,
+    qc_result: QCResult,
+    *,
+    mailbox_root: Path | None = None,
+    correlation_id: str | None = None,
+) -> Path | None:
+    """Write a TAILOR_REVISION into the tailor inbox, or return None.
+
+    Returns None when no request is warranted, when an equivalent request has
+    already been made, or when the write fails — a mailbox that cannot be
+    written is not a reason to crash the ready sweep.
+
+    Duplicate detection spans ``inbox/`` AND ``processed/``. The tailor moves
+    handled messages to ``processed/``, so checking only the inbox would
+    re-emit the same request on the next sweep, forever.
+
+    The file is written under a temporary name and renamed into place. The
+    tailor reads that directory on its own schedule, so a partially written
+    file is a file it can pick up.
+    """
+    message = build_revision_request(job_id, qc_result, correlation_id=correlation_id)
+    if message is None:
+        return None
+
+    root = Path(mailbox_root) if mailbox_root is not None else DEFAULT_MAILBOX_ROOT
+    token = _dedupe_token(message["idempotency_key"])
+    inbox = root / "tailor" / "inbox"
+    processed = root / "tailor" / "processed"
+
+    try:
+        for directory in (inbox, processed):
+            if directory.is_dir() and any(
+                directory.glob(f"*_TAILOR_REVISION_applier_{token}.json")
+            ):
+                return None
+
+        inbox.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        final = inbox / f"{stamp}_TAILOR_REVISION_applier_{token}.json"
+        tmp = inbox / f".{final.name}.tmp"
+        tmp.write_text(json.dumps(message, indent=2), encoding="utf-8")
+        os.replace(tmp, final)
+        return final
+    except Exception:
+        try:
+            if "tmp" in dir() and tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        return None
