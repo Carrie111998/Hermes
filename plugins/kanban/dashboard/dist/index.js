@@ -95,6 +95,47 @@
     return body || raw;
   }
 
+  function formatTimeAgo(locale, ts) {
+    const numericTs = Number(ts);
+    if (!Number.isFinite(numericTs) || numericTs <= 0) return "";
+    const delta = Math.max(0, Math.floor(Date.now() / 1000 - numericTs));
+    try {
+      const rtf = new Intl.RelativeTimeFormat(locale || "en", { numeric: "auto" });
+      if (delta < 60) return rtf.format(0, "second");
+      if (delta < 3600) return rtf.format(-Math.floor(delta / 60), "minute");
+      if (delta < 86400) return rtf.format(-Math.floor(delta / 3600), "hour");
+      return rtf.format(-Math.floor(delta / 86400), "day");
+    } catch (_e) {
+      return timeAgo ? timeAgo(numericTs) : "";
+    }
+  }
+
+  function getEventKindLabel(t, kind) {
+    if (!kind) return "";
+    return tx(t, "eventKinds." + kind, String(kind).replace(/_/g, " "));
+  }
+
+  function getEventPayloadKeyLabel(t, key) {
+    return tx(t, "eventPayloadKeys." + key, String(key).replace(/_/g, " "));
+  }
+
+  function formatEventPayload(t, payload) {
+    if (!payload || typeof payload !== "object") return "";
+    const parts = [];
+    Object.keys(payload).forEach(function (key) {
+      let value = payload[key];
+      if (key === "status" && typeof value === "string") {
+        value = getColumnLabel(t, value);
+      } else if (value === null) {
+        value = tx(t, "none", "none");
+      } else if (typeof value === "object") {
+        try { value = JSON.stringify(value); } catch (_e) { value = String(value); }
+      }
+      parts.push(getEventPayloadKeyLabel(t, key) + ": " + String(value));
+    });
+    return parts.join(" · ");
+  }
+
   // Board column display order; any backend status not listed here renders after these.
   const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "review", "done"];
   // English fallback dictionaries — used when the i18n catalog is missing
@@ -2753,7 +2794,7 @@
   }
 
   function TaskCard(props) {
-    const { t: i18n } = useI18n();
+    const { t: i18n, locale } = useI18n();
     const t = props.task;
     const cardRef = useRef(null);
 
@@ -2905,7 +2946,7 @@
               : null,
             h("span", { className: "hermes-kanban-ago",
                         title: t.created_at ? `Created ${t.created_at}` : "" },
-              timeAgo ? timeAgo(t.created_at) : ""),
+              formatTimeAgo(locale, t.created_at)),
           ),
         ),
       ),
@@ -3566,7 +3607,7 @@
   }
 
   function TaskDetail(props) {
-    const { t: i18n } = useI18n();
+    const { t: i18n, locale } = useI18n();
     const t = props.data.task;
     const comments = props.data.comments || [];
     const events = props.data.events || [];
@@ -3592,7 +3633,7 @@
             }, t.title || tx(i18n, "untitled", "(untitled)")),
       ),
       h("div", { className: "hermes-kanban-drawer-meta" },
-        h(MetaRow, { label: tx(i18n, "status", "Status"), value: t.status }),
+        h(MetaRow, { label: tx(i18n, "status", "Status"), value: getColumnLabel(i18n, t.status) }),
         h(AssigneeEditor, { task: t, onPatch: props.onPatch }),
         h(PriorityEditor, { task: t, onPatch: props.onPatch }),
         h(ModelEditor, { task: t, onPatch: props.onPatch }),
@@ -3608,8 +3649,8 @@
         t.goal_mode ? h(MetaRow, {
           label: tx(i18n, "goalMode", "Goal mode"),
           value: t.goal_max_turns
-            ? `on (max ${t.goal_max_turns} turns)`
-            : "on",
+            ? tx(i18n, "goalOnMaxTurns", "on (max {n} turns)", { n: t.goal_max_turns })
+            : tx(i18n, "goalOn", "on"),
         }) : null,
         t.created_by ? h(MetaRow, { label: tx(i18n, "createdBy", "Created by"), value: t.created_by }) : null,
       ),
@@ -3686,7 +3727,7 @@
             h("div", { className: "hermes-kanban-comment-head" },
               h("span", { className: "hermes-kanban-comment-author" },
                 `${child.id} · ${child.title || tx(i18n, "untitled", "(untitled)")}`),
-              h(Badge, { variant: "outline" }, child.status),
+              h(Badge, { variant: "outline" }, getColumnLabel(i18n, child.status)),
               h("button", {
                 type: "button",
                 className: "hermes-kanban-diag-action-btn",
@@ -3720,7 +3761,7 @@
                 h("div", { className: "hermes-kanban-comment-head" },
                   h("span", { className: "hermes-kanban-comment-author" }, c.author || "anon"),
                   h("span", { className: "hermes-kanban-comment-ago" },
-                    timeAgo ? timeAgo(c.created_at) : ""),
+                    formatTimeAgo(locale, c.created_at)),
                 ),
                 h(MarkdownBlock, { source: c.body, enabled: props.renderMarkdown }),
               );
@@ -3745,12 +3786,12 @@
                   h("span", { className: "hermes-kanban-event-warning-label" },
                     getDiagnosticEventLabel(i18n, e.kind) || e.kind),
                   h("span", { className: "hermes-kanban-event-ago" },
-                    timeAgo ? timeAgo(e.created_at) : ""),
+                    formatTimeAgo(locale, e.created_at)),
                 )
               : h("div", { className: "hermes-kanban-event-header-plain" },
-                  h("span", { className: "hermes-kanban-event-kind" }, e.kind),
+                  h("span", { className: "hermes-kanban-event-kind" }, getEventKindLabel(i18n, e.kind)),
                   h("span", { className: "hermes-kanban-event-ago" },
-                    timeAgo ? timeAgo(e.created_at) : ""),
+                    formatTimeAgo(locale, e.created_at)),
                 ),
             isDiag && phantoms.length > 0
               ? h("div", { className: "hermes-kanban-event-phantom-row" },
@@ -3765,8 +3806,10 @@
                 )
               : null,
             e.payload && !isDiag
-              ? h("code", { className: "hermes-kanban-event-payload" },
-                  JSON.stringify(e.payload))
+              ? h("code", {
+                  className: "hermes-kanban-event-payload",
+                  title: JSON.stringify(e.payload),
+                }, formatEventPayload(i18n, e.payload))
               : null,
           );
         }),
@@ -3780,7 +3823,7 @@
   // active run if any. Each row shows profile / outcome / elapsed /
   // summary. Collapsed by default when there are more than three runs.
   function RunHistorySection(props) {
-    const { t } = useI18n();
+    const { t, locale } = useI18n();
     const runs = props.runs || [];
     const [expanded, setExpanded] = useState(false);
     if (runs.length === 0) return null;
@@ -3806,7 +3849,7 @@
               onClick: function () { setExpanded(true); },
               className: "hermes-kanban-edit-link",
               title: tx(t, "showAllAttempts", "Show all attempts"),
-            }, `+${runs.length - 3} earlier`)
+            }, tx(t, "earlierAttempts", "+{n} earlier", { n: runs.length - 3 }))
           : null,
       ),
       visible.map(function (r) {
@@ -3821,7 +3864,7 @@
               r.profile ? `@${r.profile}` : tx(t, "noProfile", "(no profile)")),
             h("span", { className: "hermes-kanban-run-elapsed" }, fmtElapsed(r)),
             h("span", { className: "hermes-kanban-run-ago" },
-              timeAgo ? timeAgo(r.started_at) : ""),
+              formatTimeAgo(locale, r.started_at)),
           ),
           r.summary
             ? h("div", { className: "hermes-kanban-run-summary" }, r.summary)
@@ -3837,7 +3880,7 @@
                     className: "hermes-kanban-run-meta-block",
                     open: !collapsed,
                   },
-                  h("summary", { className: "hermes-kanban-run-meta-label" }, "Metadata"),
+                  h("summary", { className: "hermes-kanban-run-meta-label" }, tx(t, "metadata", "Metadata")),
                   h("code", { className: "hermes-kanban-run-meta" }, json),
                 );
               })()
@@ -3875,7 +3918,7 @@
           "— no worker log yet (task hasn't spawned or log was rotated away) —"));
     } else {
       body = h("pre", { className: "hermes-kanban-pre hermes-kanban-log" },
-        data.content || "(empty)");
+        data.content || tx(t, "emptyLog", "(empty)"));
     }
 
     return h("div", { className: "hermes-kanban-section" },
@@ -3886,8 +3929,8 @@
           type: "button",
           onClick: load,
           className: "hermes-kanban-edit-link",
-          title: "Refresh log",
-        }, "refresh"),
+          title: tx(t, "refreshLog", "Refresh log"),
+        }, tx(t, "refresh", "Refresh")),
       ),
       body,
       data && data.truncated
@@ -4193,7 +4236,7 @@
               type: "button",
               onClick: function () { setEditing(true); },
               className: "hermes-kanban-edit-link",
-              title: "Edit description",
+              title: tx(t, "editDescription", "Edit description"),
             }, tx(t, "edit", "edit")),
       ),
       editing
@@ -4262,7 +4305,7 @@
           },
           disabled: !newParent,
           size: "sm",
-        }, "+ parent"),
+        }, tx(t, "addParentButton", "+ parent")),
       ),
       h("div", { className: "hermes-kanban-deps-row" },
         h("span", { className: "hermes-kanban-deps-label" }, tx(t, "children", "Children:")),
@@ -4300,7 +4343,7 @@
           },
           disabled: !newChild,
           size: "sm",
-        }, "+ child"),
+        }, tx(t, "addChildButton", "+ child")),
       ),
     );
   }
