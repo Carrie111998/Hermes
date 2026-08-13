@@ -34,6 +34,12 @@ class FailingAdapter(RecordingAdapter):
         return SimpleNamespace(success=False)
 
 
+class SideEffectNegativeAckAdapter(RecordingAdapter):
+    async def send(self, chat_id: str, content: str, metadata=None) -> object:
+        self.sent.append((chat_id, content))
+        return SimpleNamespace(success=False, message_id="published-event-id")
+
+
 class ListingAdapter(RecordingAdapter):
     async def list_channels(self):
         return [
@@ -99,7 +105,7 @@ def test_review_terminal_projection_is_typed_event_keyed_and_order_independent(
     assert adapter.sent[0][0] == "blockers-id"
     assert "t_decision" in adapter.sent[0][1]
     assert "Action required" in adapter.sent[0][1]
-    assert adapter.sent[1][0] == "alerts-id"
+    assert adapter.sent[1][0] == "final-id"
     assert "t_exhausted" in adapter.sent[1][1]
     assert "final receipt" in adapter.sent[1][1]
     state = json.loads((tmp_path / "kanban-alerts.json").read_text(encoding="utf-8"))
@@ -170,9 +176,15 @@ def _notifier(tmp_path, adapter, *, now=lambda: 1000.0):
         platform="buzz",
         automation_channel="#alerts",
         blockers_channel="#blockers",
+        final_channel="#final",
         cooldown_seconds=300,
+        max_batches_per_flush=10,
     )
-    channels = {"#alerts": "alerts-id", "#blockers": "blockers-id"}
+    channels = {
+        "#alerts": "alerts-id",
+        "#blockers": "blockers-id",
+        "#final": "final-id",
+    }
     return KanbanAlertNotifier(
         settings,
         state_path=tmp_path / "kanban-alerts.json",
@@ -182,6 +194,7 @@ def _notifier(tmp_path, adapter, *, now=lambda: 1000.0):
         list_known_channels=lambda platform: [
             {"id": "alerts-id", "name": "alerts", "type": "channel"},
             {"id": "blockers-id", "name": "blockers", "type": "channel"},
+            {"id": "final-id", "name": "final", "type": "channel"},
         ],
         now=now,
     )
@@ -392,7 +405,7 @@ def test_process_directory_route_rejects_ambiguous_channel_names(tmp_path):
     assert adapter.sent == []
 
 
-def test_destination_change_reopens_active_incident_on_new_channel(tmp_path):
+def test_destination_change_to_unapproved_channel_is_refused(tmp_path):
     adapter = RecordingAdapter()
     state_path = tmp_path / "kanban-alerts.json"
     incident = KanbanAlertIncident("stalled", "automation", "dispatcher stalled")
@@ -424,10 +437,7 @@ def test_destination_change_reopens_active_incident_on_new_channel(tmp_path):
     second.sync_scope("dispatcher", [incident])
     asyncio.run(second.flush())
 
-    assert adapter.sent == [
-        ("alerts-id", "dispatcher stalled"),
-        ("new-alerts-id", "dispatcher stalled"),
-    ]
+    assert adapter.sent == [("alerts-id", "dispatcher stalled")]
 
 
 def test_removed_board_scope_is_retired_without_false_recovery(tmp_path):
@@ -893,6 +903,56 @@ def test_failed_delivery_retries_only_after_retry_interval(tmp_path):
     assert len(adapter.sent) == 2
 
 
+def test_persistent_delivery_attempts_are_bounded_and_cooldown_suppressed(tmp_path):
+    adapter = FailingAdapter()
+    clock = [1000.0]
+    notifier = KanbanAlertNotifier(
+        KanbanAlertSettings(
+            enabled=True,
+            platform="buzz",
+            automation_channel="#alerts",
+            max_delivery_attempts=2,
+            retry_seconds=10,
+            cooldown_seconds=300,
+        ),
+        state_path=tmp_path / "bounded.json",
+        adapter_lookup=lambda platform, profile: adapter,
+        resolve_channel=lambda platform, name: "alerts-id",
+        lookup_channel_type=lambda platform, chat_id: "channel",
+        list_known_channels=lambda platform: [
+            {"id": "alerts-id", "name": "alerts", "type": "channel"}
+        ],
+        now=lambda: clock[0],
+    )
+    incident = KanbanAlertIncident("bounded", "automation", "bounded retry")
+
+    notifier.sync_scope("dispatcher", [incident])
+    asyncio.run(notifier.flush())
+    clock[0] += 11
+    asyncio.run(notifier.flush())
+    notifier.sync_scope("dispatcher", [incident])
+    clock[0] += 11
+    asyncio.run(notifier.flush())
+
+    assert len(adapter.sent) == 2
+
+
+def test_published_message_id_is_acked_despite_negative_transport_flag(tmp_path):
+    adapter = SideEffectNegativeAckAdapter()
+    clock = [1000.0]
+    notifier = _notifier(tmp_path, adapter, now=lambda: clock[0])
+    incident = KanbanAlertIncident("one", "blockers", "one actionable blocker")
+    notifier.sync_scope("blockers:default", [incident])
+
+    asyncio.run(notifier.flush())
+    clock[0] += 61
+    restarted = _notifier(tmp_path, adapter, now=lambda: clock[0])
+    restarted.sync_scope("blockers:default", [incident])
+    asyncio.run(restarted.flush())
+
+    assert adapter.sent == [("blockers-id", "one actionable blocker")]
+
+
 def test_state_write_failure_does_not_block_delivery(tmp_path, monkeypatch):
     import utils
 
@@ -940,6 +1000,195 @@ def test_restart_does_not_reannounce_active_incident(tmp_path):
         ("alerts-id", "dispatcher stalled"),
         ("alerts-id", "dispatcher recovered"),
     ]
+
+
+def test_first_start_baselines_historical_blockers_without_burst_or_recovery(tmp_path):
+    adapter = RecordingAdapter()
+    notifier = _notifier(tmp_path, adapter)
+    historical = [
+        KanbanAlertIncident(
+            key=f"blocker:default:t_{index}",
+            route="blockers",
+            message=f"historical blocker {index}",
+            recovery_message=f"historical blocker {index} recovered",
+        )
+        for index in range(24)
+    ]
+
+    notifier.begin_startup_baseline()
+    notifier.sync_scope("blockers:default", historical)
+    notifier.complete_startup_baseline()
+    asyncio.run(notifier.flush())
+    restarted = _notifier(tmp_path, adapter)
+    restarted.sync_scope("blockers:default", historical)
+    asyncio.run(restarted.flush())
+    restarted.sync_scope("blockers:default", historical[1:])
+    asyncio.run(restarted.flush())
+
+    assert adapter.sent == []
+
+    restarted.sync_scope(
+        "blockers:default",
+        [
+            *historical[1:],
+            KanbanAlertIncident(
+                key="blocker:default:t_new",
+                route="blockers",
+                message="new actionable blocker",
+                recovery_message="new actionable blocker recovered",
+            ),
+        ],
+    )
+    asyncio.run(restarted.flush())
+
+    assert adapter.sent == [("blockers-id", "new actionable blocker")]
+
+
+def test_home_and_raw_channel_ids_are_never_alert_destinations(tmp_path):
+    adapter = RecordingAdapter()
+    for route, channel_ref in (
+        ("automation", "#home"),
+        ("blockers", "home-id"),
+        ("final", "#alerts"),
+    ):
+        settings = KanbanAlertSettings(
+            enabled=True,
+            platform="buzz",
+            automation_channel=channel_ref if route == "automation" else "#alerts",
+            blockers_channel=channel_ref if route == "blockers" else "#blockers",
+            final_channel=channel_ref if route == "final" else "#final",
+        )
+        notifier = KanbanAlertNotifier(
+            settings,
+            state_path=tmp_path / f"{route}.json",
+            adapter_lookup=lambda platform, profile: adapter,
+            resolve_channel=lambda platform, name: "home-id",
+            lookup_channel_type=lambda platform, chat_id: "channel",
+            list_known_channels=lambda platform: [
+                {"id": "home-id", "name": "home", "type": "channel"}
+            ],
+        )
+        notifier.queue_once(
+            KanbanAlertIncident(
+                key=f"{route}:unsafe",
+                route=route,
+                message="must not reach Home",
+            )
+        )
+        asyncio.run(notifier.flush())
+
+    assert adapter.sent == []
+
+
+def test_restart_replay_is_stale_bounded_and_one_batch_per_flush(tmp_path):
+    adapter = RecordingAdapter()
+    clock = [10_000.0]
+    settings = KanbanAlertSettings(
+        enabled=True,
+        platform="buzz",
+        automation_channel="#alerts",
+        blockers_channel="#blockers",
+        final_channel="#final",
+        max_batches_per_flush=1,
+        replay_max_age_seconds=300,
+    )
+    state_path = tmp_path / "restart-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "destination": json.dumps(
+                    ["buzz", None, "#alerts", "#blockers", "#final"],
+                    separators=(",", ":"),
+                ),
+                "active": {},
+                "recent": {},
+                "pending_transients": {
+                    "stale": {
+                        "key": "stale",
+                        "route": "automation",
+                        "message": "stale queued event",
+                        "queued_at": 1.0,
+                        "attempts": 1,
+                        "last_attempt_at": 1.0,
+                    },
+                    "fresh-alert": {
+                        "key": "fresh-alert",
+                        "route": "automation",
+                        "message": "fresh alert",
+                        "queued_at": 9_999.0,
+                        "attempts": 0,
+                        "last_attempt_at": 0.0,
+                    },
+                    "fresh-final": {
+                        "key": "fresh-final",
+                        "route": "final",
+                        "message": "fresh final receipt",
+                        "queued_at": 9_999.0,
+                        "attempts": 0,
+                        "last_attempt_at": 0.0,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    channels = {
+        "#alerts": "alerts-id",
+        "#blockers": "blockers-id",
+        "#final": "final-id",
+    }
+    notifier = KanbanAlertNotifier(
+        settings,
+        state_path=state_path,
+        adapter_lookup=lambda platform, profile: adapter,
+        resolve_channel=lambda platform, name: channels.get(name),
+        lookup_channel_type=lambda platform, chat_id: "channel",
+        list_known_channels=lambda platform: [
+            {"id": "alerts-id", "name": "alerts", "type": "channel"},
+            {"id": "blockers-id", "name": "blockers", "type": "channel"},
+            {"id": "final-id", "name": "final", "type": "channel"},
+        ],
+        now=lambda: clock[0],
+    )
+
+    asyncio.run(notifier.flush())
+    assert len(adapter.sent) == 1
+    assert "stale queued event" not in adapter.sent[0][1]
+    asyncio.run(notifier.flush())
+    assert len(adapter.sent) == 2
+    assert {chat_id for chat_id, _ in adapter.sent} == {"alerts-id", "final-id"}
+
+
+def test_canary_uses_metadata_only_disposable_sink(tmp_path):
+    adapter = RecordingAdapter()
+    sink = tmp_path / "canary.jsonl"
+    notifier = KanbanAlertNotifier(
+        KanbanAlertSettings(
+            enabled=True,
+            platform="buzz",
+            automation_channel="#alerts",
+            canary_sink_path=str(sink),
+        ),
+        state_path=tmp_path / "state.json",
+        adapter_lookup=lambda platform, profile: adapter,
+        resolve_channel=lambda platform, name: "home-id",
+        lookup_channel_type=lambda platform, chat_id: "channel",
+    )
+
+    assert notifier.record_canary(
+        kind="route-probe",
+        producer="test-suite",
+        source_id="canary-1",
+    )
+    record = json.loads(sink.read_text(encoding="utf-8"))
+
+    assert record == {
+        "kind": "route-probe",
+        "producer": "test-suite",
+        "source_id": "canary-1",
+    }
+    assert adapter.sent == []
 
 
 def test_persisted_alert_state_is_bounded(tmp_path):
@@ -998,6 +1247,12 @@ def test_gateway_dispatcher_tick_routes_results_and_blocker_snapshot(
             return None
 
         def queue_transient(self, incident):
+            return None
+
+        def begin_startup_baseline(self):
+            return False
+
+        def complete_startup_baseline(self):
             return None
 
         async def flush(self):

@@ -1082,10 +1082,16 @@ operations feed to dedicated channels:
   `dependency` blockers, plus one recovery when each clears. `transient` waits
   stay off this channel because no human decision or tracked prerequisite is
   involved.
+- `final_channel` receives typed final receipts such as
+  `RECOVERY_EXHAUSTED`; ordinary progress and test/canary traffic never use a
+  messaging route.
 - Stable incidents are de-duplicated; rapid close/re-open flaps use the
   cooldown. Multiple incidents in one tick are batched and truncated with a
   `+N more` summary. Delivery failures remain pending but retry no faster than
-  `retry_seconds`. State is persisted across gateway restarts.
+  `retry_seconds`, stop after `max_delivery_attempts`, and stale queued entries
+  expire after `replay_max_age_seconds`. A new destination establishes a
+  baseline instead of announcing every historical blocker. State is persisted
+  across gateway restarts.
 
 ```yaml
 kanban:
@@ -1093,25 +1099,33 @@ kanban:
     enabled: true
     platform: buzz
     profile: ""                    # optional adapter-owning profile
-    automation_channel: "#alerts" # or a discovered Buzz channel UUID
+    automation_channel: "#alerts"
     blockers_channel: "#blockers"
+    final_channel: "#final"
     health_window_ticks: 6
     cooldown_seconds: 900
     retry_seconds: 60
     max_items_per_message: 10
+    max_batches_per_flush: 1
+    max_delivery_attempts: 3
+    replay_max_age_seconds: 300
+    canary_sink_path: "/tmp/hermes-kanban-canary.jsonl"
 ```
 
 Restart the gateway after changing these settings. Channel names are resolved
 through the gateway channel directory (or the selected profile adapter's live
 channel list) to real platform IDs; Hermes fails closed instead of guessing an
 unknown or ambiguous destination. A name must match exactly one visible
-channel; use a discovered channel ID when multiple workspaces or guilds expose
-the same name. The adapter must therefore have discovered the channel (for
-Buzz, join it and let the gateway connect). Automation and dependency alerts
-are never sent to a destination classified as a DM. Human-actionable
+channel. The alert plane accepts only the exact typed routes `#alerts`,
+`#blockers`, and `#final`; raw IDs, `#home`, and renamed channels fail closed.
+The adapter must therefore have discovered the channel (for Buzz, join it and
+let the gateway connect). Automation and dependency alerts are never sent to a
+destination classified as a DM. Human-actionable
 `needs_input` and `capability` openings may use a DM; informational recovery
 notices remain channel-only.
-Dedicated `#alerts` and `#blockers` channels are recommended.
+Dedicated `#alerts`, `#blockers`, and `#final` channels are required. Canary
+probes write metadata only (`kind`, `producer`, and `source_id`) to the local
+disposable `canary_sink_path`; they are never published to Buzz.
 
 Operations alerts run only in the gateway that owns the singleton Kanban
 dispatcher lock, so multi-profile deployments do not duplicate them. This is

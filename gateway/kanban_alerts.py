@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import os
 import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
@@ -24,11 +25,16 @@ class KanbanAlertSettings:
     platform: str = "buzz"
     automation_channel: str = ""
     blockers_channel: str = ""
+    final_channel: str = ""
     profile: Optional[str] = None
     cooldown_seconds: float = 900.0
     retry_seconds: float = 60.0
     max_items_per_message: int = 10
     health_window_ticks: int = 6
+    max_batches_per_flush: int = 1
+    max_delivery_attempts: int = 3
+    replay_max_age_seconds: float = 300.0
+    canary_sink_path: str = ""
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "KanbanAlertSettings":
@@ -51,17 +57,30 @@ class KanbanAlertSettings:
             health_window = int(alerts.get("health_window_ticks", 6))
         except (TypeError, ValueError):
             health_window = 6
+        try:
+            max_batches = int(alerts.get("max_batches_per_flush", 1))
+        except (TypeError, ValueError):
+            max_batches = 1
+        try:
+            max_attempts = int(alerts.get("max_delivery_attempts", 3))
+        except (TypeError, ValueError):
+            max_attempts = 3
         profile = str(alerts.get("profile") or "").strip() or None
         return cls(
             enabled=alerts.get("enabled") is True,
             platform=str(alerts.get("platform") or "buzz").strip().lower(),
             automation_channel=str(alerts.get("automation_channel") or "").strip(),
             blockers_channel=str(alerts.get("blockers_channel") or "").strip(),
+            final_channel=str(alerts.get("final_channel") or "").strip(),
             profile=profile,
             cooldown_seconds=number("cooldown_seconds", 900.0),
             retry_seconds=number("retry_seconds", 60.0, minimum=1.0),
             max_items_per_message=max(1, min(max_items, 50)),
             health_window_ticks=max(1, min(health_window, 120)),
+            max_batches_per_flush=max(1, min(max_batches, 10)),
+            max_delivery_attempts=max(1, min(max_attempts, 10)),
+            replay_max_age_seconds=number("replay_max_age_seconds", 300.0),
+            canary_sink_path=str(alerts.get("canary_sink_path") or "").strip(),
         )
 
 
@@ -193,7 +212,7 @@ def project_review_terminal_events(
         else:
             incident = KanbanAlertIncident(
                 key=key,
-                route="automation",
+                route="final",
                 message=(
                     f"✅ Kanban recovery final receipt: {board}/{task_id} closed "
                     f"after the bounded review repair budget was exhausted{details}"
@@ -477,10 +496,15 @@ class KanbanAlertNotifier:
                 settings.profile,
                 settings.automation_channel,
                 settings.blockers_channel,
+                settings.final_channel,
             ],
             separators=(",", ":"),
         )
         self._state = self._load_state()
+        self._startup_baseline_needed = (
+            self._state.get("destination") != self._destination_fingerprint
+        )
+        self._startup_baseline_active = False
         if self._state.get("destination") != self._destination_fingerprint:
             self._state = {
                 "version": 1,
@@ -555,7 +579,11 @@ class KanbanAlertNotifier:
         for key, entry in list(active.items()):
             if entry.get("scope") != scope or key in current:
                 continue
-            if entry.get("announced") and entry.get("recovery_message"):
+            if (
+                entry.get("announced")
+                and not entry.get("baseline_suppressed")
+                and entry.get("recovery_message")
+            ):
                 entry["pending_recovery"] = True
             else:
                 active.pop(key, None)
@@ -575,6 +603,8 @@ class KanbanAlertNotifier:
                     "pending_recovery": False,
                     "opened_at": self._now(),
                     "last_attempt_at": 0.0,
+                    "attempts": 0,
+                    "baseline_suppressed": self._startup_baseline_active,
                     "suppress_until": (
                         last_sent + self.settings.cooldown_seconds if last_sent else 0.0
                     ),
@@ -617,6 +647,8 @@ class KanbanAlertNotifier:
                 "pending_recovery": False,
                 "opened_at": self._now(),
                 "last_attempt_at": 0.0,
+                "attempts": 0,
+                "baseline_suppressed": self._startup_baseline_active,
                 "suppress_until": (
                     last_sent + self.settings.cooldown_seconds if last_sent else 0.0
                 ),
@@ -647,7 +679,11 @@ class KanbanAlertNotifier:
             return
         if recovery_message is not None:
             entry["recovery_message"] = recovery_message
-        if entry.get("announced") and entry.get("recovery_message"):
+        if (
+            entry.get("announced")
+            and not entry.get("baseline_suppressed")
+            and entry.get("recovery_message")
+        ):
             entry["pending_recovery"] = True
         else:
             self._state["active"].pop(key, None)
@@ -656,27 +692,83 @@ class KanbanAlertNotifier:
     def queue_transient(self, incident: KanbanAlertIncident) -> None:
         """Queue a one-shot alert unless the same key is inside its cooldown."""
         now = self._now()
+        if self._startup_baseline_active:
+            self._state["recent"][incident.key] = now
+            self._save_state()
+            return
         last_sent = float(self._state["recent"].get(incident.key) or 0.0)
         if last_sent and now - last_sent < self.settings.cooldown_seconds:
             return
         self._state["pending_transients"].setdefault(
             incident.key,
-            {**asdict(incident), "last_attempt_at": 0.0},
+            {
+                **asdict(incident),
+                "queued_at": now,
+                "attempts": 0,
+                "last_attempt_at": 0.0,
+            },
         )
         self._save_state()
 
     def queue_once(self, incident: KanbanAlertIncident) -> None:
         """Queue an immutable event receipt exactly once across restarts."""
+        if self._startup_baseline_active:
+            self._state["recent"][incident.key] = self._now()
+            self._save_state()
+            return
         if incident.key in self._state["recent"]:
             return
         self._state["pending_transients"].setdefault(
             incident.key,
-            {**asdict(incident), "last_attempt_at": 0.0},
+            {
+                **asdict(incident),
+                "queued_at": self._now(),
+                "attempts": 0,
+                "last_attempt_at": 0.0,
+            },
         )
         self._save_state()
 
+    def begin_startup_baseline(self) -> bool:
+        """Suppress pre-existing incidents on a new or changed destination."""
+        self._startup_baseline_active = self._startup_baseline_needed
+        return self._startup_baseline_active
+
+    def complete_startup_baseline(self) -> None:
+        if not self._startup_baseline_active:
+            return
+        for entry in self._state["active"].values():
+            if entry.get("baseline_suppressed"):
+                entry["announced"] = True
+        self._startup_baseline_active = False
+        self._startup_baseline_needed = False
+        self._state["destination"] = self._destination_fingerprint
+        self._save_state()
+
+    def record_canary(self, *, kind: str, producer: str, source_id: str) -> bool:
+        """Write a metadata-only canary to a local disposable sink, never a platform."""
+        sink = str(self.settings.canary_sink_path or "").strip()
+        fields = {
+            "kind": _one_line(kind, limit=80),
+            "producer": _one_line(producer, limit=80),
+            "source_id": _one_line(source_id, limit=180),
+        }
+        if not sink or not all(fields.values()):
+            return False
+        path = Path(sink).expanduser()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(fields, separators=(",", ":")) + "\n")
+        except OSError:
+            logger.warning("kanban alerts: cannot write disposable canary sink %s", path)
+            return False
+        return True
+
     async def flush(self) -> None:
-        """Deliver pending openings/recoveries and persist successful acks."""
+        """Deliver a bounded number of pending batches and persist successful acks."""
+        batches_sent = 0
         active = self._state["active"]
         groups: dict[tuple[str, str, bool], list[tuple[str, dict[str, Any]]]] = {}
         for key, entry in list(active.items()):
@@ -692,10 +784,7 @@ class KanbanAlertNotifier:
             ):
                 continue
             last_attempt = float(entry.get("last_attempt_at") or 0.0)
-            if (
-                last_attempt
-                and self._now() - last_attempt < self.settings.retry_seconds
-            ):
+            if last_attempt and self._now() - last_attempt < self.settings.retry_seconds:
                 continue
             if not message:
                 if recovering:
@@ -703,11 +792,12 @@ class KanbanAlertNotifier:
                 continue
             route = str(entry.get("route") or "automation")
             transition = "recovery" if recovering else "opening"
-            # Recovery is informational, never actionable enough to justify a DM.
             allow_dm = bool(entry.get("allow_dm")) and not recovering
             groups.setdefault((route, transition, allow_dm), []).append((key, entry))
 
         for (route, transition, allow_dm), entries in groups.items():
+            if batches_sent >= self.settings.max_batches_per_flush:
+                break
             messages = [
                 str(
                     entry.get("recovery_message")
@@ -719,18 +809,23 @@ class KanbanAlertNotifier:
             attempted_at = self._now()
             for _key, entry in entries:
                 entry["last_attempt_at"] = attempted_at
+                entry["attempts"] = int(entry.get("attempts") or 0) + 1
             delivery = await self._send(
                 route,
                 self._render_batch(route, transition, messages),
                 allow_dm=allow_dm,
             )
             if delivery is None:
-                if transition == "recovery":
-                    for key, _entry in entries:
-                        active.pop(key, None)
+                for key, _entry in entries:
+                    active.pop(key, None)
                 continue
             if not delivery:
+                for key, entry in entries:
+                    if int(entry.get("attempts") or 0) >= self.settings.max_delivery_attempts:
+                        self._state["recent"][key] = self._now()
+                        active.pop(key, None)
                 continue
+            batches_sent += 1
             now = self._now()
             for key, entry in entries:
                 self._state["recent"][key] = now
@@ -743,21 +838,29 @@ class KanbanAlertNotifier:
 
         pending = self._state["pending_transients"]
         transient_groups: dict[tuple[str, bool], list[tuple[str, dict[str, Any]]]] = {}
-        for key, entry in pending.items():
-            last_attempt = float(entry.get("last_attempt_at") or 0.0)
+        for key, entry in list(pending.items()):
+            queued_at = float(entry.get("queued_at") or 0.0)
             if (
-                last_attempt
-                and self._now() - last_attempt < self.settings.retry_seconds
+                queued_at
+                and self.settings.replay_max_age_seconds >= 0
+                and self._now() - queued_at > self.settings.replay_max_age_seconds
             ):
+                pending.pop(key, None)
+                continue
+            last_attempt = float(entry.get("last_attempt_at") or 0.0)
+            if last_attempt and self._now() - last_attempt < self.settings.retry_seconds:
                 continue
             route = str(entry.get("route") or "automation")
             allow_dm = bool(entry.get("allow_dm"))
             transient_groups.setdefault((route, allow_dm), []).append((key, entry))
         for (route, allow_dm), entries in transient_groups.items():
+            if batches_sent >= self.settings.max_batches_per_flush:
+                break
             messages = [str(entry.get("message") or "") for _, entry in entries]
             attempted_at = self._now()
             for _key, entry in entries:
                 entry["last_attempt_at"] = attempted_at
+                entry["attempts"] = int(entry.get("attempts") or 0) + 1
             delivery = await self._send(
                 route,
                 self._render_batch(route, "alert", messages),
@@ -768,7 +871,11 @@ class KanbanAlertNotifier:
                     pending.pop(key, None)
                 continue
             if not delivery:
+                for key, entry in entries:
+                    if int(entry.get("attempts") or 0) >= self.settings.max_delivery_attempts:
+                        pending.pop(key, None)
                 continue
+            batches_sent += 1
             now = self._now()
             for key, _entry in entries:
                 self._state["recent"][key] = now
@@ -779,7 +886,11 @@ class KanbanAlertNotifier:
         if len(messages) == 1:
             return messages[0]
         limit = max(1, int(self.settings.max_items_per_message))
-        label = "blocker" if route == "blockers" else "automation"
+        label = (
+            "blocker"
+            if route == "blockers"
+            else ("final" if route == "final" else "automation")
+        )
         noun = "recoveries" if transition == "recovery" else "alerts"
         lines = [f"Kanban {label} {noun} ({len(messages)}):"]
         lines.extend(f"• {message}" for message in messages[:limit])
@@ -791,13 +902,26 @@ class KanbanAlertNotifier:
     async def _send(
         self, route: str, message: str, *, allow_dm: bool
     ) -> Optional[bool]:
-        channel_ref = (
-            self.settings.blockers_channel
-            if route == "blockers"
-            else self.settings.automation_channel
-        )
+        channel_ref = {
+            "automation": self.settings.automation_channel,
+            "blockers": self.settings.blockers_channel,
+            "final": self.settings.final_channel,
+        }.get(route, "")
         if not self.settings.enabled or not channel_ref:
             return False
+        expected_ref = {
+            "automation": "#alerts",
+            "blockers": "#blockers",
+            "final": "#final",
+        }.get(route)
+        if channel_ref.strip().lower() != expected_ref:
+            logger.warning(
+                "kanban alerts: refusing unsafe %s route %r; use %s",
+                route,
+                channel_ref,
+                expected_ref,
+            )
+            return None
         adapter = self._adapter_lookup(self.settings.platform, self.settings.profile)
         if adapter is None:
             return False
@@ -833,6 +957,11 @@ class KanbanAlertNotifier:
         except Exception:
             logger.warning("kanban alerts: delivery failed", exc_info=True)
             return False
+        # A durable remote id proves the side effect happened. Some adapters
+        # can return a conservative/late negative acknowledgement after the
+        # publish succeeded; retrying that result duplicates the message.
+        if getattr(result, "message_id", None):
+            return True
         return getattr(result, "success", True) is not False
 
     async def _resolve_destination(

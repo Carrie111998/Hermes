@@ -1930,6 +1930,7 @@ class GatewayKanbanWatchersMixin:
                             board.get("slug") or _kb.DEFAULT_BOARD
                             for board in board_meta
                         ]
+                        alert_notifier.begin_startup_baseline()
                         if board_listing_authoritative:
                             alert_notifier.retire_missing_scopes(
                                 "blockers:",
@@ -1972,6 +1973,7 @@ class GatewayKanbanWatchersMixin:
                                 alert_notifier,
                                 _kb,
                             )
+                        alert_notifier.complete_startup_baseline()
                         await alert_notifier.flush()
                     except Exception:
                         logger.exception("kanban alerts: tick failed")

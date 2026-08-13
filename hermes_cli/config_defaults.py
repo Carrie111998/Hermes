@@ -2455,6 +2455,7 @@ DEFAULT_CONFIG = {
             "profile": "",
             "automation_channel": "",
             "blockers_channel": "",
+            "final_channel": "",
             # A stable incident alerts once and recovers once. This cooldown
             # suppresses rapid close/re-open flapping for the same incident key.
             "cooldown_seconds": 900,
@@ -2465,6 +2466,14 @@ DEFAULT_CONFIG = {
             # New/recovered incidents are batched; only this many details are
             # rendered before a bounded "+N more" summary.
             "max_items_per_message": 10,
+            # Bound each tick and restart replay. Stale queued events and
+            # repeatedly failing deliveries are dropped rather than bursting.
+            "max_batches_per_flush": 1,
+            "max_delivery_attempts": 3,
+            "replay_max_age_seconds": 300,
+            # Metadata-only local sink for route canaries. Empty disables them;
+            # canaries are never delivered through a messaging adapter.
+            "canary_sink_path": "",
         },
     },
 
