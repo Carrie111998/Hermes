@@ -231,20 +231,140 @@ def test_executor_canary_cli_requires_request_id(queue_mode, capsys):
     assert "--request-id" in capsys.readouterr().err
 
 
-def test_executor_canary_cli_no_eligible_target_is_safe_noop(queue_mode, capsys, monkeypatch):
+def test_executor_canary_cli_unknown_request_id_fails_loudly(queue_mode, capsys, monkeypatch):
+    # H2: an unknown --request-id used to fall through to run_executor_tick,
+    # which found no matching PLANNED row and returned a silent processed=0
+    # -- indistinguishable from "no eligible target". That is a footgun at
+    # exactly the moment a canary is being run, so this now refuses BEFORE
+    # the tick (and before GhPrClient is ever constructed) with exit 2 and a
+    # diagnostic naming the unknown id. This intentionally supersedes the
+    # prior "safe no-op" expectation for this case; the wrong-state case
+    # (see the next test) is refused the same way.
     import devflow_delegation.executor as executor_mod
 
-    class _Fake:
-        def create_pr(self, **kwargs):
-            raise AssertionError("no eligible target -> create_pr must never be called")
+    def _boom(*_a, **_k):
+        raise AssertionError("unknown request -> GhPrClient must never be constructed")
 
-    monkeypatch.setattr(executor_mod, "GhPrClient", _Fake)
+    monkeypatch.setattr(executor_mod, "GhPrClient", _boom)
     rc = cli.main([
         "executor-canary", "--i-understand-this-opens-a-real-pr", "--request-id", "dwr_missing",
     ])
-    assert rc == 0
+    assert rc == 2
+    assert "unknown request: dwr_missing" in capsys.readouterr().err
+
+
+def test_executor_canary_cli_wrong_state_fails_loudly(queue_mode, capsys, monkeypatch):
+    # H2: a designated request that exists but is not PLANNED (very commonly
+    # VALIDATED, because a prior shadow tick already advanced it) must also
+    # fail loudly rather than silently reporting processed=0. This is NOT a
+    # resume-from-VALIDATED path -- the request is left exactly as found.
+    import devflow_delegation.executor as executor_mod
+    from devflow_delegation.emitter import DelegationEmitter
+    from devflow_delegation.lifecycle import transition
+
+    monkeypatch.setattr("sys.stdin", __import__("io").StringIO(json.dumps(make_delegate_kwargs())))
+    cli.main(["delegate"])
+    ledger = DelegationEmitter().ledger
+    rid = ledger.list_requests()[0]["request_id"]
+    transition(ledger, None, rid, "TRIAGED", actor="operator")
+    assert ledger.record_human_decision(rid, "operator", "approve", "fixture setup", f"token-{rid}")
+    transition(ledger, None, rid, "PLANNED", actor="operator")
+    # Simulate the common real-world cause: a prior shadow tick advanced this
+    # SAME request to VALIDATED (BUILDING -> VALIDATED is a legal lifecycle
+    # transition; set_state here is only test setup, not exercising that
+    # path).
+    ledger.set_state(rid, "VALIDATED")
+
+    def _boom(*_a, **_k):
+        raise AssertionError("wrong-state request -> GhPrClient must never be constructed")
+
+    monkeypatch.setattr(executor_mod, "GhPrClient", _boom)
+    rc = cli.main([
+        "executor-canary", "--i-understand-this-opens-a-real-pr", "--request-id", rid,
+    ])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert f"request {rid} is in state VALIDATED, not PLANNED" in err
+    assert "canary requires a PLANNED request" in err
+
+
+def test_executor_canary_cli_reaches_a_pr_with_a_fake_client(
+    hermes_root, allowlist_file, tmp_path_factory, capsys, monkeypatch
+):
+    # H6: the happy path -- executor-canary reaching a real PR and printing
+    # pr=<url> -- was only covered at the run_executor_tick level, never at
+    # the CLI layer. Drive it through cli.main() end-to-end against a REAL
+    # temp git repo + bare remote (the same fixture-repo pattern used by
+    # test_executor.py), with a FAKE GhPrClient injected -- never a real
+    # client, never a network call.
+    import io
+
+    import devflow_delegation.executor as executor_mod
+    from devflow_delegation.emitter import DelegationEmitter
+    from devflow_delegation.lifecycle import transition
+    from tests.devflow_delegation.test_executor import _fixture_repo, _write_source_command
+
+    # The fixture repo lives under its OWN tmp_path_factory root, distinct
+    # from hermes_root's tmp_path -- _validate_target_boundary refuses a
+    # checkout nested inside (or equal to) get_default_hermes_root(), which
+    # hermes_root monkeypatches to its own tmp_path.
+    fixture_root = tmp_path_factory.mktemp("ddp-canary-cli")
+    repo = _fixture_repo(fixture_root)
+
+    (hermes_root / "devflow" / "policy.json").write_text(
+        json.dumps({"explicit": {"mode": "queue"}}), encoding="utf-8")
+
+    allowlist = json.loads(allowlist_file.read_text(encoding="utf-8"))
+    allowlist["targets"]["canary_real"] = {
+        "repo": "canary_real",
+        "checkout_path": str(repo),
+        "default_branch": "main",
+        "remote": "origin",
+        "allowed_globs": ["src/**"],
+        "denied_globs": ["**/.env", "secrets/**"],
+        "worktree_base": str(fixture_root / "worktrees"),
+        "test_commands": [["python", "-c", "print('tests passed')"]],
+        "command_timeout_seconds": 30,
+        "required_checks": ["test"],
+        "risk_ceiling": "low",
+        "max_autonomous_action": "create_pr",
+        "executor_enabled": True,
+        "canary_real": True,
+        "pr_budget": 1,
+        "implementation_command": list(_write_source_command()),
+        "github_repo": "example/canary-fixture",
+        "live_gateway_imports": False,
+    }
+    allowlist_file.write_text(json.dumps(allowlist), encoding="utf-8")
+
+    # Queue + approve a PLANNED request from the "explicit" source kind
+    # (EXECUTOR_ALLOWED_SOURCES) against the canary_real target.
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(make_delegate_kwargs(
+        source={"agent": "operator", "kind": "explicit", "finding_id": "f-1"},
+        target={"repo": "canary_real", "subsystem": "src"},
+        severity="low",
+    ))))
+    assert cli.main(["delegate"]) == 0
+
+    ledger = DelegationEmitter().ledger
+    rid = ledger.list_requests()[0]["request_id"]
+    transition(ledger, None, rid, "TRIAGED", actor="operator")
+    assert ledger.record_human_decision(rid, "operator", "approve", "fixture setup", f"token-{rid}")
+    transition(ledger, None, rid, "PLANNED", actor="operator")
+
+    class _FakeGhPrClient:
+        def create_pr(self, **kwargs):
+            return {"number": 99, "url": "https://example.test/pr/99"}
+
+    monkeypatch.setattr(executor_mod, "GhPrClient", _FakeGhPrClient)
+
+    rc = cli.main(["executor-canary", "--i-understand-this-opens-a-real-pr", "--request-id", rid])
     out = capsys.readouterr().out
-    assert "mode=canary" in out and "processed=0" in out
+
+    assert rc == 0
+    assert "mode=canary" in out
+    assert "processed=1" in out
+    assert "pr=https://example.test/pr/99" in out
 
 
 def test_gate_cli_records_shadow_decision_without_authority(queue_mode, allowlist_file, capsys, monkeypatch):

@@ -70,14 +70,14 @@ def _target(repo, tmp_path, *, command, **overrides):
     return TargetConfig(**values)
 
 
-def _request(*, source_kind="explicit", severity="low"):
+def _request(*, source_kind="explicit", severity="low", title="Update synthetic fixture"):
     return parse_request({
         "schema_version": "3.0",
         "type": "DEVFLOW_WORK_REQUEST",
         "idempotency_key": "test:fixture:v1",
         "source": {"agent": "operator", "kind": source_kind, "finding_id": "fixture-1"},
         "kind": "task",
-        "title": "Update synthetic fixture",
+        "title": title,
         "problem_statement": "Exercise the isolated executor.",
         "evidence": [{"kind": "test", "summary": "synthetic"}],
         "target": {"repo": "fixture", "subsystem": "src"},
@@ -592,3 +592,68 @@ def test_canary_without_designated_request_id_is_a_safe_noop(tmp_path):
     # No BUILDING/FAILED transition was ever recorded; only the setup
     # transitions from _planned_ledger (TRIAGED, PLANNED) exist.
     assert [item["to_state"] for item in ledger.transitions_for(request.request_id)] == ["TRIAGED", "PLANNED"]
+
+
+def test_title_with_newlines_and_control_chars_is_sanitized_in_commit_and_pr_title(tmp_path):
+    # H1 regression: the raw envelope title (producer-supplied free text) was
+    # sanitized ONLY for the shadow artifact. It flowed RAW into the git
+    # commit message and the canary PR title, so a newline/control character
+    # in a title could land in both. _safe_title is now the ONE sanitizer
+    # shared by all three surfaces.
+    repo = _fixture_repo(tmp_path)
+    dirty_title = "Bad title\nrm -rf /\x07\x1b[31mred\x1b[0m"
+    ledger, request = _planned_ledger(tmp_path, title=dirty_title)
+    client = FakePrClient()
+
+    result = run_executor_tick(
+        ledger, _allowlist(_canary_target(repo, tmp_path, command=_write_source_command())), None,
+        pr_client=client, mode="canary", request_id=request.request_id,
+    )
+
+    assert result == {"processed": 1, "errors": 0, "skipped": 0}
+
+    # 1) PR title carries no raw newline or control character.
+    pr_title = client.calls[0]["title"]
+    assert "\n" not in pr_title
+    assert "\x07" not in pr_title and "\x1b" not in pr_title
+    assert pr_title.startswith("Bad title rm -rf /")
+
+    # 2) The pushed commit's message (on the bare remote, since the local
+    # worktree/branch are removed by the executor's cleanup) carries no raw
+    # newline injected from the title and no control characters either.
+    branch = next(i["ref"] for i in ledger.artifacts_for(request.request_id) if i["kind"] == "branch")
+    bare = tmp_path / "fixture-remote.git"
+    log = subprocess.run(
+        ["git", "--git-dir", str(bare), "log", "-1", "--format=%s", branch],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    assert log.returncode == 0, log.stderr
+    subject = log.stdout.strip()
+    assert subject == "[ddp] Bad title rm -rf /[31mred[0m"
+    assert "\x07" not in subject and "\x1b" not in subject
+
+
+def test_diff_line_count_reflects_a_fully_deleted_tracked_file(tmp_path):
+    # H3 regression: `git add -N` (intent-to-add) stages a full DELETION of
+    # an already-tracked file, so a subsequent UNSTAGED `git diff --numstat`
+    # (no HEAD) compares an already-empty index entry to an already-absent
+    # worktree file and reports NOTHING for it -- silently undercounting
+    # deleted lines in the shadow artifact's diagnostic. Diffing against HEAD
+    # picks up the deletion correctly.
+    repo = _fixture_repo(tmp_path)
+    ledger, request = _planned_ledger(tmp_path)
+    # src/seed.txt ("seed\n", 1 line) is deleted outright by the
+    # implementation command -- no replacement file is written.
+    command = ("python", "-c", "import os; os.remove('src/seed.txt'); print('implemented')")
+
+    result = run_executor_tick(
+        ledger, _allowlist(_target(repo, tmp_path, command=command)), None,
+    )
+
+    assert result == {"processed": 1, "errors": 0, "skipped": 0}
+    assert ledger.get_request(request.request_id)["state"] == "VALIDATED"
+    shadow = next(i["ref"] for i in ledger.artifacts_for(request.request_id) if i["kind"] == "shadow")
+    # 1 line removed, 0 added -> lines=1. The pre-fix implementation reports
+    # lines=0 here because the unstaged diff sees no difference once the
+    # deletion is already staged by `git add -N`.
+    assert "lines=1" in shadow

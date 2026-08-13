@@ -124,9 +124,30 @@ def _cmd_executor_canary(args) -> int:
     if not args.request_id:
         print("ERROR: --request-id is required for a canary run", file=sys.stderr)
         return 2
-    from devflow_delegation.executor import GhPrClient, run_executor_tick
 
     em = DelegationEmitter()
+
+    # A silent processed=0 is indistinguishable from "no eligible target" and
+    # is a real operator footgun right when a canary is being run -- most
+    # commonly because a prior shadow tick already advanced the SAME request
+    # to VALIDATED. Fail loudly, before the tick (and before GhPrClient is
+    # ever constructed), naming the actual state. This does not add a
+    # resume-from-VALIDATED path; run_executor_tick's own PLANNED-only
+    # selection is unchanged.
+    designated = em.ledger.get_request(args.request_id)
+    if designated is None:
+        print(f"ERROR: unknown request: {args.request_id}", file=sys.stderr)
+        return 2
+    if designated["state"] != "PLANNED":
+        print(
+            f"ERROR: request {args.request_id} is in state {designated['state']}, not PLANNED; "
+            "canary requires a PLANNED request (a prior shadow tick advances a request to VALIDATED)",
+            file=sys.stderr,
+        )
+        return 2
+
+    from devflow_delegation.executor import GhPrClient, run_executor_tick
+
     counts = run_executor_tick(
         em.ledger, em.allowlist, em.bus, actor=args.actor,
         pr_client=GhPrClient(), mode="canary", request_id=args.request_id,

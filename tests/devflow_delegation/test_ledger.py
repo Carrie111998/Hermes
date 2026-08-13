@@ -353,3 +353,71 @@ def test_count_prs_for_target_since_counts_pr_attempt_alone(tmp_path):
     ledger.add_artifact(req.request_id, "pr_attempt", "ddp-branch-a1")
 
     assert ledger.count_prs_for_target_since("sandbox", "1970-01-01T00:00:00+00:00") == 1
+
+
+def test_count_prs_for_target_since_sums_multiple_rows_of_both_kinds(tmp_path):
+    # H5: this is the durable backstop for "exactly one real PR" -- prove it
+    # actually SUMS across multiple requests, and that a "pr" artifact on one
+    # request and a "pr_attempt" artifact on another BOTH count toward the
+    # same target's total (not just each kind counted in isolation, which is
+    # all the pre-existing tests covered).
+    ledger = DelegationLedger(tmp_path / "ledger.db")
+
+    def _seed(idem, repo):
+        req = parse_request({
+            "schema_version": "3.0", "type": "DEVFLOW_WORK_REQUEST",
+            "idempotency_key": idem,
+            "source": {"agent": "operator", "kind": "explicit", "finding_id": "f"},
+            "kind": "task", "title": "t", "problem_statement": "p",
+            "evidence": [{"kind": "test", "summary": "s"}],
+            "target": {"repo": repo, "subsystem": "src"},
+            "severity": "low", "priority": "P3", "confidence": 1.0,
+            "acceptance_criteria": ["a"], "safety_notes": [],
+        })
+        ledger.insert_request(req)
+        return req.request_id
+
+    a = _seed("k-sum-a", "sandbox")
+    b = _seed("k-sum-b", "sandbox")
+    c = _seed("k-sum-c", "other")
+
+    ledger.add_artifact(a, "pr", "https://example.test/pr/10")
+    ledger.add_artifact(b, "pr_attempt", "ddp-branch-a1")
+    ledger.add_artifact(c, "pr", "https://example.test/pr/99")  # other target -> not summed in
+
+    assert ledger.count_prs_for_target_since("sandbox", "1970-01-01T00:00:00+00:00") == 2
+
+
+def test_count_prs_for_target_since_boundary_is_inclusive(tmp_path):
+    # H5: an artifact whose created_at is EXACTLY equal to since_iso must be
+    # counted (the query uses >=). Insert an artifact row with an explicit
+    # created_at via a raw connection, since add_artifact always stamps
+    # "now".
+    ledger = DelegationLedger(tmp_path / "ledger.db")
+    req = parse_request({
+        "schema_version": "3.0", "type": "DEVFLOW_WORK_REQUEST",
+        "idempotency_key": "k-boundary",
+        "source": {"agent": "operator", "kind": "explicit", "finding_id": "f"},
+        "kind": "task", "title": "t", "problem_statement": "p",
+        "evidence": [{"kind": "test", "summary": "s"}],
+        "target": {"repo": "sandbox", "subsystem": "src"},
+        "severity": "low", "priority": "P3", "confidence": 1.0,
+        "acceptance_criteria": ["a"], "safety_notes": [],
+    })
+    ledger.insert_request(req)
+
+    boundary = "2026-01-01T00:00:00+00:00"
+    conn = sqlite3.connect(str(ledger.db_path))
+    try:
+        conn.execute(
+            "INSERT INTO artifacts (request_id, kind, ref, created_at) VALUES (?,?,?,?)",
+            (req.request_id, "pr", "https://example.test/pr/boundary", boundary),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert ledger.count_prs_for_target_since("sandbox", boundary) == 1
+    # One microsecond later, the same row is excluded -- pins the boundary is
+    # ">=", not "==" (a coarser fix could pass the equality case alone).
+    assert ledger.count_prs_for_target_since("sandbox", "2026-01-01T00:00:00.000001+00:00") == 0

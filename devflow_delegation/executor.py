@@ -18,6 +18,7 @@ import os
 import re
 import sqlite3
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Protocol, Sequence
 
@@ -314,7 +315,7 @@ def _stage_commit_push(
     if staged.returncode != 1:
         raise ExecutorError(f"git diff --cached failed ({staged.returncode}): {_bounded(staged.stderr)}")
     _run_checked(
-        ["git", "commit", "-m", f"[ddp] {title[:72]}", "-m", f"request-id: {request_id}"],
+        ["git", "commit", "-m", f"[ddp] {_safe_title(title, 72)}", "-m", f"request-id: {request_id}"],
         cwd=worktree_path, timeout_seconds=45, label="git commit",
     )
     branch = _run_checked(
@@ -333,8 +334,6 @@ def _pr_budget_exhausted(ledger: DelegationLedger, target: TargetConfig, target_
 
     Fail-closed and independent of the gate.py merge/deploy window budget.
     """
-    from datetime import datetime, timedelta, timezone
-
     since = (datetime.now(timezone.utc) - timedelta(hours=target.pr_budget_window_hours)).isoformat()
     return ledger.count_prs_for_target_since(target_repo, since) >= target.pr_budget
 
@@ -406,11 +405,17 @@ def _diff_line_count(worktree_path: Path, paths: Sequence[str]) -> int:
     ``git add -N`` (intent-to-add) surfaces untracked files in the diff without
     committing; the worktree is disposable and removed in the caller's finally
     block, so mutating its index here has no lasting effect.
+
+    Diffed against ``HEAD`` (not the bare unstaged tree): ``git add -N`` on a
+    tracked file that was DELETED stages that deletion into the index, so an
+    unstaged-only diff would compare an empty index entry against an already
+    identical worktree (nothing) and silently report 0 removed lines. Diffing
+    against HEAD captures both staged and unstaged changes uniformly.
     """
     if not paths:
         return 0
     _run_checked(["git", "add", "-N", "--", *paths], cwd=worktree_path, timeout_seconds=20, label="git add intent")
-    numstat = _run_checked(["git", "diff", "--numstat", "--", *paths], cwd=worktree_path, timeout_seconds=20, label="git diff numstat")
+    numstat = _run_checked(["git", "diff", "--numstat", "HEAD", "--", *paths], cwd=worktree_path, timeout_seconds=20, label="git diff numstat")
     total = 0
     for line in numstat.stdout.splitlines():
         parts = line.split("\t")
@@ -421,14 +426,25 @@ def _diff_line_count(worktree_path: Path, paths: Sequence[str]) -> int:
     return total
 
 
+def _safe_title(title: str, limit: int) -> str:
+    """Collapse whitespace, keep only printable characters, and truncate.
+
+    The envelope ``title`` is producer-supplied free text. This is the ONE
+    sanitizer shared by every surface it reaches -- the shadow artifact, the
+    git commit message, and the PR title -- so a newline or control
+    character in a title can never land in any of them.
+    """
+    safe = re.sub(r"\s+", " ", str(title or "")).strip()[:limit]
+    return "".join(ch for ch in safe if ch.isprintable())
+
+
 def _shadow_ref(paths_count: int, lines: int, branch: str, title: str) -> str:
     """Compact, leak-free shadow evidence: counts + safe branch + sanitized title.
 
     Deliberately excludes absolute paths, file contents, prompts, and model
     details, matching the projection's sanitization posture.
     """
-    safe_title = re.sub(r"\s+", " ", str(title or "")).strip()[:80]
-    safe_title = "".join(ch for ch in safe_title if ch.isprintable())
+    safe_title = _safe_title(title, 80)
     return f"paths={paths_count} lines={lines} branch={branch} title={safe_title}"
 
 
@@ -594,7 +610,7 @@ def run_executor_tick(
             worktree_path=worktree_path,
             branch=branch,
             base_branch=target.default_branch,
-            title=title[:160],
+            title=_safe_title(title, 160),
             body=_pr_body(request_id),
             repo=target.github_repo,
             label="devflow-canary",
