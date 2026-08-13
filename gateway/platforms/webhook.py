@@ -460,6 +460,11 @@ class WebhookAdapter(BasePlatformAdapter):
             self._prune_seen_deliveries(now)
         return True
 
+    def _release_delivery_id(self, delivery_id: str, reserved_at: float) -> None:
+        """Release this request's reservation after incomplete processing."""
+        if self._seen_deliveries.get(delivery_id) == reserved_at:
+            self._seen_deliveries.pop(delivery_id, None)
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "webhook"}
 
@@ -780,7 +785,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 if isinstance((value := request.headers.get(name)), str)
                 and value.strip()
                 and len(value.strip()) <= 256
-                and "\x00" not in value
+                and not any(ord(char) < 32 or ord(char) == 127 for char in value)
             ),
             None,
         )
@@ -788,7 +793,7 @@ class WebhookAdapter(BasePlatformAdapter):
             event_type
             if isinstance(event_type, str)
             and len(event_type) <= 128
-            and "\x00" not in event_type
+            and not any(ord(char) < 32 or ord(char) == 127 for char in event_type)
             else None
         )
         if route_config.get("script") and (
@@ -821,14 +826,25 @@ class WebhookAdapter(BasePlatformAdapter):
         if route_config.get("script"):
             # run_route_script shells out (subprocess.run, up to its timeout);
             # run it in a worker thread so it can't block the gateway event loop.
-            keep, transformed_payload = await asyncio.to_thread(
+            script_outcome, transformed_payload = await asyncio.to_thread(
                 self._route_processor.run_route_script,
                 route_config.get("script"),
                 payload,
                 event_type=script_event_type,
                 delivery_id=delivery_id,
             )
-            if not keep:
+            if script_outcome == "failed":
+                self._release_delivery_id(delivery_id, now)
+                logger.warning(
+                    "[webhook] script failed event=%s route=%s",
+                    event_type,
+                    route_name,
+                )
+                return web.json_response(
+                    {"error": "Route script execution failed", "route": route_name},
+                    status=503,
+                )
+            if script_outcome == "ignored":
                 logger.info(
                     "[webhook] script ignored event=%s route=%s",
                     event_type,
