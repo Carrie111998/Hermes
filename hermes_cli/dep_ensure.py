@@ -21,7 +21,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from hermes_constants import agent_browser_runnable, find_node_executable
+from hermes_constants import (
+    agent_browser_managed_shim_candidates,
+    find_node_executable,
+    resolve_agent_browser_candidate,
+)
 from tools.environments.local import hermes_subprocess_env
 
 _IS_WINDOWS = platform.system() == "Windows"
@@ -32,7 +36,7 @@ _DEP_CHECKS = {
     # a managed one and trigger a redundant re-install.
     "node": lambda: find_node_executable("node") is not None,
     "browser": lambda: (
-        agent_browser_runnable(shutil.which("agent-browser"))
+        resolve_agent_browser_candidate(shutil.which("agent-browser")) is not None
         or _has_system_browser()
         or _has_hermes_agent_browser()
     ),
@@ -62,14 +66,10 @@ def _has_system_browser() -> bool:
 def _has_hermes_agent_browser() -> bool:
     from hermes_constants import get_hermes_home
     home = get_hermes_home()
-    if _IS_WINDOWS:
-        # npm -g --prefix puts .cmd shims directly in the prefix dir on Windows
-        return (home / "node" / "agent-browser.cmd").is_file()
-    # install.sh installs globally into $HERMES_HOME/node/bin/ via npm -g --prefix
-    # Also check legacy node_modules/.bin/ path for git-clone installs.
-    return (
-        (home / "node" / "bin" / "agent-browser").is_file()
-        or (home / "node_modules" / ".bin" / "agent-browser").is_file()
+    probe_env = hermes_subprocess_env(inherit_credentials=False)
+    return any(
+        resolve_agent_browser_candidate(str(candidate), env=probe_env)
+        for candidate in agent_browser_managed_shim_candidates(home)
     )
 
 

@@ -224,8 +224,8 @@ def test_has_agent_browser_resolves_via_hermes_managed_node_path(monkeypatch, tm
         "hermes_constants.with_hermes_node_path", lambda: {"PATH": str(managed_dir)}
     )
     monkeypatch.setattr(
-        "hermes_constants.agent_browser_runnable",
-        lambda p: bool(p) and str(p) == str(managed_bin),
+        "hermes_constants.resolve_agent_browser_candidate",
+        lambda p, **_: str(managed_bin) if p else None,
     )
 
     assert ns._has_agent_browser() is True

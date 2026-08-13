@@ -66,9 +66,13 @@ from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
 from agent.redact import redact_cdp_url
 from hermes_constants import (
+    agent_browser_native_binary_names,
+    agent_browser_native_sibling_candidates,
     agent_browser_runnable,
+    find_node_executable_on_path,
     get_hermes_home,
     get_hermes_home_override,
+    prepare_agent_browser_native_candidate,
 )
 from utils import env_int, is_truthy_value
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
@@ -2296,6 +2300,57 @@ def _agent_browser_candidate_present(path: str | None) -> bool:
     return os.path.exists(path) and (os.name == "nt" or os.access(path, os.X_OK))
 
 
+def _browser_node_available(extended_path: str = "") -> bool:
+    return bool(find_node_executable_on_path("node", extended_path or None))
+
+
+def _agent_browser_shim_requires_node(path: str) -> bool:
+    try:
+        sample = Path(path).read_bytes()[:1024]
+    except OSError:
+        return False
+    if sample.startswith((b"\x7fELF", b"MZ", b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe")):
+        return False
+    text = sample.decode("utf-8", errors="ignore").lower()
+    return "node" in text and ("agent-browser" in text or ".js" in text)
+
+
+def _resolve_agent_browser_candidate(
+    path: str | None,
+    extended_path: str = "",
+    *,
+    validate: bool,
+) -> str | None:
+    if not path:
+        return None
+    probe_env = {"PATH": extended_path} if extended_path else None
+    if _agent_browser_shim_requires_node(path) and not _browser_node_available(extended_path):
+        logger.debug("browser: skipping agent-browser shim without node on PATH: %s", path)
+    elif validate:
+        if agent_browser_runnable(path, env=probe_env):
+            return path
+    elif _agent_browser_candidate_present(path):
+        return path
+
+    for candidate in agent_browser_native_sibling_candidates(path):
+        if not prepare_agent_browser_native_candidate(candidate):
+            continue
+        resolved = str(candidate)
+        if not validate or agent_browser_runnable(resolved, env=probe_env):
+            return resolved
+    return None
+
+
+def _candidate_agent_browser_native_bins() -> list[Path]:
+    repo_root = Path(__file__).parent.parent
+    roots = [
+        repo_root / "node_modules" / "agent-browser" / "bin",
+        get_hermes_home() / "node_modules" / "agent-browser" / "bin",
+        get_hermes_home() / "node" / "lib" / "node_modules" / "agent-browser" / "bin",
+    ]
+    return [root / name for root in roots for name in agent_browser_native_binary_names()]
+
+
 def _find_agent_browser(*, validate: bool = True) -> str:
     """
     Find the agent-browser CLI executable.
@@ -2333,30 +2388,54 @@ def _find_agent_browser(*, validate: bool = True) -> str:
     # the next working resolution (extended PATH → local .bin → npx) instead of
     # caching the broken one and silently killing every browser tool.
 
-    # Check if it's in PATH (global install)
-    which_result = shutil.which("agent-browser")
-    if which_result and (
-        agent_browser_runnable(which_result) if validate else _agent_browser_candidate_present(which_result)
-    ):
+    extended_path = _merge_browser_path(os.environ.get("PATH", ""))
+
+    # A Node-backed shim is not usable without Node; try its packaged native
+    # sibling before falling through to local and npx candidates.
+    which_result = _resolve_agent_browser_candidate(
+        shutil.which("agent-browser"), extended_path, validate=validate
+    )
+    if which_result:
         if not validate:
             return which_result
         _cached_agent_browser = which_result
         _agent_browser_resolved = True
         return which_result
 
-    # Build an extended search PATH including Hermes-managed Node, macOS
-    # versioned Homebrew installs, and fallback system dirs like Termux.
-    extended_path = _merge_browser_path("")
     if extended_path:
-        which_result = shutil.which("agent-browser", path=extended_path)
-        if which_result and (
-            agent_browser_runnable(which_result) if validate else _agent_browser_candidate_present(which_result)
-        ):
+        which_result = _resolve_agent_browser_candidate(
+            shutil.which("agent-browser", path=extended_path),
+            extended_path,
+            validate=validate,
+        )
+        if which_result:
             if not validate:
                 return which_result
             _cached_agent_browser = which_result
             _agent_browser_resolved = True
             return which_result
+
+    native_binary = next(
+        (
+            str(candidate)
+            for candidate in _candidate_agent_browser_native_bins()
+            if prepare_agent_browser_native_candidate(candidate)
+            and (
+                not validate
+                or agent_browser_runnable(
+                    str(candidate),
+                    env={"PATH": extended_path} if extended_path else None,
+                )
+            )
+        ),
+        None,
+    )
+    if native_binary:
+        if not validate:
+            return native_binary
+        _cached_agent_browser = native_binary
+        _agent_browser_resolved = True
+        return native_binary
 
     # Check local node_modules/.bin/ (npm install in repo root).
     # On Windows, npm drops three shims in .bin: an extensionless POSIX shell
@@ -2369,10 +2448,12 @@ def _find_agent_browser(*, validate: bool = True) -> str:
     repo_root = Path(__file__).parent.parent
     local_bin_dir = repo_root / "node_modules" / ".bin"
     if local_bin_dir.is_dir():
-        local_which = shutil.which("agent-browser", path=str(local_bin_dir))
-        if local_which and (
-            agent_browser_runnable(local_which) if validate else _agent_browser_candidate_present(local_which)
-        ):
+        local_which = _resolve_agent_browser_candidate(
+            shutil.which("agent-browser", path=str(local_bin_dir)),
+            extended_path,
+            validate=validate,
+        )
+        if local_which:
             if not validate:
                 return local_which
             _cached_agent_browser = local_which
@@ -2383,7 +2464,7 @@ def _find_agent_browser(*, validate: bool = True) -> str:
     npx_path = shutil.which("npx")
     if not npx_path and extended_path:
         npx_path = shutil.which("npx", path=extended_path)
-    if npx_path:
+    if npx_path and _browser_node_available(extended_path):
         if not validate:
             return "npx agent-browser"
         _cached_agent_browser = "npx agent-browser"
@@ -2592,10 +2673,7 @@ def _run_browser_command(
         # Honour either the legacy AGENT_BROWSER_CHROME_FLAGS (never consumed by
         # agent-browser itself, but documented in older notes) or the real
         # AGENT_BROWSER_ARGS — if the user pre-sets either, don't overwrite it.
-        if (
-            "AGENT_BROWSER_ARGS" not in browser_env
-            and "AGENT_BROWSER_CHROME_FLAGS" not in browser_env
-        ):
+        if "AGENT_BROWSER_ARGS" not in browser_env:
             if _needs_chromium_sandbox_bypass():
                 logger.debug(
                     "browser: sandbox bypass needed (root/docker/AppArmor userns) — "
