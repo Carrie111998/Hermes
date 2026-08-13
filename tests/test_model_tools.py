@@ -244,6 +244,39 @@ class TestAgentLoopTools:
 class TestPreToolCallBlocking:
     """Verify that pre_tool_call hooks can block tool execution."""
 
+    def test_governed_capture_block_keeps_explicit_failure_shape(self, monkeypatch):
+        marker = (
+            "Capture requires an explicit app target. "
+            "[agente-cua-diagnostic schema=1 reason=capture_app_required "
+            "phase=scope_target requested_app=- matched_app=- "
+            "pid_present=0 window_id_present=0]"
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: (
+                [{"action": "block", "message": marker}]
+                if hook_name == "pre_tool_call"
+                else []
+            ),
+        )
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("dispatch should not run when capture is blocked")
+            ),
+        )
+
+        result = json.loads(
+            handle_function_call("computer_use", {"action": "capture"}, task_id="t-cua")
+        )
+
+        assert result["ok"] is False
+        assert result["success"] is False
+        assert result["status"] == "failed"
+        assert result["action"] == "capture"
+        assert result["code"] == "capture_app_required"
+        assert "agente-cua-diagnostic" not in json.dumps(result)
+
     def test_blocked_tool_returns_error_and_skips_dispatch(self, monkeypatch):
         hook_calls = []
 

@@ -61,7 +61,11 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "effects). All other actions require approval unless "
                     "auto-approved. Use `set_value` for select/popup elements "
                     "and sliders — it selects the matching option directly "
-                    "without opening the native menu (no focus steal)."
+                    "without opening the native menu (no focus steal). "
+                    "A rejected capture returns an explicit failed result "
+                    "with `ok:false`, `status:'failed'`, a stable `code`, "
+                    "and a bounded repair hint; do not treat a failed result "
+                    "as a 0x0 screenshot."
                 ),
             },
             # ── capture ────────────────────────────────────────────
@@ -80,30 +84,28 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
             "app": {
                 "type": "string",
                 "description": (
-                    "Optional. Limit capture/action to a specific app "
+                    "Required for action='capture'; optional for other actions. "
+                    "Limit capture/action to a specific app "
                     "(by name, e.g. 'Safari', or bundle ID, "
-                    "'com.apple.Safari'). If omitted, operates on the "
-                    "frontmost app's window. Pass app='screen' (or "
-                    "'desktop') to capture the OS desktop/shell surface — "
-                    "e.g. to see the wallpaper or click the taskbar. Note: "
-                    "capture is per-window; a single image cannot span "
-                    "multiple monitors, so on a multi-screen setup capture "
-                    "one window or display at a time."
+                    "'com.apple.Safari'). Governed capture never accepts "
+                    "screen/desktop/fullscreen sentinels; target an explicit "
+                    "application window instead."
                 ),
             },
             "pid": {
                 "type": "integer",
                 "description": (
-                    "Optional exact process target for action='capture'. Pair "
-                    "with window_id when discovery cannot resolve an X11 app."
+                    "Optional exact process target for action='capture'. If "
+                    "provided, window_id is required too; use the exact pair "
+                    "from one list_windows result."
                 ),
             },
             "window_id": {
                 "type": "integer",
                 "description": (
                     "Optional exact native window target for action='capture'. "
-                    "Pair with pid when an external cua-driver list_windows "
-                    "lookup has already identified the window."
+                    "If provided, pid is required too; use the exact pair from "
+                    "one list_windows result."
                 ),
             },
             "max_elements": {

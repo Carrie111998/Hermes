@@ -1215,11 +1215,112 @@ class TestCaptureAppFilterNoMatch:
             f"app= filter no-match should not silently target a window; got {cap.app!r}"
         )
         assert cap.elements == []
-        assert "Calculator" in cap.window_title
-        assert "list_apps" in cap.window_title
+        assert cap.ok is False
+        assert cap.status == "failed"
+        assert cap.error_code == "capture_app_window_unavailable"
+        assert cap.window_title == ""
         # _active_pid must remain unset so a subsequent click doesn't hit Fuwari.
         assert backend._active_pid is None
         assert backend._active_window_id is None
+
+    def test_failed_capture_serializes_as_explicit_failure_not_empty_image(self):
+        from tools.computer_use.cua_backend import CuaDriverBackend
+        from tools.computer_use.tool import _capture_response
+
+        backend = CuaDriverBackend()
+        cap = backend.capture(mode="ax", pid=101)
+
+        assert cap.ok is False
+        assert cap.status == "failed"
+        assert cap.error_code == "capture_target_pair_required"
+        payload = json.loads(_capture_response(cap))
+        assert payload["ok"] is False
+        assert payload["success"] is False
+        assert payload["status"] == "failed"
+        assert payload["action"] == "capture"
+        assert payload["code"] == "capture_target_pair_required"
+        assert payload["error"]["phase"] == "target_validation"
+        assert "repair_hint" in payload["error"]
+        assert "width" not in payload and "height" not in payload
+        assert payload["meta"]["target"] == {
+            "app_present": False,
+            "pid_present": True,
+            "window_id_present": False,
+        }
+
+    def test_invalid_exact_pair_is_distinct_and_does_not_leak_native_detail(self):
+        from tools.computer_use.cua_backend import CuaDriverBackend
+        from tools.computer_use.tool import _capture_response
+
+        cap = CuaDriverBackend().capture(
+            mode="som", app="Google Chrome", pid=0, window_id=202
+        )
+        payload = json.loads(_capture_response(cap))
+
+        assert payload["code"] == "capture_target_pair_invalid"
+        assert payload["error"]["phase"] == "target_validation"
+        assert "Google Chrome" not in json.dumps(payload)
+        assert "0x0" not in json.dumps(payload)
+
+    def test_failed_capture_response_keeps_unbounded_driver_fields_out(self):
+        from tools.computer_use.backend import CaptureResult
+        from tools.computer_use.tool import _capture_response
+
+        cap = CaptureResult(
+            mode="untrusted-mode",
+            width=0,
+            height=0,
+            png_b64=None,
+            elements=[],
+            app="Secret App",
+            window_title="Secret Window",
+            png_bytes_len=0,
+            ok=False,
+            status="failed",
+            error_code="[raw-code]",
+            error_phase="raw phase with spaces",
+            repair_hint="raw native detail",
+        )
+
+        payload = json.loads(_capture_response(cap))
+
+        assert payload["code"] == "capture_failed"
+        assert payload["error"]["phase"] == "capture"
+        assert payload["error"]["repair_hint"] == "Correct the capture target and retry."
+        assert "Secret App" not in json.dumps(payload)
+        assert "Secret Window" not in json.dumps(payload)
+        assert "raw native detail" not in json.dumps(payload)
+
+    def test_governance_block_is_normalized_to_the_capture_failure_contract(self):
+        from tools.computer_use.tool import capture_failure_from_governance_block
+
+        out = capture_failure_from_governance_block(
+            "Capture requires an explicit app target. "
+            "[agente-cua-diagnostic schema=1 reason=capture_app_required "
+            "phase=scope_target requested_app=- matched_app=- "
+            "pid_present=0 window_id_present=0]"
+        )
+
+        payload = json.loads(out)
+        assert payload["ok"] is False
+        assert payload["status"] == "failed"
+        assert payload["action"] == "capture"
+        assert payload["code"] == "capture_app_required"
+        assert payload["error"]["phase"] == "scope_target"
+        assert payload["meta"]["target"] == {
+            "app_present": False,
+            "pid_present": False,
+            "window_id_present": False,
+        }
+        assert "Capture requires" not in json.dumps(payload)
+
+    def test_unbounded_or_malformed_governance_marker_falls_back(self):
+        from tools.computer_use.tool import capture_failure_from_governance_block
+
+        assert capture_failure_from_governance_block(
+            "blocked [agente-cua-diagnostic schema=2 reason=capture_app_required "
+            "phase=scope_target requested_app=secret pid_present=0 window_id_present=0]"
+        ) is None
 
     def test_linux_default_capture_skips_gnome_shell_helper(self):
         windows = [

@@ -2931,7 +2931,16 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         except Exception:
             block_message = None
     if block_message is not None:
-        result = json.dumps({"error": block_message}, ensure_ascii=False)
+        result = None
+        if function_name == "computer_use" and function_args.get("action") == "capture":
+            try:
+                from tools.computer_use.tool import capture_failure_from_governance_block
+
+                result = capture_failure_from_governance_block(block_message)
+            except Exception:
+                logger.debug("governed capture block shaping failed", exc_info=True)
+        if result is None:
+            result = json.dumps({"error": block_message}, ensure_ascii=False)
         try:
             from model_tools import _emit_post_tool_call_hook
             _emit_post_tool_call_hook(

@@ -495,6 +495,20 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     try:
         backend = _get_backend(session_id=session_id)
     except Exception as e:
+        logger.exception("computer_use backend unavailable for action=%s", action)
+        if action == "capture":
+            return _capture_failure_response(
+                CaptureResult(
+                    mode=str(args.get("mode", "som")),
+                    width=0,
+                    height=0,
+                    ok=False,
+                    status="failed",
+                    error_code="capture_backend_unavailable",
+                    error_phase="backend_startup",
+                    repair_hint="Install or repair the CUA backend, then retry the scoped capture.",
+                )
+            )
         return json.dumps({
             "error": f"computer_use backend unavailable: {e}",
             "hint": "If the cua-driver binary is missing, run `hermes computer-use install`. "
@@ -508,6 +522,19 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
             return _dispatch(backend, action, args)
     except Exception as e:
         logger.exception("computer_use %s failed", action)
+        if action == "capture":
+            return _capture_failure_response(
+                CaptureResult(
+                    mode=str(args.get("mode", "som")),
+                    width=0,
+                    height=0,
+                    ok=False,
+                    status="failed",
+                    error_code="capture_backend_error",
+                    error_phase="backend_capture",
+                    repair_hint="Verify the approved app/window is still available, then retry the scoped capture.",
+                )
+            )
         return json.dumps({"error": f"{action} failed: {e}"})
 
 
@@ -903,6 +930,167 @@ _DEFAULT_MAX_ELEMENTS = 100
 _MAX_ALLOWED_MAX_ELEMENTS = 1000
 _MIN_PROVIDER_IMAGE_DIMENSION = 8
 
+_CAPTURE_FAILURE_SCHEMA_VERSION = 1
+_BASE_CAPTURE_FAILURE_CODES = frozenset(
+    {
+        "capture_failed",
+        "capture_backend_unavailable",
+        "capture_backend_error",
+        "capture_target_pair_required",
+        "capture_target_pair_invalid",
+        "capture_window_unavailable",
+        "capture_desktop_scope_denied",
+        "capture_app_window_unavailable",
+    }
+)
+
+_GOVERNED_CAPTURE_MARKER_RE = re.compile(
+    r"\[agente-cua-diagnostic\s+([^\]]+)\]"
+)
+_GOVERNED_CAPTURE_REASON_CODES = {
+    "capture_app_required": "capture_app_required",
+    "capture_app_unauthorized": "capture_app_unauthorized",
+    "capture_desktop_scope_denied": "capture_desktop_scope_denied",
+    "capture_governance_unavailable": "capture_governance_unavailable",
+    "capture_target_pair_required": "capture_target_pair_required",
+    "capture_target_pair_invalid": "capture_target_pair_invalid",
+    # AGC-388 browser-task diagnostics are normalized into the capture
+    # contract while retaining their bounded reason in the phase field.
+    "window_not_discovered": "capture_window_unavailable",
+    "window_disappeared": "capture_window_unavailable",
+    "approval_lease_missing": "capture_approval_required",
+    "action_target_mismatch": "capture_target_mismatch",
+    "backend_target_changed": "capture_target_changed",
+    "permissions_required": "capture_permissions_required",
+}
+_CAPTURE_FAILURE_CODES = frozenset(
+    {*_BASE_CAPTURE_FAILURE_CODES, *(_GOVERNED_CAPTURE_REASON_CODES.values())}
+)
+
+_CAPTURE_FAILURE_REPAIR_HINTS = {
+    "capture_app_required": "Pass an explicit approved app target before capture.",
+    "capture_app_unauthorized": "Obtain approval for the requested app, then retry capture.",
+    "capture_desktop_scope_denied": "Use an explicit application window; whole-screen capture is not a governed target.",
+    "capture_governance_unavailable": "Retry when capture authorization is available.",
+    "capture_target_pair_required": "Pass both pid and window_id from the same list_windows result.",
+    "capture_target_pair_invalid": "Pass positive integer pid and window_id values from list_windows.",
+    "capture_window_unavailable": "Call list_windows, choose an on-screen target, then retry with its exact pid and window_id.",
+    "capture_approval_required": "Obtain approval for the exact native target, then retry capture.",
+    "capture_target_mismatch": "Use the exact approved pid and window_id pair, then retry capture.",
+    "capture_target_changed": "Refresh the approved target with list_windows, then retry capture.",
+    "capture_permissions_required": "Obtain the required native capture permission, then retry.",
+}
+
+
+def capture_failure_from_governance_block(block_message: str) -> Optional[str]:
+    """Convert an addon pre-tool block into the governed capture envelope.
+
+    Hermes' generic pre-tool hook intentionally carries only a string. The
+    addon marker is the bounded cross-process carrier; this adapter strips the
+    customer-facing/raw block text and emits the same result shape as stock
+    backend capture failures.
+    """
+
+    marker = _GOVERNED_CAPTURE_MARKER_RE.search(str(block_message or ""))
+    if not marker:
+        return None
+    fields: Dict[str, str] = {}
+    for field in marker.group(1).split():
+        key, separator, value = field.partition("=")
+        if separator and key and value:
+            fields[key] = value
+    reason = fields.get("reason")
+    code = _GOVERNED_CAPTURE_REASON_CODES.get(reason or "")
+    phase = fields.get("phase")
+    schema_version = fields.get("schema")
+    if (
+        not code
+        or not phase
+        or len(phase) > 32
+        or not re.fullmatch(r"[a-zA-Z0-9._-]+", phase)
+        or schema_version != "1"
+    ):
+        return None
+    if any(
+        fields.get(key) not in {"0", "1"}
+        for key in ("pid_present", "window_id_present")
+    ):
+        return None
+    if any(
+        not isinstance(fields.get(key), str)
+        or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", fields[key])
+        for key in ("requested_app", "matched_app")
+    ):
+        return None
+    return json.dumps(
+        {
+            "ok": False,
+            "success": False,
+            "status": "failed",
+            "action": "capture",
+            "code": code,
+            "error": {
+                "code": code,
+                "phase": phase,
+                "message": "Capture was not performed.",
+                "repair_hint": _CAPTURE_FAILURE_REPAIR_HINTS[code],
+            },
+            "meta": {
+                "schema_version": int(schema_version),
+                "target": {
+                    "app_present": fields.get("requested_app") not in {None, "", "-"},
+                    "pid_present": fields["pid_present"] == "1",
+                    "window_id_present": fields["window_id_present"] == "1",
+                },
+            },
+        },
+        ensure_ascii=False,
+    )
+
+
+def _capture_failure_response(cap: CaptureResult) -> str:
+    """Return the single bounded failure shape for every capture rejection."""
+
+    code = (
+        cap.error_code
+        if isinstance(cap.error_code, str) and cap.error_code in _CAPTURE_FAILURE_CODES
+        else "capture_failed"
+    )
+    phase = (
+        cap.error_phase
+        if isinstance(cap.error_phase, str)
+        and re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", cap.error_phase)
+        else "capture"
+    )
+    repair_hint = _CAPTURE_FAILURE_REPAIR_HINTS.get(
+        code, "Correct the capture target and retry."
+    )
+    raw_target = cap.target if isinstance(cap.target, dict) else {}
+    target = {
+        key: bool(raw_target.get(key))
+        for key in ("app_present", "pid_present", "window_id_present")
+    }
+    return json.dumps(
+        {
+            "ok": False,
+            "success": False,
+            "status": "failed",
+            "action": "capture",
+            "code": code,
+            "error": {
+                "code": code,
+                "phase": phase,
+                "message": "Capture was not performed.",
+                "repair_hint": repair_hint,
+            },
+            "meta": {
+                "schema_version": _CAPTURE_FAILURE_SCHEMA_VERSION,
+                "target": target,
+            },
+        },
+        ensure_ascii=False,
+    )
+
 
 def _image_dimensions_from_b64(image_b64: str) -> Optional[Tuple[int, int]]:
     """Return (width, height) for common inline screenshot formats.
@@ -981,6 +1169,9 @@ def _coerce_max_elements(value: Any) -> int:
 
 
 def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEMENTS) -> Any:
+    if not cap.ok or cap.status == "failed":
+        return _capture_failure_response(cap)
+
     total_elements = len(cap.elements)
     visible_elements = cap.elements[:max_elements]
     truncated_elements = max(0, total_elements - len(visible_elements))

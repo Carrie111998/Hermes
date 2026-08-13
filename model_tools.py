@@ -40,6 +40,25 @@ from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
 
+
+def _pre_tool_block_result(
+    function_name: str,
+    function_args: Dict[str, Any],
+    block_message: str,
+) -> str:
+    """Preserve the governed CUA capture failure contract through hooks."""
+
+    if function_name == "computer_use" and function_args.get("action") == "capture":
+        try:
+            from tools.computer_use.tool import capture_failure_from_governance_block
+
+            governed = capture_failure_from_governance_block(block_message)
+            if governed is not None:
+                return governed
+        except Exception:
+            logger.debug("governed capture block shaping failed", exc_info=True)
+    return tool_error(block_message)
+
 # Tracks platform-bundle names already flagged in disabled_toolsets so the
 # advisory (#33924) is logged once per name, not on every tool recompute.
 _WARNED_DISABLED_BUNDLES: set = set()
@@ -1377,7 +1396,7 @@ def handle_function_call(
                 logger.debug("pre_tool_call hook error: %s", _hook_err)
 
             if block_message is not None:
-                result = tool_error(block_message)
+                result = _pre_tool_block_result(function_name, function_args, block_message)
                 _emit_post_tool_call_hook(
                     function_name=function_name,
                     function_args=function_args,

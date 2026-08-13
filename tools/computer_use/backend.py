@@ -65,6 +65,18 @@ class CaptureResult:
     # When None, downstream consumers fall back to base64-prefix
     # sniffing for back-compat with older drivers.
     image_mime_type: Optional[str] = None
+    # Governed capture outcome. These fields are additive so older backends
+    # that construct CaptureResult positionally remain valid. A failed
+    # capture is not represented by a normal 0x0 image; the tool layer emits
+    # an explicit {ok:false,status:"failed",...} envelope instead.
+    ok: bool = True
+    status: str = "succeeded"
+    error_code: Optional[str] = None
+    error_phase: Optional[str] = None
+    repair_hint: Optional[str] = None
+    # Safe target-presence metadata only. Never put native IDs, titles, or
+    # page content here.
+    target: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

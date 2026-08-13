@@ -38,6 +38,16 @@ call — call the `computer_use` actions documented below.
 computer_use(action="capture", mode="som", app="<the app you're driving>")
 ```
 
+Capture must name an explicit application. `screen`, `desktop`, and other
+whole-screen sentinels are not governed targets. When an exact native target
+is required, pass both `pid` and `window_id` from the same `list_windows`
+result; never send only half of the pair.
+
+Rejected captures return an explicit result with `ok:false`,
+`success:false`, `status:"failed"`, a stable `code`, and a bounded
+`error.repair_hint`. This is a failure result, not an empty screenshot; fix
+the reported contract before retrying and do not infer success from dimensions.
+
 Returns a screenshot with numbered overlays on every interactable
 element AND an AX-tree index like:
 
@@ -80,7 +90,7 @@ computer_use(action="click", element=7, capture_after=True)
 ## Actions
 
 ```
-capture           mode=som|vision|ax   app=…  (default: current app)
+capture           mode=som|vision|ax   app=…  (required; explicit app only)
 click             element=N     OR     coordinate=[x, y]    button=left|right|middle
 double_click      element=N     OR     coordinate=[x, y]
 right_click       element=N     OR     coordinate=[x, y]

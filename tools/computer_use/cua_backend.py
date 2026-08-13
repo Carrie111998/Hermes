@@ -2076,9 +2076,30 @@ class CuaDriverBackend(ComputerUseBackend):
         self._last_target = None
         self._snapshot_tokens = {}
 
-    def _failed_capture(self, mode: str, message: str = "") -> CaptureResult:
-        """Return an empty capture after disarming any prior target context."""
+    def _failed_capture(
+        self,
+        mode: str,
+        message: str = "",
+        *,
+        code: str = "capture_failed",
+        phase: str = "capture",
+        repair_hint: str = "Correct the capture target and retry.",
+        app: Optional[str] = None,
+        pid: Any = None,
+        window_id: Any = None,
+    ) -> CaptureResult:
+        """Return an explicit failed result after disarming target context.
+
+        ``message`` is retained only for local diagnostics. The model-facing
+        response is shaped by ``_capture_response`` from the bounded code,
+        phase, repair hint, and target-presence booleans below.
+        """
         self._clear_active_target()
+        logger.warning(
+            "computer_use capture rejected code=%s phase=%s",
+            code,
+            phase,
+        )
         return CaptureResult(
             mode=mode,
             width=0,
@@ -2086,8 +2107,18 @@ class CuaDriverBackend(ComputerUseBackend):
             png_b64=None,
             elements=[],
             app="",
-            window_title=message,
+            window_title="",
             png_bytes_len=0,
+            ok=False,
+            status="failed",
+            error_code=code,
+            error_phase=phase,
+            repair_hint=repair_hint,
+            target={
+                "app_present": bool(str(app or "").strip()),
+                "pid_present": pid is not None,
+                "window_id_present": window_id is not None,
+            },
         )
 
     def _call_capture_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -2251,13 +2282,27 @@ class CuaDriverBackend(ComputerUseBackend):
         if pid is not None or window_id is not None:
             if pid is None or window_id is None:
                 return self._failed_capture(
-                    mode, "<capture targeting requires both pid and window_id>",
+                    mode,
+                    "<capture targeting requires both pid and window_id>",
+                    code="capture_target_pair_required",
+                    phase="target_validation",
+                    repair_hint="Pass both pid and window_id from the same list_windows result.",
+                    app=app,
+                    pid=pid,
+                    window_id=window_id,
                 )
             target_pid = _positive_int(pid)
             target_window_id = _positive_int(window_id)
             if target_pid is None or target_window_id is None:
                 return self._failed_capture(
-                    mode, "<capture targeting requires positive integer pid and window_id>",
+                    mode,
+                    "<capture targeting requires positive integer pid and window_id>",
+                    code="capture_target_pair_invalid",
+                    phase="target_validation",
+                    repair_hint="Pass positive integer pid and window_id values from list_windows.",
+                    app=app,
+                    pid=pid,
+                    window_id=window_id,
                 )
             windows = [{
                 "app_name": app or "",
@@ -2274,7 +2319,15 @@ class CuaDriverBackend(ComputerUseBackend):
                 self._clear_active_target()
                 raise
             if not windows:
-                return self._failed_capture(mode)
+                return self._failed_capture(
+                    mode,
+                    code="capture_window_unavailable",
+                    phase="window_discovery",
+                    repair_hint="Call list_windows, choose an on-screen target, then retry with its exact pid and window_id.",
+                    app=app,
+                    pid=pid,
+                    window_id=window_id,
+                )
 
         # Filter by app name (case-insensitive substring) if requested.
         # When the filter matches nothing, surface that explicitly instead of
@@ -2305,6 +2358,10 @@ class CuaDriverBackend(ComputerUseBackend):
                         f"specific window instead. On Windows the taskbar is "
                         f"'Shell_TrayWnd' and the desktop is 'Progman'.>"
                     ),
+                    code="capture_desktop_scope_denied",
+                    phase="window_discovery",
+                    repair_hint="Use an explicit application name; whole-screen and desktop capture are not governed targets.",
+                    app=app,
                 )
             # Prefer the desktop backdrop (Progman/WorkerW/Finder) over the
             # taskbar when both are present, so a bare "screen" capture shows
@@ -2328,6 +2385,10 @@ class CuaDriverBackend(ComputerUseBackend):
                         f"instead of 'Calculator'; some Linux/Qt apps only "
                         f"resolve via list_apps metadata)>"
                     ),
+                    code="capture_app_window_unavailable",
+                    phase="window_discovery",
+                    repair_hint="Call list_apps, use the reported application alias, and retry with an exact window target when available.",
+                    app=app,
                 )
             windows = filtered
 
