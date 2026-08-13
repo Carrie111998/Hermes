@@ -251,6 +251,10 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # installed on demand like every other messaging platform; also exposed
     # as the `teams` extra in pyproject for packagers / explicit installs.
     "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.3"),  # aiohttp 3.14.3: prior CVEs + GHSA-cq5v-8q36-5273/GHSA-mfx4-hv73-q22v/GHSA-mq44-7p77-q5h7
+    # X Chat (encrypted X DMs) adapter — chatxdk is the official Chat XDK
+    # (native E2EE binding: keygen, encrypt/decrypt, sign/verify). The REST
+    # layer uses core httpx directly, so no xdk client dependency.
+    "platform.xchat": ("chatxdk==0.4.1",),
 
     # ─── Terminal backends ─────────────────────────────────────────────────
     "terminal.modal": ("modal==1.3.4",),
