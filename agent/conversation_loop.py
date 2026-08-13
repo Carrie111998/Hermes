@@ -25,6 +25,11 @@ import ssl
 import time
 from typing import Any, Dict, List, Optional
 
+from agent.provider_request_identity import (
+    RequestSecretSnapshot,
+    apply_deepseek_request_identity,
+    load_deepseek_identity_secret,
+)
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
@@ -2442,6 +2447,9 @@ def run_conversation(
         api_kwargs = None  # Guard against UnboundLocalError in except handler
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
+        _deepseek_identity_secret_for_request = RequestSecretSnapshot(
+            load_deepseek_identity_secret
+        )
 
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────
@@ -2697,6 +2705,9 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    # Execution middleware and transport preflight may rewrite
+                    # the payload. Derive identity only after both so it covers
+                    # the final body and actual agent-bound wire destination.
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -2704,6 +2715,14 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    next_api_kwargs = apply_deepseek_request_identity(
+                        next_api_kwargs,
+                        api_request_id=api_request_id,
+                        provider=agent.provider,
+                        model=next_api_kwargs.get("model", agent.model),
+                        base_url=agent.base_url,
+                        identity_secret_loader=_deepseek_identity_secret_for_request,
+                    )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
