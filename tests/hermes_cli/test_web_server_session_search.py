@@ -14,6 +14,16 @@ class _FakeSessionDB:
 
     closed = False
 
+    def __init__(self, *args, **kwargs):
+        # The read path opens this as ``SessionDB(read_only=True)`` (and passes
+        # ``db_path=`` for a cross-profile read), so the fake has to accept the
+        # constructor kwargs. Without this the endpoint raised
+        # ``TypeError: _FakeSessionDB() takes no arguments`` — the same
+        # 64bff9dfe1 read-only flip that broke the live write and search paths,
+        # landed as f376f5fce9. Swallow and ignore: what this fake exists to
+        # exercise is the id-match/content-match merge, not the open mode.
+        pass
+
     def search_sessions_by_id(self, query, limit=20, include_archived=True):
         assert query == "20260603"
         assert include_archived is True
