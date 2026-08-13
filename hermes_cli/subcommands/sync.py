@@ -121,4 +121,28 @@ def build_sync_parser(subparsers, *, cmd_sync: Callable) -> None:
     coll_delete = collective_sub.add_parser("delete", help="Delete a collective")
     coll_delete.add_argument("name", help="Collective name")
 
+    # Adoption (Wisdom v1, M3).
+    sync_sub.add_parser(
+        "shares",
+        help="List org skills you haven't adopted or declined yet",
+    )
+
+    adopt = sync_sub.add_parser(
+        "adopt",
+        help="Adopt an org-shared skill into your personal skills",
+    )
+    adopt.add_argument(
+        "skill",
+        help="Skill path (category/name, e.g. software-development/code-review)",
+    )
+
+    decline_share = sync_sub.add_parser(
+        "decline-share",
+        help="Decline an org-shared skill (it won't be re-offered)",
+    )
+    decline_share.add_argument(
+        "skill",
+        help="Skill path (category/name, e.g. software-development/code-review)",
+    )
+
     sync_parser.set_defaults(func=cmd_sync)

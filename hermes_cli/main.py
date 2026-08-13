@@ -4796,6 +4796,104 @@ def cmd_sync(args):
 
         return 1
 
+    if sub == "shares":
+        from tools import skills_sync_client as ssc
+        from tools import skill_adoption
+
+        try:
+            identity = ssc.resolve_org_identity()
+        except ssc.SyncInertError:
+            print(
+                "not part of a shared organisation — no shares to review.",
+                file=sys.stderr,
+            )
+            return 1
+
+        org_id = identity["org_id"]
+        pending = skill_adoption.pending_shares(org_id)
+        if not pending:
+            print("No pending shares. You're caught up.")
+            return 0
+
+        print(f"Pending shares ({len(pending)}):\n")
+        for s in pending:
+            print(f"  {s['rel_path']}")
+        print(
+            "\nTo adopt:  hermes sync adopt <category/name>"
+            "\nTo decline: hermes sync decline-share <category/name>"
+        )
+        return 0
+
+    if sub == "adopt":
+        from tools import skills_sync_client as ssc
+        from tools import skill_adoption
+
+        try:
+            identity = ssc.resolve_org_identity()
+        except ssc.SyncInertError:
+            print(
+                "not part of a shared organisation — nothing to adopt.",
+                file=sys.stderr,
+            )
+            return 1
+
+        org_id = identity["org_id"]
+        skill_path = args.skill
+
+        # Read org provenance for the adoption record.
+        provenance_data = {}
+        try:
+            from agent.skill_utils import ORG_PROVENANCE_FILE
+
+            prov_path = skill_adoption._org_dir() / org_id / ORG_PROVENANCE_FILE
+            if prov_path.exists():
+                provenance_data = json.loads(
+                    prov_path.read_text(encoding="utf-8")
+                )
+        except Exception:
+            pass
+
+        result = skill_adoption.adopt_skill(
+            org_id,
+            skill_path,
+            source_commit=provenance_data.get("head"),
+            author=provenance_data.get("author_user_id"),
+        )
+
+        if not result.get("ok"):
+            print(f"cannot adopt: {result.get('error')}", file=sys.stderr)
+            return 1
+
+        print(
+            f"Adopted '{result['skill_name']}' into your personal skills. "
+            f"It's a local copy — edit it freely; changes don't write back."
+        )
+        return 0
+
+    if sub == "decline-share":
+        from tools import skills_sync_client as ssc
+        from tools import skill_adoption
+
+        try:
+            identity = ssc.resolve_org_identity()
+        except ssc.SyncInertError:
+            print(
+                "not part of a shared organisation — nothing to decline.",
+                file=sys.stderr,
+            )
+            return 1
+
+        org_id = identity["org_id"]
+        skill_path = args.skill
+
+        result = skill_adoption.decline_share(org_id, skill_path)
+        if not result.get("ok"):
+            print(f"cannot decline: {result.get('error')}", file=sys.stderr)
+            return 1
+
+        print(f"'{skill_path}' declined — it won't be re-offered.")
+        return 0
+
     if sub in {"enable", "disable"}:
         from tools.skill_usage import set_sync, is_curation_eligible
 
