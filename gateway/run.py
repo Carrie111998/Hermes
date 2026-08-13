@@ -2507,6 +2507,19 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _construct_agent_with_session_open(
+    constructor,
+    *,
+    session_id: object,
+    platform: object,
+):
+    """Emit the addressable-session boundary before agent construction."""
+    from hermes_cli.plugins import notify_session_open
+
+    notify_session_open(session_id, platform)
+    return constructor()
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -5012,43 +5025,47 @@ class TurnRunner:
 
         if agent is None:
             # Config changed or first message — create fresh agent
-            agent = ctx.AIAgent(
-                model=turn_route["model"],
-                **turn_route["runtime"],
-                **_checkpoint_agent_kwargs(ctx.user_config),
-                max_iterations=max_iterations,
-                quiet_mode=True,
-                verbose_logging=False,
-                enabled_toolsets=ctx.enabled_toolsets,
-                disabled_toolsets=ctx.disabled_toolsets,
-                ephemeral_system_prompt=combined_ephemeral or None,
-                prefill_messages=self._runner._prefill_messages or None,
-                reasoning_config=reasoning_config,
-                service_tier=self._runner._service_tier,
-                request_overrides=turn_route.get("request_overrides"),
-                providers_allowed=pr.get("only"),
-                providers_ignored=pr.get("ignore"),
-                providers_order=pr.get("order"),
-                provider_sort=pr.get("sort"),
-                provider_require_parameters=pr.get("require_parameters", False),
-                provider_data_collection=pr.get("data_collection"),
+            agent = _construct_agent_with_session_open(
+                lambda: ctx.AIAgent(
+                    model=turn_route["model"],
+                    **turn_route["runtime"],
+                    **_checkpoint_agent_kwargs(ctx.user_config),
+                    max_iterations=max_iterations,
+                    quiet_mode=True,
+                    verbose_logging=False,
+                    enabled_toolsets=ctx.enabled_toolsets,
+                    disabled_toolsets=ctx.disabled_toolsets,
+                    ephemeral_system_prompt=combined_ephemeral or None,
+                    prefill_messages=self._runner._prefill_messages or None,
+                    reasoning_config=reasoning_config,
+                    service_tier=self._runner._service_tier,
+                    request_overrides=turn_route.get("request_overrides"),
+                    providers_allowed=pr.get("only"),
+                    providers_ignored=pr.get("ignore"),
+                    providers_order=pr.get("order"),
+                    provider_sort=pr.get("sort"),
+                    provider_require_parameters=pr.get("require_parameters", False),
+                    provider_data_collection=pr.get("data_collection"),
+                    session_id=ctx.session_id,
+                    platform=platform_key,
+                    user_id=ctx.source.user_id,
+                    user_id_alt=ctx.source.user_id_alt,
+                    user_name=ctx.source.user_name,
+                    chat_id=ctx.source.chat_id,
+                    chat_name=ctx.source.chat_name,
+                    chat_type=ctx.source.chat_type,
+                    thread_id=ctx.source.thread_id,
+                    gateway_session_key=ctx.session_key,
+                    session_db=getattr(self._runner._session_db, "_db", self._runner._session_db),
+                    # Reload from disk — do not reuse the startup snapshot (#60955).
+                    fallback_model=self._runner._refresh_fallback_model(),
+                    skip_context_files=skip_context_files,
+                    # Keep the persona even with minimal context: soul identity is
+                    # a single small file, not part of the expensive walk.
+                    load_soul_identity=True,
+                ),
                 session_id=ctx.session_id,
                 platform=platform_key,
-                user_id=ctx.source.user_id,
-                user_id_alt=ctx.source.user_id_alt,
-                user_name=ctx.source.user_name,
-                chat_id=ctx.source.chat_id,
-                chat_name=ctx.source.chat_name,
-                chat_type=ctx.source.chat_type,
-                thread_id=ctx.source.thread_id,
-                gateway_session_key=ctx.session_key,
-                session_db=getattr(self._runner._session_db, "_db", self._runner._session_db),
-                # Reload from disk — do not reuse the startup snapshot (#60955).
-                fallback_model=self._runner._refresh_fallback_model(),
-                skip_context_files=skip_context_files,
-                # Keep the persona even with minimal context: soul identity is
-                # a single small file, not part of the expensive walk.
-                load_soul_identity=True,
             )
             if _cache_lock and _cache is not None:
                 with _cache_lock:
@@ -6104,6 +6121,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
+        # Host-owned plugin injection router for headless plugin contexts
+        # (see inject_plugin_message). Registered at construction; the loop
+        # reference is bound when the gateway starts.
+        try:
+            from hermes_cli.plugins import register_injection_router as _register_router
+
+            _register_router("gateway", self._inject_plugin_router_sync)
+        except Exception:
+            logger.debug("gateway injection router registration skipped", exc_info=True)
         self._shutdown_event = asyncio.Event()
         self._exit_cleanly = False
         self._exit_with_failure = False
@@ -8038,6 +8064,144 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         else:
             pending_slot[session_key] = queued_event
+
+    # ------------------------------------------------------------------
+    # Plugin message injection (host-owned seam)
+    # ------------------------------------------------------------------
+
+    def _plugin_gateway_injection_allowed(self, plugin_id: str) -> bool:
+        """Return True when ``allow_gateway_injection`` is set for the plugin.
+
+        Gateway injection is disabled per plugin by default; the operator
+        must explicitly set ``plugins.entries.<plugin_id>.allow_gateway_injection:
+        true`` in config.yaml. Any config error fails closed.
+        """
+        if not plugin_id:
+            return False
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config() or {}
+        except Exception:
+            return False
+        entries = (cfg.get("plugins") or {}).get("entries") or {}
+        entry = entries.get(plugin_id) or {}
+        return bool(entry.get("allow_gateway_injection", False))
+
+    def _resolve_route_adapter(self, entry: Any):
+        """Return the live adapter serving the entry's stored route, or None.
+
+        The gateway only injects into sessions whose authorised platform
+        route is live — it never fabricates a synthetic route.
+        """
+        platform = getattr(entry, "platform", None)
+        if platform is None:
+            return None
+        try:
+            transport = resolve_delivery_transport(
+                platform, self.config, self.adapters
+            )
+        except Exception:
+            return None
+        if transport is None:
+            return None
+        return getattr(transport, "adapter", None)
+
+    async def inject_plugin_message(
+        self,
+        content: str,
+        role: str = "user",
+        *,
+        mode: str = "queue",
+        session_key: str | None = None,
+        plugin_id: str = "",
+    ) -> bool:
+        """Inject a plugin message into one exact gateway session (public seam).
+
+        - Disabled per plugin unless
+          ``plugins.entries.<plugin_id>.allow_gateway_injection: true``.
+        - Reuses the existing authorised route (live adapter); never a
+          synthetic platform route.
+        - Busy target: queued behind active work (session FIFO) — the active
+          tool is never interrupted.
+        - Idle target: dispatched as a synthetic internal turn, which skips
+          auth and command routing (conversational input only).
+        - Unknown, closed, rotated or unauthorised targets fail closed.
+
+        Only ``mode="queue"`` is supported on the gateway in v1; other modes
+        return ``False``.
+        """
+        if mode != "queue":
+            return False
+        if not session_key:
+            return False
+        if not self._plugin_gateway_injection_allowed(plugin_id):
+            return False
+
+        entry = self.session_store._entries.get(session_key)
+        if entry is None or entry.origin is None:
+            return False
+        if await self._async_session_store._is_session_ended_in_db(entry.session_id):
+            return False
+
+        adapter = self._resolve_route_adapter(entry)
+        if adapter is None:
+            return False
+
+        text = content if role == "user" else f"[{role}] {content}"
+        event = MessageEvent(text=text, source=entry.origin, internal=True, non_control=True)
+
+        busy = session_key in getattr(self, "_running_agents", {})
+        if busy or session_key in getattr(adapter, "_active_sessions", set()):
+            # Queue behind active work at the safe boundary.
+            self._enqueue_fifo(session_key, event, adapter)
+            return True
+
+        # Idle target: dispatch as a synthetic internal turn (conversational
+        # input only — skips auth and command routing). Handled through the
+        # normal per-event dispatch so the session FIFO and event pipeline
+        # stay the single source of truth.
+        try:
+            result = self._handle_message(event)
+            if asyncio.iscoroutine(result):
+                await result
+            return True
+        except Exception:
+            logger.warning("gateway internal inject dispatch failed", exc_info=True)
+            return False
+
+    def _inject_plugin_router_sync(
+        self,
+        content: str,
+        *,
+        mode: str = "queue",
+        session_key: str,
+        plugin_id: str = "",
+        role: str = "user",
+    ) -> bool:
+        """Sync bridge from ``PluginContext.inject_message`` to the event loop.
+
+        The gateway loop may not be running yet (registration happens in
+        ``__init__``); fail closed in that case.
+        """
+        loop = self._gateway_loop
+        if loop is None or loop.is_closed():
+            return False
+        future = asyncio.run_coroutine_threadsafe(
+            self.inject_plugin_message(
+                content,
+                role=role,
+                mode=mode,
+                session_key=session_key,
+                plugin_id=plugin_id,
+            ),
+            loop,
+        )
+        try:
+            return future.result(timeout=5)
+        except Exception:
+            logger.warning("gateway inject_plugin_message timed out", exc_info=True)
+            return False
 
     def _promote_queued_event(
         self,
@@ -15783,7 +15947,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
 
         # Check for commands
-        command = event.get_command()
+        # Plugin-injected events (peer messages, marked non_control=True) are
+        # conversational input only: they must never reach command dispatch
+        # (H-107 inert-control guarantee — no slash commands, approvals or
+        # confirmation answers from peer text). All other internal events
+        # keep their existing behaviour. The `is True` test guards against
+        # mock/test objects that auto-create truthy attributes.
+        command = None if getattr(event, "non_control", False) is True else event.get_command()
 
         from hermes_cli.commands import (
             GATEWAY_KNOWN_COMMANDS,

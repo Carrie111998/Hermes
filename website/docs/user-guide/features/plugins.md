@@ -260,13 +260,22 @@ When you upgrade to a version of Hermes that has opt-in plugins (config schema v
 
 ## Available hooks
 
-Plugins can register the 26 lifecycle events currently accepted by `hermes_cli.plugins.VALID_HOOKS`. The **[Event Hooks catalog](/user-guide/features/hooks#shipped-plugin-hook-catalog)** is canonical for exact timing, return handling, payload fields, and privacy notes.
+Plugins can register callbacks for these lifecycle events. See the **[Event Hooks page](/user-guide/features/hooks#plugin-hooks)** for full details, callback signatures, and examples.
 
-| Descriptive category | Shipped hooks |
-|---|---|
-| **Directive/control** | `pre_tool_call`, `pre_llm_call`, `pre_verify`, `pre_gateway_dispatch` |
-| **Transform** | `transform_tool_result`, `transform_terminal_output`, `transform_llm_output`, `pre_transcription` |
-| **Observer** | `post_tool_call`, `post_llm_call`, `pre_api_request`, `post_api_request`, `api_request_error`, `on_stream_start`, `on_stream_delta`, `on_stream_end`, `on_interim_message`, `on_session_start`, `on_session_end`, `on_session_finalize`, `on_session_reset`, `on_skill_lifecycle`, `subagent_start`, `subagent_stop`, `pre_approval_request`, `post_approval_response`, `pre_command`, `kanban_task_claimed`, `kanban_task_completed`, `kanban_task_blocked` |
+| Hook | Fires when |
+|------|-----------|
+| [`pre_tool_call`](/user-guide/features/hooks#pre_tool_call) | Before any tool executes |
+| [`post_tool_call`](/user-guide/features/hooks#post_tool_call) | After any tool returns |
+| [`pre_llm_call`](/user-guide/features/hooks#pre_llm_call) | Once per turn, before the LLM loop — can return `{"context": "..."}` to [inject context into the user message](/user-guide/features/hooks#pre_llm_call) |
+| [`post_llm_call`](/user-guide/features/hooks#post_llm_call) | Once per turn, after the LLM loop (successful turns only) |
+| [`on_session_start`](/user-guide/features/hooks#on_session_start) | New session created (first turn only) |
+| [`on_session_open`](/user-guide/features/hooks#on_session_open) | Live addressable session created/resumed and registered, BEFORE its first model turn (distinct from `on_session_start`, which fires when turn activity begins) |
+| [`on_session_end`](/user-guide/features/hooks#on_session_end) | End of every `run_conversation` call + CLI exit handler |
+| [`on_session_finalize`](/user-guide/features/hooks#on_session_finalize) | CLI/gateway tears down an active session (`/new`, GC, CLI quit) |
+| [`on_session_reset`](/user-guide/features/hooks#on_session_reset) | Gateway swaps in a new session key (`/new`, `/reset`, `/clear`, idle rotation) |
+| [`subagent_stop`](/user-guide/features/hooks#subagent_stop) | Once per child after `delegate_task` finishes |
+| [`pre_gateway_dispatch`](/user-guide/features/hooks#pre_gateway_dispatch) | Gateway received a user message, before auth + dispatch. Return `{"action": "skip" \| "rewrite" \| "allow", ...}` to influence flow. |
+
 
 These categories describe current behavior rather than defining future naming rules. Plugin middleware remains a separate registry/surface.
 ## Plugin types
@@ -635,13 +644,16 @@ In a running session, `/plugins` shows which plugins are currently loaded.
 
 ## Injecting Messages
 
-Plugins can inject messages into a CLI conversation or a known gateway session using `ctx.inject_message()`:
+Plugins can inject messages into a live conversation using `ctx.inject_message()`:
 
 ```python
 # Active CLI conversation
 ctx.inject_message("New data arrived from the webhook", role="user")
 
-# Existing gateway conversation
+# Safe default: queue — busy sessions are never interrupted.
+ctx.inject_message("Please check the new schema", mode="queue")
+
+# Existing gateway conversation (requires allow_gateway_injection)
 ctx.inject_message(
     "New data arrived from the webhook",
     role="user",
@@ -649,14 +661,25 @@ ctx.inject_message(
 )
 ```
 
-**Signature:** `ctx.inject_message(content: str, role: str = "user", *, session_key: str | None = None) -> bool`
+**Signature:** `ctx.inject_message(content: str, role: str = "user", *, mode: str = "queue", session_key=None) -> bool`
+
+The `mode` argument selects the delivery behaviour:
+
+- `"queue"` (default): an **idle** target starts a new turn; a **busy** target
+  queues the message at the safe boundary (delivered after the active turn
+  ends). The active tool is never interrupted.
+- `"steer"`: explicit mid-turn steering via `agent.steer()` when the host
+  supports it; degrades to a queued next-turn message when idle.
+- `"interrupt"`: legacy hard-interrupt behaviour (busy → interrupt queue; the
+  agent loop drains it mid-turn).
+
 
 In CLI mode:
 
 - If the agent is **idle** (waiting for user input), the message is queued as the next input and starts a new turn.
-- If the agent is **mid-turn** (actively running), the message interrupts the current operation — the same as a user typing a new message and pressing Enter.
+- If the agent is **mid-turn** (actively running), the default `"queue"` mode appends the message at the safe boundary rather than interrupting.
 - For non-`"user"` roles, the content is prefixed with `[role]` (e.g. `[system] ...`).
-- Returns `True` if the message was queued successfully.
+- Returns `True` if the message was accepted by the host, `False` if no host reference is available (e.g. gateway mode) or the request is invalid.
 
 In gateway mode:
 
@@ -669,6 +692,7 @@ In gateway mode:
 - The request enters the platform adapter's normal message path. Active sessions use the existing busy-session queue rather than starting a competing turn.
 - Returns `True` when the live gateway accepts the request for asynchronous dispatch. This does not confirm that the agent turn or platform delivery has completed.
 - Returns `False` when `session_key` is omitted, the permission is not granted, or no live gateway can accept the request. Unknown or unroutable session keys discovered after asynchronous acceptance are written to the gateway log.
+
 
 This enables plugins like remote control viewers, messaging bridges, or webhook receivers to feed messages into the conversation from external sources.
 
@@ -686,7 +710,7 @@ Only grant gateway injection to plugins you trust. Hermes checks this host API p
 :::
 
 :::note
-This plugin API does not expose a public HTTP endpoint or CLI command for external processes. The plugin must already know the target gateway `session_key`, for example from its own trusted configuration or previously retained session state.
+`inject_message` is available in CLI mode and, for plugins with `allow_gateway_injection` enabled, in gateway mode (`plugins.entries.<id>.allow_gateway_injection: true` in `config.yaml`). Gateway injection reuses the session's existing authorised route and only delivers conversational input — it never reaches command dispatch.
 :::
 
 ## Calling MCP servers from plugins
