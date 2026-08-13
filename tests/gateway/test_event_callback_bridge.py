@@ -14,15 +14,20 @@ ownership, leaving the ``emit(...)`` coroutine created-but-never-awaited, which
 both drops the hook silently and leaks the coroutine frame with a
 ``RuntimeWarning: coroutine ... was never awaited``.
 
-These tests pin the invariant on the loop-closed branch: the coroutine must end
-up *closed*, not merely have its exception swallowed -- swallowing was never
-the missing half.
+These tests pin the invariant on the two failure branches the helper
+distinguishes: the loop is closed, and the loop is missing entirely.  They
+assert the coroutine ends up *closed*, not merely that no exception escaped --
+swallowing the exception was never the missing half.
 """
 
 from __future__ import annotations
 
 import asyncio
 import inspect
+import threading
+import time
+
+import pytest
 
 from gateway.turn_context import TurnContext
 
@@ -97,3 +102,75 @@ class TestEventCallbackBridgeLeakSafety:
         # point is that it was disposed of, not that it was delivered.
         assert hooks.emitted == []
         assert not [w for w in recwarn.list if "never awaited" in str(w.message)]
+
+    def test_missing_step_loop_closes_the_event_coroutine(self, recwarn):
+        """``_loop_for_step`` can be ``None`` outright, a distinct branch.
+
+        The turn context carries ``_loop_for_step=None`` by default, and the
+        helper handles that without going near asyncio at all.  The bare bridge
+        instead reaches ``None.call_soon_threadsafe`` and leaks the coroutine on
+        the way out.
+        """
+        coro, hooks = _bridge_one_event(None)
+
+        assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
+        assert hooks.emitted == []
+        assert not [w for w in recwarn.list if "never awaited" in str(w.message)]
+
+    def test_live_step_loop_still_delivers_the_event(self):
+        """Invariant guard: the leak-safe path must not change the happy path.
+
+        A running loop still receives and runs the hook coroutine, so routing
+        through the helper is a pure hardening of the failure branches.
+        """
+        loop = asyncio.new_event_loop()
+        thread = None
+        try:
+            ready = threading.Event()
+
+            def _run() -> None:
+                asyncio.set_event_loop(loop)
+                loop.call_soon(ready.set)
+                loop.run_forever()
+
+            thread = threading.Thread(target=_run, daemon=True)
+            thread.start()
+            assert ready.wait(5.0)
+
+            coro, hooks = _bridge_one_event(loop)
+
+            waited = 0.0
+            while not hooks.emitted and waited < 5.0:
+                time.sleep(0.02)
+                waited += 0.02
+
+            assert hooks.emitted == [("session:compress", {"session_id": "s-1"})]
+            assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            if thread is not None:
+                thread.join(timeout=5.0)
+            loop.close()
+
+
+@pytest.mark.parametrize("loop_state", ["closed", "missing"])
+def test_bridge_stays_non_raising_and_returns_none(loop_state):
+    """Invariant guard on the bridge's own contract, both failure branches.
+
+    ``_event_callback_sync`` is called from the agent thread and is typed
+    ``-> None``; the ``except Exception`` it replaces already guaranteed the
+    non-raising half, and the helper must keep it while also returning nothing
+    (the future is deliberately not consumed here, matching the sibling
+    ``_step_callback_sync`` bridge).
+    """
+    if loop_state == "closed":
+        loop = asyncio.new_event_loop()
+        loop.close()
+    else:
+        loop = None
+
+    hooks = _RecordingHooks()
+    ctx = TurnContext(_hooks_ref=hooks, _loop_for_step=loop)
+    runner = _make_runner(ctx)
+
+    assert runner._event_callback_sync("session:compress", {"session_id": "s-1"}) is None
