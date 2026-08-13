@@ -145,15 +145,21 @@ export const host = {
   status: async () => getStatus(),
 
   /** Gateway JSON-RPC — sessions, config, skills, cron, kanban, everything
-   *  the app itself uses. Lazy: resolves the LIVE socket per call. */
-  request: async <T>(method: string, params: Record<string, unknown> = {}): Promise<T> => {
+   *  the app itself uses. Lazy: resolves the LIVE socket per call.
+   *  `timeoutMs` overrides the client's 30s default; without it, long
+   *  multi-second RPCs like `image.generate` (remote image backends +
+   *  data-URL transfer) time out and surface as "request timeout". */
+  request: async <T>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> => {
     const gateway = $gateway.get()
 
     if (!gateway) {
       throw new Error('Hermes gateway unavailable')
     }
 
-    return gateway.request<T>(method, params)
+    const effectiveTimeout =
+      timeoutMs ?? (method === 'image.generate' ? 180_000 : undefined)
+
+    return gateway.request<T>(method, params, effectiveTimeout)
   }
 }
 
