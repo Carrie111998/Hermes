@@ -353,7 +353,6 @@ def test_heartbeat_extends_claim_expires(worker_env):
 def test_comment_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_comment({
-        "task_id": worker_env,
         "body": "hello thread",
     })
     d = json.loads(out)
@@ -369,6 +368,16 @@ def test_comment_happy_path(worker_env):
         assert comments[0].body == "hello thread"
     finally:
         conn.close()
+
+
+def test_comment_does_not_inherit_task_outside_dispatcher_worker(worker_env):
+    from agent.delegation_context import non_dispatcher_owned_context
+    from tools import kanban_tools as kt
+
+    with non_dispatcher_owned_context():
+        out = kt._handle_comment({"body": "must not reach the worker thread"})
+
+    assert json.loads(out)["error"].startswith("task_id is required")
 
 
 def test_comment_ignores_caller_supplied_author(worker_env):

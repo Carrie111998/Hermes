@@ -1080,7 +1080,7 @@ def _handle_comment(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_comment")
     if delegated_err:
         return delegated_err
-    tid = args.get("task_id") or os.environ.get("HERMES_KANBAN_TASK")
+    tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
     body = args.get("body")
