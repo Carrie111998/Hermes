@@ -525,6 +525,8 @@ export function StatusRule({
   // house tests (invoked directly, no React tree). Skin swaps still re-render
   // it because applySkin also swaps the theme, which arrives via the `t` prop.
   const verbs = $tickerVerbs.get()
+  // NOTE: keep `verbs` sourced from the computed above — it is the same list
+  // FaceTicker renders and the same list busyIndicatorWidth reserves.
 
   // On narrow terminals the context read-out collapses to a bare token count
   // (`12k tok`) and the visual fill bar is dropped entirely.
