@@ -11705,8 +11705,8 @@ def gc_events(
             "  (SELECT id FROM task_runs WHERE outcome_code IS NOT NULL "
             "   AND subject_sha IS NOT NULL)) "
             "AND NOT (kind = 'status' AND task_id IN "
-            "  (SELECT parent_id FROM task_links "
-            "   WHERE accepted_outcome_codes IS NOT NULL OR subject_sha IS NOT NULL))",
+            "  (SELECT task_id FROM task_runs "
+            "   WHERE outcome_code IS NOT NULL OR subject_sha IS NOT NULL))",
             (cutoff,),
         )
     return int(cur.rowcount or 0)

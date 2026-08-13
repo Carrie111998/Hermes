@@ -253,6 +253,31 @@ def test_edge_condition_round_trips_as_canonical_json(conn):
     assert row["subject_sha"] == APPROVED_SHA
 
 
+def test_gc_preserves_reopen_history_before_conditional_edge_exists(conn):
+    parent = _complete_review(
+        conn, outcome_code="APPROVED", subject_sha=APPROVED_SHA
+    )
+    conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (parent,))
+    kb._append_event(conn, parent, "status", {"status": "todo"})
+    assert kb.archive_task(conn, parent)
+    conn.execute("UPDATE task_events SET created_at = 0 WHERE task_id = ?", (parent,))
+
+    kb.gc_events(conn, older_than_seconds=1)
+    child = kb.create_task(conn, title="release")
+    kb.link_tasks(
+        conn,
+        parent,
+        child,
+        accepted_outcome_codes=["APPROVED"],
+        subject_sha=APPROVED_SHA,
+    )
+
+    assert kb.get_task(conn, child).status == "todo"
+    assert kb.dependency_blockers(conn, child)[0]["reason"] == (
+        "stale_evidence_after_reopen"
+    )
+
+
 def test_existing_board_adds_nullable_condition_and_evidence_columns(
     tmp_path, monkeypatch
 ):
