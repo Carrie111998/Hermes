@@ -1432,6 +1432,62 @@ def _notify_context_engine_turn_complete(
         )
 
 
+def _emit_post_api_request_hook(
+    agent,
+    response,
+    assistant_message,
+    finish_reason,
+    api_messages,
+    api_call_count,
+    api_duration,
+    api_start_time,
+    effective_task_id,
+    turn_id,
+    api_request_id,
+) -> None:
+    try:
+        from hermes_cli.lifecycle import (
+            has_hook,
+            invoke_hook as _invoke_hook,
+        )
+        if has_hook("post_api_request"):
+            _assistant_tool_calls = (
+                getattr(assistant_message, "tool_calls", None) or []
+            )
+            _assistant_text = assistant_message.content or ""
+            _api_ended_at = api_start_time + api_duration
+            _invoke_hook(
+                "post_api_request",
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                session_id=agent.session_id or "",
+                platform=agent.platform or "",
+                model=agent.model,
+                provider=agent.provider,
+                base_url=agent.base_url,
+                api_mode=agent.api_mode,
+                api_call_count=api_call_count,
+                api_duration=api_duration,
+                started_at=api_start_time,
+                ended_at=_api_ended_at,
+                finish_reason=finish_reason,
+                message_count=len(api_messages),
+                response_model=getattr(response, "model", None),
+                response=agent._api_response_payload_for_hook(
+                    response,
+                    assistant_message,
+                    finish_reason=finish_reason,
+                ),
+                usage=agent._usage_summary_for_api_request_hook(response),
+                assistant_message=assistant_message,
+                assistant_content_chars=len(_assistant_text),
+                assistant_tool_call_count=len(_assistant_tool_calls),
+            )
+    except Exception:
+        pass
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -6135,47 +6191,7 @@ def run_conversation(
                 else:
                     assistant_message.content = str(raw)
 
-            try:
-                from hermes_cli.lifecycle import (
-                    has_hook,
-                    invoke_hook as _invoke_hook,
-                )
-                if has_hook("post_api_request"):
-                    _assistant_tool_calls = (
-                        getattr(assistant_message, "tool_calls", None) or []
-                    )
-                    _assistant_text = assistant_message.content or ""
-                    _api_ended_at = api_start_time + api_duration
-                    _invoke_hook(
-                        "post_api_request",
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        api_duration=api_duration,
-                        started_at=api_start_time,
-                        ended_at=_api_ended_at,
-                        finish_reason=finish_reason,
-                        message_count=len(api_messages),
-                        response_model=getattr(response, "model", None),
-                        response=agent._api_response_payload_for_hook(
-                            response,
-                            assistant_message,
-                            finish_reason=finish_reason,
-                        ),
-                        usage=agent._usage_summary_for_api_request_hook(response),
-                        assistant_message=assistant_message,
-                        assistant_content_chars=len(_assistant_text),
-                        assistant_tool_call_count=len(_assistant_tool_calls),
-                    )
-            except Exception:
-                pass
+            _emit_post_api_request_hook(agent, response, assistant_message, finish_reason, api_messages, api_call_count, api_duration, api_start_time, effective_task_id, turn_id, api_request_id)
 
             # Handle assistant response
             if assistant_message.content and not agent.quiet_mode:
