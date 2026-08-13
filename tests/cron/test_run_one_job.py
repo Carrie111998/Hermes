@@ -66,6 +66,140 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j2", True)
 
 
+def _patch_outer_failure_pipeline(monkeypatch, *, delivery_result=None):
+    """Install the minimal real run_one_job shell around an escaped failure."""
+    from agent import secret_scope as ss
+
+    delivered = []
+    marked = []
+    finished = []
+
+    monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(ss, "build_profile_secret_scope", lambda _home: None)
+    monkeypatch.setattr(ss, "set_secret_scope", lambda _scope: None)
+    monkeypatch.setattr(ss, "reset_secret_scope", lambda _token: None)
+    monkeypatch.setattr(
+        s,
+        "run_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("outer boom")),
+    )
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda job, content, **_kwargs: delivered.append((job["id"], content))
+        or delivery_result,
+    )
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda *args, **kwargs: marked.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        s,
+        "finish_execution",
+        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+    )
+    return delivered, marked, finished
+
+
+def test_run_one_job_delivers_exception_escaping_normal_completion(monkeypatch):
+    """An escaped run_job exception must alert the configured destination."""
+    delivered, marked, finished = _patch_outer_failure_pipeline(monkeypatch)
+    job = {
+        "id": "outer-failure",
+        "name": "Outer failure",
+        "deliver": "telegram:123",
+        "execution_id": "exec-outer-failure",
+    }
+
+    assert s.run_one_job(job) is False
+
+    assert delivered == [
+        ("outer-failure", "⚠️ Cron 'Outer failure' failed: outer boom")
+    ]
+    assert marked == [
+        (("outer-failure", False, "outer boom"), {"delivery_error": None})
+    ]
+    assert finished == [
+        (
+            "exec-outer-failure",
+            {
+                "success": False,
+                "error": "outer boom",
+                "delivery_outcome": "delivered",
+            },
+        )
+    ]
+
+
+def test_run_one_job_records_outer_failure_delivery_error(monkeypatch):
+    """A failed outer-failure alert is visible in both job and ledger state."""
+    delivered, marked, finished = _patch_outer_failure_pipeline(
+        monkeypatch, delivery_result="telegram offline",
+    )
+    job = {
+        "id": "outer-delivery-failure",
+        "name": "Outer delivery failure",
+        "deliver": "telegram:123",
+        "execution_id": "exec-outer-delivery-failure",
+    }
+
+    assert s.run_one_job(job) is False
+
+    assert len(delivered) == 1
+    assert marked == [
+        (
+            ("outer-delivery-failure", False, "outer boom"),
+            {"delivery_error": "telegram offline"},
+        )
+    ]
+    assert finished[0][1]["delivery_outcome"] == "failed"
+
+
+def test_run_one_job_does_not_redeliver_after_post_delivery_exception(monkeypatch):
+    """Bookkeeping failure after delivery must not send the result twice."""
+    from agent import secret_scope as ss
+
+    delivered = []
+    finished = []
+    monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(ss, "build_profile_secret_scope", lambda _home: None)
+    monkeypatch.setattr(ss, "set_secret_scope", lambda _scope: None)
+    monkeypatch.setattr(ss, "reset_secret_scope", lambda _token: None)
+    monkeypatch.setattr(
+        s, "run_job",
+        lambda *_args, **_kwargs: (True, "output", "finished", None),
+    )
+    monkeypatch.setattr(s, "save_job_output", lambda *_args: "/tmp/output.md")
+    monkeypatch.setattr(
+        s, "_deliver_result",
+        lambda job, content, **_kwargs: delivered.append((job["id"], content)),
+    )
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("mark failed")),
+    )
+    monkeypatch.setattr(
+        s,
+        "finish_execution",
+        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+    )
+    job = {
+        "id": "post-delivery-failure",
+        "name": "Post delivery failure",
+        "deliver": "telegram:123",
+        "execution_id": "exec-post-delivery-failure",
+    }
+
+    assert s.run_one_job(job) is False
+
+    assert delivered == [("post-delivery-failure", "finished")]
+    assert finished[0][1]["delivery_outcome"] == "delivered"
+
+
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
     """Regression: under profile isolation (multiplex active), run_one_job must
     execute run_job inside a profile secret scope so credential reads
@@ -107,5 +241,4 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert scope_during_run["base_url"] == "https://openrouter.ai/api/v1"
     # And it was torn down after run_one_job returned (no leak).
     assert ss.current_secret_scope() is None
-
 
