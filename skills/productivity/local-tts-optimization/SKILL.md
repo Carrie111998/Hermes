@@ -1,7 +1,13 @@
 ---
 name: local-tts-optimization
-category: productivity
 description: Use when tuning local TTS latency/stability (MLX Qwen3-TTS).
+version: 1.0.0
+author: Hermes Agent
+license: MIT
+platforms: [macos, linux]
+metadata:
+  hermes:
+    tags: [TTS, MLX, Apple Silicon, voice, performance]
 ---
 
 # Local TTS Optimization (Apple Silicon)
