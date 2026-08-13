@@ -2870,7 +2870,13 @@ def _strip_vendor_prefix(model_id: str) -> str:
 
 def model_supports_fast_mode(model_id: Optional[str]) -> bool:
     """Return whether Hermes should expose the /fast toggle for this model."""
-    return _is_anthropic_fast_model(model_id) or _is_openai_fast_model(model_id)
+    from agent.model_metadata import is_grok_46_family
+
+    return (
+        _is_anthropic_fast_model(model_id)
+        or _is_openai_fast_model(model_id)
+        or is_grok_46_family(str(model_id or ""))
+    )
 
 
 def _is_anthropic_fast_model(model_id: Optional[str]) -> bool:
@@ -2898,6 +2904,7 @@ def resolve_fast_mode_overrides(model_id: Optional[str]) -> dict[str, Any] | Non
     Returns provider-appropriate overrides:
     - OpenAI models: ``{"service_tier": "priority"}`` (Priority Processing)
     - Anthropic models: ``{"speed": "fast"}`` (Anthropic Fast Mode beta)
+    - Grok 4.6: ``{"service_tier": "priority"}`` (xAI Priority Processing)
 
     The overrides are injected into the API request kwargs by
     ``_build_api_kwargs`` in run_agent.py — each API path handles its own
