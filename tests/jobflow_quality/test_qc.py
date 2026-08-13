@@ -275,3 +275,41 @@ class TestNameMayLiveInTheSignOff:
         )
         r = check_application(_package(tmp_path, cover=cover), IDENTITY)
         assert r.status is QCStatus.BLOCKED
+
+
+class TestStalenessThresholdSeparatesWriteOrderFromRealStaleness:
+    """The 1-second slack was too tight and produced mostly false positives.
+
+    Measured across all 428 real packages, `md newer than pdf` is bimodal:
+
+        38.4s  39.5s  40.0s  55.0s  151.6s   <- one generation pass, write order
+        73414.0s (20.4h)  x2                 <- genuinely regenerated afterwards
+
+    Three orders of magnitude separate them, so any threshold inside that gap
+    is safe. 15 minutes sits well above the observed 152s spread and far below
+    20 hours. At 1 second, 5 of 6 flagged packages were the markdown simply
+    landing a minute after its PDF in the same run — and each one blocked a
+    submission and would have bought a regeneration.
+    """
+
+    def _aged(self, tmp_path, seconds):
+        import os
+        d = _package(tmp_path)
+        pdf = d / "resume.pdf"
+        md_time = (d / "resume.md").stat().st_mtime
+        os.utime(pdf, (md_time - seconds, md_time - seconds))
+        return d
+
+    def test_a_pdf_written_seconds_before_its_source_is_not_stale(self, tmp_path):
+        r = check_application(self._aged(tmp_path, 152), IDENTITY)
+        assert r.status is QCStatus.PASS, [f.code for f in r.findings]
+
+    def test_a_pdf_a_day_older_than_its_source_is_stale(self, tmp_path):
+        r = check_application(self._aged(tmp_path, 73414), IDENTITY)
+        assert r.status is QCStatus.REVISE
+        assert any(f.code is QCFinding.STALE_RENDERING for f in r.findings)
+
+    def test_the_threshold_is_explicit_and_inside_the_observed_gap(self):
+        from jobflow_quality.qc import RENDER_SLACK_SECONDS
+
+        assert 152 < RENDER_SLACK_SECONDS < 73414

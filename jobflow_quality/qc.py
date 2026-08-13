@@ -68,6 +68,17 @@ _EMAIL = re.compile(r"[\w.+-]+@[\w.-]+\.\w+")
 # document would flag every third party the letter legitimately names.
 _IDENTITY_WINDOW_CHARS = 1200
 
+# How far a rendered PDF may lag its markdown before it counts as stale.
+#
+# Measured across all 428 real packages, "md newer than pdf" is bimodal:
+#   38.4s  39.5s  40.0s  55.0s  151.6s   <- one generation pass, write ordering
+#   73414.0s (20.4h) x2                  <- genuinely regenerated afterwards
+# Three orders of magnitude separate the groups, so any threshold inside that
+# gap is safe. The original 1-second slack put 5 of 6 flagged packages in the
+# wrong group — each blocking a submission because the markdown landed a minute
+# after its PDF in the same run.
+RENDER_SLACK_SECONDS = 900
+
 
 class QCStatus(str, Enum):
     PASS = "pass"
@@ -205,9 +216,9 @@ def check_application(
         src, dst = package_dir / source, package_dir / rendered
         if not (src.is_file() and dst.is_file()):
             continue
-        # One second of slack: the pair is usually written in the same pass and
-        # filesystem timestamp resolution should not manufacture a finding.
-        if src.stat().st_mtime > dst.stat().st_mtime + 1:
+        # See RENDER_SLACK_SECONDS: the pair is written in one pass and the
+        # markdown can land minutes after its PDF without anything being wrong.
+        if src.stat().st_mtime > dst.stat().st_mtime + RENDER_SLACK_SECONDS:
             findings.append(Finding(QCFinding.STALE_RENDERING, rendered,
                                     "rendered file is older than its source"))
 
