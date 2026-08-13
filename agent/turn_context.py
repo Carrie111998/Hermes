@@ -1372,7 +1372,8 @@ def build_turn_context(
         agent._tool_interrupt_reason = None
         agent._interrupt_thread_signal_pending = False
 
-    # Notify memory providers of the new turn (BEFORE prefetch_all).
+    # Preserve the generic memory lifecycle ordering from HEAD. Timing opens
+    # separately before context build, with an already-frozen session identity.
     if agent._memory_manager:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
