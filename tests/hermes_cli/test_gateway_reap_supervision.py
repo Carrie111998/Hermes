@@ -132,6 +132,58 @@ class TestSupervisorSurvivesPoolChurn:
         # And the supervised PID is still reported live (unchanged).
         assert gateway.find_gateway_pids() == [live_gw_pid]
 
+    def test_profile_selection_keeps_launchd_gateway_pids_unchanged(self, monkeypatch):
+        # Regression for @luiborge23's reproduction (issue #83683): with multiple
+        # named Desktop profiles, each owning a launchd-supervised gateway, merely
+        # *selecting* a profile starts that profile's `hermes serve` backend, which
+        # calls `_reap_unsupervised_gateway_orphans()`. Every launchd-managed
+        # gateway (selected profile and others) must survive the reap untouched —
+        # the reap must not SIGTERM a supervised gateway nor write a planned-stop
+        # marker, and the gateway PID reported by `find_gateway_pids` must be
+        # unchanged. A read-only `gateway status` does not trigger this; the
+        # Desktop profile *selection* does.
+        monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway, "is_windows", lambda: False)
+        monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: _FakePath(True))
+        monkeypatch.setattr(gateway, "_probe_launchd_service_running", lambda: True)
+
+        # Two profiles, each with its own supervised launchd gateway (mirrors
+        # coder_1=95356, coder_3=95442 from the report).
+        coder_1_pid, coder_3_pid = 95356, 95442
+        monkeypatch.setattr(
+            gateway, "find_gateway_pids", lambda **k: [coder_1_pid, coder_3_pid]
+        )
+        monkeypatch.setattr(gateway_status, "get_running_pid", lambda: None)
+
+        killed = []
+        monkeypatch.setattr("os.kill", lambda pid, sig: killed.append((pid, sig)))
+        markers = []
+        monkeypatch.setattr(
+            gateway_status, "write_planned_stop_marker", lambda *a, **k: markers.append(a) or True
+        )
+        monkeypatch.setattr(gateway_status, "_pid_exists", lambda pid: False)
+        monkeypatch.setattr("time.sleep", lambda *_a, **_k: None)
+
+        clock = [0.0]
+
+        def fake_monotonic():
+            clock[0] += 100.0
+            return clock[0]
+
+        monkeypatch.setattr("time.monotonic", fake_monotonic)
+
+        # Simulate the desktop backend start triggered by selecting profile
+        # "coder_1" (a single reap call, not churn).
+        assert gateway._reap_unsupervised_gateway_orphans() is False
+
+        # Neither the selected profile's gateway nor the other profile's gateway
+        # was signaled, and no planned-stop marker was written.
+        assert killed == []
+        assert markers == []
+        # Both PIDs are still reported live and unchanged.
+        assert gateway.find_gateway_pids() == [coder_1_pid, coder_3_pid]
+
 
 class TestGatewayHasActiveSupervisor:
     def test_systemd_running(self, monkeypatch):
