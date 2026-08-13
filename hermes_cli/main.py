@@ -6725,7 +6725,7 @@ def _redownload_electron_dist(
     if mirror:
         dl_env["ELECTRON_MIRROR"] = mirror
     try:
-        subprocess.run([node, str(installer)], cwd=str(electron_dir), env=dl_env, check=False)
+        subprocess.run([node, str(installer)], cwd=str(electron_dir), env=dl_env, check=False, creationflags=windows_hide_flags())
     except OSError:
         return False
     return _electron_dist_ok(project_root)
@@ -7523,7 +7523,7 @@ def cmd_gui(args: argparse.Namespace):
 
     if source_mode:
         print("→ Launching Hermes Desktop from source build...")
-        launch_result = subprocess.run([npm, "exec", "--", "electron", "."], cwd=desktop_dir, env=env, check=False)
+        launch_result = subprocess.run([npm, "exec", "--", "electron", "."], cwd=desktop_dir, env=env, check=False, creationflags=windows_hide_flags())
         sys.exit(launch_result.returncode)
 
     if packaged_executable is None:

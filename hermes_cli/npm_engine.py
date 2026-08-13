@@ -39,6 +39,7 @@ from hermes_constants import (
     get_hermes_home,
     with_hermes_node_path,
 )
+from hermes_cli._subprocess_compat import windows_hide_flags
 
 __all__ = [
     "is_ebadengine",
@@ -208,6 +209,7 @@ def upgrade_managed_npm(
                 errors="replace",
                 timeout=_UPGRADE_TIMEOUT,
                 check=False,
+                creationflags=windows_hide_flags(),
             )
     except (OSError, subprocess.SubprocessError):
         if not quiet:
@@ -238,6 +240,7 @@ def _probe_version(npm: str) -> str | None:
             timeout=30,
             env=with_hermes_node_path(),
             check=False,
+            creationflags=windows_hide_flags(),
         )
     except (OSError, subprocess.SubprocessError):
         return None

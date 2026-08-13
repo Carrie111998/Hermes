@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 from hermes_constants import get_hermes_home
+from hermes_cli._subprocess_compat import windows_hide_flags
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 # rich and prompt_toolkit are imported lazily (inside the functions that use
@@ -185,6 +186,7 @@ def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str
             errors="replace",
             timeout=timeout,
             cwd=str(cwd),
+            creationflags=windows_hide_flags(),
         )
     except Exception:
         return None
@@ -246,6 +248,7 @@ def _upstream_main_sha() -> Optional[str]:
             ["git", "ls-remote", _UPSTREAM_REPO_URL, "refs/heads/main"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=10,
+            creationflags=windows_hide_flags(),
         )
     except Exception:
         return None
@@ -335,6 +338,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
             fetch_args,
             capture_output=True, timeout=10,
             cwd=str(repo_dir),
+            creationflags=windows_hide_flags(),
         )
     except Exception:
         pass  # Offline or timeout — use stale refs, that's fine
@@ -365,6 +369,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=5,
             cwd=str(repo_dir),
+            creationflags=windows_hide_flags(),
         )
         if result.returncode == 0:
             return int(result.stdout.strip())
@@ -470,6 +475,7 @@ def _git_short_hash(repo_dir: Path, rev: str) -> Optional[str]:
             errors="replace",
             timeout=5,
             cwd=str(repo_dir),
+            creationflags=windows_hide_flags(),
         )
     except Exception:
         return None
@@ -547,6 +553,7 @@ def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]
             errors="replace",
             timeout=5,
             cwd=str(repo_dir),
+            creationflags=windows_hide_flags(),
         )
         if result.returncode == 0:
             ahead = int((result.stdout or "0").strip() or "0")
@@ -585,6 +592,7 @@ def get_latest_release_tag(repo_dir: Optional[Path] = None) -> Optional[tuple]:
             errors="replace",
             timeout=3,
             cwd=str(repo_dir),
+            creationflags=windows_hide_flags(),
         )
     except Exception:
         _latest_release_cache = ()

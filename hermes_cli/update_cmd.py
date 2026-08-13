@@ -4383,6 +4383,32 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print(
                     "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                 )
+                # GUARD (local-fixes survival): the reset below orphans any
+                # committed-but-unpushed local work (flash/gateway/MCP fixes
+                # were wiped by this exact path twice). Pin current HEAD to a
+                # backup ref BEFORE the destructive reset so committed local
+                # work stays recoverable afterwards:
+                #   git reset --hard hermes-local-fixes-backup
+                backup_ref = "hermes-local-fixes-backup"
+                backup_result = subprocess.run(
+                    git_cmd + ["branch", "-f", backup_ref, "HEAD"],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                    creationflags=windows_hide_flags(),
+                )
+                if backup_result.returncode != 0:
+                    print(
+                        f"  ⚠ Could not create backup ref '{backup_ref}' — "
+                        "committed local work may be lost after the reset."
+                    )
+                    if backup_result.stderr.strip():
+                        print(f"    {backup_result.stderr.strip()}")
+                else:
+                    print(
+                        f"  ✓ Pinned local HEAD to backup ref '{backup_ref}' "
+                        f"(recover with: git reset --hard {backup_ref})"
+                    )
                 reset_result = subprocess.run(
                     git_cmd + ["reset", "--hard", f"origin/{branch}"],
                     cwd=_m().PROJECT_ROOT,
