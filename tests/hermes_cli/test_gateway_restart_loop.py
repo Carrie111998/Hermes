@@ -695,6 +695,20 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_absolute_path_with_embedded_nul_does_not_crash_guard(self):
+        """An arbitrary binary-derived path token containing NUL is unreadable,
+        not a reason for the synchronous terminal guard to raise."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        binary_path = "/safe" + chr(0) + "tail"
+
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(binary_path)
+            is False
+        )
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""
