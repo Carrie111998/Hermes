@@ -4,6 +4,7 @@
 
 import { PassThrough } from 'stream'
 
+import type * as HermesInk from '@hermes/ink'
 import { Box, renderSync, Text } from '@hermes/ink'
 import React from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -16,7 +17,7 @@ const { copyText, noSelectClickHandlers } = vi.hoisted(() => ({
 vi.mock('../lib/copyText.js', () => ({ copyText }))
 
 vi.mock('@hermes/ink', async importOriginal => {
-  const actual = await importOriginal<typeof import('@hermes/ink')>()
+  const actual = await importOriginal<typeof HermesInk>()
 
   return {
     ...actual,
