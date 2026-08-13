@@ -278,8 +278,17 @@ def test_non_factory_holder_challenge_and_steal(tmp_path):
         # non-eligibility both trigger step-down on the next tick.
         challenged = _read_dispatcher_lease(lock_path)
         assert challenged.get("challenge", {}).get("by") == "default"
-        assert _dispatcher_holder_should_step_down(challenged, self_eligible=True) is True
-        assert _dispatcher_holder_should_step_down(challenged, self_eligible=False) is True
+        assert _dispatcher_holder_should_step_down(
+            challenged, self_eligible=True, challenger_eligible=True,
+        ) is True
+        assert _dispatcher_holder_should_step_down(
+            challenged, self_eligible=False,
+        ) is True
+        # A challenge from a profile that is itself not allowed to dispatch
+        # must NOT bounce a healthy holder.
+        assert _dispatcher_holder_should_step_down(
+            challenged, self_eligible=True, challenger_eligible=False,
+        ) is False
 
         # The holder releases (its _release_kanban_dispatcher_lock path
         # truncates the lease, mirroring the mixin).

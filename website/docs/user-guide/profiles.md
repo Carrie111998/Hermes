@@ -47,7 +47,11 @@ to dispatch (e.g. `default`) keeps `dispatch_in_gateway: true`. A profile withou
 an explicit `kanban:` section inherits `dispatch_in_gateway: true` from the
 defaults and its gateway would race for the singleton dispatcher lock
 (`<kanban-root>/kanban/.dispatcher.lock`) — a non-factory profile must never hold
-that lock. See the [multi-gateway
+that lock. As a code-side backstop, only profiles named in
+`kanban.dispatch_profiles` (default `["default"]`) may even attempt the lock,
+and contenders re-check it every `kanban.lock_takeover_interval` (default 30s)
+instead of giving up at boot, so a dead dispatcher-gateway is replaced within
+~a minute. See the [multi-gateway
 guide](https://github.com/NousResearch/hermes-agent/blob/main/docs/kanban/multi-gateway.md) for
 details. Cloning with `--clone` / `--clone-all` copies the source profile's
 `kanban:` section as-is — verify it after cloning so a clone of the dispatcher

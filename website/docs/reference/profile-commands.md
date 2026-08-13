@@ -97,8 +97,10 @@ gateway that is explicitly meant to dispatch (e.g. `default`) keeps
 `<kanban-root>/kanban/.dispatcher.lock`. A profile whose `config.yaml` lacks a
 `kanban:` section inherits `dispatch_in_gateway: true` from the defaults — a
 helper profile's gateway would then silently become a second dispatcher, so keep
-the section explicit. Cloning copies the source's `kanban:` section as-is; check
-it after cloning.
+the section explicit. Only profiles named in `kanban.dispatch_profiles`
+(default `["default"]`) may even attempt the lock; contenders re-check it every
+`kanban.lock_takeover_interval` (default 30s) instead of giving up at boot.
+Cloning copies the source's `kanban:` section as-is; check it after cloning.
 
 **Examples:**
 

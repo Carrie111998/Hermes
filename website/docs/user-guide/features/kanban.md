@@ -1062,7 +1062,14 @@ dispatch and delivery have separate owners:
   `kanban.enabled: false` precisely so a new gateway never races for the lock.
   A profile whose `config.yaml` lacks an explicit `kanban:` section inherits
   `dispatch_in_gateway: true` from the defaults — keep the section explicit in
-  every non-factory profile.
+  every non-factory profile. As a code-side backstop, only profiles named in
+  `kanban.dispatch_profiles` (default `["default"]`) may even attempt the
+  lock, so a misconfigured worker/helper gateway cannot steal it. The lock is
+  durable: contenders re-check the flock every `kanban.lock_takeover_interval`
+  (default 30s) instead of giving up at boot, a dead holder's lock is
+  recovered within that interval, and a holder whose profile is no longer
+  dispatch-eligible (or is challenged by an eligible contender) releases it
+  and stands down on its next tick.
 - **Notification delivery is profile-owned.** Every gateway — including
   non-dispatch ones — runs the notifier and polls only subscriptions stamped
   with a profile whose platform adapters it hosts. A task created from the

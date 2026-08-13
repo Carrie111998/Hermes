@@ -404,7 +404,9 @@ def _dispatcher_takeover_challenge(lock_path, verdict: str, challenger: str) -> 
         pass
 
 
-def _dispatcher_holder_should_step_down(lease: dict, self_eligible: bool) -> bool:
+def _dispatcher_holder_should_step_down(
+    lease: dict, self_eligible: bool, challenger_eligible: bool = True,
+) -> bool:
     """Return whether the current lock holder should voluntarily release.
 
     True when the holder's own profile is no longer dispatch-eligible
@@ -414,12 +416,18 @@ def _dispatcher_holder_should_step_down(lease: dict, self_eligible: bool) -> boo
     (``non_factory`` / ``stale`` / ``dead``). Step-down is cooperative: the
     holder releases the flock on its next tick so the contender's periodic
     recheck can acquire it — a live flock can never be stolen.
+
+    A challenge from a profile that is ITSELF not allowed to dispatch is
+    ignored: a rogue local process (or a misconfigured worker gateway)
+    must not be able to bounce a healthy dispatcher. ``challenger_eligible``
+    is computed by the caller from the challenge's ``by`` field against the
+    live ``kanban.dispatch_profiles`` config.
     """
     if not self_eligible:
         return True
     challenge = lease.get("challenge") if isinstance(lease, dict) else None
     if isinstance(challenge, dict) and challenge.get("by"):
-        return True
+        return bool(challenger_eligible)
     return False
 
 
@@ -2146,8 +2154,16 @@ class GatewayKanbanWatchersMixin:
                         _self_profile, kanban_cfg,
                     ) and bool(kanban_cfg.get("dispatch_in_gateway", True))
                     _holder_lease = _read_dispatcher_lease(_lock_path)
+                    _challenge = _holder_lease.get("challenge") or {}
+                    _challenger = (
+                        _challenge.get("by") if isinstance(_challenge, dict) else None
+                    )
+                    _challenger_eligible = (
+                        isinstance(_challenger, str)
+                        and _dispatcher_profile_eligible(_challenger, kanban_cfg)
+                    )
                     if _dispatcher_holder_should_step_down(
-                        _holder_lease, _self_eligible,
+                        _holder_lease, _self_eligible, _challenger_eligible,
                     ):
                         _why = (
                             "profile no longer dispatch-eligible"
