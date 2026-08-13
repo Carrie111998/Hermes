@@ -1637,9 +1637,9 @@ def _collect_gateway_stop_pids(primary_pid: int | None = None) -> list[int]:
 def stop() -> None:
     """Stop the gateway.
 
-    Writes the planned-stop marker first so the gateway can drain
-    in-flight agents and persist ``resume_pending`` before exit (the
-    gateway's marker-watcher thread picks this up — Windows asyncio
+    Writes the planned-stop marker for every known gateway PID first so the
+    gateway can drain in-flight agents and persist ``resume_pending`` before
+    exit (the gateway's marker-watcher thread picks this up — Windows asyncio
     can't deliver SIGTERM to the loop, so the marker is our only IPC).
     Then escalates with bounded Windows process termination against the
     known gateway PID(s).
@@ -1647,15 +1647,24 @@ def stop() -> None:
     _assert_windows()
     from gateway.status import get_running_pid
 
-    # Phase 1: ask the running gateway (if any) to drain itself by writing
-    # the planned-stop marker, then wait briefly for it to exit cleanly.
-    # On clean exit, sessions land with resume_pending=True and the next
-    # boot will auto-resume them.
+    # Phase 1: ask every running gateway to drain itself by writing the
+    # planned-stop marker, then wait briefly for it to exit cleanly. On clean
+    # exit, sessions land with resume_pending=True and the next boot will
+    # auto-resume them.
+    #
+    # Drain the same PID list Phase 3 hard-kills, not just the lock-tracked
+    # one: get_running_pid() reports None whenever the runtime lock is
+    # missing/unheld, independently of whether a gateway is alive, while
+    # _collect_gateway_stop_pids() also sees the service registry and the
+    # command-line scan. Draining only the former meant that exact state --
+    # no runtime lock, live gateway -- skipped the marker entirely and went
+    # straight to schtasks /End + taskkill /F, abandoning the in-flight turn
+    # that #33778 was fixed to preserve. The POSIX stop path already handles
+    # this case (hermes_cli/gateway.py _reap_unsupervised_gateway_orphans
+    # writes the marker for every scanned PID before signalling it).
     pid = get_running_pid()
     stop_pids = _collect_gateway_stop_pids(pid)
-    drained = False
-    if pid is not None:
-        drained = _drain_gateway_pids([pid], _windows_stop_drain_timeout())
+    drained = _drain_gateway_pids(stop_pids, _windows_stop_drain_timeout())
 
     stopped_any = drained
     if is_task_registered():
