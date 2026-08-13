@@ -359,3 +359,51 @@ def test_drain_continues_with_later_queued_prompt_after_dispatch_failure(monkeyp
     assert session.get("queued_prompts") is None
 
 
+def test_load_busy_input_mode_recognized_values(monkeypatch):
+    """Recognized busy_input_mode values are honored verbatim."""
+    for mode in ("queue", "steer", "interrupt"):
+        monkeypatch.setattr(
+            server, "_load_cfg", lambda _mode=mode: {"display": {"busy_input_mode": _mode}}
+        )
+        assert server._load_busy_input_mode() == mode
+
+
+def test_load_busy_input_mode_unrecognized_falls_back_with_warning(monkeypatch, caplog):
+    """An unrecognized busy_input_mode logs a warning and falls back to interrupt.
+
+    Previously the fallback was silent, so a typo in config was invisible to the
+    operator (#82878).
+    """
+    monkeypatch.setattr(
+        server, "_load_cfg", lambda: {"display": {"busy_input_mode": "bogus"}}
+    )
+    with caplog.at_level("WARNING", logger=server.logger.name):
+        assert server._load_busy_input_mode() == "interrupt"
+    assert any("Unrecognized busy_input_mode" in r.message for r in caplog.records)
+
+
+def test_load_busy_input_mode_empty_no_warning(monkeypatch, caplog):
+    """An unset busy_input_mode defaults to interrupt without warning."""
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"display": {}})
+    with caplog.at_level("WARNING", logger=server.logger.name):
+        assert server._load_busy_input_mode() == "interrupt"
+    assert not any("Unrecognized busy_input_mode" in r.message for r in caplog.records)
+
+
+def test_gateway_runner_load_busy_input_mode(monkeypatch, caplog):
+    """gateway.run's loader mirrors tui_gateway: interrupt is recognized and
+    never warned about, while a bogus value warns and falls back."""
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_INPUT_MODE", "interrupt")
+    with caplog.at_level("WARNING", logger="hermes.gateway.run"):
+        assert GatewayRunner._load_busy_input_mode() == "interrupt"
+    assert not any("Unrecognized busy_input_mode" in r.message for r in caplog.records)
+
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_INPUT_MODE", "bogus")
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="hermes.gateway.run"):
+        assert GatewayRunner._load_busy_input_mode() == "interrupt"
+    assert any("Unrecognized busy_input_mode" in r.message for r in caplog.records)
+
+

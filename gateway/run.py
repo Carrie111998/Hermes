@@ -8582,11 +8582,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not mode:
             cfg = _load_gateway_runtime_config()
             mode = str(cfg_get(cfg, "display", "busy_input_mode", default="") or "").strip().lower()
-        if mode == "queue":
-            return "queue"
-        if mode == "steer":
-            return "steer"
-        return "interrupt"
+        if mode not in {"queue", "steer", "interrupt"}:
+            if mode:
+                logger.warning(
+                    "Unrecognized busy_input_mode %r; falling back to 'interrupt'. "
+                    "Supported values: 'queue', 'steer', 'interrupt'.",
+                    mode,
+                )
+            return "interrupt"
+        return mode
 
     @staticmethod
     def _load_busy_text_mode() -> str:
