@@ -499,6 +499,16 @@ export const de = defineLocale({
       themeTitle: 'Theme',
       themeDesc: 'Nur Desktop-Paletten. Der gewählte Modus wird darüber angewendet.',
       themeProfileNote: profile => `Für das Profil „${profile}“ gespeichert — jedes Profil behält sein eigenes Theme.`,
+      themeSearchPlaceholder: 'Eigene Themes oder den VS Code Marketplace durchsuchen…',
+      themeNoMatch: query => `Keine installierten Themes passen zu „${query}“.`,
+      themeDescriptions: {
+        nous: 'Glasartige Neutraltöne mit Akzenten in Nous-Blau',
+        midnight: 'Tiefes Blauviolett mit kühlen Akzenten',
+        ember: 'Warmes Karminrot und Bronze im Schmiede-Look',
+        mono: 'Klare Graustufen — minimalistisch und fokussiert',
+        cyberpunk: 'Neongrün auf Schwarz im Matrix-Terminal-Look',
+        slate: 'Kühles Schieferblau für eine fokussierte Entwicklungsumgebung'
+      },
       installTitle: 'Aus VS Code installieren',
       installDesc:
         'Füge eine Marketplace-Extension-ID ein (z. B. dracula-theme.theme-dracula), um deren Farb-Theme in eine Desktop-Palette zu konvertieren.',
@@ -1132,6 +1142,24 @@ export const de = defineLocale({
       fallbackEmpty: 'Keine Fallback-Modelle. Das Standardmodell wird verwendet, sofern es nicht fehlschlägt.',
       notInCatalog:
         'ist nicht in der Modellliste dieses Providers enthalten; Aufrufe können auf ein Ersatzmodell ausweichen.',
+      moa: {
+        title: 'Mixture of Agents',
+        description:
+          'Konfiguriere benannte Presets, die beim Provider „Mixture of Agents“ als Modelle erscheinen. Der Aggregator führt die Aufgabe aus.',
+        preset: 'Preset',
+        enabled: 'Aktiviert',
+        setDefault: 'Als Standard festlegen',
+        delete: 'Löschen',
+        newPreset: 'Neues Preset',
+        addPreset: 'Preset hinzufügen',
+        defaultLabel: 'Standard',
+        enableReference: index => `Referenz ${index} aktivieren`,
+        disableReference: index => `Referenz ${index} deaktivieren`,
+        remove: 'Entfernen',
+        reference: index => `Referenz ${index}`,
+        addReferenceModel: 'Referenzmodell hinzufügen',
+        aggregator: 'Aggregator'
+      },
       tasks: {
         vision: { label: 'Vision', hint: 'Bildanalyse' },
         web_extract: { label: 'Web-Extraktion', hint: 'Seiten-Zusammenfassung' },
@@ -1498,6 +1526,7 @@ export const de = defineLocale({
     installTheme: {
       title: 'Theme installieren…',
       pageTitle: 'Theme installieren',
+      marketplaceSource: 'Aus dem VS Code Marketplace',
       placeholder: 'Den VS-Code-Marketplace durchsuchen…',
       loading: 'Marketplace wird durchsucht…',
       error: 'Der Marketplace war nicht erreichbar.',
@@ -1777,6 +1806,7 @@ export const de = defineLocale({
     nameHint:
       'Kleinbuchstaben, Ziffern, Bindestriche und Unterstriche. Muss mit einem Buchstaben oder einer Ziffer beginnen.',
     title: 'Profile',
+    railAria: 'Profile',
     count: count => `${count} ${count === 1 ? 'Profil' : 'Profile'}`,
     search: 'Profile durchsuchen…',
     loading: 'Profile werden geladen…',
@@ -2084,6 +2114,43 @@ export const de = defineLocale({
     projectEmpty: 'Noch keine Sitzungen',
     noSessions: 'Noch keine Sitzungen',
     noFilterMatches: 'Keine Sitzungen entsprechen diesen Filtern',
+    filters: {
+      aria: 'Filter',
+      grouping: 'Gruppierung',
+      ordering: 'Sortierung',
+      show: 'Anzeigen',
+      inboxStyle: 'Posteingangsansicht',
+      title: 'Filter',
+      pullRequest: 'Pull Request',
+      profile: 'Profil',
+      project: 'Projekt',
+      archived: 'Archiviert',
+      resetDefaults: 'Auf Standard zurücksetzen',
+      expandAll: 'Alle ausklappen',
+      collapseAll: 'Alle einklappen',
+      markAllRead: 'Alle als gelesen markieren',
+      options: {
+        updated: 'Aktualisiert',
+        created: 'Erstellt',
+        status: 'Status',
+        project: 'Projekt',
+        profile: 'Profil',
+        tokens: 'Tokens',
+        cost: 'Kosten',
+        manual: 'Manuell',
+        preview: 'Vorschau',
+        pr: 'PR',
+        open: 'Offen',
+        draft: 'Entwurf',
+        merged: 'Zusammengeführt',
+        closed: 'Geschlossen',
+        noPr: 'Kein PR',
+        needsInput: 'Eingabe erforderlich',
+        working: 'In Arbeit',
+        unread: 'Ungelesen',
+        idle: 'Inaktiv'
+      }
+    },
     projects: {
       sectionLabel: 'Projekte',
       home: 'Home',
@@ -2214,6 +2281,9 @@ export const de = defineLocale({
 
   composer: {
     message: 'Nachricht',
+    introBody:
+      'Schick die Aufgabe, Fehlermeldung oder Datei. Hermes prüft den Kontext und bearbeitet den nächsten konkreten Schritt.',
+    addContext: 'Kontext hinzufügen',
     wakingProfile: profile => `Profil ${profile} wird aktiviert…`,
     placeholderStarting: 'Hermes wird gestartet…',
     placeholderReconnecting: 'Verbindung zu Hermes wird wiederhergestellt…',

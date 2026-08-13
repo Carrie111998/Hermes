@@ -385,6 +385,9 @@ export interface Translations {
       themeTitle: string
       themeDesc: string
       themeProfileNote: (profile: string) => string
+      themeSearchPlaceholder: string
+      themeNoMatch: (query: string) => string
+      themeDescriptions: Record<string, string>
       installTitle: string
       installDesc: string
       installPlaceholder: string
@@ -735,6 +738,23 @@ export interface Translations {
       fallbackAdd: string
       fallbackEmpty: string
       notInCatalog: string
+      moa: {
+        title: string
+        description: string
+        preset: string
+        enabled: string
+        setDefault: string
+        delete: string
+        newPreset: string
+        addPreset: string
+        defaultLabel: string
+        enableReference: (index: number) => string
+        disableReference: (index: number) => string
+        remove: string
+        reference: (index: number) => string
+        addReferenceModel: string
+        aggregator: string
+      }
       tasks: Record<string, AuxTaskCopy>
     }
     providers: {
@@ -1092,6 +1112,7 @@ export interface Translations {
     installTheme: {
       title: string
       pageTitle: string
+      marketplaceSource: string
       placeholder: string
       loading: string
       error: string
@@ -1319,6 +1340,7 @@ export interface Translations {
     close: string
     nameHint: string
     title: string
+    railAria: string
     count: (count: number) => string
     search: string
     loading: string
@@ -1578,6 +1600,43 @@ export interface Translations {
     projectEmpty: string
     noSessions: string
     noFilterMatches: string
+    filters: {
+      aria: string
+      grouping: string
+      ordering: string
+      show: string
+      inboxStyle: string
+      title: string
+      pullRequest: string
+      profile: string
+      project: string
+      archived: string
+      resetDefaults: string
+      expandAll: string
+      collapseAll: string
+      markAllRead: string
+      options: {
+        updated: string
+        created: string
+        status: string
+        project: string
+        profile: string
+        tokens: string
+        cost: string
+        manual: string
+        preview: string
+        pr: string
+        open: string
+        draft: string
+        merged: string
+        closed: string
+        noPr: string
+        needsInput: string
+        working: string
+        unread: string
+        idle: string
+      }
+    }
     projects: {
       sectionLabel: string
       home: string
@@ -1703,6 +1762,8 @@ export interface Translations {
 
   composer: {
     message: string
+    introBody: string
+    addContext: string
     wakingProfile: (profile: string) => string
     placeholderStarting: string
     placeholderReconnecting: string
