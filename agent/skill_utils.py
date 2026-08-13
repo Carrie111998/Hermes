@@ -122,7 +122,10 @@ def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
     # Some older callers own their own directory walk. Keep the authority
     # boundary in this common predicate as a final fail-closed guard while
     # callers migrate to ``iter_skill_index_files`` for subtree pruning.
-    return is_central_private_skill_path(path)
+    candidate = Path(path)
+    if root is not None and not candidate.is_absolute():
+        candidate = Path(root) / candidate
+    return is_central_private_skill_path(candidate)
 
 
 def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:

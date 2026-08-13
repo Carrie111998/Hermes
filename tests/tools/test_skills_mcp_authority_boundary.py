@@ -131,6 +131,68 @@ def test_symlink_aliases_cannot_bypass_authority_exclusion(authority_env, tmp_pa
     }
 
 
+@pytest.mark.parametrize(
+    "boundary", ["equal", "nested", "containing", "symlink_alias"]
+)
+def test_relative_exclusion_resolves_candidate_under_scan_root(
+    authority_env, tmp_path, boundary
+):
+    scan_root = tmp_path / "scan-root"
+    if boundary == "symlink_alias":
+        authority = tmp_path / "authority"
+        private_dir = _write_skill(authority, "canonical", PRIVATE_ID)
+        scan_root.mkdir()
+        (scan_root / "private").symlink_to(authority, target_is_directory=True)
+        candidate = scan_root / "private" / "canonical" / "SKILL.md"
+    else:
+        private_dir = _write_skill(scan_root, f"private/{PRIVATE_ID}", PRIVATE_ID)
+        candidate = private_dir / "SKILL.md"
+        if boundary == "equal":
+            authority = scan_root
+        elif boundary == "nested":
+            authority = private_dir
+        else:
+            authority = tmp_path
+    _write_config(authority_env, authority_roots=[authority])
+
+    relative_candidate = candidate.relative_to(scan_root)
+
+    assert skill_utils.is_excluded_skill_path(relative_candidate, root=scan_root)
+
+
+def test_sync_relative_scans_exclude_authority_skills(authority_env, tmp_path):
+    from tools.skills_sync import _discover_bundled_skills, _optional_skill_index
+
+    scan_root = tmp_path / "official-skills"
+    _write_skill(scan_root, "public", "public-skill")
+    authority = scan_root / "private"
+    _write_skill(authority, "canonical", PRIVATE_ID)
+    _write_config(authority_env, authority_roots=[authority])
+
+    discovered = _discover_bundled_skills(scan_root)
+    with patch("tools.skills_sync._get_optional_dir", return_value=scan_root):
+        optional_index = _optional_skill_index()
+
+    assert [name for name, _path in discovered] == ["public-skill"]
+    assert set(optional_index) == {"public", "public-skill"}
+
+
+def test_hub_relative_scans_exclude_authority_skills(authority_env, tmp_path):
+    from tools.skills_hub import OptionalSkillSource
+
+    scan_root = tmp_path / "optional-skills"
+    public = _write_skill(scan_root, "public", "public-skill")
+    authority = scan_root / "private"
+    _write_skill(authority, "canonical", PRIVATE_ID)
+    _write_config(authority_env, authority_roots=[authority])
+    source = OptionalSkillSource()
+    source._optional_dir = scan_root
+
+    assert [meta.name for meta in source._scan_all()] == ["public-skill"]
+    assert source._find_skill_dir("public") == public
+    assert source._find_skill_dir("canonical") is None
+
+
 def test_authority_boundary_cache_tracks_profile_switch_and_config_mtime(authority_env, tmp_path, monkeypatch):
     external = tmp_path / "external"
     first_root = external / "first"
