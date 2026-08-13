@@ -230,31 +230,97 @@ def test_already_expanded_env_ref_api_key_is_dropped_when_out_of_scope(
     )
 
 
-def test_partially_interpolated_api_key_keeps_its_expanded_value(
+def test_composite_api_key_ref_is_rebuilt_from_the_profile_scope(
     monkeypatch, probed_keys, scope
 ):
-    """A composite template is not a bare ref and must not be re-resolved.
+    """A ``${...}`` inside a larger string is the same cross-profile read.
 
-    ``_expand_env_vars`` substitutes each ``${...}`` inside a larger string, so
-    ``sk-${MYCORP_SUFFIX}`` legitimately yields a usable key. Deliberately *not*
-    in the red-before set — it guards behaviour the fix must leave alone.
+    ``_expand_env_vars`` substitutes *every* ``${...}`` it finds, not only a
+    template that is exactly one whole ref, and every one of those
+    substitutions comes from the process-global ``os.environ``. So
+    ``sk-${MYCORP_SUFFIX}`` expands into a perfectly well-formed key built out
+    of another profile's secret, and it keeps no ``${`` afterwards to give
+    itself away. The surrounding literal text does not make it a different
+    question — the whole value has to be rebuilt from the template through the
+    scope-aware reader.
     """
-    monkeypatch.setenv("MYCORP_SUFFIX", "live-abc")
-    scope({"MYCORP_SUFFIX": "live-abc"})
+    monkeypatch.setenv("MYCORP_SUFFIX", "other-profile")
+    scope({"MYCORP_SUFFIX": "this-profile"})
 
     from hermes_cli.model_setup_flows import _model_flow_named_custom
 
     _model_flow_named_custom(
         {},
         _provider_info(
-            api_key="sk-live-abc",
+            # What ``_expand_env_vars`` produced from the process environment.
+            api_key="sk-other-profile",
+            # What config.yaml actually says.
             api_key_ref="sk-${MYCORP_SUFFIX}",
         ),
     )
 
-    assert probed_keys == ["sk-live-abc"], (
-        "a composite ${...} template resolves during expansion and must keep "
-        "its expanded value"
+    assert probed_keys == ["sk-this-profile"], (
+        "every ${...} in a composite api_key ref must resolve through the "
+        "profile scope, not survive from the process-environment expansion"
+    )
+
+
+def test_multi_ref_api_key_ref_is_rebuilt_from_the_profile_scope(
+    monkeypatch, probed_keys, scope
+):
+    """Two refs in one template, neither of which is the whole template.
+
+    ``${A}-${B}`` both starts with ``${`` and ends with ``}`` while being no
+    kind of bare ref at all, so a shape test that inspects only the template's
+    two ends misreads it. ``_expand_env_vars`` treats it as two independent
+    substitutions; the re-resolution has to do the same.
+    """
+    monkeypatch.setenv("MYCORP_PREFIX", "other")
+    monkeypatch.setenv("MYCORP_SUFFIX", "profile")
+    scope({"MYCORP_PREFIX": "this", "MYCORP_SUFFIX": "profile-key"})
+
+    from hermes_cli.model_setup_flows import _model_flow_named_custom
+
+    _model_flow_named_custom(
+        {},
+        _provider_info(
+            api_key="other-profile",
+            api_key_ref="${MYCORP_PREFIX}-${MYCORP_SUFFIX}",
+        ),
+    )
+
+    assert probed_keys == ["this-profile-key"], (
+        "each ${...} in a multi-ref api_key ref must resolve through the "
+        "profile scope independently"
+    )
+
+
+def test_composite_api_key_ref_is_dropped_when_a_ref_is_out_of_scope(
+    monkeypatch, probed_keys, scope
+):
+    """A hole in a rebuilt credential must fail closed, not fall back.
+
+    The scope is authoritative under multiplexing, so a ref it cannot resolve
+    yields nothing *for this profile*. Splicing the process environment's value
+    back in to keep the string well-formed would defeat the check entirely, and
+    a half-built key is worth nothing to the endpoint in any case.
+    """
+    monkeypatch.setenv("MYCORP_SUFFIX", "other-profile")
+    scope({"UNRELATED_KEY": "sk-unrelated"})
+
+    from hermes_cli.model_setup_flows import _model_flow_named_custom
+
+    _model_flow_named_custom(
+        {},
+        _provider_info(
+            api_key="sk-other-profile",
+            api_key_ref="sk-${MYCORP_SUFFIX}",
+        ),
+    )
+
+    assert probed_keys == [""], (
+        "a composite ref the profile scope cannot resolve must not keep the "
+        "process environment's expanded value"
     )
 
 
