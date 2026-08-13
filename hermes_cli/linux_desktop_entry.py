@@ -63,15 +63,37 @@ def resolve_exec_command() -> str:
     Prefer the real ``hermes`` executable (argv[0] or PATH). When Hermes
     runs as a module with no launcher installed, use the current
     interpreter, also absolute.
+
+    A resolved binary that is itself a Python script (e.g. the in-checkout
+    ``hermes`` launcher) is run through the interpreter running now. Its
+    ``#!/usr/bin/env python3`` shebang would otherwise pick the system
+    interpreter — outside the venv, where imports fail.
     """
     from hermes_cli.relaunch import resolve_hermes_bin
 
+    # Keep sys.executable as-is (it is already absolute). A venv
+    # interpreter is a symlink whose path selects the venv; resolving it
+    # yields the base interpreter without the venv's site-packages.
+    interpreter = sys.executable
     bin_path = resolve_hermes_bin()
     if bin_path:
-        argv = [str(Path(bin_path).resolve()), "desktop"]
+        resolved = str(Path(bin_path).resolve())
+        if _has_python_shebang(resolved):
+            argv = [interpreter, resolved, "desktop"]
+        else:
+            argv = [resolved, "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        argv = [interpreter, "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
+
+
+def _has_python_shebang(path: str) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            first_line = fh.readline(256)
+    except OSError:
+        return False
+    return first_line.startswith(b"#!") and b"python" in first_line
 
 
 def _quote_exec_arg(arg: str) -> str:

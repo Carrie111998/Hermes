@@ -76,6 +76,46 @@ def test_installed_entry_is_executable(tmp_path, xdg_home, monkeypatch):
     assert entry.stat().st_mode & stat.S_IXUSR
 
 
+def test_exec_runs_python_shebang_script_through_current_interpreter(
+    tmp_path, xdg_home, monkeypatch
+):
+    """A launcher-run `#!/usr/bin/env python3` script resolves to the system
+    interpreter, not the venv running Hermes — imports then fail. The entry
+    must run such a script through the interpreter that is running now."""
+    root = _make_project(tmp_path)
+    script = tmp_path / "checkout" / "hermes"
+    script.parent.mkdir()
+    script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(script))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+    # A venv interpreter is a symlink; its *path* is what selects the venv
+    # (pyvenv.cfg lives next to it). The entry must keep the symlink path,
+    # not resolve it down to the de-virtualized base interpreter.
+    venv_python = tmp_path / "venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(Path(lde.sys.executable).resolve())
+    monkeypatch.setattr(lde.sys, "executable", str(venv_python))
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line == f"{venv_python} {script} desktop"
+
+
+def test_exec_keeps_non_python_launcher_unprefixed(tmp_path, xdg_home, monkeypatch):
+    root = _make_project(tmp_path)
+    wrapper = tmp_path / "bin" / "hermes"
+    wrapper.parent.mkdir()
+    wrapper.write_text('#!/usr/bin/env bash\nexec python "$@"\n', encoding="utf-8")
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(wrapper))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line == f"{wrapper} desktop"
+
+
 def test_exec_falls_back_to_interpreter_module(tmp_path, xdg_home, monkeypatch):
     root = _make_project(tmp_path)
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: None)
