@@ -1,4 +1,4 @@
-"""Per-task worktree isolation for decompose siblings.
+"""Capability-based workspace policy and per-task worktree isolation.
 
 Decompose children used to inherit the root's literal ``workspace_path``,
 so every sibling of a worktree-kind root pointed at the SAME checkout —
@@ -6,12 +6,9 @@ and ``_resolve_worktree_workspace``'s existing-checkout shortcut reused it
 on whatever branch was there, letting sibling workers run concurrently in
 one directory on one branch (cross-task provenance corruption, no lock).
 
-Two-part fix under test:
-- ``decompose_triage_task`` leaves worktree children's ``workspace_path``
-  unset so each child materializes its own ``<repo>/.worktrees/<child-id>``.
-- ``_resolve_worktree_workspace`` falls back to a fresh per-task worktree
-  when the requested path is occupied by another task's branch (heals
-  pre-existing rows that still carry a shared path).
+Only explicitly repository-writing children receive worktrees. Non-writing
+children fail closed to scratch even when their root owns a worktree. Existing
+stale paths still fall back to a fresh per-task checkout.
 """
 
 from __future__ import annotations
@@ -66,7 +63,7 @@ def _add_worktree(repo: Path, target: Path, branch: str) -> Path:
     return target
 
 
-def test_decompose_worktree_children_get_own_workspace(kanban_home):
+def test_decompose_worktree_root_applies_child_capability_policy(kanban_home):
     with kb.connect() as conn:
         root = kb.create_task(conn, title="build the feature", triage=True)
         conn.execute(
@@ -81,22 +78,98 @@ def test_decompose_worktree_children_get_own_workspace(kanban_home):
             root,
             root_assignee="orchestrator",
             children=[
-                {"title": "spec it", "assignee": "alice", "parents": []},
-                {"title": "implement it", "assignee": "bob", "parents": [0]},
+                {
+                    "title": "research it",
+                    "assignee": "alice",
+                    "parents": [],
+                    "workspace_policy": "scratch",
+                },
+                {
+                    "title": "implement it",
+                    "assignee": "bob",
+                    "parents": [0],
+                    "workspace_policy": "repo_write",
+                },
+                {
+                    "title": "review it",
+                    "assignee": "reviewer",
+                    "parents": [1],
+                },
             ],
             author="decomposer",
         )
-        assert child_ids is not None and len(child_ids) == 2
+        assert child_ids is not None and len(child_ids) == 3
+        rows = [kb.get_task(conn, child_id) for child_id in child_ids]
 
-        for cid in child_ids:
-            row = conn.execute(
-                "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
-                (cid,),
-            ).fetchone()
-            assert row["workspace_kind"] == "worktree"
-            # Each child resolves its own <repo>/.worktrees/<child-id> at
-            # dispatch; the root's literal path must never be shared.
-            assert row["workspace_path"] is None
+    research, implementation, review = rows
+    assert research.workspace_kind == "scratch"
+    assert research.workspace_path is None
+    assert implementation.workspace_kind == "worktree"
+    assert implementation.workspace_path is None
+    assert review.workspace_kind == "scratch"
+    assert review.workspace_path is None
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "research upstream behavior",
+        "run QA evidence review",
+        "review the proposed changes",
+        "draft launch copy",
+        "reconcile operations checklist",
+    ],
+)
+def test_missing_policy_never_inherits_worktree_root(kanban_home, title):
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="code root", triage=True)
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='worktree', "
+            "workspace_path='/repo/.worktrees/root' WHERE id = ?",
+            (root,),
+        )
+        conn.commit()
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root,
+            root_assignee="orchestrator",
+            children=[{"title": title, "assignee": "specialist", "parents": []}],
+            author="decomposer",
+        )
+        child = kb.get_task(conn, child_ids[0])
+
+    assert child.workspace_kind == "scratch"
+    assert child.workspace_path is None
+
+
+def test_explicit_repo_write_siblings_get_distinct_unresolved_worktrees(kanban_home):
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="parallel code", triage=True)
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root,
+            root_assignee="orchestrator",
+            children=[
+                {
+                    "title": "implement API",
+                    "assignee": "alice",
+                    "parents": [],
+                    "workspace_policy": "repo_write",
+                },
+                {
+                    "title": "implement UI",
+                    "assignee": "bob",
+                    "parents": [],
+                    "workspace_policy": "repo_write",
+                },
+            ],
+            author="decomposer",
+        )
+        rows = [kb.get_task(conn, child_id) for child_id in child_ids]
+
+    assert all(row.workspace_kind == "worktree" for row in rows)
+    assert all(row.workspace_path is None for row in rows)
+    assert rows[0].id != rows[1].id
 
 
 
@@ -124,7 +197,5 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert head == "wt/sibling"
-
-
 
 

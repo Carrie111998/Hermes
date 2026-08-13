@@ -86,6 +86,8 @@ The operator recovery paths, both audited via a `triage_escalation_recovered` ev
 
 Decomposition also refuses a task with any open downstream child graph. The check runs in the same write transaction as child creation, so a link added while the decomposer model is running cannot race into a duplicate graph.
 
+The same kernel write maps each child's declared capability to its workspace. Only `workspace_policy: repo_write` creates an isolated worktree/branch. Missing, invalid, and explicitly non-writing policies resolve to a task-owned scratch workspace; no child inherits the root's mutable checkout. This is intentionally independent of assignee names—a profile called QA, Reviewer, or Engineer receives no branch authority unless that specific task declares repository writes.
+
 ## Logs and audit trail
 
 The dispatcher writes per-task worker stdout/stderr to `<board-root>/logs/<task_id>.log`. Logs are auditable from kanban metadata:

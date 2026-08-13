@@ -76,7 +76,8 @@ Output a single JSON object with this exact shape:
         "title": "<concrete task title, imperative voice, <= 80 chars>",
         "body":  "<detailed spec for the worker on this child task>",
         "assignee": "<profile name from the roster, or null for default>",
-        "parents": [<int>, ...]
+        "parents": [<int>, ...],
+        "workspace_policy": "scratch" | "repo_write"
       },
       ...
     ]
@@ -95,6 +96,11 @@ Rules:
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
+  - Set "workspace_policy" to "repo_write" ONLY when the task's acceptance
+    criteria require modifying repository files. Use "scratch" for research,
+    planning, QA, review, marketing, operations, coordination, or inspection.
+    A repo_write child receives its own isolated worktree and branch; scratch
+    children never inherit the root's checkout.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -466,11 +472,18 @@ def decompose_task(
             parents = []
         # Clean parent indices: drop non-int and out-of-range.
         clean_parents = [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx]
+        workspace_policy = entry.get("workspace_policy")
+        if workspace_policy != "repo_write":
+            # Missing, invalid, or over-broad declarations fail closed. The
+            # DB repeats the enum validation so direct callers cannot smuggle
+            # an unknown policy past this parser.
+            workspace_policy = "scratch"
         children.append({
             "title": title.strip()[:200],
             "body": body.strip(),
             "assignee": chosen,
             "parents": clean_parents,
+            "workspace_policy": workspace_policy,
         })
 
     try:
