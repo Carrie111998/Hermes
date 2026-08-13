@@ -26,6 +26,9 @@ PRs #9850, #9934, #7536):
 """
 
 import asyncio
+import os
+import subprocess
+import sys
 import time
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -726,6 +729,125 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
     assert seen == ["resume-start", "inbound:hello"]
     assert runner._startup_restore_queue == []
     assert runner._startup_restore_in_progress is False
+
+
+# ---------------------------------------------------------------------------
+# Per-session exclusivity: never resume while the previous loop is alive
+# ---------------------------------------------------------------------------
+
+
+def _dead_pid() -> int:
+    """A PID guaranteed to be dead: a child that has already exited."""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+def _pending_entry_with_marker(
+    session_key: str,
+    source: SessionSource,
+    *,
+    pid: int | None,
+) -> SessionEntry:
+    return SessionEntry(
+        session_key=session_key,
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+        active_turn_token="tok-1",
+        active_turn_started_at=datetime.now(),
+        active_turn_pid=pid,
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_resume_skips_session_with_live_previous_loop():
+    """Restart mid-turn must not spawn a SECOND loop on the same session.
+
+    A detached restart boots the new gateway while the old one is still
+    draining its in-flight turn.  The durable active-turn marker records the
+    owning PID; when that process is alive the old loop owns the session and
+    startup auto-resume must fail closed (#85207) — otherwise the user gets
+    two divergent final responses for the same message.
+    """
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="live-owner-chat")
+    entry = _pending_entry_with_marker(
+        "agent:main:telegram:dm:live-owner-chat", source, pid=os.getpid()
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+    # No running slot was claimed for the session.
+    assert entry.session_key not in runner._running_agents
+
+
+@pytest.mark.asyncio
+async def test_auto_resume_proceeds_when_previous_owner_dead():
+    """A crash-left marker whose owning process is dead resumes as before."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="dead-owner-chat")
+    entry = _pending_entry_with_marker(
+        "agent:main:telegram:dm:dead-owner-chat", source, pid=_dead_pid()
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source == source
+
+
+@pytest.mark.asyncio
+async def test_second_scheduling_pass_does_not_double_resume():
+    """A concurrent scheduling pass while a resume is in flight -> one loop.
+
+    The slot pre-claim makes the second pass a no-op for the same session
+    (#45456); combined with the exclusivity check above, two loops on one
+    session are impossible (#85207).
+    """
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="double-chat")
+    entry = _pending_entry_with_marker(
+        "agent:main:telegram:dm:double-chat", source, pid=None
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+
+    gate = asyncio.Event()
+
+    async def _slow_handle(event):
+        await gate.wait()
+
+    adapter.handle_message = _slow_handle
+
+    first = runner._schedule_resume_pending_sessions()
+    second = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert first == 1
+    assert second == 0
+    # Exactly one slot claim for the session.
+    assert entry.session_key in runner._running_agents
+    assert runner._running_agents[entry.session_key] is _AGENT_PENDING_SENTINEL
+
+    gate.set()
+    await asyncio.sleep(0.05)
+    assert entry.session_key not in runner._running_agents
 
 
 # ---------------------------------------------------------------------------

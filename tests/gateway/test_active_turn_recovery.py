@@ -11,6 +11,10 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
+import os
+import subprocess
+import sys
+
 import pytest
 
 from gateway.config import GatewayConfig, Platform
@@ -149,6 +153,76 @@ def test_mark_and_clear_use_single_entry_persistence(tmp_path):
     )
 
 
+def _dead_pid() -> int:
+    """A PID guaranteed to be dead: a child that has already exited."""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+def test_active_turn_pid_round_trip_and_legacy_default(tmp_path):
+    store = _make_store(tmp_path)
+    source = _make_source()
+    entry = store.get_or_create_session(source)
+    store.mark_turn_active(entry.session_key)
+
+    payload = _entry_for(store, source).to_dict()
+    assert isinstance(payload["active_turn_pid"], int)
+    assert payload["active_turn_pid"] == os.getpid()
+
+    restored = SessionEntry.from_dict(payload)
+    assert restored.active_turn_pid == os.getpid()
+
+    # Legacy markers without the field default to unknown (None).
+    payload.pop("active_turn_pid")
+    legacy = SessionEntry.from_dict(payload)
+    assert legacy.active_turn_pid is None
+
+
+def test_recover_keeps_marker_when_owner_alive(tmp_path):
+    """A marker whose gateway process is STILL ALIVE must not be promoted or
+    cleared — the old loop owns the session (#85207).
+
+    This is the detached-restart overlap: the new gateway boots while the old
+    one is still draining its in-flight turn.  Promoting the marker would
+    auto-resume a SECOND loop on the same session and deliver a duplicate
+    final response.
+    """
+    store = _make_store(tmp_path)
+    source = _make_source()
+    entry = store.get_or_create_session(source)
+    store.mark_turn_active(entry.session_key)
+    # mark_turn_active stamps os.getpid() — the live test process.
+    assert _entry_for(store, source).active_turn_pid == os.getpid()
+
+    promoted = store.recover_interrupted_turns(max_age_seconds=3600)
+
+    assert promoted == 0
+    current = _entry_for(store, source)
+    assert current.resume_pending is False
+    assert current.active_turn_token is not None  # marker preserved
+    assert current.active_turn_pid == os.getpid()
+
+
+def test_recover_promotes_and_clears_when_owner_dead(tmp_path):
+    """A crash-left marker whose owning process is dead resumes as before."""
+    store = _make_store(tmp_path)
+    source = _make_source()
+    entry = store.get_or_create_session(source)
+    store.mark_turn_active(entry.session_key)
+    with store._lock:
+        store._entries[entry.session_key].active_turn_pid = _dead_pid()
+
+    promoted = store.recover_interrupted_turns(max_age_seconds=3600)
+
+    assert promoted == 1
+    current = _entry_for(store, source)
+    assert current.resume_pending is True
+    assert current.resume_reason == "restart_interrupted"
+    assert current.active_turn_token is None
+    assert current.active_turn_pid is None
+
+
 def test_failed_mark_persistence_does_not_leak_marker_into_later_save(tmp_path):
     store = _make_store(tmp_path)
     source = _make_source()
@@ -265,6 +339,10 @@ def test_exact_old_active_turn_recovers_even_when_updated_at_is_stale(tmp_path):
         current = store._entries[entry.session_key]
         current.updated_at = datetime.now() - timedelta(hours=2)
         current.active_turn_started_at = datetime.now() - timedelta(minutes=10)
+        # The owning gateway process is dead (crash) — mark_turn_active stamps
+        # the LIVE test pid, which the #85207 liveness guard would otherwise
+        # treat as a still-running loop and refuse to recover.
+        current.active_turn_pid = _dead_pid()
         store._save()
 
     # Prove the marker survives a fresh SessionStore and is not relying on the
@@ -313,6 +391,9 @@ def test_existing_resume_reason_and_freshness_are_preserved(tmp_path):
         current.resume_pending = True
         current.resume_reason = "shutdown_timeout"
         current.last_resume_marked_at = original_mark
+        # Owning gateway process is dead — see
+        # test_exact_old_active_turn_recovers_even_when_updated_at_is_stale.
+        current.active_turn_pid = _dead_pid()
 
     assert store.recover_interrupted_turns() == 0
     recovered = _entry_for(store, source)
