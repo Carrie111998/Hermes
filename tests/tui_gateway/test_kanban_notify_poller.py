@@ -222,6 +222,29 @@ class TestFormatKanbanEventText:
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
         assert "timed out" in text
 
+    def test_timed_out_retry_copy_requires_affirmative_payload(self):
+        for payload in ({}, {"will_retry": False}, {"will_retry": "true"}):
+            ev = SimpleNamespace(kind="timed_out", payload=payload)
+            text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
+            assert "will retry" not in text
+
+        ev = SimpleNamespace(
+            kind="timed_out",
+            payload={"limit_seconds": 5, "will_retry": True},
+        )
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
+        assert "will retry" in text
+
+    def test_crashed_retry_copy_requires_affirmative_payload(self):
+        for payload in ({}, {"will_retry": False}, {"will_retry": "true"}):
+            ev = SimpleNamespace(kind="crashed", payload=payload)
+            text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
+            assert "dispatcher will retry" not in text
+
+        ev = SimpleNamespace(kind="crashed", payload={"will_retry": True})
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
+        assert "dispatcher will retry" in text
+
 
 class TestNotificationPollerLoopKanbanWiring:
     """Drive a real TUI subscription through ``_notification_poller_loop``.
