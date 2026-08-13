@@ -69,6 +69,7 @@ export interface Palette {
   memoryInk: Rgb
   primary: Rgb
   skillInk: Rgb
+  wikiInk: Rgb
 }
 
 export interface Ring {

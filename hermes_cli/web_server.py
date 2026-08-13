@@ -1071,6 +1071,9 @@ _CATEGORY_MERGE: Dict[str, str] = {
     # field — fold it into the agent tab rather than spawning a one-field
     # orphan category.
     "runtime": "agent",
+    # `journey.include_wiki` is the only schema-surfaced journey field — fold
+    # it into the agent tab alongside the rest of the learning configuration.
+    "journey": "agent",
 }
 
 # Display order for tabs — unlisted categories sort alphabetically after these.

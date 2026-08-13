@@ -31,12 +31,20 @@ def home():
     skill = base / "skills" / "my-skill"
     skill.mkdir(parents=True, exist_ok=True)
     (skill / "SKILL.md").write_text(_SKILL, encoding="utf-8")
+    wiki = base / "wiki"
+    wiki.mkdir()
+    (wiki / "project.md").write_text("---\ntitle: Project\n---\n\nOriginal.", encoding="utf-8")
+    (base / "config.yaml").write_text(
+        f"skills:\n  config:\n    wiki:\n      path: {wiki.as_posix()}\n",
+        encoding="utf-8",
+    )
     return base
 
 
 def test_parse_node_kind():
     assert lm.parse_node_kind("memory:memory:0") == "memory"
     assert lm.parse_node_kind("memory:profile:3") == "memory"
+    assert lm.parse_node_kind("wiki:project.md") == "wiki"
     assert lm.parse_node_kind("debugging-hermes") == "skill"
 
 
@@ -61,6 +69,30 @@ def test_skill_detail_returns_skill_md(home):
     d = lm.node_detail("my-skill")
     assert d["ok"] and d["kind"] == "skill"
     assert "name: my-skill" in d["content"]
+
+
+def test_wiki_detail_and_edit_resolve_configured_page(home):
+    detail = lm.node_detail("wiki:project.md")
+    assert detail["ok"] and detail["kind"] == "wiki" and detail["label"] == "Project"
+
+    assert lm.edit_node("wiki:project.md", "# Updated\n")["ok"]
+    assert (home / "wiki" / "project.md").read_text(encoding="utf-8") == "# Updated\n"
+
+
+def test_delete_wiki_hides_node_without_deleting_file(home):
+    page = home / "wiki" / "project.md"
+    assert lm.delete_node("wiki:project.md")["ok"]
+    assert page.exists()
+
+    from agent.learning_graph import _wiki_cards
+
+    assert not _wiki_cards()
+
+
+def test_wiki_node_rejects_path_traversal(home):
+    result = lm.node_detail("wiki:../memories/MEMORY.md")
+    assert not result["ok"]
+    assert "bad wiki node id" in result["message"]
 
 
 

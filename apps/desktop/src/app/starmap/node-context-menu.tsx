@@ -13,7 +13,7 @@ import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
 
 export interface NodeMenuTarget {
   id: string
-  kind: 'memory' | 'skill'
+  kind: 'memory' | 'skill' | 'wiki'
   label: string
   x: number
   y: number
@@ -53,7 +53,7 @@ export function NodeContextMenu({ onClose, onNodeRemoved, target }: NodeContextM
     setError(null)
   })
 
-  const noun = target?.kind === 'memory' ? 'memory' : 'skill'
+  const noun = target?.kind ?? 'node'
 
   const openEdit = async () => {
     if (!target) {
@@ -135,7 +135,7 @@ export function NodeContextMenu({ onClose, onNodeRemoved, target }: NodeContextM
               }}
               type="button"
             >
-              {target.kind === 'skill' ? 'Archive skill' : 'Delete memory'}
+              {target.kind === 'skill' ? 'Archive skill' : target.kind === 'wiki' ? 'Remove from journey' : 'Delete memory'}
             </button>
           </div>
         </>
@@ -149,7 +149,7 @@ export function NodeContextMenu({ onClose, onNodeRemoved, target }: NodeContextM
           <div className="h-80">
             {editing && (
               <CodeEditor
-                filePath={noun === 'skill' ? 'SKILL.md' : 'memory.md'}
+                filePath={noun === 'skill' ? 'SKILL.md' : noun === 'wiki' ? 'wiki.md' : 'memory.md'}
                 framed
                 initialValue={editing.content}
                 key={editing.id}
@@ -186,9 +186,13 @@ export function NodeContextMenu({ onClose, onNodeRemoved, target }: NodeContextM
         />
       ) : (
         <ConfirmDialog
-          confirmLabel="Delete"
-          description="This memory is removed permanently."
-          destructive
+          confirmLabel={deleting?.kind === 'wiki' ? 'Remove' : 'Delete'}
+          description={
+            deleting?.kind === 'wiki'
+              ? 'This page is hidden from the journey. The Markdown file is kept.'
+              : 'This memory is removed permanently.'
+          }
+          destructive={deleting?.kind !== 'wiki'}
           dismissOnConfirm
           onClose={() => setDeleting(null)}
           onConfirm={() => {
@@ -211,7 +215,7 @@ export function NodeContextMenu({ onClose, onNodeRemoved, target }: NodeContextM
             )
           }}
           open={Boolean(deleting)}
-          title={`Delete ${deleting?.label ?? ''}?`}
+          title={`${deleting?.kind === 'wiki' ? 'Remove' : 'Delete'} ${deleting?.label ?? ''}?`}
         />
       )}
     </>
