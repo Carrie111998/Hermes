@@ -173,7 +173,7 @@ fallback_providers:
 |---------|-------------------|
 | CLI sessions | ✔ |
 | Messaging gateway (Telegram, Discord, etc.) | ✔ |
-| Subagent delegation | ✔ (subagents inherit the parent fallback chain) |
+| Subagent delegation | ✔ (subagents inherit the parent fallback chain, or use `delegation.fallback_providers` for an independent chain) |
 | Cron jobs | ✔ (cron agents inherit configured fallback providers) |
 | Auxiliary tasks on `provider: auto` | ✔ (try per-task fallback, then the main fallback chain before built-in aux discovery) |
 
