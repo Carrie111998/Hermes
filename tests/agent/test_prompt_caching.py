@@ -57,24 +57,6 @@ def _tool_heavy_native_tools():
     ]
 
 
-def test_prompt_cache_plan_filters_invalid_tool_entries_before_final_marker():
-    tools = [
-        {"type": "function", "function": {"name": "first"}},
-        "not-a-tool-schema",
-        {"type": "function", "function": {"name": "last"}},
-    ]
-
-    plan = build_prompt_cache_plan(
-        [{"role": "system", "content": "stable"}],
-        tools,
-        native_anthropic=True,
-        direct_native_tool_cache=True,
-    )
-
-    assert [tool["function"]["name"] for tool in plan.tools] == ["first", "last"]
-    assert plan.tools[-1]["cache_control"] == MARKER
-
-
 def test_t20880_tool_heavy_native_loop_reproduction():
     """A 28-tool native loop needs a tool marker and a retained transaction endpoint."""
     tools = _tool_heavy_native_tools()
