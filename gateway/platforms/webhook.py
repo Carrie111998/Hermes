@@ -67,6 +67,8 @@ from gateway.platforms.webhook_profile_admission import (
     WebhookProfileAdmissionMixin,
     _PROFILE_REJECTED,
 )
+from gateway.platforms.webhook_models import to_legacy_route
+from gateway.platforms.webhook_store import WebhookRouteStore
 from gateway.response_filters import is_autonomous_silence_response
 
 logger = logging.getLogger(__name__)
@@ -503,8 +505,16 @@ class WebhookAdapter(WebhookProfileAdmissionMixin, BasePlatformAdapter):
     def _reload_dynamic_routes(self) -> None:
         """Reload agent-created subscriptions from disk if the file changed."""
         from hermes_constants import get_hermes_home
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            active_profile = get_active_profile_name() or "default"
+            if active_profile == "custom":
+                active_profile = "default"
+        except Exception:
+            active_profile = "default"
         hermes_home = get_hermes_home()
-        subs_path = hermes_home / _DYNAMIC_ROUTES_FILENAME
+        store = WebhookRouteStore.for_hermes_home(hermes_home, active_profile)
+        subs_path = store.path
         if not subs_path.exists():
             if self._dynamic_routes:
                 self._dynamic_routes = {}
@@ -515,9 +525,10 @@ class WebhookAdapter(WebhookProfileAdmissionMixin, BasePlatformAdapter):
             mtime = subs_path.stat().st_mtime
             if mtime <= self._dynamic_routes_mtime:
                 return  # No change
-            data = json.loads(subs_path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                return
+            data = {
+                name: to_legacy_route(route)
+                for name, route in store.load().items()
+            }
             # Merge: static routes take precedence over dynamic ones.
             # Reject any dynamic route whose effective secret is empty —
             # an empty secret would cause _handle_webhook to skip HMAC

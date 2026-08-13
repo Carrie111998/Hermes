@@ -20,8 +20,9 @@ from pathlib import Path
 from typing import Dict
 
 from hermes_constants import display_hermes_home
-from utils import atomic_replace
 from hermes_cli.config import cfg_get
+from gateway.platforms.webhook_models import to_legacy_route
+from gateway.platforms.webhook_store import WebhookRouteStore
 
 
 _SUBSCRIPTIONS_FILENAME = "webhook_subscriptions.json"
@@ -37,47 +38,23 @@ def _subscriptions_path() -> Path:
     return _hermes_home() / _SUBSCRIPTIONS_FILENAME
 
 
-def _load_subscriptions() -> Dict[str, dict]:
-    path = _subscriptions_path()
-    if not path.exists():
-        return {}
+def _route_store() -> WebhookRouteStore:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
+        from hermes_cli.profiles import get_active_profile_name
+        profile = get_active_profile_name() or "default"
+        if profile == "custom":
+            profile = "default"
     except Exception:
-        return {}
+        profile = "default"
+    return WebhookRouteStore.for_hermes_home(_hermes_home(), profile)
+
+
+def _load_subscriptions() -> Dict[str, dict]:
+    return {name: to_legacy_route(route) for name, route in _route_store().load().items()}
 
 
 def _save_subscriptions(subs: Dict[str, dict]) -> None:
-    path = _subscriptions_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # webhook_subscriptions.json contains per-route HMAC secrets — write
-    # via tempfile + chmod 0o600 before the atomic rename so a permissive
-    # umask cannot leave the secrets readable to other local users in the
-    # window between create and rename.
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=path.parent,
-        text=True,
-    )
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(subs, fh, indent=2, ensure_ascii=False)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(tmp_path, _SUBSCRIPTIONS_FILE_MODE)
-        atomic_replace(tmp_path, path)
-        # Re-assert after rename in case the destination existed with a
-        # broader mode and atomic_replace preserved it.
-        os.chmod(path, _SUBSCRIPTIONS_FILE_MODE)
-    except Exception:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+    _route_store().save(subs)
 
 
 def _get_webhook_config() -> dict:
