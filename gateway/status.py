@@ -1041,7 +1041,6 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
                 if (
                     not stale
                     and existing.get("start_time") is None
-                    and current_start is None
                     and not _looks_like_gateway_process(existing_pid)
                 ):
                     live_cmdline = _read_process_cmdline(existing_pid)

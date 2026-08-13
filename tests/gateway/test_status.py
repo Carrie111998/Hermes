@@ -895,6 +895,39 @@ class TestScopedLocks:
         assert acquired is False
         assert existing["pid"] == 99999
 
+    def test_acquire_scoped_lock_replaces_reused_pid_when_record_start_time_missing_but_live_start_time_exists(self, tmp_path, monkeypatch):
+        """macOS regression: stale locks from old gateways should not survive PID reuse.
+
+        Older lock files may have ``start_time=None``. On macOS the live reused PID
+        often has a readable creation time via psutil even when the record does not.
+        If that live process is not actually Hermes, the lock must still be evicted.
+        """
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = tmp_path / "locks" / "telegram-bot-token-2bb80d537b1da3e3.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(json.dumps({
+            "pid": 733,
+            "start_time": None,
+            "kind": "hermes-gateway",
+            "argv": ["/Users/user/.hermes/hermes-agent/hermes_cli/main.py", "gateway", "run", "--replace"],
+        }))
+
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 456789)
+        monkeypatch.setattr(status, "_looks_like_gateway_process", lambda pid: False)
+        monkeypatch.setattr(
+            status,
+            "_read_process_cmdline",
+            lambda pid: "/System/Library/PrivateFrameworks/AmbientDisplay.framework/.../com.apple.AmbientDisplayAgent",
+        )
+
+        acquired, existing = status.acquire_scoped_lock("telegram-bot-token", "secret", metadata={"platform": "telegram"})
+
+        assert acquired is True
+        payload = json.loads(lock_path.read_text())
+        assert payload["pid"] == os.getpid()
+        assert payload["metadata"]["platform"] == "telegram"
+
     def test_acquire_scoped_lock_replaces_stale_record(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
         lock_path = tmp_path / "locks" / "telegram-bot-token-2bb80d537b1da3e3.lock"
