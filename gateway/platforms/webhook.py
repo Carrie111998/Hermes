@@ -41,6 +41,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional
 
@@ -66,6 +67,10 @@ from gateway.platforms.webhook_filters import (
 from gateway.response_filters import is_autonomous_silence_response
 
 logger = logging.getLogger(__name__)
+
+
+def _contains_control_character(value: str) -> bool:
+    return any(unicodedata.category(char) == "Cc" for char in value)
 
 
 def _is_webhook_silence_response(content: Any) -> bool:
@@ -785,7 +790,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 if isinstance((value := request.headers.get(name)), str)
                 and value.strip()
                 and len(value.strip()) <= 256
-                and not any(ord(char) < 32 or ord(char) == 127 for char in value)
+                and not _contains_control_character(value)
             ),
             None,
         )
@@ -793,7 +798,7 @@ class WebhookAdapter(BasePlatformAdapter):
             event_type
             if isinstance(event_type, str)
             and len(event_type) <= 128
-            and not any(ord(char) < 32 or ord(char) == 127 for char in event_type)
+            and not _contains_control_character(event_type)
             else None
         )
         if route_config.get("script") and (

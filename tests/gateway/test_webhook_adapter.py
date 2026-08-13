@@ -631,8 +631,9 @@ class TestPayloadFilters:
         assert duplicate_data["status"] == "duplicate"
         assert counter.read_text(encoding="utf-8") == "x"
 
+    @pytest.mark.parametrize("control", ["\n", "\u0085"])
     @pytest.mark.asyncio
-    async def test_script_event_metadata_rejects_control_characters(self):
+    async def test_script_event_metadata_rejects_control_characters(self, control):
         adapter = _make_adapter(
             routes={
                 "scripted": {
@@ -647,7 +648,7 @@ class TestPayloadFilters:
         async with TestClient(TestServer(app)) as cli:
             response = await cli.post(
                 "/webhooks/scripted",
-                json={"event_type": "issues\nforged"},
+                json={"event_type": f"issues{control}forged"},
                 headers={"X-GitHub-Delivery": "control-char-1"},
             )
 
