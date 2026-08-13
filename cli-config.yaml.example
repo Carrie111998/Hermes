@@ -133,6 +133,49 @@ model:
   #       CF-Access-Client-Secret: "${CF_ACCESS_SECRET}"
   #       X-Client-Name: "hermes-agent"
 
+# Command-minted credentials (optional): key_cmd
+# ------------------------------------------------------------------
+# Enterprise gateways often issue SHORT-LIVED bearers (SSO/OIDC brokers, cloud
+# IAM, internal auth proxies) rather than static API keys, so a value copied
+# into .env via `key_env` is stale within the hour and every later request 401s.
+# `key_cmd` names a command that PRINTS a token instead: Hermes runs it per
+# request (cached until shortly before expiry), so long sessions keep working
+# with no restart.
+#
+# Contract: print ONLY the token on stdout, either bare or as JSON with an
+# "access_token" field ("expires_in" is honoured). Same shape as OAuth 2.0
+# token endpoints, Claude Code's `apiKeyHelper`, `gcloud auth
+# print-access-token`, and `aws ecr get-login-password`.
+#
+# Precedence: an explicit --api-key still wins; otherwise key_cmd is preferred
+# over inline api_key / key_env on that entry.
+#
+# providers:
+#   my-gateway:
+#     base_url: "https://gateway.internal.example.com/v1"
+#     api_mode: chat_completions
+#     key_cmd: "my-auth-cli print-token --profile prod"
+#
+# Worked example — an AI gateway that routes by model family, so one entry per
+# wire format shares the same credential helper:
+#
+# providers:
+#   dbx:                             # OpenAI-compatible (MLflow) route
+#     base_url: "https://<workspace>.cloud.databricks.com/ai-gateway/mlflow/v1"
+#     api_mode: chat_completions
+#     model: databricks-claude-sonnet-4-6
+#     key_cmd: "databricks auth token -p MY-PROFILE"
+#   dbx-gpt:                         # OpenAI Responses route
+#     base_url: "https://<workspace>.cloud.databricks.com/ai-gateway/openai/v1"
+#     api_mode: codex_responses
+#     model: databricks-gpt-5-5
+#     key_cmd: "databricks auth token -p MY-PROFILE"
+#   dbx-claude:                      # Anthropic Messages route
+#     base_url: "https://<workspace>.cloud.databricks.com/ai-gateway/anthropic"
+#     api_mode: anthropic_messages
+#     model: databricks-claude-fable-5
+#     key_cmd: "databricks auth token -p MY-PROFILE"
+
 # Named provider overrides (optional)
 # Use this for per-provider request timeouts, non-stream stale timeouts,
 # and per-model exceptions.

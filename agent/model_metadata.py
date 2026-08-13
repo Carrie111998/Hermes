@@ -1720,6 +1720,11 @@ def is_output_cap_error(error_msg: str) -> bool:
         "max_tokens" in error_lower
         or "max_output_tokens" in error_lower
         or "max_completion_tokens" in error_lower
+        # Some gateways name the parameter in prose rather than by its wire
+        # name ("The maximum tokens you requested exceeds the model limit of
+        # 128000"). Without this the 400 is misread as a context overflow and
+        # enters the compression death-loop described above.
+        or "maximum tokens you requested" in error_lower
     )
     if not mentions_output_param:
         return False
@@ -1736,6 +1741,10 @@ def is_output_cap_error(error_msg: str) -> bool:
         or "should be" in error_lower                       # generic "max_tokens should be <= N"
         or "less than or equal" in error_lower
         or "must be" in error_lower
+        # Gateways that state the cap in prose: "The maximum tokens you
+        # requested exceeds the model limit of N".
+        or ("maximum tokens you requested" in error_lower
+            and "exceeds" in error_lower)
     )
     if not output_cap_signal:
         return False
