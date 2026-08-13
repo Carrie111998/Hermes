@@ -1346,7 +1346,8 @@ def try_recover_primary_transport(
                 shared=True,
             )
 
-        wait_time = min(3 + retry_count, 8)
+        from agent.error_classifier import jittered_wait
+        wait_time = min(jittered_wait(3 + retry_count), 8)
         agent._vprint(
             f"{agent.log_prefix}🔁 Transient {error_type} on {agent.provider} — "
             f"rebuilt client, waiting {wait_time}s before one last primary attempt.",

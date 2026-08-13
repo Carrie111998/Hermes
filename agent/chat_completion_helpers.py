@@ -1949,6 +1949,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
             agent._rate_limit_backoff_count = backoff_count + 1
             backoff_seconds = min(60 * (2 ** backoff_count), 14400)
+            # S1-04 jitter: de-synchronize retry storms; floor preserved.
+            from agent.error_classifier import jittered_wait
+            backoff_seconds = int(jittered_wait(backoff_seconds))
             agent._rate_limited_until = time.monotonic() + backoff_seconds
             logging.info(
                 "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d)",

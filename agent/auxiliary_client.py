@@ -9304,7 +9304,8 @@ def _call_llm_impl(
             _max_transient_retries = _transient_retry_count()
             _last_transient = transient_err
             for _attempt in range(1, _max_transient_retries + 1):
-                _backoff = min(_TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (_attempt - 1)), 8.0)
+                from agent.error_classifier import jittered_wait
+                _backoff = min(jittered_wait(_TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (_attempt - 1))), 8.0)
                 logger.info(
                     "Auxiliary %s: transient transport error (attempt %d/%d); "
                     "retrying same provider after %.1fs before fallback: %s",

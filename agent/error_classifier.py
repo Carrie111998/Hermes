@@ -13,10 +13,33 @@ from __future__ import annotations
 
 import enum
 import logging
+import random
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def jittered_wait(seconds: float) -> float:
+    """Multiplicative jitter for retry/cooldown waits.
+
+    Deterministic exponential backoff is a synchronized-retry-storm hazard:
+    N concurrent sessions hitting the same provider 429 at once all compute
+    the same wait and re-collide on the next attempt (the aider #5165 class).
+    A uniform(0.75, 1.25) spread keeps the backoff's intent (floor preserved)
+    while de-synchronizing storms. Bounded - never below 0.75x, never above
+    1.25x - so a cooldown can't be jittered to near-zero and defeat itself.
+
+    The BASE is clamped to [0, 3600] before jittering: a pathological
+    server-influenced base (negative Retry-After, absurd float) must not
+    produce a negative or huge sleep. time.sleep(negative) raises and a
+    huge sleep is a self-DoS.
+    """
+    try:
+        base = max(0.0, min(float(seconds), 3600.0))
+        return base * random.uniform(0.75, 1.25)
+    except Exception:
+        return seconds
 
 
 # ── Error taxonomy ──────────────────────────────────────────────────────
