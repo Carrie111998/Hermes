@@ -403,7 +403,8 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     """Scan ~/.hermes/skills/ and return a mapping of /command -> skill info.
 
     Returns:
-        Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
+        Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir,
+        python_skill?, python_skill_info?}.
     """
     global _skill_commands, _skill_commands_platform
     _skill_commands_platform = _resolve_skill_commands_platform()
@@ -490,6 +491,34 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     }
                 except Exception:
                     continue
+
+        # ── Python-backed skills ─────────────────────────────────────────
+        # These are discovered from _skill.py files and merged into the
+        # same command map. Local Python skills override markdown skills
+        # with the same name.
+        try:
+            from agent.python_skills import get_python_skills
+            python_skills = get_python_skills()
+            for name, pinfo in python_skills.items():
+                if name in seen_names:
+                    continue
+                if name in disabled:
+                    continue
+                cmd_name = name.lower().replace(' ', '-').replace('_', '-')
+                cmd_name = _SKILL_INVALID_CHARS.sub('', cmd_name)
+                cmd_name = _SKILL_MULTI_HYPHEN.sub('-', cmd_name).strip('-')
+                if not cmd_name:
+                    continue
+                seen_names.add(name)
+                _skill_commands[f"/{cmd_name}"] = {
+                    "name": pinfo.name,
+                    "description": pinfo.description or f"Invoke the {pinfo.name} Python skill",
+                    "skill_dir": str(pinfo.path) if pinfo.path else "",
+                    "python_skill": True,
+                    "python_skill_info": pinfo,
+                }
+        except Exception:
+            pass  # Non-critical — markdown skills still work
     except Exception:
         pass
     return _skill_commands
@@ -614,6 +643,22 @@ def build_skill_invocation_message(
     if not skill_info:
         return None
 
+    # ── Python-backed skill path ───────────────────────────────────────
+    if skill_info.get("python_skill"):
+        pinfo = skill_info.get("python_skill_info")
+        if not pinfo:
+            return None
+        from agent.python_skills import build_python_skill_message
+        parts = [build_python_skill_message(pinfo)]
+        if user_instruction:
+            parts.append(
+                f"The user has provided the following instruction alongside the skill invocation: {user_instruction}"
+            )
+        if runtime_note:
+            parts.append(f"[Runtime note: {runtime_note}]")
+        return "\n\n".join(parts)
+
+    # ── Markdown skill path (existing) ─────────────────────────────────
     loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id)
     if not loaded:
         return None
@@ -778,6 +823,8 @@ def build_preloaded_skills_prompt(
 ) -> tuple[str, list[str], list[str]]:
     """Load one or more skills for session-wide CLI/TUI preloading.
 
+    Supports both markdown and Python-backed skills.
+
     Returns (prompt_text, loaded_skill_names, missing_identifiers).
 
     Disabled skills are treated the same as missing ones: this loads via a
@@ -804,6 +851,27 @@ def build_preloaded_skills_prompt(
             continue
         seen.add(identifier)
 
+        # ── Try Python-backed skill first ──────────────────────────────
+        try:
+            from agent.python_skills import get_python_skill
+            pinfo = get_python_skill(identifier)
+            if pinfo:
+                from agent.python_skills import build_python_skill_message
+                activation_note = (
+                    f'[IMPORTANT: The user launched this CLI session with the "{pinfo.name}" '
+                    f"Python skill preloaded. Treat its instructions and callable functions "
+                    f"as active guidance for the duration of this session unless the user "
+                    f"overrides them.]"
+                )
+                prompt_parts.append(
+                    f"{activation_note}\n\n{build_python_skill_message(pinfo)}"
+                )
+                loaded_names.append(pinfo.name)
+                continue
+        except Exception:
+            pass
+
+        # ── Fallback: markdown skill ───────────────────────────────────
         loaded = _load_skill_payload(identifier, task_id=task_id)
         if not loaded:
             missing.append(identifier)

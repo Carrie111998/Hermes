@@ -1416,6 +1416,140 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     }
 
 
+def _create_python_skill(
+    name: str,
+    category: Optional[str],
+    functions: List[Dict[str, str]],
+    instructions: Optional[str] = "",
+    description: Optional[str] = "",
+    version: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Create a Python-backed skill directory with _skill.py + optional _skill.md.
+
+    Args:
+        name: Skill name (lowercase, hyphens, ≤64 chars).
+        category: Optional category directory (e.g. 'devops').
+        functions: List of dicts with keys 'name' and 'description'.
+        instructions: Markdown instructions for the agent (stored in _skill.md).
+        description: One-line description (shown in skills index).
+        version: Semantic version string.
+        config: Optional YAML dict for _skill_config.yaml.
+
+    Returns:
+        Dict with success status and details.
+    """
+    err = _validate_name(name)
+    if err:
+        return {"success": False, "error": err}
+
+    # Determine path
+    if category:
+        cat_err = _validate_category(category)
+        if cat_err:
+            return {"success": False, "error": cat_err}
+        skill_dir = SKILLS_DIR / category / name
+    else:
+        skill_dir = SKILLS_DIR / name
+
+    # Guard against overwriting an existing skill
+    if skill_dir.exists():
+        return {"success": False, "error": f"Skill '{name}' already exists at {skill_dir}. Use action='edit' to update it."}
+
+    # Security guard
+    guard = _background_review_write_guard(name, skill_dir, "create_python")
+    if guard:
+        return guard
+
+    # Validate functions
+    if not functions:
+        return {"success": False, "error": "At least one function is required. Pass 'functions' with name and description for each async function."}
+    for fn in functions:
+        if not isinstance(fn, dict):
+            return {"success": False, "error": "Each function must be a dict with 'name' and 'description' keys."}
+        if "name" not in fn or "description" not in fn:
+            return {"success": False, "error": f"Function must have 'name' and 'description' keys. Got: {fn}"}
+        fn_name = fn["name"]
+        if not VALID_NAME_RE.match(fn_name):
+            return {"success": False, "error": f"Invalid function name '{fn_name}'. Use lowercase letters, numbers, hyphens, dots, and underscores."}
+
+    # Use provided description or generate from functions
+    if not description:
+        desc_parts = [f["description"] for f in functions]
+        description = "; ".join(desc_parts[:3])
+        if len(functions) > 3:
+            description += f" (+{len(functions)-3} more)"
+
+    if not version:
+        version = "1.0.0"
+
+    # Generate _skill.py
+    func_bodies = ""
+    for fn in functions:
+        func_bodies += (
+            f'\n@python_skill\n'
+            f'async def {fn["name"]}(**kwargs) -> dict:\n'
+            f'    """{fn["description"]}"""\n'
+            f'    return {{"function": "{fn["name"]}"}}\n'
+            f'\n'
+        )
+
+    skill_py_content = (
+        '#!/usr/bin/env python3\n'
+        f'"""Python-backed skill: {name}\n'
+        f'\n'
+        f'{description}\n'
+        f'"""\n'
+        '\n'
+        'from agent.python_skills import python_skill\n'
+        '\n'
+        'SKILL_INFO = {\n'
+        f'    "name": "{name}",\n'
+        f'    "description": "{description}",\n'
+        f'    "version": "{version}",\n'
+        '}\n'
+        '\n'
+        f'{func_bodies}'
+    )
+
+    # Generate _skill.md if instructions provided
+    md_content = None
+    if instructions:
+        md_content = instructions
+
+    # Generate _skill_config.yaml if config provided
+    config_content = None
+    if config:
+        config_content = yaml.dump(config, default_flow_style=False, sort_keys=False)
+
+    # Write files
+    skill_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write _skill.py
+    (skill_dir / "_skill.py").write_text(skill_py_content, encoding="utf-8")
+
+    # Write _skill.md if provided
+    if md_content:
+        (skill_dir / "_skill.md").write_text(md_content, encoding="utf-8")
+
+    # Write _skill_config.yaml if provided
+    if config_content:
+        (skill_dir / "_skill_config.yaml").write_text(config_content, encoding="utf-8")
+
+    # Security scan
+    scan_error = _security_scan_skill(skill_dir)
+    if scan_error:
+        shutil.rmtree(skill_dir, ignore_errors=True)
+        return {"success": False, "error": scan_error}
+
+    return {
+        "success": True,
+        "message": f"Python-backed skill '{name}' created at {skill_dir}.",
+        "path": str(skill_dir),
+        "functions": [f["name"] for f in functions],
+    }
+
+
 # =============================================================================
 # Main entry point
 # =============================================================================
@@ -1484,6 +1618,11 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
             new_string=payload.get("new_string"),
             replace_all=payload.get("replace_all", False),
             absorbed_into=payload.get("absorbed_into"),
+            functions=payload.get("functions"),
+            instructions=payload.get("instructions"),
+            description=payload.get("description"),
+            version=payload.get("version"),
+            config=payload.get("config"),
         )
     finally:
         _skill_gate_bypass.reset(token)
@@ -1552,6 +1691,11 @@ def skill_manage(
     absorbed_into: str = None,
     task_id: str = None,
     session_id: str = None,
+    functions: Optional[List[Dict[str, str]]] = None,
+    instructions: Optional[str] = None,
+    description: Optional[str] = None,
+    version: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Manage user-created skills. Dispatches to the appropriate action handler.
@@ -1571,6 +1715,8 @@ def skill_manage(
         file_path=file_path, file_content=file_content,
         old_string=old_string, new_string=new_string,
         replace_all=replace_all, absorbed_into=absorbed_into,
+        functions=functions, instructions=instructions,
+        description=description, version=version, config=config,
     )
     if gate_result is not None:
         return gate_result
@@ -1579,6 +1725,19 @@ def skill_manage(
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
         result = _create_skill(name, content, category)
+
+    elif action == "create_python":
+        if not functions:
+            return tool_error("functions is required for 'create_python'. Pass a list of dicts with 'name' and 'description' for each async function.", success=False)
+        result = _create_python_skill(
+            name=name,
+            category=category,
+            functions=functions,
+            instructions=instructions,
+            description=description,
+            version=version,
+            config=config,
+        )
 
     elif action == "edit":
         if not content:
@@ -1674,6 +1833,7 @@ SKILL_MANAGE_SCHEMA = {
         "memory — reusable approaches for recurring task types. "
         f"New skills go to {display_hermes_home()}/skills/; existing skills can be modified wherever they live.\n\n"
         "Actions: create (full SKILL.md + optional category), "
+        "create_python (Python-backed skill with _skill.py + functions), "
         "patch (old_string/new_string — preferred for fixes), "
         "edit (full SKILL.md rewrite — major overhauls only), "
         "delete, write_file, remove_file.\n\n"
@@ -1708,7 +1868,7 @@ SKILL_MANAGE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["create", "patch", "edit", "delete", "write_file", "remove_file"],
+                "enum": ["create", "create_python", "patch", "edit", "delete", "write_file", "remove_file"],
                 "description": "The action to perform."
             },
             "name": {
@@ -1780,6 +1940,52 @@ SKILL_MANAGE_SCHEMA = {
                     "rewriting) will have to guess at intent."
                 )
             },
+            "functions": {
+                "type": "array",
+                "description": (
+                    "For 'create_python' only. List of dicts, each with 'name' "
+                    "(function name, lowercase + hyphens) and 'description' "
+                    "(one-line docstring). Example: [{\"name\": \"do_thing\", "
+                    "\"description\": \"Do the thing\"}]."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "description": {"type": "string"},
+                    },
+                    "required": ["name", "description"],
+                },
+            },
+            "instructions": {
+                "type": "string",
+                "description": (
+                    "For 'create_python' only. Markdown instructions for the "
+                    "agent (stored in _skill.md). Optional — if omitted, "
+                    "the skill has no markdown instructions."
+                )
+            },
+            "description": {
+                "type": "string",
+                "description": (
+                    "For 'create_python' only. One-line description for the "
+                    "skills index. Auto-generated from functions if omitted."
+                )
+            },
+            "version": {
+                "type": "string",
+                "description": (
+                    "For 'create_python' only. Semantic version string (e.g. "
+                    "'1.0.0'). Defaults to '1.0.0'."
+                )
+            },
+            "config": {
+                "type": "object",
+                "description": (
+                    "For 'create_python' only. Optional YAML-serializable dict "
+                    "for skill configuration (stored in _skill_config.yaml)."
+                )
+            },
         },
         "required": ["action", "name"],
     },
@@ -1805,6 +2011,11 @@ registry.register(
         replace_all=args.get("replace_all", False),
         absorbed_into=args.get("absorbed_into"),
         task_id=kw.get("task_id"),
-        session_id=kw.get("session_id")),
+        session_id=kw.get("session_id"),
+        functions=args.get("functions"),
+        instructions=args.get("instructions"),
+        description=args.get("description"),
+        version=args.get("version"),
+        config=args.get("config")),
     emoji="📝",
 )

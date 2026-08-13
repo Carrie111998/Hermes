@@ -2047,6 +2047,18 @@ def _build_skills_system_prompt_inner(
             "\n"
             "<available_skills>\n"
             + "\n".join(index_lines) + "\n"
+        )
+
+        # Append Python-backed skills to the index
+        try:
+            from agent.python_skills import build_python_skills_index
+            python_index = build_python_skills_index()
+            if python_index:
+                result += python_index + "\n"
+        except Exception:
+            pass  # Non-critical — markdown skills still work
+
+        result += (
             "</available_skills>\n"
             "\n"
             "Only proceed without loading a skill if genuinely none are relevant to the task."
