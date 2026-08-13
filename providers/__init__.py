@@ -214,6 +214,40 @@ def _discover_entry_point_providers() -> None:
                 "entry-point provider %r skipped: not enabled in config", ep.name
             )
             continue
+        # Ownership: the ``hermes_agent.plugins`` group is shared with the
+        # general PluginManager and ``plugins/memory`` discovery. Classify
+        # the entry point with the SAME classifier the manager uses so the
+        # two sides can never drift: only a model-provider is invoked here;
+        # a general plugin (standalone) belongs to the manager and a memory
+        # provider (exclusive) belongs to ``plugins/memory``. Without this,
+        # a general plugin that happens to expose a zero-arg ``register()``
+        # would be invoked as a provider (inverse double-load) and a pip
+        # memory-provider would be invoked as a MODEL provider (wrong
+        # registry).
+        try:
+            from hermes_cli.entrypoint_kind import (
+                classify_entrypoint,
+                kind_is_provider,
+            )
+            kind = classify_entrypoint(ep)
+            # "unknown" → the source could not be read; do NOT skip here. Fall
+            # through to the historical callable/arity check below so a real
+            # provider (e.g. a callable target, a module with import-side
+            # registration) is never dropped just because its source could
+            # not be classified.
+            if kind not in ("unknown",) and not kind_is_provider(kind):
+                logger.debug(
+                    "entry-point %r skipped by provider scan: classified "
+                    "kind=%r (owned by PluginManager / memory discovery)",
+                    ep.name, kind,
+                )
+                continue
+        except Exception as exc:
+            logger.debug("entry-point %r ownership classification failed: %s",
+                         ep.name, exc)
+            # Fail-open on classifier failure: fall back to the historical
+            # callable/arity check below so a classification regression can
+            # never silently stop loading real providers.
         try:
             loaded = ep.load()
         except Exception as exc:
@@ -225,7 +259,9 @@ def _discover_entry_point_providers() -> None:
         # effect already happened during load(). Only call when it's callable
         # AND zero-arg: general plugins in this shared group expose
         # ``register(ctx)`` (requires an argument) and belong to the
-        # PluginManager, not the provider registry.
+        # PluginManager, not the provider registry. (The ownership check
+        # above already excluded non-providers; this is a second guard for
+        # providers whose module registered via import side-effect.)
         if callable(loaded):
             if _requires_arguments(loaded):
                 logger.debug(
