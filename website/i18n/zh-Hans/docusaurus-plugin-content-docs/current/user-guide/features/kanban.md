@@ -833,10 +833,10 @@ hermes kanban runs t_abcd
 | `completed` | `{result_len, summary?}` | Worker 写入 `--result` / `--summary` 且任务达到 `done`。`summary` 是第一行交接（400 字符上限）；完整版本存在于运行行上。如果在从未认领的任务上调用 `complete_task` 并带有交接字段，则合成零持续时间运行，以便 `run_id` 仍然指向某处。 |
 | `blocked` | `{reason}` | Worker 或人类将任务翻转为 `blocked`。在带有 `--reason` 的从未认领任务上调用时合成零持续时间运行。 |
 | `unblocked` | — | `blocked → ready`，手动或通过 `/unblock`。`run_id` 为 `NULL`。 |
+| `archived` | — | 从默认看板中隐藏。如果任务仍在运行，携带作为副作用被回收的运行的 `run_id`。 |
 
 工作区来源信息采用增量、向后兼容的格式。读取方必须接受不含
 `requested_workspace` 的旧 `created` 事件；此时无法得知归一化前的显式请求，而原有工作区字段仍表示创建时状态。缺少后续 `workspace_resolved` 事件仅表示没有记录到创建后的路径变更。内核不会回填或重写旧事件。当项目绑定取代显式请求的 `scratch` 工作区时，创建仍会成功，CLI/API 会返回同时列出请求值和所选项目工作树的警告；省略工作区或使用默认项目继承时保持静默。
-| `archived` | — | 从默认看板中隐藏。如果任务仍在运行，携带作为副作用被回收的运行的 `run_id`。 |
 
 **编辑**（不是转换的人类驱动变更）：
 
