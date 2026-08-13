@@ -7104,6 +7104,30 @@ def _resolve_external_process_launch(
     return command, args
 
 
+def _resolve_external_process_command(command: str) -> Optional[str]:
+    """Resolve an ACP executable, including standard user-local bins.
+
+    Desktop applications commonly inherit the graphical session's minimal
+    PATH rather than the user's interactive-shell PATH. Commands installed by
+    pipx, npm, uv, or another user-local package manager therefore live at
+    ``~/.local/bin`` but remain invisible to ``shutil.which``. Probe that
+    standard location without mutating the process environment.
+    """
+    command = os.path.expanduser(str(command or "").strip())
+    if not command:
+        return None
+
+    resolved = shutil.which(command)
+    if resolved or os.path.dirname(command):
+        return resolved
+
+    for directory in (Path.home() / ".local" / "bin", Path.home() / "bin"):
+        candidate = directory / command
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     """Status snapshot for providers that run a local subprocess."""
     pconfig = PROVIDER_REGISTRY.get(provider_id)
@@ -7115,7 +7139,7 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    resolved_command = shutil.which(command) if command else None
+    resolved_command = _resolve_external_process_command(command)
     return {
         "configured": bool(resolved_command or base_url.startswith("acp+tcp://")),
         "provider": provider_id,
@@ -7337,7 +7361,7 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
 
     command, args = _resolve_external_process_launch(provider_id, pconfig)
     error_name = pconfig.name
-    resolved_command = shutil.which(command) if command else None
+    resolved_command = _resolve_external_process_command(command)
     if not resolved_command and not base_url.startswith("acp+tcp://"):
         raise AuthError(
             f"Could not find the {error_name} command '{command}'.",

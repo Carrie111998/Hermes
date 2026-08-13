@@ -2453,6 +2453,8 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             "_anthropic_base_url",
             "_is_anthropic_oauth",
             "_config_context_length",
+            "acp_command",
+            "acp_args",
         )
     }
     # _client_kwargs is a dict — snapshot a shallow copy so mutating the
@@ -2605,6 +2607,20 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 "api_key": effective_key,
                 "base_url": effective_base,
             }
+            if new_norm_provider in {"copilot-acp", "prime-agent"}:
+                # Model switches rebuild _client_kwargs from scratch. Preserve
+                # the external-process launch metadata too; otherwise ACPClient
+                # falls back to a bare command name, which desktop PATHs often
+                # cannot resolve even though setup/status found the executable.
+                from hermes_cli.auth import resolve_external_process_provider_credentials
+
+                _process_runtime = resolve_external_process_provider_credentials(
+                    new_norm_provider
+                )
+                agent.acp_command = _process_runtime.get("command") or None
+                agent.acp_args = list(_process_runtime.get("args") or [])
+                agent._client_kwargs["command"] = agent.acp_command
+                agent._client_kwargs["args"] = agent.acp_args
             try:
                 from hermes_cli.config import (
                     apply_custom_provider_tls_to_client_kwargs,
