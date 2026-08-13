@@ -646,7 +646,13 @@ def _call(tool_name, args):
 # ---------------------------------------------------------------------------
 
 # Terminal parameters that must not be used from ephemeral sandbox scripts
-_TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify_on_complete", "watch_patterns"}
+_TERMINAL_BLOCKED_PARAMS = {
+    "background",
+    "pty",
+    "notify_on_complete",
+    "watch_patterns",
+    "ci_wait_timeout",
+}
 
 
 def _rpc_server_loop(

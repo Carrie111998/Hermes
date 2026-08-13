@@ -2530,6 +2530,151 @@ def _resolve_command_cwd(
     return recorded or default_cwd
 
 
+def _parse_gh_pr_checks(command: str) -> Optional[Dict[str, List[str]]]:
+    """Recognize the narrow ``gh pr checks`` shape eligible for CI waiting.
+
+    This deliberately rejects shell composition, watch/structured-output modes,
+    and unknown flags.  ``ci_wait_timeout`` must never turn an arbitrary model-
+    supplied shell command into a durable background process.
+    """
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if argv[:3] != ["gh", "pr", "checks"]:
+        return None
+
+    selector: Optional[str] = None
+    repo: Optional[str] = None
+    index = 3
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--required":
+            index += 1
+            continue
+        if arg in {"--repo", "-R"}:
+            if index + 1 >= len(argv) or repo is not None:
+                return None
+            repo = argv[index + 1]
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+                return None
+            index += 2
+            continue
+        if arg.startswith("-") or selector is not None:
+            return None
+        # gh accepts a PR number, URL, or branch name. Keep that flexibility,
+        # but reject every shell metacharacter rather than trying to sanitize it.
+        if not re.fullmatch(r"[A-Za-z0-9_./:#-]+", arg):
+            return None
+        selector = arg
+        index += 1
+
+    checks_argv = argv
+    view_argv = ["gh", "pr", "view"]
+    if selector:
+        view_argv.append(selector)
+    if repo:
+        view_argv.extend(["--repo", repo])
+    view_argv.extend(["--json", "headRefOid", "--jq", ".headRefOid"])
+    return {"checks_argv": checks_argv, "view_argv": view_argv}
+
+
+def _build_bounded_ci_wait_command(
+    parsed: Dict[str, List[str]],
+    *,
+    timeout: int,
+    expected_sha: Optional[str] = None,
+) -> str:
+    """Build a bounded, exit-code-driven CI poller for the active backend."""
+    checks = shlex.join(parsed["checks_argv"])
+    view = shlex.join(parsed["view_argv"])
+    expected_setup = (
+        f"ci_wait_expected_sha={shlex.quote(expected_sha)}"
+        if expected_sha is not None
+        else f"ci_wait_expected_sha=$({view} 2>/dev/null)"
+    )
+    return f"""\
+ci_wait_deadline=$(( $(date +%s) + {timeout} ))
+ci_wait_delay=10
+{expected_setup}
+if [ "${{#ci_wait_expected_sha}}" -ne 40 ]; then
+  printf '%s\n' 'CI_WAIT_SETUP_FAILURE unable to resolve PR head SHA'
+  exit 70
+fi
+case "$ci_wait_expected_sha" in
+  *[!0-9a-fA-F]*) printf '%s\n' 'CI_WAIT_SETUP_FAILURE invalid PR head SHA'; exit 70 ;;
+esac
+while :; do
+  ci_wait_current_sha=$({view} 2>/dev/null)
+  if [ "${{#ci_wait_current_sha}}" -ne 40 ]; then
+    printf '%s\n' 'CI_WAIT_SHA_LOOKUP_FAILURE unable to resolve current PR head SHA'
+    exit 70
+  fi
+  case "$ci_wait_current_sha" in
+    *[!0-9a-fA-F]*) printf '%s\n' 'CI_WAIT_SHA_LOOKUP_FAILURE invalid current PR head SHA'; exit 70 ;;
+  esac
+  if [ "$ci_wait_current_sha" != "$ci_wait_expected_sha" ]; then
+    printf 'CI_WAIT_SHA_DRIFT expected=%s actual=%s\n' "$ci_wait_expected_sha" "$ci_wait_current_sha"
+    exit 75
+  fi
+  ci_wait_output=$({checks} 2>&1)
+  ci_wait_rc=$?
+  ci_wait_verified_sha=$({view} 2>/dev/null)
+  if [ "${{#ci_wait_verified_sha}}" -ne 40 ]; then
+    printf '%s\n' 'CI_WAIT_SHA_LOOKUP_FAILURE unable to verify PR head after checks'
+    exit 70
+  fi
+  case "$ci_wait_verified_sha" in
+    *[!0-9a-fA-F]*) printf '%s\n' 'CI_WAIT_SHA_LOOKUP_FAILURE invalid PR head after checks'; exit 70 ;;
+  esac
+  if [ "$ci_wait_verified_sha" != "$ci_wait_expected_sha" ]; then
+    printf 'CI_WAIT_SHA_DRIFT expected=%s actual=%s\n' "$ci_wait_expected_sha" "$ci_wait_verified_sha"
+    exit 75
+  fi
+  if [ "$ci_wait_rc" -eq 0 ]; then
+    [ -n "$ci_wait_output" ] && printf '%s\n' "$ci_wait_output"
+    printf 'CI_WAIT_SUCCESS sha=%s\n' "$ci_wait_expected_sha"
+    exit 0
+  fi
+  if [ "$ci_wait_rc" -ne 8 ]; then
+    [ -n "$ci_wait_output" ] && printf '%s\n' "$ci_wait_output"
+    printf 'CI_WAIT_FAILURE exit_code=%s sha=%s\n' "$ci_wait_rc" "$ci_wait_expected_sha"
+    exit "$ci_wait_rc"
+  fi
+  ci_wait_now=$(date +%s)
+  if [ "$ci_wait_now" -ge "$ci_wait_deadline" ]; then
+    printf 'CI_WAIT_TIMEOUT timeout_seconds={timeout} sha=%s\n' "$ci_wait_expected_sha"
+    exit 124
+  fi
+  ci_wait_remaining=$(( ci_wait_deadline - ci_wait_now ))
+  ci_wait_sleep=$ci_wait_delay
+  [ "$ci_wait_sleep" -gt "$ci_wait_remaining" ] && ci_wait_sleep=$ci_wait_remaining
+  sleep "$ci_wait_sleep"
+  [ "$ci_wait_delay" -lt 60 ] && ci_wait_delay=$(( ci_wait_delay * 2 ))
+  [ "$ci_wait_delay" -gt 60 ] && ci_wait_delay=60
+done"""
+
+
+def _resolve_ci_wait_expected_sha(
+    env: Any,
+    parsed: Dict[str, List[str]],
+    *,
+    cwd: str,
+    timeout: int,
+) -> Optional[str]:
+    """Resolve and validate the PR head through the active terminal backend."""
+    result = env.execute(
+        shlex.join(parsed["view_argv"]),
+        timeout=min(timeout, 30),
+        cwd=cwd,
+        bounded_capture=True,
+    )
+    candidate = str(result.get("output") or "").strip()
+    if result.get("returncode") != 0 or not re.fullmatch(r"[0-9a-fA-F]{40}", candidate):
+        return None
+    return candidate
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -2541,6 +2686,7 @@ def terminal_tool(
     pty: bool = False,
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
+    ci_wait_timeout: Optional[int] = None,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -2556,6 +2702,7 @@ def terminal_tool(
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
         notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row, watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
+        ci_wait_timeout: For an exact foreground ``gh pr checks`` command, promote exit 8 (pending) to a bounded background poller and notify on resolution.
 
     Returns:
         str: JSON string with output, exit_code, and error fields
@@ -2655,6 +2802,29 @@ def terminal_tool(
                 f"timeout must be a positive number of seconds (got {timeout})."
             )
         effective_timeout = timeout or default_timeout
+
+        ci_wait_parsed = None
+        if ci_wait_timeout is not None:
+            if (
+                isinstance(ci_wait_timeout, bool)
+                or not isinstance(ci_wait_timeout, int)
+                or not 30 <= ci_wait_timeout <= 3600
+            ):
+                return tool_error(
+                    "ci_wait_timeout must be an integer from 30 to 3600 seconds."
+                )
+            if background or notify_on_complete or watch_patterns:
+                return tool_error(
+                    "ci_wait_timeout owns background notification; do not combine it "
+                    "with background, notify_on_complete, or watch_patterns."
+                )
+            ci_wait_parsed = _parse_gh_pr_checks(command)
+            if ci_wait_parsed is None:
+                return tool_error(
+                    "ci_wait_timeout requires an exact `gh pr checks [PR] "
+                    "[--required] [--repo OWNER/REPO]` command without pipes, "
+                    "shell composition, watch mode, or structured-output flags."
+                )
 
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
@@ -3198,7 +3368,7 @@ def terminal_tool(
 
                 # Mark for agent notification on completion
                 if notify_on_complete and background:
-                    proc_session.notify_on_complete = True
+                    process_registry.arm_completion_notification(proc_session)
                     result_data["notify_on_complete"] = True
 
                     # In gateway mode, auto-register a fast watcher so the
@@ -3239,6 +3409,29 @@ def terminal_tool(
             retry_count = 0
             result = None
             command_cwd = None
+            ci_wait_expected_sha = None
+
+            # Bind the foreground pending check to the exact PR head before
+            # executing it. The promoted waiter receives this immutable SHA;
+            # a head change during the handoff is drift rather than a silently
+            # accepted new baseline.
+            if ci_wait_parsed is not None:
+                command_cwd = _resolve_command_cwd(
+                    workdir=workdir,
+                    default_cwd=cwd,
+                    session_key=session_key,
+                )
+                ci_wait_expected_sha = _resolve_ci_wait_expected_sha(
+                    env,
+                    ci_wait_parsed,
+                    cwd=command_cwd,
+                    timeout=effective_timeout,
+                )
+                if ci_wait_expected_sha is None:
+                    return tool_error(
+                        "Unable to bind the CI wait to the current PR head SHA; "
+                        "no checks command or waiter was started."
+                    )
 
             # Clean interrupt slate for an approved command, ONCE before the
             # retry loop: drop a stale bit that landed on this thread during the
@@ -3317,6 +3510,35 @@ def terminal_tool(
             # Extract output
             output = result.get("output", "")
             returncode = result.get("returncode", 0)
+
+            # Every foreground terminal state belongs to the pre-check head,
+            # not only the pending state that gets promoted. Revalidate after
+            # success and failure as well so a concurrent push cannot make an
+            # old result look authoritative for the new PR head.
+            if ci_wait_parsed is not None:
+                verified_sha = _resolve_ci_wait_expected_sha(
+                    env,
+                    ci_wait_parsed,
+                    cwd=command_cwd,
+                    timeout=effective_timeout,
+                )
+                if verified_sha is None:
+                    return tool_error(
+                        "Unable to revalidate the PR head after the foreground "
+                        "checks command; its result is not authoritative."
+                    )
+                if verified_sha != ci_wait_expected_sha:
+                    return json.dumps(
+                        {
+                            "output": (
+                                "CI_WAIT_SHA_DRIFT "
+                                f"expected={ci_wait_expected_sha} actual={verified_sha}"
+                            ),
+                            "exit_code": 75,
+                            "error": None,
+                        },
+                        ensure_ascii=False,
+                    )
             # Spill metadata from the bounded collector: present only when
             # output overflowed the capture window (see _wait_for_process).
             spill_total_chars = result.get("output_total_chars")
@@ -3493,6 +3715,70 @@ def terminal_tool(
                 result_dict["sudo_auth_failed"] = True
             if sudo_cache_cleared:
                 result_dict["sudo_cache_cleared"] = True
+
+            # ``gh pr checks`` uses exit 8 for pending.  With the explicit
+            # bounded-wait option, hand that state to the existing managed
+            # background-process completion rail.  No notification is emitted
+            # while checks remain pending; the wrapper exits only on success,
+            # failure, timeout, setup failure, or PR-head SHA drift.
+            if ci_wait_parsed is not None and returncode == 8:
+                # Validation above narrows this Optional to the bounded integer.
+                assert ci_wait_timeout is not None
+                wait_command = _build_bounded_ci_wait_command(
+                    ci_wait_parsed,
+                    timeout=ci_wait_timeout,
+                    expected_sha=ci_wait_expected_sha,
+                )
+                promoted = json.loads(terminal_tool(
+                    command=wait_command,
+                    background=True,
+                    task_id=task_id,
+                    session_id=session_id,
+                    workdir=command_cwd,
+                    notify_on_complete=True,
+                ))
+                promoted_id = promoted.get("session_id")
+                if not promoted_id or promoted.get("notify_on_complete") is not True:
+                    cleanup_verified = not promoted_id
+                    if promoted_id:
+                        try:
+                            from tools.process_registry import process_registry
+
+                            cleanup = process_registry.kill_process(promoted_id)
+                            cleanup_verified = cleanup.get("status") in {
+                                "killed",
+                                "already_exited",
+                            }
+                        except Exception:
+                            logger.warning(
+                                "Could not stop CI waiter after async-delivery refusal",
+                                exc_info=True,
+                            )
+                    result_dict["status"] = "error"
+                    if cleanup_verified:
+                        result_dict["error"] = (
+                            "CI is pending, but this session cannot receive an async "
+                            "completion; no CI waiter was left running."
+                        )
+                        result_dict["ci_wait_status"] = "not_started"
+                    else:
+                        logger.error(
+                            "CI waiter cleanup could not be verified: %s",
+                            promoted_id,
+                        )
+                        result_dict["error"] = (
+                            "CI is pending and async completion is unavailable. "
+                            "Cleanup of the promoted waiter could not be verified; "
+                            f"inspect process {promoted_id}."
+                        )
+                        result_dict["ci_wait_status"] = "cleanup_failed"
+                        result_dict["ci_wait_session_id"] = promoted_id
+                    return json.dumps(result_dict, ensure_ascii=False)
+
+                result_dict["ci_wait_status"] = "pending"
+                result_dict["ci_wait_session_id"] = promoted_id
+                result_dict["ci_wait_timeout"] = ci_wait_timeout
+                result_dict["notify_on_complete"] = True
 
             return json.dumps(result_dict, ensure_ascii=False)
 
@@ -3778,6 +4064,12 @@ TERMINAL_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Strings to watch for in background output. ONLY for rare one-shot mid-process signals on processes that never exit (e.g. ['Application startup complete'] on a server). NOT for end-of-run markers (use notify_on_complete) and NOT for per-iteration patterns like 'ERROR' in loops — rate-limited to 1 notification/15s; repeated over-firing auto-disables it and falls back to notify-on-exit. When in doubt, use notify_on_complete. MUTUALLY EXCLUSIVE with notify_on_complete."
+            },
+            "ci_wait_timeout": {
+                "type": "integer",
+                "minimum": 30,
+                "maximum": 3600,
+                "description": "For an exact foreground `gh pr checks [PR] [--required] [--repo OWNER/REPO]` command: if GitHub returns pending (exit 8), start bounded polling with exponential backoff and wake a new turn via notify_on_complete only when checks resolve, fail, time out, or the PR head SHA drifts. Omit for ordinary commands."
             }
         },
         "required": ["command"]
@@ -3807,6 +4099,7 @@ def _handle_terminal(args, **kw):
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),
         watch_patterns=args.get("watch_patterns"),
+        ci_wait_timeout=args.get("ci_wait_timeout"),
     )
 
 

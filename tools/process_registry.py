@@ -411,6 +411,7 @@ class ProcessSession:
     _watch_strike_candidate: bool = field(default=False, repr=False)
     _watch_consecutive_strikes: int = field(default=0, repr=False)
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    _completion_enqueued: bool = field(default=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
@@ -1560,23 +1561,45 @@ class ProcessRegistry:
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
         # _move_to_finished(), producing duplicate [IMPORTANT: ...] messages.
-        if was_running and session.notify_on_complete:
-            from tools.ansi_strip import strip_ansi
-            output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
-            self.completion_queue.put({
-                "type": "completion",
-                "session_id": session.id,
-                "session_key": session.session_key,
-                "command": session.command,
-                "exit_code": session.exit_code,
-                "completion_reason": session.completion_reason,
-                "termination_source": session.termination_source,
-                "output": output_tail,
-                # Stable producer identity across checkpoint recovery; unlike
-                # a consumer-observed completion timestamp, this does not vary
-                # based on which watcher notices exit first.
-                "started_at": session.started_at,
-            })
+        if was_running:
+            with session._lock:
+                self._enqueue_completion_locked(session)
+
+    def arm_completion_notification(self, session: ProcessSession) -> None:
+        """Enable completion delivery without losing an ultra-fast exit.
+
+        Background reader threads start inside ``spawn_*``.  A short process can
+        therefore finish before the terminal handler has attached notification
+        metadata.  Arming and enqueueing under the session lock closes that race
+        while ``_completion_enqueued`` preserves exactly-once delivery.
+        """
+        with session._lock:
+            session.notify_on_complete = True
+            if session.exited:
+                self._enqueue_completion_locked(session)
+
+    def _enqueue_completion_locked(self, session: ProcessSession) -> None:
+        """Queue one completion event; caller must hold ``session._lock``."""
+        if not session.notify_on_complete or session._completion_enqueued:
+            return
+        from tools.ansi_strip import strip_ansi
+
+        output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
+        self.completion_queue.put({
+            "type": "completion",
+            "session_id": session.id,
+            "session_key": session.session_key,
+            "command": session.command,
+            "exit_code": session.exit_code,
+            "completion_reason": session.completion_reason,
+            "termination_source": session.termination_source,
+            "output": output_tail,
+            # Stable producer identity across checkpoint recovery; unlike
+            # a consumer-observed completion timestamp, this does not vary
+            # based on which watcher notices exit first.
+            "started_at": session.started_at,
+        })
+        session._completion_enqueued = True
 
     # ----- Query Methods -----
 
