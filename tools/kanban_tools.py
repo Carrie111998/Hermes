@@ -971,7 +971,7 @@ def _handle_review_target(args: dict, **kw) -> str:
             )
             product_review = review_shape == ("product", "review", "review")
             default_review = (
-                review_shape == (None, None, None)
+                review_shape in {(None, None, None), (None, "review", "review")}
                 and task.assignee == "reviewer"
                 and task.source_commit_forbidden
                 and task.branch_name

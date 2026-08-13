@@ -8191,8 +8191,13 @@ def test_default_review_dispatch_requires_structural_target_contract(
 
 
 @pytest.mark.parametrize("board_repository", [True, False])
+@pytest.mark.parametrize("current_step_key", [None, "review"])
 def test_default_review_dispatch_pins_completed_predecessor_target(
-    kanban_home, tmp_path, all_assignees_spawnable, board_repository,
+    kanban_home,
+    tmp_path,
+    all_assignees_spawnable,
+    board_repository,
+    current_step_key,
 ):
     board = "default-review-target-pinned"
     repo = tmp_path / "repo"
@@ -8244,7 +8249,10 @@ def test_default_review_dispatch_pins_completed_predecessor_target(
             source_commit_forbidden=True,
         )
         kb.set_branch_name(conn, tid, "review-candidate")
-        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        conn.execute(
+            "UPDATE tasks SET status='review', current_step_key=? WHERE id=?",
+            (current_step_key, tid),
+        )
         conn.commit()
 
         def capture_spawn(task, launched_workspace, board=None):
@@ -8258,12 +8266,12 @@ def test_default_review_dispatch_pins_completed_predecessor_target(
     assert result.spawned[0][0] == tid
     assert task is not None
     assert task.workflow_template_id is None
-    assert task.current_step_key is None
+    assert task.current_step_key == current_step_key
     assert predecessor_run_id > 0
     assert observed == [
         (
             str(repo),
-            None,
+            current_step_key,
             {
                 "review_contract_kind": "default",
                 "review_branch": "review-candidate",
