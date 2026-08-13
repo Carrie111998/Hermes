@@ -20,6 +20,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import projects_db as pdb
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +115,43 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_explicit_workspace_supersession_is_returned_as_api_warning(
+    client, tmp_path
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with pdb.connect_closing() as conn:
+        project_id = pdb.create_project(conn, name="API Project", folders=[str(repo)])
+
+    kb.write_board_metadata("default", project_id=project_id)
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Explicit scratch", "workspace_kind": "scratch"},
+    )
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["warning"] == (
+        "requested workspace 'scratch' was superseded by project-linked "
+        f"workspace 'worktree:{data['task']['workspace_path']}'"
+    )
+
+
+def test_omitted_workspace_inherits_project_without_api_warning(client, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with pdb.connect_closing() as conn:
+        project_id = pdb.create_project(conn, name="API Project", folders=[str(repo)])
+
+    kb.write_board_metadata("default", project_id=project_id)
+    response = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "Implicit workspace"}
+    )
+
+    assert response.status_code == 200, response.text
+    assert "warning" not in response.json()
 
 
 def test_patch_board_sets_project_directory(client, tmp_path):

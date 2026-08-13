@@ -601,7 +601,7 @@ class CreateTaskBody(BaseModel):
     assignee: Optional[str] = None
     tenant: Optional[str] = None
     priority: int = 0
-    workspace_kind: str = "scratch"
+    workspace_kind: Optional[str] = None
     workspace_path: Optional[str] = None
     parents: list[str] = Field(default_factory=list)
     triage: bool = False
@@ -631,7 +631,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             body=payload.body,
             assignee=payload.assignee,
             created_by="dashboard",
-            workspace_kind=payload.workspace_kind,
+            workspace_kind=payload.workspace_kind or "scratch",
             workspace_path=payload.workspace_path,
             tenant=payload.tenant,
             priority=payload.priority,
@@ -650,6 +650,18 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
+        from hermes_cli.kanban_workspace import supersession_warning, workspace_spec
+
+        workspace_warning = supersession_warning(
+            (
+                workspace_spec(payload.workspace_kind, payload.workspace_path)
+                if payload.workspace_kind is not None
+                else None
+            ),
+            task,
+        ) if task else None
+        if workspace_warning:
+            body["warning"] = workspace_warning
         # Surface a dispatcher-presence warning so the UI can show a
         # banner when a `ready` task would otherwise sit idle because no
         # gateway is running (or dispatch_in_gateway=false). Only emit
@@ -667,7 +679,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
                 running, message = _check_dispatcher_presence(
                     hermes_home=get_hermes_home()
                 )
-                if not running and message:
+                if not running and message and "warning" not in body:
                     body["warning"] = message
             except Exception:
                 # Probe failure must never block the create itself.

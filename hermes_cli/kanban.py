@@ -333,7 +333,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
-    p_create.add_argument("--workspace", default="scratch",
+    p_create.add_argument("--workspace", default=None,
                           help="scratch | worktree | worktree:<path> | dir:<path> "
                                "(default: scratch)")
     p_create.add_argument("--branch", default=None,
@@ -1541,7 +1541,8 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 
 def _cmd_create(args: argparse.Namespace) -> int:
     try:
-        ws_kind, ws_path = _parse_workspace_flag(args.workspace)
+        requested_workspace = args.workspace
+        ws_kind, ws_path = _parse_workspace_flag(requested_workspace or "scratch")
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
     except argparse.ArgumentTypeError as exc:
         print(f"kanban: {exc}", file=sys.stderr)
@@ -1588,6 +1589,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
+    from hermes_cli.kanban_workspace import supersession_warning
+
+    workspace_warning = supersession_warning(requested_workspace, task)
+    if workspace_warning:
+        print(f"kanban: warning: {workspace_warning}", file=sys.stderr)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:

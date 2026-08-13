@@ -1386,6 +1386,7 @@ def _handle_create(args: dict, **kw) -> str:
     # preserving the repository/branch convention without sharing a checkout.
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
+    requested_workspace_kind = workspace_kind
     project_id = args.get("project") or args.get("project_id")
     project_source_task_id = None
     _inherit_project = workspace_kind is None and workspace_path is None
@@ -1464,6 +1465,16 @@ def _handle_create(args: dict, **kw) -> str:
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
+            from hermes_cli.kanban_workspace import supersession_warning, workspace_spec
+
+            workspace_warning = supersession_warning(
+                (
+                    workspace_spec(str(requested_workspace_kind), workspace_path)
+                    if requested_workspace_kind is not None
+                    else None
+                ),
+                new_task,
+            ) if new_task else None
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
@@ -1471,6 +1482,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
+                warning=workspace_warning,
             )
         finally:
             conn.close()
