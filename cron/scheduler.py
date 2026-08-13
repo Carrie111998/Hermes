@@ -1649,6 +1649,42 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+_BRIEF_DELIVERY_JOB_IDS = frozenset({
+    "6ce3128480c9",  # AI news
+    "daeb6079f4f0",  # rehabilitation research
+    "3832d720a370",  # opportunity radar
+})
+
+
+def _sanitize_brief_delivery_content(job: dict, content: str) -> str:
+    """Keep internal collection notes out of user-facing brief deliveries.
+
+    The complete model response remains in the cron output audit file. This
+    boundary only removes optional explanatory tail sections from the three
+    human-facing research briefs before Discord/other platform delivery.
+    """
+    if str(job.get("id") or "") not in _BRIEF_DELIVERY_JOB_IDS:
+        return content
+
+    kept: list[str] = []
+    for line in str(content or "").strip().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## 참고"):
+            break
+        if re.match(
+            r"^(오늘 새 (소식|연구|공고)가 적어|"
+            r"최근 (자료|연구|소식)을 함께 담았|"
+            r"원문 주소는 내부|링크.*표기|"
+            r".*수집 상황.*|.*확인한 출처.*|.*다음 수집.*)$",
+            stripped,
+        ):
+            continue
+        kept.append(line)
+
+    while kept and not kept[-1].strip():
+        kept.pop()
+    return "\n".join(kept).strip()
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -1681,6 +1717,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         msg = f"no delivery target resolved for deliver={deliver_value}"
         logger.warning("Job '%s': %s", job["id"], msg)
         return msg
+
+    if any(str(target.get("platform") or "").lower() != "local" for target in targets):
+        content = _sanitize_brief_delivery_content(job, content)
 
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
@@ -2775,8 +2814,22 @@ def _build_job_prompt(
         has_injected_data = True
 
     # Always prepend cron execution guidance so the agent knows how
-    # delivery works and can suppress delivery when appropriate.
-    cron_hint = (
+    # delivery works. Report-style jobs opt out of silence suppression so a
+    # deliberate zero-item report still reaches the configured channel.
+    always_deliver = bool(job.get("always_deliver"))
+    if always_deliver:
+        cron_hint = (
+            "[IMPORTANT: You are running as a scheduled cron job. "
+            "DELIVERY: Your final response will be automatically delivered "
+            "to the user — do NOT use send_message or try to deliver "
+            "the output yourself. Just produce your report/output as your "
+            "final response and the system handles the rest. "
+            "This job must always produce its configured human-readable "
+            "report, including when there are zero items. Never output "
+            "[SILENT] or suppress the report.]\n\n"
+        )
+    else:
+        cron_hint = (
         "[IMPORTANT: You are running as a scheduled cron job. "
         "DELIVERY: Your final response will be automatically delivered "
         "to the user — do NOT use send_message or try to deliver "
@@ -2786,7 +2839,7 @@ def _build_job_prompt(
         "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
         "Never combine [SILENT] with content — either report your "
         "findings normally, or say [SILENT] and nothing more.]\n\n"
-    )
+        )
     prompt = cron_hint + prompt
     if skills is None:
         legacy = job.get("skill")
@@ -4739,7 +4792,12 @@ def run_one_job(
             # a real report that merely quoted "[SILENT]" mid-sentence (#51438,
             # #46917).  Keeps the intentional bracketed-prefix / trailing-line
             # tolerance the cron contract relies on.
-            if should_deliver and success and _is_cron_silence_response(deliver_content):
+            if (
+                should_deliver
+                and success
+                and not job.get("always_deliver")
+                and _is_cron_silence_response(deliver_content)
+            ):
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                 should_deliver = False
 
@@ -5169,7 +5227,6 @@ def tick(
             except (OSError, IOError):
                 pass
         lock_fd.close()
-
 
 if __name__ == "__main__":
     tick(verbose=True)
