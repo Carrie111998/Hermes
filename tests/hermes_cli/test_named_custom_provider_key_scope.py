@@ -164,6 +164,100 @@ def test_unresolvable_env_ref_api_key_falls_through_to_key_env(
     )
 
 
+def test_already_expanded_env_ref_api_key_is_re_resolved_through_the_scope(
+    monkeypatch, probed_keys, scope
+):
+    """The ``${VAR}`` case that is *invisible* in ``provider_info["api_key"]``.
+
+    ``_expand_env_vars`` only keeps the ``${VAR}`` literal when the variable is
+    unset. When it *is* set, the expansion substitutes it — out of the
+    process-global ``os.environ``, via ``config.py::_env_expand_match``, with no
+    scope check — and ``api_key`` arrives as a plain string indistinguishable
+    from a directly-configured inline key.
+
+    So the placeholder shape detects only the harmless branch. This is the
+    harmful one: the value is another profile's key and it is about to be sent
+    to this provider's ``base_url``. The unexpanded template is still on
+    ``api_key_ref``, so the resolution must key off that.
+    """
+    monkeypatch.setenv("MYCORP_API_KEY", "sk-other-profile")
+    scope({"MYCORP_API_KEY": "sk-this-profile"})
+
+    from hermes_cli.model_setup_flows import _model_flow_named_custom
+
+    _model_flow_named_custom(
+        {},
+        _provider_info(
+            # What ``_expand_env_vars`` produced from the process environment.
+            api_key="sk-other-profile",
+            # What config.yaml actually says.
+            api_key_ref="${MYCORP_API_KEY}",
+        ),
+    )
+
+    assert probed_keys == ["sk-this-profile"], (
+        "an api_key whose config ref was already expanded from the process "
+        "environment must be re-resolved through the profile scope"
+    )
+
+
+def test_already_expanded_env_ref_api_key_is_dropped_when_out_of_scope(
+    monkeypatch, probed_keys, scope
+):
+    """No credential for this profile means no credential — not the other one.
+
+    With the referenced variable absent from the scope, ``get_env_value``
+    returns ``None`` (scope is authoritative under multiplexing). The expanded
+    process-env value must be discarded rather than used as the fallback,
+    otherwise the scope check accomplishes nothing on this path.
+    """
+    monkeypatch.setenv("MYCORP_API_KEY", "sk-other-profile")
+    scope({"UNRELATED_KEY": "sk-unrelated"})
+
+    from hermes_cli.model_setup_flows import _model_flow_named_custom
+
+    _model_flow_named_custom(
+        {},
+        _provider_info(
+            api_key="sk-other-profile",
+            api_key_ref="${MYCORP_API_KEY}",
+        ),
+    )
+
+    assert probed_keys == [""], (
+        "a config ref the profile scope cannot resolve must not fall back to "
+        "the process environment's expanded value"
+    )
+
+
+def test_partially_interpolated_api_key_keeps_its_expanded_value(
+    monkeypatch, probed_keys, scope
+):
+    """A composite template is not a bare ref and must not be re-resolved.
+
+    ``_expand_env_vars`` substitutes each ``${...}`` inside a larger string, so
+    ``sk-${MYCORP_SUFFIX}`` legitimately yields a usable key. Deliberately *not*
+    in the red-before set — it guards behaviour the fix must leave alone.
+    """
+    monkeypatch.setenv("MYCORP_SUFFIX", "live-abc")
+    scope({"MYCORP_SUFFIX": "live-abc"})
+
+    from hermes_cli.model_setup_flows import _model_flow_named_custom
+
+    _model_flow_named_custom(
+        {},
+        _provider_info(
+            api_key="sk-live-abc",
+            api_key_ref="sk-${MYCORP_SUFFIX}",
+        ),
+    )
+
+    assert probed_keys == ["sk-live-abc"], (
+        "a composite ${...} template resolves during expansion and must keep "
+        "its expanded value"
+    )
+
+
 def test_key_env_is_fail_closed_when_multiplexing_runs_without_a_scope(
     monkeypatch, probed_keys, scope
 ):
