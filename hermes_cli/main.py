@@ -4839,10 +4839,11 @@ def cmd_wisdom(args):
 
     if sub in {None, ""}:
         print(
-            "usage: hermes wisdom <candidates|run|decline>\n"
+            "usage: hermes wisdom <candidates|run|approve|decline>\n"
             "\n"
             "  candidates        Show current share candidates with evidence\n"
             "  run               Force a share-candidate scoring pass now (dry-run)\n"
+            "  approve <skill>   Share a skill with your organisation\n"
             "  decline <skill>   Stop nominating a skill for sharing",
             file=sys.stderr,
         )
@@ -4900,6 +4901,49 @@ def cmd_wisdom(args):
             "\nThis is a dry-run — nothing was shared. To share a skill:\n"
             "  hermes sync propose <skill>"
         )
+        return 0
+
+    if sub == "approve":
+        skill = args.skill
+        message = getattr(args, "message", None)
+
+        # Check if the skill is a current candidate (advisory, not blocking).
+        state = wsp.load_state()
+        last_candidates = state.get("last_candidates") or []
+        if skill not in last_candidates:
+            print(
+                f"note: '{skill}' is not a current share candidate. "
+                f"Sharing anyway (owner's call).",
+                file=sys.stderr,
+            )
+
+        # Submit via the existing proposal path.
+        from tools import skills_sync_client as ssc
+
+        try:
+            result = ssc.propose_skill(skill, message=message)
+        except ssc.SyncInertError as e:
+            print(f"cannot share: {e}", file=sys.stderr)
+            return 1
+        except ssc.SyncError as e:
+            print(f"could not share '{skill}': {e}", file=sys.stderr)
+            return 1
+
+        if result.get("proposal_pending"):
+            print(
+                f"Shared '{skill}' with your organisation — an admin needs to "
+                f"approve it (proposal #{result.get('proposal_id')}). It is "
+                f"not live for the team until then."
+            )
+        else:
+            print(f"Added '{skill}' to your organisation's shared skills.")
+
+        # Remove from candidates so it doesn't re-nominate.
+        if skill in last_candidates:
+            last_candidates.remove(skill)
+            state["last_candidates"] = last_candidates
+            wsp.save_state(state)
+
         return 0
 
     if sub == "decline":
