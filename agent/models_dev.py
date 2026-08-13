@@ -678,11 +678,14 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
                 toggle_supported = True
             elif option_type == "effort" and isinstance(option.get("values"), list):
                 has_known_option = True
-                effort_values.extend(
-                    str(value).strip().lower()
-                    for value in option["values"]
-                    if isinstance(value, str) and value.strip()
-                )
+                for value in option["values"]:
+                    if not isinstance(value, str) or not value.strip():
+                        continue
+                    normalized = value.strip().lower()
+                    if normalized == "none":
+                        toggle_supported = True
+                    else:
+                        effort_values.append(normalized)
         if has_known_option:
             reasoning_efforts = tuple(dict.fromkeys(effort_values))
             reasoning_toggle = toggle_supported
