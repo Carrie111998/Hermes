@@ -31,7 +31,6 @@ export type ChatActions = Pick<
   | 'onAddUrl'
   | 'onAttachDroppedItems'
   | 'onAttachImageBlob'
-  | 'onAttachPrCommentUrl'
   | 'onBranchInNewChat'
   | 'onCancel'
   | 'onDeleteSelectedSession'
@@ -67,6 +66,8 @@ export interface WiringActions extends SidebarActions, ChatActions {
   requestGateway: GatewayRequester
   selectModel: ComponentProps<typeof ModelMenuPanel>['onSelectModel']
   toggleCommandCenter: () => void
+  /** Change the workspace directory for the current conversation. */
+  changeSessionCwd: (cwd: string) => Promise<void>
 }
 
 /** The four wired surfaces the controller publishes; `WiredPane` renders one by

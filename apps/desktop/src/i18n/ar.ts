@@ -52,7 +52,8 @@ export const ar = defineLocale({
     renameLabel: 'الاسم الجديد',
     deleteTitle: name => `حذف ${name}؟`,
     deleteBody: 'سيتم نقله إلى سلة المهملات — يمكنك استعادته من هناك.',
-    pathCopied: 'تم نسخ المسار'
+    pathCopied: 'تم نسخ المسار',
+    changeCwdTitle: 'تغيير المسار',
   },
   boot: {
     ready: 'Hermes Desktop جاهز',
@@ -1370,13 +1371,6 @@ export const ar = defineLocale({
   },
   cron: {
     close: 'إغلاق',
-    modelImpact: {
-      title: 'تحتاج المهام المجدولة إلى المراجعة',
-      message: count => `سيتم تخطي ${count} من المهام المجدولة حتى تراجع إعدادات النموذج الخاصة بها.`,
-      detailMore: (names, remaining) => `${names} و${remaining} أخرى`,
-      review: 'مراجعة المهام المجدولة',
-      saveFailed: 'لم يحفظ Hermes تغيير النموذج هذا.'
-    },
     search: 'بحث',
     loading: 'جار التحميل...',
     states: {
@@ -1737,7 +1731,6 @@ export const ar = defineLocale({
     editingQueuedInComposer: 'جار تحرير رسالة في الطابور',
     queueEdit: 'تحرير الرسالة المجدولة',
     queueSendNext: 'إرسالها تاليا',
-    queueSteer: 'توجيه — تصحيح الدور الجاري فورا',
     queueSend: 'إرسالها الآن',
     queueDelete: 'حذف من الطابور',
     queueStuckTitle: 'لم تُرسل الرسالة في قائمة الانتظار',
