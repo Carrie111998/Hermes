@@ -1678,6 +1678,10 @@ def _compute_host_turn_frame(
     text: Any,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    accepted_turn=None,
+    turn_lease=None,
+    turn_authorization=None,
+    turn_lease_seconds: float = 90.0,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -1687,7 +1691,7 @@ def _compute_host_turn_frame(
             if image_paths is not None
             else list(session.get("attached_images", []))
         )
-    return {
+    frame = {
         "type": "turn.start",
         "sid": sid,
         "request_id": rid,
@@ -1705,6 +1709,29 @@ def _compute_host_turn_frame(
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
     }
+    if accepted_turn is not None and turn_lease is not None:
+        frame["canonical_turn"] = {
+            "command": {
+                "session_id": accepted_turn.command.session_id,
+                "turn_id": accepted_turn.command.turn_id,
+                "idempotency_key": accepted_turn.command.idempotency_key,
+                "expected_revision": accepted_turn.command.expected_revision,
+                "user_event": dict(accepted_turn.command.user_event),
+            },
+            "receipt": _turn_receipt_payload(
+                accepted_turn.receipt, True
+            ),
+            "lease": {
+                "session_id": turn_lease.session_id,
+                "turn_id": turn_lease.turn_id,
+                "owner_id": turn_lease.owner_id,
+                "attempt": turn_lease.attempt,
+                "lease_expires_at": turn_lease.lease_expires_at,
+            },
+            "principal": turn_authorization.principal,
+            "lease_seconds": turn_lease_seconds,
+        }
+    return frame
 
 
 def _metadata_mirror(session: dict | None) -> dict:
@@ -1781,6 +1808,10 @@ def _submit_prompt_to_compute_host(
     text: Any,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    accepted_turn=None,
+    turn_lease=None,
+    turn_authorization=None,
+    turn_lease_seconds: float = 90.0,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -1790,6 +1821,10 @@ def _submit_prompt_to_compute_host(
         text,
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
+        accepted_turn=accepted_turn,
+        turn_lease=turn_lease,
+        turn_authorization=turn_authorization,
+        turn_lease_seconds=turn_lease_seconds,
     )
 
     def _complete(done: dict) -> None:
@@ -9738,7 +9773,13 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    accepted_turn=None,
+    turn_lease=None,
+    turn_authorization=None,
+    turn_lease_seconds: float = 90.0,
 ) -> None:
+    if accepted_turn is not None and (turn_lease is None or turn_authorization is None):
+        raise ValueError("accepted turn requires an execution lease and authorization")
     with session["history_lock"]:
         if (
             queued_prompt_generation is not None
@@ -9777,6 +9818,10 @@ def _run_prompt_submit(
         secret_token = None
         goal_followup = None  # set by the post-turn goal hook below
         result = None  # turn outcome; read after the finally for leftover /steer
+        turn_failed_with_exception = False
+        turn_lease_box = [turn_lease]
+        turn_lease_stop = threading.Event()
+        turn_lease_thread = None
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         thinking_started = False  # ambient thinking sound armed for this turn
         one_turn_restore = session.pop("one_turn_model_restore", None)
@@ -9796,6 +9841,42 @@ def _run_prompt_submit(
         if isinstance(marker_text, str) and marker_text.strip():
             record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
         try:
+            if accepted_turn is not None:
+                with _session_db(session) as _turn_db:
+                    if _turn_db is None:
+                        raise RuntimeError("session storage is unavailable")
+                    turn_lease_box[0] = _turn_db.renew_turn_execution(
+                        turn_lease_box[0],
+                        lease_seconds=turn_lease_seconds,
+                        authorization=turn_authorization,
+                    )
+
+                def _renew_turn_lease() -> None:
+                    interval = max(1.0, float(turn_lease_seconds) / 3.0)
+                    while not turn_lease_stop.wait(interval):
+                        try:
+                            with _session_db(session) as _turn_db:
+                                if _turn_db is None:
+                                    continue
+                                turn_lease_box[0] = _turn_db.renew_turn_execution(
+                                    turn_lease_box[0],
+                                    lease_seconds=turn_lease_seconds,
+                                    authorization=turn_authorization,
+                                )
+                        except Exception:
+                            logger.error(
+                                "canonical turn lease renewal failed for %s",
+                                accepted_turn.command.turn_id,
+                                exc_info=True,
+                            )
+                            return
+
+                turn_lease_thread = threading.Thread(
+                    target=_renew_turn_lease,
+                    daemon=True,
+                    name=f"turn-lease-{accepted_turn.command.turn_id[:24]}",
+                )
+                turn_lease_thread.start()
             from tools.approval import (
                 reset_current_session_key,
                 set_current_session_key,
@@ -10037,6 +10118,8 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+            if accepted_turn is not None and "accepted_turn" in _run_params:
+                run_kwargs["accepted_turn"] = accepted_turn
             # Auto-titling now fires inside the turn prologue (shared by every
             # surface). Hand the agent this session's live-rename hook so the
             # sidebar repaints the moment a title lands, rather than waiting
@@ -10380,6 +10463,7 @@ def _run_prompt_submit(
                 except Exception as e:
                     logger.warning("voice TTS dispatch failed: %s", e)
         except Exception as e:
+            turn_failed_with_exception = True
             import traceback
 
             trace = traceback.format_exc()
@@ -10417,6 +10501,50 @@ def _run_prompt_submit(
                 )
                 _emit("error", sid, {"message": str(e)})
         finally:
+            turn_lease_stop.set()
+            if turn_lease_thread is not None:
+                turn_lease_thread.join(timeout=1.0)
+            if accepted_turn is not None:
+                from agent.session_contracts import TurnState
+
+                terminal_state = TurnState.COMPLETED
+                terminal_reason = None
+                if turn_failed_with_exception or (
+                    isinstance(result, dict) and result.get("failed") is True
+                ):
+                    terminal_state = TurnState.FAILED
+                    terminal_reason = "turn_failed"
+                elif (
+                    isinstance(result, dict) and result.get("interrupted") is True
+                ) or session.get("_turn_cancel_requested"):
+                    terminal_state = TurnState.CANCELED
+                    terminal_reason = "turn_canceled"
+                try:
+                    with _session_db(session) as _turn_db:
+                        if _turn_db is None:
+                            raise RuntimeError("session storage is unavailable")
+                        terminal_receipt = _turn_db.finish_turn_execution(
+                            turn_lease_box[0],
+                            state=terminal_state,
+                            authorization=turn_authorization,
+                            reason=terminal_reason,
+                        )
+                    _emit(
+                        "session.turn.updated",
+                        sid,
+                        {
+                            "session_contract_version": 1,
+                            "turn": _turn_receipt_payload(
+                                terminal_receipt, False
+                            ),
+                        },
+                    )
+                except Exception:
+                    logger.error(
+                        "canonical turn terminal state persistence failed for %s",
+                        accepted_turn.command.turn_id,
+                        exc_info=True,
+                    )
             # Drop both local snapshots of the pre-turn history before asking
             # glibc to return pages. session["history"] already points at the
             # new/pruned result; retaining either list defeats this trim.

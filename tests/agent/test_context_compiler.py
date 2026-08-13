@@ -1,10 +1,16 @@
 from __future__ import annotations
 
-from agent.context_compiler import compile_turn, conservative_json_token_count
+from agent.context_compiler import (
+    compile_context,
+    compile_turn,
+    conservative_json_token_count,
+)
 from agent.models_dev import ModelCapabilities
 from agent.session_contracts import (
     CanonicalSessionEvent,
+    CompilationMessage,
     ContextCompilationFailureReason,
+    ModelInvocation,
     SessionSnapshot,
     ToolCatalogSnapshot,
     TurnCommand,
@@ -176,9 +182,11 @@ def test_existing_history_never_silently_compiles_to_empty() -> None:
 def test_tool_call_and_results_are_selected_as_one_atomic_history_unit() -> None:
     events = (
         _event("event-old", 1, "user", "x" * 15_000),
+        _event("event-old-answer", 2, "assistant", "Old answer."),
+        _event("event-prompt", 3, "user", "Look up the new result."),
         _event(
             "event-call",
-            2,
+            4,
             "assistant",
             "",
             tool_calls=[{
@@ -187,8 +195,8 @@ def test_tool_call_and_results_are_selected_as_one_atomic_history_unit() -> None
                 "function": {"name": "lookup", "arguments": "{}"},
             }],
         ),
-        _event("event-result", 3, "tool", "result", tool_call_id="call-1"),
-        _event("event-answer", 4, "assistant", "The result was accepted."),
+        _event("event-result", 5, "tool", "result", tool_call_id="call-1"),
+        _event("event-answer", 6, "assistant", "The result was accepted."),
     )
     result = compile_turn(
         snapshot=SessionSnapshot(session_id="session-1", revision=2, events=events),
@@ -203,14 +211,138 @@ def test_tool_call_and_results_are_selected_as_one_atomic_history_unit() -> None
     assert result.ok
     assert result.compiled is not None
     assert result.compiled.receipt.retained_event_ids == (
+        "event-prompt",
         "event-call",
         "event-result",
         "event-answer",
     )
-    assert result.compiled.receipt.omitted_event_ids == ("event-old",)
+    assert result.compiled.receipt.omitted_event_ids == (
+        "event-old",
+        "event-old-answer",
+    )
 
 
 def test_hebrew_estimator_counts_utf8_bytes_conservatively() -> None:
     hebrew = {"role": "user", "content": "שלום עולם"}
     ascii_text = {"role": "user", "content": "hello world"}
     assert conservative_json_token_count(hebrew) > conservative_json_token_count(ascii_text)
+
+
+def test_tool_loop_invocation_keeps_entire_active_turn_mandatory() -> None:
+    invocation = ModelInvocation(
+        session_id="session-1",
+        session_revision=8,
+        turn_id="turn-4",
+        messages=(
+            CompilationMessage(
+                message={"role": "system", "content": "Use tools safely."},
+                required=True,
+            ),
+            CompilationMessage(
+                message={"role": "user", "content": "old history" * 2_000},
+                source_event_ids=("event-old",),
+            ),
+            CompilationMessage(
+                message={"role": "assistant", "content": "Old answer."},
+                source_event_ids=("event-old-answer",),
+            ),
+            CompilationMessage(
+                message={"role": "user", "content": "Recent question."},
+                source_event_ids=("event-recent-user",),
+            ),
+            CompilationMessage(
+                message={"role": "assistant", "content": "Recent checkpoint."},
+                source_event_ids=("event-recent",),
+            ),
+            CompilationMessage(
+                message={"role": "user", "content": "Look up the order."},
+                source_event_ids=("event-user",),
+                required=True,
+            ),
+            CompilationMessage(
+                message={
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }],
+                },
+                source_event_ids=("event-call",),
+                required=True,
+            ),
+            CompilationMessage(
+                message={
+                    "role": "tool",
+                    "content": "Order 42 is ready.",
+                    "tool_call_id": "call-1",
+                },
+                source_event_ids=("event-result",),
+                required=True,
+            ),
+        ),
+    )
+
+    result = compile_context(
+        invocation=invocation,
+        tool_catalog=ToolCatalogSnapshot(version="tools-v1"),
+        capabilities=ModelCapabilities(context_window=4_000, max_output_tokens=1_000),
+        model="model-b",
+        provider="provider-b",
+    )
+
+    assert result.compiled is not None
+    assert result.compiled.receipt.omitted_event_ids == (
+        "event-old",
+        "event-old-answer",
+    )
+    assert result.compiled.receipt.retained_event_ids == (
+        "event-recent-user",
+        "event-recent",
+        "event-user",
+        "event-call",
+        "event-result",
+    )
+    assert [message["role"] for message in result.compiled.messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "tool",
+    ]
+
+
+def test_active_tool_result_no_fit_fails_before_provider_invocation() -> None:
+    invocation = ModelInvocation(
+        session_id="session-1",
+        session_revision=3,
+        turn_id="turn-2",
+        messages=(
+            CompilationMessage(
+                message={"role": "user", "content": "Run the report."},
+                source_event_ids=("event-user",),
+                required=True,
+            ),
+            CompilationMessage(
+                message={"role": "tool", "content": "x" * 20_000},
+                source_event_ids=("event-result",),
+                required=True,
+            ),
+        ),
+    )
+
+    result = compile_context(
+        invocation=invocation,
+        tool_catalog=ToolCatalogSnapshot(version="none"),
+        capabilities=ModelCapabilities(context_window=4_000, max_output_tokens=1_000),
+        model="small-model",
+        provider="provider-b",
+    )
+
+    assert result.compiled is None
+    assert result.failure is not None
+    assert result.failure.reason is (
+        ContextCompilationFailureReason.MANDATORY_ENVELOPE_EXCEEDS_CAPACITY
+    )

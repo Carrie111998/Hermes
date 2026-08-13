@@ -291,6 +291,56 @@ def _emit_terminal_post_tool_call(
         pass
 
 
+def _execute_tool_with_canonical_journal(
+    agent,
+    *,
+    function_name: str,
+    function_args: dict[str, Any],
+    tool_call_id: str,
+    execute,
+) -> Any:
+    """Fence native tool dispatch with a durable claim/result journal.
+
+    Legacy turns have no ``session_turn_commands`` row and pass through. For a
+    native turn, ``begin_tool_execution`` commits before external dispatch and
+    ``complete_tool_execution`` commits the result before the transcript/UI can
+    observe it. An effect-capable call whose process dies in between is never
+    automatically repeated: recovery yields a typed uncertain result instead.
+    """
+    session_db = getattr(agent, "_session_db", None)
+    session_id = str(getattr(agent, "session_id", "") or "")
+    turn_id = str(getattr(agent, "_current_turn_id", "") or "")
+    if session_db is None or not session_id or not turn_id or not tool_call_id:
+        return execute(function_args)
+
+    from agent.tool_result_classification import tool_may_have_side_effect
+
+    may_have_side_effect = tool_may_have_side_effect(function_name)
+    receipt = session_db.begin_tool_execution(
+        session_id,
+        turn_id,
+        tool_call_id,
+        function_name,
+        function_args,
+        may_have_side_effect=may_have_side_effect,
+    )
+    if receipt is None:
+        return execute(function_args)
+    if not receipt.execute:
+        return receipt.result
+    try:
+        result = execute(function_args)
+    except BaseException as exc:
+        if may_have_side_effect:
+            session_db.mark_tool_execution_uncertain(receipt, exc)
+        else:
+            error_result = f"Error executing tool '{function_name}': {exc}"
+            session_db.complete_tool_execution(receipt, error_result)
+        raise
+    session_db.complete_tool_execution(receipt, result)
+    return result
+
+
 def _cancelled_tool_result(reason: str = "user interrupt") -> str:
     return json.dumps(
         {
@@ -608,7 +658,13 @@ def _run_agent_tool_execution_middleware(
             agent._iters_since_skill = 0
 
         _advance_start_order(_begin)
-        return execute(final_args)
+        return _execute_tool_with_canonical_journal(
+            agent,
+            function_name=function_name,
+            function_args=final_args,
+            tool_call_id=tool_call_id,
+            execute=execute,
+        )
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
         request_result = apply_tool_request_middleware(

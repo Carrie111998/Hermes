@@ -2291,8 +2291,14 @@ class AIAgent:
                         self, "_active_compression_lock_holder", None
                     ),
                 )
-                for _written in _batch_msgs:
+                for _written, _stored_row in zip(_batch_msgs, _batch_rows):
                     _written[_DB_PERSISTED_MARKER] = True
+                    _stored_row_id = _stored_row.get("_row_id")
+                    if type(_stored_row_id) is int and _stored_row_id >= 0:
+                        # Keep the live transcript addressable by the same
+                        # canonical event ID the SessionDB snapshot exposes.
+                        # The per-call compiler strips this before transport.
+                        _written["_row_id"] = _stored_row_id
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
             # allocated next turn at a recycled address.
@@ -7858,6 +7864,20 @@ class AIAgent:
         """
         tool_calls = assistant_message.tool_calls
 
+        # The model-issued tool-call event is part of the canonical command
+        # plan. Persist it before any external dispatch so crash recovery sees
+        # the same tool_call_id/arguments that the durable execution journal
+        # fences. Persisting only after the result left a crash window where a
+        # restarted model could emit a new call ID and repeat a side effect.
+        from agent.tool_executor import _flush_session_db_after_tool_progress
+
+        if not _flush_session_db_after_tool_progress(
+            self,
+            messages,
+            stage="assistant tool-call plan",
+        ):
+            return
+
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
@@ -8023,6 +8043,7 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        accepted_turn: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -8040,15 +8061,33 @@ class AIAgent:
             start_task_run,
         )
         from agent.subagent_lifecycle import bind_subagent_parent
-        effective_task_id = task_id or str(uuid.uuid4())
+        if accepted_turn is not None:
+            from agent.session_contracts import AcceptedTurn
+
+            if not isinstance(accepted_turn, AcceptedTurn):
+                raise TypeError("accepted_turn must be AcceptedTurn")
+            effective_task_id = accepted_turn.command.turn_id
+        else:
+            effective_task_id = task_id or str(uuid.uuid4())
         session_id = str(getattr(self, "session_id", None) or "")
+        if accepted_turn is not None and accepted_turn.command.session_id != session_id:
+            raise ValueError("accepted turn does not belong to this agent session")
+        prior_compression_in_place = getattr(self, "compression_in_place", True)
+        if accepted_turn is not None:
+            # Native clients address one stable Hermes session. Legacy
+            # compression rotation changes session_id and therefore cannot run
+            # inside a revisioned native turn; compact derived history in place
+            # while preserving the append-only source rows instead.
+            self.compression_in_place = True
         task_context = {
             "session_id": session_id,
             "task_id": effective_task_id,
             "platform": getattr(self, "platform", None) or "",
         }
         relay_turn_id = (
-            f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+            accepted_turn.command.turn_id
+            if accepted_turn is not None
+            else f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
         )
         self._relay_pending_turn_id = relay_turn_id
         relay_parent_session_id = (
@@ -8117,6 +8156,7 @@ class AIAgent:
                     persist_user_display_kind=persist_user_display_kind,
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
+                    accepted_turn=accepted_turn,
                 )
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:
@@ -8175,6 +8215,8 @@ class AIAgent:
                         reset_accounting_context(acct_token)
                     if token is not None:
                         reset_conversation_context(token)
+                    if accepted_turn is not None:
+                        self.compression_in_place = prior_compression_in_place
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
@@ -8198,10 +8240,21 @@ class AIAgent:
         messages: List[Dict[str, Any]],
         effective_task_id: str,
         should_review_memory: bool = False,
+        active_system_prompt: str | None = None,
+        current_turn_user_idx: int | None = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
         from agent.codex_runtime import run_codex_app_server_turn
-        return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
+        return run_codex_app_server_turn(
+            self,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=should_review_memory,
+            active_system_prompt=active_system_prompt,
+            current_turn_user_idx=current_turn_user_idx,
+        )
 
 def main(
     query: str = None,

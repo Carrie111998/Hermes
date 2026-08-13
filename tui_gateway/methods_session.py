@@ -3290,6 +3290,101 @@ def _(rid, params: dict) -> dict:
     )
 
 
+@method("session.create.v1")
+def _(rid, params: dict) -> dict:
+    """Versioned native create alias without a caller-selected profile DB."""
+    if params.get("profile"):
+        return _err(rid, 4031, "native session APIs do not accept a profile selector")
+    response = _methods["session.create"](rid, dict(params))
+    if response.get("result") is not None:
+        response["result"]["session_contract_version"] = 1
+    return response
+
+
+@method("session.open.v1")
+def _(rid, params: dict) -> dict:
+    """Open one exact canonical session ID in the active authenticated scope."""
+    if params.get("profile"):
+        return _err(rid, 4031, "native session APIs do not accept a profile selector")
+    target = params.get("session_id")
+    if not isinstance(target, str) or not target.strip():
+        return _err(rid, 4006, "session_id required")
+    db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5000)
+    if db.get_session(target) is None:
+        return _err(rid, 4007, "session not found")
+    response = _methods["session.resume"](rid, dict(params))
+    if response.get("result") is not None:
+        response["result"]["session_contract_version"] = 1
+    return response
+
+
+@method("session.snapshot.v1")
+def _(rid, params: dict) -> dict:
+    """Read the canonical snapshot for an already-open exact session."""
+    target = params.get("session_id")
+    if not isinstance(target, str) or not target.strip():
+        return _err(rid, 4006, "session_id required")
+    if params.get("profile"):
+        return _err(rid, 4031, "native session APIs do not accept a profile selector")
+    live = _find_live_session_by_key(target)
+    if live is None:
+        return _err(rid, 4001, "session is not open")
+    live_sid, session = live
+    request_transport = current_transport()
+    if request_transport is not None and session.get("transport") is not request_transport:
+        return _err(rid, 4031, "session is not owned by this client transport")
+    from agent.session_contracts import SessionAuthorization
+
+    authorization = SessionAuthorization(
+        principal=f"gateway:{live_sid}",
+        allowed_session_ids=frozenset({target}),
+    )
+    try:
+        with _session_db(session) as db:
+            if db is None:
+                return _err(rid, 5071, "session storage is unavailable")
+            snapshot = db.read_session_snapshot(target, authorization=authorization)
+    except Exception as exc:
+        return _err(rid, 5071, f"session snapshot could not be read: {exc}")
+    return _ok(
+        rid,
+        {
+            "session_contract_version": 1,
+            "session_id": snapshot.session_id,
+            "revision": snapshot.revision,
+            "events": [
+                {
+                    "event_id": event.event_id,
+                    "sequence": event.sequence,
+                    "message": dict(event.message),
+                    "source_event_ids": list(event.source_event_ids),
+                }
+                for event in snapshot.events
+            ],
+        },
+    )
+
+
+@method("session.turn.cancel.v1")
+def _(rid, params: dict) -> dict:
+    """Cancel the active turn for an exact, already-open Hermes session."""
+    target = params.get("session_id")
+    if not isinstance(target, str) or not target.strip():
+        return _err(rid, 4006, "session_id required")
+    if params.get("profile"):
+        return _err(rid, 4031, "native session APIs do not accept a profile selector")
+    live = _find_live_session_by_key(target)
+    if live is None:
+        return _err(rid, 4001, "session is not open")
+    live_sid, _session = live
+    request_transport = current_transport()
+    if request_transport is not None and _session.get("transport") is not request_transport:
+        return _err(rid, 4031, "session is not owned by this client transport")
+    return _methods["session.interrupt"](rid, {"session_id": live_sid})
+
+
 @method("terminal.resize")
 def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)

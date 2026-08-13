@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.context_compressor import ContextCompressor
+from agent.session_contracts import AcceptedTurn, AppendTurnReceipt, TurnCommand
 from agent.turn_context import TurnContext, build_turn_context
 from hermes_state import SessionDB
 
@@ -206,6 +207,44 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.messages[-1] == {"role": "user", "content": "hello"}
     assert ctx.current_turn_user_idx == len(ctx.messages) - 1
     assert ctx.active_system_prompt == "SYSTEM"
+
+
+def test_recovered_accepted_turn_reuses_loaded_canonical_event_without_duplicate():
+    agent = _FakeAgent()
+    command = TurnCommand(
+        session_id="sess-1",
+        turn_id="turn-1",
+        idempotency_key="delivery-1",
+        expected_revision=0,
+        user_event={"role": "user", "content": "hello"},
+    )
+    receipt = AppendTurnReceipt(
+        session_id="sess-1",
+        turn_id="turn-1",
+        idempotency_key="delivery-1",
+        prior_revision=0,
+        event_revision=41,
+        session_revision=42,
+        event_id="db:41",
+        projection_row_id=41,
+        appended=False,
+    )
+    loaded = [
+        {"role": "user", "content": "hello", "_row_id": 41},
+        {"role": "assistant", "content": "partial work", "_row_id": 42},
+    ]
+
+    ctx = _build(
+        agent,
+        conversation_history=loaded,
+        accepted_turn=AcceptedTurn(command, receipt),
+    )
+
+    assert len(ctx.messages) == 2
+    assert ctx.current_turn_user_idx == 0
+    assert ctx.messages[0]["_row_id"] == 41
+    assert ctx.messages[0]["_db_persisted"] is True
+    assert ctx.messages[1]["content"] == "partial work"
 
 
 # ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────
@@ -405,4 +444,3 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
     overwritten or never read.
     """
     assert not _title_turn(platform).called
-

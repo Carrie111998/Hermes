@@ -27,6 +27,8 @@ from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
 from agent.memory_manager import MemoryManager
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+from agent.session_contracts import AcceptedTurn, SessionAuthorization, TurnCommand
+from hermes_state import SessionDB
 
 
 # ---------------------------------------------------------------------------
@@ -2726,6 +2728,21 @@ class TestRunConversation:
         agent.compression_enabled = False
         agent.save_trajectories = False
 
+    def test_tool_call_plan_flushes_before_dispatch(self, agent):
+        order = []
+        assistant = SimpleNamespace(tool_calls=[_mock_tool_call(call_id="call-1")])
+        agent._execute_tool_calls_sequential = MagicMock(
+            side_effect=lambda *_args: order.append("dispatch")
+        )
+
+        with patch(
+            "agent.tool_executor._flush_session_db_after_tool_progress",
+            side_effect=lambda *_args, **_kwargs: order.append("flush") or True,
+        ):
+            agent._execute_tool_calls(assistant, [], "task-1")
+
+        assert order == ["flush", "dispatch"]
+
     def test_task_start_failure_closes_relay_turn_and_lease(self, agent):
         relay_lease = SimpleNamespace(
             parent_session_id="",
@@ -2782,6 +2799,140 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
+
+    def test_accepted_turn_reuses_canonical_user_event_without_duplicate_append(
+        self, agent, tmp_path
+    ):
+        self._setup_agent(agent)
+        observed_in_place = []
+        agent.compression_in_place = False
+
+        def _respond(**_kwargs):
+            observed_in_place.append(agent.compression_in_place)
+            return _mock_response(
+                content="I remember OLIVE-42.", finish_reason="stop"
+            )
+
+        agent.client.chat.completions.create.side_effect = _respond
+        agent._memory_manager = MagicMock()
+        agent._memory_manager.prefetch_all.return_value = "PREFETCHED OLIVE FACT"
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("canonical-session", "desktop")
+        authorization = SessionAuthorization(
+            principal="desktop:test",
+            allowed_session_ids=frozenset({"canonical-session"}),
+        )
+        command = TurnCommand(
+            session_id="canonical-session",
+            turn_id="desktop-turn-1",
+            idempotency_key="desktop-delivery-1",
+            expected_revision=0,
+            user_event={"role": "user", "content": "Remember OLIVE-42."},
+        )
+        receipt = db.append_turn(command, authorization=authorization)
+        agent.session_id = "canonical-session"
+        agent._session_db = db
+        agent._session_db_created = True
+        agent._session_json_enabled = False
+
+        with (
+            patch("agent.turn_context._maybe_title_session_at_turn_start"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "Remember OLIVE-42.",
+                accepted_turn=AcceptedTurn(command, receipt),
+            )
+
+        snapshot = db.read_session_snapshot(
+            "canonical-session", authorization=authorization
+        )
+        assert [event.message["role"] for event in snapshot.events] == [
+            "user",
+            "assistant",
+        ]
+        assert snapshot.events[0].event_id == receipt.event_id
+        assert snapshot.events[0].message["content"] == "Remember OLIVE-42."
+        assert "PREFETCHED OLIVE FACT" in snapshot.events[0].message["api_content"]
+        assert snapshot.revision > receipt.event_revision
+        assert result["context_compilation_receipts"][0]["retained_event_ids"] == (
+            receipt.event_id,
+        )
+        assert observed_in_place == [True]
+        assert agent.compression_in_place is False
+        db.close()
+
+    def test_normal_model_path_exposes_compiler_receipt_and_strips_metadata(self, agent):
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Final answer",
+            finish_reason="stop",
+        )
+        history = [
+            {"role": "user", "content": "Remember OLIVE-42.", "_row_id": 41},
+            {"role": "assistant", "content": "Stored.", "_row_id": 42},
+        ]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "What was the code?",
+                conversation_history=history,
+            )
+
+        assert result["completed"] is True
+        receipt = result["context_compilation_receipts"][0]
+        assert receipt["retained_event_ids"][:2] == ("db:41", "db:42")
+        sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        assert "OLIVE-42" in str(sent)
+        assert all(
+            "_hermes_context_event_ids" not in message
+            and "_hermes_context_required" not in message
+            for message in sent
+        )
+
+    def test_mandatory_large_tool_envelope_stops_before_normal_provider(self, agent):
+        self._setup_agent(agent)
+        agent.context_compressor.context_length = 16_000
+        agent.max_tokens = 8_000
+        agent.tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": f"office_tool_{index}",
+                    "description": "Office automation schema. " * 40,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            f"field_{part}": {
+                                "type": "string",
+                                "description": "Required schema detail. " * 10,
+                            }
+                            for part in range(8)
+                        },
+                    },
+                },
+            }
+            for index in range(165)
+        ]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("Continue.")
+
+        assert result["failed"] is True
+        assert result["api_calls"] == 0
+        assert result["context_compilation_failure"]["reason"] == (
+            "mandatory_envelope_exceeds_capacity"
+        )
+        agent.client.chat.completions.create.assert_not_called()
 
     def test_prompt_cache_marks_static_system_prefix_on_wire(self, agent):
         self._setup_agent(agent)
@@ -2928,6 +3079,9 @@ class TestRunConversation:
             result = agent.run_conversation("search something")
         assert result["final_response"] == "Done searching"
         assert result["api_calls"] == 2
+        assert len(result["context_compilation_receipts"]) == 2
+        second_receipt = result["context_compilation_receipts"][1]
+        assert len(second_receipt["retained_event_ids"]) >= 3
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
@@ -3288,6 +3442,10 @@ class TestRunConversation:
         assert fallback_called["called"], "Fallback should have been triggered"
         assert result["completed"] is True
         assert result["final_response"] == "Fallback answer."
+        receipts = result["context_compilation_receipts"]
+        assert receipts[-1]["provider"] == "openrouter"
+        assert receipts[-1]["model"] == "anthropic/claude-sonnet-4"
+        assert receipts[-1]["context_fingerprint"] != receipts[0]["context_fingerprint"]
 
     def test_empty_response_fallback_also_empty_returns_empty(self, agent):
         """If fallback also returns empty, final response is (empty)."""
@@ -4324,10 +4482,11 @@ class TestRunConversation:
         assert agent.context_compressor.context_length == 200_000
         mock_compress.assert_called_once()
 
-    def test_output_cap_retry_with_large_api_only_content(self, agent):
-        """When a large system prompt makes api_messages huge while persisted
-        messages stay tiny, the retry cap must still respect provider
-        available_tokens — not blow up to the full context window.
+    def test_large_api_only_mandatory_content_fails_before_provider(self, agent):
+        """A mandatory request-only prompt that cannot fit fails explicitly.
+
+        The shared compiler owns the complete envelope, so this no longer
+        relies on a provider error followed by a heuristic output-cap retry.
         """
         self._setup_agent(agent)
         agent.api_mode = "chat_completions"
@@ -4340,17 +4499,6 @@ class TestRunConversation:
 
         # Huge API-only system prompt; persisted messages are tiny.
         agent._cached_system_prompt = "S" * 796_000
-
-        error_msg = (
-            "max_tokens: 65536 > context_window: 200000 "
-            "- input_tokens: 199000 = available_tokens: 1000"
-        )
-        exc = Exception(error_msg)
-        exc.status_code = 400
-        exc.code = 400
-
-        ok_resp = _mock_response(content="done", finish_reason="stop")
-        agent.client.chat.completions.create.side_effect = [exc, ok_resp]
 
         mock_compress = MagicMock(return_value=(
             [{"role": "user", "content": "hello"}],
@@ -4365,13 +4513,15 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("hello")
 
-        second_call = agent.client.chat.completions.create.call_args_list[1].kwargs
-        assert result["completed"] is True
-        # The current branch (messages-only estimate) would send max_tokens
-        # near 199927 — this test fails on it.
-        assert second_call["max_tokens"] <= 936
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["api_calls"] == 0
+        assert result["context_compilation_failure"]["reason"] == (
+            "mandatory_envelope_exceeds_capacity"
+        )
+        agent.client.chat.completions.create.assert_not_called()
         assert agent.context_compressor.context_length == 200_000
-        mock_compress.assert_called_once()
+        mock_compress.assert_not_called()
 
     def test_output_cap_retry_triggers_compression_and_recovers(self, agent):
         """Regression for the output-cap death-loop (#55546 / #61761).

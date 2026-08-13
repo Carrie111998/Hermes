@@ -21,12 +21,23 @@ Contract pinned here:
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import types
 
 import pytest
 
+from agent.session_contracts import (
+    AcceptedTurn,
+    SessionAuthorization,
+    TurnCommand,
+    TurnState,
+)
+from hermes_state import SessionDB
 from tui_gateway import server
+
+
+_REAL_THREAD = threading.Thread
 
 
 class _InlineThread:
@@ -187,6 +198,81 @@ def test_completed_turn_still_clears_inflight(emits, turn_env):
     assert completes[0]["status"] == "complete"
     assert "error" not in completes[0]
     assert server._inflight_snapshot(session) is None
+
+
+def test_native_completed_turn_commits_terminal_revision(
+    emits, turn_env, tmp_path, monkeypatch
+):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("session-key", "desktop")
+    authorization = SessionAuthorization(
+        principal="gateway:test",
+        allowed_session_ids=frozenset({"session-key"}),
+    )
+    command = TurnCommand(
+        session_id="session-key",
+        turn_id="desktop-turn-1",
+        idempotency_key="desktop-delivery-1",
+        expected_revision=0,
+        user_event={"role": "user", "content": "Remember OLIVE-42."},
+    )
+    receipt = db.append_turn(command, authorization=authorization)
+    lease = db.claim_turn_execution(
+        "session-key",
+        "desktop-turn-1",
+        owner_id="gateway-owner",
+        lease_seconds=90,
+        authorization=authorization,
+    )
+
+    def run_conversation(message, *, accepted_turn=None, **_kwargs):
+        assert message == "Remember OLIVE-42."
+        assert accepted_turn.receipt.event_id == receipt.event_id
+        db.append_message("session-key", "assistant", "Stored.")
+        return {
+            "final_response": "Stored.",
+            "messages": [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": "Stored."},
+            ],
+        }
+
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=run_conversation,
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True)
+    server._start_inflight_turn(session, "Remember OLIVE-42.")
+
+    @contextlib.contextmanager
+    def session_db(_session):
+        yield db
+
+    monkeypatch.setattr(server, "_session_db", session_db)
+    monkeypatch.setattr(server.threading, "Thread", _REAL_THREAD)
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "Remember OLIVE-42.",
+        accepted_turn=AcceptedTurn(command, receipt),
+        turn_lease=lease,
+        turn_authorization=authorization,
+        turn_lease_seconds=3,
+    )
+    session["_run_thread"].join(timeout=5)
+
+    current = db.get_turn(command, authorization=authorization)
+    assert current.state is TurnState.COMPLETED
+    assert current.terminal_revision == current.session_revision
+    assert current.terminal_revision > current.event_revision
+    updates = _events(emits, "session.turn.updated")
+    assert len(updates) == 1
+    assert updates[0]["turn"]["state"] == "completed"
+    assert updates[0]["turn"]["session_revision"] == current.session_revision
+    assert session["running"] is False
+    db.close()
 
 
 # ── Exception path ─────────────────────────────────────────────────────

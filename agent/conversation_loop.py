@@ -17,6 +17,7 @@ resolved through :func:`_ra` so those patches keep working.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import random
@@ -36,6 +37,12 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
 )
 from agent.context_engine import automatic_compaction_status_message
+from agent.context_compiler import (
+    CONTEXT_EVENT_IDS_KEY,
+    CONTEXT_REQUIRED_KEY,
+    compile_prepared_context,
+    resolve_runtime_capabilities,
+)
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.turn_context import (
@@ -1444,6 +1451,7 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    accepted_turn: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1545,6 +1553,7 @@ def run_conversation(
         persist_user_timestamp,
         persist_user_display_kind=persist_user_display_kind,
         persist_user_display_metadata=persist_user_display_metadata,
+        accepted_turn=accepted_turn,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,
         install_safe_stdio=_install_safe_stdio,
         sanitize_surrogates=_sanitize_surrogates,
@@ -1615,6 +1624,8 @@ def run_conversation(
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
+    context_compilation_failure = None
+    context_compilation_receipts = []
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -1642,6 +1653,8 @@ def run_conversation(
             messages=messages,
             effective_task_id=effective_task_id,
             should_review_memory=_should_review_memory,
+            active_system_prompt=active_system_prompt,
+            current_turn_user_idx=current_turn_user_idx,
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
@@ -1850,6 +1863,28 @@ def run_conversation(
             # _clone_message_for_send.
             api_msg = _clone_message_for_send(msg)
 
+            # Migration projection into the canonical compiler contract. DB
+            # rows keep their durable IDs; live rows receive deterministic
+            # turn-local IDs until SessionSnapshot becomes the only reader.
+            # The current user event and every assistant/tool event after it
+            # form one mandatory active-turn suffix for every model call.
+            _row_id = api_msg.get("_row_id")
+            if type(_row_id) is int and _row_id >= 0:
+                _context_event_id = f"db:{_row_id}"
+            else:
+                _event_digest = hashlib.sha256(
+                    json.dumps(
+                        api_msg,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=str,
+                    ).encode("utf-8")
+                ).hexdigest()[:16]
+                _context_event_id = f"projection:{idx}:{_event_digest}"
+            api_msg[CONTEXT_EVENT_IDS_KEY] = (_context_event_id,)
+            api_msg[CONTEXT_REQUIRED_KEY] = idx >= current_turn_user_idx
+
             # api_content is the persistence sidecar carrying the exact bytes
             # sent to the API for this message when they differ from the clean
             # stored content (see compose_user_api_content in turn_context).
@@ -1975,7 +2010,11 @@ def run_conversation(
         if agent.ephemeral_system_prompt:
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
         if effective_system:
-            api_messages = [{"role": "system", "content": effective_system}] + api_messages
+            api_messages = [{
+                "role": "system",
+                "content": effective_system,
+                CONTEXT_REQUIRED_KEY: True,
+            }] + api_messages
 
         if moa_config:
             try:
@@ -2037,7 +2076,9 @@ def run_conversation(
                 # api_messages in place, and a shallow copy would let them
                 # write through into agent.prefill_messages' nested
                 # containers (same aliasing class as the history build).
-                api_messages.insert(sys_offset + idx, _clone_message_for_send(pfm))
+                _prefill = _clone_message_for_send(pfm)
+                _prefill[CONTEXT_REQUIRED_KEY] = True
+                api_messages.insert(sys_offset + idx, _prefill)
 
         # Per-turn context selection hook (additive, no-op by default).
         # Lets a context engine select/replace which context enters the
@@ -2166,6 +2207,59 @@ def run_conversation(
                     _moa_prepared_request = _prepare_moa_request(api_messages)
             if _moa_prepared_request is not None:
                 api_messages = _moa_prepared_request["messages"]
+
+        # One provider-neutral compiler boundary for every normal-loop model
+        # call. It runs after request-only context selection/MoA preparation so
+        # the complete envelope is accounted, but before transport dispatch.
+        # Fallbacks rebuild the outer loop and therefore recompile against the
+        # newly active provider/model capabilities.
+        _compilation = compile_prepared_context(
+            session_id=str(agent.session_id or f"task:{effective_task_id}"),
+            session_revision=len(messages),
+            turn_id=str(turn_id),
+            messages=api_messages,
+            tools=tools_for_api or (),
+            capabilities=resolve_runtime_capabilities(agent),
+            model=str(agent.model or "unknown-model"),
+            provider=str(agent.provider or "unknown-provider"),
+        )
+        if _compilation.failure is not None:
+            _failure = _compilation.failure
+            context_compilation_failure = {
+                "reason": _failure.reason.value,
+                "required_tokens": _failure.required_tokens,
+                "capacity_tokens": _failure.capacity_tokens,
+                "session_revision": _failure.session_revision,
+            }
+            final_response = (
+                "Hermes could not compile this model request without losing "
+                "required session context "
+                f"({_failure.reason.value}: required={_failure.required_tokens}, "
+                f"capacity={_failure.capacity_tokens})."
+            )
+            failed = True
+            _turn_exit_reason = "context_compilation_failed"
+            api_call_count -= 1
+            agent._api_call_count = api_call_count
+            try:
+                agent.iteration_budget.refund()
+            except Exception:
+                pass
+            break
+        assert _compilation.compiled is not None
+        _compiled_turn = _compilation.compiled
+        api_messages = [dict(message) for message in _compiled_turn.messages]
+        tools_for_api = list(_compiled_turn.tools)
+        context_compilation_receipts.append({
+            "session_revision": _compiled_turn.receipt.source_revision,
+            "turn_id": _compiled_turn.turn_id,
+            "model": _compiled_turn.model,
+            "provider": _compiled_turn.provider,
+            "context_fingerprint": _compiled_turn.context_fingerprint,
+            "retained_event_ids": _compiled_turn.receipt.retained_event_ids,
+            "omitted_event_ids": _compiled_turn.receipt.omitted_event_ids,
+            "tool_catalog_version": _compiled_turn.receipt.tool_catalog_version,
+        })
 
         # One image-stripped message estimate feeds both figures. Was: a
         # str(msg) char walk (re-serialized base64 every call) + a second
@@ -7778,7 +7872,7 @@ def run_conversation(
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
-    return finalize_turn(
+    result = finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
@@ -7795,6 +7889,11 @@ def run_conversation(
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )
+    if context_compilation_failure is not None:
+        result["context_compilation_failure"] = context_compilation_failure
+        result["error"] = final_response
+    result["context_compilation_receipts"] = context_compilation_receipts
+    return result
 
 
 

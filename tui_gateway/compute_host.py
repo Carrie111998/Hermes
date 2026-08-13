@@ -484,7 +484,64 @@ class ComputeHost:
             except Exception:
                 pass
             text = frame.get("text") if "text" in frame else frame.get("prompt", "")
-            server._run_prompt_submit(request_id, sid, session, text)
+            canonical_turn = frame.get("canonical_turn")
+            accepted_turn = None
+            turn_lease = None
+            turn_authorization = None
+            turn_lease_seconds = 90.0
+            if isinstance(canonical_turn, dict):
+                from agent.session_contracts import (
+                    AcceptedTurn,
+                    AppendTurnReceipt,
+                    SessionAuthorization,
+                    TurnCommand,
+                    TurnExecutionLease,
+                    TurnState,
+                )
+
+                command_data = canonical_turn.get("command") or {}
+                receipt_data = canonical_turn.get("receipt") or {}
+                lease_data = canonical_turn.get("lease") or {}
+                command = TurnCommand(**command_data)
+                receipt = AppendTurnReceipt(
+                    session_id=receipt_data["session_id"],
+                    turn_id=receipt_data["turn_id"],
+                    idempotency_key=receipt_data["idempotency_key"],
+                    prior_revision=int(receipt_data["prior_revision"]),
+                    event_revision=int(receipt_data["event_revision"]),
+                    session_revision=int(receipt_data["session_revision"]),
+                    event_id=receipt_data["event_id"],
+                    projection_row_id=int(receipt_data["projection_row_id"]),
+                    appended=False,
+                    state=TurnState(receipt_data["state"]),
+                    attempt=int(receipt_data.get("attempt") or 0),
+                    terminal_revision=receipt_data.get("terminal_revision"),
+                )
+                accepted_turn = AcceptedTurn(command, receipt)
+                turn_lease = TurnExecutionLease(
+                    session_id=lease_data["session_id"],
+                    turn_id=lease_data["turn_id"],
+                    owner_id=lease_data["owner_id"],
+                    attempt=int(lease_data["attempt"]),
+                    lease_expires_at=float(lease_data["lease_expires_at"]),
+                )
+                turn_authorization = SessionAuthorization(
+                    principal=str(canonical_turn.get("principal") or "compute-host"),
+                    allowed_session_ids=frozenset({command.session_id}),
+                )
+                turn_lease_seconds = float(
+                    canonical_turn.get("lease_seconds") or 90.0
+                )
+            server._run_prompt_submit(
+                request_id,
+                sid,
+                session,
+                text,
+                accepted_turn=accepted_turn,
+                turn_lease=turn_lease,
+                turn_authorization=turn_authorization,
+                turn_lease_seconds=turn_lease_seconds,
+            )
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):
                 run_thread.join()

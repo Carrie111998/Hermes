@@ -164,7 +164,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 28
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -259,6 +259,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     archived INTEGER NOT NULL DEFAULT 0,
     pinned INTEGER NOT NULL DEFAULT 0,
     last_read_at REAL,
+    canonical_revision INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
     FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
 );
@@ -286,7 +287,58 @@ CREATE TABLE IF NOT EXISTS messages (
     compacted INTEGER NOT NULL DEFAULT 0,
     api_content TEXT,
     display_kind TEXT,
-    display_metadata TEXT
+    display_metadata TEXT,
+    event_revision INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS session_projection_revisions (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL,
+    kind TEXT NOT NULL
+        CHECK (kind IN ('rewrite', 'checkpoint', 'rewind', 'restore', 'sidecar', 'redaction')),
+    source_event_ids TEXT NOT NULL,
+    projected_event_ids TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (session_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS session_turn_commands (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    idempotency_key TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    event_row_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    event_revision INTEGER,
+    prior_revision INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'accepted'
+        CHECK (state IN ('accepted', 'running', 'completed', 'failed', 'canceled')),
+    attempt INTEGER NOT NULL DEFAULT 0,
+    lease_owner TEXT,
+    lease_expires_at REAL,
+    terminal_revision INTEGER,
+    terminal_reason TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, idempotency_key),
+    UNIQUE (session_id, turn_id)
+);
+
+CREATE TABLE IF NOT EXISTS session_tool_executions (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL,
+    tool_call_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    state TEXT NOT NULL
+        CHECK (state IN ('running', 'completed', 'uncertain')),
+    may_have_side_effect INTEGER NOT NULL,
+    result_json TEXT,
+    attempt INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (session_id, turn_id, tool_call_id),
+    FOREIGN KEY (session_id, turn_id)
+        REFERENCES session_turn_commands(session_id, turn_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS session_model_usage (
@@ -358,6 +410,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_session_turn_commands_event
+    ON session_turn_commands(event_row_id);
 -- Partial index for the Insights assistant tool-call scan
 -- (agent/insights.py _get_tool_usage / _get_skill_usage): those queries filter
 -- messages by role='assistant' AND tool_calls IS NOT NULL, a small fraction of

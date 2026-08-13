@@ -25,6 +25,7 @@ call is synchronous and behaves like AIAgent's existing chat_completions loop.
 from __future__ import annotations
 
 import logging
+import json
 import os
 import threading
 import time
@@ -33,6 +34,7 @@ from typing import Any, Callable, Optional
 
 from agent.codex_responses_adapter import _format_responses_error
 from agent.redact import redact_sensitive_text
+from agent.session_contracts import CompiledTurn
 from agent.transports.codex_app_server import (
     CodexAppServerClient,
     CodexAppServerError,
@@ -196,6 +198,43 @@ def _coerce_turn_input_text(user_input: Any) -> str:
         text = "\n\n".join(p for p in parts if p).strip()
         return text or "What do you see in this image?"
     return "" if user_input is None else str(user_input)
+
+
+def _serialize_compiled_turn(turn: CompiledTurn) -> str:
+    """Translate provider-neutral context into Codex's text-only turn input.
+
+    Codex app-server owns a disposable provider thread, while Hermes owns the
+    transcript.  A fresh thread therefore receives the complete compiled turn
+    as a deterministic JSON envelope.  Live continuation threads receive only
+    the current input because they already contain the preceding revision.
+    Tool schemas are configured on the runtime surface and are intentionally
+    not duplicated into this text envelope; the compiler has already charged
+    their full cost to the request budget.
+    """
+    payload = {
+        "schema": "hermes.compiled-turn.v1",
+        "session_id": turn.session_id,
+        "session_revision": turn.session_revision,
+        "turn_id": turn.turn_id,
+        "messages": turn.messages,
+        "context_receipt": {
+            "retained_event_ids": turn.receipt.retained_event_ids,
+            "omitted_event_ids": turn.receipt.omitted_event_ids,
+            "source_revision": turn.receipt.source_revision,
+        },
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return (
+        "Hermes owns this session. Continue from the canonical compiled "
+        "context below and answer its final user message.\n"
+        f"<hermes_compiled_turn>{encoded}</hermes_compiled_turn>"
+    )
 
 
 # Substrings in codex stderr / JSON-RPC error messages that signal the
@@ -471,6 +510,7 @@ class CodexAppServerSession:
         self,
         user_input: Any,
         *,
+        compiled_turn: Optional[CompiledTurn] = None,
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
@@ -491,6 +531,7 @@ class CodexAppServerSession:
         # the caller can render — instead of bubbling raw codex exceptions
         # up to AIAgent.run_conversation.
         result = TurnResult()
+        starting_fresh = self._thread_id is None
         try:
             self.ensure_started()
         except (CodexAppServerError, TimeoutError) as exc:
@@ -514,7 +555,11 @@ class CodexAppServerSession:
             return result
         projector = CodexEventProjector()
 
-        user_input_text = _coerce_turn_input_text(user_input)
+        user_input_text = (
+            _serialize_compiled_turn(compiled_turn)
+            if starting_fresh and compiled_turn is not None
+            else _coerce_turn_input_text(user_input)
+        )
 
         # Send turn/start with the user input. Text-only for now (codex
         # supports rich content but Hermes' text path is the common case).

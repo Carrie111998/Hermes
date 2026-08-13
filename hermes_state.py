@@ -8071,12 +8071,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._check_transcript_write_guards(
                 conn, session_id, compression_lock_holder
             )
+            event_revision = self._allocate_canonical_revisions(
+                conn, session_id, 1
+            )[0]
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active, api_content, display_kind,
+                   display_metadata, event_revision)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -8099,6 +8103,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(display_kind) if isinstance(display_kind, str) else None,
                     display_metadata_json,
+                    event_revision,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -8195,6 +8200,923 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return inserted
 
         # Same criticality as append_message: this IS the turn's transcript.
+        return self._execute_write(
+            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        )
+
+    @staticmethod
+    def _canonical_session_revision(conn, session_id: str) -> int:
+        """Return the monotonic journal revision for one session.
+
+        Pre-v28 message rows have no ``event_revision``. Their globally
+        monotonic row id is a safe migration floor, so an existing session can
+        adopt the native contract without a startup rewrite of every message
+        in a multi-gigabyte state database.
+        """
+        row = conn.execute(
+            "SELECT canonical_revision FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"session not found: {session_id}")
+        stored = int(row[0] or 0)
+        message_row = conn.execute(
+            "SELECT COALESCE(MAX(COALESCE(event_revision, id)), 0) "
+            "FROM messages WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        projection_row = conn.execute(
+            "SELECT COALESCE(MAX(revision), 0) FROM session_projection_revisions "
+            "WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return max(
+            stored,
+            int(message_row[0] or 0),
+            int(projection_row[0] or 0),
+        )
+
+    @classmethod
+    def _allocate_canonical_revisions(
+        cls, conn, session_id: str, count: int
+    ) -> tuple[int, ...]:
+        """Reserve ``count`` ordered revisions inside the caller transaction."""
+        if count < 1:
+            return ()
+        current = cls._canonical_session_revision(conn, session_id)
+        revisions = tuple(range(current + 1, current + count + 1))
+        conn.execute(
+            "UPDATE sessions SET canonical_revision = ? WHERE id = ?",
+            (revisions[-1], session_id),
+        )
+        return revisions
+
+    @classmethod
+    def _record_projection_revision(
+        cls,
+        conn,
+        session_id: str,
+        *,
+        kind: str,
+        source_event_ids: List[int],
+        projected_event_ids: List[int],
+    ) -> int:
+        """Append a rebuildable transcript-projection transition."""
+        revision = cls._allocate_canonical_revisions(conn, session_id, 1)[0]
+        conn.execute(
+            "INSERT INTO session_projection_revisions "
+            "(session_id, revision, kind, source_event_ids, "
+            " projected_event_ids, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                session_id,
+                revision,
+                kind,
+                json.dumps(source_event_ids, separators=(",", ":")),
+                json.dumps(projected_event_ids, separators=(",", ":")),
+                time.time(),
+            ),
+        )
+        return revision
+
+    @classmethod
+    def _rebuild_active_event_ids(cls, conn, session_id: str) -> List[int]:
+        """Rebuild the current transcript projection from journal revisions.
+
+        Legacy sessions with no structural projection record retain their
+        existing active flags as the migration seed. After the first recorded
+        rewrite/checkpoint/rewind/restore, the ordered projected event IDs plus
+        later append revisions are sufficient to reconstruct the live view.
+        """
+        structural = conn.execute(
+            "SELECT revision, projected_event_ids "
+            "FROM session_projection_revisions WHERE session_id = ? "
+            "AND kind IN ('rewrite', 'checkpoint', 'rewind', 'restore') "
+            "ORDER BY revision",
+            (session_id,),
+        ).fetchall()
+        if not structural:
+            return [
+                int(row[0])
+                for row in conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? "
+                    "AND active = 1 ORDER BY COALESCE(event_revision, id), id",
+                    (session_id,),
+                ).fetchall()
+            ]
+
+        active_ids: List[int] = []
+        previous_revision = 0
+        for projection in structural:
+            projection_revision = int(projection["revision"])
+            if previous_revision:
+                appended = conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? "
+                    "AND COALESCE(event_revision, id) > ? "
+                    "AND COALESCE(event_revision, id) < ? "
+                    "ORDER BY COALESCE(event_revision, id), id",
+                    (session_id, previous_revision, projection_revision),
+                ).fetchall()
+                active_ids.extend(int(row[0]) for row in appended)
+            try:
+                projected = json.loads(projection["projected_event_ids"])
+                active_ids = [int(event_id) for event_id in projected]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raise RuntimeError("canonical projection revision is malformed")
+            previous_revision = projection_revision
+
+        appended = conn.execute(
+            "SELECT id FROM messages WHERE session_id = ? "
+            "AND COALESCE(event_revision, id) > ? "
+            "ORDER BY COALESCE(event_revision, id), id",
+            (session_id, previous_revision),
+        ).fetchall()
+        active_ids.extend(int(row[0]) for row in appended)
+        if len(active_ids) != len(set(active_ids)):
+            raise RuntimeError("canonical projection contains duplicate event IDs")
+        return active_ids
+
+    def read_session_snapshot(self, session_id: str, *, authorization):
+        """Read the canonical active transcript through one authorized API.
+
+        This is the native replacement for compatibility code that opens
+        ``state.db`` and reconstructs lineage itself. The caller supplies an
+        authenticated :class:`SessionAuthorization`; no profile or database
+        path participates in identity resolution here.
+        """
+        from agent.session_contracts import (
+            CanonicalSessionEvent,
+            SessionAuthorization,
+            SessionSnapshot,
+        )
+
+        if not isinstance(authorization, SessionAuthorization):
+            raise TypeError("authorization must be SessionAuthorization")
+        authorization.require(session_id)
+
+        with self._read_ctx() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if exists is None:
+                raise KeyError(f"session not found: {session_id}")
+            active_event_ids = self._rebuild_active_event_ids(conn, session_id)
+            if active_event_ids:
+                placeholders = ",".join("?" for _ in active_event_ids)
+                raw_rows = conn.execute(
+                    f"SELECT {self._CONVERSATION_ROW_COLUMNS} FROM messages "
+                    f"WHERE session_id = ? AND id IN ({placeholders})",
+                    (session_id, *active_event_ids),
+                ).fetchall()
+                rows_by_id = {int(row["id"]): row for row in raw_rows}
+                try:
+                    rows = [rows_by_id[event_id] for event_id in active_event_ids]
+                except KeyError as exc:
+                    raise RuntimeError(
+                        "canonical projection references a missing event"
+                    ) from exc
+            else:
+                rows = []
+            revision = self._canonical_session_revision(conn, session_id)
+            lineage_rows = conn.execute(
+                "SELECT kind, source_event_ids, projected_event_ids "
+                "FROM session_projection_revisions WHERE session_id = ? "
+                "ORDER BY revision",
+                (session_id,),
+            ).fetchall()
+
+        lineage: Dict[int, tuple[str, ...]] = {}
+        for lineage_row in lineage_rows:
+            if lineage_row["kind"] not in {"rewrite", "checkpoint"}:
+                continue
+            try:
+                sources = tuple(
+                    f"db:{int(event_id)}"
+                    for event_id in json.loads(lineage_row["source_event_ids"])
+                )
+                projected = tuple(
+                    int(event_id)
+                    for event_id in json.loads(lineage_row["projected_event_ids"])
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raise RuntimeError("canonical projection lineage is malformed")
+            for event_id in projected:
+                lineage[event_id] = sources
+
+        projected = self._rows_to_conversation(
+            rows,
+            session_id=session_id,
+            include_ancestors=False,
+            repair_alternation=False,
+            include_row_ids=True,
+        )
+        events = []
+        for message in projected:
+            row_id = message.pop("_row_id", None)
+            if type(row_id) is not int or row_id < 0:
+                raise RuntimeError("canonical session row is missing durable identity")
+            events.append(
+                CanonicalSessionEvent(
+                    event_id=f"db:{row_id}",
+                    sequence=int(message.pop("_event_revision", None) or row_id),
+                    message=message,
+                    source_event_ids=lineage.get(row_id, ()),
+                )
+            )
+        return SessionSnapshot(
+            session_id=session_id,
+            revision=revision,
+            events=tuple(events),
+        )
+
+    def append_turn(self, command, *, authorization):
+        """Atomically accept one idempotent user turn at an expected revision.
+
+        Acceptance writes both the canonical user event and its durable turn
+        lifecycle row in one transaction. Replaying the same command returns
+        the existing lifecycle state and never appends another event.
+        """
+        from agent.session_contracts import (
+            AppendTurnReceipt,
+            SessionAuthorization,
+            StaleSessionRevisionError,
+            TurnCommand,
+            TurnIdempotencyConflictError,
+            TurnState,
+        )
+
+        if not isinstance(command, TurnCommand):
+            raise TypeError("command must be TurnCommand")
+        if not isinstance(authorization, SessionAuthorization):
+            raise TypeError("authorization must be SessionAuthorization")
+        authorization.require(command.session_id)
+        payload_hash = hashlib.sha256(
+            json.dumps(
+                command.user_event,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+
+        def _session_revision(conn) -> int:
+            return self._canonical_session_revision(conn, command.session_id)
+
+        def _receipt(row, *, appended: bool, session_revision: int):
+            terminal_revision = row["terminal_revision"]
+            return AppendTurnReceipt(
+                session_id=command.session_id,
+                turn_id=str(row["turn_id"]),
+                idempotency_key=str(row["idempotency_key"]),
+                prior_revision=int(row["prior_revision"]),
+                event_revision=int(row["event_revision"] or row["event_row_id"]),
+                session_revision=session_revision,
+                event_id=f"db:{int(row['event_row_id'])}",
+                projection_row_id=int(row["event_row_id"]),
+                appended=appended,
+                state=TurnState(str(row["state"])),
+                attempt=int(row["attempt"] or 0),
+                terminal_revision=(
+                    int(terminal_revision) if terminal_revision is not None else None
+                ),
+            )
+
+        def _do(conn):
+            matches = conn.execute(
+                "SELECT idempotency_key, turn_id, payload_hash, event_row_id, event_revision, "
+                "prior_revision, state, attempt, terminal_revision "
+                "FROM session_turn_commands "
+                "WHERE session_id = ? AND (idempotency_key = ? OR turn_id = ?) "
+                "ORDER BY created_at LIMIT 2",
+                (command.session_id, command.idempotency_key, command.turn_id),
+            ).fetchall()
+            if matches:
+                match = matches[0]
+                if (
+                    len(matches) != 1
+                    or match["idempotency_key"] != command.idempotency_key
+                    or match["turn_id"] != command.turn_id
+                    or match["payload_hash"] != payload_hash
+                ):
+                    raise TurnIdempotencyConflictError(
+                        "turn_id or idempotency_key was reused with a different payload"
+                    )
+                return _receipt(
+                    match,
+                    appended=False,
+                    session_revision=_session_revision(conn),
+                )
+
+            self._check_transcript_write_guards(conn, command.session_id, None)
+            exists = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?",
+                (command.session_id,),
+            ).fetchone()
+            if exists is None:
+                raise KeyError(f"session not found: {command.session_id}")
+            current = _session_revision(conn)
+            if current != command.expected_revision:
+                raise StaleSessionRevisionError(
+                    f"expected revision {command.expected_revision}, current is {current}"
+                )
+
+            row = dict(command.user_event)
+            inserted, _tool_calls = self._insert_message_rows(
+                conn,
+                command.session_id,
+                [row],
+            )
+            if inserted != 1 or type(row.get("_row_id")) is not int:
+                raise RuntimeError("canonical turn append did not create one event")
+            event_row_id = int(row["_row_id"])
+            event_revision = int(row["_event_revision"])
+            conn.execute(
+                "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+                (command.session_id,),
+            )
+            conn.execute(
+                "INSERT INTO session_turn_commands "
+                "(session_id, idempotency_key, turn_id, payload_hash, "
+                " event_row_id, event_revision, prior_revision, state, attempt, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'accepted', 0, ?, ?)",
+                (
+                    command.session_id,
+                    command.idempotency_key,
+                    command.turn_id,
+                    payload_hash,
+                    event_row_id,
+                    event_revision,
+                    current,
+                    time.time(),
+                    time.time(),
+                ),
+            )
+            return AppendTurnReceipt(
+                session_id=command.session_id,
+                turn_id=command.turn_id,
+                idempotency_key=command.idempotency_key,
+                prior_revision=current,
+                event_revision=event_revision,
+                session_revision=event_revision,
+                event_id=f"db:{event_row_id}",
+                projection_row_id=event_row_id,
+                appended=True,
+                state=TurnState.ACCEPTED,
+            )
+
+        return self._execute_write(
+            _do,
+            patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+        )
+
+    def get_turn(self, command, *, authorization):
+        """Return an existing command's lifecycle without mutating the journal.
+
+        The full command is required so an idempotency-key or turn-ID collision
+        is rejected instead of being mistaken for a harmless delivery replay.
+        """
+        from agent.session_contracts import (
+            AppendTurnReceipt,
+            SessionAuthorization,
+            TurnCommand,
+            TurnIdempotencyConflictError,
+            TurnState,
+        )
+
+        if not isinstance(command, TurnCommand):
+            raise TypeError("command must be TurnCommand")
+        if not isinstance(authorization, SessionAuthorization):
+            raise TypeError("authorization must be SessionAuthorization")
+        authorization.require(command.session_id)
+        payload_hash = hashlib.sha256(
+            json.dumps(
+                command.user_event,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+
+        with self._read_ctx() as conn:
+            matches = conn.execute(
+                "SELECT idempotency_key, turn_id, payload_hash, event_row_id, event_revision, "
+                "prior_revision, state, attempt, terminal_revision "
+                "FROM session_turn_commands "
+                "WHERE session_id = ? AND (idempotency_key = ? OR turn_id = ?) "
+                "ORDER BY created_at LIMIT 2",
+                (command.session_id, command.idempotency_key, command.turn_id),
+            ).fetchall()
+            if not matches:
+                return None
+            match = matches[0]
+            if (
+                len(matches) != 1
+                or match["idempotency_key"] != command.idempotency_key
+                or match["turn_id"] != command.turn_id
+                or match["payload_hash"] != payload_hash
+            ):
+                raise TurnIdempotencyConflictError(
+                    "turn_id or idempotency_key was reused with a different payload"
+                )
+            session_revision = self._canonical_session_revision(
+                conn, command.session_id
+            )
+        terminal_revision = match["terminal_revision"]
+        return AppendTurnReceipt(
+            session_id=command.session_id,
+            turn_id=str(match["turn_id"]),
+            idempotency_key=str(match["idempotency_key"]),
+            prior_revision=int(match["prior_revision"]),
+            event_revision=int(match["event_revision"] or match["event_row_id"]),
+            session_revision=session_revision,
+            event_id=f"db:{int(match['event_row_id'])}",
+            projection_row_id=int(match["event_row_id"]),
+            appended=False,
+            state=TurnState(str(match["state"])),
+            attempt=int(match["attempt"] or 0),
+            terminal_revision=(
+                int(terminal_revision) if terminal_revision is not None else None
+            ),
+        )
+
+    def claim_turn_execution(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        owner_id: str,
+        lease_seconds: float,
+        authorization,
+    ):
+        """Claim or renew the exclusive execution lease for an accepted turn.
+
+        Another owner may reclaim only after the durable lease expires. The
+        transcript append and this claim are separate on purpose: a process
+        can die after accepting a command but before starting inference, and a
+        replacement coordinator can then execute the already-durable input.
+        """
+        from agent.session_contracts import (
+            SessionAuthorization,
+            TurnExecutionLease,
+            TurnLeaseConflictError,
+            TurnState,
+        )
+
+        if not isinstance(authorization, SessionAuthorization):
+            raise TypeError("authorization must be SessionAuthorization")
+        authorization.require(session_id)
+        if not turn_id.strip():
+            raise ValueError("turn_id must not be empty")
+        if not owner_id.strip():
+            raise ValueError("owner_id must not be empty")
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+
+        now = time.time()
+        expires = now + float(lease_seconds)
+
+        def _do(conn):
+            self._check_transcript_write_guards(conn, session_id, None)
+            row = conn.execute(
+                "SELECT state, attempt, lease_owner, lease_expires_at "
+                "FROM session_turn_commands WHERE session_id = ? AND turn_id = ?",
+                (session_id, turn_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"turn not found: {turn_id}")
+            state = TurnState(str(row["state"]))
+            current_owner = str(row["lease_owner"] or "")
+            current_expiry = float(row["lease_expires_at"] or 0.0)
+            if state in {TurnState.COMPLETED, TurnState.FAILED, TurnState.CANCELED}:
+                raise TurnLeaseConflictError(f"turn is already {state.value}")
+            if (
+                state is TurnState.RUNNING
+                and current_owner != owner_id
+                and current_expiry > now
+            ):
+                raise TurnLeaseConflictError("turn execution lease is already held")
+
+            same_owner = state is TurnState.RUNNING and current_owner == owner_id
+            attempt = int(row["attempt"] or 0) + (0 if same_owner else 1)
+            conn.execute(
+                "UPDATE session_turn_commands SET state = 'running', attempt = ?, "
+                "lease_owner = ?, lease_expires_at = ?, updated_at = ? "
+                "WHERE session_id = ? AND turn_id = ?",
+                (attempt, owner_id, expires, now, session_id, turn_id),
+            )
+            return TurnExecutionLease(
+                session_id=session_id,
+                turn_id=turn_id,
+                owner_id=owner_id,
+                attempt=attempt,
+                lease_expires_at=expires,
+            )
+
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
+    def renew_turn_execution(
+        self,
+        lease,
+        *,
+        lease_seconds: float,
+        authorization,
+    ):
+        """Extend an execution lease while preserving its owner and attempt."""
+        from agent.session_contracts import (
+            SessionAuthorization,
+            TurnExecutionLease,
+            TurnLeaseConflictError,
+        )
+
+        if not isinstance(lease, TurnExecutionLease):
+            raise TypeError("lease must be TurnExecutionLease")
+        if not isinstance(authorization, SessionAuthorization):
+            raise TypeError("authorization must be SessionAuthorization")
+        authorization.require(lease.session_id)
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        now = time.time()
+        expires = now + float(lease_seconds)
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT state, attempt, lease_owner FROM session_turn_commands "
+                "WHERE session_id = ? AND turn_id = ?",
+                (lease.session_id, lease.turn_id),
+            ).fetchone()
+            if (
+                row is None
+                or str(row["state"]) != "running"
+                or str(row["lease_owner"] or "") != lease.owner_id
+                or int(row["attempt"] or 0) != lease.attempt
+            ):
+                raise TurnLeaseConflictError("turn execution lease is no longer owned")
+            conn.execute(
+                "UPDATE session_turn_commands SET lease_expires_at = ?, updated_at = ? "
+                "WHERE session_id = ? AND turn_id = ?",
+                (expires, now, lease.session_id, lease.turn_id),
+            )
+            return TurnExecutionLease(
+                session_id=lease.session_id,
+                turn_id=lease.turn_id,
+                owner_id=lease.owner_id,
+                attempt=lease.attempt,
+                lease_expires_at=expires,
+            )
+
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
+    def finish_turn_execution(
+        self,
+        lease,
+        *,
+        state,
+        authorization,
+        reason: str | None = None,
+    ):
+        """Commit a terminal lifecycle state after transcript events flush."""
+        from agent.session_contracts import (
+            AppendTurnReceipt,
+            SessionAuthorization,
+            TurnExecutionLease,
+            TurnLeaseConflictError,
+            TurnState,
+        )
+
+        if not isinstance(lease, TurnExecutionLease):
+            raise TypeError("lease must be TurnExecutionLease")
+        if not isinstance(authorization, SessionAuthorization):
+            raise TypeError("authorization must be SessionAuthorization")
+        authorization.require(lease.session_id)
+        try:
+            terminal_state = state if isinstance(state, TurnState) else TurnState(state)
+        except ValueError as exc:
+            raise ValueError("state must be completed, failed, or canceled") from exc
+        if terminal_state not in {
+            TurnState.COMPLETED,
+            TurnState.FAILED,
+            TurnState.CANCELED,
+        }:
+            raise ValueError("state must be completed, failed, or canceled")
+        terminal_reason = str(reason or "").strip()[:128] or None
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT idempotency_key, turn_id, event_row_id, event_revision, prior_revision, "
+                "state, attempt, lease_owner, terminal_revision "
+                "FROM session_turn_commands WHERE session_id = ? AND turn_id = ?",
+                (lease.session_id, lease.turn_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"turn not found: {lease.turn_id}")
+            existing_state = TurnState(str(row["state"]))
+            if existing_state is terminal_state:
+                session_revision = self._canonical_session_revision(
+                    conn, lease.session_id
+                )
+                return AppendTurnReceipt(
+                    session_id=lease.session_id,
+                    turn_id=lease.turn_id,
+                    idempotency_key=str(row["idempotency_key"]),
+                    prior_revision=int(row["prior_revision"]),
+                    event_revision=int(row["event_revision"] or row["event_row_id"]),
+                    session_revision=session_revision,
+                    event_id=f"db:{int(row['event_row_id'])}",
+                    projection_row_id=int(row["event_row_id"]),
+                    appended=False,
+                    state=existing_state,
+                    attempt=int(row["attempt"] or 0),
+                    terminal_revision=(
+                        int(row["terminal_revision"])
+                        if row["terminal_revision"] is not None
+                        else session_revision
+                    ),
+                )
+            if (
+                existing_state is not TurnState.RUNNING
+                or str(row["lease_owner"] or "") != lease.owner_id
+                or int(row["attempt"] or 0) != lease.attempt
+            ):
+                raise TurnLeaseConflictError("turn execution lease is no longer owned")
+            session_revision = self._canonical_session_revision(
+                conn, lease.session_id
+            )
+            conn.execute(
+                "UPDATE session_turn_commands SET state = ?, terminal_revision = ?, "
+                "terminal_reason = ?, lease_owner = NULL, lease_expires_at = NULL, "
+                "updated_at = ? WHERE session_id = ? AND turn_id = ?",
+                (
+                    terminal_state.value,
+                    session_revision,
+                    terminal_reason,
+                    now,
+                    lease.session_id,
+                    lease.turn_id,
+                ),
+            )
+            return AppendTurnReceipt(
+                session_id=lease.session_id,
+                turn_id=lease.turn_id,
+                idempotency_key=str(row["idempotency_key"]),
+                prior_revision=int(row["prior_revision"]),
+                event_revision=int(row["event_revision"] or row["event_row_id"]),
+                session_revision=session_revision,
+                event_id=f"db:{int(row['event_row_id'])}",
+                projection_row_id=int(row["event_row_id"]),
+                appended=False,
+                state=terminal_state,
+                attempt=int(row["attempt"] or 0),
+                terminal_revision=session_revision,
+            )
+
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
+    def begin_tool_execution(
+        self,
+        session_id: str,
+        turn_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        *,
+        may_have_side_effect: bool,
+    ):
+        """Claim or replay one tool call inside a canonical running turn.
+
+        Returns ``None`` for a legacy (non-native) turn so existing callers keep
+        their historical behavior. For native turns, the unique durable key is
+        claimed before dispatch. A completed result is replayed; a safe
+        no-effect call abandoned by a crashed process may run again; an
+        effect-capable abandoned call becomes explicitly uncertain and is not
+        dispatched a second time.
+        """
+        from agent.session_contracts import ToolExecutionReceipt, ToolExecutionState
+
+        if not session_id or not turn_id or not tool_call_id or not tool_name:
+            raise ValueError("canonical tool execution identity must not be empty")
+        payload_hash = hashlib.sha256(
+            json.dumps(
+                {"tool_name": tool_name, "arguments": arguments},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        now = time.time()
+
+        def _decode_result(value):
+            if value is None:
+                return None
+            try:
+                return json.loads(value)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("stored canonical tool result is malformed") from exc
+
+        def _receipt(row, *, execute: bool, state=None, result=None):
+            resolved_state = state or ToolExecutionState(str(row["state"]))
+            return ToolExecutionReceipt(
+                session_id=session_id,
+                turn_id=turn_id,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                payload_hash=payload_hash,
+                state=resolved_state,
+                attempt=int(row["attempt"] or 0),
+                execute=execute,
+                result=(
+                    _decode_result(row["result_json"])
+                    if result is None and row["result_json"] is not None
+                    else result
+                ),
+            )
+
+        def _do(conn):
+            turn = conn.execute(
+                "SELECT state FROM session_turn_commands "
+                "WHERE session_id = ? AND turn_id = ?",
+                (session_id, turn_id),
+            ).fetchone()
+            if turn is None:
+                return None
+            if str(turn["state"]) != "running":
+                raise RuntimeError("canonical tool call requires a running turn")
+            row = conn.execute(
+                "SELECT tool_name, payload_hash, state, may_have_side_effect, "
+                "result_json, attempt FROM session_tool_executions "
+                "WHERE session_id = ? AND turn_id = ? AND tool_call_id = ?",
+                (session_id, turn_id, tool_call_id),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO session_tool_executions "
+                    "(session_id, turn_id, tool_call_id, tool_name, payload_hash, "
+                    " state, may_have_side_effect, attempt, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'running', ?, 1, ?, ?)",
+                    (
+                        session_id,
+                        turn_id,
+                        tool_call_id,
+                        tool_name,
+                        payload_hash,
+                        1 if may_have_side_effect else 0,
+                        now,
+                        now,
+                    ),
+                )
+                return ToolExecutionReceipt(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    payload_hash=payload_hash,
+                    state=ToolExecutionState.RUNNING,
+                    attempt=1,
+                    execute=True,
+                )
+            if row["tool_name"] != tool_name or row["payload_hash"] != payload_hash:
+                raise RuntimeError(
+                    "tool_call_id was reused with a different tool payload"
+                )
+            state = ToolExecutionState(str(row["state"]))
+            if state is ToolExecutionState.COMPLETED:
+                return _receipt(row, execute=False)
+            if state is ToolExecutionState.UNCERTAIN:
+                return _receipt(row, execute=False)
+            if bool(row["may_have_side_effect"]):
+                uncertain = {
+                    "error": "Tool outcome is uncertain after coordinator restart; "
+                    "Hermes did not execute it again because it may have external side effects.",
+                    "status": "uncertain",
+                    "tool_call_id": tool_call_id,
+                }
+                uncertain_result = json.dumps(
+                    uncertain, ensure_ascii=False, separators=(",", ":")
+                )
+                encoded = json.dumps(uncertain_result, ensure_ascii=False)
+                conn.execute(
+                    "UPDATE session_tool_executions SET state = 'uncertain', "
+                    "result_json = ?, updated_at = ? WHERE session_id = ? "
+                    "AND turn_id = ? AND tool_call_id = ?",
+                    (encoded, now, session_id, turn_id, tool_call_id),
+                )
+                updated = dict(row)
+                updated["state"] = "uncertain"
+                updated["result_json"] = encoded
+                return _receipt(updated, execute=False)
+            attempt = int(row["attempt"] or 0) + 1
+            conn.execute(
+                "UPDATE session_tool_executions SET attempt = ?, updated_at = ? "
+                "WHERE session_id = ? AND turn_id = ? AND tool_call_id = ?",
+                (attempt, now, session_id, turn_id, tool_call_id),
+            )
+            updated = dict(row)
+            updated["attempt"] = attempt
+            return _receipt(updated, execute=True)
+
+        return self._execute_write(
+            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        )
+
+    def complete_tool_execution(self, receipt, result: Any):
+        """Persist the exact result before it is appended to the transcript."""
+        from agent.session_contracts import ToolExecutionReceipt, ToolExecutionState
+
+        if not isinstance(receipt, ToolExecutionReceipt):
+            raise TypeError("receipt must be ToolExecutionReceipt")
+        if not receipt.execute or receipt.state is not ToolExecutionState.RUNNING:
+            raise ValueError("only an executing tool receipt can be completed")
+        encoded = json.dumps(
+            result, ensure_ascii=False, separators=(",", ":"), default=str
+        )
+        now = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE session_tool_executions SET state = 'completed', "
+                "result_json = ?, updated_at = ? WHERE session_id = ? "
+                "AND turn_id = ? AND tool_call_id = ? AND payload_hash = ? "
+                "AND state = 'running' AND attempt = ?",
+                (
+                    encoded,
+                    now,
+                    receipt.session_id,
+                    receipt.turn_id,
+                    receipt.tool_call_id,
+                    receipt.payload_hash,
+                    receipt.attempt,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("canonical tool execution claim was lost")
+            return ToolExecutionReceipt(
+                session_id=receipt.session_id,
+                turn_id=receipt.turn_id,
+                tool_call_id=receipt.tool_call_id,
+                tool_name=receipt.tool_name,
+                payload_hash=receipt.payload_hash,
+                state=ToolExecutionState.COMPLETED,
+                attempt=receipt.attempt,
+                execute=False,
+                result=result,
+            )
+
+        return self._execute_write(
+            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        )
+
+    def mark_tool_execution_uncertain(self, receipt, error: BaseException | str):
+        """Fence an effect-capable call whose dispatch raised after starting."""
+        from agent.session_contracts import ToolExecutionReceipt, ToolExecutionState
+
+        if not isinstance(receipt, ToolExecutionReceipt):
+            raise TypeError("receipt must be ToolExecutionReceipt")
+        uncertain = {
+            "error": "Tool outcome is uncertain; Hermes will not execute it again "
+            "automatically because it may have external side effects.",
+            "status": "uncertain",
+            "tool_call_id": receipt.tool_call_id,
+            "cause": str(error)[:512],
+        }
+        uncertain_result = json.dumps(
+            uncertain, ensure_ascii=False, separators=(",", ":")
+        )
+        encoded = json.dumps(uncertain_result, ensure_ascii=False)
+        now = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE session_tool_executions SET state = 'uncertain', "
+                "result_json = ?, updated_at = ? WHERE session_id = ? "
+                "AND turn_id = ? AND tool_call_id = ? AND payload_hash = ? "
+                "AND state = 'running' AND attempt = ?",
+                (
+                    encoded,
+                    now,
+                    receipt.session_id,
+                    receipt.turn_id,
+                    receipt.tool_call_id,
+                    receipt.payload_hash,
+                    receipt.attempt,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("canonical tool execution claim was lost")
+            return ToolExecutionReceipt(
+                session_id=receipt.session_id,
+                turn_id=receipt.turn_id,
+                tool_call_id=receipt.tool_call_id,
+                tool_name=receipt.tool_name,
+                payload_hash=receipt.payload_hash,
+                state=ToolExecutionState.UNCERTAIN,
+                attempt=receipt.attempt,
+                execute=False,
+                result=uncertain_result,
+            )
+
         return self._execute_write(
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
@@ -8453,7 +9375,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         now_ts = time.time()
         inserted = 0
         tool_calls_total = 0
-        for msg in messages:
+        event_revisions = self._allocate_canonical_revisions(
+            conn, session_id, len(messages)
+        )
+        for msg, event_revision in zip(messages, event_revisions):
             role = msg.get("role", "unknown")
             tool_calls = msg.get("tool_calls")
             message_timestamp = now_ts
@@ -8498,8 +9423,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active, api_content, display_kind,
+                   display_metadata, event_revision)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -8522,10 +9448,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(msg.get("display_kind")) if isinstance(msg.get("display_kind"), str) else None,
                     self._encode_display_metadata(msg.get("display_metadata")),
+                    event_revision,
                 ),
             )
             if isinstance(msg, dict) and cur.lastrowid is not None:
                 msg["_row_id"] = cur.lastrowid
+                msg["_event_revision"] = event_revision
             inserted += 1
             if tool_calls is not None:
                 tool_calls_total += (
@@ -8544,13 +9472,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Atomically replace the stored messages for a session.
 
         Used by transcript-rewrite flows such as /retry, /undo, and /compress.
-        The delete + reinsert sequence must commit as one transaction so a
+        The archive + append sequence must commit as one transaction so a
         mid-rewrite failure does not leave SQLite with a partial transcript.
 
-        DESTRUCTIVE by default: every row for the session is DELETEd (and drops
-        out of the FTS index). For compaction that must preserve the
-        pre-compaction transcript under the same id, use
-        :meth:`archive_and_compact` instead.
+        Canonical message events are append-only for the lifetime of the
+        session. Replacement soft-archives the prior active projection and
+        appends the replacement as new events; it never DELETEs source rows.
+        A projection-revision row records both event sets so the active
+        transcript can be rebuilt without trusting mutable ``active`` flags.
 
         Pass ``active_only=True`` to replace ONLY the live (``active = 1``) rows,
         leaving soft-archived rows (``active = 0`` — e.g. the ``compacted = 1``
@@ -8561,22 +9490,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         archived. ``message_count``/``tool_call_count`` then track the live set,
         matching :meth:`archive_and_compact`.
 
-        Pass ``archive_dropped=True`` to SOFT-archive the live rows instead of
-        DELETEing them: the replaced turns stay on disk with ``active = 0``,
-        ``compacted = 0`` — the same "the user took it back" marking
-        :meth:`rewind_to_message` applies — and stay readable via
-        :meth:`get_messages` with ``include_inactive=True``. This is the mode a
-        rewind/edit/regenerate must use: those flows overwrite a transcript the
-        user may not have meant to drop, and a plain DELETE also evicts the rows
-        from the FTS index, leaving nothing to recover from (#82756). It implies
-        active-only handling — already-archived rows are never touched — so
-        ``active_only`` is redundant with it. The rewritten set is inserted as
-        fresh active rows exactly as in the destructive path, so the live view
-        is identical either way; only the durability of the dropped turns
-        differs.
+        ``active_only`` and ``archive_dropped`` remain accepted for API
+        compatibility. Both now select the same durable behavior; already
+        inactive historical rows are never touched.
         """
-
-        active_clause = " AND active = 1" if active_only else ""
 
         def _do(conn):
             session = conn.execute(
@@ -8589,28 +9506,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 and session["end_reason"] == "compression"
             ):
                 raise CompressionSessionClosedError(session_id)
-            if archive_dropped:
-                # Content-preserving UPDATE: the rows keep their FTS entries
-                # (the messages_fts triggers fire on INSERT / DELETE / UPDATE
-                # of content columns, not on `active`), so the replaced turns
-                # stay readable via get_messages(include_inactive=True) and
-                # searchable with include_inactive=True after the rewrite.
-                conn.execute(
-                    "UPDATE messages SET active = 0 "
-                    "WHERE session_id = ? AND active = 1",
+            source_ids = [
+                int(row[0])
+                for row in conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? "
+                    "AND active = 1 ORDER BY id",
                     (session_id,),
-                )
-            else:
-                conn.execute(
-                    f"DELETE FROM messages WHERE session_id = ?{active_clause}",
-                    (session_id,),
-                )
+                ).fetchall()
+            ]
+            conn.execute(
+                "UPDATE messages SET active = 0, compacted = 0 "
+                "WHERE session_id = ? AND active = 1",
+                (session_id,),
+            )
             conn.execute(
                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
                 (session_id,),
             )
             total_messages, total_tool_calls = self._insert_message_rows(
                 conn, session_id, messages
+            )
+            projected_ids = [
+                int(msg["_row_id"])
+                for msg in messages
+                if isinstance(msg, dict) and type(msg.get("_row_id")) is int
+            ]
+            self._record_projection_revision(
+                conn,
+                session_id,
+                kind="rewrite",
+                source_event_ids=source_ids,
+                projected_event_ids=projected_ids,
             )
             conn.execute(
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
@@ -8677,6 +9603,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     conn, session_id, model_config_patch, on_missing="raise"
                 )
 
+            source_ids = [
+                int(row[0])
+                for row in conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? "
+                    "AND active = 1 ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+            ]
+
             # Soft-archive the live turns: active=0 hides them from the live
             # context load, compacted=1 marks them as "summarized away" (vs
             # rewind/undo's active=0+compacted=0, which means "user took it
@@ -8690,6 +9625,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, compacted_messages
+            )
+            projected_ids = [
+                int(msg["_row_id"])
+                for msg in compacted_messages
+                if isinstance(msg, dict) and type(msg.get("_row_id")) is int
+            ]
+            self._record_projection_revision(
+                conn,
+                session_id,
+                kind="checkpoint",
+                source_event_ids=source_ids,
+                projected_event_ids=projected_ids,
             )
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
@@ -8739,6 +9686,53 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return cursor.rowcount
 
         return self._execute_write(_do)
+
+    def set_user_event_api_content(
+        self,
+        session_id: str,
+        event_row_id: int,
+        content: Any,
+        api_content: str,
+    ) -> int:
+        """Persist an accepted turn's API sidecar on its exact canonical row.
+
+        Native append persists the clean user event before inference. Later
+        memory/plugin prefetch composes the actual model-visible bytes; the
+        ordinary flush intentionally skips the already-durable row. Addressing
+        the row from the append receipt avoids the legacy "latest matching"
+        heuristic and records a projection revision because replay semantics
+        changed even though the clean transcript content did not.
+        """
+        encoded = self._encode_content(content)
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT id, api_content FROM messages "
+                "WHERE id = ? AND session_id = ? AND role = 'user' "
+                "AND active = 1 AND content IS ?",
+                (int(event_row_id), session_id, encoded),
+            ).fetchone()
+            if row is None:
+                return 0
+            scrubbed = _scrub_surrogates(api_content)
+            if row["api_content"] == scrubbed:
+                return 1
+            conn.execute(
+                "UPDATE messages SET api_content = ? WHERE id = ?",
+                (scrubbed, int(event_row_id)),
+            )
+            self._record_projection_revision(
+                conn,
+                session_id,
+                kind="sidecar",
+                source_event_ids=[int(event_row_id)],
+                projected_event_ids=[int(event_row_id)],
+            )
+            return 1
+
+        return self._execute_write(
+            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        )
 
     def get_messages(
         self,
@@ -9065,7 +10059,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
-        "api_content, display_kind, display_metadata"
+        "api_content, display_kind, display_metadata, event_revision"
     )
 
     def _rows_to_conversation(
@@ -9098,6 +10092,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # strips it before the wire.
             if include_row_ids and row["id"] is not None:
                 msg["_row_id"] = row["id"]
+                msg["_event_revision"] = row["event_revision"] or row["id"]
             # api_content is the byte-fidelity sidecar: the exact string sent
             # to the API when it differed from the clean content. Returned
             # VERBATIM — no sanitize_context, no strip — because the replay
@@ -9483,6 +10478,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rewound: List[int] = []
 
         def _do(conn):
+            source_ids = [
+                int(r[0])
+                for r in conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? "
+                    "AND active = 1 ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+            ]
             cursor = conn.execute(
                 "SELECT id FROM messages "
                 "WHERE session_id = ? AND id >= ? AND active = 1",
@@ -9499,6 +10502,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "UPDATE sessions SET rewind_count = COALESCE(rewind_count, 0) + 1 "
                 "WHERE id = ?",
                 (session_id,),
+            )
+            projected_ids = [event_id for event_id in source_ids if event_id not in ids]
+            self._record_projection_revision(
+                conn,
+                session_id,
+                kind="rewind",
+                source_event_ids=source_ids,
+                projected_event_ids=projected_ids,
             )
             return ids
 
@@ -9526,6 +10537,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         slash command in v1.
         """
         def _do(conn):
+            source_ids = [
+                int(r[0])
+                for r in conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? "
+                    "AND active = 1 ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+            ]
             cursor = conn.execute(
                 "SELECT id FROM messages "
                 "WHERE session_id = ? AND id >= ? AND active = 0",
@@ -9538,6 +10557,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"UPDATE messages SET active = 1 WHERE id IN ({placeholders})",
                     ids,
                 )
+            projected_ids = [
+                int(r[0])
+                for r in conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? "
+                    "AND active = 1 ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+            ]
+            self._record_projection_revision(
+                conn,
+                session_id,
+                kind="restore",
+                source_event_ids=source_ids,
+                projected_event_ids=projected_ids,
+            )
             return len(ids)
 
         return self._execute_write(_do)

@@ -13,9 +13,10 @@ sites, fixed here:
   ``replace_messages`` deleted the archived transcript on every
   edit/regenerate of a compacted session.  Now ``active_only=True``.
 
-Behavior contract on a fresh (never-compacted) session: every row is
-``active=1``, so the active-only replace is identical to the full replace —
-also pinned below.
+The v28 canonical journal makes every replacement append-only: prior active
+rows become inactive source events and a projection revision addresses the new
+live set. ``active_only`` remains a compatibility argument rather than a
+destructive-storage switch.
 """
 
 import pytest
@@ -62,7 +63,10 @@ class TestAcpPersistPreservesArchives:
         """The ACP _persist fallback replace must not delete archived rows."""
         sid = "acp-compacted"
         _seed_compacted_session(state_db, sid)
-        assert _archived_count(state_db, sid) == 4
+        archived_before = {
+            m["id"] for m in state_db.get_messages(sid, include_inactive=True)
+            if not m["active"]
+        }
 
         # Drive the exact replace the non-owned-agent branch of _persist now
         # performs (active_only=True unconditionally, no probe).
@@ -72,7 +76,11 @@ class TestAcpPersistPreservesArchives:
         ]
         state_db.replace_messages(sid, new_history, active_only=True)
 
-        assert _archived_count(state_db, sid) == 4
+        archived_after = {
+            m["id"] for m in state_db.get_messages(sid, include_inactive=True)
+            if not m["active"]
+        }
+        assert archived_before < archived_after
         live = [
             m for m in state_db.get_messages_as_conversation(sid)
             if m.get("role") in ("user", "assistant")
@@ -100,10 +108,8 @@ class TestAcpPersistPreservesArchives:
         )
         assert "active_only=True" in src
 
-    def test_fresh_session_active_only_equals_full_replace(self, state_db):
-        """On a never-compacted session active_only=True must behave exactly
-        like the historical full replace (the safety claim the unconditional
-        switch rests on)."""
+    def test_fresh_session_active_only_preserves_source_events(self, state_db):
+        """A fresh-session rewrite changes the live view without deleting source events."""
         sid = "acp-fresh"
         state_db.create_session(sid, "test")
         state_db.append_messages_batch(
@@ -121,7 +127,7 @@ class TestAcpPersistPreservesArchives:
             if m.get("role") in ("user", "assistant")
         ]
         assert [m["content"] for m in rows] == ["only"]
-        assert _archived_count(state_db, sid) == 0
+        assert _archived_count(state_db, sid) == 2
 
 
 class TestTuiPromptTruncationPreservesArchives:
@@ -146,12 +152,19 @@ class TestTuiPromptTruncationPreservesArchives:
         compacted session and assert the archive survives."""
         sid = "tui-compacted"
         _seed_compacted_session(state_db, sid)
-        assert _archived_count(state_db, sid) == 4
+        archived_before = {
+            m["id"] for m in state_db.get_messages(sid, include_inactive=True)
+            if not m["active"]
+        }
 
         truncated = [{"role": "user", "content": "kept head"}]
         state_db.replace_messages(sid, truncated, active_only=True)
 
-        assert _archived_count(state_db, sid) == 4
+        archived_after = {
+            m["id"] for m in state_db.get_messages(sid, include_inactive=True)
+            if not m["active"]
+        }
+        assert archived_before < archived_after
         live = [
             m for m in state_db.get_messages_as_conversation(sid)
             if m.get("role") in ("user", "assistant")
@@ -160,15 +173,7 @@ class TestTuiPromptTruncationPreservesArchives:
 
 
 class TestArchiveDroppedIsRecoverable:
-    """`active_only=True` protects rows archived EARLIER; it still DELETEs the
-    live ones it replaces.
-
-    That is the last write standing between a mis-aimed rewind and permanent
-    loss, and all three reported incidents (#70516, #80763, #82756) ended
-    there with an empty WAL, no `active=0` rows and an FTS entry dropped in
-    sync. `archive_dropped=True` keeps the replaced turns on disk under the
-    same "the user took it back" marking `rewind_to_message` uses.
-    """
+    """Every replacement keeps immutable source events; legacy flags are compatible."""
 
     def test_dropped_turns_survive_as_inactive_rows(self, state_db):
         sid = "archive-dropped"
@@ -240,8 +245,8 @@ class TestArchiveDroppedIsRecoverable:
         assert archived, "the replaced rows must still be on disk"
         assert all(not m.get("compacted") for m in archived)
 
-    def test_default_stays_destructive(self, state_db):
-        """The other three callers must be untouched by the new parameter."""
+    def test_default_is_append_only(self, state_db):
+        """A caller cannot bypass canonical durability by omitting flags."""
         sid = "archive-default"
         state_db.create_session(sid, "test")
         state_db.append_messages_batch(
@@ -254,7 +259,7 @@ class TestArchiveDroppedIsRecoverable:
 
         state_db.replace_messages(sid, [{"role": "user", "content": "fresh"}])
 
-        assert not [
+        assert [
             m for m in state_db.get_messages(sid, include_inactive=True)
             if not m["active"]
         ]

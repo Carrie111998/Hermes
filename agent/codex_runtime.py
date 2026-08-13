@@ -16,6 +16,7 @@ compatibility.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -25,6 +26,147 @@ from typing import Any, Callable, Dict, List
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
 logger = logging.getLogger(__name__)
+
+
+def _provider_message(message: Dict[str, Any], *, current: bool = False) -> dict:
+    """Clone one Hermes transcript row into provider-neutral message shape."""
+    cloned = json.loads(json.dumps(message, ensure_ascii=False, default=str))
+    api_content = cloned.pop("api_content", None)
+    cloned.pop("_db_persisted", None)
+    cloned.pop("_row_id", None)
+    cloned.pop("display_kind", None)
+    cloned.pop("display_metadata", None)
+    if isinstance(api_content, str) and api_content and not current:
+        # Reproduce the exact historical input that generated subsequent
+        # assistant/tool events. Current codex-app-server turns do not stamp
+        # api_content today, so current=True keeps the operator's input.
+        cloned["content"] = api_content
+    return cloned
+
+
+def _compile_codex_app_server_input(
+    agent: Any,
+    *,
+    messages: List[Dict[str, Any]],
+    user_message: Any,
+    effective_task_id: str,
+    active_system_prompt: str | None = None,
+    current_turn_user_idx: int | None = None,
+):
+    """Bridge today's message list into the shared Hermes compiler contract.
+
+    The synthetic ``legacy:`` event identities are an explicit migration
+    bridge for live rows that predate the canonical journal contract. Resumed
+    DB rows retain their durable ``_row_id`` identity. This function performs
+    no provider I/O, so typed compilation failures stop before a Codex process
+    or thread is created.
+    """
+    from agent.context_compiler import compile_turn, resolve_runtime_capabilities
+    from agent.session_contracts import (
+        CanonicalSessionEvent,
+        SessionSnapshot,
+        ToolCatalogSnapshot,
+        TurnCommand,
+    )
+
+    if current_turn_user_idx is None:
+        current_turn_user_idx = len(messages) - 1
+    current_event_id = None
+    if not (0 <= current_turn_user_idx < len(messages)):
+        current_message = {"role": "user", "content": user_message}
+        history = list(messages)
+    else:
+        candidate = messages[current_turn_user_idx]
+        candidate_row_id = candidate.get("_row_id")
+        if type(candidate_row_id) is int and candidate_row_id >= 0:
+            current_event_id = f"db:{candidate_row_id}"
+        current_message = (
+            _provider_message(candidate, current=True)
+            if candidate.get("role") == "user"
+            else {"role": "user", "content": user_message}
+        )
+        history = [
+            message
+            for index, message in enumerate(messages)
+            if index != current_turn_user_idx
+        ]
+
+    canonical_events = []
+    for sequence, message in enumerate(history):
+        provider_message = _provider_message(message)
+        row_id = message.get("_row_id")
+        if type(row_id) is int and row_id >= 0:
+            event_id = f"db:{row_id}"
+        else:
+            digest = hashlib.sha256(
+                json.dumps(
+                    provider_message,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()[:16]
+            event_id = f"legacy:{sequence}:{digest}"
+        canonical_events.append(
+            CanonicalSessionEvent(
+                event_id=event_id,
+                sequence=sequence,
+                message=provider_message,
+            )
+        )
+
+    session_id = getattr(agent, "session_id", None)
+    if not isinstance(session_id, str) or not session_id.strip():
+        session_id = f"task:{effective_task_id}"
+    revision = len(canonical_events)
+    turn_id = effective_task_id or f"{session_id}:turn:{revision + 1}"
+
+    prompt = active_system_prompt
+    if not isinstance(prompt, str):
+        prompt = getattr(agent, "_cached_system_prompt", None)
+    instructions = []
+    if isinstance(prompt, str) and prompt:
+        effective_prompt = prompt
+        ephemeral = getattr(agent, "ephemeral_system_prompt", None)
+        if isinstance(ephemeral, str) and ephemeral and ephemeral not in effective_prompt:
+            effective_prompt = f"{effective_prompt}\n\n{ephemeral}".strip()
+        instructions.append({"role": "system", "content": effective_prompt})
+
+    raw_tools = getattr(agent, "tools", ())
+    tools = tuple(raw_tools) if isinstance(raw_tools, (list, tuple)) else ()
+    catalog_bytes = json.dumps(
+        tools,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    catalog_version = f"sha256:{hashlib.sha256(catalog_bytes).hexdigest()}"
+
+    capabilities = resolve_runtime_capabilities(agent)
+    model = getattr(agent, "model", None)
+    provider = getattr(agent, "provider", None)
+    return compile_turn(
+        snapshot=SessionSnapshot(
+            session_id=session_id,
+            revision=revision,
+            events=tuple(canonical_events),
+        ),
+        command=TurnCommand(
+            session_id=session_id,
+            turn_id=str(turn_id),
+            idempotency_key=str(turn_id),
+            expected_revision=revision,
+            user_event=current_message,
+        ),
+        instructions=tuple(instructions),
+        tool_catalog=ToolCatalogSnapshot(version=catalog_version, tools=tools),
+        capabilities=capabilities,
+        model=model if isinstance(model, str) and model else "codex",
+        provider=provider if isinstance(provider, str) and provider else "openai-codex",
+        current_event_id=current_event_id,
+    )
 
 
 def _codex_request_failure_details(error: BaseException) -> tuple[int | None, str]:
@@ -682,6 +824,8 @@ def run_codex_app_server_turn(
     messages: List[Dict[str, Any]],
     effective_task_id: str,
     should_review_memory: bool = False,
+    active_system_prompt: str | None = None,
+    current_turn_user_idx: int | None = None,
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
     app-server` subprocess and projects its events back into Hermes'
@@ -694,6 +838,41 @@ def run_codex_app_server_turn(
         CodexAppServerSession,
         _ServerRequestRouting,
     )
+
+    compilation = _compile_codex_app_server_input(
+        agent,
+        messages=messages,
+        user_message=user_message,
+        effective_task_id=effective_task_id,
+        active_system_prompt=active_system_prompt,
+        current_turn_user_idx=current_turn_user_idx,
+    )
+    if compilation.failure is not None:
+        failure = compilation.failure
+        error = (
+            "Hermes could not compile this turn without losing required "
+            f"session context ({failure.reason.value}: "
+            f"required={failure.required_tokens}, "
+            f"capacity={failure.capacity_tokens})."
+        )
+        return {
+            "final_response": error,
+            "messages": messages,
+            "api_calls": 0,
+            "completed": False,
+            "partial": False,
+            "interrupted": False,
+            "error": error,
+            "context_compilation_failure": {
+                "reason": failure.reason.value,
+                "required_tokens": failure.required_tokens,
+                "capacity_tokens": failure.capacity_tokens,
+                "session_revision": failure.session_revision,
+            },
+            "agent_persisted": True,
+        }
+    assert compilation.compiled is not None
+    compiled_turn = compilation.compiled
 
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
@@ -754,7 +933,10 @@ def run_codex_app_server_turn(
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        turn = agent._codex_session.run_turn(
+            user_input=user_message,
+            compiled_turn=compiled_turn,
+        )
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn

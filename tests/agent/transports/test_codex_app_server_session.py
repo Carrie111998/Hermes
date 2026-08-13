@@ -14,6 +14,14 @@ from typing import Any, Optional
 import pytest
 
 import agent.transports.codex_app_server_session as session_mod
+from agent.context_compiler import compile_turn
+from agent.models_dev import ModelCapabilities
+from agent.session_contracts import (
+    CanonicalSessionEvent,
+    SessionSnapshot,
+    ToolCatalogSnapshot,
+    TurnCommand,
+)
 from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
     _ServerRequestRouting,
@@ -186,6 +194,88 @@ class TestLifecycle:
 # ---- turn loop ----
 
 class TestRunTurn:
+    @staticmethod
+    def _compiled_turn():
+        result = compile_turn(
+            snapshot=SessionSnapshot(
+                session_id="hermes-session-1",
+                revision=2,
+                events=(
+                    CanonicalSessionEvent(
+                        event_id="event-1",
+                        sequence=1,
+                        message={"role": "user", "content": "Remember OLIVE-42."},
+                    ),
+                    CanonicalSessionEvent(
+                        event_id="event-2",
+                        sequence=2,
+                        message={"role": "assistant", "content": "Stored."},
+                    ),
+                ),
+            ),
+            command=TurnCommand(
+                session_id="hermes-session-1",
+                turn_id="turn-3",
+                idempotency_key="turn-3",
+                expected_revision=2,
+                user_event={"role": "user", "content": "What was the code?"},
+            ),
+            instructions=(),
+            tool_catalog=ToolCatalogSnapshot(version="none"),
+            capabilities=ModelCapabilities(
+                context_window=128_000,
+                max_output_tokens=8_000,
+            ),
+            model="codex-model",
+            provider="openai-codex",
+        )
+        assert result.compiled is not None
+        return result.compiled
+
+    def test_fresh_thread_reconstructs_compiled_hermes_context(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        session = make_session(client)
+
+        session.run_turn(
+            "What was the code?",
+            compiled_turn=self._compiled_turn(),
+            turn_timeout=2.0,
+        )
+
+        _method, params = next(
+            request for request in client.requests if request[0] == "turn/start"
+        )
+        sent = params["input"][0]["text"]
+        assert "hermes.compiled-turn.v1" in sent
+        assert "Remember OLIVE-42." in sent
+        assert "What was the code?" in sent
+
+    def test_live_thread_uses_current_input_as_disposable_optimization(self):
+        client = FakeClient()
+        session = make_session(client)
+        session.ensure_started()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        session.run_turn(
+            "What was the code?",
+            compiled_turn=self._compiled_turn(),
+            turn_timeout=2.0,
+        )
+
+        _method, params = next(
+            request for request in client.requests if request[0] == "turn/start"
+        )
+        assert params["input"] == [{"type": "text", "text": "What was the code?"}]
+
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
         client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})
@@ -895,4 +985,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

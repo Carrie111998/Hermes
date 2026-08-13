@@ -86,6 +86,10 @@ class TestIdentityFlush:
                 agent._flush_messages_to_session_db(messages, [])
 
                 assert _contents(db) == ["q", "a"]
+                assert all(type(message.get("_row_id")) is int for message in messages)
+                assert [message["_row_id"] for message in messages] == sorted(
+                    message["_row_id"] for message in messages
+                )
             finally:
                 db.close()
 

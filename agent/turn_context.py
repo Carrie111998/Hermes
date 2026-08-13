@@ -439,6 +439,7 @@ def build_turn_context(
     *,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+    accepted_turn: Optional[Any] = None,
     restore_or_build_system_prompt,
     install_safe_stdio,
     sanitize_surrogates,
@@ -615,7 +616,46 @@ def build_turn_context(
     expected_persist_content = (
         persist_user_message if persist_user_message is not None else user_message
     )
-    if (
+    accepted_history_idx = None
+    if accepted_turn is not None:
+        from agent.session_contracts import AcceptedTurn
+
+        if not isinstance(accepted_turn, AcceptedTurn):
+            raise TypeError("accepted_turn must be AcceptedTurn")
+        if accepted_turn.command.session_id != str(agent.session_id or ""):
+            raise ValueError("accepted turn does not belong to this agent session")
+        durable_content = accepted_turn.command.user_event.get("content")
+        if durable_content != expected_persist_content:
+            raise ValueError("accepted turn user event does not match persisted input")
+        user_msg = dict(accepted_turn.command.user_event)
+        # The coordinator has already committed this exact journal event.
+        # Retain its canonical identity in the live projection and make the
+        # ordinary persistence choke point skip it, while still allowing the
+        # API-facing content to carry request-only notes/prefetch context.
+        user_msg["_db_persisted"] = True
+        user_msg["_row_id"] = accepted_turn.receipt.projection_row_id
+        user_msg["_event_revision"] = accepted_turn.receipt.event_revision
+        canonical_row_id = user_msg.get("_row_id")
+        for index, history_message in enumerate(messages):
+            if (
+                isinstance(history_message, dict)
+                and history_message.get("_row_id") == canonical_row_id
+            ):
+                if (
+                    history_message.get("role") != "user"
+                    or history_message.get("content") != durable_content
+                ):
+                    raise ValueError(
+                        "accepted turn canonical event conflicts with loaded history"
+                    )
+                user_msg = dict(history_message)
+                user_msg["_db_persisted"] = True
+                user_msg["_row_id"] = canonical_row_id
+                accepted_history_idx = index
+                break
+        user_msg["content"] = user_message
+        agent._pending_cli_user_message = None
+    elif (
         isinstance(pending_cli_message, dict)
         and pending_cli_message.get("content") == expected_persist_content
     ):
@@ -659,8 +699,12 @@ def build_turn_context(
         if persist_user_display_metadata:
             user_msg["display_metadata"] = persist_user_display_metadata
 
-    messages.append(user_msg)
-    current_turn_user_idx = len(messages) - 1
+    if accepted_history_idx is None:
+        messages.append(user_msg)
+        current_turn_user_idx = len(messages) - 1
+    else:
+        messages[accepted_history_idx] = user_msg
+        current_turn_user_idx = accepted_history_idx
     agent._persist_user_message_idx = current_turn_user_idx
 
     # Track user turns for memory flush and periodic nudge logic.
@@ -1295,6 +1339,18 @@ def build_turn_context(
         )
         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             _turn_user_msg["api_content"] = _api_content
+            if accepted_turn is not None:
+                _db = getattr(agent, "_session_db", None)
+                if _db is None or _db.set_user_event_api_content(
+                    agent.session_id,
+                    accepted_turn.receipt.projection_row_id,
+                    accepted_turn.command.user_event.get("content"),
+                    _api_content,
+                ) != 1:
+                    raise RuntimeError(
+                        "accepted-turn api_content could not be persisted on "
+                        f"canonical event {accepted_turn.receipt.event_id}"
+                    )
             # In-place preflight compaction has ALREADY inserted this turn's
             # user row (archive_and_compact runs before prefetch/pre_llm_call
             # can compose the sidecar), and the crash persist below identity-
@@ -1303,7 +1359,7 @@ def build_turn_context(
             # Backfill it onto the freshly-inserted row directly. Rotation
             # mode needs nothing here: its compacted copies flush to the
             # child session after this stamp.
-            if _preflight_compressed and bool(
+            if accepted_turn is None and _preflight_compressed and bool(
                 getattr(agent, "_last_compaction_in_place", False)
             ):
                 _db = getattr(agent, "_session_db", None)

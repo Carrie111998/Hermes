@@ -35,6 +35,25 @@ def _message_row_id(msg: dict):
         return None
 
 
+def _turn_receipt_payload(receipt, include_projection_row_id: bool) -> dict:
+    """Content-free JSON projection of a canonical turn receipt."""
+    payload = {
+        "session_id": receipt.session_id,
+        "turn_id": receipt.turn_id,
+        "idempotency_key": receipt.idempotency_key,
+        "prior_revision": receipt.prior_revision,
+        "event_revision": receipt.event_revision,
+        "session_revision": receipt.session_revision,
+        "event_id": receipt.event_id,
+        "state": receipt.state.value,
+        "attempt": receipt.attempt,
+        "terminal_revision": receipt.terminal_revision,
+    }
+    if include_projection_row_id:
+        payload["projection_row_id"] = receipt.projection_row_id
+    return payload
+
+
 def _mem_db_pair_agrees(mem, db_msg) -> bool:
     """True when a live-memory entry plausibly corresponds to a durable row.
 
@@ -255,7 +274,7 @@ def _pending_reaction_notes(session: dict) -> str:
 
 
 @method("prompt.submit")
-def _(rid, params: dict) -> dict:
+def _prompt_submit(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
 
     sid = params.get("session_id", "")
@@ -301,6 +320,76 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    native_turn_v1 = bool(params.get("_native_session_turn_v1"))
+    turn_command = None
+    accepted_turn = None
+    turn_response_receipt = None
+    turn_lease = None
+    turn_authorization = None
+    turn_owner_id = None
+    turn_lease_seconds = 90.0
+    if native_turn_v1:
+        from agent.session_contracts import SessionAuthorization, TurnCommand
+
+        canonical_session_id = str(params.get("_canonical_session_id") or "")
+        if canonical_session_id != str(session.get("session_key") or ""):
+            return _err(rid, 4031, "canonical session identity mismatch")
+        try:
+            turn_command = TurnCommand(
+                session_id=canonical_session_id,
+                turn_id=params.get("turn_id", ""),
+                idempotency_key=params.get("idempotency_key", ""),
+                expected_revision=params.get("expected_revision", -1),
+                user_event=params.get("user_event") or {},
+            )
+        except (TypeError, ValueError) as exc:
+            return _err(rid, 4004, f"invalid turn command: {exc}")
+        turn_authorization = SessionAuthorization(
+            principal=f"gateway:{sid}",
+            allowed_session_ids=frozenset({canonical_session_id}),
+        )
+        # Native commands never combine revisioned append with the legacy
+        # destructive-rewrite or interrupt-and-queue semantics. A client sends
+        # a new command against the revision it last read, and the coordinator
+        # either accepts exactly that command or returns a typed conflict.
+        if (
+            truncate_user_ordinal is not None
+            or params.get("truncate_before_row_id") is not None
+            or params.get("truncate_before_message_id") is not None
+            or params.get("queued")
+        ):
+            return _err(rid, 4004, "native turn append does not accept queue or truncation fields")
+        try:
+            _ensure_session_db_row(session)
+            _persist_branch_seed(session)
+            with _session_db(session) as turn_db:
+                if turn_db is None:
+                    return _err(rid, 5071, "session storage is unavailable")
+                existing_turn = turn_db.get_turn(
+                    turn_command,
+                    authorization=turn_authorization,
+                )
+        except Exception as exc:
+            from agent.session_contracts import TurnIdempotencyConflictError
+            from hermes_state import is_disk_full_error
+
+            if isinstance(exc, TurnIdempotencyConflictError):
+                return _err(rid, 4092, str(exc))
+            if is_disk_full_error(exc):
+                return _err(rid, 5070, "disk full: session storage could not be written")
+            return _err(rid, 5071, f"session storage could not be read: {exc}")
+        if existing_turn is not None and (
+            existing_turn.state.value in {"completed", "failed", "canceled"}
+            or session.get("running")
+        ):
+            return _ok(
+                rid,
+                {
+                    "status": existing_turn.state.value,
+                    "replayed": True,
+                        "turn": _turn_receipt_payload(existing_turn, False),
+                },
+            )
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     # Which desktop window this message was typed into. Rewritten on every
@@ -332,6 +421,8 @@ def _(rid, params: dict) -> dict:
         busy_transport = None
         with session["history_lock"]:
             if session.get("running"):
+                if native_turn_v1:
+                    return _err(rid, 4091, "another turn is active for this session")
                 # Don't reject a mid-turn prompt — queue it (and, by default,
                 # interrupt the live turn) so it runs as the next turn. The
                 # provider interrupt itself must happen after this lock is
@@ -603,14 +694,92 @@ def _(rid, params: dict) -> dict:
                     _message_row_id(truncated[i])
                     for i in _history_user_indices(truncated)
                 ]
+        if native_turn_v1:
+            from agent.session_contracts import AcceptedTurn
+
+            try:
+                with _session_db(session) as turn_db:
+                    if turn_db is None:
+                        return _err(rid, 5071, "session storage is unavailable")
+                    turn_receipt = turn_db.append_turn(
+                        turn_command,
+                        authorization=turn_authorization,
+                    )
+                    turn_owner_id = f"gateway:{os.getpid()}:{uuid.uuid4().hex}"
+                    turn_lease = turn_db.claim_turn_execution(
+                        turn_command.session_id,
+                        turn_command.turn_id,
+                        owner_id=turn_owner_id,
+                        lease_seconds=turn_lease_seconds,
+                        authorization=turn_authorization,
+                    )
+                    turn_response_receipt = turn_db.get_turn(
+                        turn_command,
+                        authorization=turn_authorization,
+                    )
+                accepted_turn = AcceptedTurn(turn_command, turn_receipt)
+            except Exception as exc:
+                from agent.session_contracts import (
+                    StaleSessionRevisionError,
+                    TurnIdempotencyConflictError,
+                    TurnLeaseConflictError,
+                )
+
+                if isinstance(exc, StaleSessionRevisionError):
+                    return _err(rid, 4093, str(exc))
+                if isinstance(exc, TurnIdempotencyConflictError):
+                    return _err(rid, 4092, str(exc))
+                if isinstance(exc, TurnLeaseConflictError):
+                    try:
+                        with _session_db(session) as turn_db:
+                            current_turn = (
+                                turn_db.get_turn(
+                                    turn_command,
+                                    authorization=turn_authorization,
+                                )
+                                if turn_db is not None
+                                else None
+                            )
+                    except Exception:
+                        current_turn = None
+                    if current_turn is not None:
+                        return _ok(
+                            rid,
+                            {
+                                "status": current_turn.state.value,
+                                "replayed": True,
+                                "turn": _turn_receipt_payload(current_turn, False),
+                            },
+                        )
+                    return _err(rid, 4091, str(exc))
+                return _err(rid, 5071, f"session turn could not be accepted: {exc}")
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
 
     if turn_isolation:
-        isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
+        if accepted_turn is None:
+            isolated_response = _submit_prompt_to_compute_host(
+                rid, sid, session, text
+            )
+        else:
+            isolated_response = _submit_prompt_to_compute_host(
+                rid,
+                sid,
+                session,
+                text,
+                accepted_turn=accepted_turn,
+                turn_lease=turn_lease,
+                turn_authorization=turn_authorization,
+                turn_lease_seconds=turn_lease_seconds,
+            )
         if not isolated_response.get("error"):
+            if accepted_turn is not None:
+                isolated_response["result"]["turn"] = _turn_receipt_payload(
+                    turn_response_receipt or accepted_turn.receipt,
+                    False,
+                )
             if survivor_user_row_ids is not None:
                 # The truncation already happened inline above (memory + DB),
                 # before compute-host dispatch — the rebind payload applies to
@@ -640,6 +809,33 @@ def _(rid, params: dict) -> dict:
             session["running"] = False
             session["last_active"] = time.time()
             _clear_inflight_turn(session)
+        if accepted_turn is not None:
+            from agent.session_contracts import TurnState
+
+            try:
+                with _session_db(session) as turn_db:
+                    if turn_db is not None:
+                        terminal_receipt = turn_db.finish_turn_execution(
+                            turn_lease,
+                            state=TurnState.FAILED,
+                            authorization=turn_authorization,
+                            reason="session_initialization_failed",
+                        )
+                        _emit(
+                            "session.turn.updated",
+                            sid,
+                            {
+                                "session_contract_version": 1,
+                                "turn": _turn_receipt_payload(
+                                    terminal_receipt, False
+                                ),
+                            },
+                        )
+            except Exception:
+                logger.error(
+                    "failed to persist canonical session initialization failure",
+                    exc_info=True,
+                )
         if is_disk_full_error(exc):
             return _err(
                 rid,
@@ -655,12 +851,43 @@ def _(rid, params: dict) -> dict:
     _start_agent_build(sid, session)
 
     def run_after_agent_ready() -> None:
+        build_lease_box = [turn_lease]
+        build_lease_stop = threading.Event()
+        build_lease_thread = None
+        if accepted_turn is not None:
+            def _renew_while_building() -> None:
+                interval = max(1.0, float(turn_lease_seconds) / 3.0)
+                while not build_lease_stop.wait(interval):
+                    try:
+                        with _session_db(session) as turn_db:
+                            if turn_db is not None:
+                                build_lease_box[0] = turn_db.renew_turn_execution(
+                                    build_lease_box[0],
+                                    lease_seconds=turn_lease_seconds,
+                                    authorization=turn_authorization,
+                                )
+                    except Exception:
+                        logger.error(
+                            "canonical turn lease renewal failed during agent build",
+                            exc_info=True,
+                        )
+                        return
+
+            build_lease_thread = threading.Thread(
+                target=_renew_while_building,
+                daemon=True,
+                name=f"turn-build-lease-{accepted_turn.command.turn_id[:24]}",
+            )
+            build_lease_thread.start()
         # Patient wait (#63078): the user's message is already the accepted
         # in-flight turn, so a slow deferred build must not eat it. The wait
         # delivers the prompt when the still-running build completes, honors a
         # cancel promptly, notices the user once past the slow threshold, and
         # only errors when the build itself fails or the bounded cap expires.
         err = _wait_agent_for_prompt(session, rid, sid)
+        build_lease_stop.set()
+        if build_lease_thread is not None:
+            build_lease_thread.join(timeout=1.0)
         if err:
             # Terminal frame + retained snapshot (not a bare "error" event +
             # cleared inflight): if the client is disconnected right now, the
@@ -673,6 +900,33 @@ def _(rid, params: dict) -> dict:
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
+            if accepted_turn is not None:
+                from agent.session_contracts import TurnState
+
+                try:
+                    with _session_db(session) as turn_db:
+                        if turn_db is not None:
+                            terminal_receipt = turn_db.finish_turn_execution(
+                                build_lease_box[0],
+                                state=TurnState.FAILED,
+                                authorization=turn_authorization,
+                                reason="agent_initialization_failed",
+                            )
+                            _emit(
+                                "session.turn.updated",
+                                sid,
+                                {
+                                    "session_contract_version": 1,
+                                    "turn": _turn_receipt_payload(
+                                        terminal_receipt, False
+                                    ),
+                                },
+                            )
+                except Exception:
+                    logger.error(
+                        "failed to persist canonical turn initialization failure",
+                        exc_info=True,
+                    )
             _emit("session.info", sid, _session_info(session.get("agent"), session))
             return
         with session["history_lock"]:
@@ -694,25 +948,111 @@ def _(rid, params: dict) -> dict:
                         else "Session no longer running before the agent was ready"
                     },
                 )
+                if accepted_turn is not None:
+                    from agent.session_contracts import TurnState
+
+                    try:
+                        with _session_db(session) as turn_db:
+                            if turn_db is not None:
+                                terminal_receipt = turn_db.finish_turn_execution(
+                                    build_lease_box[0],
+                                    state=TurnState.CANCELED,
+                                    authorization=turn_authorization,
+                                    reason="canceled_before_execution",
+                                )
+                                _emit(
+                                    "session.turn.updated",
+                                    sid,
+                                    {
+                                        "session_contract_version": 1,
+                                        "turn": _turn_receipt_payload(
+                                            terminal_receipt, False
+                                        ),
+                                    },
+                                )
+                    except Exception:
+                        logger.error(
+                            "failed to persist canonical pre-execution cancellation",
+                            exc_info=True,
+                        )
                 return
-        _run_prompt_submit(rid, sid, session, text)
+        if accepted_turn is not None:
+            try:
+                with _session_db(session) as turn_db:
+                    if turn_db is None:
+                        raise RuntimeError("session storage is unavailable")
+                    refreshed_lease = turn_db.claim_turn_execution(
+                        accepted_turn.command.session_id,
+                        accepted_turn.command.turn_id,
+                        owner_id=turn_owner_id,
+                        lease_seconds=turn_lease_seconds,
+                        authorization=turn_authorization,
+                    )
+            except Exception as exc:
+                _emit_terminal_turn_error(sid, session, f"turn execution lease lost: {exc}")
+                with session["history_lock"]:
+                    session["running"] = False
+                    session["last_active"] = time.time()
+                return
+        else:
+            refreshed_lease = None
+        if accepted_turn is None:
+            _run_prompt_submit(rid, sid, session, text)
+        else:
+            _run_prompt_submit(
+                rid,
+                sid,
+                session,
+                text,
+                accepted_turn=accepted_turn,
+                turn_lease=refreshed_lease,
+                turn_authorization=turn_authorization,
+                turn_lease_seconds=turn_lease_seconds,
+            )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
     # `running` flag (a turn that died without clearing it) and recover the latter.
     session["_run_thread"] = run_thread
     run_thread.start()
-    return _ok(
-        rid,
-        {
-            "status": "streaming",
-            **(
-                {"survivor_user_row_ids": survivor_user_row_ids}
-                if survivor_user_row_ids is not None
-                else {}
-            ),
-        },
-    )
+    response_payload = {
+        "status": "streaming",
+        **(
+            {"survivor_user_row_ids": survivor_user_row_ids}
+            if survivor_user_row_ids is not None
+            else {}
+        ),
+    }
+    if accepted_turn is not None:
+        response_payload["turn"] = _turn_receipt_payload(
+            turn_response_receipt or accepted_turn.receipt,
+            False,
+        )
+    return _ok(rid, response_payload)
+
+
+@method("session.turn.append.v1")
+def _(rid, params: dict) -> dict:
+    """Append and execute one revisioned turn on an open Hermes session."""
+    canonical_session_id = params.get("session_id")
+    if not isinstance(canonical_session_id, str) or not canonical_session_id.strip():
+        return _err(rid, 4004, "session_id must be a non-empty string")
+    live = _find_live_session_by_key(canonical_session_id)
+    if live is None:
+        return _err(rid, 4001, "session is not open")
+    live_sid, _session = live
+    request_transport = current_transport()
+    if request_transport is not None and _session.get("transport") is not request_transport:
+        return _err(rid, 4031, "session is not owned by this client transport")
+    user_event = params.get("user_event")
+    if not isinstance(user_event, dict) or user_event.get("role") != "user":
+        return _err(rid, 4004, "user_event must be an object with role='user'")
+    internal = dict(params)
+    internal["session_id"] = live_sid
+    internal["text"] = user_event.get("content")
+    internal["_canonical_session_id"] = canonical_session_id
+    internal["_native_session_turn_v1"] = True
+    return _methods["prompt.submit"](rid, internal)
 
 
 @method("clipboard.paste")
@@ -1344,6 +1684,7 @@ def register(server) -> None:
     for helper in (
         _history_user_indices,
         _message_row_id,
+        _turn_receipt_payload,
         _mem_db_pair_agrees,
         _find_user_turn_by_row_id,
         _resolve_truncate_row_id,

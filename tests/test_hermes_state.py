@@ -644,10 +644,15 @@ class TestTimestampPreservation:
         compressed = [{"role": "user", "content": "[summary]"}] + history[-2:]
         db.replace_messages("s1", compressed)
 
+        active = [m["timestamp"] for m in db.get_messages("s1")]
+        assert len(active) == 3
+        assert active[1:] == timestamps[-2:]
+        assert active[0] > timestamps[-1]  # summary stamped with a current time
+        # The v28 journal retains the pre-rewrite source events as immutable
+        # inactive rows instead of deleting them.
         raw = self._raw_timestamps(db, "s1")
-        assert len(raw) == 3
-        assert raw[1:] == timestamps[-2:]
-        assert raw[0] > timestamps[-1]  # summary stamped with a current time
+        assert raw[:3] == timestamps
+        assert raw[-2:] == timestamps[-2:]
 
 
 # =========================================================================
