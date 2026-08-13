@@ -16,10 +16,12 @@ with their own system prompt, not conversation turns, so persisting them as
 message rows would corrupt role alternation / replay. Traces live in their own
 files, keyed by session id, and are safe to delete.
 
-Cost model note: gated OFF by default. When off, the only overhead is the
-``_traces_enabled()`` config read (cheap) — no file I/O, no serialization.
-The metrics-lite record (``<hermes_home>/metrics/moa-refs.jsonl``) follows
-the same gate: it is written alongside the full trace, never before it.
+Cost model note: full traces are gated OFF by default. When off, the only
+overhead is one metrics-lite append per reference fan-out
+(``<hermes_home>/metrics/moa-refs.jsonl`` — duration/usage/stats, no message
+bodies). No full-trace serialization. Metrics-lite is independent of
+``moa.save_traces`` so preset editors that rewrite the moa block and drop
+``save_traces`` cannot silently kill proposer observability.
 """
 
 from __future__ import annotations
@@ -116,6 +118,10 @@ def save_moa_turn(
     Best-effort: any failure is logged at debug and swallowed — tracing must
     never break a live turn. Called once per turn on a reference cache MISS.
 
+    Metrics-lite (``metrics/moa-refs.jsonl``) writes on every reference
+    fan-out, independent of ``moa.save_traces``. The full trace file is
+    still gated.
+
     ``aggregator_output`` is the aggregator's synthesized text. On the
     non-streaming path (eval / quiet-mode / subagents) it was captured inline
     at call time. On the streaming path it is captured after the fact from the
@@ -124,9 +130,6 @@ def save_moa_turn(
     that resolved text was unavailable, it falls back to None and the record
     points at the session store via ``output_location``.
     """
-    base = _traces_enabled_and_dir()
-    if base is None:
-        return
     try:
         _save_moa_metrics(
             session_id=session_id,
@@ -135,6 +138,10 @@ def save_moa_turn(
         )
     except Exception as exc:  # pragma: no cover
         logger.debug("MoA metrics-lite write failed (session=%s): %s", session_id, exc)
+
+    base = _traces_enabled_and_dir()
+    if base is None:
+        return
 
     try:
         base.mkdir(parents=True, exist_ok=True)
@@ -186,11 +193,11 @@ def _save_moa_metrics(
     preset_name: str,
     reference_outputs: list[tuple[str, str, Any]],
 ) -> None:
-    """Append a metrics-lite MoA record (no message bodies) per trace turn.
+    """Append a metrics-lite MoA record (no message bodies) per fan-out.
 
-    Observer path for per-proposer duration/usage/stats. Writes under the same
-    ``moa.save_traces`` gate as the full trace (caller checks it first), so
-    tracing off means no file I/O at all — matching the module docstring.
+    Observer path for per-proposer duration/usage/stats. Independent of
+    ``moa.save_traces`` — one JSONL append per reference fan-out even when
+    the full-body trace is off. Never writes message bodies.
     """
     base = get_hermes_home() / "metrics"
     base.mkdir(parents=True, exist_ok=True)

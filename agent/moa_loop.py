@@ -1649,10 +1649,11 @@ class MoAChatCompletions:
     ) -> None:
         """Flush the pending full-turn trace to disk, if one is pending.
 
-        No-op when tracing is off (``save_moa_turn`` checks the config), when
-        there is no pending trace (a cache-HIT iteration ran no references), or
-        when the aggregator input was never recorded. Clears the pending trace
-        so a repeat consume cannot double-write. Best-effort — never raises.
+        No-op when there is no pending fan-out (a cache-HIT iteration ran no
+        references) or when the aggregator input was never recorded. Full
+        traces still respect ``moa.save_traces``; metrics-lite always writes
+        on a pending fan-out. Clears the pending trace so a repeat consume
+        cannot double-write. Best-effort — never raises.
 
         ``aggregator_output_fallback`` is the aggregator's resolved acting text
         as the caller already holds it in memory (the streamed assistant text).
@@ -2299,9 +2300,10 @@ class MoAClient:
     ) -> None:
         """Flush the pending full-turn MoA trace via the completions facade.
 
-        No-op unless ``moa.save_traces`` is enabled and a turn is pending.
-        ``aggregator_output_fallback`` supplies the resolved acting text so the
-        streaming path's trace is self-contained (see the facade docstring).
+        Metrics-lite always writes on a pending fan-out. Full traces still
+        require ``moa.save_traces``. ``aggregator_output_fallback`` supplies
+        the resolved acting text so the streaming path's trace is
+        self-contained (see the facade docstring).
         """
         return self.chat.completions.consume_and_save_trace(
             session_id, aggregator_output_fallback=aggregator_output_fallback

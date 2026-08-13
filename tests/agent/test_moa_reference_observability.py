@@ -1,4 +1,4 @@
-"""MoA per-reference duration/stats + metrics-lite (gated with save_traces)."""
+"""MoA per-reference duration/stats + metrics-lite (independent of save_traces)."""
 
 from __future__ import annotations
 
@@ -67,8 +67,8 @@ def test_save_moa_turn_writes_metrics_when_traces_on(tmp_path, monkeypatch):
     assert "output" not in rec["references"][0]
 
 
-def test_save_moa_turn_writes_nothing_when_traces_off(tmp_path, monkeypatch):
-    """Tracing off must mean NO file I/O at all — full trace AND metrics-lite."""
+def test_save_moa_turn_writes_metrics_when_traces_off(tmp_path, monkeypatch):
+    """metrics-lite still writes when save_traces is off; full trace does not."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     with patch("agent.moa_trace._traces_enabled_and_dir", return_value=None):
         save_moa_turn(
@@ -94,8 +94,12 @@ def test_save_moa_turn_writes_nothing_when_traces_off(tmp_path, monkeypatch):
             aggregator_streamed=False,
         )
 
-    assert not (Path(tmp_path) / "metrics" / "moa-refs.jsonl").exists(), \
-        "metrics-lite must NOT write when save_traces is off"
+    metrics_path = Path(tmp_path) / "metrics" / "moa-refs.jsonl"
+    assert metrics_path.is_file(), "metrics-lite must write even when traces are off"
+    rec = json.loads(metrics_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert rec["session_id"] == "sess-off"
+    assert rec["references"][0]["duration_s"] == 0.5
+    assert "output" not in rec["references"][0]
     assert not (Path(tmp_path) / "moa-traces").exists()
 
 
