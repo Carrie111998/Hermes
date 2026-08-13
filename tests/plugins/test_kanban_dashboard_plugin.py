@@ -234,6 +234,32 @@ def test_board_project_attribution_precedence_and_payload(client, tmp_path):
     assert {project["id"] for project in data["projects"]} == {alpha_id, beta_id}
 
 
+def test_board_loads_root_projects_from_named_profile(client, tmp_path):
+    """Shared Kanban resolves projects even when dashboard runs as a profile."""
+    root_db = tmp_path / ".hermes" / "projects.db"
+    profile_home = tmp_path / ".hermes" / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    os.environ["HERMES_HOME"] = str(profile_home)
+    # The fixture's Path.home patch makes get_default_hermes_root() resolve
+    # tmp_path/.hermes, mirroring a normal named-profile launch.
+    pconn = projects_db.connect(db_path=root_db)
+    try:
+        project_id = projects_db.create_project(
+            pconn, name="Root Project", slug="root-project",
+            primary_path=str(tmp_path / "root-project"), color="#abcdef",
+        )
+    finally:
+        pconn.close()
+
+    client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Ship Root Project dashboard"},
+    )
+    tasks, data = _board_tasks(client)
+    assert tasks["Ship Root Project dashboard"]["project_id"] == project_id
+    assert any(project["id"] == project_id for project in data["projects"])
+
+
 def test_board_project_metadata_inference_is_conservative(client, tmp_path):
     """Metadata fallback attributes one unique match and rejects ambiguity."""
     pconn = projects_db.connect()

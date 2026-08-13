@@ -54,6 +54,7 @@ from pydantic import BaseModel, Field
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
 from hermes_cli import projects_db
+from hermes_constants import get_default_hermes_root, get_hermes_home
 
 log = logging.getLogger(__name__)
 
@@ -235,6 +236,37 @@ def _project_payload(project: projects_db.Project) -> dict[str, Any]:
         "slug": project.slug,
         "color": _project_color(project),
     }
+
+
+def _load_dashboard_projects() -> list[projects_db.Project]:
+    """Load projects visible to the machine-wide, shared Kanban board.
+
+    Projects are profile-scoped while Kanban boards are root-scoped and shared.
+    Read every existing project store under the Hermes root so a dashboard
+    launched from one profile can attribute tasks linked by another profile.
+    """
+    root = get_default_hermes_root()
+    candidates = [get_hermes_home() / "projects.db", root / "projects.db"]
+    profiles_dir = root / "profiles"
+    if profiles_dir.is_dir():
+        candidates.extend(sorted(profiles_dir.glob("*/projects.db")))
+
+    projects_by_id: dict[str, projects_db.Project] = {}
+    seen_paths: set[str] = set()
+    for db_path in candidates:
+        resolved = str(db_path.resolve())
+        if resolved in seen_paths or not db_path.is_file():
+            continue
+        seen_paths.add(resolved)
+        conn = projects_db.connect(db_path=db_path)
+        try:
+            for project in projects_db.list_projects(conn):
+                projects_by_id.setdefault(project.id, project)
+        finally:
+            conn.close()
+    return sorted(
+        projects_by_id.values(), key=lambda project: (project.name.lower(), project.id)
+    )
 
 
 def _task_dict(
@@ -542,11 +574,7 @@ def get_board(
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
 
         try:
-            project_conn = projects_db.connect()
-            try:
-                projects = projects_db.list_projects(project_conn)
-            finally:
-                project_conn.close()
+            projects = _load_dashboard_projects()
         except Exception as exc:
             log.warning("kanban project attribution unavailable: %s", exc)
             projects = []
