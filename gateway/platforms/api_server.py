@@ -1050,6 +1050,7 @@ def _api_access_log_line(request, status: int, t0: float, unhandled: bool = Fals
         pass
 
 
+@web.middleware
 async def access_log_middleware(request, handler):
     """Outermost middleware: log method/path/IP/UA/status for every request."""
     t0 = time.time()
@@ -7250,18 +7251,19 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
+            # aiohttp applies middlewares in REVERSE list order — the last
+            # element is the outermost. access_log_middleware goes last so it
+            # wraps everything (logs even unauthenticated probes).
             mws = [
-                access_log_middleware,  # outermost: logs even unauthenticated probes
-                *(
-                    mw
-                    for mw in (
-                        self._make_profile_prefix_middleware(),
-                        cors_middleware,
-                        body_limit_middleware,
-                        security_headers_middleware,
-                    )
-                    if mw is not None
-                ),
+                mw
+                for mw in (
+                    self._make_profile_prefix_middleware(),
+                    cors_middleware,
+                    body_limit_middleware,
+                    security_headers_middleware,
+                    access_log_middleware,
+                )
+                if mw is not None
             ]
             self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             assert self._app is not None
