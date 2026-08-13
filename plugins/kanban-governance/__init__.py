@@ -765,8 +765,21 @@ def _verification_runner_targets(argv: list[str]) -> tuple[list[str], bool]:
 for _runner in {"make", "npm", "npx", "pytest", "python3", "vitest"}:
     _COMMAND_POLICIES[_runner] = _CommandPolicy(targets=_verification_runner_targets)
 
+_REPOSITORY_TEST_RUNNER = "scripts/run_tests.sh"
+_REPOSITORY_TEST_RUNNER_FORMS = {
+    _REPOSITORY_TEST_RUNNER,
+    f"./{_REPOSITORY_TEST_RUNNER}",
+}
+
+
+def _repository_test_runner_targets(argv: list[str]) -> tuple[list[str], bool]:
+    return _positional_operands(argv[1:]), False
+
+
 def _command_policy(argv: list[str]) -> Optional[_CommandPolicy]:
     raw_executable = argv[0]
+    if raw_executable.replace("\\", "/") in _REPOSITORY_TEST_RUNNER_FORMS:
+        return _CommandPolicy(targets=_repository_test_runner_targets)
     executable = os.path.basename(raw_executable).lower()
     if "/" in raw_executable or "\\" in raw_executable:
         return None
@@ -793,8 +806,49 @@ def _unrecognized_executable_diagnostic(command: str) -> Optional[str]:
     return None
 
 
+def _repository_test_runner_is_trusted(argv: list[str], workspace: Path) -> bool:
+    raw_executable = argv[0].replace("\\", "/")
+    if raw_executable not in _REPOSITORY_TEST_RUNNER_FORMS:
+        return False
+    lexical = Path(os.path.abspath(workspace / raw_executable))
+    expected = Path(os.path.abspath(workspace / _REPOSITORY_TEST_RUNNER))
+    if lexical != expected or lexical.is_symlink():
+        return False
+    actual = lexical.resolve(strict=False)
+    if (
+        not _path_is_within(lexical, workspace)
+        or not _path_is_within(actual, workspace)
+        or not actual.is_file()
+        or not os.access(actual, os.X_OK)
+    ):
+        return False
+    tracked = subprocess.run(
+        [
+            "git", "-C", str(workspace), "ls-files", "--error-unmatch", "--",
+            _REPOSITORY_TEST_RUNNER,
+        ],
+        check=False,
+        capture_output=True,
+        timeout=5,
+    )
+    if tracked.returncode != 0:
+        return False
+    clean = subprocess.run(
+        [
+            "git", "-C", str(workspace), "diff", "--quiet", "HEAD", "--",
+            _REPOSITORY_TEST_RUNNER,
+        ],
+        check=False,
+        capture_output=True,
+        timeout=5,
+    )
+    return clean.returncode == 0
+
+
 def _policy_executable_is_trusted(argv: list[str], workspace: Path) -> bool:
     raw_executable = argv[0]
+    if raw_executable.replace("\\", "/") in _REPOSITORY_TEST_RUNNER_FORMS:
+        return _repository_test_runner_is_trusted(argv, workspace)
     if "/" in raw_executable or "\\" in raw_executable:
         return False
     search_path = os.environ.get("PATH", os.defpath)
