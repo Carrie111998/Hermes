@@ -1572,6 +1572,13 @@ def _drain_gateway_pids(pids: list[int], drain_timeout: float) -> bool:
     drain request at all; a PID that exits early hands its unused share back
     to the ones after it.
 
+    Because the marker is sequential and the budget is bounded, a PID reached
+    after the deadline has passed gets no marker at all: it is skipped and the
+    return value drops to False, leaving it to the caller's hard-kill phase.
+    That is the deliberate trade -- pre-writing its marker would overwrite the
+    marker the PID currently being drained has not consumed yet, converting a
+    bounded loss of drain for the tail into a loss of drain for everyone.
+
     Returns True only when every live PID exited within the shared deadline,
     so the caller can honestly report a clean drain rather than claiming one
     while a sibling process is still being hard-killed.
@@ -1645,12 +1652,17 @@ def _collect_gateway_stop_pids(primary_pid: int | None = None) -> list[int]:
 def stop() -> None:
     """Stop the gateway.
 
-    Writes the planned-stop marker for every known gateway PID first so the
-    gateway can drain in-flight agents and persist ``resume_pending`` before
-    exit (the gateway's marker-watcher thread picks this up — Windows asyncio
-    can't deliver SIGTERM to the loop, so the marker is our only IPC).
-    Then escalates with bounded Windows process termination against the
-    known gateway PID(s).
+    Drains the known gateway PIDs first so each gateway can flush in-flight
+    agents and persist ``resume_pending`` before exit (the gateway's
+    marker-watcher thread picks the marker up — Windows asyncio can't deliver
+    SIGTERM to the loop, so the marker is our only IPC). Concretely,
+    ``_drain_gateway_pids`` writes the planned-stop marker for each *valid,
+    non-self* known PID in turn — invalid PIDs and this process's own PID are
+    never marked — and only for as long as the shared drain budget lasts; see
+    that helper for why the marker cannot be written for several PIDs at once
+    and why the budget is bounded. Then escalates with bounded Windows process
+    termination against the known gateway PID(s), which covers any PID the
+    drain phase did not reach.
     """
     _assert_windows()
     from gateway.status import get_running_pid

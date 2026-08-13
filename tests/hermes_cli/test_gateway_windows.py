@@ -279,9 +279,10 @@ class _FakeClock:
 def _arrange_stop(monkeypatch, running_pid, scanned_pids, live_pids, honour_marker):
     """Drive ``stop()`` with a scripted PID topology and record ordered effects.
 
-    Host-agnostic on purpose: every Windows-specific dependency ``stop()`` has
-    (``_assert_windows``, ``schtasks``, the process scan, ``terminate_pid``) is
-    mocked, so the ordering invariant under test is exercised on any host.
+    Host-agnostic on purpose: all of the Windows-specific dependencies
+    ``stop()`` relies on (``_assert_windows``, ``schtasks``, the process scan,
+    ``terminate_pid``) are mocked, so the ordering invariant under test is
+    exercised on any host.
 
     ``live_pids`` is the mutable set of PIDs ``_pid_exists`` reports as alive.
     When ``honour_marker`` is True the fake gateway behaves like a healthy one
