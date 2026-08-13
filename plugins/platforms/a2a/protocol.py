@@ -4,15 +4,17 @@ and disk-backed conversation persistence.
 
 Wire shape follows A2A Protocol v1.0 (JSON-RPC 2.0 binding over HTTP):
   - Agent Card served at GET /.well-known/agent-card.json (canonical v1.0; legacy agent.json also answers)
-  - Tasks via POST {jsonrpc:"2.0", method:"message/send", params:{...}}
-  - Streaming via ``message/stream`` → SSE; events are StreamResponse objects
+  - Tasks via POST {jsonrpc:"2.0", method:"SendMessage", params:{...}}
+    (the legacy ``message/send`` alias is also accepted)
+  - Streaming via ``SendStreamingMessage`` → SSE (legacy
+    ``message/stream`` is also accepted); events are StreamResponse objects
     discriminated by member presence (``statusUpdate`` / ``artifactUpdate``),
     stream closure signals the terminal state (no ``final`` field in v1.0)
   - Task states / message roles are v1.0 SCREAMING_SNAKE_CASE enums
   - Parts are the v1.0 unified shape ({"text": ..., "mediaType": ...}),
     discriminated by member presence (no ``kind`` field)
   - Push notification configs carry ``configId`` + ``createdAt`` and can be
-    passed inline in ``message/send`` via configuration.taskPushNotificationConfig
+    passed inline in ``SendMessage`` via configuration.taskPushNotificationConfig
 
 We deliberately implement the subset of A2A needed for text task exchange with
 stdlib only (no a2a-sdk). ``extract_text`` stays tolerant of v0.3 peers.

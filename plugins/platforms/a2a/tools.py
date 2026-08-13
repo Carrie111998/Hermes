@@ -13,12 +13,13 @@ Peers are resolved from config.yaml under ``a2a_agents``::
     a2a_agents:
       researcher:
         url: "http://localhost:9999"
-        auth: { type: bearer, token: "sk-..." }
+        auth: { type: bearer, token: "<peer-token>" }
         timeout: 120
         capabilities: [web_search, research]
 
 Transport is stdlib urllib (no a2a-sdk dependency). The wire format is the A2A
-v1.0 JSON-RPC ``message/send`` method; replies from v0.3 peers still parse.
+v1.0 JSON-RPC ``SendMessage`` method (legacy ``message/send`` is also
+accepted); replies from v0.3 peers still parse.
 """
 
 from __future__ import annotations

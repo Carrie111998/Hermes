@@ -19,7 +19,7 @@ must not touch core files.** A2A now lives entirely under
 ### Outbound — client tools (`a2a` toolset)
 - `a2a_discover(url)` — fetch + summarize a peer's Agent Card (v1.0
   `supportedInterfaces` aware, tolerates 0.3 cards).
-- `a2a_call(agent, message, context_id?)` — send a JSON-RPC `message/send`
+- `a2a_call(agent, message, context_id?)` — send a JSON-RPC `SendMessage`
   task to a peer, return the reply. Multi-turn via `context_id` (carried
   inside the Message per v1.0). Surfaces `TASK_STATE_INPUT_REQUIRED` so the
   model knows to answer and continue the context.
@@ -44,9 +44,11 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
   `provider`, `capabilities.extendedAgentCard`). **Dynamic**: skills are
   built from the live tool registry at serve time
   (`A2A_ADVERTISED_TOOLSETS` / `extra.advertised_toolsets` restricts them).
-- JSON-RPC methods: `message/send`, `message/stream` (SSE), `tasks/get`,
-  `tasks/list`, `tasks/cancel`, `tasks/subscribe`,
-  `tasks/pushNotificationConfig/create` (legacy `set` names accepted).
+- JSON-RPC methods: v1.0 `SendMessage`, `SendStreamingMessage`, `GetTask`,
+  `ListTasks`, `CancelTask`, `SubscribeToTask`, and push-notification config
+  CRUD. Legacy path aliases (`message/send`, `message/stream`, `tasks/get`,
+  `tasks/list`, `tasks/cancel`, `tasks/subscribe`, and the push-config paths)
+  remain accepted.
 - **Live-session injection (the #11025 insight):** inbound tasks route through
   the normal `MessageEvent` → `handle_message` path keyed by the A2A
   `contextId`, so the agent that answers is the same one serving the user —
@@ -55,19 +57,21 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
   on (per-context FIFO, so concurrent same-context requests can't cross-talk);
   `on_processing_complete` resolves failures/cancellations promptly.
 - **Task store:** every task (including terminal ones, bounded to the last
-  500) stays queryable via `tasks/get` / `tasks/list`, and `tasks/subscribe`
-  reattaches to a running task's stream via store watchers. A watchdog fails
-  orphaned tasks after 5 minutes (idempotent transitions — no double
-  counting in metrics).
+  500) stays queryable via `GetTask` / `ListTasks` (and their legacy aliases),
+  and `SubscribeToTask` reattaches to a running task's stream via store
+  watchers. A watchdog fails orphaned tasks after 5 minutes (idempotent
+  transitions — no double counting in metrics).
 - **input-required:** the platform hint tells the agent to start a reply with
   `[INPUT_REQUIRED]` when it needs clarification; the adapter maps that to
   `TASK_STATE_INPUT_REQUIRED` with the question in `status.message`.
-- **Push notifications:** config accepted inline in `message/send`
-  (`configuration.taskPushNotificationConfig`) or via the create method
-  (returns `configId` + `createdAt`). On terminal transition the callback
-  receives a v1.0 `StreamResponse` (`statusUpdate`) payload, HMAC-SHA256
-  signed (`X-A2A-Signature`, secret `A2A_PUSH_SECRET` falling back to the
-  bearer token), with SSRF-guarded callback URLs.
+- **Push notifications:** config accepted inline in `SendMessage`
+  (`configuration.taskPushNotificationConfig`) or via
+  `CreateTaskPushNotificationConfig` (returns `configId` + `createdAt`). On
+  terminal transition the callback receives a v1.0 `StreamResponse`
+  (`statusUpdate`) payload, HMAC-SHA256 signed (`X-A2A-Signature`, dedicated
+  `A2A_PUSH_SECRET` falling back to the shared bearer credential), with
+  callback URL checks that block unsafe internal destinations. Loopback
+  callbacks are allowed only in localhost-only mode.
 
 ## v1.0 wire format notes
 - Task states / roles are SCREAMING_SNAKE_CASE (TASK_STATE_*, ROLE_*).
@@ -79,15 +83,16 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
   accepts v0.3 (kind) and pre-0.3 (type) shapes from older peers.
   Outbound replies are still text-only — the agent produces text, and
   file/data Parts are for inbound richness.
-- Push notification config: full CRUD — create (inline in message/send
+- Push notification config: full CRUD — create (inline in `SendMessage`
   via configuration.taskPushNotificationConfig, or via the create
   method), get, list, delete. Each config has a configId and createdAt.
   One config per task (v1.0 allows multiple; we keep one).
 - SSE events are StreamResponse objects (statusUpdate / artifactUpdate
   members); stream closure signals the terminal state — no final field.
 - contextId lives inside the Message (legacy top-level accepted inbound).
-- Timestamps are ISO 8601 with millisecond precision; Tasks carry
-  createdAt / lastModified.
+- Task status timestamps are ISO 8601 with millisecond precision. The v1.0
+  Task object does not carry `createdAt` or `lastModified`; push-configuration
+  objects do carry `createdAt`.
 - Error codes: A2A-reserved codes are used only with their spec semantics
   (`-32001` TaskNotFound, `-32002` TaskNotCancelable); custom errors sit at
   `-32050..-32052` (unauthorized / rate-limited / untrusted).
@@ -96,8 +101,8 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
 - **Bind safety:** no token configured (`A2A_BEARER_TOKEN` or
   `A2A_PEER_TOKENS`) ⇒ bind `127.0.0.1` only. A token alone does not widen
   the bind; remote exposure requires token **and** explicit `A2A_HOST`.
-- **Peer identity:** `A2A_PEER_TOKENS="alice:tok1,bob:tok2"` gives each peer
-  its own credential; the matched name is the authenticated identity used
+- **Peer identity:** `A2A_PEER_TOKENS="peer-a:<token-a>,peer-b:<token-b>"`
+  gives each peer its own credential; the matched name is the authenticated identity used
   for rate limiting, the trust gate, message framing, and audit. A shared
   `A2A_BEARER_TOKEN` authenticates as `ip:<addr>`. Nothing in the request
   body can assert identity. Comparisons are constant-time.
@@ -107,14 +112,16 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
   peers can never reach operator slash commands) is defanged (ChatML /
   role-prefix / override patterns → `[filtered]`) and framed with a privacy
   prefix marking it untrusted peer input.
-- **Outbound redaction:** credential-shaped strings (`sk-…`, `ghp_…`, JWTs,
-  bearer tokens, emails) scrubbed before anything leaves.
+- **Outbound redaction:** known credential-shaped strings are scrubbed before
+  anything leaves; this is not a guarantee for arbitrary secrets.
 - **Rate limiting:** sliding window per authenticated identity
   (`A2A_RATE_LIMIT`/min).
 - **Anti-loop:** per-context turn cap (`A2A_MAX_PINGPONG_TURNS`, default 5,
   hard max 20) rejects (v1.0 `TASK_STATE_REJECTED`) runaway agent↔agent
   ping-pong; `tasks/cancel` resets the counter for the task's context.
-- **Audit log:** append-only `~/.hermes/a2a_audit.jsonl` for every exchange.
+- **Audit log:** exchanges are written best-effort to append-only
+  `~/.hermes/a2a_audit.jsonl`; records include a bounded message summary and
+  should be protected as local sensitive data.
 
 ## State placement
 Task store, turn tracker, and rate limiter are **adapter-instance** objects
@@ -145,7 +152,9 @@ them (#11025 requirement). The `a2a_history` tool recalls them by context id.
 ## Deliberately out of scope (future, not this pass)
 - **a2a-sdk / gRPC + HTTP+JSON bindings.** Only the JSONRPC binding is
   served; the card advertises exactly that.
-- **`tenant` field, extended Agent Card, `stateTransitionHistory`.**
+- **Extended Agent Card and `stateTransitionHistory`.** Optional v1.0
+  `tenant` routing is supported; task and push-config queries are scoped to the
+  routed agent/tenant.
 - **True task abort:** `tasks/cancel` marks the task canceled and drops the
   reply, but cannot abort the live session's in-flight turn.
 - **DID / Ed25519 identity, OAuth2 scopes, x402 micropayments** (#14559
