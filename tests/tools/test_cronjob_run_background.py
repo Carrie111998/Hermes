@@ -194,6 +194,20 @@ class TestSyncFallbacks:
         assert res["success"] is True
         m_run.assert_called_once()   # ran inline on this thread
 
+    def test_dispatch_uses_profile_real_child_ceiling(self):
+        """Manual cron runs share the active profile's real-child governor."""
+        with _bound_session_key():
+            with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+                 patch("tools.delegate_tool._get_max_async_children", return_value=3), \
+                 patch("tools.delegate_tool._get_profile_real_child_ceiling",
+                       return_value=7), \
+                 patch("tools.async_delegation.dispatch_async_delegation",
+                       return_value={"status": "dispatched", "delegation_id": "d1"}) as m_disp:
+                res = _try_dispatch_background_run(_job('job-bg-ceiling'))
+        assert res is not None
+        assert res["dispatched"] is True
+        assert m_disp.call_args.kwargs["profile_real_child_ceiling"] == 7
+
 
 class TestInFlightDedupe:
     """Manual runs must not double-fire a job that is already mid-run
