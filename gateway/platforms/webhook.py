@@ -619,6 +619,25 @@ class WebhookAdapter(BasePlatformAdapter):
         effective_profile = request_profile or "default"
         return configured_profile == effective_profile
 
+    @staticmethod
+    def _validate_queue_to(queue_to: Any) -> Optional[str]:
+        """Return a client-safe configuration error for malformed queue_to."""
+        if not isinstance(queue_to, dict):
+            return "queue_to must be a mapping"
+        platform = queue_to.get("platform")
+        chat_id = queue_to.get("chat_id")
+        if not isinstance(platform, str) or not platform.strip():
+            return "queue_to.platform is required"
+        if chat_id is None or not str(chat_id).strip():
+            return "queue_to.chat_id is required"
+        if platform.strip().lower() == Platform.WEBHOOK.value:
+            return "queue_to.platform cannot be webhook"
+        if queue_to.get("chat_type", "group") not in {
+            "dm", "group", "channel", "thread"
+        }:
+            return "queue_to.chat_type must be dm, group, channel, or thread"
+        return None
+
     async def _handle_webhook(self, request: "web.Request") -> "web.Response":
         """POST /webhooks/{route_name} — receive and process a webhook event."""
         # Hot-reload dynamic subscriptions on each request (mtime-gated, cheap)
@@ -710,6 +729,19 @@ class WebhookAdapter(BasePlatformAdapter):
                 return web.json_response(
                     {"error": "Invalid signature"}, status=401
                 )
+
+        queue_to = route_config.get("queue_to")
+        if queue_to is not None:
+            queue_error = self._validate_queue_to(queue_to)
+            if route_config.get("deliver_only"):
+                queue_error = "queue_to cannot be combined with deliver_only"
+            if queue_error:
+                logger.warning(
+                    "[webhook] Invalid queue_to for route %s: %s",
+                    route_name,
+                    queue_error,
+                )
+                return web.json_response({"error": queue_error}, status=400)
 
         # ── Rate limiting (after auth) ───────────────────────────
         now = time.time()
@@ -837,6 +869,83 @@ class WebhookAdapter(BasePlatformAdapter):
             ),
         )
 
+        queue_event = None
+        if queue_to is not None:
+            try:
+                target_platform = Platform(
+                    str(queue_to["platform"]).strip().lower()
+                )
+            except ValueError:
+                return web.json_response(
+                    {"error": "Unknown queue_to.platform"}, status=400
+                )
+            runner = self.gateway_runner
+            queue_target_adapter = None
+            if runner is not None:
+                if profile and isinstance(profile, str) and profile != "default":
+                    active_profile_fn = getattr(runner, "_active_profile_name", None)
+                    active_profile = (
+                        active_profile_fn() if callable(active_profile_fn) else None
+                    )
+                    if profile == active_profile:
+                        queue_target_adapter = getattr(runner, "adapters", {}).get(
+                            target_platform
+                        )
+                    else:
+                        profile_adapters = (
+                            getattr(runner, "_profile_adapters", {}) or {}
+                        )
+                        queue_target_adapter = profile_adapters.get(profile, {}).get(
+                            target_platform
+                        )
+                else:
+                    queue_target_adapter = getattr(runner, "adapters", {}).get(
+                        target_platform
+                    )
+            if queue_target_adapter is None:
+                logger.warning(
+                    "[webhook] queue target unavailable route=%s platform=%s",
+                    route_name,
+                    target_platform.value,
+                )
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "error": "Configured queue target is unavailable",
+                        "delivery_id": delivery_id,
+                    },
+                    status=503,
+                )
+            source = queue_target_adapter.build_source(
+                chat_id=str(queue_to["chat_id"]),
+                chat_name=queue_to.get("chat_name"),
+                chat_type=str(queue_to.get("chat_type", "group")),
+                user_id=(
+                    str(queue_to["user_id"])
+                    if queue_to.get("user_id") is not None
+                    else None
+                ),
+                user_name=queue_to.get("user_name"),
+                thread_id=(
+                    str(queue_to["thread_id"])
+                    if queue_to.get("thread_id") is not None
+                    else None
+                ),
+            )
+            # The authenticated webhook route owns the runtime boundary.
+            # Override any profile_routes match made by the target adapter;
+            # an unprefixed route is explicitly confined to the default
+            # profile rather than inheriting a target chat's routed profile.
+            source.profile = profile if isinstance(profile, str) else "default"
+            queue_event = MessageEvent(
+                text=prompt,
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message=payload,
+                message_id=delivery_id,
+                allow_gateway_control=False,
+            )
+
         # ── Idempotency ─────────────────────────────────────────
         # Skip duplicate deliveries (webhook retries).
         now = time.time()
@@ -905,6 +1014,40 @@ class WebhookAdapter(BasePlatformAdapter):
             return web.json_response(
                 {"status": "error", "error": "Delivery failed", "delivery_id": delivery_id},
                 status=502,
+            )
+
+        if queue_to is not None:
+            runner = self.gateway_runner
+            try:
+                if runner is None:
+                    raise ValueError("Gateway runner is unavailable")
+                await runner.enqueue_gateway_turn(queue_event)
+            except ValueError as exc:
+                # Admission did not happen. Let a corrected configuration or
+                # recovered adapter accept a provider retry with the same ID.
+                self._seen_deliveries.pop(delivery_id, None)
+                logger.warning(
+                    "[webhook] queue target unavailable route=%s delivery=%s: %s",
+                    route_name,
+                    delivery_id,
+                    exc,
+                )
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "error": "Configured queue target is unavailable",
+                        "delivery_id": delivery_id,
+                    },
+                    status=503,
+                )
+            return web.json_response(
+                {
+                    "status": "queued",
+                    "route": route_name,
+                    "event": event_type,
+                    "delivery_id": delivery_id,
+                },
+                status=202,
             )
 
         # Use delivery_id in session key so concurrent webhooks on the

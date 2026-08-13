@@ -29,7 +29,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import SendResult
+from gateway.platforms.base import MessageEvent, SendResult
 from gateway.platforms.webhook import (
     WebhookAdapter,
     _INSECURE_NO_AUTH,
@@ -638,6 +638,192 @@ class TestSessionIsolation:
         assert len(captured_events) == 2
         ids = {ev.source.chat_id for ev in captured_events}
         assert len(ids) == 2, "Each delivery must have a unique session chat_id"
+
+
+class TestQueuedSessionAdmission:
+    @pytest.mark.asyncio
+    async def test_default_route_overrides_target_chat_profile_routing(self):
+        adapter = _make_adapter(
+            routes={
+                "alerts": {
+                    "secret": _INSECURE_NO_AUTH,
+                    "prompt": "alert",
+                    "queue_to": {
+                        "platform": "telegram",
+                        "chat_id": "-100123",
+                        "thread_id": "77",
+                    },
+                }
+            }
+        )
+        target = MagicMock()
+        routed_source = adapter.build_source(
+            chat_id="-100123", chat_type="group", thread_id="77"
+        )
+        routed_source.platform = Platform.TELEGRAM
+        routed_source.profile = "secondary"
+        target.build_source.return_value = routed_source
+        runner = MagicMock()
+        runner.config.profile_routes = [
+            {
+                "profile": "secondary",
+                "platform": "telegram",
+                "chat_id": "-100123",
+            }
+        ]
+        runner.adapters = {Platform.TELEGRAM: target}
+        runner.enqueue_gateway_turn = AsyncMock(return_value="queued-session")
+        adapter.gateway_runner = runner
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/webhooks/alerts",
+                json={},
+                headers={"X-GitHub-Delivery": "default-profile-1"},
+            )
+
+        assert response.status == 202
+        event = runner.enqueue_gateway_turn.await_args.args[0]
+        assert event.source.profile == "default"
+        assert event.source.chat_id == "-100123"
+        assert event.source.thread_id == "77"
+
+    @pytest.mark.asyncio
+    async def test_signed_webhook_queues_rendered_target_event(self):
+        routes = {
+            "alerts": {
+                "secret": "queue-secret",
+                "prompt": "Alert: {message}",
+                "queue_to": {
+                    "platform": "telegram",
+                    "chat_id": "-100123",
+                    "thread_id": "77",
+                },
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        target = MagicMock()
+        target.build_source.return_value = adapter.build_source(
+            chat_id="-100123", chat_type="group", thread_id="77"
+        )
+        target.build_source.return_value.platform = Platform.TELEGRAM
+        runner = MagicMock()
+        runner.adapters = {Platform.TELEGRAM: target}
+        runner.enqueue_gateway_turn = AsyncMock(
+            return_value="agent:main:telegram:group:-100123:77"
+        )
+        adapter.gateway_runner = runner
+        body = b'{"message":"disk full"}'
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/webhooks/alerts",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Hub-Signature-256": _github_signature(body, "queue-secret"),
+                    "X-GitHub-Delivery": "queued-1",
+                },
+            )
+            response_data = await response.json()
+
+        assert response.status == 202
+        assert response_data["status"] == "queued"
+        event = runner.enqueue_gateway_turn.await_args.args[0]
+        assert isinstance(event, MessageEvent)
+        assert event.text == "Alert: disk full"
+        assert event.source.platform is Platform.TELEGRAM
+        assert event.source.chat_id == "-100123"
+        assert event.source.thread_id == "77"
+        assert event.source.chat_type == "group"
+        assert event.allow_gateway_control is False
+
+    @pytest.mark.asyncio
+    async def test_missing_queue_to_keeps_independent_webhook_session(self):
+        adapter = _make_adapter(
+            routes={"ci": {"secret": _INSECURE_NO_AUTH, "prompt": "build"}}
+        )
+        adapter.handle_message = AsyncMock()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/webhooks/ci",
+                json={"ref": "main"},
+                headers={"X-GitHub-Delivery": "independent-1"},
+            )
+        await asyncio.sleep(0)
+        assert response.status == 202
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.platform is Platform.WEBHOOK
+        assert event.source.chat_id == "webhook:ci:independent-1"
+
+    @pytest.mark.asyncio
+    async def test_unavailable_queue_target_fails_without_autonomous_fallback(self):
+        adapter = _make_adapter(
+            routes={
+                "alerts": {
+                    "secret": _INSECURE_NO_AUTH,
+                    "prompt": "alert",
+                    "queue_to": {"platform": "telegram", "chat_id": "-100123"},
+                }
+            }
+        )
+        adapter.handle_message = AsyncMock()
+        runner = MagicMock()
+        runner.adapters = {}
+        adapter.gateway_runner = runner
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/webhooks/alerts",
+                json={},
+                headers={"X-GitHub-Delivery": "bad-target-1"},
+            )
+        assert response.status == 503
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_invalid_queue_target_config_fails_without_fallback(self):
+        adapter = _make_adapter(
+            routes={
+                "alerts": {
+                    "secret": _INSECURE_NO_AUTH,
+                    "prompt": "alert",
+                    "queue_to": {"platform": "telegram"},
+                }
+            }
+        )
+        adapter.handle_message = AsyncMock()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post("/webhooks/alerts", json={})
+        assert response.status == 400
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unknown_queue_target_platform_fails_without_fallback(self):
+        adapter = _make_adapter(
+            routes={
+                "alerts": {
+                    "secret": _INSECURE_NO_AUTH,
+                    "prompt": "alert",
+                    "queue_to": {
+                        "platform": "not-a-platform",
+                        "chat_id": "1",
+                    },
+                }
+            }
+        )
+        adapter.handle_message = AsyncMock()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post("/webhooks/alerts", json={})
+            response_data = await response.json()
+        assert response.status == 400
+        assert response_data == {"error": "Unknown queue_to.platform"}
+        adapter.handle_message.assert_not_awaited()
 
 
 # ===================================================================

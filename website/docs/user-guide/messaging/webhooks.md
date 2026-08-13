@@ -89,6 +89,7 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`, or `log` (default). |
 | `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `repo`, `pr_number`, `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. |
 | `deliver_only` | No | If `true`, skip the agent entirely — the rendered `prompt` template becomes the literal message that gets delivered. Zero LLM cost, sub-second delivery. See [Direct Delivery Mode](#direct-delivery-mode) for use cases. Requires `deliver` to be a real target (not `log`). |
+| `queue_to` | No | Enqueue the rendered prompt as a full FIFO turn in an existing gateway conversation. Requires `platform` and `chat_id`; accepts `thread_id`, `chat_type` (default `group`), `chat_name`, `user_id`, and `user_name`. The target platform must be enabled and available. Cannot be combined with `deliver_only`. See [Queue Into a Gateway Conversation](#queue-into-a-gateway-conversation). |
 
 ### Full example
 
@@ -208,6 +209,50 @@ prompt: "PR #{pull_request.number} by {pull_request.user.login}: {__raw__}"
 If no `prompt` template is configured for a route, the entire payload is dumped as indented JSON (truncated at 4000 characters).
 
 The same dot-notation templates work in `deliver_extra` values.
+
+### Queue Into a Gateway Conversation
+
+Set `queue_to` when a verified webhook should become a normal turn in an
+existing messaging conversation instead of running in its own autonomous
+webhook session:
+
+```yaml
+platforms:
+  webhook:
+    extra:
+      routes:
+        deploy-finished:
+          secret: "deploy-webhook-secret"
+          events: ["deployment.complete"]
+          prompt: "Deployment {deployment.id} finished: {deployment.status}"
+          queue_to:
+            platform: "telegram"
+            chat_id: "-1001234567890"
+            thread_id: "42"
+```
+
+`platform` and `chat_id` are required. Use `thread_id` for a Telegram forum
+topic, Discord thread, Slack thread, or another adapter that supports threaded
+sessions. `chat_type` defaults to `group`; set it explicitly to `dm`, `channel`,
+or `thread` when that matches the target conversation. In per-user group
+session configurations, `user_id` can identify the intended participant lane.
+
+Hermes returns HTTP 202 with `status: queued` after admitting the turn. If the
+target conversation is busy, the webhook waits in the same FIFO used by
+`/queue`: it does not interrupt the active turn, even when human busy-input
+behavior is configured as `interrupt`. If the target is idle, its turn starts
+normally. Each queued webhook remains a separate full turn and retains arrival
+order.
+
+The target platform must already be enabled in the same gateway (and in the
+selected profile when profile multiplexing is used). Missing or malformed
+target configuration returns HTTP 400; an unavailable target adapter returns
+HTTP 503. Hermes never falls back to an independent webhook session for a
+route that declares `queue_to`.
+
+Without `queue_to`, webhook routes retain their existing behavior: every
+delivery runs concurrently in an independent `webhook:<route>:<delivery_id>`
+session and returns HTTP 202 with `status: accepted`.
 
 ### Forum Topic Delivery
 

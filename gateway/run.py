@@ -8039,6 +8039,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             pending_slot[session_key] = queued_event
 
+    async def enqueue_gateway_turn(self, event: "MessageEvent") -> str:
+        """Admit a complete synthetic turn without interrupting its session.
+
+        Idle sessions start through the target adapter's normal intake path.
+        Busy sessions use the same one-turn-per-item FIFO as ``/queue``,
+        regardless of the gateway's busy-input preference.
+
+        Raises ``ValueError`` when the event does not resolve to a configured,
+        available target adapter. Callers must surface that failure rather
+        than rerouting the work to another session.
+        """
+        source = getattr(event, "source", None)
+        if source is None or getattr(source, "profile_route_rejected", False):
+            raise ValueError("Gateway target source is invalid")
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            platform = getattr(getattr(source, "platform", None), "value", "unknown")
+            raise ValueError(f"Gateway target platform is unavailable: {platform}")
+
+        session_key = self._session_key_for_source(source)
+        adapter_active = session_key in getattr(adapter, "_active_sessions", {})
+        if adapter_active or self._is_session_running(session_key):
+            if not isinstance(getattr(adapter, "_pending_messages", None), dict):
+                raise ValueError("Gateway target adapter does not support queued turns")
+            self._enqueue_fifo(session_key, event, adapter)
+        else:
+            await adapter.handle_message(event)
+        return session_key
+
     def _promote_queued_event(
         self,
         session_key: str,

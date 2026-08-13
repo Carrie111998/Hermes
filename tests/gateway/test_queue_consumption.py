@@ -6,8 +6,9 @@ after the agent finishes its current task — not silently dropped.
 """
 
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 
 from gateway.run import _dequeue_pending_event
 from gateway.platforms.base import (
@@ -87,6 +88,48 @@ class TestQueueMessageStorage:
         # The interrupt event should NOT be set
         assert not adapter._active_sessions[session_key].is_set()
         assert not adapter.has_pending_interrupt(session_key)
+
+
+class TestGatewayTurnAdmission:
+    @pytest.mark.asyncio
+    async def test_idle_session_starts_through_target_adapter(self):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.adapters = {}
+        adapter = _StubAdapter()
+        adapter.handle_message = AsyncMock()
+        runner.adapters[Platform.TELEGRAM] = adapter
+        source = adapter.build_source(chat_id="-100123", chat_type="group")
+        event = MessageEvent(text="webhook turn", source=source, message_id="w-0")
+
+        admitted_key = await runner.enqueue_gateway_turn(event)
+
+        assert admitted_key == runner._session_key_for_source(source)
+        adapter.handle_message.assert_awaited_once_with(event)
+
+    @pytest.mark.asyncio
+    async def test_active_session_is_admitted_fifo_without_interrupt(self):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.adapters = {}
+        runner._queued_events = {}
+        adapter = _StubAdapter()
+        runner.adapters[Platform.TELEGRAM] = adapter
+        source = adapter.build_source(
+            chat_id="-100123", chat_type="group", thread_id="77"
+        )
+        event = MessageEvent(text="webhook turn", source=source, message_id="w-1")
+        session_key = runner._session_key_for_source(source)
+        interrupt_guard = asyncio.Event()
+        adapter._active_sessions[session_key] = interrupt_guard
+
+        admitted_key = await runner.enqueue_gateway_turn(event)
+
+        assert admitted_key == session_key
+        assert adapter._pending_messages[session_key] is event
+        assert not interrupt_guard.is_set()
 
 
 class TestQueueConsumptionAfterCompletion:
@@ -218,5 +261,3 @@ class TestBusyInputModeQueueFifo:
             "five",
         ]
         assert runner._queue_depth(session_key, adapter=adapter) == len(texts)
-
-
