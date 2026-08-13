@@ -303,20 +303,11 @@ def strip_anthropic_cache_control(
 
 
 def strip_anthropic_tool_cache_control(tools: List[Dict[str, Any]] | None) -> List[Dict[str, Any]]:
-    """Return valid copied tools without request-local cache markers.
-
-    Tool schemas are a wire boundary: non-mapping entries cannot be sent as
-    tool definitions and must not survive into the cache planner. Filtering
-    them here establishes the invariant required before the direct native
-    tool-cache path decorates the final tool.
-    """
-    cleaned = []
-    for tool in tools or []:
-        if not isinstance(tool, dict):
-            continue
-        copied = copy.deepcopy(tool)
-        copied.pop("cache_control", None)
-        cleaned.append(copied)
+    """Return copied tools without request-local Anthropic cache markers."""
+    cleaned = copy.deepcopy(tools or [])
+    for tool in cleaned:
+        if isinstance(tool, dict):
+            tool.pop("cache_control", None)
     return cleaned
 
 
