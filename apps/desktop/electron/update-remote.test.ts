@@ -21,6 +21,7 @@ import { test } from 'vitest'
 
 import {
   canonicalGitHubRemote,
+  isOfficialRemote,
   isOfficialSshRemote,
   isSshRemote,
   OFFICIAL_REPO_CANONICAL,
@@ -76,4 +77,19 @@ test('isOfficialSshRemote does NOT match forks, other hosts, or HTTPS', () => {
 test('OFFICIAL_REPO_HTTPS_URL canonicalizes to OFFICIAL_REPO_CANONICAL', () => {
   // Invariant: the URL we substitute in must be the same repo we detect.
   assert.equal(canonicalGitHubRemote(OFFICIAL_REPO_HTTPS_URL), OFFICIAL_REPO_CANONICAL)
+})
+
+test('isOfficialRemote matches the official repo over SSH or HTTPS only', () => {
+  assert.equal(isOfficialRemote('git@github.com:NousResearch/hermes-agent.git'), true)
+  assert.equal(isOfficialRemote('git@github.com:NousResearch/hermes-agent'), true)
+  assert.equal(isOfficialRemote('ssh://git@github.com/NousResearch/hermes-agent.git'), true)
+  assert.equal(isOfficialRemote('https://github.com/NousResearch/hermes-agent.git'), true)
+  // Case-insensitive owner/repo match.
+  assert.equal(isOfficialRemote('git@github.com:nousresearch/hermes-agent.git'), true)
+  // Forks and other hosts are not the official repo, even with the same name.
+  assert.equal(isOfficialRemote('git@github.com:someuser/hermes-agent.git'), false)
+  assert.equal(isOfficialRemote('https://github.com/someuser/hermes-agent.git'), false)
+  assert.equal(isOfficialRemote('git@gitlab.com:NousResearch/hermes-agent.git'), false)
+  assert.equal(isOfficialRemote(''), false)
+  assert.equal(isOfficialRemote(null), false)
 })
