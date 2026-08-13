@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from tools.file_tools import (
     PATCH_SCHEMA,
+    WRITE_FILE_SCHEMA,
 )
 
 
@@ -599,6 +600,15 @@ class TestPatchSchemaShape:
         params = PATCH_SCHEMA["parameters"]
         assert params["required"] == ["mode"]
         assert "anyOf" not in params and "oneOf" not in params
+
+
+def test_mutation_schemas_document_applied_validation_failure_contract():
+    for schema in (WRITE_FILE_SCHEMA, PATCH_SCHEMA):
+        description = schema["description"]
+        assert "applied=true" in description
+        assert "changed" in description and "disk" in description
+        assert "validated=false" in description
+        assert "must be repaired" in description
 
 
 # ---------------------------------------------------------------------------

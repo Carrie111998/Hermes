@@ -1974,7 +1974,7 @@ READ_FILE_SCHEMA = {
 
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
-    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out).",
+    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out). Result fields: applied=true means the content changed on disk even if an error is returned; validated=false means the landed content introduced a validation error and must be repaired (validated is omitted when validation is skipped).",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1995,7 +1995,10 @@ PATCH_SCHEMA = {
     "description": (
         "Targeted find-and-replace edits in files. Use this instead of sed/awk in terminal. "
         "Uses fuzzy matching (9 strategies) so minor whitespace/indentation differences won't break it. "
-        "Returns a unified diff. Auto-runs syntax checks after editing.\n\n"
+        "Returns a unified diff. Auto-runs syntax checks after editing. "
+        "Result fields: applied=true means at least one edit changed disk even if an error is returned; "
+        "validated=false means a landed edit introduced a validation error and must be repaired "
+        "(validated is omitted when validation is skipped).\n\n"
         "REPLACE MODE (mode='replace', default): find a unique string and replace it. "
         "REQUIRED PARAMETERS: mode, path, old_string, new_string.\n"
         "PATCH MODE (mode='patch'): apply V4A multi-file patches for bulk changes. "
