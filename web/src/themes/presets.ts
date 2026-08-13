@@ -207,6 +207,16 @@ export const nousBlueTheme: DashboardTheme = {
   swatchColors: ["#170d02", "#0053FD", "#E8F2FD"],
 };
 
+/** Nous Blue chrome with a high-contrast navy terminal for the embedded TUI. */
+export const nousBlueContrastTheme: DashboardTheme = {
+  ...nousBlueTheme,
+  name: "nous-blue-contrast",
+  label: "Nous Blue Contrast",
+  description: "Nous Blue with a navy, high-contrast terminal",
+  terminalBackground: "#001934",
+  terminalForeground: "#f5f8fc",
+};
+
 /**
  * Same look as ``defaultTheme`` but with a larger root font size, looser
  * line-height, and ``spacious`` density so every rem-based size in the
@@ -232,6 +242,7 @@ export const BUILTIN_THEMES: Record<string, DashboardTheme> = {
   default: defaultTheme,
   "default-large": defaultLargeTheme,
   "nous-blue": nousBlueTheme,
+  "nous-blue-contrast": nousBlueContrastTheme,
   midnight: midnightTheme,
   ember: emberTheme,
   mono: monoTheme,
