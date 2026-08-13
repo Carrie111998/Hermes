@@ -114,7 +114,7 @@ class TestReadJournalMode:
             holder.close()
 
     @pytest.mark.skipif(os.name == "nt", reason="chmod is a no-op on Windows")
-    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+    @pytest.mark.skipif(getattr(os, "geteuid", None) == 0, reason="root ignores file permissions")
     def test_read_only_directory_is_still_readable(self, tmp_path):
         db = tmp_path / "state.db"
         _make_db(db, journal_mode="WAL")
@@ -147,7 +147,7 @@ class TestReportDatabaseJournalModes:
 
         doctor._report_database_journal_modes(tmp_path, VULNERABLE)
 
-        out = capsys.readouterr().out
+        out = capsys.readouterr().out.replace(chr(92), "/")
         assert "state.db is in WAL mode" in out
         assert EXPOSED_TEXT in out
 
@@ -156,7 +156,7 @@ class TestReportDatabaseJournalModes:
 
         doctor._report_database_journal_modes(tmp_path, VULNERABLE)
 
-        out = capsys.readouterr().out
+        out = capsys.readouterr().out.replace(chr(92), "/")
         assert "state.db: rollback journal mode" in out
         assert EXPOSED_TEXT not in out
 
@@ -166,7 +166,7 @@ class TestReportDatabaseJournalModes:
 
         doctor._report_database_journal_modes(tmp_path, version)
 
-        out = capsys.readouterr().out
+        out = capsys.readouterr().out.replace(chr(92), "/")
         assert "state.db: WAL journal mode" in out
         assert EXPOSED_TEXT not in out
         assert "⚠" not in out
@@ -181,7 +181,7 @@ class TestReportDatabaseJournalModes:
 
         doctor._report_database_journal_modes(tmp_path, VULNERABLE)
 
-        out = capsys.readouterr().out
+        out = capsys.readouterr().out.replace(chr(92), "/")
         assert "state.db is in WAL mode" in out
         assert "projects.db: rollback journal mode" in out
         assert "kanban.db: rollback journal mode" in out
@@ -190,7 +190,7 @@ class TestReportDatabaseJournalModes:
     def test_missing_databases_are_skipped(self, tmp_path, capsys):
         doctor._report_database_journal_modes(tmp_path, VULNERABLE)
 
-        out = capsys.readouterr().out
+        out = capsys.readouterr().out.replace(chr(92), "/")
         assert "state.db" not in out
         assert EXPOSED_TEXT not in out
 
@@ -205,11 +205,11 @@ class TestReportDatabaseJournalModes:
         finally:
             holder.close()
 
-        out = capsys.readouterr().out
+        out = capsys.readouterr().out.replace(chr(92), "/")
         assert "state.db: rollback journal mode" in out
 
     @pytest.mark.skipif(os.name == "nt", reason="chmod is a no-op on Windows")
-    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+    @pytest.mark.skipif(getattr(os, "geteuid", None) == 0, reason="root ignores file permissions")
     def test_unreadable_database_does_not_crash(self, tmp_path, capsys):
         db = tmp_path / "state.db"
         _make_db(db)
@@ -219,7 +219,7 @@ class TestReportDatabaseJournalModes:
         finally:
             os.chmod(db, 0o644)
 
-        out = capsys.readouterr().out
+        out = capsys.readouterr().out.replace(chr(92), "/")
         assert "state.db: journal mode could not be read" in out
         assert "cannot rule out WAL exposure" in out
 
@@ -228,7 +228,7 @@ class TestReportDatabaseJournalModes:
 
         doctor._report_database_journal_modes(tmp_path, VULNERABLE)
 
-        out = capsys.readouterr().out
+        out = capsys.readouterr().out.replace(chr(92), "/")
         assert "state.db: journal mode could not be read" in out
 
     def test_read_error_is_informational_on_fixed_runtime(self, tmp_path, capsys):
@@ -236,7 +236,7 @@ class TestReportDatabaseJournalModes:
 
         doctor._report_database_journal_modes(tmp_path, (3, 51, 3))
 
-        out = capsys.readouterr().out
+        out = capsys.readouterr().out.replace(chr(92), "/")
         assert "state.db: journal mode could not be read" in out
         assert "cannot rule out WAL exposure" not in out
         assert "⚠" not in out
@@ -257,7 +257,7 @@ class TestSizeAndRepairHint:
         db = tmp_path / "state.db"
         _make_db(db, journal_mode="WAL")
         doctor._report_database_journal_modes(tmp_path, VULNERABLE)
-        out = capsys.readouterr().out
+        out = capsys.readouterr().out.replace(chr(92), "/")
         # _format_size picks the unit (a fresh test DB is KB-scale).
         assert re.search(r"\(\d[\d.]* [KMGT]?B\)", out)
         assert "To clear the exposure:" in out
