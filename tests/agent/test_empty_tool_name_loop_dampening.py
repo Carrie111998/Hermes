@@ -136,9 +136,28 @@ def agent_env():
 
     # Import fresh so the patched conversation_loop is exercised even when the
     # module was imported earlier in the same worker.
-    for mod in list(sys.modules):
-        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
-            del sys.modules[mod]
+    #
+    # This purge is load-bearing for THIS test, and was catastrophic for every
+    # test after it: the evicted modules were never put back, so later tests
+    # re-imported fresh objects while still holding references to (or patches
+    # on) the old ones. It also silently disarmed conftest's
+    # _reset_module_state, which looks each module up in sys.modules and skips
+    # on KeyError — after the purge there was nothing there to reset.
+    #
+    # Measured 2026-08-13: this single fixture accounted for all 23
+    # test_title_generator failures in the nightly suite, and the effect is
+    # strictly one-way — run title_generator first and both files pass.
+    # Snapshot and restore so the blast radius ends with this fixture.
+    _purged = {
+        name: mod
+        for name, mod in sys.modules.items()
+        if name == "run_agent"
+        or name.startswith("agent.")
+        or name.startswith("tools.")
+        or name.startswith("hermes_")
+    }
+    for name in _purged:
+        del sys.modules[name]
     from run_agent import AIAgent
 
     agent = AIAgent(
@@ -159,6 +178,17 @@ def agent_env():
             os.environ.pop("HERMES_HOME", None)
         else:
             os.environ["HERMES_HOME"] = prev_home
+        # Put back exactly what was evicted, and drop the fresh copies this
+        # fixture imported so no later test can pick one up by accident.
+        for name in list(sys.modules):
+            if (
+                name == "run_agent"
+                or name.startswith("agent.")
+                or name.startswith("tools.")
+                or name.startswith("hermes_")
+            ) and name not in _purged:
+                del sys.modules[name]
+        sys.modules.update(_purged)
 
 
 def _tool_results(handler) -> list[str]:
