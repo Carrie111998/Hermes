@@ -69,6 +69,7 @@ def test_init_raises_when_no_fallback_configured():
             )
 
 
+
 def test_init_tells_oauth_provider_user_to_reauthenticate():
     """OAuth providers must not suggest a fabricated API-key variable."""
     with patch("agent.auxiliary_client.resolve_provider_client", return_value=(None, None)), \
@@ -96,12 +97,7 @@ def test_init_tells_oauth_provider_user_to_reauthenticate():
 @pytest.mark.parametrize(
     ("provider", "expected_hint", "forbidden_text", "api_mode_override"),
     [
-        # Non-OAuth providers whose credentials resolve outside an API-key
-        # variable must get their own accurate remediation, not the OAuth
-        # sign-in wording and not a fabricated API-key variable.
         ("vertex", "gcloud auth application-default login", "sign-in flow", None),
-        # Bedrock auto-routes to bedrock_converse; force the generic
-        # chat-completions path to exercise the credential-failure branch.
         ("bedrock", "aws configure", "sign-in flow", "chat_completions"),
         ("copilot-acp", "external process", "sign-in flow", None),
     ],
