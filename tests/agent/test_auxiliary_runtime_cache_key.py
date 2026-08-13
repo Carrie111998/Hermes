@@ -134,6 +134,13 @@ def test_aiagent_wrapper_resets_runtime_context_after_turn():
         _conversation_root_id=lambda: "root-session",
         _session_db=None,
         session_id="session-id",
+        # Added by cf43413896 (2026-07-30), which made run_conversation publish
+        # the accounting context with source=self._session_source_for_persistence().
+        # This stub predates that commit, so it raised AttributeError on every
+        # run. Real AIAgent instances always have the method (run_agent.py:616)
+        # — only this duck-typed stub could lack it, so the stub is what was
+        # stale, not the call site.
+        _session_source_for_persistence=lambda: "cli",
     )
 
     def fake_turn(*_args, **_kwargs):
