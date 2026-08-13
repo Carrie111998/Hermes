@@ -25,7 +25,7 @@ import { FloatingPet } from '@/components/pet/floating-pet'
 import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { emitGatewayEvent } from '@/contrib/events'
 import { getLatestSessionMessages, triggerCronJob } from '@/hermes'
-import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, preserveMcpUiCards, toChatMessages } from '@/lib/chat-messages'
 import { sessionMessagesSignature } from '@/lib/session-signatures'
 import { isMessagingSource } from '@/lib/session-source'
 import { latestSessionTodos } from '@/lib/todos'
@@ -350,7 +350,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
           const messages = toChatMessages(latest.messages)
           updateSessionState(
             runtimeSessionId,
-            state => ({ ...state, messages: preserveLocalAssistantErrors(messages, state.messages) }),
+            state => ({ ...state, messages: preserveMcpUiCards(preserveLocalAssistantErrors(messages, state.messages), state.messages, storedSessionId) }),
             storedSessionId
           )
 
@@ -406,7 +406,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
       updateSessionState(
         runtimeSessionId,
-        state => ({ ...state, messages: preserveLocalAssistantErrors(messages, state.messages) }),
+        state => ({ ...state, messages: preserveMcpUiCards(preserveLocalAssistantErrors(messages, state.messages), state.messages, storedSessionId) }),
         storedSessionId
       )
     } catch {
