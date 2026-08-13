@@ -133,3 +133,145 @@ class TestIdentityLoading:
         from jobflow_quality.readiness import load_default_identity
 
         assert load_default_identity(tmp_path / "absent.md") is None
+
+
+class TestSemanticReviewIsCachedByArtifactState:
+    """Without a cache this costs a model call per package per sweep.
+
+    The ready sweep runs every 3 hours. Re-reviewing unchanged artifacts would
+    bill ~8 premium reviews a day per eligible package to reach the same
+    verdict. The cache is keyed on the artifact hashes, so a regenerated
+    package is reviewed again and an untouched one is not.
+    """
+
+    def test_a_verdict_is_reused_for_unchanged_artifacts(self, tmp_path):
+        from jobflow_quality.readiness import semantic_verdict
+
+        calls = []
+
+        def _invoke(prompt):
+            calls.append(prompt)
+            return '{"findings": []}'
+
+        d = _pkg(tmp_path)
+        cache = tmp_path / "cache.json"
+        for _ in range(3):
+            semantic_verdict(d, IDENTITY, invoke=_invoke, cache_path=cache)
+        assert len(calls) == 1, "unchanged artifacts must not be re-reviewed"
+
+    def test_changed_artifacts_are_reviewed_again(self, tmp_path):
+        from jobflow_quality.readiness import semantic_verdict
+
+        calls = []
+
+        def _invoke(prompt):
+            calls.append(prompt)
+            return '{"findings": []}'
+
+        d = _pkg(tmp_path)
+        cache = tmp_path / "cache.json"
+        semantic_verdict(d, IDENTITY, invoke=_invoke, cache_path=cache)
+        (d / "resume.md").write_text(RESUME + "\nNew bullet.\n", encoding="utf-8")
+        semantic_verdict(d, IDENTITY, invoke=_invoke, cache_path=cache)
+        assert len(calls) == 2
+
+    def test_an_unknown_verdict_is_not_cached(self, tmp_path):
+        """Caching a failure would make one outage permanent for those bytes."""
+        from jobflow_quality.readiness import semantic_verdict
+
+        calls = []
+
+        def _flaky(prompt):
+            calls.append(prompt)
+            raise RuntimeError("provider down")
+
+        d = _pkg(tmp_path)
+        cache = tmp_path / "cache.json"
+        semantic_verdict(d, IDENTITY, invoke=_flaky, cache_path=cache)
+        semantic_verdict(d, IDENTITY, invoke=_flaky, cache_path=cache)
+        assert len(calls) == 2
+
+    def test_a_corrupt_cache_file_does_not_crash(self, tmp_path):
+        from jobflow_quality.readiness import semantic_verdict
+
+        d = _pkg(tmp_path)
+        cache = tmp_path / "cache.json"
+        cache.write_text("{not json", encoding="utf-8")
+        r = semantic_verdict(d, IDENTITY, invoke=lambda p: '{"findings": []}',
+                             cache_path=cache)
+        assert r is not None
+
+
+class TestSemanticFindingsBlockSubmission:
+    def test_a_clean_review_does_not_block(self, tmp_path):
+        from jobflow_quality.readiness import submission_block_reason
+
+        d = _pkg(tmp_path)
+        reason = submission_block_reason(
+            d, IDENTITY, invoke=lambda p: '{"findings": []}',
+            cache_path=tmp_path / "c.json")
+        assert reason is None
+
+    def test_an_unsupported_claim_blocks(self, tmp_path):
+        from jobflow_quality.readiness import submission_block_reason
+
+        raw = ('{"findings": [{"category": "unsupported_claim", '
+               '"artifact": "resume.md", "detail": "not in the master resume"}]}')
+        d = _pkg(tmp_path)
+        reason = submission_block_reason(d, IDENTITY, invoke=lambda p: raw,
+                                         cache_path=tmp_path / "c.json")
+        assert reason is not None
+        assert "unsupported_claim" in reason
+
+    def test_an_unknown_review_blocks(self, tmp_path):
+        """Fail closed: an unreviewed document is not a reviewed one."""
+        from jobflow_quality.readiness import submission_block_reason
+
+        def _boom(prompt):
+            raise RuntimeError("down")
+
+        d = _pkg(tmp_path)
+        reason = submission_block_reason(d, IDENTITY, invoke=_boom,
+                                         cache_path=tmp_path / "c.json")
+        assert reason is not None
+        assert "unknown" in reason
+
+    def test_without_an_invoke_the_semantic_pass_is_skipped(self, tmp_path):
+        """No reviewer configured must not block every submission."""
+        from jobflow_quality.readiness import submission_block_reason
+
+        assert submission_block_reason(_pkg(tmp_path), IDENTITY) is None
+
+    def test_the_deterministic_gate_still_runs_first(self, tmp_path):
+        """A blocked package must never reach the expensive review."""
+        from jobflow_quality.readiness import submission_block_reason
+
+        calls = []
+        d = _pkg(tmp_path, resume=RESUME.replace("Diego De Aragao", "Diego Rodrigues"))
+        reason = submission_block_reason(
+            d, IDENTITY, invoke=lambda p: calls.append(p) or '{"findings": []}',
+            cache_path=tmp_path / "c.json")
+        assert reason.startswith("qc_blocked:")
+        assert calls == [], "semantic review ran on a package that already failed"
+
+    def test_an_unknown_verdict_is_not_written_to_the_cache_file(self, tmp_path):
+        """Arms the WRITE side specifically.
+
+        The read side only accepts pass/findings as a hit, so a mutation that
+        cached UNKNOWN was invisible to the call-count test — the guard on the
+        other side absorbed it. Inspecting the file is what makes the write
+        rule testable on its own.
+        """
+        import json as _json
+        from jobflow_quality.readiness import semantic_verdict
+
+        def _boom(prompt):
+            raise RuntimeError("provider down")
+
+        d = _pkg(tmp_path)
+        cache = tmp_path / "cache.json"
+        semantic_verdict(d, IDENTITY, invoke=_boom, cache_path=cache)
+
+        if cache.exists():
+            stored = _json.loads(cache.read_text(encoding="utf-8"))
+            assert all(v.get("status") != "unknown" for v in stored.values()), stored

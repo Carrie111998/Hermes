@@ -43,6 +43,18 @@ _CHANGE_FOR: dict[str, str] = {
 }
 _FALLBACK_CHANGE = "Re-check this artifact against the deterministic QC finding."
 
+# Findings that block submission but must NOT buy a premium regeneration.
+#
+# Measured 2026-08-13: 6 of the 7 revise verdicts across 380 packages are
+# `stale_rendering` — a PDF older than the markdown it was rendered from.
+# Re-rendering is deterministic (several packages already ship a
+# generate_pdf.py), so a P3 generation call rewrites the whole package to fix
+# something a render would. It still blocks submission, which is right — a
+# stale PDF is the wrong document to send — it simply is not a content problem.
+NO_REGENERATION_CODES: frozenset[str] = frozenset({
+    QCFinding.STALE_RENDERING.value,
+})
+
 
 def revision_idempotency_key(job_id: str, artifact_hashes: Mapping[str, str]) -> str:
     """Stable per (job, exact artifact bytes).
@@ -85,6 +97,7 @@ def build_revision_request(
             "change": _CHANGE_FOR.get(finding.code.value, _FALLBACK_CHANGE),
         }
         for finding in qc_result.findings
+        if finding.code.value not in NO_REGENERATION_CODES
     ]
     if not changes:
         return None

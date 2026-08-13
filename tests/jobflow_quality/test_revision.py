@@ -96,9 +96,11 @@ class TestMessageShape:
             assert field in msg, field
         assert msg["to"] == "tailor"
 
-    def test_each_finding_becomes_one_change(self):
+    def test_each_actionable_finding_becomes_one_change(self):
+        """Two content findings, two changes. stale_rendering is carved out
+        separately — see TestStaleRenderingDoesNotWarrantRegeneration."""
         msg = build_revision_request("job-1", _revise(
-            QCFinding.UNFILLED_PLACEHOLDER, QCFinding.STALE_RENDERING))
+            QCFinding.UNFILLED_PLACEHOLDER, QCFinding.MISSING_ARTIFACT))
         assert len(msg["payload"]["changes"]) == 2
 
     def test_changes_are_bounded_codes_not_document_text(self):
@@ -126,3 +128,36 @@ class TestMalformedInput:
     def test_a_revise_with_no_findings_produces_nothing(self):
         """Nothing to ask for means nothing to send."""
         assert build_revision_request("job-1", _result(QCStatus.REVISE)) is None
+
+
+class TestStaleRenderingDoesNotWarrantRegeneration:
+    """Measured carve-out: 6 of the 7 revise verdicts today are a stale PDF.
+
+    `stale_rendering` means the PDF is older than the markdown it was rendered
+    from. Re-rendering is deterministic — several packages already ship a
+    generate_pdf.py — so asking a premium model to rewrite the whole package is
+    the wrong tool at roughly 100x the price of the right one.
+
+    The finding still BLOCKS submission, which is correct: a stale PDF is the
+    wrong document to send. It simply does not buy a regeneration.
+    """
+
+    def test_a_stale_pdf_alone_requests_nothing(self):
+        assert build_revision_request("job-1", _revise(QCFinding.STALE_RENDERING)) is None
+
+    def test_a_content_finding_still_requests(self):
+        msg = build_revision_request("job-1", _revise(QCFinding.UNFILLED_PLACEHOLDER))
+        assert msg is not None
+
+    def test_a_mixed_verdict_requests_only_the_content_changes(self):
+        """Regenerating re-renders the PDF anyway, so asking for it is noise."""
+        msg = build_revision_request("job-1", _revise(
+            QCFinding.UNFILLED_PLACEHOLDER, QCFinding.STALE_RENDERING))
+        codes = [c["reason_code"] for c in msg["payload"]["changes"]]
+        assert codes == ["unfilled_placeholder"]
+
+    def test_the_carve_out_is_explicit_not_incidental(self):
+        from jobflow_quality.revision import NO_REGENERATION_CODES
+
+        assert QCFinding.STALE_RENDERING.value in NO_REGENERATION_CODES
+        assert QCFinding.UNFILLED_PLACEHOLDER.value not in NO_REGENERATION_CODES
