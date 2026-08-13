@@ -17,7 +17,7 @@ On every LLM call the plugin injects a small context block on the
 user-message side of the request:
 
 ```
-[LIVE-TIME] Now: 2026-08-13 16:30:00 (Weekday 4/7, 四), TZ offset UTC+8.
+[LIVE-TIME] Now: 2026-08-13 16:30:00 (Weekday 4/7, 四), TZ Asia/Shanghai.
 Injected by live-time plugin at THIS LLM call's moment. Use THIS as the
 authoritative current time for any today/now/elapsed/date judgment. ...
 ```
@@ -26,9 +26,12 @@ Design properties:
 
 - **Ephemeral** — the block is appended to the request, never written into
   the cached system prompt, so prompt caching is unaffected.
-- **Local timezone aware** — reports the host's local time plus its UTC
-  offset, so "now" is meaningful regardless of where Hermes runs.
-- **Zero dependencies** — stdlib only.
+- **Timezone aware** — resolves the timezone in this order:
+  1. `HERMES_TIMEZONE` environment variable
+  2. `timezone` key in `<HERMES_HOME | ~/.hermes>/config.yaml`
+  3. local system timezone (reported as `TZ UTC±H`)
+- **Zero dependencies** — stdlib only, no internal Hermes imports (so the
+  plugin survives upstream refactors).
 
 ## Install
 
