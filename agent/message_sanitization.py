@@ -643,12 +643,22 @@ def uniquify_tool_call_ids(tool_calls: list) -> list:
 #                aggregators re-exporting kimi models reject the echo.
 #     deepseek — provider "deepseek", model contains "deepseek", or host
 #                api.deepseek.com (#15250; V4 rejects empty-string pads,
-#                hence the " " single-space pad, #17341).
+#                hence the " " single-space pad, #17341).  The NATIVE
+#                endpoint (provider "deepseek" / api.deepseek.com host)
+#                additionally applies the conditional passback: plain
+#                non-tool-call turns drop reasoning_content (the API
+#                ignores it there — token savings); aggregator-hosted
+#                deepseek models (OpenRouter etc.) keep the legacy
+#                all-assistant echo.
 #     mimo     — provider "xiaomi", model contains "mimo", or host
 #                *.xiaomimimo.com.
 #   strict side (field rejected with 400/422 "Extra inputs are not
 #     permitted"): everyone else — Mistral, Cerebras, Groq, SambaNova, …
 #     (#45655). Strip the key entirely, even a single-space pad.
+
+# Hosts that serve the native DeepSeek API (also referenced by
+# ``is_native_deepseek_endpoint``).
+_DEEPSEEK_NATIVE_HOSTS = ("api.deepseek.com",)
 
 _REASONING_ECHO_RULES: tuple = (
     # (family, exact providers (raw), exact providers (lowered),
@@ -656,10 +666,26 @@ _REASONING_ECHO_RULES: tuple = (
     ("kimi", frozenset({"kimi-coding", "kimi-coding-cn"}), frozenset(), (),
      ("api.kimi.com", "moonshot.ai", "moonshot.cn")),
     ("deepseek", frozenset(), frozenset({"deepseek"}), ("deepseek",),
-     ("api.deepseek.com",)),
+     _DEEPSEEK_NATIVE_HOSTS),
     ("mimo", frozenset(), frozenset({"xiaomi"}), ("mimo",),
      ("api.xiaomimimo.com", "xiaomimimo.com")),
 )
+
+
+def is_native_deepseek_endpoint(provider: Any, base_url: Any) -> bool:
+    """True when the wire target is the native DeepSeek API.
+
+    Provider ``deepseek`` or the ``api.deepseek.com`` host.  Aggregators
+    re-exporting deepseek models (OpenRouter, custom proxies) return False —
+    they speak their own protocol and keep the legacy all-assistant echo
+    behavior.
+    """
+    from utils import base_url_host_matches
+
+    provider_lower = (provider or "").lower()
+    if provider_lower == "deepseek":
+        return True
+    return any(base_url_host_matches(base_url, host) for host in _DEEPSEEK_NATIVE_HOSTS)
 
 
 def _family_rule(family: str) -> tuple:
@@ -710,15 +736,37 @@ def needs_reasoning_echo(provider: Any, model: Any, base_url: Any) -> bool:
 
 
 def apply_reasoning_content_policy(
-    source_msg: dict, api_msg: dict, needs_thinking_pad: bool
+    source_msg: dict,
+    api_msg: dict,
+    needs_thinking_pad: bool,
+    *,
+    native_deepseek: bool = False,
 ) -> None:
     """Copy provider-facing reasoning fields onto an API replay message.
 
     ``needs_thinking_pad`` is the require-side flag (see
     ``needs_reasoning_echo`` / the agent's cached
     ``_needs_thinking_reasoning_pad``). Mutates ``api_msg`` in place.
+
+    ``native_deepseek`` narrows the require-side policy for the NATIVE
+    DeepSeek API: plain (non-tool-call) assistant turns drop
+    ``reasoning_content`` entirely — the API ignores the field there
+    (thinking-mode guide), so replaying it only burns input tokens.
+    Tool-call turns keep the full echo-back logic below (verbatim
+    reasoning, or the single-space pad).  Kimi / MiMo and aggregator-hosted
+    deepseek models keep the legacy all-assistant behavior.
     """
     if source_msg.get("role") != "assistant":
+        return
+
+    # Native DeepSeek thinking mode: reasoning_content is only meaningful on
+    # tool-call turns.  Plain turns never carry it on the wire — the API
+    # ignores it (guides/thinking_mode.mdx) and every replayed token is
+    # billed input.  The persisted message keeps the field (kimi/mimo replay
+    # and reasoning-only payload accounting still read it); only the wire
+    # copy drops it.
+    if native_deepseek and not source_msg.get("tool_calls"):
+        api_msg.pop("reasoning_content", None)
         return
 
     # 1. Explicit reasoning_content already set.
@@ -800,7 +848,9 @@ def apply_reasoning_content_policy(
     api_msg.pop("reasoning_content", None)
 
 
-def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool) -> int:
+def reapply_reasoning_echo(
+    api_messages: list, needs_thinking_pad: bool, *, native_deepseek: bool = False
+) -> int:
     """Re-pad (or strip) assistant turns' reasoning_content for the active provider.
 
     ``api_messages`` is built once, before the retry loop, while the *primary*
@@ -822,6 +872,12 @@ def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool) -> int:
       fallback bug from #45655 — a DeepSeek primary pads history with ``" "``,
       the request falls back to Mistral, and Mistral 422s on the stale pad.
 
+    ``native_deepseek`` applies the conditional passback for the native
+    DeepSeek API: plain (non-tool-call) assistant turns never carry
+    ``reasoning_content`` on the wire (the API ignores it there — token
+    savings), so any pad/text a prior provider's build baked into them is
+    stripped; tool-call turns keep the full echo-back logic.
+
     Calling this immediately before building the request kwargs reconciles the
     fields against the *current* provider.  It is idempotent and safe to call
     every iteration; it covers every fallback path.
@@ -832,6 +888,14 @@ def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool) -> int:
     changed = 0
     for api_msg in api_messages:
         if api_msg.get("role") != "assistant":
+            continue
+        if native_deepseek and not api_msg.get("tool_calls"):
+            # Plain turn on the native DeepSeek wire: reasoning_content is
+            # ignored by the API there, so drop whatever the prior provider
+            # baked in (space pad, verbatim text, promoted reasoning).
+            if "reasoning_content" in api_msg:
+                api_msg.pop("reasoning_content", None)
+                changed += 1
             continue
         if needs_thinking_pad:
             if api_msg.get("reasoning_content"):

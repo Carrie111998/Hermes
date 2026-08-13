@@ -7490,6 +7490,30 @@ class AIAgent:
             "mimo", (self.provider or "").lower(), self.model, self.base_url
         )
 
+    def _is_native_deepseek_endpoint(self) -> bool:
+        """Return True when the wire target is the native DeepSeek API.
+
+        Provider ``deepseek`` or the ``api.deepseek.com`` host.  Only the
+        native endpoint gets the conditional reasoning passback (plain,
+        non-tool-call assistant turns drop ``reasoning_content`` — the API
+        ignores it there); aggregators re-exporting deepseek models
+        (OpenRouter, custom proxies) keep the legacy all-assistant echo.
+
+        Cached on the AIAgent instance keyed by (provider, base_url), the
+        same pattern as ``_needs_thinking_reasoning_pad`` — this runs per
+        assistant message per send.
+
+        Rule table owner: ``agent.message_sanitization.is_native_deepseek_endpoint``.
+        """
+        key = (self.provider, getattr(self, "_base_url_lower", self.base_url))
+        cached = getattr(self, "_native_deepseek_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        from agent.message_sanitization import is_native_deepseek_endpoint
+        result = is_native_deepseek_endpoint(self.provider, self.base_url)
+        self._native_deepseek_cache = (key, result)
+        return result
+
     def _copy_reasoning_content_for_api(self, source_msg: dict, api_msg: dict) -> None:
         """Forwarder — see ``agent.agent_runtime_helpers.copy_reasoning_content_for_api``."""
         from agent.agent_runtime_helpers import copy_reasoning_content_for_api

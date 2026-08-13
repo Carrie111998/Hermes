@@ -370,13 +370,44 @@ def test_sanitize_drops_empty_tool_calls_array():
 # such turns on the per-call copy so the session recovers itself in memory.
 
 
+def test_sanitize_normalizes_assistant_content_none_to_empty():
+    """sanitize_api_messages guarantees assistant content is "" — never null —
+    on the wire. Reasoning-only turns and host-fed histories can persist
+    content=None; OpenAI-compat endpoints reject a null-content assistant
+    turn that also lacks tool_calls ("content or tool_calls must be set" —
+    DeepSeek 400). The stored history stays untouched (copy-on-change)."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": None},
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "call_X", "type": "function",
+                         "function": {"name": "foo", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_X", "content": "A"},
+        {"role": "assistant", "content": "done"},
+    ]
+    out = sanitize_api_messages(list(messages))
+    # The bare non-final assistant turn (index 1) is healed by the existing
+    # empty-turn repair pass; the tool-call turn (index 2, has payload) is
+    # normalized by the content pass — "" never null on the wire.
+    assert out[1]["content"] == "[response interrupted]"
+    assert out[2]["content"] == ""
+    # Original list untouched — stored history / prompt caching byte-stable.
+    assert messages[1]["content"] is None
+    assert messages[2]["content"] is None
 
 
+def test_sanitize_normalizes_only_assistant_content():
+    """User turns with content=None are NOT rewritten by the assistant
+    content pass (the empty-turn repair pass owns non-final user healing;
+    a FINAL empty user turn is legal and left untouched)."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
 
-
-
-
-
-
-
-
+    messages = [
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": None},
+    ]
+    out = sanitize_api_messages(list(messages))
+    assert out[0]["content"] == "ok"
+    assert out[1]["content"] is None

@@ -84,6 +84,33 @@ class TestNeedsDeepSeekToolReasoning:
 
 
 
+class TestIsNativeDeepSeekEndpoint:
+    """Only the native DeepSeek API gets the conditional reasoning passback —
+    aggregators re-exporting deepseek models (OpenRouter) keep legacy echo."""
+
+    @pytest.mark.parametrize("provider,model,base_url", [
+        ("deepseek", "deepseek-v4-flash", ""),
+        ("custom", "deepseek-v4-flash", "https://api.deepseek.com/v1"),
+    ])
+    def test_native(self, provider, model, base_url) -> None:
+        agent = _make_agent(provider=provider, model=model, base_url=base_url)
+        assert agent._is_native_deepseek_endpoint() is True
+
+    @pytest.mark.parametrize("provider,model,base_url", [
+        ("openrouter", "deepseek/deepseek-v4-flash", "https://openrouter.ai/api/v1"),
+        ("kimi-coding", "kimi-k2.6", ""),
+        ("custom", "deepseek-v4-flash", "https://api.kimi.com/v1"),
+    ])
+    def test_aggregator(self, provider, model, base_url) -> None:
+        agent = _make_agent(provider=provider, model=model, base_url=base_url)
+        assert agent._is_native_deepseek_endpoint() is False
+
+    def test_cached_per_provider_base_url(self) -> None:
+        agent = _make_agent(provider="deepseek", model="deepseek-v4-flash")
+        assert agent._is_native_deepseek_endpoint() is True
+        assert agent._is_native_deepseek_endpoint() is True  # cache hit
+
+
 class TestCopyReasoningContentForApi:
     """_copy_reasoning_content_for_api pads reasoning_content for DeepSeek tool-calls."""
 
@@ -98,6 +125,50 @@ class TestCopyReasoningContentForApi:
         api_msg: dict = {}
         agent._copy_reasoning_content_for_api(source, api_msg)
         assert api_msg.get("reasoning_content") == " "
+
+    def test_native_deepseek_plain_turn_drops_reasoning_content(self) -> None:
+        """Conditional passback: a plain (no tool-call) assistant turn on the
+        native DeepSeek endpoint drops reasoning_content from the wire copy."""
+        agent = _make_agent(provider="deepseek", model="deepseek-v4-flash")
+        for source in (
+            {"role": "assistant", "content": "hi", "reasoning_content": "thoughts"},
+            {"role": "assistant", "content": "hi", "reasoning": "healthy"},
+            {"role": "assistant", "content": "hi"},
+        ):
+            api_msg: dict = {"role": "assistant", "content": "hi"}
+            agent._copy_reasoning_content_for_api(source, api_msg)
+            assert "reasoning_content" not in api_msg, source
+
+    def test_native_deepseek_tool_call_turn_keeps_reasoning_content(self) -> None:
+        """Conditional passback: tool-call turns keep the echo-back — verbatim
+        reasoning wins, otherwise the space pad."""
+        agent = _make_agent(provider="deepseek", model="deepseek-v4-flash")
+        src = {"role": "assistant", "content": "", "reasoning_content": "thoughts",
+               "tool_calls": [{"id": "c1", "function": {"name": "terminal"}}]}
+        api_msg: dict = {"role": "assistant", "content": ""}
+        agent._copy_reasoning_content_for_api(src, api_msg)
+        assert api_msg["reasoning_content"] == "thoughts"
+
+        src2 = {"role": "assistant", "content": "",
+                "tool_calls": [{"id": "c1", "function": {"name": "terminal"}}]}
+        api_msg2: dict = {"role": "assistant", "content": ""}
+        agent._copy_reasoning_content_for_api(src2, api_msg2)
+        assert api_msg2["reasoning_content"] == " "
+
+    def test_openrouter_deepseek_model_keeps_legacy_echo(self) -> None:
+        """Scope guard: an OpenRouter-hosted deepseek model is NOT the native
+        endpoint — plain turns keep the legacy all-assistant pad."""
+        agent = _make_agent(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-flash",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        api_msg: dict = {"role": "assistant", "content": "hi"}
+        agent._copy_reasoning_content_for_api(
+            {"role": "assistant", "content": "hi"}, api_msg
+        )
+        assert api_msg.get("reasoning_content") == " "
+
 
 
 
@@ -305,6 +376,28 @@ class TestReapplyReasoningEchoForProviderSwitch:
         # existing summary preserved verbatim, not clobbered with the pad
         assert msgs[2]["reasoning_content"] == "summary from codex"
         assert msgs[4]["reasoning_content"] == " "
+    def test_switch_to_native_deepseek_strips_plain_turns_pads_tool_turns(self) -> None:
+        """Conditional passback reconciliation: on the native DeepSeek
+        endpoint a fallback re-pads tool-call turns but leaves plain
+        (non-tool-call) turns bare — their reasoning_content is ignored by
+        the API and only burns input tokens."""
+        from agent.agent_runtime_helpers import reapply_reasoning_echo_for_provider
+
+        agent = _make_agent(provider="deepseek", model="deepseek-v4-pro")
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "do the thing"},
+            {"role": "assistant", "content": "plain answer", "reasoning_content": "stale pad"},
+            {"role": "user", "content": "and now"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "c1", "function": {"name": "terminal"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        ]
+        changed = reapply_reasoning_echo_for_provider(agent, msgs)
+        assert changed == 2
+        assert "reasoning_content" not in msgs[2]          # plain turn stripped
+        assert msgs[4]["reasoning_content"] == " "         # tool-call turn padded
+
 
     def test_strips_stale_pad_under_strict_provider(self) -> None:
         """Switching TO a strict provider (Codex/Mistral/Cerebras) must STRIP

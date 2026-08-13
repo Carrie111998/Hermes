@@ -149,6 +149,40 @@ class TestChatCompletionsBasic:
         assert "call_id" in msgs[1]["tool_calls"][1]
         assert "extra_content" in msgs[1]["tool_calls"][1]
 
+    def test_convert_messages_normalizes_assistant_content_none_to_empty(self, transport):
+        """Assistant turns must never carry content:null on the wire —
+        reasoning-only turns and host-fed histories can persist content=None.
+        Normalized to "" (the official DeepSeek samples replay text-less
+        turns as ""); the input list stays untouched."""
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": None},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "t", "arguments": "{}"}}]},
+        ]
+        result = transport.convert_messages(msgs)
+        assert result is not msgs
+        assert result[1]["content"] == ""
+        assert result[2]["content"] == ""
+        assert result[2]["tool_calls"] == msgs[2]["tool_calls"]
+        # Original list untouched (copy-on-demand)
+        assert msgs[1]["content"] is None
+        assert msgs[2]["content"] is None
+
+    def test_convert_messages_clean_list_still_identity(self, transport):
+        """A clean list (no None assistant content) is returned by identity —
+        the copy-on-demand contract is preserved.  An ABSENT content key (a
+        tool-call turn built without one) is clean, not null."""
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "assistant",
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "t", "arguments": "{}"}}]},
+        ]
+        assert transport.convert_messages(msgs) is msgs
+
 
 
 class TestChatCompletionsBuildKwargs:

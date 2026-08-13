@@ -15,6 +15,7 @@ from agent.message_sanitization import (
     apply_reasoning_content_policy,
     coalesce_tool_call_id,
     deterministic_call_id,
+    is_native_deepseek_endpoint,
     matches_reasoning_echo_family,
     needs_reasoning_echo,
     reapply_reasoning_echo,
@@ -203,6 +204,31 @@ class TestReasoningEchoFamily:
             matches_reasoning_echo_family("nope", "p", "m", "https://x")
 
 
+class TestIsNativeDeepseekEndpoint:
+    """Only the native DeepSeek API gets the conditional reasoning passback."""
+
+    @pytest.mark.parametrize("provider,base_url", [
+        ("deepseek", ""),
+        ("DeepSeek", "https://custom-proxy.example/v1"),
+        ("custom", "https://api.deepseek.com/v1"),
+        ("custom", "https://api.deepseek.com/beta"),
+    ])
+    def test_native_endpoint(self, provider, base_url):
+        assert is_native_deepseek_endpoint(provider, base_url) is True
+
+    @pytest.mark.parametrize("provider,base_url", [
+        ("openrouter", "https://openrouter.ai/api/v1"),
+        ("custom", "https://api.kimi.com/v1"),
+        ("custom", "https://api.moonshot.ai/v1"),
+        ("kimi-coding", ""),
+        ("xiaomi", ""),
+        ("", ""),
+        (None, None),
+    ])
+    def test_aggregator_or_other_endpoints(self, provider, base_url):
+        assert is_native_deepseek_endpoint(provider, base_url) is False
+
+
 # ---------------------------------------------------------------------------
 # apply_reasoning_content_policy
 # ---------------------------------------------------------------------------
@@ -254,6 +280,43 @@ class TestApplyReasoningContentPolicy:
         apply_reasoning_content_policy({"role": "assistant", "content": "x"}, api, True)
         assert api["reasoning_content"] == " "
 
+    def test_native_deepseek_plain_turn_drops_reasoning_content(self):
+        """Native DeepSeek: a plain (no tool-call) assistant turn never
+        carries reasoning_content on the wire — the API ignores it there and
+        every replayed token is billed input."""
+        for src in (
+            {"role": "assistant", "content": "x", "reasoning_content": "thoughts"},
+            {"role": "assistant", "content": "x", "reasoning_content": " "},
+            {"role": "assistant", "content": "x", "reasoning": "healthy"},
+            {"role": "assistant", "content": "x"},
+        ):
+            api = {"role": "assistant", "content": src["content"]}
+            apply_reasoning_content_policy(src, api, True, native_deepseek=True)
+            assert "reasoning_content" not in api, src
+
+    def test_native_deepseek_tool_call_turn_keeps_passback(self):
+        """Native DeepSeek: tool-call turns keep the full echo-back — verbatim
+        reasoning_content, the space pad, and the poisoned-history pad."""
+        src = {"role": "assistant", "content": "",
+               "reasoning_content": "thoughts",
+               "tool_calls": [{"id": "c", "function": {"name": "t", "arguments": "{}"}}]}
+        api = {"role": "assistant", "content": ""}
+        apply_reasoning_content_policy(src, api, True, native_deepseek=True)
+        assert api["reasoning_content"] == "thoughts"
+
+        src2 = {"role": "assistant", "content": "",
+                "tool_calls": [{"id": "c", "function": {"name": "t", "arguments": "{}"}}]}
+        api2 = {"role": "assistant", "content": ""}
+        apply_reasoning_content_policy(src2, api2, True, native_deepseek=True)
+        assert api2["reasoning_content"] == " "
+
+    def test_native_deepseek_plain_turn_still_pads_without_flag(self):
+        """Without the native_deepseek flag (kimi/mimo, aggregator-hosted
+        deepseek models) plain turns keep the legacy pad."""
+        api = {"role": "assistant", "content": "x"}
+        apply_reasoning_content_policy({"role": "assistant", "content": "x"}, api, True)
+        assert api["reasoning_content"] == " "
+
     def test_non_string_reasoning_content_removed(self):
         api = {"role": "assistant", "content": "x", "reasoning_content": None}
         apply_reasoning_content_policy(
@@ -294,3 +357,32 @@ class TestReapplyReasoningEcho:
         assert reapply_reasoning_echo(msgs, True) == 0
         reapply_reasoning_echo(msgs, False)
         assert reapply_reasoning_echo(msgs, False) == 0
+
+    def test_native_deepseek_plain_turns_stripped(self):
+        """Native DeepSeek reconciliation: plain turns lose reasoning_content
+        (pads baked in under a prior provider), tool-call turns keep it."""
+        import copy
+        msgs = copy.deepcopy(self.MSGS)
+        assert reapply_reasoning_echo(msgs, True, native_deepseek=True) == 1
+        assert "reasoning_content" not in msgs[0]  # plain turn stripped (was " ")
+        assert "reasoning_content" not in msgs[1]  # plain turn stays bare
+        assert "reasoning_content" not in msgs[2]
+
+    def test_native_deepseek_idempotent(self):
+        import copy
+        msgs = copy.deepcopy(self.MSGS)
+        reapply_reasoning_echo(msgs, True, native_deepseek=True)
+        assert reapply_reasoning_echo(msgs, True, native_deepseek=True) == 0
+
+    def test_native_deepseek_tool_call_turns_repadded_from_bare(self):
+        """Switch to native DeepSeek from a bare builder: tool-call turns get
+        padded, plain turns stay bare (conditional passback)."""
+        msgs = [
+            {"role": "assistant", "content": "plain answer"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "c", "function": {"name": "t", "arguments": "{}"}}]},
+        ]
+        changed = reapply_reasoning_echo(msgs, True, native_deepseek=True)
+        assert changed == 1
+        assert "reasoning_content" not in msgs[0]
+        assert msgs[1]["reasoning_content"] == " "
