@@ -8492,6 +8492,11 @@ async function startHermes() {
 
     hermesProcess.stdout.on('data', rememberLog)
     hermesProcess.stderr.on('data', rememberLog)
+    // Start watching immediately after spawn. The backend can bind and emit
+    // its READY line before the async boot-progress update below yields back
+    // to the event loop; registering this watcher later would lose that line
+    // and leave a healthy backend waiting until the announce timeout.
+    const portAnnouncement = waitForDashboardPortAnnouncement(hermesProcess, { readyFile })
     let backendReady = false
     let rejectBackendStart = null
 
@@ -8557,7 +8562,7 @@ async function startHermes() {
 
     // Discover the ephemeral port the child bound to
     const port = await Promise.race([
-      waitForDashboardPortAnnouncement(hermesProcess, { readyFile }),
+      portAnnouncement,
       backendStartFailed
     ])
 
