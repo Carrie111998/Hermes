@@ -1504,8 +1504,10 @@ def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
         spec = entry.strip()
         if not spec:
             continue
-        # Prefer the first ':/' so absolute container paths are unambiguous.
-        sep = spec.find(":/")
+        # The container path is the final absolute-path component.  Use the
+        # last ``:/`` so forward-slash Windows hosts (``C:/...:/workspace``)
+        # do not split at the drive colon.
+        sep = spec.rfind(":/")
         if sep <= 0:
             continue
         host_raw = spec[:sep]

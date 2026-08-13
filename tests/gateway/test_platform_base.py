@@ -2,6 +2,7 @@
 
 import os
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -800,6 +801,21 @@ class TestDockerContainerMediaPathTranslation:
         assert BasePlatformAdapter.validate_media_delivery_path(
             "/workspace/shot.png"
         ) == str(media.resolve())
+
+    def test_forward_slash_windows_host_mount_parses(self, monkeypatch):
+        import json
+
+        monkeypatch.setenv(
+            "TERMINAL_DOCKER_VOLUMES",
+            json.dumps(["C:/Users/demo/artifacts:/workspace"]),
+        )
+
+        from gateway.platforms.base import _parse_docker_volume_mounts
+
+        mounts = _parse_docker_volume_mounts()
+        assert len(mounts) == 1
+        assert mounts[0][0] == Path("C:/Users/demo/artifacts").resolve(strict=False)
+        assert mounts[0][1].as_posix() == "/workspace"
 
     def test_configured_output_mount_translates(self, tmp_path, monkeypatch):
         import json
