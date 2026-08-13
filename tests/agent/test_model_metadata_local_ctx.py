@@ -374,7 +374,8 @@ class TestDetectLocalServerTypeAuth:
 
         assert result == "lm-studio"
         assert mock_client.call_args.kwargs["headers"] == {
-            "Authorization": "Bearer lm-token"
+            "Authorization": "Bearer lm-token",
+            "Accept-Encoding": "identity",
         }
 
     def test_native_api_base_url_is_not_doubled(self):
@@ -477,7 +478,8 @@ class TestFetchEndpointModelMetadataLmStudio:
         assert mock_get.call_count == 1
         assert mock_get.call_args[0][0] == "http://localhost:1234/api/v1/models"
         assert mock_get.call_args.kwargs["headers"] == {
-            "Authorization": "Bearer lm-token"
+            "Authorization": "Bearer lm-token",
+            "Accept-Encoding": "identity",
         }
         assert result["lmstudio-community/Qwen3.5-27B-GGUF/Qwen3.5-27B-Q8_0.gguf"]["context_length"] == 131072
         assert result["Qwen3.5-27B-GGUF/Qwen3.5-27B-Q8_0.gguf"]["context_length"] == 131072

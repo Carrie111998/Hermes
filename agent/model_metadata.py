@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse
@@ -46,6 +47,76 @@ def __getattr__(name: str):
     if name == "requests":
         return _ensure_requests()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+_MODEL_PROBE_RESPONSE_MAX_BYTES = 16 * 1024 * 1024
+
+
+class _ModelProbeResponseTooLarge(ValueError):
+    pass
+
+
+def _check_model_probe_response_headers(response: Any) -> None:
+    headers = getattr(response, "headers", None)
+    if not isinstance(headers, Mapping):
+        return
+    encoding = headers.get("content-encoding", "")
+    if isinstance(encoding, str) and encoding.strip().lower() not in {"", "identity"}:
+        raise ValueError("encoded model probe responses are not accepted")
+    content_length = headers.get("content-length")
+    if isinstance(content_length, (str, int)):
+        try:
+            parsed_content_length = int(content_length)
+        except ValueError:
+            pass
+        else:
+            if parsed_content_length > _MODEL_PROBE_RESPONSE_MAX_BYTES:
+                raise _ModelProbeResponseTooLarge(
+                    f"model probe response exceeds {_MODEL_PROBE_RESPONSE_MAX_BYTES} bytes"
+                )
+
+
+def _bound_model_probe_response(response: Any) -> None:
+    """Cap model-discovery responses before httpx buffers them in memory."""
+    import httpx
+
+    _check_model_probe_response_headers(response)
+
+    wrapped = response.stream
+
+    class _LimitedStream(httpx.SyncByteStream):
+        def __iter__(self):
+            total = 0
+            for chunk in wrapped:
+                total += len(chunk)
+                if total > _MODEL_PROBE_RESPONSE_MAX_BYTES:
+                    raise _ModelProbeResponseTooLarge(
+                        f"model probe response exceeds {_MODEL_PROBE_RESPONSE_MAX_BYTES} bytes"
+                    )
+                yield chunk
+
+        def close(self) -> None:
+            wrapped.close()
+
+    response.stream = _LimitedStream()
+
+
+def _read_bounded_requests_model_probe_json(response: Any) -> Any:
+    """Decode a requests response without allowing its body to buffer unbounded."""
+    response.raise_for_status()
+    _check_model_probe_response_headers(response)
+    chunks = []
+    total = 0
+    for chunk in response.iter_content(chunk_size=64 * 1024):
+        total += len(chunk)
+        if total > _MODEL_PROBE_RESPONSE_MAX_BYTES:
+            raise _ModelProbeResponseTooLarge(
+                f"model probe response exceeds {_MODEL_PROBE_RESPONSE_MAX_BYTES} bytes"
+            )
+        chunks.append(chunk)
+    response._content = b"".join(chunks)
+    response._content_consumed = True
+    return response.json()
 
 
 def _resolve_requests_verify() -> bool | str:
@@ -646,6 +717,10 @@ def _auth_headers(api_key: str = "") -> Dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _model_probe_headers(api_key: str = "") -> Dict[str, str]:
+    return {**_auth_headers(api_key), "Accept-Encoding": "identity"}
+
+
 def _is_openrouter_base_url(base_url: str) -> bool:
     return base_url_host_matches(base_url, "openrouter.ai")
 
@@ -978,7 +1053,7 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
         _endpoint_probe_path_cache[server_url] = (disk_hit, time.monotonic())
         return disk_hit
 
-    headers = _auth_headers(api_key)
+    headers = _model_probe_headers(api_key)
 
     def _probe_failed(exc: Exception) -> None:
         """Swallow a probe error — or abort the waterfall if we were blackholed.
@@ -992,7 +1067,11 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
 
     result: Optional[str] = None
     try:
-        with httpx.Client(timeout=2.0, headers=headers) as client:
+        with httpx.Client(
+            timeout=2.0,
+            headers=headers,
+            event_hooks={"response": [_bound_model_probe_response]},
+        ) as client:
             # LM Studio exposes /api/v1/models — check first (most specific)
             try:
                 r = client.get(f"{lmstudio_url}/api/v1/models")
@@ -1242,7 +1321,7 @@ def fetch_endpoint_model_metadata(
     if alternate and alternate not in candidates:
         candidates.append(alternate)
 
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    headers = _model_probe_headers(api_key)
     last_error: Optional[Exception] = None
 
     if is_local_endpoint(normalized):
@@ -1254,9 +1333,12 @@ def fetch_endpoint_model_metadata(
                     headers=headers,
                     timeout=(5, 10),
                     verify=_resolve_requests_verify(),
+                    stream=True,
                 )
-                response.raise_for_status()
-                payload = response.json()
+                try:
+                    payload = _read_bounded_requests_model_probe_json(response)
+                finally:
+                    response.close()
                 cache: Dict[str, Dict[str, Any]] = {}
                 for model in payload.get("models", []):
                     if not isinstance(model, dict):
@@ -1326,8 +1408,7 @@ def fetch_endpoint_model_metadata(
                     url,
                 )
                 break
-            response.raise_for_status()
-            payload = response.json()
+            payload = _read_bounded_requests_model_probe_json(response)
             cache: Dict[str, Dict[str, Any]] = {}
             for model in payload.get("data", []):
                 if not isinstance(model, dict):
@@ -1357,16 +1438,28 @@ def fetch_endpoint_model_metadata(
                     # Try /v1/props first (current llama.cpp); fall back to /props for older builds
                     base = request_candidate.rstrip("/").replace("/v1", "")
                     _verify = _resolve_requests_verify()
-                    props_resp = requests.get(base + "/v1/props", headers=headers, timeout=5, verify=_verify)
+                    props_resp = requests.get(
+                        base + "/v1/props", headers=headers, timeout=5,
+                        verify=_verify, stream=True,
+                    )
                     if not props_resp.ok:
-                        props_resp = requests.get(base + "/props", headers=headers, timeout=5, verify=_verify)
+                        props_resp.close()
+                        props_resp = requests.get(
+                            base + "/props", headers=headers, timeout=5,
+                            verify=_verify, stream=True,
+                        )
                     if props_resp.ok:
-                        props = props_resp.json()
+                        try:
+                            props = _read_bounded_requests_model_probe_json(props_resp)
+                        finally:
+                            props_resp.close()
                         gen_settings = props.get("default_generation_settings", {})
                         n_ctx = gen_settings.get("n_ctx")
                         model_alias = props.get("model_alias", "")
                         if n_ctx and model_alias and model_alias in cache:
                             cache[model_alias]["context_length"] = n_ctx
+                    else:
+                        props_resp.close()
                 except Exception:
                     pass
 
@@ -1805,10 +1898,14 @@ def query_ollama_num_ctx(model: str, base_url: str, api_key: str = "") -> Option
     if isinstance(disk_hit, int) and disk_hit > 0:
         return disk_hit
 
-    headers = _auth_headers(api_key)
+    headers = _model_probe_headers(api_key)
 
     try:
-        with httpx.Client(timeout=3.0, headers=headers) as client:
+        with httpx.Client(
+            timeout=3.0,
+            headers=headers,
+            event_hooks={"response": [_bound_model_probe_response]},
+        ) as client:
             resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
             if resp.status_code != 200:
                 return None
@@ -1863,10 +1960,14 @@ def query_ollama_supports_vision(model: str, base_url: str, api_key: str = "") -
     if server_url.endswith("/v1"):
         server_url = server_url[:-3]
 
-    headers = _auth_headers(api_key)
+    headers = _model_probe_headers(api_key)
 
     try:
-        with httpx.Client(timeout=3.0, headers=headers) as client:
+        with httpx.Client(
+            timeout=3.0,
+            headers=headers,
+            event_hooks={"response": [_bound_model_probe_response]},
+        ) as client:
             resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
             if resp.status_code != 200:
                 return None
@@ -1943,10 +2044,14 @@ def _query_ollama_api_show_uncached(model: str, base_url: str, api_key: str = ""
     if _endpoint_blackholed(server_url):
         return None
 
-    headers = _auth_headers(api_key)
+    headers = _model_probe_headers(api_key)
 
     try:
-        with httpx.Client(timeout=5.0, headers=headers) as client:
+        with httpx.Client(
+            timeout=5.0,
+            headers=headers,
+            event_hooks={"response": [_bound_model_probe_response]},
+        ) as client:
             resp = client.post(f"{server_url}/api/show", json={"name": model})
             if resp.status_code != 200:
                 return None
@@ -2067,7 +2172,7 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
     if _endpoint_blackholed(server_url):
         return None
 
-    headers = _auth_headers(api_key)
+    headers = _model_probe_headers(api_key)
 
     try:
         server_type = detect_local_server_type(base_url, api_key=api_key)
@@ -2075,7 +2180,11 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
         server_type = None
 
     try:
-        with httpx.Client(timeout=3.0, headers=headers) as client:
+        with httpx.Client(
+            timeout=3.0,
+            headers=headers,
+            event_hooks={"response": [_bound_model_probe_response]},
+        ) as client:
             # Ollama: /api/show returns model details with context info
             if server_type == "ollama":
                 resp = client.post(f"{server_url}/api/show", json={"name": model})
