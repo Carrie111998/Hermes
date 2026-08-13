@@ -16,6 +16,7 @@ import logging
 import os
 import secrets
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -37,6 +38,12 @@ logger = logging.getLogger(__name__)
 CONTRACT_VERSION = 1
 DEFAULT_POLICY_VERSION = "product-handoff-v2+qualification-v1"
 REQUALIFICATION_QUALIFIER_REVISION = 3
+ACTIVE_REQUALIFICATION_STATUSES = (
+    "pending",
+    "running",
+    "needs_clarification",
+    "attention_required",
+)
 SIGNING_KEY_RELATIVE_PATH = "kanban/work_contract_signing.key"
 
 _SIGNING_METADATA_FIELDS = {"canonical_json", "digest", "signature", "contract"}
@@ -552,13 +559,16 @@ def existing_requalification_intake(
 
     rows = conn.execute(
         "SELECT * FROM qualification_intake "
-        "WHERE status IN ('pending', 'rejected') ORDER BY created_at, id"
+        "WHERE status IN (?,?,?,?) OR status = 'rejected' "
+        "ORDER BY (status IN ('pending', 'running', 'needs_clarification', "
+        "'attention_required')) DESC, created_at, id",
+        ACTIVE_REQUALIFICATION_STATUSES,
     ).fetchall()
     for row in rows:
         record = dict(row)
         if requalification_target_id(record) != task_id:
             continue
-        if record["status"] == "pending":
+        if record["status"] in ACTIVE_REQUALIFICATION_STATUSES:
             return record
         payload = intake_payload(record)
         if (
@@ -667,11 +677,9 @@ def submit_requalification(
             if existing is not None:
                 intake_id = str(existing["id"])
                 return {
-                    "status": (
-                        "requalification_required"
-                        if existing["status"] == "pending"
-                        else "requalification_rejected"
-                    ),
+                    "status": "requalification_required"
+                    if existing["status"] in ACTIVE_REQUALIFICATION_STATUSES
+                    else "requalification_rejected",
                     "created": False,
                     "intake_id": intake_id,
                     "intake_status": str(existing["status"]),
@@ -696,11 +704,33 @@ def submit_requalification(
                 ensure_ascii=False,
                 default=str,
             )
-            intake_id = kanban_db.create_qualification_intake(
-                conn,
-                raw_request=raw_request,
-                source="hermes-reconcile",
-            )
+            try:
+                intake_id = kanban_db.create_qualification_intake(
+                    conn,
+                    raw_request=raw_request,
+                    source="hermes-reconcile",
+                )
+            except sqlite3.IntegrityError as exc:
+                if "idx_requalification_one_active_target" not in str(exc):
+                    raise
+                existing = existing_requalification_intake(
+                    conn,
+                    task_id,
+                    evidence_digest=evidence_digest,
+                    qualifier_revision=REQUALIFICATION_QUALIFIER_REVISION,
+                )
+                if existing is None:
+                    raise
+                intake_id = str(existing["id"])
+                return {
+                    "status": "requalification_required"
+                    if existing["status"] in ACTIVE_REQUALIFICATION_STATUSES
+                    else "requalification_rejected",
+                    "created": False,
+                    "intake_id": intake_id,
+                    "intake_status": str(existing["status"]),
+                    "task_id": task_id,
+                }
             kanban_db._append_event(
                 conn,
                 task_id,

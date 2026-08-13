@@ -90,7 +90,10 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Tuple
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
-from hermes_cli.kanban_intake import DEFAULT_POLICY_VERSION
+from hermes_cli.kanban_intake import (
+    ACTIVE_REQUALIFICATION_STATUSES,
+    DEFAULT_POLICY_VERSION,
+)
 from hermes_cli.kanban_repository import (
     EvidenceWorkspaceError,
     EvidenceWorkspaceResult,
@@ -6109,6 +6112,7 @@ def _migrate_qualification_intake_lifecycle(conn: sqlite3.Connection) -> None:
                 conn.rollback()
             raise
 
+    _reconcile_legacy_requalification_duplicates(conn)
     try:
         conn.executescript(
             """
@@ -6118,6 +6122,13 @@ def _migrate_qualification_intake_lifecycle(conn: sqlite3.Connection) -> None:
         CREATE UNIQUE INDEX IF NOT EXISTS idx_qualification_intake_idempotency
             ON qualification_intake(idempotency_digest)
             WHERE idempotency_digest IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_requalification_one_active_target
+            ON qualification_intake(json_extract(raw_request, '$.target_task_id'))
+            WHERE json_valid(raw_request)
+              AND json_extract(raw_request, '$.kind') = 'task_requalification'
+              AND status IN (
+                  'pending', 'running', 'needs_clarification', 'attention_required'
+              );
         CREATE INDEX IF NOT EXISTS idx_qualification_intake_runs
             ON qualification_intake_runs(intake_id, id);
         CREATE INDEX IF NOT EXISTS idx_qualification_intake_events
@@ -6169,6 +6180,67 @@ def _migrate_qualification_intake_lifecycle(conn: sqlite3.Connection) -> None:
         if conn.in_transaction:
             conn.rollback()
         raise
+
+
+def _reconcile_legacy_requalification_duplicates(
+    conn: sqlite3.Connection,
+) -> None:
+    """Reject older active requalification duplicates before indexing targets."""
+
+    placeholders = ",".join("?" for _ in ACTIVE_REQUALIFICATION_STATUSES)
+    duplicate_targets = conn.execute(
+        f"""
+        SELECT json_extract(raw_request, '$.target_task_id') AS target_task_id
+          FROM qualification_intake
+         WHERE json_valid(raw_request)
+           AND json_extract(raw_request, '$.kind') = 'task_requalification'
+           AND json_type(raw_request, '$.target_task_id') = 'text'
+           AND status IN ({placeholders})
+         GROUP BY json_extract(raw_request, '$.target_task_id')
+        HAVING COUNT(*) > 1
+        """,
+        ACTIVE_REQUALIFICATION_STATUSES,
+    ).fetchall()
+    if not duplicate_targets:
+        return
+
+    now = int(time.time())
+    with write_txn(conn):
+        for target in duplicate_targets:
+            rows = conn.execute(
+                f"""
+                SELECT id
+                  FROM qualification_intake
+                 WHERE json_valid(raw_request)
+                   AND json_extract(raw_request, '$.kind') = 'task_requalification'
+                   AND json_extract(raw_request, '$.target_task_id') = ?
+                   AND status IN ({placeholders})
+                 ORDER BY created_at DESC, id DESC
+                """,
+                (target["target_task_id"], *ACTIVE_REQUALIFICATION_STATUSES),
+            ).fetchall()
+            if len(rows) < 2:
+                continue
+            newest_id = str(rows[0]["id"])
+            reason = f"superseded by active requalification intake {newest_id}"
+            for row in rows[1:]:
+                intake_id = str(row["id"])
+                conn.execute(
+                    """
+                    INSERT INTO qualification_intake_decisions (
+                        intake_id, decision, actor_profile, reason, contract_id, created_at
+                    ) VALUES (?, 'rejected', 'hermes-migration', ?, NULL, ?)
+                    """,
+                    (intake_id, reason, now),
+                )
+                conn.execute(
+                    f"""
+                    UPDATE qualification_intake
+                       SET status = 'rejected', updated_at = ?
+                     WHERE id = ? AND status IN ({placeholders})
+                    """,
+                    (now, intake_id, *ACTIVE_REQUALIFICATION_STATUSES),
+                )
 
 
 def _ensure_qualification_boundary_objects(conn: sqlite3.Connection) -> None:
