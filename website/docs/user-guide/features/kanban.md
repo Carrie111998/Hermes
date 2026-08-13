@@ -224,12 +224,19 @@ up on the next tick (60s by default).
 ```yaml
 # config.yaml
 kanban:
-  dispatch_in_gateway: true        # default
+  dispatch_in_gateway: true        # the DISPATCHING gateway (default/factory)
   dispatch_interval_seconds: 60    # default
   review_dispatch: true            # default: spawn the assigned profile with
                                    # the bundled sdlc-review skill. Set false
                                    # for human-only review boards.
 ```
+
+Every **non-dispatching** gateway must set `dispatch_in_gateway: false` (fresh
+profiles created with `hermes profile create <name>` are seeded this way, along
+with `enabled: false`), so its gateway never races for the singleton
+`.dispatcher.lock`. A profile whose `config.yaml` has no `kanban:` section at
+all inherits `dispatch_in_gateway: true` from the defaults — which makes a
+helper profile's gateway silently try to become a second dispatcher.
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
 for debugging. Standard gateway supervision applies: run `hermes gateway
@@ -1048,7 +1055,14 @@ dispatch and delivery have separate owners:
 
 - **Dispatch stays single-owner.** Exactly one gateway keeps
   `kanban.dispatch_in_gateway: true` and runs the dispatcher; every other
-  gateway sets it to `false`.
+  gateway sets it to `false`. The dispatcher gateway holds an exclusive flock
+  on `<kanban-root>/kanban/.dispatcher.lock`; a non-factory profile must never
+  hold that lock. Fresh profiles (`hermes profile create <name>` without
+  `--clone`) are seeded with `kanban.dispatch_in_gateway: false` +
+  `kanban.enabled: false` precisely so a new gateway never races for the lock.
+  A profile whose `config.yaml` lacks an explicit `kanban:` section inherits
+  `dispatch_in_gateway: true` from the defaults — keep the section explicit in
+  every non-factory profile.
 - **Notification delivery is profile-owned.** Every gateway — including
   non-dispatch ones — runs the notifier and polls only subscriptions stamped
   with a profile whose platform adapters it hosts. A task created from the

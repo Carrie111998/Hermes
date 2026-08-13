@@ -174,6 +174,31 @@ class TestCreateProfile:
 
 
 
+    def test_fresh_profile_seeds_kanban_dispatcher_off(self, profile_env):
+        """Fresh (non-clone) profiles get a config.yaml that keeps the kanban
+        dispatcher OFF by default.
+
+        A profile whose config.yaml lacks an explicit ``kanban:`` section
+        inherits ``kanban.dispatch_in_gateway: true`` from DEFAULT_CONFIG,
+        which makes its gateway try to acquire the singleton dispatcher lock
+        (``<kanban-root>/kanban/.dispatcher.lock``) and race the
+        default/factory gateway. Non-factory profiles must never hold that
+        lock; the seeded default keeps them out of the dispatcher race.
+        """
+        import stat
+        profile_dir = create_profile("coder", no_alias=True)
+        config_path = profile_dir / "config.yaml"
+        assert config_path.exists(), "fresh profile should get a seeded config.yaml"
+        config = yaml.safe_load(config_path.read_text())
+        assert config["_config_version"] == DEFAULT_CONFIG["_config_version"]
+        kanban = config["kanban"]
+        assert kanban["dispatch_in_gateway"] is False
+        assert kanban["enabled"] is False
+        mode = stat.S_IMODE(config_path.stat().st_mode)
+        assert mode == 0o644
+
+
+
 
     def test_clone_config_copies_files(self, profile_env):
         tmp_path = profile_env

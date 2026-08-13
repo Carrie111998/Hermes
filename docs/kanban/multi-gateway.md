@@ -23,6 +23,31 @@ each gateway polls only subscriptions for profiles whose platform adapters it
 hosts. The atomic event claim prevents duplicate delivery across watcher
 processes.
 
+**The dispatcher lock is a hard backstop, not a preference.** The gateway that
+runs the dispatcher holds an exclusive flock on
+`<kanban-root>/kanban/.dispatcher.lock` (the machine-global kanban root,
+shared across all profiles). A non-factory profile must **never** hold this
+lock: a helper/secondary profile that accidentally flips `dispatch_in_gateway`
+on (or lacks an explicit `kanban:` section and inherits the default `true`)
+will silently race the default/factory gateway for every board.
+
+**Fresh profiles are safe by default.** `hermes profile create <name>` (without
+`--clone`) seeds the new profile's `config.yaml` with the dispatcher off:
+
+```yaml
+kanban:
+  dispatch_in_gateway: false
+  enabled: false
+```
+
+So a brand-new non-factory profile starts its gateway without touching
+`.dispatcher.lock`. Factory dispatcher profiles (e.g. `default`, and any
+profile explicitly intended to dispatch) opt in with
+`dispatch_in_gateway: true` in their own config. If you clone a profile with
+`--clone` / `--clone-all`, the source's `kanban:` section is copied as-is —
+check it after cloning so a clone of the dispatcher doesn't become a second
+dispatcher by accident.
+
 ## Configuration
 
 On the dispatch-owning gateway (typically the `default` profile), no change is
