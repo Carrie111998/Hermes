@@ -1466,6 +1466,24 @@ class TestOutboundVoiceFlag:
         assert "voice" not in captured["document"]
 
     @pytest.mark.asyncio
+    async def test_link_branch_forwards_the_flag(self):
+        """The dispatcher's HTTPS branch forwards ``voice`` too.
+
+        No current caller reaches it -- send_voice only sets the flag for a
+        locally converted opus file, which always takes the upload branch --
+        so this pins the forwarding rather than asserting live behaviour.
+        Meta's acceptance of ``voice`` on a ``link`` send is unverified.
+        """
+        adapter, captured = _capture_adapter()
+
+        await adapter._send_media_from_path_or_link(
+            "15551234567", "https://example.com/a.ogg", "audio", voice=True
+        )
+
+        assert captured["audio"]["link"] == "https://example.com/a.ogg"
+        assert captured["audio"]["voice"] is True
+
+    @pytest.mark.asyncio
     async def test_converted_opus_send_is_flagged_as_voice(self, tmp_path, monkeypatch):
         """The path that converts to opus for the voice bubble must say so."""
         adapter, captured = _capture_adapter()
