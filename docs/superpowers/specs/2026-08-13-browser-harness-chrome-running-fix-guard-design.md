@@ -24,6 +24,31 @@ Chrome was running the whole time. `--doctor` printed `[FAIL] chrome running`,
 exited 1, and `cron_vip_scan_orchestrator.py:573` returned 3 on the
 `status: blocked` path.
 
+### The doctor verdict is a hard gate, and CDP does not rescue it
+
+Verified end to end, because the guard's whole justification rests on it:
+
+1. `parse_doctor_ok:269-278` sets `chrome_ok` only when a line containing
+   `chrome running` is *also* "okish". `[FAIL] chrome running` leaves it `False`.
+2. The same function returns `'ok': chrome_ok and daemon_ok`, so one false
+   `chrome_ok` sinks the whole verdict.
+3. `:555` and `:568` both gate on `if not doctor_ok or not cdp_ok`. That is AND
+   semantics for *proceeding*: **a false `doctor_ok` blocks the scan even when
+   the CDP probe is healthy.** A live browser connection cannot outvote it.
+
+So a reverted `_chrome_running()` blocks scans on its own, with no second
+condition required. There is one refresh retry (`:556-566`) between the two
+gates, and it does not help — `refresh_harness()` cannot fix a process scan that
+times out.
+
+A backup named `cron_vip_scan_orchestrator.py.bak-pre-cdp-authoritative-20260813`
+sits next to the live file, suggesting an intent to make CDP authoritative on
+the same day — which would have softened this gate. It did not land: the live
+file is **byte-identical** to that backup (both 29661 bytes, `diff` exit 0). The
+gate described above is the code that runs today. If CDP is ever made
+authoritative, revisit this section — the guard stays useful, but its urgency
+drops from "scans stop" to "scans lose a health signal".
+
 The fix lives in local git only, on branch
 `fix/chrome-running-timeout-false-negative` @ `1a36129`. Anything that restores
 the upstream file — `uv tool upgrade`, `browser-harness --update`, a branch
