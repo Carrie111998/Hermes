@@ -20,6 +20,53 @@ Hermes Agent includes a full browser automation toolset with multiple backend op
 
 In all modes, the agent can navigate websites, interact with page elements, fill forms, and extract information.
 
+## Research is isolated by default
+
+Routine agent research does not use or focus your visible Chrome window. `web_search`
+and `web_extract` use API/HTTP providers, and browser automation uses a cloud or
+headless/isolated browser. If Browser Use has no isolated backend, Hermes refuses its
+implicit local-Chrome fallback rather than opening Chrome. This policy applies to
+normal foreground routing, remote terminal backends such as the CT106 SSH backend,
+delegated agents, and Kanban workers. Card workers also discard inherited headed and
+CDP overrides before they start.
+
+For simple lookup and page retrieval, prefer `web_search` followed by `web_extract`.
+Use browser automation only when the task requires page interaction.
+
+### Artifact presentation is separate
+
+Showing a result is not research automation. In the Hermes desktop app, an explicit
+`open_preview` request can present a URL, local dev server, or generated file in the
+preview pane beside the chat. User-initiated link and artifact actions remain
+available. Background agents do not receive this desktop-only presentation tool and
+do not take over the operator's browser merely to collect information.
+
+### Opt in to a visible browser
+
+A human-owned foreground session can explicitly opt in with `/browser connect` in the
+interactive CLI, or with the desktop browser connect action. That connection permits
+the current foreground session to drive a visible CDP browser until disconnected.
+The opt-in never propagates to delegated children or Kanban workers.
+
+`browser.headed`, `AGENT_BROWSER_HEADED`, `browser.cdp_url`, and `BROWSER_CDP_URL`
+are not standalone opt-ins for routine agent work. They are honored only after the
+foreground visible-browser policy has been enabled by an explicit connect action.
+Operators should not set `HERMES_BROWSER_INTERACTION` directly; it is internal session
+state managed by Hermes.
+
+### Migration notes
+
+- Existing unattended or card-based research that relied on a local Chrome fallback
+  must configure a cloud browser provider, switch to `web_search`/`web_extract`, or
+  select the built-in headless browser with `browser.backend: "off"`.
+- Existing foreground workflows that intentionally control a visible browser should
+  start with `/browser connect` (or the desktop connect action) and disconnect when
+  finished.
+- No dedicated research profile is required. The isolation policy is enforced across
+  profiles and backends, including CT106; a research profile remains optional for
+  choosing narrower toolsets or models.
+- Artifact previews and explicit user-open actions require no migration.
+
 ## Overview
 
 Pages are represented as **accessibility trees** (text-based snapshots), making them ideal for LLM agents. Interactive elements get ref IDs (like `@e1`, `@e2`) that the agent uses for clicking and typing.

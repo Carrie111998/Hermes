@@ -45,6 +45,26 @@ API either way.
 
 Camofox is unsupported — no CDP surface, REST-only.
 
+## Agent research isolation
+
+The supervisor participates only after browser routing selects an allowed CDP endpoint.
+Routine research defaults to the isolated policy in
+`agent/browser_interaction_policy.py`: without an explicit foreground connect action,
+local headed mode and local CDP overrides resolve to disabled. Browser Use must use a
+configured cloud endpoint or fail closed instead of attaching to Chrome.
+
+`HERMES_BROWSER_INTERACTION` is internal, process-scoped policy state. Foreground
+`/browser connect` and desktop `browser.manage(connect)` set it to `visible`; their
+disconnect paths clear it. Do not document it as a user configuration knob. Contexts
+with `HERMES_KANBAN_TASK`, plus delegated child contexts, always deny visible browser
+control even if they inherit a visible value. The Kanban dispatcher additionally sets
+`isolated` and removes `AGENT_BROWSER_HEADED`, `BROWSER_CDP_URL`, `BU_CDP_URL`, and
+`BU_CDP_WS` from each worker environment.
+
+Keep research and presentation separate. `open_preview` emits a desktop renderer event
+to show a requested URL or artifact and intentionally bypasses this browser-automation
+policy. It is exposed only to the owning desktop session, not background card workers.
+
 ## Architecture
 
 ### CDPSupervisor
