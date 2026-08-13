@@ -122,7 +122,10 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {
+    "dependency", "needs_input", "capability", "transient",
+    "iteration_exhausted",
+}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -4884,6 +4887,7 @@ def goal_run_status(
                 "changes_requested": "changes_requested",
                 "blocked": "blocked",
                 "dependency_wait": "blocked",
+                "iteration_exhausted": "blocked",
             }.get(outcome)
             if outcome is not None
             else None
@@ -6799,6 +6803,10 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
+    Iteration-exhausted revisions are deliberately not resumable. Their
+    workspace remains available for an owner-created replacement, but the
+    exhausted card itself stays parked with ``resume_policy=never``.
+
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
     is a no-op. If a future or external write left the pointer dangling,
@@ -6809,9 +6817,11 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         current = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, block_kind FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        if current and current["block_kind"] == "iteration_exhausted":
+            return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if current and current["status"] == "blocked"
@@ -9222,6 +9232,102 @@ def _record_task_failure(
                 )
             # Timeout/crash path's caller already emitted its own event.
     return blocked
+
+
+def _record_iteration_exhaustion(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    budget_used: int,
+    budget_max: int,
+    error: Optional[str] = None,
+) -> Optional[int]:
+    """Terminalize one exhausted worker run without entering retry routing.
+
+    The iteration ceiling is an emergency stop, not a retry trigger. The
+    expected run id binds the transition to the exact task revision so a late
+    finalizer cannot park a successor run. Repeating the call for an already
+    terminalized run is an idempotent success.
+    """
+    run_id = int(expected_run_id)
+    used = max(0, int(budget_used))
+    maximum = max(0, int(budget_max))
+    message = str(
+        redact_review_value(
+            error
+            or f"Iteration budget exhausted ({used}/{maximum}) — task could not complete within the allowed iterations"
+        )
+    )[:500]
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, consecutive_failures, workspace_path "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+
+        current_run_id = (
+            int(row["current_run_id"])
+            if row["current_run_id"] is not None
+            else None
+        )
+        if current_run_id != run_id:
+            ended = conn.execute(
+                "SELECT outcome FROM task_runs WHERE id = ? AND task_id = ?",
+                (run_id, task_id),
+            ).fetchone()
+            if ended and ended["outcome"] == "iteration_exhausted":
+                return run_id
+            return None
+
+        failures = int(row["consecutive_failures"] or 0) + 1
+        workspace_path = str(row["workspace_path"] or "")
+        updated = conn.execute(
+            "UPDATE tasks SET status = 'blocked', "
+            "block_kind = 'iteration_exhausted', max_retries = 0, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "last_heartbeat_at = NULL, consecutive_failures = ?, "
+            "last_failure_error = ? "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+            (failures, message, task_id, run_id),
+        )
+        if updated.rowcount != 1:
+            return None
+
+        metadata = {
+            "budget_used": used,
+            "budget_max": maximum,
+            "checkpoint_required": True,
+            "workspace_preserved": True,
+            "workspace_path": workspace_path,
+            "retryable": False,
+            "resume_policy": "never",
+        }
+        closed_run_id = _end_run(
+            conn,
+            task_id,
+            outcome="iteration_exhausted",
+            status="iteration_exhausted",
+            error=message,
+            metadata=metadata,
+        )
+        payload = {
+            "error": message,
+            **metadata,
+            "blocker_type": "iteration_exhausted",
+            "terminal_run_id": closed_run_id,
+        }
+        _append_event(
+            conn,
+            task_id,
+            "iteration_exhausted",
+            payload,
+            run_id=closed_run_id,
+        )
+    return closed_run_id
 
 
 # Backward-compat alias. Old name is referenced from tests and possibly

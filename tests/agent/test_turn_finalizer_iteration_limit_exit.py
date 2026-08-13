@@ -165,13 +165,17 @@ def test_pending_response_does_not_mask_later_terminal_exit(
     assert agent._handle_max_iterations_called is False
 
 
-def test_pending_response_records_kanban_timeout(monkeypatch):
+def test_pending_response_records_terminal_kanban_iteration_exhaustion(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
-    record = MagicMock(name="record_task_failure")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+    record = MagicMock(name="record_iteration_exhaustion")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
-    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db._record_iteration_exhaustion", record,
+        raising=False,
+    )
     agent = _LimitAgent()
 
     result = _finalize(
@@ -185,14 +189,9 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     record.assert_called_once_with(
         conn,
         "task-123",
-        error=(
-            "Iteration budget exhausted (60/60) — task could not complete "
-            "within the allowed iterations"
-        ),
-        outcome="timed_out",
-        release_claim=True,
-        end_run=True,
-        event_payload_extra={"budget_used": 60, "budget_max": 60},
+        expected_run_id=42,
+        budget_used=60,
+        budget_max=60,
     )
 
 
@@ -233,5 +232,4 @@ def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch)
     assert agent.persisted_messages is not None
     persisted_roles = [m["role"] for m in agent.persisted_messages]
     assert persisted_roles == ["user", "assistant"]
-
 

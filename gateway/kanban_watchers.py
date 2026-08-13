@@ -178,7 +178,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # done/archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "iteration_exhausted", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -484,6 +484,22 @@ class GatewayKanbanWatchersMixin:
                                 f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
                                 f"(max_runtime={limit}s); will retry"
                             )
+                        elif kind == "iteration_exhausted":
+                            payload = ev.payload or {}
+                            used = payload.get("budget_used")
+                            maximum = payload.get("budget_max")
+                            budget = (
+                                f" ({used}/{maximum})"
+                                if used is not None and maximum is not None
+                                else ""
+                            )
+                            run_id = ev.run_id or payload.get("terminal_run_id")
+                            run = f" · run {run_id}" if run_id is not None else ""
+                            msg = (
+                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} "
+                                f"iteration budget exhausted{budget}{run}; "
+                                "terminal for this revision, no automatic retry"
+                            )
                         elif kind == "status":
                             new_status = ""
                             if ev.payload and ev.payload.get("status"):
@@ -661,7 +677,10 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status in {"done", "archived"}
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _WAKE_KINDS = (
+                            "completed", "gave_up", "crashed", "timed_out",
+                            "iteration_exhausted", "blocked",
+                        )
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                             if wake_agent
@@ -682,6 +701,7 @@ class GatewayKanbanWatchersMixin:
                             if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
+                            if "iteration_exhausted" in _wake_kinds: _parts.append("iteration exhausted; owner replan required")
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
@@ -692,6 +712,31 @@ class GatewayKanbanWatchersMixin:
                                 assignee=_assignee,
                                 board=board_slug,
                             )
+                            if "iteration_exhausted" in _wake_kinds:
+                                _terminal_event = next(
+                                    (
+                                        ev for ev in reversed(d["events"])
+                                        if ev.kind == "iteration_exhausted"
+                                    ),
+                                    None,
+                                )
+                                _terminal_payload = (
+                                    _terminal_event.payload
+                                    if _terminal_event and _terminal_event.payload
+                                    else {}
+                                )
+                                _terminal_run = (
+                                    _terminal_event.run_id
+                                    if _terminal_event
+                                    else None
+                                ) or _terminal_payload.get("terminal_run_id")
+                                _workspace = _terminal_payload.get("workspace_path") or ""
+                                _synth += (
+                                    f"\nTerminal task revision/run: {_terminal_run}."
+                                    f"\nPreserved workspace: {_workspace or '(not recorded)'}."
+                                    "\nResume policy: never; create an owner-planned "
+                                    "replacement revision to continue."
+                                )
 
                         if not _is_push_adapter and _wake_kinds and _session_key:
                             # Wake self-post IS the delivery on this path —
