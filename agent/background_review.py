@@ -651,6 +651,66 @@ def build_memory_write_metadata(
     return {k: v for k, v in metadata.items() if v not in {None, ""}}
 
 
+def _record_review_usage_to_parent(parent_agent: Any, review_agent: Any) -> None:
+    """Record a background-review fork's usage against the parent session.
+
+    Background-review forks run with ``_session_db = None`` for persistence
+    isolation (see the PERSISTENCE ISOLATION comment in
+    :func:`_run_review_in_thread`): the fork must never write its harness turn
+    into the user's real session. A side effect of that isolation is that the
+    fork's API calls — which the provider bills — were never recorded in
+    ``session_model_usage``, because the accounting path in
+    ``conversation_loop`` is gated on the DB handle. This hides the
+    background-review volume from billing analytics.
+
+    The fork still accumulates the same in-memory counters the main loop does
+    (``session_input_tokens`` etc., incremented regardless of ``_session_db``)
+    and shares the parent's ``session_id``, so its usage can be attributed to
+    the parent session through the aux-accounting chokepoint, which writes
+    only ``session_model_usage`` — never the transcript or the ``sessions``
+    summary row.
+
+    Best-effort by contract: accounting must never fail the review.
+    """
+    try:
+        session_db = getattr(parent_agent, "_session_db", None)
+        session_id = getattr(parent_agent, "session_id", None)
+        if session_db is None or not session_id:
+            return
+        model = getattr(review_agent, "model", None)
+        provider = getattr(review_agent, "provider", None)
+        base_url = getattr(review_agent, "base_url", None)
+        input_tokens = int(getattr(review_agent, "session_input_tokens", 0) or 0)
+        output_tokens = int(getattr(review_agent, "session_output_tokens", 0) or 0)
+        cache_read = int(getattr(review_agent, "session_cache_read_tokens", 0) or 0)
+        cache_write = int(getattr(review_agent, "session_cache_write_tokens", 0) or 0)
+        reasoning = int(getattr(review_agent, "session_reasoning_tokens", 0) or 0)
+        api_calls = int(getattr(review_agent, "session_api_calls", 0) or 0)
+        est_cost = getattr(review_agent, "session_estimated_cost_usd", None)
+        if not (input_tokens or output_tokens or cache_read or cache_write
+                or reasoning or api_calls):
+            return  # fork made no successful API calls (e.g. failed at spawn)
+        session_db.record_auxiliary_usage(
+            session_id,
+            task="background_review",
+            model=model,
+            billing_provider=provider,
+            billing_base_url=base_url,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read,
+            cache_write_tokens=cache_write,
+            reasoning_tokens=reasoning,
+            estimated_cost_usd=est_cost,
+        )
+    except Exception as e:
+        # Same contract as record_auxiliary_usage itself: accounting loss is
+        # logged, never raised into the review thread.
+        logger.debug(
+            "Background review usage recording failed (non-fatal): %s", e
+        )
+
+
 def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
@@ -989,6 +1049,18 @@ def _run_review_in_thread(
                 # next live turn. Runs on both the success and exception
                 # path (this whole block is inside the try/finally above).
                 _unregister_review_agent(review_agent)
+
+            # Attribute the review fork's usage to the PARENT session. The
+            # fork runs with ``_session_db=None`` (persistence isolation — see
+            # the PERSISTENCE ISOLATION comment above), so its API calls are
+            # billed by the provider but never written to
+            # ``session_model_usage``. The fork still accumulates the same
+            # in-memory counters the main loop does (session_*_tokens), so
+            # snapshot them BEFORE close() and record them against the parent
+            # session via the aux-accounting chokepoint, which writes only
+            # session_model_usage (never the transcript, never the sessions
+            # summary row).
+            _record_review_usage_to_parent(agent, review_agent)
 
             # Snapshot review actions before teardown. close() is allowed to
             # clean per-session state, but the user-visible self-improvement
