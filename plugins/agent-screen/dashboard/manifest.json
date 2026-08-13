@@ -1,0 +1,8 @@
+{
+  "name": "agent-screen",
+  "label": "Agent Screen",
+  "description": "Virtual display for macOS (no Xvfb equivalent exists) — start/stop a second screen with a native window + live MJPEG stream, snap any window onto it, and watch it in a desktop pane",
+  "icon": "Monitor",
+  "version": "1.0.0",
+  "api": "plugin_api.py"
+}

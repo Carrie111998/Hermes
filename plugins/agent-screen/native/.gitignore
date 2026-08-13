@@ -1,0 +1,4 @@
+# Build artifacts — never commit binaries or generated bundles
+/app/
+*.icns
+AgentScreen.iconset/
