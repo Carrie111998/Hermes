@@ -332,6 +332,12 @@ async def test_blocks_sensitive_home_and_hermes_paths(tmp_path: Path, monkeypatc
     from agent.context_references import preprocess_context_references_async
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    # ntpath.expanduser reads USERPROFILE, not HOME. Setting only HOME left
+    # `home` in _is_sensitive_path() resolving to the REAL profile on Windows,
+    # so tmp_path/.ssh was never recognised as the home .ssh and the block did
+    # not apply. The guard itself is correct — the fake home simply had no
+    # effect here.
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
 
     hermes_env = tmp_path / ".hermes" / ".env"
