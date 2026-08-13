@@ -629,7 +629,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           // the next turn untouched — without it, losing the settle race
           // (client saw idle, server still unwinding) redirects or interrupts
           // the live turn with text the user explicitly queued.
-          ...(options?.fromQueue && { queued: true })
+          ...(options?.fromQueue && {
+            queued: true,
+            ...(options.queueDeliveryId && { queue_delivery_id: options.queueDeliveryId })
+          })
         })
 
         // On sleep/wake the gateway's in-memory session may have been cleared

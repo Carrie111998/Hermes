@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
+  claimQueuedPrompt,
   enqueueQueuedPrompt,
   getQueuedPrompts,
   isQueueParked,
@@ -70,6 +71,82 @@ describe('useComposerQueue park integration', () => {
     const { onSubmit } = renderQueueHook()
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
+  })
+
+  it('holds an ambiguous delivery across remount until the user retries it', async () => {
+    let settleFirst: (accepted: boolean) => void = () => undefined
+    const firstResult = new Promise<boolean>(resolve => {
+      settleFirst = resolve
+    })
+    const onSubmit = vi.fn<ChatBarProps['onSubmit']>(() => firstResult)
+    const queueEditRef: { current: QueueEditState | null } = { current: null }
+
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'run this exactly once' })
+
+    const first = renderHook(() =>
+      useComposerQueue({
+        activeQueueSessionKey: SESSION_KEY,
+        attachments: [],
+        busy: false,
+        clearDraft: () => undefined,
+        draftRef: { current: '' },
+        focusInput: () => undefined,
+        loadIntoComposer: () => undefined,
+        onCancel: vi.fn(),
+        onSubmit,
+        queueEditRef,
+        queueSessionKey: SESSION_KEY,
+        sessionId: 'rt-session-queue-hook'
+      })
+    )
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    first.unmount()
+
+    // Compression/session rotation remounts the drainer before the original
+    // RPC promise settles. The gateway may already have accepted the turn, so
+    // replaying the durable local entry here would execute it twice (#84417).
+    const second = renderQueueHook()
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(second.onSubmit).not.toHaveBeenCalled()
+    expect(onSubmit.mock.calls[0]?.[1]).toMatchObject({
+      queueDeliveryId: expect.any(String)
+    })
+    expect(getQueuedPrompts(SESSION_KEY)).toMatchObject([
+      { deliveryStarted: true, text: 'run this exactly once' }
+    ])
+
+    const entryId = getQueuedPrompts(SESSION_KEY)[0]!.id
+    await act(async () => {
+      await second.hook.result.current.sendQueuedNow(entryId)
+    })
+
+    expect(second.onSubmit).toHaveBeenCalledTimes(1)
+    expect(second.onSubmit.mock.calls[0]?.[1]).toMatchObject({ queueDeliveryId: entryId })
+    expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
+
+    settleFirst(true)
+  })
+
+  it('retries an ambiguous head when the user drains with Enter', async () => {
+    const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'retry with enter' })!
+    expect(claimQueuedPrompt(SESSION_KEY, entry.id)).toMatchObject({ deliveryStarted: true })
+    const second = renderQueueHook()
+
+    await act(async () => {
+      await second.hook.result.current.drainNextQueued()
+    })
+
+    expect(second.onSubmit).toHaveBeenCalledTimes(1)
+    expect(second.onSubmit).toHaveBeenCalledWith(
+      'retry with enter',
+      expect.objectContaining({ queueDeliveryId: entry.id })
+    )
     expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
   })
 
