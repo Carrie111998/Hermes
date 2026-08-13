@@ -225,6 +225,61 @@ def test_dispatch_rejected_at_capacity():
     ev.set()
 
 
+def test_batch_capacity_counts_each_real_child():
+    gate = threading.Event()
+
+    def blocker():
+        gate.wait(timeout=60)
+        return {
+            "results": [{"status": "completed"}] * 3,
+            "total_duration_seconds": 0.1,
+        }
+
+    first = ad.dispatch_async_delegation_batch(
+        goals=["first child", "second child", "third child"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="",
+        runner=blocker,
+        max_async_children=15,
+        profile_real_child_ceiling=3,
+    )
+    assert first["status"] == "dispatched"
+
+    rejected = ad.dispatch_async_delegation(
+        goal="overflow",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="",
+        runner=blocker,
+        max_async_children=15,
+        profile_real_child_ceiling=3,
+    )
+    assert rejected["status"] == "rejected"
+    assert "3/3" in rejected["error"]
+
+    gate.set()
+    assert _drain_for(first["delegation_id"]) is not None
+
+    retry = ad.dispatch_async_delegation(
+        goal="after release",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="",
+        runner=lambda: {"status": "completed", "summary": "done"},
+        max_async_children=15,
+        profile_real_child_ceiling=3,
+    )
+    assert retry["status"] == "dispatched"
+    assert _drain_for(retry["delegation_id"]) is not None
+
+
 def test_interrupt_all_signals_running_children():
     ev = threading.Event()
     interrupted = {"count": 0}

@@ -1365,6 +1365,26 @@ class TestAsyncCapUnified(unittest.TestCase):
         from tools.delegate_tool import _get_max_async_children
         self.assertEqual(_get_max_async_children(), 15)
 
+
+class TestProfileRealChildCeiling(unittest.TestCase):
+    @patch("tools.delegate_tool._load_config",
+           return_value={"profile_real_child_ceiling": 15})
+    def test_reads_configured_ceiling(self, mock_cfg):
+        from tools.delegate_tool import _get_profile_real_child_ceiling
+        self.assertEqual(_get_profile_real_child_ceiling(), 15)
+
+    @patch("tools.delegate_tool._load_config",
+           return_value={"profile_real_child_ceiling": "invalid"})
+    def test_invalid_ceiling_uses_default(self, mock_cfg):
+        from tools.delegate_tool import (
+            _DEFAULT_PROFILE_REAL_CHILD_CEILING,
+            _get_profile_real_child_ceiling,
+        )
+        self.assertEqual(
+            _get_profile_real_child_ceiling(),
+            _DEFAULT_PROFILE_REAL_CHILD_CEILING,
+        )
+
 # =========================================================================
 # max_spawn_depth clamping
 # =========================================================================
