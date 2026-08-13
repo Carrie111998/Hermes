@@ -173,8 +173,9 @@ def test_windows_commit_lock_seeds_and_locks_byte_zero(jobs_env, monkeypatch):
     monkeypatch.setattr(jobs.msvcrt, "locking", locking)
 
     with jobs._jobs_commit_lock():
-        assert jobs._jobs_commit_lock_file().read_bytes() == b" "
+        pass
 
+    assert jobs._jobs_commit_lock_file().read_bytes() == b" "
     assert calls == [
         (0, jobs.msvcrt.LK_NBLCK, 1),
         (0, jobs.msvcrt.LK_UNLCK, 1),
