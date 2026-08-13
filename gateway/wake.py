@@ -26,8 +26,9 @@ rewind cursors / retry instead of silently losing the event.
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -59,13 +60,16 @@ async def deliver_wake(
     text: str,
     session_id: str = "",
     source: Any = None,
+    metadata: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Deliver a wake turn to the session behind ``adapter``.
 
     ``session_id`` is the RAW session id (the ``X-Hermes-Session-Id`` value /
     ``state.db`` key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` used to build the synthetic event — required for
-    push-capable adapters.
+    push-capable adapters. ``metadata`` is copied onto that synthetic event so
+    adapters can identify machine-generated wake types without parsing
+    human-readable text. Stateless self-post wakes intentionally ignore it.
 
     Raises on failure (bad arguments, exhausted retries, HTTP error) so the
     caller can rewind/retry instead of treating the wake as delivered.
@@ -82,6 +86,7 @@ async def deliver_wake(
             message_type=MessageType.TEXT,
             source=source,
             internal=True,
+            metadata=copy.deepcopy(dict(metadata)) if metadata is not None else {},
         )
         await adapter.handle_message(synth_event)
         return

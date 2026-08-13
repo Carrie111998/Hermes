@@ -1034,6 +1034,15 @@ Duplicate delivery across gateways is prevented by the atomic per-event claim
 in the board DB. No relays, credential sharing, or extra dispatchers are
 needed — each profile gateway simply delivers through its own adapters.
 
+Push-capable platform adapters receive Kanban terminal wakes as internal
+`MessageEvent` objects. In addition to the localized wake text, adapters can
+identify these events through `event.metadata["hermes_kanban_wake"]`, a
+versioned envelope containing only `board`, `task_id`, deterministically ordered
+`event_kinds`, and the claimed event `cursor`. Delivery metadata, event payloads,
+task content, and profile details are intentionally excluded. Stateless API
+self-post wakes keep their existing request shape and do not receive this
+adapter-only metadata.
+
 ## Runs — one row per attempt
 
 A task is a logical unit of work; a **run** is one attempt to execute it. When the dispatcher claims a ready task it creates a row in `task_runs` and points `tasks.current_run_id` at it. When that attempt ends — completed, blocked, crashed, timed out, spawn-failed, reclaimed — the run row closes with an `outcome` and the task's pointer clears. A task that's been attempted three times has three `task_runs` rows.

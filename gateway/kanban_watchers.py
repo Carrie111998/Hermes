@@ -658,6 +658,7 @@ class GatewayKanbanWatchersMixin:
                         _is_push_adapter = _adapter_push_ok(adapter)
                         _session_key = ""
                         _synth = ""
+                        _wake_metadata: dict[str, Any] = {}
                         if _wake_kinds:
                             _session_key = getattr(task, "session_id", None) or ""
                         if _wake_kinds and _session_key:
@@ -678,6 +679,25 @@ class GatewayKanbanWatchersMixin:
                                 assignee=_assignee,
                                 board=board_slug,
                             )
+                            # Keep the localized text above for humans and
+                            # older adapters. Push-capable adapters also get a
+                            # deliberately small machine contract: only stable
+                            # routing/event identity from the claimed batch,
+                            # never task content, event payloads, or delivery
+                            # metadata from the subscription.
+                            _wake_metadata = {
+                                "hermes_kanban_wake": {
+                                    "version": 1,
+                                    "board": board_slug,
+                                    "task_id": sub["task_id"],
+                                    "event_kinds": [
+                                        kind
+                                        for kind in _WAKE_KINDS
+                                        if kind in _wake_kinds
+                                    ],
+                                    "cursor": d["cursor"],
+                                }
+                            }
 
                         if not _is_push_adapter and _wake_kinds and _session_key:
                             # Wake self-post IS the delivery on this path —
@@ -787,6 +807,7 @@ class GatewayKanbanWatchersMixin:
                                     text=_synth,
                                     session_id=_session_key,
                                     source=_source,
+                                    metadata=_wake_metadata,
                                 )
                                 logger.info(
                                     "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",

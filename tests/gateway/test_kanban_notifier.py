@@ -2,7 +2,7 @@ import asyncio
 import sqlite3
 from pathlib import Path
 
-
+import pytest
 from gateway.config import Platform
 from gateway.kanban_watchers import (
     _acquire_singleton_lock,
@@ -62,6 +62,29 @@ def _create_completed_subscription(summary="done once"):
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         kb.complete_task(conn, tid, summary=summary)
         return tid
+    finally:
+        conn.close()
+
+
+def _create_wake_subscription(event_kinds, *, payload=None):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="wake metadata",
+            assignee="worker",
+            session_id="origin-session",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+        )
+        for kind in event_kinds:
+            kb._append_event(conn, tid, kind=kind, payload=payload)
+        cursor = kb.list_events(conn, tid)[-1].id
+        return tid, cursor
     finally:
         conn.close()
 
@@ -393,6 +416,79 @@ def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
     wake_key = build_session_key(adapter.handled[0].source)
     assert wake_key == "agent:main:telegram:dm:chat-dm"
     assert ":group:" not in wake_key
+
+
+@pytest.mark.parametrize(
+    "event_kind",
+    ["completed", "blocked", "gave_up", "crashed", "timed_out"],
+)
+def test_notifier_wake_exposes_terminal_event_identity(
+    tmp_path,
+    monkeypatch,
+    event_kind,
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / f"{event_kind}.db"))
+    kb.init_db()
+    task_id, cursor = _create_wake_subscription([event_kind])
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].metadata == {
+        "hermes_kanban_wake": {
+            "version": 1,
+            "board": "default",
+            "task_id": task_id,
+            "event_kinds": [event_kind],
+            "cursor": cursor,
+        }
+    }
+
+
+def test_notifier_wake_metadata_is_ordered_and_privacy_bounded(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "bounded.db"))
+    kb.init_db()
+    task_id, cursor = _create_wake_subscription(
+        ["timed_out", "completed", "blocked", "crashed", "gave_up"],
+        payload={
+            "arbitrary": "must-not-leak",
+            "assignee": "private-worker",
+            "workspace": "/private/worktree",
+            "credential_hint": "must-not-leak",
+            "delivery_metadata": {"thread_id": "private-thread"},
+        },
+    )
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].metadata == {
+        "hermes_kanban_wake": {
+            "version": 1,
+            "board": "default",
+            "task_id": task_id,
+            "event_kinds": [
+                "completed",
+                "gave_up",
+                "crashed",
+                "timed_out",
+                "blocked",
+            ],
+            "cursor": cursor,
+        }
+    }
+
+    # The claim cursor remains the exact-once boundary: a later poll has no
+    # terminal event to deliver or wake again.
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 5
+    assert len(adapter.handled) == 1
 
 
 def _unseen_terminal_events_for(tid, chat_id):

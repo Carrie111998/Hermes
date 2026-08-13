@@ -53,6 +53,37 @@ def test_adapter_supports_push_default_true():
     assert adapter_supports_push(ApiServerLikeAdapter()) is False
 
 
+def test_deliver_wake_push_defaults_are_unchanged():
+    adapter = PushAdapter()
+
+    asyncio.run(deliver_wake(adapter, text="wake", source=_source()))
+
+    assert len(adapter.handled) == 1
+    event = adapter.handled[0]
+    assert event.text == "wake"
+    assert event.internal is True
+    assert event.metadata == {}
+
+
+def test_deliver_wake_push_copies_metadata():
+    adapter = PushAdapter()
+    metadata = {"custom_wake": {"version": 1, "items": ["one"]}}
+
+    asyncio.run(
+        deliver_wake(
+            adapter,
+            text="wake",
+            source=_source(),
+            metadata=metadata,
+        )
+    )
+    metadata["custom_wake"]["items"].append("two")
+
+    assert adapter.handled[0].metadata == {
+        "custom_wake": {"version": 1, "items": ["one"]}
+    }
+
+
 async def _serve(handler):
     """Spin an in-process aiohttp server on an ephemeral loopback port."""
     from aiohttp import web
@@ -85,7 +116,12 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
         runner, port = await _serve(handler)
         try:
             adapter = ApiServerLikeAdapter(host="0.0.0.0", port=port, key="sekrit")
-            await deliver_wake(adapter, text="task done — wake", session_id="raw-sid-42")
+            await deliver_wake(
+                adapter,
+                text="task done — wake",
+                session_id="raw-sid-42",
+                metadata={"custom_wake": {"version": 1}},
+            )
         finally:
             await runner.cleanup()
 
