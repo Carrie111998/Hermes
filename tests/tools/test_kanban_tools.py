@@ -418,19 +418,26 @@ def test_review_target_reads_only_pinned_commits(reviewer_target_env):
     assert result["complete"] is True
 
 
-def test_review_target_accepts_dispatcher_pinned_default_review(reviewer_target_env):
+@pytest.mark.parametrize(
+    ("current_step_key", "run_step_key"),
+    [(None, None), ("review", "review")],
+)
+def test_review_target_accepts_dispatcher_pinned_default_review(
+    reviewer_target_env, current_step_key, run_step_key,
+):
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
     with kb.connect() as conn:
         conn.execute(
-            "UPDATE tasks SET workflow_template_id=NULL, current_step_key=NULL, "
+            "UPDATE tasks SET workflow_template_id=NULL, current_step_key=?, "
             "source_commit_forbidden=1, branch_name='main' WHERE id=?",
-            (reviewer_target_env["task_id"],),
+            (current_step_key, reviewer_target_env["task_id"]),
         )
         conn.execute(
-            "UPDATE task_runs SET step_key=NULL, metadata=? WHERE id=?",
+            "UPDATE task_runs SET step_key=?, metadata=? WHERE id=?",
             (
+                run_step_key,
                 json.dumps(
                     {
                         "review_contract_kind": "default",

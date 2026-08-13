@@ -16762,7 +16762,7 @@ def _prepare_review_target(
     default_review = (
         default_review_status
         and task.workflow_template_id is None
-        and task.current_step_key is None
+        and task.current_step_key in (None, "review")
     )
     if not product_review and not default_review:
         return None
@@ -16795,7 +16795,7 @@ def _prepare_review_target(
         or run.ended_at is not None
         or run.status != "running"
         or run.profile != "reviewer"
-        or run.step_key != ("review" if product_review else None)
+        or run.step_key != ("review" if task.current_step_key == "review" else None)
     ):
         raise ReviewTargetPreparationError("active run is not the current review run")
 
@@ -16950,7 +16950,7 @@ def _pin_review_target_or_block(
     default_review_candidate = (
         default_review_status
         and task.workflow_template_id is None
-        and task.current_step_key is None
+        and task.current_step_key in (None, "review")
         and task.assignee == "reviewer"
     )
     if not product_review and not default_review_candidate:
