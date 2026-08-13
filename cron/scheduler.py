@@ -4613,6 +4613,14 @@ def run_one_job(
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+    # Track delivery across the whole fire, not only the normal completion
+    # path.  The outer exception handler uses this state to alert on failures
+    # that escape before normal delivery without sending a duplicate when a
+    # later bookkeeping step raises after delivery was already attempted.
+    delivery_attempted = False
+    delivery_error = None
+    should_deliver = False
+    unresolved_origin = False
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -4684,7 +4692,6 @@ def run_one_job(
         # / empty-response computation, or _deliver_result itself — raises, the
         # deferred agent is still torn down. Otherwise the outer `except` would
         # swallow the error and leak the agent's subprocesses/clients (#10200).
-        delivery_error = None
         blocked_config = False
         try:
             output_file = save_job_output(job["id"], output)
@@ -4743,7 +4750,6 @@ def run_one_job(
             should_deliver = bool(deliver_content.strip())
             if blocked_config_silent:
                 should_deliver = False
-            unresolved_origin = False
             # Cron silence suppression — see _is_cron_silence_response.  Replaces the
             # old `SILENT_MARKER in ...upper()` substring check, which both leaked
             # bracketless near-markers ("SILENT" / "NO_REPLY") and wrongly swallowed
@@ -4759,6 +4765,7 @@ def run_one_job(
                     _normalize_deliver_value(job.get("deliver", "local")) == "origin"
                     and not _resolve_delivery_targets(job)
                 )
+                delivery_attempted = True
                 try:
                     delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
                 except Exception as de:
@@ -4815,9 +4822,45 @@ def run_one_job(
         # anything that isn't a plain Exception.
         _err_text = str(e) or type(e).__name__
         logger.error("Error processing job %s: %s", job['id'], _err_text)
+        _interrupted = _consume_interrupted_flag(job["id"])
+
+        # run_job normally converts Exceptions into a failed result, which the
+        # main path delivers.  This fallback covers exceptions that escape that
+        # contract (or arise in another pre-delivery pipeline stage).  Do not
+        # alert during an intentional shutdown interruption, and never retry an
+        # alert after delivery was already attempted: either case could create
+        # misleading or duplicate messages.
+        if (
+            isinstance(e, Exception)
+            and not _interrupted
+            and not delivery_attempted
+            and not _interpreter_shutting_down(e)
+        ):
+            failure_content = _summarize_cron_failure_for_delivery(job, _err_text)
+            should_deliver = bool(failure_content.strip())
+            if should_deliver:
+                unresolved_origin = (
+                    _normalize_deliver_value(job.get("deliver", "local")) == "origin"
+                    and not _resolve_delivery_targets(job)
+                )
+                delivery_attempted = True
+                try:
+                    delivery_error = _deliver_result(
+                        job, failure_content, adapters=adapters, loop=loop,
+                    )
+                except Exception as delivery_exc:
+                    delivery_error = str(delivery_exc)
+                    logger.error(
+                        "Outer-failure delivery failed for job %s: %s",
+                        job["id"], delivery_exc,
+                    )
+
         try:
-            if not _consume_interrupted_flag(job["id"]):
-                mark_job_run(job["id"], False, _err_text)
+            if not _interrupted:
+                mark_job_run(
+                    job["id"], False, _err_text,
+                    delivery_error=delivery_error,
+                )
         except Exception as record_err:
             # Never let bookkeeping mask the original interruption.
             logger.error(
@@ -4825,7 +4868,23 @@ def run_one_job(
                 job["id"], record_err,
             )
         try:
-            finish_execution(execution_id, success=False, error=_err_text)
+            normalized_deliver = _normalize_deliver_value(
+                job.get("deliver", "local")
+            )
+            if delivery_error:
+                delivery_outcome = "failed"
+            elif should_deliver and unresolved_origin:
+                delivery_outcome = "not_configured"
+            elif should_deliver and normalized_deliver != "local":
+                delivery_outcome = "delivered"
+            else:
+                delivery_outcome = "suppressed"
+            finish_execution(
+                execution_id,
+                success=False,
+                error=_err_text,
+                delivery_outcome=delivery_outcome,
+            )
         except Exception as record_err:
             logger.error(
                 "Failed to finish execution record for job %s: %s",

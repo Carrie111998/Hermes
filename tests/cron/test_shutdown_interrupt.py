@@ -242,8 +242,10 @@ class TestRunOneJobHonoursInterruptedFlag:
              patch("agent.secret_scope.build_profile_secret_scope", return_value=None), \
              patch("agent.secret_scope.reset_secret_scope"), \
              patch("cron.scheduler.run_job", side_effect=RuntimeError("boom")), \
+             patch("cron.scheduler._deliver_result") as mock_deliver, \
              patch("cron.scheduler.mark_job_run") as mock_mark:
             result = sched.run_one_job(job)
 
         assert result is False
+        mock_deliver.assert_not_called()
         mock_mark.assert_not_called()
