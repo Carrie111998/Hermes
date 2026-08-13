@@ -417,9 +417,18 @@ def test_contended_retry_switching_to_exdev_uses_copy_fallback(
     target.write_text("old", encoding="utf-8")
     tmp = _write_tmp(tmp_path, "new")
 
-    replace = MagicMock(
-        side_effect=[_sharing_error(5), OSError(errno.EXDEV, "cross-device")]
-    )
+    genuine_replace = os.replace
+    calls: list[tuple[str, str]] = []
+
+    def replace(src: str, dst: str) -> None:
+        calls.append((str(src), str(dst)))
+        if len(calls) == 1:
+            raise _sharing_error(5)
+        if len(calls) == 2:
+            raise OSError(errno.EXDEV, "cross-device")
+        # Third call is the copy fallback's own staged rename — let it land.
+        genuine_replace(src, dst)
+
     monkeypatch.setattr("utils.os.replace", replace)
     monkeypatch.setattr("utils._IS_WINDOWS", True)
 
@@ -429,7 +438,14 @@ def test_contended_retry_switching_to_exdev_uses_copy_fallback(
     monkeypatch.setattr("utils._rewrite_in_place", forbid_rewrite)
 
     assert Path(atomic_replace(tmp, target)) == target
-    assert replace.call_count == 2
+    # The sharing budget is still abandoned at attempt 2: only the first two
+    # renames are tried on the source temp.
+    assert [src for src, _ in calls[:2]] == [str(tmp), str(tmp)]
+    # The fallback then renames a *staged* file onto the target rather than
+    # copying onto it, so there is a third replace and its source is not tmp.
+    assert len(calls) == 3
+    assert calls[2][0] != str(tmp)
+    assert calls[2][1] == str(target)
     assert target.read_text(encoding="utf-8") == "new"
     assert not tmp.exists()
 
