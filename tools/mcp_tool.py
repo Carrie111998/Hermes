@@ -3218,10 +3218,18 @@ class MCPServerTask:
         # tokens), re-raise so this server is reported as failed without
         # blocking other MCP servers from connecting.
         _oauth_auth = None
+        _oauth_wire_guard = None
+        _request_hooks = list(config.get("request_hooks") or [])
         if self._auth_type == "oauth":
             try:
-                from tools.mcp_oauth_manager import get_manager
+                from tools.mcp_oauth_manager import (
+                    _make_oauth_wire_guard,
+                    get_manager,
+                )
+                import httpx
 
+                _oauth_wire_guard = _make_oauth_wire_guard(httpx.URL(url))
+                _request_hooks.append(_oauth_wire_guard)
                 _oauth_auth = get_manager().get_or_build_provider(
                     self.name,
                     url,
@@ -3233,7 +3241,7 @@ class MCPServerTask:
                         "client_cert": client_cert,
                         "follow_redirects": True,
                         "headers": dict(headers),
-                        "request_hooks": list(config.get("request_hooks") or []),
+                        "request_hooks": _request_hooks,
                         "response_hooks": list(config.get("response_hooks") or []),
                         "strict_redirect_headers": _strict_cfg_headers,
                     },
@@ -3288,7 +3296,8 @@ class MCPServerTask:
                 # forwarded — SSE OAuth would silently fail with 401s.
                 _sse_kwargs["auth"] = _oauth_auth
             if (
-                client_cert is not None
+                _oauth_auth is not None
+                or client_cert is not None
                 or ssl_verify is not True
                 or config.get("request_hooks")
                 or config.get("response_hooks")
@@ -3297,7 +3306,7 @@ class MCPServerTask:
                 # them through an httpx_client_factory that wraps the SDK's
                 # defaults (follow_redirects=True) and adds Hermes TLS settings
                 # and configured request/response hooks. Supplying the factory
-                # when hooks or non-default TLS are configured is required.
+                # when OAuth, hooks, or non-default TLS are configured is required.
                 import httpx as _httpx_mod
 
                 _cert_for_factory = client_cert
@@ -3312,7 +3321,7 @@ class MCPServerTask:
                         "follow_redirects": True,
                         "verify": _verify_for_factory,
                         "event_hooks": {
-                            "request": list(config.get("request_hooks") or []),
+                            "request": _request_hooks,
                             "response": list(config.get("response_hooks") or []),
                         },
                     }
@@ -3381,7 +3390,7 @@ class MCPServerTask:
                 "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
                 "verify": ssl_verify,
                 "event_hooks": {
-                    "request": list(config.get("request_hooks") or []),
+                    "request": _request_hooks,
                     "response": list(config.get("response_hooks") or [])
                     + [_strip_auth_on_cross_origin_redirect],
                 },
@@ -3474,7 +3483,7 @@ class MCPServerTask:
                         "follow_redirects": True,
                         "verify": ssl_verify,
                         "event_hooks": {
-                            "request": list(config.get("request_hooks") or []),
+                            "request": _request_hooks,
                             "response": list(config.get("response_hooks") or []),
                         },
                         "timeout": timeout

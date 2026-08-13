@@ -864,6 +864,295 @@ async def test_public_current_http_real_followed_redirect_strips_strict_headers(
 
 
 @pytest.mark.asyncio
+async def test_public_current_http_strict_redirect_compares_each_actual_hop(
+    monkeypatch,
+):
+    """A same-origin redirect on a control origin retains its headers."""
+    import tools.mcp_tool as tool_module
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if str(request.url) == "https://auth.example/metadata":
+            return httpx.Response(
+                302,
+                request=request,
+                headers={"location": "https://auth.example/metadata-next"},
+            )
+        return httpx.Response(200, request=request)
+
+    transport = httpx.MockTransport(handler)
+    original_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return original_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched_async_client)
+
+    class FakeSession:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def initialize(self):
+            return SimpleNamespace(capabilities=SimpleNamespace(tools=None))
+
+    @asynccontextmanager
+    async def stream_factory(_url, *, http_client, **_kwargs):
+        await http_client.get("https://auth.example/metadata")
+        yield (object(), object(), lambda: None)
+
+    monkeypatch.setattr(tool_module, "ClientSession", FakeSession)
+    monkeypatch.setattr(tool_module, "streamable_http_client", stream_factory)
+    monkeypatch.setattr(tool_module, "streamablehttp_client", stream_factory)
+    monkeypatch.setattr(tool_module, "_MCP_NEW_HTTP", True)
+    monkeypatch.setattr(
+        tool_module.MCPServerTask, "_discover_tools", lambda self: _done()
+    )
+    monkeypatch.setattr(
+        tool_module.MCPServerTask,
+        "_wait_for_lifecycle_event",
+        lambda self: _shutdown(),
+    )
+    monkeypatch.setattr(tool_module, "_reset_server_error", lambda _name: None)
+
+    task = tool_module.MCPServerTask("strict-control-hop")
+    task._auth_type = ""
+    await task._run_http({
+        "url": "https://resource.example/mcp",
+        "transport": "streamable_http",
+        "strict_redirect_headers": True,
+        "headers": {"X-Strict-Secret": "keep-on-auth-origin"},
+    })
+
+    assert len(seen) == 2
+    assert all(
+        request.headers["x-strict-secret"] == "keep-on-auth-origin" for request in seen
+    )
+
+
+@pytest.mark.asyncio
+async def test_public_current_http_strips_hook_bearer_from_cross_origin_redirect(
+    monkeypatch,
+):
+    """A request hook cannot restore a resource bearer on a control redirect."""
+    import tools.mcp_tool as tool_module
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if str(request.url) == "https://auth.example/metadata":
+            return httpx.Response(
+                302,
+                request=request,
+                headers={"location": "https://other.example/metadata"},
+            )
+        return httpx.Response(200, request=request)
+
+    transport = httpx.MockTransport(handler)
+    original_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return original_async_client(*args, **kwargs)
+
+    async def inject_resource_bearer(request):
+        request.extensions["resource_bearer_injected"] = True
+        request.headers["Authorization"] = "Bearer resource-secret"
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched_async_client)
+
+    class FakeSession:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def initialize(self):
+            return SimpleNamespace(capabilities=SimpleNamespace(tools=None))
+
+    @asynccontextmanager
+    async def stream_factory(_url, *, http_client, **_kwargs):
+        await http_client.get("https://auth.example/metadata")
+        yield (object(), object(), lambda: None)
+
+    monkeypatch.setattr(tool_module, "ClientSession", FakeSession)
+    monkeypatch.setattr(tool_module, "streamable_http_client", stream_factory)
+    monkeypatch.setattr(tool_module, "streamablehttp_client", stream_factory)
+    monkeypatch.setattr(tool_module, "_MCP_NEW_HTTP", True)
+    monkeypatch.setattr(
+        tool_module.MCPServerTask, "_discover_tools", lambda self: _done()
+    )
+    monkeypatch.setattr(
+        tool_module.MCPServerTask,
+        "_wait_for_lifecycle_event",
+        lambda self: _shutdown(),
+    )
+    monkeypatch.setattr(tool_module, "_reset_server_error", lambda _name: None)
+
+    task = tool_module.MCPServerTask("strict-hook-bearer")
+    task._auth_type = "oauth"
+
+    class FakeAuth(httpx.Auth):
+        def auth_flow(self, request):
+            yield request
+
+    class Manager:
+        def get_or_build_provider(self, *_args, **_kwargs):
+            return FakeAuth()
+
+    monkeypatch.setattr("tools.mcp_oauth_manager.get_manager", lambda: Manager())
+    await task._run_http({
+        "url": "https://resource.example/mcp",
+        "transport": "streamable_http",
+        "strict_redirect_headers": True,
+        "request_hooks": [inject_resource_bearer],
+    })
+
+    assert len(seen) == 2
+    assert all(request.extensions.get("resource_bearer_injected") for request in seen)
+    assert all("authorization" not in request.headers for request in seen)
+
+
+@pytest.mark.asyncio
+async def test_final_wire_guard_strips_same_origin_control_bearer_with_mcp_header():
+    """An MCP header cannot disguise same-origin OAuth control traffic as resource traffic."""
+    from tools.mcp_oauth_manager import _make_oauth_wire_guard
+
+    guard = _make_oauth_wire_guard(httpx.URL("https://resource.example/mcp"))
+    request = httpx.Request(
+        "GET",
+        "https://resource.example/.well-known/oauth-authorization-server",
+        headers={
+            "Authorization": "Bearer injected-resource",
+            "MCP-Protocol-Version": "2025-03-26",
+        },
+    )
+
+    await guard(request)
+
+    assert request.extensions["hermes_oauth_control_plane"] is True
+    assert "authorization" not in request.headers
+
+
+@pytest.mark.asyncio
+async def test_token_client_auth_is_stripped_on_cross_origin_redirect():
+    """Token client auth is preserved only on the original token origin."""
+    from tools.mcp_oauth_manager import (
+        _make_oauth_wire_guard,
+        _mark_oauth_wire_request,
+    )
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if str(request.url) == "https://auth.example/token":
+            return httpx.Response(
+                302,
+                request=request,
+                headers={"location": "https://attacker.example/token"},
+            )
+        return httpx.Response(200, request=request)
+
+    guard = _make_oauth_wire_guard(httpx.URL("https://resource.example/mcp"))
+
+    async def capture_sdk_authorization(request):
+        _mark_oauth_wire_request(
+            request,
+            httpx.URL("https://resource.example/mcp"),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        follow_redirects=True,
+        event_hooks={"request": [capture_sdk_authorization, guard]},
+    ) as client:
+        response = await client.post(
+            "https://auth.example/token",
+            headers={"Authorization": "Basic client-secret"},
+        )
+
+    assert response.status_code == 200
+    assert seen[0].headers["authorization"] == "Basic client-secret"
+    assert "authorization" not in seen[1].headers
+
+
+@pytest.mark.asyncio
+async def test_arbitrary_token_path_preserves_sdk_client_auth_on_first_hop():
+    """Token client-auth provenance is independent of endpoint path spelling."""
+    from tools.mcp_oauth_manager import (
+        _make_oauth_wire_guard,
+        _mark_oauth_wire_request,
+    )
+
+    request = _mark_oauth_wire_request(
+        httpx.Request(
+            "POST",
+            "https://auth.example/oauth2/v1/access-token",
+            headers={"Authorization": "Basic client-secret"},
+        ),
+        httpx.URL("https://resource.example/mcp"),
+    )
+    guard = _make_oauth_wire_guard(httpx.URL("https://resource.example/mcp"))
+
+    await guard(request)
+
+    assert request.headers["authorization"] == "Basic client-secret"
+
+
+@pytest.mark.asyncio
+async def test_token_auth_is_not_restored_after_cross_origin_redirect_chain():
+    """Once a token redirect crosses origin, returning cannot restore client auth."""
+    from tools.mcp_oauth_manager import (
+        _make_oauth_wire_guard,
+        _mark_oauth_wire_request,
+    )
+
+    guard = _make_oauth_wire_guard(httpx.URL("https://resource.example/mcp"))
+    first = _mark_oauth_wire_request(
+        httpx.Request(
+            "POST",
+            "https://auth.example/token",
+            headers={"Authorization": "Basic client-secret"},
+        ),
+        httpx.URL("https://resource.example/mcp"),
+    )
+    await guard(first)
+    crossed = httpx.Request(
+        "POST",
+        "https://attacker.example/token",
+        headers=first.headers,
+        extensions=dict(first.extensions),
+    )
+    await guard(crossed)
+    returned = httpx.Request(
+        "POST",
+        "https://auth.example/token",
+        headers=crossed.headers,
+        extensions=dict(crossed.extensions),
+    )
+    await guard(returned)
+
+    assert first.headers["authorization"] == "Basic client-secret"
+    assert "authorization" not in crossed.headers
+    assert crossed.extensions["hermes_oauth_authorization_tainted"] is True
+    assert "authorization" not in returned.headers
+
+
+@pytest.mark.asyncio
 async def test_cold_prefetch_real_followed_redirect_strips_strict_headers(
     tmp_path, monkeypatch
 ):
@@ -1039,7 +1328,9 @@ async def test_public_run_http_transport_runtime_matrix(
         "url": "https://example.com/mcp",
         "transport": "sse" if transport == "sse" else "streamable_http",
         "connect_timeout": 2,
-        "ssl_verify": False,
+        # The SSE+OAuth row must require the factory because of OAuth itself,
+        # not because a non-default TLS option accidentally masks its absence.
+        "ssl_verify": transport == "sse" and auth_type == "oauth",
         "headers": {"X-Test": "yes"},
         "oauth": {"scope": "read"},
     }
@@ -1070,7 +1361,7 @@ async def test_public_run_http_transport_runtime_matrix(
             assert legacy_client_kwargs["timeout"] == 2.0
         else:
             client_kwargs = next(item[1] for item in calls if item[0] == "client")
-            assert client_kwargs["verify"] is False
+            assert client_kwargs["verify"] is True
             assert client_kwargs["timeout"] == 1.0
             assert kwargs["timeout"] == 2.0
             assert kwargs["sse_read_timeout"] == 300.0

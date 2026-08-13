@@ -80,10 +80,93 @@ def _merge_oauth_control_request(client: Any, request: Any) -> Any:
     """Apply safe HTTPX client headers to one explicit OAuth request."""
     if not hasattr(request, "headers"):
         return request
-    return _rebuild_oauth_control_request(
+    rebuilt = _rebuild_oauth_control_request(
         request,
         _oauth_control_headers(getattr(client, "headers", {}), request.headers),
     )
+    return _mark_oauth_wire_request(rebuilt)
+
+
+def _mark_oauth_wire_request(
+    request: Any,
+    resource_url: Any = None,
+    *,
+    capture_sdk_authorization: bool = True,
+) -> Any:
+    """Annotate OAuth control traffic and retain token client auth."""
+    path = request.url.path.rstrip("/") or "/"
+    leaf = path.rsplit("/", 1)[-1].lower()
+    explicit_control = path.startswith("/.well-known/") or leaf in {
+        "authorize",
+        "cimd.json",
+        "oauth-token",
+        "register",
+        "token",
+    }
+    if resource_url is not None:
+        same_resource = (request.url.scheme, request.url.host, request.url.port) == (
+            resource_url.scheme,
+            resource_url.host,
+            resource_url.port,
+        ) and "mcp-protocol-version" in request.headers
+        if same_resource and not explicit_control:
+            return request
+    request.extensions["hermes_oauth_control_plane"] = True
+    # This function is called on SDK-built requests before user request hooks.
+    # Any Authorization already present here is SDK-generated client auth,
+    # regardless of the token endpoint's path. The final wire hook calls with
+    # capture disabled so hook-injected resource bearers can never gain this
+    # provenance marker.
+    if (
+        capture_sdk_authorization
+        and "authorization" in request.headers
+        and "hermes_oauth_original_authorization" not in request.extensions
+    ):
+        request.extensions["hermes_oauth_original_authorization"] = request.headers[
+            "authorization"
+        ]
+        request.extensions["hermes_oauth_authorization_origin"] = (
+            request.url.scheme,
+            request.url.host,
+            request.url.port,
+        )
+    return request
+
+
+def _make_oauth_wire_guard(resource_url: Any):
+    """Build a final request hook that runs after user hooks."""
+
+    async def guard(request: Any) -> None:
+        marked = _mark_oauth_wire_request(
+            request, resource_url, capture_sdk_authorization=False
+        )
+        if marked.extensions.get("hermes_oauth_control_plane") or (
+            marked.url.scheme,
+            marked.url.host,
+            marked.url.port,
+        ) != (resource_url.scheme, resource_url.host, resource_url.port):
+            original = marked.extensions.get("hermes_oauth_original_authorization")
+            if original is not None:
+                original_origin = marked.extensions.get(
+                    "hermes_oauth_authorization_origin"
+                )
+                current_origin = (
+                    marked.url.scheme,
+                    marked.url.host,
+                    marked.url.port,
+                )
+                if current_origin != original_origin:
+                    marked.extensions["hermes_oauth_authorization_tainted"] = True
+                if current_origin == original_origin and not marked.extensions.get(
+                    "hermes_oauth_authorization_tainted"
+                ):
+                    marked.headers["authorization"] = original
+                else:
+                    marked.headers.pop("authorization", None)
+            else:
+                marked.headers.pop("authorization", None)
+
+    return guard
 
 
 def _StrictRedirectAsyncClient(*args: Any, **kwargs: Any) -> Any:
@@ -779,9 +862,14 @@ def _make_hermes_provider_class() -> Optional[type]:
                 if not hasattr(request, "headers"):
                     return request
                 options = getattr(self, "_hermes_transport_options", {})
-                return _rebuild_oauth_control_request(
-                    request,
-                    _oauth_control_headers(options.get("headers"), request.headers),
+                import httpx
+
+                return _mark_oauth_wire_request(
+                    _rebuild_oauth_control_request(
+                        request,
+                        _oauth_control_headers(options.get("headers"), request.headers),
+                    ),
+                    httpx.URL(self.context.server_url),
                 )
 
             try:
