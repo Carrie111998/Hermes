@@ -28,6 +28,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from _kanban_isolation import isolate_kanban_env
+
 # Resolve the worktree path robustly.
 _THIS = Path(__file__).resolve()
 WT = _THIS.parents[2] if _THIS.parent.name == "stress" else Path.cwd()
@@ -46,8 +48,7 @@ def scenario(name):
     def wrap(fn):
         def run():
             home = tempfile.mkdtemp(prefix=f"hermes_atyp_{name}_")
-            os.environ["HERMES_HOME"] = home
-            os.environ["HOME"] = home
+            isolate_kanban_env(home)
             for m in list(sys.modules.keys()):
                 if m.startswith(("hermes_cli", "plugins", "gateway")):
                     del sys.modules[m]
@@ -534,8 +535,7 @@ def _(home, kb):
     # Note: home was already created with a safe prefix. We need to
     # reset to a weird one for this test.
     weird = tempfile.mkdtemp(prefix="hermes with spaces ")
-    os.environ["HERMES_HOME"] = weird
-    os.environ["HOME"] = weird
+    isolate_kanban_env(weird)
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
     conn = kb.connect()
@@ -560,8 +560,7 @@ def _(home, kb):
     # Pre-create directly since tempfile doesn't love unicode prefixes
     weird = f"/tmp/hermes_héllo_émöji_{os.getpid()}"
     os.makedirs(weird, exist_ok=True)
-    os.environ["HERMES_HOME"] = weird
-    os.environ["HOME"] = weird
+    isolate_kanban_env(weird)
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
     conn = kb.connect()
@@ -587,8 +586,7 @@ def _(home, kb):
     os.symlink(real, link1)
     os.symlink(real, link2)
     try:
-        os.environ["HERMES_HOME"] = link1
-        os.environ["HOME"] = link1
+        isolate_kanban_env(link1)
         kb._INITIALIZED_PATHS.clear()
         kb.init_db()
         conn1 = kb.connect()
@@ -596,8 +594,7 @@ def _(home, kb):
         conn1.close()
 
         # Switch to link2 pointing at the same dir
-        os.environ["HERMES_HOME"] = link2
-        os.environ["HOME"] = link2
+        isolate_kanban_env(link2)
         conn2 = kb.connect()
         # Should see the task we created via link1
         all_tasks = kb.list_tasks(conn2)
@@ -688,8 +685,7 @@ def _(home, kb):
 def _idempotency_race_worker(hermes_home: str, key: str, result_file: str,
                              barrier_path: str) -> None:
     """Subprocess body for the idempotency race test."""
-    os.environ["HERMES_HOME"] = hermes_home
-    os.environ["HOME"] = hermes_home
+    isolate_kanban_env(hermes_home)
     sys.path.insert(0, str(WT))
     from hermes_cli import kanban_db as kb
 

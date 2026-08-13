@@ -29,6 +29,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from _kanban_isolation import isolate_kanban_env
+
 WT = str(Path(__file__).resolve().parents[2])
 NUM_SEQUENCES = 500
 OPS_PER_SEQUENCE = 100
@@ -234,8 +236,7 @@ def main():
         seed = random.randint(0, 10**9)
         rng = random.Random(seed)
         home = tempfile.mkdtemp(prefix=f"hermes_fuzz_{seq_idx}_")
-        os.environ["HERMES_HOME"] = home
-        os.environ["HOME"] = home
+        isolate_kanban_env(home)
         sys.path.insert(0, WT)
 
         # Fresh module state per sequence to avoid cached init paths.

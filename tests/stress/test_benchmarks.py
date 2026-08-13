@@ -20,6 +20,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from _kanban_isolation import isolate_kanban_env
+
 WT = str(Path(__file__).resolve().parents[2])
 
 
@@ -55,8 +57,7 @@ def seed_tasks(conn, kb, n, assignee="bench-worker", with_parents=False):
 
 def main():
     home = tempfile.mkdtemp(prefix="hermes_bench_")
-    os.environ["HERMES_HOME"] = home
-    os.environ["HOME"] = home
+    isolate_kanban_env(home)
     sys.path.insert(0, WT)
     from hermes_cli import kanban_db as kb
 

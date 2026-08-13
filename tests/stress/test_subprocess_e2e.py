@@ -17,6 +17,8 @@ import sys
 import tempfile
 import time
 
+from _kanban_isolation import isolate_kanban_env
+
 WT = str(Path(__file__).resolve().parents[2])
 FAKE_WORKER = str(Path(__file__).parent / "_fake_worker.py")
 PY = sys.executable
@@ -53,8 +55,7 @@ def make_spawn_fn(home: str):
 
 def main():
     home = tempfile.mkdtemp(prefix="hermes_e2e_")
-    os.environ["HERMES_HOME"] = home
-    os.environ["HOME"] = home
+    isolate_kanban_env(home)
     sys.path.insert(0, WT)
     from hermes_cli import kanban_db as kb
 
