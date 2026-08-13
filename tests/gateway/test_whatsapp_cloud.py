@@ -1002,6 +1002,102 @@ class TestGroupMessageGating:
             for rec in caplog.records
         ), caplog.text
 
+    @pytest.mark.asyncio
+    async def test_require_mention_admits_an_at_mention_on_cloud(self, monkeypatch):
+        """Routing groups is not enough if the mention gate can never pass.
+
+        The gate's group branch consults botIds / mentionedIds /
+        quotedParticipant. Cloud has no structured mention array -- a mention
+        arrives as "@<number>" in the body -- so supplying our own number lets
+        the gate's body-substring check find it. Without it, WHATSAPP_REQUIRE_
+        MENTION=true (the recommended group mode) drops every group message,
+        including ones that @-mention the bot.
+        """
+        monkeypatch.setenv("WHATSAPP_REQUIRE_MENTION", "true")
+        adapter = _make_adapter()
+        adapter._group_policy = "open"
+        adapter._mention_patterns = []
+
+        event = await adapter._build_message_event_from_cloud(
+            _group_raw(text={"body": "@15559998888 what is the status?"}),
+            {"15551234567": "Alice"},
+            {"display_phone_number": "15559998888"},
+        )
+
+        assert event is not None
+
+    @pytest.mark.asyncio
+    async def test_require_mention_still_drops_unaddressed_group_chatter(self, monkeypatch):
+        """The anti-spam purpose of require_mention must survive the fix."""
+        monkeypatch.setenv("WHATSAPP_REQUIRE_MENTION", "true")
+        adapter = _make_adapter()
+        adapter._group_policy = "open"
+        adapter._mention_patterns = []
+
+        event = await adapter._build_message_event_from_cloud(
+            _group_raw(text={"body": "just chatting among ourselves"}),
+            {"15551234567": "Alice"},
+            {"display_phone_number": "15559998888"},
+        )
+
+        assert event is None
+
+    @pytest.mark.asyncio
+    async def test_require_mention_admits_a_reply_to_the_bot(self, monkeypatch):
+        """context.from identifies the quoted author, so a bare "yes" replying
+        to the bot is addressed at it and must be admitted."""
+        monkeypatch.setenv("WHATSAPP_REQUIRE_MENTION", "true")
+        adapter = _make_adapter()
+        adapter._group_policy = "open"
+        adapter._mention_patterns = []
+
+        addressed = await adapter._build_message_event_from_cloud(
+            _group_raw(text={"body": "yes"}, context={"id": "w0", "from": "15559998888"}),
+            {"15551234567": "Alice"},
+            {"display_phone_number": "15559998888"},
+        )
+        assert addressed is not None
+
+        # A reply to someone else's message is not addressed at the bot.
+        unaddressed = await adapter._build_message_event_from_cloud(
+            _group_raw(text={"body": "yes"}, context={"id": "w0", "from": "15551110000"}),
+            {"15551234567": "Alice"},
+            {"display_phone_number": "15559998888"},
+        )
+        assert unaddressed is None
+
+    @pytest.mark.asyncio
+    async def test_dm_path_is_unaffected(self):
+        """No ``chat`` field means DM: chat_id stays the sender's wa_id."""
+        adapter = _make_adapter()
+        adapter._dm_policy = "open"
+        raw = _group_raw()
+        raw.pop("chat")
+
+        event = await adapter._build_message_event_from_cloud(
+            raw, {"15551234567": "Alice"}, {}
+        )
+
+        assert event is not None
+        assert event.source.chat_id == "15551234567"
+
+
+# =========================================================================
+# Phase 9 — Interactive button messages (clarify / approval / slash-confirm)
+# =========================================================================
+#
+# These tests cover the four hooks the gateway uses for richer UX on
+# platforms that support interactive buttons:
+#   - send_clarify         (mid-conversation multi-choice question)
+#   - send_exec_approval   (dangerous-command Y/N gate)
+#   - send_slash_confirm   (3-button slash-command preview)
+#   - _dispatch_interactive_reply (inbound side: route button taps to
+#                                  the right resolver)
+# Telegram and Discord have the same hooks; we mirror their callback-id
+# format (cl:, appr:, sc:) so the gateway's existing degrade-to-text
+# fallback works transparently.
+
+
 
 class TestOutboundRecipientType:
     """Group destinations must be addressed as groups.
@@ -1119,36 +1215,6 @@ class TestOutboundRecipientType:
         assert event is None
         assert any("not an addressable" in rec.message for rec in caplog.records), caplog.text
 
-    @pytest.mark.asyncio
-    async def test_dm_path_is_unaffected(self):
-        """No ``chat`` field means DM: chat_id stays the sender's wa_id."""
-        adapter = _make_adapter()
-        adapter._dm_policy = "open"
-        raw = _group_raw()
-        raw.pop("chat")
-
-        event = await adapter._build_message_event_from_cloud(
-            raw, {"15551234567": "Alice"}, {}
-        )
-
-        assert event is not None
-        assert event.source.chat_id == "15551234567"
-
-
-# =========================================================================
-# Phase 9 — Interactive button messages (clarify / approval / slash-confirm)
-# =========================================================================
-#
-# These tests cover the four hooks the gateway uses for richer UX on
-# platforms that support interactive buttons:
-#   - send_clarify         (mid-conversation multi-choice question)
-#   - send_exec_approval   (dangerous-command Y/N gate)
-#   - send_slash_confirm   (3-button slash-command preview)
-#   - _dispatch_interactive_reply (inbound side: route button taps to
-#                                  the right resolver)
-# Telegram and Discord have the same hooks; we mirror their callback-id
-# format (cl:, appr:, sc:) so the gateway's existing degrade-to-text
-# fallback works transparently.
 
 
 class TestSendClarifyButtons:

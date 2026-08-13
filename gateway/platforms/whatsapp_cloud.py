@@ -2028,11 +2028,24 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
         # Build the data dict the mixin's _should_process_message expects.
         # Cloud API uses different field names from Baileys, so we adapt.
+        #
+        # The group branch of the gate also consults botIds / mentionedIds /
+        # quotedParticipant to admit an @-mention or a reply to the bot. Cloud
+        # has no structured mention array -- a mention arrives as "@<number>"
+        # in the body -- but supplying our own number lets the gate's
+        # body-substring check find it, and context.from identifies the author
+        # of a quoted message. Without these, a group message that mentions
+        # the bot is dropped whenever require_mention is on.
+        our_number = str((metadata or {}).get("display_phone_number") or "").strip()
+        quoted_from = str((raw_message.get("context") or {}).get("from") or "").strip()
         gating_data = {
             "chatId": chat_id,
             "senderId": sender_id,
             "isGroup": is_group,
             "body": body,
+            "botIds": [our_number] if our_number else [],
+            "mentionedIds": [],
+            "quotedParticipant": quoted_from,
         }
         if not self._should_process_message(gating_data):
             if is_group:
