@@ -770,6 +770,54 @@ class WebhookAdapter(BasePlatformAdapter):
                 }
             )
 
+        # Resolve one canonical, externally supplied identity for script routes.
+        # Stateful scripts must never receive a synthesized identity because it
+        # would let a retry bypass the delivery idempotency boundary.
+        external_delivery_id = next(
+            (
+                value.strip()
+                for name in ("X-GitHub-Delivery", "svix-id", "X-Request-ID")
+                if isinstance((value := request.headers.get(name)), str)
+                and value.strip()
+                and len(value.strip()) <= 256
+                and "\x00" not in value
+            ),
+            None,
+        )
+        script_event_type = (
+            event_type
+            if isinstance(event_type, str)
+            and len(event_type) <= 128
+            and "\x00" not in event_type
+            else None
+        )
+        if route_config.get("script") and (
+            external_delivery_id is None or script_event_type is None
+        ):
+            logger.warning(
+                "[webhook] Script route %s has invalid event or delivery metadata",
+                route_name,
+            )
+            return web.json_response(
+                {"error": "Script route requires valid event and delivery metadata"},
+                status=400,
+            )
+
+        # Preserve the timestamp fallback for non-script generic webhooks while
+        # making script execution and downstream processing share one identity.
+        delivery_id = external_delivery_id or str(int(time.time() * 1000))
+
+        # ── Idempotency ─────────────────────────────────────────
+        # Check before route scripts so a retried delivery cannot invoke a
+        # stateful script more than once.
+        now = time.time()
+        if not self._record_delivery_id(delivery_id, now):
+            logger.info("[webhook] Skipping duplicate delivery %s", delivery_id)
+            return web.json_response(
+                {"status": "duplicate", "delivery_id": delivery_id},
+                status=200,
+            )
+
         if route_config.get("script"):
             # run_route_script shells out (subprocess.run, up to its timeout);
             # run it in a worker thread so it can't block the gateway event loop.
@@ -777,6 +825,8 @@ class WebhookAdapter(BasePlatformAdapter):
                 self._route_processor.run_route_script,
                 route_config.get("script"),
                 payload,
+                event_type=script_event_type,
+                delivery_id=delivery_id,
             )
             if not keep:
                 logger.info(
@@ -827,27 +877,6 @@ class WebhookAdapter(BasePlatformAdapter):
                         )
             except Exception as e:
                 logger.warning("[webhook] Skill loading failed: %s", e)
-
-        # Build a unique delivery ID
-        delivery_id = request.headers.get(
-            "X-GitHub-Delivery",
-            request.headers.get(
-                "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
-            ),
-        )
-
-        # ── Idempotency ─────────────────────────────────────────
-        # Skip duplicate deliveries (webhook retries).
-        now = time.time()
-        if not self._record_delivery_id(delivery_id, now):
-            logger.info(
-                "[webhook] Skipping duplicate delivery %s", delivery_id
-            )
-            return web.json_response(
-                {"status": "duplicate", "delivery_id": delivery_id},
-                status=200,
-            )
 
         # ── Direct delivery mode (deliver_only) ─────────────────
         # Skip the agent entirely — the rendered prompt IS the message we

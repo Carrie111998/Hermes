@@ -225,7 +225,14 @@ class WebhookRouteProcessor:
             for spec in filters
         )
 
-    def run_route_script(self, script_value: Any, payload: dict) -> tuple[bool, Optional[dict]]:
+    def run_route_script(
+        self,
+        script_value: Any,
+        payload: dict,
+        *,
+        event_type: str,
+        delivery_id: str,
+    ) -> tuple[bool, Optional[dict]]:
         """Run a route script and return (should_continue, transformed_payload)."""
         path, error = _resolve_script_path(script_value)
         if error or path is None:
@@ -248,6 +255,9 @@ class WebhookRouteProcessor:
             from tools.environments.local import build_subprocess_env
 
             popen_kwargs = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+            env = build_subprocess_env()
+            env["HERMES_WEBHOOK_EVENT_TYPE"] = event_type
+            env["HERMES_WEBHOOK_DELIVERY_ID"] = delivery_id
             result = subprocess.run(
                 argv,
                 input=json.dumps(payload),
@@ -255,7 +265,7 @@ class WebhookRouteProcessor:
                 text=True, encoding="utf-8", errors="replace",
                 timeout=self.script_timeout_seconds,
                 cwd=str(path.parent),
-                env=build_subprocess_env(),
+                env=env,
                 **popen_kwargs,
             )
         except subprocess.TimeoutExpired:

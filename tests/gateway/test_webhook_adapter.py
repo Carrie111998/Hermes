@@ -456,6 +456,89 @@ class TestPayloadFilters:
         assert captured[0].text == "Task: PAY BILLS"
         assert captured[0].raw_message["body"] == "PAY BILLS"
 
+    @pytest.mark.asyncio
+    async def test_signed_script_receives_authenticated_delivery_metadata(
+        self, tmp_path, monkeypatch
+    ):
+        """Scripts receive bounded request metadata, not payload lookalikes."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        counter = tmp_path / "script-runs.txt"
+        script = scripts / "metadata.py"
+        script.write_text(
+            "import json, os, pathlib, sys\n"
+            "payload = json.load(sys.stdin)\n"
+            f"counter = pathlib.Path({str(counter)!r})\n"
+            "counter.write_text(counter.read_text() + 'x' if counter.exists() else 'x')\n"
+            "payload['body'] = os.environ['HERMES_WEBHOOK_EVENT_TYPE'] + ':' + "
+            "os.environ['HERMES_WEBHOOK_DELIVERY_ID']\n"
+            "print(json.dumps(payload))\n",
+            encoding="utf-8",
+        )
+        secret = "route-secret"
+        routes = {
+            "github": {
+                "secret": secret,
+                "script": "metadata.py",
+                "prompt": "{body}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        captured = []
+
+        async def _capture(event):
+            captured.append(event)
+
+        adapter.handle_message = _capture
+        body = json.dumps(
+            {
+                "HERMES_WEBHOOK_EVENT_TYPE": "payload-event",
+                "HERMES_WEBHOOK_DELIVERY_ID": "payload-delivery",
+            }
+        ).encode()
+        headers = {
+            "Content-Type": "application/json",
+            "X-Hub-Signature-256": _github_signature(body, secret),
+            "X-GitHub-Event": "pull_request",
+            "X-GitHub-Delivery": "delivery-exact-1",
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post("/webhooks/github", data=body, headers=headers)
+            duplicate = await cli.post("/webhooks/github", data=body, headers=headers)
+            duplicate_data = await duplicate.json()
+
+        assert first.status == 202
+        assert duplicate.status == 200
+        assert duplicate_data["status"] == "duplicate"
+        await asyncio.sleep(0.05)
+        assert [event.text for event in captured] == ["pull_request:delivery-exact-1"]
+        assert counter.read_text(encoding="utf-8") == "x"
+
+    @pytest.mark.asyncio
+    async def test_script_without_delivery_identity_fails_before_invocation(self):
+        routes = {
+            "scripted": {
+                "secret": _INSECURE_NO_AUTH,
+                "script": "unused.py",
+                "prompt": "test",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter._route_processor.run_route_script = MagicMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/webhooks/scripted",
+                json={"event_type": "generic"},
+            )
+
+        assert response.status == 400
+        adapter._route_processor.run_route_script.assert_not_called()
+
 
 # ===================================================================
 # HTTP handling

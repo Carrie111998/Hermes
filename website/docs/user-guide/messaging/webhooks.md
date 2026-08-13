@@ -168,6 +168,14 @@ Use `script` when declarative filters are not enough. Scripts must live under `~
 
 The route payload is sent to stdin as JSON:
 
+Script routes also receive the authenticated request metadata in two bounded
+environment variables: `HERMES_WEBHOOK_EVENT_TYPE` and
+`HERMES_WEBHOOK_DELIVERY_ID`. The delivery ID is resolved from
+`X-GitHub-Delivery`, `svix-id`, or `X-Request-ID` and is the same value Hermes
+uses for idempotency. Script routes reject requests without one of these
+externally supplied identities; Hermes does not synthesize an identity for a
+stateful script. Payload fields cannot override either variable.
+
 ```python
 # ~/.hermes/scripts/todoist-hermes-label.py
 import json
