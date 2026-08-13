@@ -140,18 +140,73 @@ process disappears while it is still running is recorded as `unknown`, because
 Hermes cannot prove whether its external side effects happened. Pending and
 delivered records are bounded and profile-local.
 
-## Model Override
+## Model Override and Named Routes
 
-You can configure a different model for subagents via `config.yaml` — useful for delegating simple tasks to cheaper/faster models:
+You can configure a default model and provider for all subagents via `config.yaml`:
 
 ```yaml
 # In ~/.hermes/config.yaml
 delegation:
   model: "google/gemini-flash-2.0"    # Cheaper model for subagents
-  provider: "openrouter"              # Optional: route subagents to a different provider
+  provider: "openrouter"              # Optional: use a different provider
+  reasoning_effort: low                # Optional: override parent reasoning
 ```
 
-If omitted, subagents use the same model as the parent.
+If these values are omitted, subagents inherit them from the parent.
+
+For call-level selection, define user-named routes under `delegation.routes`.
+Each route may set `model`, `provider`, `reasoning_effort`,
+`enabled_toolsets`, and `child_timeout_seconds`:
+
+```yaml
+# In ~/.hermes/config.yaml
+delegation:
+  model: "anthropic/claude-sonnet-4"
+  provider: "openrouter"
+  reasoning_effort: medium
+  default_route: quick
+  routes:
+    quick:
+      model: "google/gemini-flash-2.0"
+      reasoning_effort: low
+      enabled_toolsets: [file, web]
+      child_timeout_seconds: 120
+    deep-review:
+      model: "anthropic/claude-opus-4"
+      reasoning_effort: high
+```
+
+Select a route with the single optional, call-level `route` parameter:
+
+```python
+delegate_task(
+    goal="Review the authentication changes",
+    route="deep-review"
+)
+```
+
+The selected route applies to every child in the call. Do not put `route` in
+individual task objects:
+
+```python
+delegate_task(
+    tasks=[
+        {"goal": "Review the API changes"},
+        {"goal": "Review the database migration"},
+    ],
+    route="deep-review"
+)
+```
+
+A route overrides the top-level delegation values it defines. Missing route
+fields inherit the matching top-level delegation values, then the existing
+parent behavior. Route toolsets can only narrow the parent's effective tools;
+they cannot grant a capability that the parent lacks. A route timeout uses the
+same 30-second floor and timeout result metadata as the global child timeout.
+When `route`
+is omitted, Hermes uses `delegation.default_route` if configured. With neither
+a call route nor a default route, delegation behaves as before. Unknown or
+invalid selected routes fail before any child starts.
 
 ### Cost strategy: frontier planner, inexpensive workers
 
@@ -172,7 +227,13 @@ Note that the pin is global: `delegate_task` has no per-task model parameter, so
 
 ## Inherited Tool Access
 
-`delegate_task` does not accept a model-facing `toolsets` parameter. Each subagent inherits the parent's enabled toolsets so the model cannot grant a child capabilities that the parent does not have. Configure the parent's tools before starting the conversation if delegated work needs additional capabilities.
+`delegate_task` does not accept a model-facing `toolsets` parameter. Each
+subagent inherits the parent's enabled toolsets unless the selected
+operator-defined route narrows them with `enabled_toolsets`. A route cannot
+grant a child capabilities that the parent does not have. A narrow scout route
+also avoids loading unrelated tool schemas and skill guidance. Configure the
+parent's tools before starting the conversation if delegated work needs
+additional capabilities.
 
 Certain tools are blocked for subagents even when the parent has them:
 - `delegate_task` — blocked for leaf subagents (the default). Retained for `role="orchestrator"` children, bounded by `max_spawn_depth` — see [Depth Limit and Nested Orchestration](#depth-limit-and-nested-orchestration) below.
@@ -210,6 +271,9 @@ delegation:
 ```
 
 A positive value enforces a hard wall-clock limit on each child; `0` or a negative value disables it.
+An operator-defined route can set a smaller positive
+`child_timeout_seconds` for bounded scout work without imposing that cap on
+long-running worker routes.
 
 When a configured cap fires, the child's result carries structured timeout
 metadata alongside the error message so parents and hooks can distinguish a

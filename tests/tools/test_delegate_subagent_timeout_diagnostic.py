@@ -195,6 +195,33 @@ class TestRunSingleChildTimeoutDump:
             parent_agent=parent,
         )
 
+    def test_route_timeout_is_used_without_reloading_global_config(
+        self, hermes_home, monkeypatch
+    ):
+        from tools import delegate_tool
+
+        child = _StubChild(api_call_count=1, hang_seconds=10.0)
+        child._delegate_child_timeout = 0.05
+        monkeypatch.setattr(
+            delegate_tool,
+            "_get_child_timeout",
+            lambda: pytest.fail("route timeout must be frozen at dispatch"),
+        )
+        parent = MagicMock()
+        parent._touch_activity = MagicMock()
+        parent._current_task_id = None
+
+        result = delegate_tool._run_single_child(
+            task_index=0,
+            goal="bounded scout",
+            child=child,
+            parent_agent=parent,
+        )
+
+        assert result["status"] == "timeout"
+        assert result["timeout_seconds"] == 0.05
+        assert result["timed_out_after_seconds"] < 1
+
     def test_zero_api_calls_writes_dump_and_surfaces_path(self, hermes_home, monkeypatch):
         child = _StubChild(api_call_count=0, hang_seconds=10.0)
         result = self._invoke_with_short_timeout(child, monkeypatch)

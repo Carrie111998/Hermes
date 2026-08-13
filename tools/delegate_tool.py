@@ -669,7 +669,7 @@ def _get_max_async_children() -> int:
     return _get_max_concurrent_children()
 
 
-def _get_child_timeout() -> Optional[float]:
+def _get_child_timeout(cfg: Optional[Dict[str, Any]] = None) -> Optional[float]:
     """Read delegation.child_timeout_seconds from config.
 
     Returns the number of seconds a single child agent is allowed to run
@@ -687,7 +687,7 @@ def _get_child_timeout() -> Optional[float]:
     Set ``delegation.child_timeout_seconds`` to a positive number to opt back
     in to a hard cap (floor 30 s); ``0`` or a negative value means disabled.
     """
-    cfg = _load_config()
+    cfg = _load_config() if cfg is None else cfg
     val = cfg.get("child_timeout_seconds")
     if val is not None:
         try:
@@ -1339,6 +1339,10 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Effective delegation config after applying a selected named route.
+    delegation_cfg: Optional[Dict[str, Any]] = None,
+    # A route-owned allowlist is exact; do not append inherited MCP toolsets.
+    strict_toolsets: bool = False,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1372,7 +1376,7 @@ def _build_child_agent(
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
-    delegation_cfg = _load_config()
+    delegation_cfg = delegation_cfg if delegation_cfg is not None else _load_config()
 
     # When no explicit toolsets given, inherit from parent's enabled toolsets
     # so disabled tools (e.g. web) don't leak to subagents.
@@ -1399,7 +1403,7 @@ def _build_child_agent(
         # toolset names (e.g. web, terminal) are recognised during intersection.
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
         child_toolsets = [t for t in toolsets if t in expanded_parent]
-        if _get_inherit_mcp_toolsets():
+        if not strict_toolsets and _get_inherit_mcp_toolsets():
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
             )
@@ -2373,8 +2377,14 @@ def _run_single_child(
 
         # Run child with an optional hard timeout (off by default —
         # result(timeout=None) blocks until the child finishes). Stuck-child
-        # protection comes from the heartbeat staleness monitor instead.
-        child_timeout = _get_child_timeout()
+        # protection comes from the heartbeat staleness monitor instead. A
+        # route-selected timeout is frozen on the child at dispatch.
+        child_dict = getattr(child, "__dict__", {})
+        child_timeout = (
+            child_dict["_delegate_child_timeout"]
+            if "_delegate_child_timeout" in child_dict
+            else _get_child_timeout()
+        )
         # Daemon worker (tools.daemon_pool): a timed-out child is abandoned
         # below; a stdlib non-daemon worker would then block interpreter
         # exit at atexit-join time if the child never unwinds.
@@ -3207,6 +3217,100 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
+def _resolve_delegation_route(
+    cfg: Dict[str, Any], route: Optional[str]
+) -> tuple[Dict[str, Any], Optional[List[str]]]:
+    """Overlay one operator-defined call route and return its toolset limit."""
+    selected = route if route is not None else cfg.get("default_route")
+    if selected is None:
+        return cfg, None
+    source = "route" if route is not None else "delegation.default_route"
+    if not isinstance(selected, str) or not selected.strip():
+        raise ValueError(f"{source} must be a non-empty string.")
+    selected = selected.strip()
+
+    routes = cfg.get("routes")
+    if not isinstance(routes, dict):
+        raise ValueError(
+            f"Delegation route '{selected}' cannot be resolved because "
+            "delegation.routes must be an object."
+        )
+    if selected not in routes:
+        raise ValueError(f"Unknown delegation route '{selected}'.")
+    route_cfg = routes[selected]
+    if not isinstance(route_cfg, dict):
+        raise ValueError(f"Delegation route '{selected}' must be an object.")
+
+    allowed_fields = {
+        "model",
+        "provider",
+        "reasoning_effort",
+        "enabled_toolsets",
+        "child_timeout_seconds",
+    }
+    unknown_fields = sorted(str(field) for field in route_cfg if field not in allowed_fields)
+    if unknown_fields:
+        raise ValueError(
+            f"Delegation route '{selected}' contains unsupported field(s): "
+            + ", ".join(unknown_fields)
+            + "."
+        )
+
+    for field in ("model", "provider"):
+        if field in route_cfg and (
+            not isinstance(route_cfg[field], str) or not route_cfg[field].strip()
+        ):
+            raise ValueError(
+                f"delegation.routes.{selected}.{field} must be a non-empty string."
+            )
+
+    if "reasoning_effort" in route_cfg:
+        from hermes_constants import parse_reasoning_effort
+
+        if parse_reasoning_effort(route_cfg["reasoning_effort"]) is None:
+            raise ValueError(
+                f"delegation.routes.{selected}.reasoning_effort is invalid: "
+                f"{route_cfg['reasoning_effort']!r}."
+            )
+
+    route_toolsets = route_cfg.get("enabled_toolsets")
+    if "enabled_toolsets" in route_cfg:
+        if (
+            not isinstance(route_toolsets, list)
+            or not route_toolsets
+            or any(not isinstance(item, str) or not item.strip() for item in route_toolsets)
+        ):
+            raise ValueError(
+                f"delegation.routes.{selected}.enabled_toolsets must be a "
+                "non-empty list of non-empty strings."
+            )
+        route_toolsets = [item.strip() for item in route_toolsets]
+
+    if "child_timeout_seconds" in route_cfg:
+        value = route_cfg["child_timeout_seconds"]
+        if isinstance(value, bool):
+            raise ValueError(
+                f"delegation.routes.{selected}.child_timeout_seconds must be "
+                "a positive number."
+            )
+        try:
+            parsed_timeout = float(value)
+        except (TypeError, ValueError):
+            parsed_timeout = 0
+        if parsed_timeout <= 0:
+            raise ValueError(
+                f"delegation.routes.{selected}.child_timeout_seconds must be "
+                "a positive number."
+            )
+
+    effective = dict(cfg)
+    if "provider" in route_cfg:
+        for field in ("base_url", "api_key", "api_mode"):
+            effective.pop(field, None)
+    effective.update(route_cfg)
+    return effective, route_toolsets
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -3215,6 +3319,7 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    route: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -3268,8 +3373,12 @@ def delegate_task(
             f"multiplies API cost)."
         )
 
-    # Load config
+    # Resolve one call-level operator route before any child is built.
     cfg = _load_config()
+    try:
+        cfg, route_toolsets = _resolve_delegation_route(cfg, route)
+    except ValueError as exc:
+        return tool_error(str(exc))
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
@@ -3424,9 +3533,9 @@ def delegate_task(
             task_index=i,
             goal=t["goal"],
             context=_child_context,
-            # Subagents always inherit the parent's toolsets; the model
-            # cannot choose or narrow them (no model-facing toolsets arg).
-            toolsets=None,
+            # Route toolsets are operator-owned and can only narrow the
+            # parent's effective capabilities in _build_child_agent.
+            toolsets=route_toolsets,
             model=creds["model"],
             max_iterations=effective_max_iter,
             task_count=n_tasks,
@@ -3440,7 +3549,10 @@ def delegate_task(
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
             role=effective_role,
+            delegation_cfg=cfg,
+            strict_toolsets=route_toolsets is not None,
         )
+        child._delegate_child_timeout = _get_child_timeout(cfg)
         # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.
         if _task_schema is not None:
@@ -4304,6 +4416,13 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "route": {
+                "type": "string",
+                "description": (
+                    "Optional named route from delegation.routes. The selected "
+                    "route applies to every child in this call, including batches."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -4422,6 +4541,7 @@ registry.register(
         goal=args.get("goal"),
         context=args.get("context"),
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
+        route=args.get("route"),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
