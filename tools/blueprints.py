@@ -144,18 +144,26 @@ def parse_blueprint(skill_md_text: str) -> Optional[BlueprintSpec]:
 def blueprint_spec_for_installed(skill_name: str) -> Optional[BlueprintSpec]:
     """Locate an installed skill's SKILL.md and parse its blueprint block.
 
-    Searches the standard skills tree for ``<skill_name>/SKILL.md``. Returns
-    None if the skill isn't found or isn't a blueprint.
+    Searches the native, authority-filtered skills index for
+    ``<skill_name>/SKILL.md``. Returns None if the skill isn't found or isn't
+    a blueprint.
     """
     try:
+        from agent.skill_utils import (
+            is_central_private_skill_path,
+            iter_skill_index_files,
+        )
         from tools.skills_hub import SKILLS_DIR
     except Exception:  # pragma: no cover - import guard
         return None
 
     base = Path(SKILLS_DIR)
-    # Skills live at skills/<category>/<name>/SKILL.md or skills/<name>/SKILL.md.
-    candidates = list(base.glob(f"**/{skill_name}/SKILL.md"))
-    for path in candidates:
+    # The shared index prunes MCP-authoritative roots and yields sorted paths.
+    # Retain the explicit predicate as a final guard for any future iterator
+    # implementation change: blueprint discovery must never bypass authority.
+    for path in iter_skill_index_files(base, "SKILL.md"):
+        if path.parent.name != skill_name or is_central_private_skill_path(path):
+            continue
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
