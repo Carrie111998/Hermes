@@ -740,6 +740,18 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
+      label: 'Enterprise',
+      collapsed: true,
+      items: [
+        'enterprise/overview',
+        'enterprise/concepts',
+        'enterprise/deployment',
+        'enterprise/installation',
+        'enterprise/security',
+      ],
+    },
+    {
+      type: 'category',
       label: 'Developer Guide',
       collapsed: true,
       items: [
