@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import sys
+
 import pytest
 
 from agent import shell_hooks
@@ -282,6 +284,7 @@ class TestCallbackSubprocess:
         # Matcher is None so the callback fires for any tool.
         assert cb(tool_name="terminal") is None
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell hooks: spawns #!/usr/bin/env bash scripts, and os.access(X_OK) is meaningless on Windows")
     def test_non_zero_exit_with_block_stdout_still_blocks(self, tmp_path):
         """A script that signals failure via exit code AND prints a block
         directive must still block — scripts should be free to mix exit
@@ -298,6 +301,7 @@ class TestCallbackSubprocess:
         cb = shell_hooks._make_callback(spec)
         assert cb(tool_name="terminal") == {"action": "block", "message": "via exit 1"}
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell hooks: spawns #!/usr/bin/env bash scripts, and os.access(X_OK) is meaningless on Windows")
     def test_block_translation_end_to_end(self, tmp_path):
         """v1 schema-bug regression gate.
 
@@ -319,6 +323,7 @@ class TestCallbackSubprocess:
         result = cb(tool_name="terminal", args={"command": "rm -rf /"})
         assert result == {"action": "block", "message": "no terminal"}
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell hooks: spawns #!/usr/bin/env bash scripts, and os.access(X_OK) is meaningless on Windows")
     def test_block_aggregation_through_plugin_manager(self, tmp_path, monkeypatch):
         """Registering via register_from_config makes
         get_pre_tool_call_block_message surface the block — the real
@@ -353,6 +358,7 @@ class TestCallbackSubprocess:
         )
         assert msg == "blocked-by-shell"
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell hooks: spawns #!/usr/bin/env bash scripts, and os.access(X_OK) is meaningless on Windows")
     def test_matcher_regex_filters_callback(self, tmp_path, monkeypatch):
         """A matcher set to 'terminal' must not fire for 'web_search'."""
         calls = tmp_path / "calls.log"
@@ -375,6 +381,7 @@ class TestCallbackSubprocess:
         # Only the terminal call wrote to the log
         assert calls.read_text().count("pre_tool_call") == 1
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell hooks: spawns #!/usr/bin/env bash scripts, and os.access(X_OK) is meaningless on Windows")
     def test_payload_schema_delivered(self, tmp_path):
         capture = tmp_path / "payload.json"
         script = _write_script(
@@ -399,6 +406,7 @@ class TestCallbackSubprocess:
         assert "cwd" in payload
         assert payload["extra"]["task_id"] == "task-77"
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell hooks: spawns #!/usr/bin/env bash scripts, and os.access(X_OK) is meaningless on Windows")
     def test_pre_llm_call_context_flows_through(self, tmp_path):
         script = _write_script(
             tmp_path, "ctx.sh",
@@ -679,6 +687,7 @@ class TestAllowlistConcurrency:
         assert "No space" in msg
         assert "re-prompt" in msg
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell hooks: spawns #!/usr/bin/env bash scripts, and os.access(X_OK) is meaningless on Windows")
     def test_script_is_executable_handles_interpreter_prefix(self, tmp_path):
         """For ``python3 hook.py`` and similar the interpreter reads
         the script, so X_OK on the script itself is not required —

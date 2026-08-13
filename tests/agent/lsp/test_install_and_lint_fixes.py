@@ -18,6 +18,8 @@ import io
 from contextlib import redirect_stdout
 from unittest.mock import MagicMock, patch
 
+import sys
+
 import pytest
 
 from agent.lsp.install import INSTALL_RECIPES
@@ -115,6 +117,7 @@ def test_existing_binary_finds_windows_wrapper_in_staging(tmp_path, monkeypatch)
     assert install_mod.detect_status("pyright") == "installed"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="real pip rejects --user together with --target under Windows Store Python")
 def test_install_pip_finds_windows_scripts_launcher(tmp_path, monkeypatch):
     """pip console scripts can land in Scripts/ on native Windows."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
