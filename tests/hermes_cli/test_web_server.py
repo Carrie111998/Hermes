@@ -3836,7 +3836,26 @@ class TestPtyWebSocket:
         q = {"token": tok, **params}
         return f"/api/pty?{urlencode(q)}"
 
+    def test_resolve_chat_argv_uses_alt_screen_for_transcript_scroll(
+        self, monkeypatch,
+    ):
+        """Dashboard chat must not force inline mode — ScrollBox needs a bounded viewport."""
+        import hermes_cli.main as main_mod
 
+        monkeypatch.setattr(
+            main_mod,
+            "_make_tui_argv",
+            lambda project_root, tui_dev=False: (
+                ["node", "dist/entry.js"],
+                "/tmp/ui-tui",
+            ),
+        )
+
+        _argv, _cwd, env = self.ws_module._resolve_chat_argv()
+
+        assert "HERMES_TUI_INLINE" not in env
+        assert env["HERMES_TUI_DISABLE_MOUSE"] == "1"
+        assert env["HERMES_TUI_DASHBOARD"] == "1"
 
     def test_tui_python_command_uses_child_path(self, tmp_path):
         """Bare Python commands are resolved from the TUI child's PATH."""
@@ -3858,10 +3877,6 @@ class TestPtyWebSocket:
         main_mod._apply_tui_python_env(env)
 
         assert env["HERMES_PYTHON"] == command
-
-
-
-
 
     def test_resolve_chat_argv_async_uses_worker_thread(self, monkeypatch):
         captured: dict = {}
