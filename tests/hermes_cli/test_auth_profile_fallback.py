@@ -200,6 +200,147 @@ def test_write_credential_pool_targets_profile_not_global(profile_env):
     assert [e["id"] for e in read_credential_pool("openrouter")] == ["prof-new"]
 
 
+def test_xai_global_pool_refresh_rotates_root_without_profile_shadow(
+    profile_env, monkeypatch
+):
+    """A profile refreshing a borrowed xAI row must persist to its owner.
+
+    xAI refresh tokens rotate.  Writing the refreshed row into the borrowing
+    profile creates a shadow while leaving root with the consumed token, so a
+    second profile later retries the stale refresh token.
+    """
+    from agent.credential_pool import load_pool
+
+    profile_b = profile_env["global"] / "profiles" / "reviewer"
+    profile_b.mkdir(parents=True)
+    root_auth = profile_env["global"] / "auth.json"
+    _write(root_auth, _make_auth_store(pool={
+        "xai-oauth": [{
+            "id": "root-xai",
+            "label": "root device login",
+            "auth_type": "oauth",
+            "priority": 0,
+            "source": "manual:device_code",
+            "access_token": "root-access-before-refresh",
+            "refresh_token": "root-refresh-before-refresh",
+            "base_url": "https://api.x.ai/v1",
+        }],
+    }, providers={}))
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.delenv("XAI_OAUTH_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.auth._xai_access_token_is_expiring",
+        lambda access_token, *_args, **_kwargs: access_token
+        == "root-access-before-refresh",
+    )
+    refresh_calls = []
+
+    def fake_refresh(access_token, refresh_token, **_kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": "root-access-after-refresh",
+            "refresh_token": "root-refresh-after-refresh",
+            "last_refresh": "2026-08-12T12:00:00+00:00",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_xai_oauth_pure", fake_refresh)
+
+    pool = load_pool("xai-oauth")
+    selected = pool.select()
+    assert selected is not None
+    assert selected.access_token == "root-access-after-refresh"
+    assert refresh_calls == [
+        ("root-access-before-refresh", "root-refresh-before-refresh")
+    ]
+
+    root_store = json.loads(root_auth.read_text())
+    root_entry = root_store["credential_pool"]["xai-oauth"][0]
+    assert root_entry["access_token"] == "root-access-after-refresh"
+    assert root_entry["refresh_token"] == "root-refresh-after-refresh"
+    assert "xai-oauth" not in root_store.get("providers", {})
+    profile_auth = profile_env["profile"] / "auth.json"
+    assert not profile_auth.exists() or "xai-oauth" not in json.loads(
+        profile_auth.read_text()
+    ).get("credential_pool", {})
+    assert not profile_auth.exists() or "xai-oauth" not in json.loads(
+        profile_auth.read_text()
+    ).get("providers", {})
+
+    monkeypatch.setenv("HERMES_HOME", str(profile_b))
+    monkeypatch.setattr(
+        "hermes_cli.auth._xai_access_token_is_expiring", lambda *_args, **_kwargs: False
+    )
+    second_profile_entry = load_pool("xai-oauth").select()
+    assert second_profile_entry is not None
+    assert second_profile_entry.access_token == "root-access-after-refresh"
+    assert second_profile_entry.refresh_token == "root-refresh-after-refresh"
+    assert not (profile_b / "auth.json").exists()
+
+    # Status persistence follows the same owner and must not create a shadow.
+    pool.mark_exhausted_and_rotate(status_code=429)
+    root_store = json.loads(root_auth.read_text())
+    assert root_store["credential_pool"]["xai-oauth"][0]["last_status"] == (
+        "exhausted"
+    )
+    assert not profile_auth.exists() or "xai-oauth" not in json.loads(
+        profile_auth.read_text()
+    ).get("credential_pool", {})
+    assert not (profile_b / "auth.json").exists()
+
+
+def test_profile_owned_xai_pool_refresh_stays_local(profile_env, monkeypatch):
+    """Ownership routing must not redirect a real profile pool to root."""
+    from agent.credential_pool import load_pool
+
+    root_auth = profile_env["global"] / "auth.json"
+    profile_auth = profile_env["profile"] / "auth.json"
+    _write(root_auth, _make_auth_store(pool={
+        "openrouter": [{
+            "id": "root-other-provider",
+            "source": "manual",
+            "auth_type": "api_key",
+            "access_token": "root-other-token",
+        }],
+    }, providers={}))
+    _write(profile_auth, _make_auth_store(pool={
+        "xai-oauth": [{
+            "id": "profile-xai",
+            "source": "manual:device_code",
+            "auth_type": "oauth",
+            "priority": 0,
+            "access_token": "profile-access-before",
+            "refresh_token": "profile-refresh-before",
+        }],
+    }, providers={}))
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.delenv("XAI_OAUTH_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.auth._xai_access_token_is_expiring",
+        lambda access_token, *_args, **_kwargs: access_token == "profile-access-before",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.refresh_xai_oauth_pure",
+        lambda *_args, **_kwargs: {
+            "access_token": "profile-access-after",
+            "refresh_token": "profile-refresh-after",
+        },
+    )
+
+    selected = load_pool("xai-oauth").select()
+    assert selected is not None
+    assert selected.access_token == "profile-access-after"
+    profile_store = json.loads(profile_auth.read_text())
+    assert profile_store["credential_pool"]["xai-oauth"][0]["refresh_token"] == (
+        "profile-refresh-after"
+    )
+    assert "xai-oauth" not in profile_store.get("providers", {})
+    root_store = json.loads(root_auth.read_text())
+    assert "xai-oauth" not in root_store.get("credential_pool", {})
+    assert root_store["credential_pool"]["openrouter"][0]["access_token"] == (
+        "root-other-token"
+    )
+
+
 
 
 def test_auth_lock_reentrancy_is_scoped_after_profile_context_switch(profile_env):
