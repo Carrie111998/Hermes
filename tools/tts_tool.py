@@ -3521,7 +3521,7 @@ def text_to_speech_tool(
         output_path: Optional custom save path.
         speed: Optional playback speed multiplier (0.25-4.0).
         instructions: Optional voice-design guidance (tone, emotion, pacing).
-        provider: Optional TTS provider override.
+        provider: Optional TTS provider override for programmatic callers.
 
     Returns:
         str: JSON result with success, file_path, file_paths, and MEDIA tag.
@@ -3548,7 +3548,8 @@ def text_to_speech_tool(
         tts_config = dict(tts_config)  # shallow copy to avoid mutating the cache
         tts_config["speed"] = clamped
 
-    # Allow per-call provider override; fall back to the configured default.
+    # Allow per-call provider override for trusted programmatic callers; the
+    # model-facing registry handler deliberately never forwards this argument.
     if provider:
         provider = provider.lower().strip()
     else:
@@ -4518,18 +4519,8 @@ TTS_SCHEMA = {
                 "description": (
                     "Optional voice-design guidance: tone, emotion, pacing, accent, "
                     "whispering, impressions (e.g. 'Speak in a cheerful, excited whisper'). "
-                    "Forwarded to the OpenAI backend (gpt-4o-mini-tts and OpenAI-compatible "
-                    "voice-design servers). Silently ignored by backends that don't support it."
-                )
-            },
-            "provider": {
-                "type": "string",
-                "description": (
-                    "Optional TTS provider override. Accepts built-in names "
-                    "(edge, openai, elevenlabs, minimax, xai, mistral, gemini, "
-                    "neutts, kittentts, piper), user-declared command provider "
-                    "names from tts.providers.<name>, or plugin-registered names. "
-                    "When omitted, the configured tts.provider from config.yaml is used."
+                    "Only used when the configured tts.provider supports voice-design "
+                    "instructions. Silently ignored by backends that don't support it."
                 )
             }
         },
@@ -4546,7 +4537,8 @@ registry.register(
         output_path=args.get("output_path"),
         speed=args.get("speed"),
         instructions=args.get("instructions"),
-        provider=args.get("provider")),
+        # provider deliberately not taken from model args — house config only
+        provider=None),
     check_fn=check_tts_requirements,
     emoji="🔊",
 )
