@@ -35,6 +35,7 @@ from gateway.config import (
 from gateway.response_filters import (
     is_intentional_silence_response as _is_intentional_silence_response,
     is_partial_silence_marker as _is_partial_silence_marker,
+    sanitize_em_dashes,
 )
 
 logger = logging.getLogger("gateway.stream_consumer")
@@ -1235,8 +1236,17 @@ class GatewayStreamConsumer:
         delivered separately via ``_deliver_media_from_response()`` after the
         stream finishes — we just need to hide the raw directives from the
         user.
+
+        Em dashes are rewritten here too so the streaming path obeys the same
+        house style as the non-streaming boundary
+        (``_sanitize_gateway_final_response``).  Every delivered-text
+        comparison below (``delivered_final_matches``, ``has_delivered_text``)
+        normalizes both sides through this method, so the dedup verdicts stay
+        symmetric.
         """
-        return _BasePlatformAdapter.strip_media_directives_for_display(text)
+        return sanitize_em_dashes(
+            _BasePlatformAdapter.strip_media_directives_for_display(text)
+        )
 
     async def _send_new_chunk(
         self,

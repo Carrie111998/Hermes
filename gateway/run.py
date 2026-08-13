@@ -63,6 +63,7 @@ from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import (
     compression_made_progress,
 )
+from gateway.response_filters import sanitize_em_dashes
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -737,8 +738,13 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
     if _looks_like_gateway_provider_error(redacted):
-        return _gateway_provider_error_reply(redacted)
-    return redacted
+        return sanitize_em_dashes(_gateway_provider_error_reply(redacted))
+
+    # House style: no em dashes on chat surfaces. Rewritten here, at the
+    # delivery boundary, rather than in the agent loop so the stored
+    # transcript keeps what the model actually produced and every platform
+    # inherits the rule without an adapter-side patch.
+    return sanitize_em_dashes(redacted)
 
 
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:

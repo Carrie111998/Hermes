@@ -15,12 +15,26 @@ a thin dispatcher that delegates to a platform-provided callback.
 """
 
 import json
+import re
 from typing import List, Optional, Callable
 
 
 # Maximum number of predefined choices the agent can offer.
 # A 5th "Other (type your answer)" option is always appended by the UI.
 MAX_CHOICES = 4
+
+# Longest a bare button label is allowed to be, in whitespace-separated words.
+# "Approve", "Hold off", "Rebase onto main" all fit; a sentence does not.
+MAX_CHOICE_WORDS = 5
+
+# A colon followed by whitespace and more text is the "Label: explanation"
+# shape we want out of `choices` and into `question`. The whitespace
+# requirement keeps legitimate colon-bearing labels ("3:1", "12:30") valid.
+_CHOICE_EXPLANATORY_COLON_RE = re.compile(r":\s+\S")
+
+# Sentence-terminal punctuation. A button label is a noun phrase or an
+# imperative, never a terminated sentence.
+_CHOICE_SENTENCE_ENDINGS = (".", "!", "?")
 
 
 def _flatten_choice(c) -> str:
@@ -54,6 +68,31 @@ def _flatten_choice(c) -> str:
     if isinstance(c, (list, tuple)):
         return " ".join(_flatten_choice(x) for x in c).strip()
     return str(c).strip()
+
+
+def _prose_choice_reason(label: str) -> Optional[str]:
+    """Return why ``label`` reads as prose rather than a button label, else None.
+
+    Models routinely hand `choices` a full sentence ("Approve this urgent
+    change to the shared config file") because the array reads like a list of
+    answers.  It isn't — every surface renders these as buttons or numbered
+    rows, so a sentence is truncated by Discord's 80-char button cap, wraps
+    into unreadable rows in Telegram, and comes back as the literal
+    ``user_response`` the agent then has to parse.  The description belongs in
+    ``question``; the array holds the labels.
+
+    Detection is deliberately mechanical (word count / colon / terminal
+    punctuation) so the verdict is predictable and a retry with short labels
+    reliably succeeds.
+    """
+    if _CHOICE_EXPLANATORY_COLON_RE.search(label):
+        return "contains a colon followed by explanatory text"
+    if label.endswith(_CHOICE_SENTENCE_ENDINGS):
+        return "ends in sentence-terminal punctuation"
+    word_count = len(label.split())
+    if word_count > MAX_CHOICE_WORDS:
+        return f"is {word_count} words long (limit is {MAX_CHOICE_WORDS})"
+    return None
 
 
 def _invoke_callback(callback, question, choices, multi_select):
@@ -151,6 +190,21 @@ def clarify_tool(
         # so the CLI panel, Discord buttons, and Telegram list all render clean
         # text and the resolved answer is never a raw Python dict repr.
         choices = [s for s in (_flatten_choice(c) for c in choices) if s]
+        # Reject-and-retry, never silent truncation: a shortened sentence is
+        # still the wrong label AND has quietly lost the words that made it
+        # meaningful. Failing the call lets the model move the prose into
+        # `question` and re-issue with real labels.
+        for choice in choices:
+            reason = _prose_choice_reason(choice)
+            if reason:
+                return tool_error(
+                    f"Choice {choice!r} {reason}, so it reads as a description "
+                    "rather than a button label. Every entry in `choices` must "
+                    "be a bare short label the user can click (e.g. 'Approve', "
+                    "'Hold off', 'Rebase onto main'). Move the explanation into "
+                    "the `question` parameter and call clarify again with short "
+                    "labels."
+                )
         if len(choices) > MAX_CHOICES:
             choices = choices[:MAX_CHOICES]
         if not choices:
@@ -231,7 +285,13 @@ CLARIFY_SCHEMA = {
                     "each distinct option is its own array element (up to 4). "
                     "The UI renders these as pickable rows and auto-appends an "
                     "'Other (type your answer)' option. Omit this parameter "
-                    "entirely ONLY for a genuinely open-ended free-text question."
+                    "entirely ONLY for a genuinely open-ended free-text question.\n"
+                    "Each element must be a BARE BUTTON LABEL, not a sentence: "
+                    f"at most {MAX_CHOICE_WORDS} words, no trailing '.'/'!'/'?', "
+                    "and no 'Label: explanation' form. Right: ['Approve', "
+                    "'Hold off']. Wrong: ['Approve this urgent change to the "
+                    "shared config file.']. A prose choice is REJECTED with an "
+                    "error - put the explanation in `question` and retry."
                 ),
             },
             "multi_select": {

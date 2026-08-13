@@ -23,6 +23,27 @@ LIVE_GATEWAY_SILENT_MARKERS = frozenset({
     "NO REPLY",
 })
 
+# U+2014 EM DASH.  Named rather than inlined so the literal never has to be
+# eyeballed in a diff against the visually near-identical en dash (U+2013),
+# which is deliberately NOT rewritten.
+EM_DASH = "—"
+
+
+def sanitize_em_dashes(text: Any) -> Any:
+    """Replace em dashes (U+2014) with a plain hyphen for outbound delivery.
+
+    Applied at the delivery boundary only: the conversation history, the
+    transcript, and the logs keep the model's original characters.  This is a
+    presentation-layer rewrite, so it must never run over text that is merely
+    being stored or compared against stored text.
+
+    Non-string input is returned untouched so this can sit inline in a
+    sanitizing chain without having to guard every call site.
+    """
+    if not isinstance(text, str) or EM_DASH not in text:
+        return text
+    return text.replace(EM_DASH, "-")
+
 
 def _canonical_silence_candidate(text: str) -> str:
     return " ".join(text.strip().upper().split())
