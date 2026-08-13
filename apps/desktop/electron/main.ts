@@ -8151,7 +8151,10 @@ async function spawnPoolBackend(profile, entry) {
   backend.args = getBackendArgsForRuntime(backend)
   const hermesCwd = resolveHermesCwd()
   const webDist = resolveWebDist()
-  const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
+  // Use the atomic ready-file channel on every platform. stdout is retained
+  // for diagnostics, but a file avoids platform-specific pipe/event timing
+  // races where the READY line is logged yet the watcher misses it.
+  const readyFile = makeDashboardReadyFile()
 
   rememberLog(`Starting Hermes backend for profile "${profile}" via ${backend.label}`)
 
@@ -8443,7 +8446,9 @@ async function startHermes() {
     backend.args = getBackendArgsForRuntime(backend)
     const hermesCwd = resolveHermesCwd()
     const webDist = resolveWebDist()
-    const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
+    // Use the atomic ready-file channel on every platform. stdout remains
+    // attached for diagnostics, while port discovery is race-free.
+    const readyFile = makeDashboardReadyFile()
 
     await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
     rememberLog(`Starting Hermes backend via ${backend.label}`)
