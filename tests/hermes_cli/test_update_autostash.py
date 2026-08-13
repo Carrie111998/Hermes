@@ -349,6 +349,8 @@ def test_update_autostash_survives_undeletable_untracked_dir(tmp_path):
 def _make_divergence_side_effect(
     *, local_only_count="0", cherry_pick_fails=False,
     local_only_count_fails=False, update_ref_fails=False,
+    replay_shas=("aaaaaaaaa1", "bbbbbbbbb2"), failing_shas=(),
+    replay_list_fails=False,
 ):
     """subprocess.run side_effect for the ff-only-fails -> reset -> preserve
     -> cherry-pick flow. Distinguishes the two different rev-list calls by
@@ -389,10 +391,24 @@ def _make_divergence_side_effect(
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "reset" in joined and "--hard" in joined:
             return SimpleNamespace(stdout="HEAD is now at abc123\n", stderr="", returncode=0)
-        if "cherry-pick" in joined and "--abort" in joined:
+        # The replay enumerates the preserved commits and picks them ONE AT A
+        # TIME, so a single unappliable commit cannot discard the rest.
+        if "rev-list" in joined and "--no-merges" in joined:
+            if replay_list_fails:
+                return SimpleNamespace(
+                    stdout="", stderr="fatal: bad revision\n", returncode=128,
+                )
+            return SimpleNamespace(
+                stdout="\n".join(replay_shas) + ("\n" if replay_shas else ""),
+                stderr="", returncode=0,
+            )
+        if "log" in joined and "--format=%s" in joined:
+            return SimpleNamespace(stdout="carried commit subject\n", stderr="", returncode=0)
+        if "cherry-pick" in joined and ("--abort" in joined or "--quit" in joined):
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "cherry-pick" in joined:
-            if cherry_pick_fails:
+            picked = cmd[-1]
+            if cherry_pick_fails or picked in failing_shas:
                 return SimpleNamespace(
                     stdout="", stderr="error: could not apply ...\nCONFLICT\n", returncode=1,
                 )
@@ -422,11 +438,17 @@ def test_cmd_update_preserves_and_reapplies_local_commits_on_reset(monkeypatch, 
 
     calls = [" ".join(str(c) for c in cmd) for cmd in recorded]
     update_ref_calls = [c for c in calls if "update-ref" in c]
-    cherry_pick_calls = [c for c in calls if "cherry-pick" in c and "--abort" not in c]
+    cherry_pick_calls = [
+        c for c in calls
+        if "cherry-pick" in c and "--abort" not in c and "--quit" not in c
+    ]
     assert len(update_ref_calls) == 1
     assert "refs/hermes-update-backups/main-" in update_ref_calls[0]
-    assert len(cherry_pick_calls) == 1
-    assert "HEAD..refs/hermes-update-backups/main-" in cherry_pick_calls[0]
+    # One pick PER COMMIT, not a single all-or-nothing range pick.
+    assert len(cherry_pick_calls) == 2
+    assert cherry_pick_calls[0].endswith("aaaaaaaaa1")
+    assert cherry_pick_calls[1].endswith("bbbbbbbbb2")
+    assert not any("HEAD..refs/hermes-update-backups/" in c for c in cherry_pick_calls)
 
     out = capsys.readouterr().out
     assert "Preserving 2 local commit(s)" in out
@@ -455,9 +477,58 @@ def test_cmd_update_cherry_pick_conflict_leaves_backup_ref_and_prints_recovery(m
     assert any("cherry-pick --abort" in c for c in calls)
 
     out = capsys.readouterr().out
-    assert "Could not automatically reapply your 1 local" in out
+    assert "could not be reapplied" in out
     assert "refs/hermes-update-backups/main-" in out
-    assert "git cherry-pick HEAD..refs/hermes-update-backups/main-" in out
+    assert "git cherry-pick <sha>" in out
+    # Every failing commit is named, so the operator knows exactly what to
+    # replay by hand instead of being told only that "something" failed.
+    assert "carried commit subject" in out
+
+
+def test_cmd_update_replays_remaining_commits_when_one_conflicts(monkeypatch, tmp_path, capsys):
+    """One unappliable commit must not discard the others.
+
+    Regression test for the all-or-nothing replay: a single
+    ``cherry-pick HEAD..<backup_ref>`` stopped at the first bad commit and the
+    recovery path aborted the whole batch, so one stale commit (e.g. a
+    fork-local change whose upstream PR was later closed) silently cost every
+    other carried commit. Observed on a real install with a 69-commit backup
+    that replayed zero commits.
+    """
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: None)
+
+    # Three preserved commits; the MIDDLE one cannot be applied.
+    side_effect, recorded = _make_divergence_side_effect(
+        local_only_count="3",
+        replay_shas=("aaaaaaaaa1", "bbbbbbbbb2", "ccccccccc3"),
+        failing_shas=("bbbbbbbbb2",),
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+    monkeypatch.setattr(hermes_main, "_validate_critical_files_syntax", lambda root: (True, None, None))
+    monkeypatch.setattr(hermes_main, "_venv_core_imports_healthy", lambda: (True, ""))
+    monkeypatch.setattr(hermes_main, "_resume_windows_gateways_after_update", lambda *a, **kw: None)
+    monkeypatch.setattr(hermes_main, "_finish_dashboard_update_cleanup", lambda *a, **kw: None)
+    monkeypatch.setattr(hermes_main, "_update_node_dependencies", lambda: [])
+    monkeypatch.setattr(hermes_main, "_build_web_ui", lambda *a, **kw: None)
+    monkeypatch.setattr(hermes_main, "_install_python_dependencies_with_optional_fallback", lambda *a, **kw: None)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    calls = [" ".join(str(c) for c in cmd) for cmd in recorded]
+    picks = [
+        c for c in calls
+        if "cherry-pick" in c and "--abort" not in c and "--quit" not in c
+    ]
+    # All three were attempted -- the loop did not stop at the failure.
+    assert len(picks) == 3
+    assert picks[2].endswith("ccccccccc3")
+
+    out = capsys.readouterr().out
+    assert "Reapplied 2 local commit(s)" in out       # the two good ones landed
+    assert "1 local commit(s) could not be reapplied" in out
+    assert "bbbbbbbb" in out                          # the bad one is named
+    assert "refs/hermes-update-backups/main-" in out
 
 
 def test_cmd_update_skips_backup_when_no_local_commits_diverged(monkeypatch, tmp_path, capsys):

@@ -4344,69 +4344,99 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
                 if backup_ref:
                     # HEAD now equals origin/{branch}; replay the preserved
-                    # commits on top. Best-effort — on any conflict, abort
-                    # cleanly and leave the backup ref in place rather than
-                    # leaving conflict markers in source files.
-                    cherry_result = subprocess.run(
-                        git_cmd + ["cherry-pick", f"HEAD..{backup_ref}"],
+                    # commits on top, ONE AT A TIME.
+                    #
+                    # A single ``cherry-pick HEAD..<ref>`` is all-or-nothing:
+                    # git stops at the first commit that will not apply and the
+                    # recovery path aborts the ENTIRE batch, so one stale commit
+                    # discards every other carried commit. Observed on a real
+                    # install: a 69-commit backup aborted on commit #1 — a
+                    # fork-local change whose upstream PR had since been closed
+                    # — and replayed nothing, leaving ten still-wanted fixes
+                    # reachable only from the backup ref. To the operator that
+                    # is indistinguishable from data loss, and it gets more
+                    # likely the longer a fork's divergence goes untended.
+                    #
+                    # Merge commits are excluded: cherry-pick refuses them
+                    # without -m, and their content arrives anyway via the
+                    # individual commits they merged.
+                    list_result = subprocess.run(
+                        git_cmd
+                        + ["rev-list", "--reverse", "--no-merges", f"HEAD..{backup_ref}"],
                         cwd=_m().PROJECT_ROOT,
                         capture_output=True,
                         text=True, encoding="utf-8", errors="replace",
                     )
-                    if cherry_result.returncode == 0:
-                        # local_only is -1 when the earlier count failed; don't
-                        # render "-1 commit(s)" at the user in that case.
-                        if local_only > 0:
-                            print(
-                                f"  ✓ Reapplied {local_only} local commit(s) on top of the update."
-                            )
-                        else:
-                            print(
-                                "  ✓ Reapplied your local commit(s) on top of the update."
-                            )
-                    else:
-                        # cherry-pick can fail for reasons other than a
-                        # conflict — a merge commit needing -m, an empty
-                        # commit, a bad ref. Don't assert a cause we did not
-                        # determine; surface git's own stderr instead.
-                        abort_result = subprocess.run(
-                            git_cmd + ["cherry-pick", "--abort"],
-                            cwd=_m().PROJECT_ROOT,
-                            capture_output=True,
+                    replay_shas = (
+                        list_result.stdout.split() if list_result.returncode == 0 else []
+                    )
+                    if list_result.returncode != 0:
+                        print(
+                            "  ⚠ Could not enumerate your local commits to reapply them."
+                        )
+                        list_err = (list_result.stderr or "").strip()
+                        for line in list_err.splitlines():
+                            print(f"    {line}")
+                        print(f"    Nothing is lost — they're saved at: {backup_ref}")
+                        print(f"    Reapply manually with: git cherry-pick HEAD..{backup_ref}")
+
+                    replayed: list[str] = []
+                    failed: list[tuple[str, str, str]] = []
+                    for sha in replay_shas:
+                        subject = subprocess.run(
+                            git_cmd + ["log", "-1", "--format=%s", sha],
+                            cwd=_m().PROJECT_ROOT, capture_output=True,
+                            text=True, encoding="utf-8", errors="replace",
+                        ).stdout.strip()
+                        pick = subprocess.run(
+                            git_cmd + ["cherry-pick", sha],
+                            cwd=_m().PROJECT_ROOT, capture_output=True,
                             text=True, encoding="utf-8", errors="replace",
                         )
-                        count = (
-                            f"your {local_only} local commit(s)"
-                            if local_only > 0
-                            else "your local commit(s)"
+                        if pick.returncode == 0:
+                            replayed.append(sha)
+                            continue
+                        detail = (pick.stderr or pick.stdout or "").strip().splitlines()
+                        failed.append(
+                            (sha[:9], subject, detail[0] if detail else "unknown error")
                         )
-                        print(f"  ⚠ Could not automatically reapply {count}.")
-                        cherry_err = (cherry_result.stderr or "").strip()
-                        if cherry_err:
-                            for line in cherry_err.splitlines():
-                                print(f"    {line}")
-                        # A failed --abort leaves the working tree mid
-                        # cherry-pick. Saying nothing here would let the user
-                        # believe the tree is clean while it still carries
-                        # conflict markers and a CHERRY_PICK_HEAD.
-                        if abort_result.returncode != 0:
-                            print(
-                                "    ✗ 'git cherry-pick --abort' also failed — this "
-                                "checkout is still mid-cherry-pick."
-                            )
-                            abort_err = (abort_result.stderr or "").strip()
-                            if abort_err:
-                                for line in abort_err.splitlines():
-                                    print(f"      {line}")
-                            print(
-                                "      Clean it up before using the checkout:\n"
-                                "        git cherry-pick --abort   # or: git cherry-pick --quit"
-                            )
-                        print(f"    Nothing is lost — they're saved at: {backup_ref}")
+                        # Roll back THIS commit only so the next one still gets
+                        # a chance. Escalate --abort -> --quit -> reset so a
+                        # wedged pick can never strand the loop mid-conflict
+                        # with markers left in the working tree.
+                        for recovery in (
+                            ["cherry-pick", "--abort"],
+                            ["cherry-pick", "--quit"],
+                            ["reset", "--hard", "HEAD"],
+                        ):
+                            if subprocess.run(
+                                git_cmd + recovery,
+                                cwd=_m().PROJECT_ROOT, capture_output=True,
+                                text=True, encoding="utf-8", errors="replace",
+                            ).returncode == 0:
+                                break
+
+                    if replayed:
+                        print(
+                            f"  ✓ Reapplied {len(replayed)} local commit(s) on top of the update."
+                        )
+                    if failed:
+                        print(
+                            f"  ⚠ {len(failed)} local commit(s) could not be reapplied "
+                            f"automatically{' (the others were)' if replayed else ''}:"
+                        )
+                        for short_sha, subject, reason in failed:
+                            print(f"    • {short_sha} {subject[:68]}")
+                            print(f"        {reason[:110]}")
+                        print(f"    Nothing is lost — all of them remain at: {backup_ref}")
                         print(f"    Review them with: git log {backup_ref}")
                         print(
-                            f"    Reapply manually with: git cherry-pick HEAD..{backup_ref}"
+                            "    Reapply one with: git cherry-pick <sha>  "
+                            "(resolve, then git cherry-pick --continue)"
                         )
+                    elif not replayed and replay_shas:
+                        print("  ⚠ No local commits were reapplied.")
+                        print(f"    They remain at: {backup_ref}")
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
