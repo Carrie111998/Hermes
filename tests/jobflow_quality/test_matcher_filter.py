@@ -340,3 +340,30 @@ class TestDefaultCriteriaProvenance:
         a decision rather than an omission.
         """
         assert not hasattr(DEFAULT_CRITERIA, "work_authorization")
+
+
+class TestTheMatcherSeamIsDeliberatelyUnwired:
+    """Measured decision, like the tracker route — keep it from being "fixed".
+
+    The filter excludes 3.5% of raw Scout discoveries, which is what made it
+    look worth wiring ahead of the matcher. It is not: measured against 432
+    real SCORE_REQUESTs joined to their pipeline records, only **4 (0.9%)**
+    are filterable, because a job reaching the matcher has already passed
+    Scout's own exclusions. 41% of those requests carry no salary at all.
+
+    0.9% of matcher calls is roughly $0.03/week, against a live change to the
+    job pipeline that would auto-archive without a model ever looking. The
+    filter earns its place where it already runs — the pre-submission gate and
+    as a non-circular label source for the golden set — not here.
+
+    See docs/superpowers/plans/2026-08-10-jobflow-premium-quality-routing.md.
+    """
+
+    def test_the_filter_is_not_imported_by_any_matcher_runtime_path(self):
+        import pathlib
+        root = pathlib.Path(__file__).resolve().parents[2]
+        wired = [
+            p for p in (root / "graphs").rglob("*.py")
+            if "matcher_filter" in p.read_text(encoding="utf-8", errors="replace")
+        ]
+        assert wired == [], f"matcher scoring path now imports the filter: {wired}"
