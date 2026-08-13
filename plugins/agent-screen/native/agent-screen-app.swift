@@ -1,9 +1,19 @@
-// agent-screen-app.swift — "Agent Screen": virtuelles Display + Live-Fenster + MJPEG-Stream.
-// Fork-Kern aus DeskPad (MIT, Stengo/DeskPad): CGVirtualDisplay private API + CGDisplayStream.
-// Ersetzt DeskPad + agent-screen-stream.py + agent-screen-viewer in EINEM Prozess.
+// agent-screen-app.swift — Agent Screen: virtual display + native window + MJPEG.
 //
-// Build: swiftc -O agent-screen-app.swift -import-objc-header CGVirtualDisplayPrivate.h -o agent-screen-app
-// Danach: codesign -s - agent-screen-app   (TCC-Grant für Bildschirmaufnahme einmalig nötig)
+// Copyright (c) 2022 Bastian Andelefski (DeskPad, https://github.com/Stengo/DeskPad)
+// Copyright (c) 2021 Khaos Tian (CGVirtualDisplayPrivate.h / VirtualDisplayExp)
+// Portions Copyright (c) 2026 Hermes Agent contributors
+//
+// This file is a fork of DeskPad (MIT). Substantial portions — virtual-display
+// setup, CGDisplayStream → layer contents, click-to-warp, titlebar highlight,
+// and window chrome — come from DeskPad. See ../NOTICE and ../LICENSE.deskpad.
+//
+// Hermes additions: loopback MJPEG server, drag-portal via Accessibility.
+//
+// Experimental: CGVirtualDisplay is private SPI and can break on any macOS update.
+//
+// Build: ./build-app.sh  (never ad-hoc codesign — Screen Recording TCC is
+// bound to the signing identity).
 
 import Cocoa
 import CoreImage
@@ -12,7 +22,18 @@ import Network
 import UniformTypeIdentifiers
 import ApplicationServices
 
-// MARK: - MJPEG-Server (Loopback, fürs Hermes-Plugin-Pane)
+// Unique from DeskPad's 0x1234/0x3456/0x0001 so both apps can run together.
+private let kVendorID: UInt32 = 0x4845 // 'HE'
+private let kProductID: UInt32 = 0x4153 // 'AS'
+private let kSerialNum: UInt32 = 0x0001
+private let kDisplayName = "Agent Screen Display"
+private let kNativeWidth = 3360
+private let kNativeHeight = 2100
+private let kStreamMaxClients = 8
+private let kJpegEveryNthFrame = 20 // ~3 fps at a 60 Hz display stream
+private let kJpegWidth = 1280
+
+// MARK: - MJPEG server (loopback only — any local process can watch)
 
 final class MJpegServer {
     private var listener: NWListener?
@@ -38,11 +59,29 @@ final class MJpegServer {
     private func handle(_ conn: NWConnection) {
         conn.start(queue: queue)
         conn.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [weak self] data, _, _, _ in
-            guard let self, let data, let req = String(data: data, encoding: .utf8) else { return }
-            if req.hasPrefix("GET /ping") {
+            guard let self, let data, let req = String(data: data, encoding: .utf8) else {
+                conn.cancel()
+                return
+            }
+            let line = req.split(separator: "\r\n", maxSplits: 1, omittingEmptySubsequences: true).first.map(String.init) ?? req
+            if line.hasPrefix("GET /ping") {
                 conn.send(content: Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".utf8),
                           completion: .contentProcessed { _ in conn.cancel() })
-            } else {
+                return
+            }
+            let isStream = line.hasPrefix("GET /stream") || line.hasPrefix("GET / HTTP") || line == "GET /"
+            guard isStream else {
+                conn.send(content: Data("HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found".utf8),
+                          completion: .contentProcessed { _ in conn.cancel() })
+                return
+            }
+            self.queue.async {
+                self.pruneClients()
+                if self.clients.count >= kStreamMaxClients {
+                    conn.send(content: Data("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 11\r\nConnection: close\r\n\r\nbusy".utf8),
+                              completion: .contentProcessed { _ in conn.cancel() })
+                    return
+                }
                 let head = "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
                 conn.send(content: head.data(using: .utf8)!, completion: .contentProcessed { _ in
                     self.queue.async { self.clients.append(conn) }
@@ -51,21 +90,25 @@ final class MJpegServer {
         }
     }
 
+    private func pruneClients() {
+        clients.removeAll { conn in
+            if case .failed = conn.state { return true }
+            return conn.state == .cancelled
+        }
+    }
+
     func broadcast(_ jpeg: Data) {
         queue.async {
+            self.pruneClients()
             let frame = Data("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: \(jpeg.count)\r\n\r\n".utf8) + jpeg + Data("\r\n".utf8)
             for conn in self.clients {
                 conn.send(content: frame, completion: .contentProcessed { _ in })
-            }
-            self.clients.removeAll { conn in
-                if case .failed = conn.state { return true }
-                return conn.state == .cancelled
             }
         }
     }
 }
 
-// MARK: - AppDelegate: Fenster + virtuelles Display + Stream
+// MARK: - AppDelegate: window + virtual display + stream
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
@@ -75,8 +118,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var server = MJpegServer()
     private let ciContext = CIContext()
     private var frameCounter = 0
+    private var axPrompted = false
 
-    // Drag-Portal: welches fremde Fenster wird gerade gezogen?
     private var dragCandidateWindowID: CGWindowID = 0
     private var dragCandidatePID: pid_t = 0
     private var dragCandidateBounds: CGRect = .zero
@@ -85,14 +128,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var dragWatchTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // --- Fenster ---
         let rect = NSRect(x: 0, y: 0, width: 960, height: 600)
         window = NSWindow(contentRect: rect,
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
         window.title = "Agent Screen"
         window.minSize = NSSize(width: 200, height: 125)
-        // DeskPad-Setup: transparente Titlebar, damit backgroundColor sie mitfärbt
+        // DeskPad chrome: transparent titlebar so backgroundColor tints it.
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
         window.backgroundColor = .windowBackgroundColor
@@ -101,30 +143,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         contentView.layer?.backgroundColor = NSColor.black.cgColor
         window.contentView = contentView
         window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        // Show the window without stealing key focus from Hermes.
+        window.orderFrontRegardless()
 
-        // Klick ins Fenster → Cursor aufs virtuelle Display (wie DeskPad)
         contentView.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(didClickOnScreen)))
 
-        // --- MJPEG-Server ---
         do {
             try server.start()
-            NSLog("[agent-screen] MJPEG auf http://127.0.0.1:8788/stream.mjpeg")
+            NSLog("[agent-screen] MJPEG on http://127.0.0.1:8788/stream.mjpeg (loopback, unauthenticated)")
         } catch {
-            NSLog("[agent-screen] Server-Fehler: \(error)")
+            NSLog("[agent-screen] server error: \(error)")
         }
 
-        // --- Virtuelles Display erzeugen (DeskPad-Kern, private API) ---
         let descriptor = CGVirtualDisplayDescriptor()
         descriptor.setDispatchQueue(DispatchQueue.main)
-        descriptor.name = "Agent Screen Display"
+        descriptor.name = kDisplayName
         descriptor.maxPixelsWide = 5120
         descriptor.maxPixelsHigh = 2160
         descriptor.sizeInMillimeters = CGSize(width: 1600, height: 1000)
-        descriptor.productID = 0x1234
-        descriptor.vendorID = 0x3456
-        descriptor.serialNum = 0x0001
+        descriptor.productID = kProductID
+        descriptor.vendorID = kVendorID
+        descriptor.serialNum = kSerialNum
 
         let display = CGVirtualDisplay(descriptor: descriptor)
         self.display = display
@@ -140,13 +179,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             CGVirtualDisplayMode(width: 1280, height: 720, refreshRate: 60),
         ]
         display.apply(settings)
-        NSLog("[agent-screen] Display erzeugt: ID \(display.displayID)")
+        NSLog("[agent-screen] display created: ID \(display.displayID)")
 
-        // --- Display-Inhalt streamen (CGDisplayStream, IOSurface-Frames) ---
         let stream = CGDisplayStream(
             dispatchQueueDisplay: display.displayID,
-            outputWidth: 3360,
-            outputHeight: 2100,
+            outputWidth: kNativeWidth,
+            outputHeight: kNativeHeight,
             pixelFormat: 1_111_970_369, // kCVPixelFormatType_32BGRA
             properties: [CGDisplayStream.showCursor: true] as CFDictionary,
             queue: .main,
@@ -156,51 +194,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         self.stream = stream
         stream?.start()
-        NSLog("[agent-screen] CGDisplayStream läuft.")
+        NSLog("[agent-screen] CGDisplayStream running.")
 
-        // Seitenverhältnis des Fensters an die Display-Auflösung koppeln
-        window.contentAspectRatio = NSSize(width: 3360, height: 2100)
+        window.contentAspectRatio = NSSize(width: kNativeWidth, height: kNativeHeight)
 
-        // Titlebar-Feedback: grünlich, solange der Cursor auf dem Agent-Screen ist
         Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.updateTitlebarHighlight()
         }
 
-        // Drag-Portal: fremde Fenster aufs virtuelle Display ziehen
         installWindowDragMonitor()
     }
 
-    // MARK: - Drag-Portal (Fenster auf den Agent Screen ziehen)
+    // MARK: - Drag portal (drop a foreign window onto us → teleport it)
 
-    /// Erkennt, wenn der User ein fremdes App-Fenster packt und über unserem
-    /// Fenster loslässt → das Fenster wird auf die Mitte des virtuellen Displays
-    /// teleportiert (wie bei DeskPad, aber intuitiver: Drop aufs Fenster).
-    ///
-    /// Technik: Polling statt Event-Monitor. Bei Titelleisten-Drags übernimmt
-    /// der WindowServer die Maus-Events — globale Monitore sehen sie nicht
-    /// (besonders bei synthetischen Events). Stattdessen: Jeder Tick prüft
-    /// (a) linke Maustaste gedrückt? (b) bewegt sich ein fremdes Fenster?
-    /// (c) Cursor über unserem Fenster? Beim Loslassen über unserem Fenster
-    /// mit vorheriger Bewegung → teleportieren.
+    /// Polling, not an event monitor: title-bar drags are swallowed by
+    /// WindowServer, so global monitors never see them. Each tick: left button
+    /// down? is a foreign window moving? cursor over us? On release over us
+    /// after movement → teleport via Accessibility.
     private func installWindowDragMonitor() {
-        let timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+        dragWatchTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             self?.tickDragWatch()
         }
-        dragWatchTimer = timer
-        NSLog("[agent-screen] Drag-Portal aktiv: Fenster aufs virtuelle Display ziehbar")
+        NSLog("[agent-screen] drag portal on: drop a window onto this one to move it")
     }
 
     private func tickDragWatch() {
         let pressed = (NSEvent.pressedMouseButtons & 1) != 0
         let mouse = NSEvent.mouseLocation
         let overOurWindow = window.frame.contains(mouse)
-        // WICHTIG: CGWindowBounds, NSEvent.mouseLocation und AppleScript
-        // position nutzen ALLE den globalen Quartz-Raum (Ursprung unten-links)
-        // — KEINE Umrechnung. Nur Toleranz beim Hit-Test.
 
         if pressed {
             if !dragWasPressed {
-                // Frischer Maus-Down: Kandidat merken (fremdes Fenster unter Cursor)
                 if let info = windowInfo(at: mouse),
                    (info[kCGWindowOwnerName as String] as? String) != "Agent Screen",
                    (info[kCGWindowLayer as String] as? Int) == 0 {
@@ -211,14 +235,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                      width: boundsDict["Width"] ?? 0, height: boundsDict["Height"] ?? 0)
                     }
                     dragSeenMovement = false
-                    NSLog("[agent-screen] Drag-Portal: Kandidat wID=%d pid=%d", dragCandidateWindowID, dragCandidatePID)
                 } else {
                     dragCandidateWindowID = 0
                     dragCandidatePID = 0
-                    // still — kein Kandidat ist normal (Klick auf Desktop etc.)
                 }
             } else if dragCandidateWindowID != 0, !dragSeenMovement {
-                // Bewegt sich das Kandidaten-Fenster gerade? (Titelleisten-Drag)
                 if let info = windowInfoByID(dragCandidateWindowID),
                    let boundsDict = info[kCGWindowBounds as String] as? [String: CGFloat] {
                     let now = CGRect(x: boundsDict["X"] ?? 0, y: boundsDict["Y"] ?? 0,
@@ -230,7 +251,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         } else {
-            // Losgelassen: War ein Drag über unserem Fenster? → teleportieren
             if dragWasPressed, dragSeenMovement, overOurWindow,
                dragCandidateWindowID != 0, dragCandidatePID != 0 {
                 moveWindowToAgentScreen(pid: dragCandidatePID, windowID: dragCandidateWindowID)
@@ -242,14 +262,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         dragWasPressed = pressed
     }
 
-    /// Oberstes NORMALES Fenster (Layer 0) unter einem Punkt finden.
-    /// WICHTIG: CGWindowList enthält auch Dock/Menüleiste (Layer 20+); das
-    /// erste Fenster in der Liste ist NICHT das oberste App-Fenster. Daher
-    /// alle Treffer sammeln und das mit dem höchsten Layer ≤ 0 nehmen.
+    /// Topmost normal (layer ≤ 0) window under a point. Dock/menu bar live on
+    /// layer 20+ and must not win the hit-test.
     private func windowInfo(at point: CGPoint) -> [String: Any]? {
         guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
                 as? [[String: Any]] else { return nil }
-        let tol: CGFloat = 5 // Toleranz: contains() ist an maxX/maxY exklusiv
+        let tol: CGFloat = 5
         var best: [String: Any]?
         var bestLayer = Int.min
         for info in list {
@@ -273,67 +291,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return list.first { ($0[kCGWindowNumber as String] as? CGWindowID) == id }
     }
 
-    /// Das gezogene Fenster per Accessibility-API auf die Mitte des virtuellen
-    /// Displays verschieben (CGDisplayMoveCursorToPoint wäre nur Cursor).
+    private func ensureAccessibility() -> Bool {
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        let trusted = AXIsProcessTrustedWithOptions(opts)
+        if !trusted, !axPrompted {
+            axPrompted = true
+            NSLog("[agent-screen] drag portal needs Accessibility permission (System Settings ▸ Privacy & Security ▸ Accessibility)")
+        }
+        return trusted
+    }
+
+    private func axValue(_ ref: CFTypeRef, _ type: AXValueType, _ dest: UnsafeMutableRawPointer) -> Bool {
+        guard CFGetTypeID(ref) == AXValueGetTypeID() else { return false }
+        return AXValueGetValue(unsafeBitCast(ref, to: AXValue.self), type, dest)
+    }
+
     private func moveWindowToAgentScreen(pid: pid_t, windowID: CGWindowID) {
+        guard ensureAccessibility() else { return }
         guard let screen = NSScreen.screens.first(where: { $0.localizedName.contains("Agent Screen") }) else {
-            NSLog("[agent-screen] Drag-Portal: Agent-Screen-Display nicht gefunden")
+            NSLog("[agent-screen] drag portal: Agent Screen display not found")
             return
         }
         let appRef = AXUIElementCreateApplication(pid)
         var windowsRef: CFTypeRef?
         let err = AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &windowsRef)
         guard err == .success, let windows = windowsRef as? [AXUIElement] else {
-            NSLog("[agent-screen] Drag-Portal: AX-Fensterliste fehlgeschlagen (%@)", String(describing: err))
+            NSLog("[agent-screen] drag portal: AX window list failed (%@)", String(describing: err))
             return
         }
-        // AKTUELLE Bounds des gezogenen Fensters holen (es hat sich während
-        // des Drags bewegt — die Bounds vom Maus-Down sind veraltet!)
         var matchBounds = dragCandidateBounds
         if let info = windowInfoByID(windowID),
            let boundsDict = info[kCGWindowBounds as String] as? [String: CGFloat] {
             matchBounds = CGRect(x: boundsDict["X"] ?? 0, y: boundsDict["Y"] ?? 0,
                                  width: boundsDict["Width"] ?? 0, height: boundsDict["Height"] ?? 0)
         }
-        // Das gezogene Fenster über seine Bounds identifizieren (Position+Größe
-        // zum Zeitpunkt des Loslassens; Toleranz für minimale Abweichungen).
         let tolerance: CGFloat = 60
         var target: AXUIElement?
-        for window in windows {
+        for candidate in windows {
             var posRef: CFTypeRef?
             var sizeRef: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &posRef) == .success,
-                  AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef) == .success,
+            guard AXUIElementCopyAttributeValue(candidate, kAXPositionAttribute as CFString, &posRef) == .success,
+                  AXUIElementCopyAttributeValue(candidate, kAXSizeAttribute as CFString, &sizeRef) == .success,
                   let posValue = posRef,
                   let sizeValue = sizeRef else { continue }
             var pos = CGPoint.zero
             var size = CGSize.zero
-            AXValueGetValue(posValue as! AXValue, .cgPoint, &pos)
-            AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
+            guard axValue(posValue, .cgPoint, &pos), axValue(sizeValue, .cgSize, &size) else { continue }
             let bounds = CGRect(origin: pos, size: size)
             if abs(bounds.minX - matchBounds.minX) < tolerance,
                abs(bounds.minY - matchBounds.minY) < tolerance,
                abs(bounds.width - matchBounds.width) < tolerance,
                abs(bounds.height - matchBounds.height) < tolerance {
-                target = window
+                target = candidate
                 break
             }
         }
-        guard let window = target else {
-            NSLog("[agent-screen] Drag-Portal: Fenster %d nicht in AX-Liste (PID %d)", windowID, pid)
+        guard let axWindow = target else {
+            NSLog("[agent-screen] drag portal: window %d not in AX list (PID %d)", windowID, pid)
             return
         }
-        // Auf die Display-Mitte setzen (Fenster bleibt zentriert)
         let center = NSPoint(x: screen.frame.midX, y: screen.frame.midY)
         var size = CGSize(width: 800, height: 500)
         var sizeRef: CFTypeRef?
-        if AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef) == .success, let sizeValue = sizeRef {
-            AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
+        if AXUIElementCopyAttributeValue(axWindow, kAXSizeAttribute as CFString, &sizeRef) == .success,
+           let sizeValue = sizeRef {
+            _ = axValue(sizeValue, .cgSize, &size)
         }
         var newOrigin = CGPoint(x: center.x - size.width / 2, y: center.y - size.height / 2)
         if let posValue = AXValueCreate(.cgPoint, &newOrigin) {
-            AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, posValue)
-            NSLog("[agent-screen] Drag-Portal: Fenster %d → Agent Screen @ %@", windowID, NSStringFromPoint(newOrigin))
+            AXUIElementSetAttributeValue(axWindow, kAXPositionAttribute as CFString, posValue)
+            NSLog("[agent-screen] drag portal: window %d → Agent Screen @ %@", windowID, NSStringFromPoint(newOrigin))
         }
     }
 
@@ -343,54 +370,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             $0.localizedName.contains("Agent Screen") && NSMouseInRect(mouse, $0.frame, false)
         }
         let target: NSColor = onAgentScreen
-            ? NSColor(calibratedRed: 0.086, green: 0.639, blue: 0.290, alpha: 1.0) // Teknium-Grün #16A34A
+            ? NSColor(calibratedRed: 0.086, green: 0.639, blue: 0.290, alpha: 1.0) // #16A34A
             : NSColor.windowBackgroundColor
         if window.backgroundColor != target {
             window.backgroundColor = target
-            NSLog("[agent-screen] Titlebar → \(onAgentScreen ? "BLAU" : "neutral") (Maus \(Int(mouse.x)),\(Int(mouse.y)))")
         }
     }
 
     private func handleFrame(surface: IOSurface?) {
         guard let surface else { return }
-        // Fenster direkt aus der IOSurface rendern (wie DeskPad)
         contentView.layer?.contents = surface
 
-        // MJPEG: jeden 2. Frame (~2-3 fps) als JPEG encodieren (Hintergrund-Queue)
+        // Copy pixels on the stream queue (main) BEFORE the surface is recycled,
+        // then JPEG-encode the owned CGImage off-thread. ~3 fps (every 20th frame
+        // of a 60 Hz stream) — enough for the chip preview, cheap on CPU.
         frameCounter += 1
-        guard frameCounter % 2 == 0 else { return }
+        guard frameCounter % kJpegEveryNthFrame == 0 else { return }
+        let ci = CIImage(ioSurface: surface)
+        guard let cg = ciContext.createCGImage(ci, from: ci.extent) else { return }
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self else { return }
-            let ci = CIImage(ioSurface: surface)
-            let targetW = 1280
-            let scale = Double(targetW) / Double(ci.extent.width)
-            let targetH = max(1, Int(Double(ci.extent.height) * scale))
-            guard let ctx = CGContext(data: nil, width: targetW, height: targetH,
-                                      bitsPerComponent: 8, bytesPerRow: 0,
-                                      space: CGColorSpaceCreateDeviceRGB(),
-                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
-                  let cg = self.ciContext.createCGImage(ci, from: ci.extent),
-                  ctx.draw(cg, in: CGRect(x: 0, y: 0, width: targetW, height: targetH)) as Void? != nil,
-                  let scaled = ctx.makeImage(),
-                  let data = CFDataCreateMutable(nil, 0),
-                  let dest = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil)
-            else { return }
-            CGImageDestinationAddImage(dest, scaled, [kCGImageDestinationLossyCompressionQuality: 0.55] as CFDictionary)
-            if CGImageDestinationFinalize(dest) {
-                self.server.broadcast(data as Data)
-            }
+            self?.broadcastJPEG(cg)
         }
     }
 
-    // Klick im Fenster → Cursor auf den Punkt des virtuellen Displays warpen.
-    // Der User kann dann direkt auf dem Agent-Screen klicken/tippen (wie DeskPad).
+    private func broadcastJPEG(_ cg: CGImage) {
+        let targetW = kJpegWidth
+        let scale = Double(targetW) / Double(cg.width)
+        let targetH = max(1, Int(Double(cg.height) * scale))
+        guard let ctx = CGContext(data: nil, width: targetW, height: targetH,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: targetW, height: targetH))
+        guard let scaled = ctx.makeImage(),
+              let data = CFDataCreateMutable(nil, 0),
+              let dest = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil)
+        else { return }
+        CGImageDestinationAddImage(dest, scaled, [kCGImageDestinationLossyCompressionQuality: 0.55] as CFDictionary)
+        if CGImageDestinationFinalize(dest) {
+            server.broadcast(data as Data)
+        }
+    }
+
     @objc private func didClickOnScreen(_ gesture: NSGestureRecognizer) {
         let p = gesture.location(in: contentView)
         let w = contentView.bounds.width
         let h = contentView.bounds.height
         guard w > 0, h > 0, display != nil else { return }
-        let dispW: CGFloat = 3360
-        let dispH: CGFloat = 2100
+        let dispW = CGFloat(kNativeWidth)
+        let dispH = CGFloat(kNativeHeight)
         let x = p.x / w * dispW
         let y = (h - p.y) / h * dispH
         CGDisplayMoveCursorToPoint(display.displayID, CGPoint(x: x, y: y))

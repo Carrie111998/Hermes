@@ -5,49 +5,65 @@ Mounted at /api/plugins/agent-screen/ by the dashboard plugin system.
 Starts/stops the agent-screen native app (a virtual display + native window
 + MJPEG stream on :8788) and reports its status.
 
-Routes:
-  GET  /status  -> {running, stream}
-  POST /start   -> start agent-screen.sh (idempotent)
-  POST /stop    -> pkill -f agent-screen-app
+macOS only. /start and /stop return HTTP 501 on any other platform.
 
-Layout
-------
-The native companion lives in ``<plugin>/native/``: Swift sources,
-``build-app.sh`` (compiles + codesigns the .app bundle) and
-``agent-screen.sh`` (launcher). ``build-app.sh`` installs the built app to
-``$AGENT_SCREEN_DIR`` (default ``~/.hermes/agent-screen``); this backend
-resolves the launcher the same way, so a bundled and a user-installed plugin
-behave identically.
+Routes:
+  GET  /status  -> {running, stream, supported, platform, error?}
+  POST /start   -> start agent-screen.sh if needed (idempotent)
+  POST /stop    -> pkill -x agent-screen-app
+
+Process matching uses ``pgrep -x`` / ``pkill -x`` on the binary name
+(``agent-screen-app``). Never ``-f`` — that matches any argv containing the
+string (an editor with the source file open, swiftc, etc.).
 
 Security note
 -------------
 Plugin HTTP routes go through the dashboard's session-token auth middleware
-just like core API routes — every request must present the session bearer
-token (see the kanban plugin docs for details).
+just like core API routes. The MJPEG stream itself binds loopback-only and
+has no auth — any local process can watch. That is intentional and documented.
 """
-import os
+from __future__ import annotations
+
 import subprocess
+import sys
+import time
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 router = APIRouter()
 
-# The launcher script ships with the plugin (native/agent-screen.sh); the
-# built .app bundle lives wherever $AGENT_SCREEN_DIR points (default:
-# ~/.hermes/agent-screen). Keeping both sides on the same resolution rule
-# means "build with AGENT_SCREEN_DIR=X, then run with AGENT_SCREEN_DIR=X".
+# The launcher ships with the plugin. The built .app lives under
+# ~/.hermes/agent-screen (see native/build-app.sh). No user-facing env var —
+# that directory is the install location, not configuration.
 NATIVE_DIR = Path(__file__).resolve().parent.parent / "native"
 START_SCRIPT = NATIVE_DIR / "agent-screen.sh"
 PING_URL = "http://127.0.0.1:8788/ping"
 
+# Exact process name of the bundle executable. ``-x`` matches this and only this.
+PROC_NAME = "agent-screen-app"
+
+# After SIGTERM the app does not release CGVirtualDisplay immediately.
+# Restarting inside that window crashes (measured: 0s crashes, 3s is enough).
+_DISPLAY_GRACE_S = 2.5
+
+
+def _supported() -> bool:
+    return sys.platform == "darwin"
+
+
+def _launcher_ok() -> bool:
+    return START_SCRIPT.is_file()
+
 
 def _app_running() -> bool:
-    """Is the agent-screen-app process alive (pgrep on the binary name)?"""
+    """Is the agent-screen-app process alive? Exact name match only."""
     try:
         r = subprocess.run(
-            ["pgrep", "-f", "agent-screen-app"],
-            capture_output=True, text=True, timeout=3,
+            ["pgrep", "-x", PROC_NAME],
+            capture_output=True,
+            text=True,
+            timeout=3,
         )
         return r.returncode == 0
     except Exception:
@@ -59,22 +75,30 @@ def _stream_ok() -> bool:
     try:
         r = subprocess.run(
             ["curl", "-s", "--max-time", "1", PING_URL],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         return r.returncode == 0 and r.stdout.strip() == "ok"
     except Exception:
         return False
 
 
-def _state() -> dict:
-    return {"running": _app_running(), "stream": _stream_ok()}
+def _state(*, error: str | None = None) -> dict:
+    payload = {
+        "running": _app_running() if _supported() else False,
+        "stream": _stream_ok() if _supported() else False,
+        "supported": _supported(),
+        "platform": sys.platform,
+    }
+    if error:
+        payload["error"] = error
+    elif not _supported():
+        payload["error"] = "Agent Screen requires macOS."
+    return payload
 
 
-def _wait_until(pred, timeout=6.0, step=0.2) -> bool:
-    """Poll until pred() is true (or timeout). pkill is asynchronous — the
-    process dies a moment after the signal; an immediate /start right after
-    would still find it via pgrep and wrongly skip starting."""
-    import time
+def _wait_until(pred, timeout: float = 6.0, step: float = 0.2) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if pred():
@@ -83,11 +107,18 @@ def _wait_until(pred, timeout=6.0, step=0.2) -> bool:
     return pred()
 
 
-# After pkill (SIGTERM) the app does NOT release the virtual display
-# (CGVirtualDisplay) immediately. Restarting within that window crashes — the
-# app starts, cannot create the display, and dies after ~2-4s. Only after this
-# pause is the display really free (measured: 3s suffices, 0s crashes).
-_DISPLAY_GRACE_S = 2.5
+def _spawn() -> None:
+    subprocess.Popen(
+        [str(START_SCRIPT)],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _require_macos() -> None:
+    if not _supported():
+        raise HTTPException(status_code=501, detail="Agent Screen requires macOS.")
 
 
 @router.get("/status")
@@ -97,48 +128,36 @@ def status():
 
 @router.post("/start")
 def start():
-    # Wait out any still-dying instance, THEN start cleanly.
+    """Idempotent: a healthy running instance is a no-op."""
+    _require_macos()
+    if not _launcher_ok():
+        return _state(error="launcher missing; run plugins/agent-screen/native/build-app.sh")
+    if _app_running() and _stream_ok():
+        return _state()
     if _app_running():
+        # Process up but stream down — wait for it to die, then start clean.
         _wait_until(lambda: not _app_running())
-        # Wait for the display to free up (CGVirtualDisplay lags behind pkill)
-        import time
         time.sleep(_DISPLAY_GRACE_S)
     if not _app_running():
-        # start_new_session=True: the child survives the serve process
-        # (parent-death watchdog); stdout/stderr to DEVNULL — the launcher
-        # redirects app logs to /tmp/agent-screen-app.log.
-        subprocess.Popen(
-            [str(START_SCRIPT)],
-            start_new_session=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    # Wait for the STREAM (not just the process): the app can briefly start
-    # and crash again because the display is still busy — the stream proves it
-    # really came up. Retry once after a short pause.
+        _spawn()
     if not _wait_until(_stream_ok, timeout=6.0):
-        import time
         time.sleep(_DISPLAY_GRACE_S)
-        subprocess.Popen(
-            [str(START_SCRIPT)],
-            start_new_session=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        if not _app_running():
+            _spawn()
         _wait_until(_stream_ok, timeout=6.0)
     return _state()
 
 
 @router.post("/stop")
 def stop():
+    _require_macos()
+    if not _app_running():
+        return _state()
     subprocess.run(
-        ["pkill", "-f", "agent-screen-app"],
-        capture_output=True, timeout=5,
+        ["pkill", "-x", PROC_NAME],
+        capture_output=True,
+        timeout=5,
     )
-    # Wait until really dead — otherwise /status still reports the dying app
-    # as "running" and the chip toggles wrong on the next click.
     _wait_until(lambda: not _app_running())
-    # Wait for display release — an immediate restart would crash.
-    import time
     time.sleep(_DISPLAY_GRACE_S)
     return _state()

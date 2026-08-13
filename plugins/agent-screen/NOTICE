@@ -1,0 +1,41 @@
+Agent Screen
+============
+
+This plugin includes a fork of DeskPad and a private CoreGraphics
+header originally published elsewhere. Credit belongs with those
+authors first — Agent Screen is a Hermes companion built on their work.
+
+DeskPad
+-------
+
+    Project:   DeskPad
+    Author:    Bastian Andelefski (Stengo)
+    Source:    https://github.com/Stengo/DeskPad
+    License:   MIT License (c) 2022 Bastian Andelefski
+               see LICENSE.deskpad in this directory
+
+Forked content (substantial portions of DeskPad):
+
+    - CGVirtualDisplay private-API setup (descriptor, modes, apply)
+    - CGDisplayStream → IOSurface → window layer contents
+    - click-to-warp the cursor onto the virtual display
+    - titlebar highlight while the cursor is on the virtual screen
+    - window chrome (transparent titlebar, movable-by-background,
+      aspect-ratio lock, terminate-after-last-window)
+
+CGVirtualDisplayPrivate.h
+-------------------------
+
+    Origin:    Khaos Tian, VirtualDisplayExp (2021-02-17)
+    Via:       DeskPad (Stengo/DeskPad)
+    License:   MIT, same terms as LICENSE.deskpad
+
+Original work
+-------------
+
+The Hermes-side pieces — MJPEG loopback server, drag-portal (AX),
+dashboard router, desktop chip/pane, build/launcher scripts — are
+original work for hermes-agent and are licensed under the MIT License
+that applies to the rest of this repository, except where they
+incorporate the forked DeskPad/VirtualDisplayExp material above.
+That incorporation does not change the license of either file.

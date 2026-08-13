@@ -1,99 +1,121 @@
 # Agent Screen
 
+> **A fork of [DeskPad](https://github.com/Stengo/DeskPad)** by
+> [Bastian Andelefski](https://github.com/Stengo) (MIT, 2022).
+> The virtual display, the window chrome, click-to-warp, and the titlebar
+> highlight are DeskPad. Agent Screen adds a loopback MJPEG preview, a
+> drag-portal, and a Hermes desktop chip/pane. See [`NOTICE`](./NOTICE)
+> and [`LICENSE.deskpad`](./LICENSE.deskpad).
+> `CGVirtualDisplayPrivate.h` originates from Khaos Tian's VirtualDisplayExp
+> (2021).
+
 A virtual display for macOS — the missing Xvfb equivalent. macOS offers no
 headless second display; Agent Screen fills the gap with a tiny Swift
 companion app that owns a **real** `CGVirtualDisplay` (a true second display
 with its own Space), renders it into a native window, and exposes it as a
-live MJPEG stream on `:8788`.
+live MJPEG stream on loopback `:8788`.
+
+**Experimental.** `CGVirtualDisplay` is private SPI. Apple can break it on
+any macOS update. The plugin ships **off** by default.
 
 **What you get:**
 
 - A real second display — drag any window onto it (native display shift),
-  or drag a window ONTO the agent-screen window and it teleports over
-  (drag portal)
-- A statusbar chip: monitor icon, **green** while the app runs, **gray**
-  when off; click toggles start/stop; hover shows a live preview of the
-  virtual screen (only while active)
-- A snappable pane in the desktop layout with the live stream, dockable
-  left/right/bottom via drag & drop
-- Click into the agent-screen window and the cursor warps onto the virtual
-  display — it behaves like a real screen
+  or drop a window onto the Agent Screen window to teleport it (drag portal)
+- A statusbar chip: monitor icon, green while the app runs, gray when off;
+  click toggles start/stop; hover shows a live preview (only while active)
+- A snappable pane in the desktop layout with the live stream
+- Click into the Agent Screen window and the cursor warps onto the virtual
+  display
+
+**Local macOS backend only.** Start/stop talk to the connected Hermes
+backend; the preview always reads `http://127.0.0.1:8788` on this Mac.
+A remote or Linux backend cannot drive the display on your machine.
 
 ## Layout
 
 ```
 plugins/agent-screen/
-├── dashboard/            # FastAPI router mounted at /api/plugins/agent-screen/
+├── NOTICE                # DeskPad + VirtualDisplayExp credit (read this)
+├── LICENSE.deskpad       # MIT (c) 2022 Bastian Andelefski
+├── README.md
+├── dashboard/            # FastAPI router at /api/plugins/agent-screen/
 │   ├── manifest.json
-│   └── plugin_api.py     # /status, /start, /stop (starts/stops the app)
-└── native/               # The Swift companion (sources, NOT the binary)
+│   └── plugin_api.py     # /status, /start, /stop
+└── native/
     ├── agent-screen-app.swift
     ├── CGVirtualDisplayPrivate.h
-    ├── build-app.sh      # compiles + codesigns the .app bundle
-    ├── agent-screen.sh   # launcher
-    └── icon/             # app icon source (1024² PNG)
+    ├── build-app.sh
+    ├── agent-screen.sh
+    └── icon/
 ```
 
 The desktop plugin (`apps/desktop/src/plugins/agent-screen/plugin.tsx`)
-contributes the statusbar chip + pane; it ships OFF by default
-(`defaultEnabled: false`) because the native companion must be built first —
-enable it in **Settings ▸ Plugins** after building.
+contributes the statusbar chip + pane; it ships OFF
+(`defaultEnabled: false`) because the native companion must be built first.
 
 ## Setup
 
-1. **Build the native app** (Xcode command line tools required):
+1. **Create the codesigning certificate once** (never ad-hoc).
+
+   Keychain Access → Certificate Assistant → Create a Certificate…
+   Name: `Agent Screen Dev` · Identity Type: Self Signed Root ·
+   Certificate Type: Code Signing.
+
+   Screen Recording TCC is bound to the signing identity. Ad-hoc
+   (`codesign -s -`) loses the grant on every rebuild.
+
+2. **Build the native app** (Xcode command line tools, macOS 14+):
 
    ```bash
    cd plugins/agent-screen/native
    ./build-app.sh
    ```
 
-   This compiles `agent-screen-app.swift` (macOS 14 target — required for
-   `CGDisplayStream`), assembles `Agent Screen.app`, and codesigns it.
+   This compiles a universal binary when the toolchain allows (arm64 +
+   x86_64, else host arch), writes `Info.plist` (`ai.hermes.agent-screen`),
+   and codesigns `~/.hermes/agent-screen/app/Agent Screen.app`.
 
-   > **Codesigning: never ad-hoc.** The app needs Screen Recording TCC
-   > permission (macOS grants it per-signing-identity). If you codesign
-   > ad-hoc, the TCC grant is lost on every rebuild and the stream stays
-   > black until you re-grant it in System Settings ▸ Privacy &
-   > Security ▸ Screen Recording. Create a self-signed certificate
-   > ("Agent Screen Dev") in Keychain Access and codesign with it — the
-   > TCC grant then survives rebuilds.
-
-2. **Start it** (or use the statusbar chip — it does exactly this):
+3. **Start it** (or use the statusbar chip):
 
    ```bash
-   cd plugins/agent-screen/native
    ./agent-screen.sh
    ```
 
-   The stream is then at `http://127.0.0.1:8788/stream.mjpeg` (health:
-   `/ping` → `ok`).
+   Stream: `http://127.0.0.1:8788/stream.mjpeg` · health: `/ping` → `ok`.
 
-3. **Enable the plugin** in Settings ▸ Plugins ("Agent Screen").
+4. **Enable the plugin** in Settings ▸ Plugins ("Agent Screen").
 
-## Configuration
+5. Grant **Screen Recording** (and **Accessibility** if you want the drag
+   portal) in System Settings ▸ Privacy & Security, then restart the app.
 
-| Env var | Default | Meaning |
-|---|---|---|
-| `AGENT_SCREEN_DIR` | `~/.hermes/agent-screen` | Where `build-app.sh` installs the app; `agent-screen.sh` and the backend resolve it the same way |
+## Threat model
+
+- `/start` and `/stop` sit behind the dashboard session-token middleware,
+  same as every other `/api/plugins/…` route.
+- The MJPEG server binds **loopback only** and has **no auth**. Any local
+  process can watch the virtual display. That is the trade-off for a cheap
+  preview the desktop pane can `<img src>` without a token. Do not treat
+  the virtual screen as a secrets vault.
+- Process control uses `pgrep -x` / `pkill -x agent-screen-app` (exact
+  name). It will not match an editor or compiler whose argv merely
+  contains that string.
 
 ## Troubleshooting
 
 - **Stream is black** → Screen Recording permission missing for the
-  signing identity. Re-grant in System Settings ▸ Privacy & Security ▸
-  Screen Recording, then restart the app.
+  signing identity. Re-grant, then restart the app.
 - **App crashes right after restart** → the virtual display wasn't released
-  yet. Wait ~3s after stop before starting again (the backend already does
-  this; only relevant when restarting manually).
-- **Dock shows the old icon** → flush the icon caches:
-  `killall IconServicesAgent Dock`, then remove
-  `/var/folders/**/iconcache*` and `iconserv*` and repeat.
+  yet. Wait ~3s after stop (the backend already does this).
+- **Chip says "macOS only" / "local backend"** → the connected Hermes
+  backend is not this Mac. Switch the desktop app to the local gateway.
+- **Drag portal does nothing** → grant Accessibility to Agent Screen.
+- **Stale Dock icon after an icon change** → `killall Dock`.
 
 ## Attribution
 
-The virtual-display plumbing (`CGVirtualDisplayPrivate.h`, display setup and
-window rendering) is derived from
-[DeskPad](https://github.com/Stengo/DeskPad) by Bastian Andelefski,
-MIT-licensed (c) 2022 — see `LICENSE.deskpad` for the full license text.
+Agent Screen is a **fork of [DeskPad](https://github.com/Stengo/DeskPad)**
+by Bastian Andelefski, MIT-licensed (c) 2022 — full text in
+`LICENSE.deskpad`, provenance in `NOTICE`.
 `CGVirtualDisplayPrivate.h` itself originates from Khaos Tian's
 VirtualDisplayExp (2/17/21).

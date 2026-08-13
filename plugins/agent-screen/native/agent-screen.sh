@@ -1,30 +1,31 @@
 #!/bin/bash
-# agent-screen.sh — startet den Agent Screen (EIN Prozess): virtuelles Display
-# + natives Fenster + MJPEG-Stream auf :8788.
+# agent-screen.sh — start Agent Screen (one process): virtual display
+# + native window + MJPEG stream on loopback :8788.
 #
-# Nutzung:  ./agent-screen.sh
-# Pfad:     $AGENT_SCREEN_DIR (Default: ~/.hermes/agent-screen) — dorthin hat
-#           build-app.sh die App gebaut.
+# Usage:  ./agent-screen.sh
+# Install dir is ~/.hermes/agent-screen (written by build-app.sh).
 set -u
 
-INSTALL_DIR="${AGENT_SCREEN_DIR:-$HOME/.hermes/agent-screen}"
+INSTALL_DIR="${HOME}/.hermes/agent-screen"
 APP_BUNDLE="$INSTALL_DIR/app/Agent Screen.app"
 BINARY="$APP_BUNDLE/Contents/MacOS/agent-screen-app"
 
 if [ ! -x "$BINARY" ]; then
-  echo "[agent-screen] FEHLER: Binary fehlt unter $BINARY"
-  echo "[agent-screen] Erst bauen: ./build-app.sh (siehe README)"
+  echo "[agent-screen] ERROR: binary missing at $BINARY" >&2
+  echo "[agent-screen] Build first: ./build-app.sh (see README)" >&2
   exit 1
 fi
 
-if ! pgrep -f "agent-screen-app" > /dev/null; then
-  echo "[agent-screen] Starte Agent-Screen-App …"
+# Exact process-name match. Never pgrep -f — that kills editors / compilers
+# whose argv happens to contain "agent-screen-app".
+if ! pgrep -x "agent-screen-app" > /dev/null; then
+  echo "[agent-screen] starting Agent Screen…"
   "$BINARY" > /tmp/agent-screen-app.log 2>&1 &
   sleep 2
 fi
 
 if curl -s --max-time 1 http://127.0.0.1:8788/ping > /dev/null 2>&1; then
-  echo "[agent-screen] Läuft ✓ — Fenster offen, Stream auf :8788"
+  echo "[agent-screen] running — window open, stream on 127.0.0.1:8788"
 else
-  echo "[agent-screen] WARNUNG: Stream nicht erreichbar (Log: /tmp/agent-screen-app.log)"
+  echo "[agent-screen] WARNING: stream not reachable (log: /tmp/agent-screen-app.log)" >&2
 fi
