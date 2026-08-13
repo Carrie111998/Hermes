@@ -83,7 +83,6 @@ def _authorization_gate_guidance(text: str) -> Optional[str]:
     if (
         "allow remote debugging" in low
         or "chrome://inspect" in low
-        or "needs your authorization" in low
         or "authorization" in low
     ):
         return _AUTHORIZATION_GATE_GUIDANCE

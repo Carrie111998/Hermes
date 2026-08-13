@@ -714,8 +714,11 @@ class TestAuthorizationGateGuidance:
     def test_plain_output_gets_no_guidance(self):
         assert bu_cli._authorization_gate_guidance("") is None
         assert bu_cli._authorization_gate_guidance("page title: Amazon") is None
-        # "remote debugging" alone (e.g. a --help echo) is not the gate.
-        assert bu_cli._authorization_gate_guidance("usage: browser-use --remote-debugging-port") is None
+        # "remote debugging" alone (e.g. a --help echo naming the flag with a
+        # space) is not the gate — none of the gate phrases follow it.
+        assert bu_cli._authorization_gate_guidance(
+            "usage: browser-use --remote debugging port [OPTIONS]"
+        ) is None
 
     def test_guidance_explains_separate_instance_and_windows_link_limit(self):
         g = bu_cli._AUTHORIZATION_GATE_GUIDANCE
