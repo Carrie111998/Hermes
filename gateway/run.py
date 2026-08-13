@@ -43,7 +43,7 @@ import time
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
@@ -2262,6 +2262,12 @@ if _config_path.exists():
                 os.environ["HERMES_SESSION_STALL_TIMEOUT"] = str(
                     _agent_cfg["session_stall_timeout"]
                 )
+            if "reconnect_attention_after" in _agent_cfg:
+                # Internal bridge only — config.yaml (agent.reconnect_attention_after)
+                # is the documented, user-facing setting.
+                os.environ["HERMES_RECONNECT_ATTENTION_AFTER_SECONDS"] = str(
+                    _agent_cfg["reconnect_attention_after"]
+                )
             if "restart_drain_timeout" in _agent_cfg:
                 os.environ["HERMES_RESTART_DRAIN_TIMEOUT"] = str(_agent_cfg["restart_drain_timeout"])
             if "gateway_auto_continue_freshness" in _agent_cfg:
@@ -3788,10 +3794,41 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
 # secondary-profile reconnects share this policy — tune in one place).
 _RECONNECT_BACKOFF_CAP = 300
 
+# Seconds a platform may sit continuously in the reconnect queue before the
+# watcher flags it NEEDS_ATTENTION in runtime status. Retrying never stops
+# (auto-pause was deliberately removed — a transient outage must self-heal
+# without operator action); this only makes a *long-lived* retry loop loud so
+# owners and fleet monitoring can distinguish hour one from week three.
+# A dead bot token, a revoked Discord intent, or a deterministically crashing
+# sidecar all present as "retrying" forever without this signal.
+# User-facing setting: agent.reconnect_attention_after in config.yaml
+# (bridged to this env var above). 0 disables.
+_RECONNECT_ATTENTION_AFTER_SECONDS = _float_env(
+    "HERMES_RECONNECT_ATTENTION_AFTER_SECONDS", 7200
+)
+
 
 def _reconnect_backoff(attempt: int) -> int:
     """Exponential reconnect backoff: 30s, 60s, 120s, ... capped at 5 min."""
     return min(30 * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
+
+
+def _reconnect_needs_attention(info: dict, now: float) -> bool:
+    """Return True when a reconnect-queue entry has been continuously queued
+    long enough to warrant a NEEDS_ATTENTION signal.
+
+    ``queued_at`` is (re)stamped whenever the platform (re)enters the queue,
+    so a platform that reconnects successfully and later fails again starts a
+    fresh clock — only *continuous* failure escalates. Entries queued before
+    this field existed (in-flight upgrade) are treated as newly queued.
+    """
+    if _RECONNECT_ATTENTION_AFTER_SECONDS <= 0:
+        return False  # escalation disabled
+    queued_at = info.get("queued_at")
+    if queued_at is None:
+        info["queued_at"] = now
+        return False
+    return (now - queued_at) >= _RECONNECT_ATTENTION_AFTER_SECONDS
 
 
 class TurnRunner:
@@ -7385,6 +7422,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "config": platform_config,
             "attempts": 0,
             "next_retry": time.monotonic(),
+            "queued_at": time.monotonic(),
             "credential_claim": self._adapter_credential_claim(
                 adapter.platform, adapter
             ),
@@ -8216,14 +8254,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform_state: Optional[str] = None,
         error_code: Optional[str] = None,
         error_message: Optional[str] = None,
+        needs_attention: Optional[bool] = None,
+        retrying_since: Any = _UNSET,
     ) -> None:
         try:
             from gateway.status import write_runtime_status
+            extra: Dict[str, Any] = {}
+            if needs_attention is not None:
+                extra["needs_attention"] = needs_attention
+            if retrying_since is not _UNSET:
+                extra["retrying_since"] = retrying_since
             write_runtime_status(
                 platform=platform,
                 platform_state=platform_state,
                 error_code=error_code,
                 error_message=error_message,
+                **extra,
             )
         except Exception:
             pass
@@ -11576,6 +11622,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         platform_state="connected",
                         error_code=None,
                         error_message=None,
+                        needs_attention=False,
+                        retrying_since=None,
                     )
                     logger.info("✓ %s connected", platform.value)
                 else:
@@ -11610,6 +11658,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "config": platform_config,
                                 "attempts": 1,
                                 "next_retry": time.monotonic() + 30,
+                                "queued_at": time.monotonic(),
                                 "credential_claim": self._adapter_credential_claim(
                                     platform, adapter
                                 ),
@@ -11632,6 +11681,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "config": platform_config,
                             "attempts": 1,
                             "next_retry": time.monotonic() + 30,
+                            "queued_at": time.monotonic(),
                             "credential_claim": self._adapter_credential_claim(
                                 platform, adapter
                             ),
@@ -11657,6 +11707,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "config": platform_config,
                     "attempts": 1,
                     "next_retry": time.monotonic() + 30,
+                    "queued_at": time.monotonic(),
                     "credential_claim": self._adapter_credential_claim(
                         platform, adapter
                     ),
@@ -12900,6 +12951,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # /platform resume to come back.
                 if info.get("paused"):
                     continue
+                # Long-lived retry-loop escalation (OOF-156): once a platform
+                # has been continuously queued past the attention threshold,
+                # flag it NEEDS_ATTENTION in runtime status so owners and
+                # fleet monitoring see "this is not a blip" — a dead token,
+                # revoked intent, or crash-looping sidecar otherwise presents
+                # as ordinary "retrying" forever. Retries continue unchanged:
+                # this is a signal, NOT a circuit breaker (auto-pause was
+                # deliberately removed — see this docstring's history).
+                if not info.get("attention_flagged") and _reconnect_needs_attention(info, now):
+                    info["attention_flagged"] = True
+                    queued_for = now - info.get("queued_at", now)
+                    retrying_since_iso = (
+                        datetime.now(timezone.utc) - timedelta(seconds=queued_for)
+                    ).isoformat()
+                    logger.warning(
+                        "%s has been failing/reconnecting continuously for "
+                        "%.1f hours (%d attempts) — flagging NEEDS_ATTENTION. "
+                        "Retries continue, but this usually means a permanent "
+                        "problem (revoked credentials, missing intents, broken "
+                        "sidecar). Check `hermes status` / `/platform list`.",
+                        platform.value,
+                        queued_for / 3600.0,
+                        info.get("attempts", 0),
+                    )
+                    self._update_platform_runtime_status(
+                        platform.value,
+                        platform_state="retrying",
+                        needs_attention=True,
+                        retrying_since=retrying_since_iso,
+                    )
                 if now < info["next_retry"]:
                     continue  # not time yet
 
@@ -12963,6 +13044,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             platform_state="connected",
                             error_code=None,
                             error_message=None,
+                            needs_attention=False,
+                            retrying_since=None,
                         )
                         logger.info("✓ %s reconnected successfully", platform.value)
 
@@ -16131,35 +16214,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_heartbeat_command(event)
         if canonical == "refine":
             return await self._handle_refine_command(event)
-
-        if canonical == "council":
-            # /council <question> — one-shot Model Council (inspired by
-            # Perplexity Computer's Model Council, Aug 2026). Encodes the
-            # question as a hidden MoA one-shot marker with the council
-            # synthesis style forced on; run_conversation decodes it, the
-            # default preset's reference models answer independently, and
-            # the chair's consensus/disagreement report reaches the session
-            # model as context. No model switch, no agent eviction.
-            from hermes_cli.moa_config import build_moa_turn_prompt
-            from hermes_cli.config import load_config
-
-            council_payload = event.get_command_args().strip()
-            if not council_payload:
-                return (
-                    "Usage: /council <question>  (runs the default MoA preset's "
-                    "models as an independent council and reports consensus vs "
-                    "disagreement)"
-                )
-            try:
-                cfg = load_config()
-                event.text = build_moa_turn_prompt(
-                    council_payload,
-                    cfg.get("moa") if isinstance(cfg, dict) else {},
-                    synthesis_style="council",
-                )
-            except Exception:
-                return "Failed to prepare council turn."
-            # Fall through to _handle_message_with_agent with the rewritten text.
 
         if canonical == "moa":
             # /moa is one-shot sugar only: run a single prompt through the
