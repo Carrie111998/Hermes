@@ -532,6 +532,10 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "nemotron-3-ultra-free",
     ],
     "opencode-go": [
+        "gpt-5.6-luna",
+        "grok-4.5",
+        "hy3",
+        "hy3-preview",
         "kimi-k3",
         "kimi-k2.7-code",
         "kimi-k2.6",
@@ -552,6 +556,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "qwen3.7-plus",
         "qwen3.6-plus",
         "qwen3.5-plus",
+        "qwen3.8-max",
     ],
     "kilocode": [
         "anthropic/claude-opus-4.6",
