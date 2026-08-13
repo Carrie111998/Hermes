@@ -1069,8 +1069,14 @@ def cmd_mcp_configure(args):
     server_entry = cfg_get(config, "mcp_servers", name, default={})
 
     if len(chosen) == total:
-        # All selected → remove include/exclude (register all)
-        server_entry.pop("tools", None)
+        # All selected → remove only selection filters (register all). Preserve
+        # independent utility-family toggles such as tools.prompts/resources.
+        tools_entry = server_entry.get("tools")
+        if isinstance(tools_entry, dict):
+            tools_entry.pop("include", None)
+            tools_entry.pop("exclude", None)
+            if not tools_entry:
+                server_entry.pop("tools", None)
     else:
         chosen_names = [tool_names[i] for i in sorted(chosen)]
         server_entry.setdefault("tools", {})

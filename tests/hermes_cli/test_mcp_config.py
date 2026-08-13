@@ -401,6 +401,32 @@ class TestMcpConfigure:
 
         assert "tools" not in read_raw_config()["mcp_servers"]["ink"]
 
+    def test_all_preserves_utility_tool_settings(
+        self, tmp_path, monkeypatch
+    ):
+        _seed_config(tmp_path, {
+            "ink": {
+                "url": "https://mcp.ml.ink/mcp",
+                "tools": {
+                    "include": ["create_service"],
+                    "prompts": False,
+                    "resources": False,
+                },
+            },
+        })
+        self._mock_tools(monkeypatch)
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+        from hermes_cli.config import read_raw_config
+        from hermes_cli.mcp_config import cmd_mcp_configure
+
+        cmd_mcp_configure(_make_args(name="ink", all=True))
+
+        assert read_raw_config()["mcp_servers"]["ink"]["tools"] == {
+            "prompts": False,
+            "resources": False,
+        }
+
     def test_unknown_tools_fail_without_changing_config(
         self, tmp_path, capsys, monkeypatch
     ):
