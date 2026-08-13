@@ -196,7 +196,7 @@ TOOLSETS = {
     
     "todo": {
         "description": "Task planning and tracking for multi-step work",
-        "tools": ["todo"],
+        "tools": ["todo", "ctl_todo"],
         "includes": []
     },
     

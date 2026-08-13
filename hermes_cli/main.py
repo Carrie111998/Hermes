@@ -6032,6 +6032,13 @@ def cmd_webhook(args):
     webhook_command(args)
 
 
+def cmd_todo(args):
+    """Persistent todo management."""
+    from hermes_cli.todo import todo_command
+
+    todo_command(args)
+
+
 def cmd_slack(args):
     """Slack integration helpers.
 
@@ -11787,6 +11794,49 @@ def main():
     )
 
     webhook_parser.set_defaults(func=cmd_webhook)
+
+    # =========================================================================
+    # todo command — persistent todo management via CTL
+    # =========================================================================
+    todo_parser = subparsers.add_parser(
+        "todo",
+        help="Manage persistent todos (stored in CTL database)",
+        description="Add, list, complete, and manage todos that persist across Hermes sessions",
+    )
+    todo_subparsers = todo_parser.add_subparsers(dest="todo_action")
+
+    todo_list = todo_subparsers.add_parser(
+        "list", aliases=["ls"], help="List todos (default action)"
+    )
+    todo_list.add_argument(
+        "--all", "-a", action="store_true", help="Show completed todos"
+    )
+
+    todo_add = todo_subparsers.add_parser("add", help="Add a new todo")
+    todo_add.add_argument("content", nargs="*", help="Todo content")
+
+    todo_complete = todo_subparsers.add_parser(
+        "complete", aliases=["done"], help="Mark todo as complete"
+    )
+    todo_complete.add_argument("todo_id", type=int, help="Todo ID")
+
+    todo_update = todo_subparsers.add_parser(
+        "update", aliases=["edit"], help="Update todo content"
+    )
+    todo_update.add_argument("todo_id", type=int, help="Todo ID")
+    todo_update.add_argument("content", nargs="*", help="New content")
+
+    todo_delete = todo_subparsers.add_parser(
+        "delete", aliases=["rm"], help="Delete a todo"
+    )
+    todo_delete.add_argument("todo_id", type=int, help="Todo ID")
+
+    todo_toggle = todo_subparsers.add_parser(
+        "toggle", help="Toggle completion status"
+    )
+    todo_toggle.add_argument("todo_id", type=int, help="Todo ID")
+
+    todo_parser.set_defaults(func=cmd_todo)
 
     # =========================================================================
     # kanban command — multi-profile collaboration board

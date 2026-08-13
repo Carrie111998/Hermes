@@ -466,6 +466,52 @@ def _remove_role(token: str, guild_id: str, user_id: str, role_id: str, **_kwarg
     return json.dumps({"success": True, "message": f"Role {role_id} removed from user {user_id}."})
 
 
+def _create_channel(
+    token: str,
+    guild_id: str,
+    name: str,
+    channel_type: int = 0,
+    parent_id: Optional[str] = None,
+    topic: Optional[str] = None,
+    private: bool = False,
+    allowed_user_ids: Optional[List[str]] = None,
+    **_kwargs: Any,
+) -> str:
+    """Create a channel in a guild. Set private=True with allowed_user_ids for a private channel."""
+    body: Dict[str, Any] = {"name": name, "type": channel_type}
+    if parent_id:
+        body["parent_id"] = parent_id
+    if topic:
+        body["topic"] = topic
+    if private:
+        # Deny VIEW_CHANNEL to @everyone (role ID == guild ID), allow to specific users
+        overwrites: List[Dict[str, Any]] = [
+            {"id": guild_id, "type": 0, "deny": "1024", "allow": "0"},
+        ]
+        for uid in (allowed_user_ids or []):
+            overwrites.append({"id": uid, "type": 1, "allow": "1024", "deny": "0"})
+        body["permission_overwrites"] = overwrites
+    channel = _discord_request("POST", f"/guilds/{guild_id}/channels", token, body=body)
+    type_names = {0: "text", 2: "voice", 4: "category", 5: "announcement", 13: "stage", 15: "forum"}
+    return json.dumps({
+        "success": True,
+        "channel_id": channel["id"],
+        "name": channel.get("name"),
+        "type": type_names.get(channel["type"], str(channel["type"])),
+        "private": private,
+    })
+
+
+def _delete_channel(token: str, channel_id: str, **_kwargs: Any) -> str:
+    """Permanently delete a channel (or close a thread). This action is irreversible."""
+    channel = _discord_request("DELETE", f"/channels/{channel_id}", token)
+    return json.dumps({
+        "success": True,
+        "message": f"Channel {channel_id} deleted.",
+        "channel_name": channel.get("name") if channel else None,
+    })
+
+
 # ---------------------------------------------------------------------------
 # Action dispatch + metadata
 # ---------------------------------------------------------------------------
@@ -486,6 +532,8 @@ _ACTIONS = {
     "create_thread": _create_thread,
     "add_role": _add_role,
     "remove_role": _remove_role,
+    "create_channel": _create_channel,
+    "delete_channel": _delete_channel,
 }
 
 _CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread"})
@@ -513,6 +561,8 @@ _ACTION_MANIFEST: List[Tuple[str, str, str]] = [
     ("create_thread", "(channel_id, name)", "create a public thread; optional message_id anchor"),
     ("add_role", "(guild_id, user_id, role_id)", "assign a role"),
     ("remove_role", "(guild_id, user_id, role_id)", "remove a role"),
+    ("create_channel", "(guild_id, name)", "create a text/voice/category channel; private=True + allowed_user_ids for private channels"),
+    ("delete_channel", "(channel_id)", "permanently delete a channel — irreversible"),
 ]
 
 # Actions that require the GUILD_MEMBERS privileged intent.
@@ -534,6 +584,8 @@ _REQUIRED_PARAMS: Dict[str, List[str]] = {
     "create_thread": ["channel_id", "name"],
     "add_role": ["guild_id", "user_id", "role_id"],
     "remove_role": ["guild_id", "user_id", "role_id"],
+    "create_channel": ["guild_id", "name"],
+    "delete_channel": ["channel_id"],
 }
 
 
@@ -680,6 +732,24 @@ def _build_schema(
         "role_id": {
             "type": "string",
             "description": "Discord role ID.",
+        },
+        "channel_type": {
+            "type": "integer",
+            "enum": [0, 2, 4],
+            "description": "Channel type for create_channel: 0=text (default), 2=voice, 4=category.",
+        },
+        "topic": {
+            "type": "string",
+            "description": "Channel topic/description for create_channel (optional).",
+        },
+        "private": {
+            "type": "boolean",
+            "description": "Create a private channel visible only to allowed_user_ids (create_channel).",
+        },
+        "allowed_user_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "User IDs to grant VIEW_CHANNEL on a private channel (create_channel).",
         },
         "message_id": {
             "type": "string",
@@ -923,6 +993,7 @@ _HANDLER_DEFAULTS = {
     "action": "", "guild_id": "", "channel_id": "", "user_id": "",
     "role_id": "", "message_id": "", "query": "", "name": "",
     "limit": 50, "before": "", "after": "", "auto_archive_duration": 1440,
+    "channel_type": 0, "topic": "", "private": False, "allowed_user_ids": None,
 }
 
 

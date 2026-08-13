@@ -240,6 +240,27 @@ class WebhookAdapter(BasePlatformAdapter):
             logger.info("[webhook] Response for %s: %s", chat_id, content[:200])
             return SendResult(success=True)
 
+        if deliver_type == "http_callback":
+            # POST response back to a URL from deliver_extra or original payload
+            extra = delivery.get("deliver_extra", {})
+            url = extra.get("url") or delivery.get("payload", {}).get("callback_url", "")
+            if not url:
+                logger.warning("[webhook] http_callback: no url in deliver_extra or payload")
+                return SendResult(success=False, error="No callback URL")
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        url,
+                        json={"response": content},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        logger.info("[webhook] http_callback → %s status=%d", url, resp.status)
+                        return SendResult(success=resp.status < 400)
+            except Exception as e:
+                logger.warning("[webhook] http_callback failed: %s", e)
+                return SendResult(success=False, error=str(e))
+
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
 

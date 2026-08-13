@@ -8340,6 +8340,39 @@ class GatewayRunner:
                             "Session hygiene auto-compress failed: %s", e
                         )
 
+            else:
+                # Compression is disabled — fall back to hard-trimming oldest
+                # messages when the session exceeds the hard message limit.
+                # This prevents runaway context growth from crashing the session
+                # without requiring a compression-capable auxiliary model.
+                _msg_count = len(history)
+                _HARD_MSG_LIMIT = _hyg_hard_msg_limit
+                if _msg_count >= _HARD_MSG_LIMIT:
+                    # Keep the most recent 60% of messages, drop the rest.
+                    # Inject a system note at the trim boundary so the agent
+                    # knows older context is available via session_search.
+                    _keep_count = max(int(_HARD_MSG_LIMIT * 0.6), 4)
+                    _trimmed = history[-_keep_count:]
+                    _dropped_count = _msg_count - _keep_count
+                    _trim_note = {
+                        "role": "system",
+                        "content": (
+                            f"[Session trimmed: {_dropped_count} older messages dropped "
+                            f"to keep context within limits. Use session_search or "
+                            f"honcho_search to recall past context.]"
+                        ),
+                    }
+                    _trimmed.insert(0, _trim_note)
+                    self.session_store.rewrite_transcript(
+                        session_entry.session_id, _trimmed
+                    )
+                    session_entry.last_prompt_tokens = 0
+                    history = _trimmed
+                    logger.info(
+                        "Session hygiene (no-compress fallback): trimmed %s → %s msgs",
+                        _msg_count, len(_trimmed),
+                    )
+
         # First-message onboarding -- only on the very first interaction ever
         if not history and not self.session_store.has_any_sessions():
             context_prompt += (
@@ -14519,18 +14552,36 @@ class GatewayRunner:
                 if agent_notify and not _pr_check.is_completion_consumed(session_id):
                     from tools.ansi_strip import strip_ansi
                     _raw = strip_ansi(session.output_buffer) if session.output_buffer else ""
+                    # Strip common shell-init noise that appears when ~/.bashrc is
+                    # sourced in background sessions (tsession-dashboard, direnv,
+                    # lesspipe, dircolors, etc.).  These patterns pollute
+                    # notifications with irrelevant "command not found" spam.
+                    import re as _re
+                    _noise_patterns = [
+                        r"^Command '[^']+' is available in the following places\n(\s+\*[^\n]+\n)+",
+                        r"^The command could not be located because '[^']+' is not included.*\n",
+                        r"^[^:]+: command not found\n?",
+                        r"^/home/[^\s]+tsession[^\n]*\n?",
+                        r"^External IP: Not available\n?",
+                        r"^GPU: No Nvidia GPU detected\n?",
+                    ]
+                    _cleaned = _raw
+                    for _pat in _noise_patterns:
+                        _cleaned = _re.sub(_pat, "", _cleaned, flags=_re.MULTILINE)
+                    # Collapse runs of blank lines left by stripping
+                    _cleaned = _re.sub(r"\n{3,}", "\n\n", _cleaned).strip()
                     # Truncate at line boundaries so notifications never start
                     # mid-line (fixes #23284). Keep the last ~2000 chars but
                     # snap to the nearest preceding newline, then prepend a
                     # truncation marker when output was cut.
                     _LIMIT = 2000
-                    if len(_raw) > _LIMIT:
-                        _tail = _raw[-_LIMIT:]
+                    if len(_cleaned) > _LIMIT:
+                        _tail = _cleaned[-_LIMIT:]
                         _nl = _tail.find("\n")
                         _tail = _tail[_nl + 1:] if _nl != -1 else _tail
                         _out = f"[… output truncated — showing last {len(_tail)} chars]\n{_tail}"
                     else:
-                        _out = _raw
+                        _out = _cleaned
                     synth_text = (
                         f"[IMPORTANT: Background process {session_id} completed "
                         f"(exit code {session.exit_code}).\n"
@@ -14586,7 +14637,20 @@ class GatewayRunner:
                     or (notify_mode == "error" and session.exit_code not in {0, None})
                 )
                 if should_notify:
-                    new_output = session.output_buffer[-1000:] if session.output_buffer else ""
+                    from tools.ansi_strip import strip_ansi
+                    import re as _re
+                    _raw2 = strip_ansi(session.output_buffer[-1000:]) if session.output_buffer else ""
+                    _noise2 = [
+                        r"^Command '[^']+' is available in the following places\n(\s+\*[^\n]+\n)+",
+                        r"^The command could not be located because '[^']+' is not included.*\n",
+                        r"^[^:]+: command not found\n?",
+                        r"^/home/[^\s]+tsession[^\n]*\n?",
+                        r"^External IP: Not available\n?",
+                        r"^GPU: No Nvidia GPU detected\n?",
+                    ]
+                    for _p in _noise2:
+                        _raw2 = _re.sub(_p, "", _raw2, flags=_re.MULTILINE)
+                    new_output = _re.sub(r"\n{3,}", "\n\n", _raw2).strip()
                     message_text = (
                         f"[Background process {session_id} finished with exit code {session.exit_code}~ "
                         f"Here's the final output:\n{new_output}]"
