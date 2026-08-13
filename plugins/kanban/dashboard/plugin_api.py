@@ -672,6 +672,27 @@ def _materialized_intake_items(
     return items
 
 
+def _intake_failure_path(events: list[dict[str, Any]]) -> Optional[str]:
+    """Return only the latest bounded Work Contract failure code."""
+
+    safe_paths = {
+        "shape",
+        "canonical_mismatch",
+        "digest_mismatch",
+        "signature_mismatch",
+        "key_unreadable",
+        "io_error",
+    }
+    for event in reversed(events):
+        if event.get("kind") != "work_contract_verification_failed":
+            continue
+        payload = event.get("payload")
+        failure_path = payload.get("failure_path") if isinstance(payload, dict) else None
+        if failure_path in safe_paths:
+            return failure_path
+    return None
+
+
 @router.post("/work-inbox")
 def submit_work_inbox(
     request: Request,
@@ -849,6 +870,7 @@ def get_work_inbox_status(
         decisions = kanban_db.list_qualification_decisions(conn, intake_id)
         decision = decisions[-1] if decisions else None
         events = kanban_db.list_qualification_intake_events(conn, intake_id)
+        failure_path = _intake_failure_path(events)
         question = None
         if record["status"] == "needs_clarification":
             for event in reversed(events):
@@ -873,6 +895,8 @@ def get_work_inbox_status(
             ),
             "items": _materialized_intake_items(conn, intake_id),
         }
+        if failure_path is not None:
+            response["failure_path"] = failure_path
         if question is not None:
             response["question"] = redact_sensitive_text(
                 str(question), force=True
@@ -954,6 +978,8 @@ def get_intake(intake_id: str, board: Optional[str] = Query(None)):
             raise HTTPException(status_code=404, detail=f"intake {intake_id} not found")
         decisions = kanban_db.list_qualification_decisions(conn, intake_id)
         decision = decisions[-1] if decisions else None
+        events = kanban_db.list_qualification_intake_events(conn, intake_id)
+        failure_path = _intake_failure_path(events)
         contract_id = decision.get("contract_id") if decision else None
         contract_summary = _work_contract_summary(conn, contract_id)
         materialized_items = _materialized_intake_items(conn, intake_id)
@@ -966,7 +992,7 @@ def get_intake(intake_id: str, board: Optional[str] = Query(None)):
                 task = kanban_db.get_task(conn, row["id"])
                 if task is not None:
                     materialized_item = _task_dict(task)
-        return {
+        response: dict[str, Any] = {
             "intake": record,
             "decision": decision,
             "decisions": decisions,
@@ -974,6 +1000,9 @@ def get_intake(intake_id: str, board: Optional[str] = Query(None)):
             "materialized_item": materialized_item,
             "materialized_items": materialized_items,
         }
+        if failure_path is not None:
+            response["failure_path"] = failure_path
+        return response
     finally:
         conn.close()
 

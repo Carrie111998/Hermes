@@ -565,6 +565,37 @@ def test_official_intake_api_returns_receipt_filtered_inbox_and_detail(client):
     assert "internal_prompt" not in json.dumps(body).lower()
 
 
+def test_operator_intake_detail_exposes_only_bounded_contract_failure_path(client):
+    kb.ensure_product_board_defaults("strict")
+    with kb.connect(board="strict") as conn:
+        intake_id = kb.create_qualification_intake(
+            conn,
+            raw_request=json.dumps({"title": "Operator-visible intake"}),
+            source="dashboard-api",
+        )
+        kb.append_qualification_intake_event(
+            conn,
+            intake_id=intake_id,
+            kind="work_contract_verification_failed",
+            payload={"failure_path": "io_error", "raw": "secret-event-sentinel"},
+        )
+        kb.append_qualification_intake_event(
+            conn,
+            intake_id=intake_id,
+            kind="work_contract_verification_failed",
+            payload={"failure_path": "arbitrary-unsafe-path"},
+        )
+
+    response = client.get(
+        f"/api/plugins/kanban/intake/{intake_id}?board=strict"
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["failure_path"] == "io_error"
+    assert "secret-event-sentinel" not in response.text
+    assert "arbitrary-unsafe-path" not in response.text
+
+
 def test_task_and_epic_detail_expose_safe_work_contract_views(client):
     kb.ensure_product_board_defaults("strict")
     metadata_path = kb.board_metadata_path("strict")
@@ -3020,5 +3051,4 @@ def test_conditional_reassign_holds_write_lock_through_canonical_mutation(
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
 

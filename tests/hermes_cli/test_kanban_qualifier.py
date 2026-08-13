@@ -5,6 +5,7 @@ import json
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_intake as intake
 from hermes_cli import kanban_qualifier as qualifier
 
 
@@ -927,6 +928,55 @@ def test_auxiliary_po_qualification_persists_sizing_and_feasibility(
         {"requirement": "tests", "basis": ["Existing tests"]},
         {"requirement": "green", "basis": ["Existing tests"]},
     ]
+
+
+def test_materialization_verification_failure_marks_intake_attention_required(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    board = "strict"
+    kb.ensure_product_board_defaults(board)
+    metadata = kb.read_board_metadata(board)
+    metadata["qualification"]["required"] = True
+    kb.board_metadata_path(board).write_text(json.dumps(metadata), encoding="utf-8")
+
+    with kb.connect(board=board) as connection:
+        receipt = qualifier.submit_request(
+            connection,
+            request={"title": "Contract verification failure"},
+            source="work-inbox:test",
+        )
+        monkeypatch.setattr(
+            intake,
+            "verify_work_contract",
+            lambda *_args, **_kwargs: intake.WorkContractVerification(
+                valid=False, failure="digest_mismatch"
+            ),
+        )
+
+        result = qualifier.qualify_intake(
+            connection,
+            board=board,
+            intake_id=receipt["intake_id"],
+            model_call=lambda _prompt: _decision(),
+            secret=b"test-only-secret",
+            issued_at=100,
+        )
+        stored = kb.get_qualification_intake(connection, receipt["intake_id"])
+        events = kb.list_qualification_intake_events(
+            connection, receipt["intake_id"]
+        )
+
+    assert result == {
+        "status": "attention_required",
+        "intake_id": receipt["intake_id"],
+        "failure_path": "digest_mismatch",
+    }
+    assert stored["status"] == "attention_required"
+    assert events[-1]["kind"] == "work_contract_verification_failed"
+    assert events[-1]["payload"] == {"failure_path": "digest_mismatch"}
 
 
 def test_invalid_model_decision_retries_once_then_stores_rejection_without_card(
