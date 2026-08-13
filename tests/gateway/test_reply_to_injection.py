@@ -161,6 +161,33 @@ async def test_quote_at_or_under_the_cap_is_left_alone(length: int):
 
 
 @pytest.mark.asyncio
+async def test_quote_one_char_over_the_cap_is_marked():
+    """The other half of the boundary: 500 is clean, 501 is marked.
+
+    Paired with the case above this pins the comparison exactly. A quote one
+    char over is the smallest real loss there is, and the marker has to report
+    it as `[1 more chars]` — an off-by-one that reported `[0 more chars]` would
+    be the silent-truncation bug wearing the fix's clothes.
+    """
+    runner = _make_runner()
+    source = _source()
+    quoted = "D" * 501
+    event = MessageEvent(
+        text="and the rest?",
+        source=source,
+        reply_to_message_id="42",
+        reply_to_text=quoted,
+    )
+
+    result = await runner._prepare_inbound_message_text(
+        event=event, source=source, history=[],
+    )
+
+    assert result is not None
+    assert result.startswith(f'[Replying to: "{"D" * 500}...[1 more chars]"]')
+
+
+@pytest.mark.asyncio
 async def test_own_message_branch_marks_truncation_too():
     """Both render paths read the same snippet, so both must carry the marker."""
     runner = _make_runner()
