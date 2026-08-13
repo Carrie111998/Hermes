@@ -2587,7 +2587,19 @@ async function checkUpdates() {
     }
   }
 
-  const fetched = await runGit(['fetch', '--quiet', 'origin', branch], { cwd: updateRoot })
+  // Installer checkouts are shallow (`git clone --depth 1`). A plain fetch on
+  // a shallow clone would unshallow the repo, dragging in the entire history
+  // (hundreds of MB) — the exact cost the shallow clone avoided. Detect it up
+  // front and preserve the boundary with --depth 1, mirroring the CLI guard in
+  // hermes_cli/banner.py. The --is-shallow-repository probe below then reports
+  // the true state, and the SHA compare in resolveBehindCount keeps the
+  // behind-count meaningful.
+  const shallowProbe = await runGit(['rev-parse', '--is-shallow-repository'], { cwd: updateRoot })
+  const shallowFetch = shallowProbe.stdout.trim() === 'true'
+  const fetchArgs = shallowFetch
+    ? ['fetch', '--quiet', '--depth', '1', 'origin', branch]
+    : ['fetch', '--quiet', 'origin', branch]
+  const fetched = await runGit(fetchArgs, { cwd: updateRoot })
 
   if (fetched.code !== 0) {
     return {
