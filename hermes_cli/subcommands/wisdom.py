@@ -52,5 +52,10 @@ def build_wisdom_parser(subparsers, *, cmd_wisdom: Callable) -> None:
         default=None,
         help="Optional message describing the share",
     )
+    approve.add_argument(
+        "--collective",
+        default=None,
+        help="Share with a specific collective instead of the whole org",
+    )
 
     wisdom_parser.set_defaults(func=cmd_wisdom)

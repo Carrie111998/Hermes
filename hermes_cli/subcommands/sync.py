@@ -95,5 +95,30 @@ def build_sync_parser(subparsers, *, cmd_sync: Callable) -> None:
         default=None,
         help="Optional message describing the change",
     )
+    propose.add_argument(
+        "--collective",
+        default=None,
+        help="Share with a specific collective instead of the whole org",
+    )
+
+    # Collective management (Wisdom v1, M2).
+    collective = sync_sub.add_parser(
+        "collective",
+        help="Manage collectives (named groups within your organisation)",
+    )
+    collective_sub = collective.add_subparsers(dest="collective_command")
+
+    coll_create = collective_sub.add_parser("create", help="Create a collective")
+    coll_create.add_argument("name", help="Collective name")
+    coll_create.add_argument(
+        "--members",
+        required=True,
+        help="Comma-separated list of member user IDs",
+    )
+
+    collective_sub.add_parser("list", help="List collectives")
+
+    coll_delete = collective_sub.add_parser("delete", help="Delete a collective")
+    coll_delete.add_argument("name", help="Collective name")
 
     sync_parser.set_defaults(func=cmd_sync)

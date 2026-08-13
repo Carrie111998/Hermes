@@ -4687,23 +4687,114 @@ def cmd_sync(args):
         from tools import skills_sync_client as ssc
 
         name = args.name
+        collective = getattr(args, "collective", None)
         try:
-            result = ssc.propose_skill(name, message=args.message)
+            result = ssc.propose_skill(
+                name, message=args.message, collective=collective
+            )
         except ssc.SyncInertError as e:
             print(f"cannot share this skill: {e}", file=sys.stderr)
             return 1
         except ssc.SyncError as e:
             print(f"could not share '{name}': {e}", file=sys.stderr)
             return 1
+        target = f"collective '{collective}'" if collective else "your organisation"
         if result.get("proposal_pending"):
             print(
-                f"Shared '{name}' with your organisation — an admin needs to "
+                f"Shared '{name}' with {target} — an admin needs to "
                 f"approve it (proposal #{result.get('proposal_id')}). It is "
                 f"not live for the team until then."
             )
         else:
-            print(f"Added '{name}' to your organisation's shared skills.")
+            print(f"Added '{name}' to {target}'s shared skills.")
         return 0
+
+    if sub == "collective":
+        coll_sub = getattr(args, "collective_command", None)
+        if not coll_sub:
+            print(
+                "usage: hermes sync collective <create|list|delete>",
+                file=sys.stderr,
+            )
+            return 1
+
+        from tools import skills_sync_client as ssc
+
+        try:
+            identity = ssc.resolve_org_identity()
+        except ssc.SyncInertError as e:
+            print(f"cannot manage collectives: {e}", file=sys.stderr)
+            return 1
+
+        base_url = ssc.resolve_sync_base_url()
+        if not base_url:
+            print("no sync base URL configured", file=sys.stderr)
+            return 1
+
+        import requests
+
+        client = ssc.SyncClient(base_url, identity["api_key"])
+
+        if coll_sub == "create":
+            members = [m.strip() for m in args.members.split(",") if m.strip()]
+            name = args.name
+            resp = client._session.put(
+                client._url(f"org/collectives/{name}"),
+                json={"members": members},
+                timeout=client.timeout,
+            )
+            if resp.status_code == 200:
+                print(
+                    f"Collective '{name}' created with {len(members)} member(s)."
+                )
+            else:
+                body = resp.json() if resp.content else {}
+                print(
+                    f"failed to create collective: {body.get('error', resp.status_code)}",
+                    file=sys.stderr,
+                )
+                return 1
+            return 0
+
+        if coll_sub == "list":
+            resp = client._session.get(
+                client._url("org/collectives"),
+                timeout=client.timeout,
+            )
+            if resp.status_code != 200:
+                body = resp.json() if resp.content else {}
+                print(
+                    f"failed to list collectives: {body.get('error', resp.status_code)}",
+                    file=sys.stderr,
+                )
+                return 1
+            data = resp.json()
+            collectives = data.get("collectives", [])
+            if not collectives:
+                print("No collectives yet.")
+            else:
+                for c in collectives:
+                    print(f"  {c['name']}")
+            return 0
+
+        if coll_sub == "delete":
+            name = args.name
+            resp = client._session.delete(
+                client._url(f"org/collectives/{name}"),
+                timeout=client.timeout,
+            )
+            if resp.status_code == 200:
+                print(f"Collective '{name}' deleted.")
+            else:
+                body = resp.json() if resp.content else {}
+                print(
+                    f"failed to delete collective: {body.get('error', resp.status_code)}",
+                    file=sys.stderr,
+                )
+                return 1
+            return 0
+
+        return 1
 
     if sub in {"enable", "disable"}:
         from tools.skill_usage import set_sync, is_curation_eligible
@@ -4906,6 +4997,7 @@ def cmd_wisdom(args):
     if sub == "approve":
         skill = args.skill
         message = getattr(args, "message", None)
+        collective = getattr(args, "collective", None)
 
         # Check if the skill is a current candidate (advisory, not blocking).
         state = wsp.load_state()
@@ -4921,7 +5013,7 @@ def cmd_wisdom(args):
         from tools import skills_sync_client as ssc
 
         try:
-            result = ssc.propose_skill(skill, message=message)
+            result = ssc.propose_skill(skill, message=message, collective=collective)
         except ssc.SyncInertError as e:
             print(f"cannot share: {e}", file=sys.stderr)
             return 1
@@ -4929,9 +5021,10 @@ def cmd_wisdom(args):
             print(f"could not share '{skill}': {e}", file=sys.stderr)
             return 1
 
+        target = f"collective '{collective}'" if collective else "your organisation"
         if result.get("proposal_pending"):
             print(
-                f"Shared '{skill}' with your organisation — an admin needs to "
+                f"Shared '{skill}' with {target} — an admin needs to "
                 f"approve it (proposal #{result.get('proposal_id')}). It is "
                 f"not live for the team until then."
             )
