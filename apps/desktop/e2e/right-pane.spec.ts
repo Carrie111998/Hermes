@@ -241,6 +241,15 @@ test('global close identifies the focused real xterm panel', async () => {
   await page.keyboard.press(process.platform === 'darwin' ? 'Meta+w' : 'Control+w')
   await expect(railTabs).toHaveCount(1)
   await expect(railTabs).not.toHaveAttribute('data-terminal-rail-tab', terminalId)
+
+  const survivor = railTabs.first()
+  await expect(survivor).toBeFocused()
+
+  // The first close must leave ownership in the nested terminal stack. A
+  // second global close should therefore remove the surviving terminal, not
+  // dismiss the containing layout pane while leaving its xterm alive.
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+w' : 'Control+w')
+  await expect(railTabs).toHaveCount(0)
 })
 
 test('terminal rail keeps focus after its selected survivor finishes initializing', async () => {

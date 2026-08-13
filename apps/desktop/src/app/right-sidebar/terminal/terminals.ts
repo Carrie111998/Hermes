@@ -368,10 +368,23 @@ export function closeFocusedTerminal(): boolean | null {
     return null
   }
 
-  const focusedId = focused.closest<HTMLElement>('[data-terminal-id]')?.dataset.terminalId
+  const focusedPanel = focused.closest<HTMLElement>('[data-terminal-id]')
 
-  if (focusedId && $terminals.get().some(term => term.id === focusedId)) {
-    return closeTerminalWithFocusRecovery(focusedId)
+  if (focusedPanel) {
+    const focusedId = focusedPanel.dataset.terminalId
+
+    if (!focusedId || !$terminals.get().some(term => term.id === focusedId)) {
+      return false
+    }
+
+    const restoreRailFocus = $terminals.get().length > 1
+    const closed = closeTerminalWithFocusRecovery(focusedId)
+
+    if (closed && restoreRailFocus) {
+      requestTerminalRailFocusHandoff()
+    }
+
+    return closed
   }
 
   return closeActiveTerminal()

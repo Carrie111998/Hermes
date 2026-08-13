@@ -74,8 +74,10 @@ export function closeActiveTab(loadSessionIntoWorkspace?: (storedSessionId: stri
     return false
   }
 
-  if (closeFocusedTerminal() !== null) {
-    return true
+  const terminalClose = closeFocusedTerminal()
+
+  if (terminalClose !== null) {
+    return terminalClose
   }
 
   // A closeable tab in the focused chat zone (a session tile that's the active

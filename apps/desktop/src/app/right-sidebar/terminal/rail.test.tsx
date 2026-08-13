@@ -6,7 +6,7 @@ import { $treeFocusRequest, requestTreeFocusAfterClose } from '@/components/pane
 import { $bindings } from '@/store/keybinds'
 
 import { TerminalRail } from './rail'
-import { $activeTerminalId, $terminals } from './terminals'
+import { $activeTerminalId, $terminals, closeFocusedTerminal } from './terminals'
 import { TerminalWorkspace } from './workspace'
 
 vi.mock('./instance', () => ({
@@ -98,13 +98,18 @@ describe('TerminalRail', () => {
     expect($terminals.get().map(term => term.id)).toEqual(['term-1'])
   })
 
-  it('routes ⌘W to the focused terminal instance when selection has drifted', () => {
+  it('routes ⌘W to the focused terminal instance and keeps the survivor in the close scope', async () => {
     $terminals.set([
       { auto: true, cwd: 'C:\\repo', id: 'term-1', kind: 'user', title: 'PowerShell' },
       { auto: true, cwd: 'C:\\repo', id: 'term-2', kind: 'user', title: 'zsh' }
     ])
     $activeTerminalId.set('term-2')
-    render(<TerminalWorkspace onAddSelectionToChat={() => undefined} />)
+    render(
+      <>
+        <TerminalRail />
+        <TerminalWorkspace onAddSelectionToChat={() => undefined} />
+      </>
+    )
 
     const focusedTerminal = screen.getByRole('button', { name: 'User terminal term-2' })
     act(() => focusedTerminal.focus())
@@ -119,6 +124,46 @@ describe('TerminalRail', () => {
     })
 
     expect($terminals.get().map(term => term.id)).toEqual(['term-1'])
+    const survivor = screen.getByRole('tab', { name: '1. PowerShell' })
+    await waitFor(() => expect(window.document.activeElement).toBe(survivor))
+
+    act(() => {
+      expect(closeActiveTab()).toBe(true)
+    })
+
+    expect($terminals.get()).toEqual([])
+  })
+
+  it('declines a stale focused terminal owner without closing the active survivor', () => {
+    const stalePanel = window.document.createElement('div')
+    const staleInput = window.document.createElement('button')
+
+    stalePanel.dataset.terminal = ''
+    stalePanel.dataset.terminalId = 'removed-terminal'
+    stalePanel.append(staleInput)
+    window.document.body.append(stalePanel)
+    staleInput.focus()
+
+    expect(closeFocusedTerminal()).toBe(false)
+    expect($terminals.get().map(term => term.id)).toEqual(['term-1'])
+
+    stalePanel.remove()
+  })
+
+  it('reports a stale focused terminal owner as an owned global-close no-op', () => {
+    const stalePanel = window.document.createElement('div')
+    const staleInput = window.document.createElement('button')
+
+    stalePanel.dataset.terminal = ''
+    stalePanel.dataset.terminalId = 'removed-terminal'
+    stalePanel.append(staleInput)
+    window.document.body.append(stalePanel)
+    staleInput.focus()
+
+    expect(closeActiveTab()).toBe(false)
+    expect($terminals.get().map(term => term.id)).toEqual(['term-1'])
+
+    stalePanel.remove()
   })
 
   it('keeps rail focus when ⌘W closes a selected rail tab', async () => {
