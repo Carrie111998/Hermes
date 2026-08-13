@@ -492,7 +492,7 @@ def normalize_tool_transaction_adjacency(
     This copy-on-write pass treats each assistant plus its immediately
     following run of tool messages as one transaction.  It:
 
-    * preserves one matching result per call, in tool-call order;
+    * preserves one matching result per call in its existing order;
     * inserts a deterministic placeholder for each locally missing result;
     * drops duplicate, mismatched, and standalone tool results.
 
@@ -543,7 +543,7 @@ def normalize_tool_transaction_adjacency(
             expected.append((call_id, name if isinstance(name, str) else ""))
 
         result_by_id: dict[str, dict[str, Any]] = {}
-        encountered_result_ids: list[str] = []
+        encountered_results: list[dict[str, Any]] = []
         cursor = index + 1
         while cursor < len(messages):
             candidate = messages[cursor]
@@ -555,20 +555,19 @@ def normalize_tool_transaction_adjacency(
             result_id = (candidate.get("tool_call_id") or "").strip()
             if result_id in expected_ids and result_id not in result_by_id:
                 result_by_id[result_id] = candidate
-                encountered_result_ids.append(result_id)
+                encountered_results.append(candidate)
             else:
                 dropped_results += 1
                 changed = True
             cursor += 1
 
-        expected_order = [call_id for call_id, _ in expected]
-        if encountered_result_ids != expected_order:
-            changed = True
+        # Existing result order is semantically valid because each message
+        # carries its pairing id.  Preserve it to avoid needless prompt-prefix
+        # churn; only append placeholders for ids absent from this local block.
+        repaired.extend(encountered_results)
 
         for call_id, name in expected:
-            result = result_by_id.get(call_id)
-            if result is not None:
-                repaired.append(result)
+            if call_id in result_by_id:
                 continue
             repaired.append({
                 "role": "tool",

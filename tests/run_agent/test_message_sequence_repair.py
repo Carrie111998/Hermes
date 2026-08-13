@@ -425,9 +425,9 @@ def test_sanitize_repairs_results_that_exist_only_later_in_history():
 
     first_assistant = next(i for i, msg in enumerate(out) if msg.get("tool_calls"))
     adjacent = out[first_assistant + 1:first_assistant + 3]
-    assert [msg["tool_call_id"] for msg in adjacent] == ["call_late", "call_here"]
-    assert adjacent[0]["content"] == "[Result unavailable — see context summary above]"
-    assert adjacent[1]["content"] == "local"
+    assert [msg["tool_call_id"] for msg in adjacent] == ["call_here", "call_late"]
+    assert adjacent[0]["content"] == "local"
+    assert adjacent[1]["content"] == "[Result unavailable — see context summary above]"
     assert not any(msg.get("content") == "too late" for msg in out)
 
 
@@ -452,8 +452,8 @@ def test_sanitize_preserves_complete_adjacent_tool_transaction_by_identity():
                 },
             ],
         },
-        {"role": "tool", "tool_call_id": "call_a", "content": "A"},
         {"role": "tool", "tool_call_id": "call_b", "content": "B"},
+        {"role": "tool", "tool_call_id": "call_a", "content": "A"},
     ]
 
     out = sanitize_api_messages(messages)
@@ -474,7 +474,6 @@ def test_sanitize_preserves_complete_adjacent_tool_transaction_by_identity():
 # "all messages must have non-empty content except for the optional final
 # assistant message" (INVALID_REQUEST_BODY). sanitize_api_messages now heals
 # such turns on the per-call copy so the session recovers itself in memory.
-
 
 
 

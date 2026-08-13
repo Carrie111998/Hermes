@@ -129,11 +129,11 @@ class TestChatCompletionsBasic:
         result = transport.convert_messages(msgs)
 
         assert [msg["tool_call_id"] for msg in result[1:3]] == [
-            "call_a",
             "call_b",
+            "call_a",
         ]
-        assert result[1]["content"] == "[Result unavailable — see context summary above]"
-        assert result[2]["content"] == "B"
+        assert result[1]["content"] == "B"
+        assert result[2]["content"] == "[Result unavailable — see context summary above]"
         assert not any(msg.get("content") == "late A" for msg in result)
         assert msgs[1]["tool_call_id"] == "call_b"
 
