@@ -4356,7 +4356,30 @@ def copilot_model_api_mode(
     if not normalized:
         return "chat_completions"
 
-    # Primary: model ID pattern (matches opencode's shouldUseCopilotResponsesApi)
+    # Primary: the live catalog's own supported_endpoints. Copilot advertises
+    # per-model endpoints and rejects mismatches with
+    # 400 "model X is not accessible via the /chat/completions endpoint".
+    # Non-GPT vendors hit this too (e.g. grok-4.5 is /responses-only), so the
+    # name-pattern heuristic below is not sufficient on its own.
+    for _item in catalog or []:
+        if not isinstance(_item, dict) or _item.get("id") != normalized:
+            continue
+        _eps = _item.get("supported_endpoints")
+        if not isinstance(_eps, list) or not _eps:
+            break
+        _has_chat = any(
+            isinstance(e, str) and e.endswith("/chat/completions") for e in _eps
+        )
+        _has_resp = any(
+            isinstance(e, str) and e.lstrip("ws:").endswith("/responses") for e in _eps
+        )
+        if _has_resp and not _has_chat:
+            return "codex_responses"
+        if _has_chat and not _has_resp:
+            return "chat_completions"
+        break
+
+    # Fallback: model ID pattern (matches opencode's shouldUseCopilotResponsesApi)
     if _should_use_copilot_responses_api(normalized):
         return "codex_responses"
 
