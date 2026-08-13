@@ -9939,7 +9939,13 @@ class AIAgent:
             )
             if not _is_lmstudio_summary and self._supports_reasoning_extra_body():
                 if self.reasoning_config is not None:
-                    summary_extra_body["reasoning"] = self.reasoning_config
+                    rc_sum = dict(self.reasoning_config)
+                    _sum_effort = str(rc_sum.get("effort") or "").strip().lower()
+                    if _sum_effort == "xhigh":
+                        rc_sum["effort"] = "high"
+                    elif _sum_effort == "minimal":
+                        rc_sum["effort"] = "low"
+                    summary_extra_body["reasoning"] = rc_sum
                 else:
                     summary_extra_body["reasoning"] = {
                         "enabled": True,

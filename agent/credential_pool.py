@@ -1380,6 +1380,8 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
 def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
     changed = False
     active_sources: Set[str] = set()
+    if provider == "copilot":
+        return changed, active_sources
     # Honour user suppression — `hermes auth remove <provider> <N>` for an
     # env-seeded credential marks the env:<VAR> source as suppressed so it
     # won't be re-seeded from the user's shell environment or ~/.hermes/.env.

@@ -357,6 +357,11 @@ class ChatCompletionsTransport(ProviderTransport):
                     if is_nous and rc.get("enabled") is False:
                         pass  # omit for Nous when disabled
                     else:
+                        _effort = str(rc.get("effort") or "").strip().lower()
+                        if _effort == "xhigh":
+                            rc["effort"] = "high"
+                        elif _effort == "minimal":
+                            rc["effort"] = "low"
                         extra_body["reasoning"] = rc
                 else:
                     extra_body["reasoning"] = {"enabled": True, "effort": "medium"}

@@ -105,6 +105,16 @@ class TestChatCompletionsBuildKwargs:
         # Nous rejects enabled=false; reasoning omitted entirely
         assert "reasoning" not in kw.get("extra_body", {})
 
+    def test_xhigh_reasoning_clamped_to_high(self, transport):
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="qwen3-coder-30b", messages=msgs,
+            supports_reasoning=True,
+            is_nous=True,
+            reasoning_config={"enabled": True, "effort": "xhigh"},
+        )
+        assert kw["extra_body"]["reasoning"] == {"enabled": True, "effort": "high"}
+
     def test_ollama_num_ctx(self, transport):
         msgs = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(
