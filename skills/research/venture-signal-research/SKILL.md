@@ -52,10 +52,13 @@ Then run the four handoffs in order:
 
 | Rule | Required behavior |
 |---|---|
-| Search result | Discovery lead only; open the target before supporting a claim |
+| Evidence Matrix | Only opened targets with substantive evidence; use all ten contract fields |
+| Claim scope | Evidence must directly entail the claim; pricing proves a price, not demand |
+| Controlled values | Use only the contract's `source_lane` and `signal_type` values |
+| Search result | Discovery lead only; log it under coverage until its target is opened |
 | Healthy target | Substantive, relevant content—not merely HTTP/tool success |
 | Failed target | Retry one transient failure, then try one suitable fallback |
-| Still blocked | Record a coverage gap; never invent or silently substitute evidence |
+| Still blocked | Put it in the coverage/failure log, never in the Evidence Matrix |
 | Sensitive access | Refuse cookies, scraping bypasses, credential reuse, and posting |
 | Strong claim | Prefer primary evidence plus independent corroboration |
 
@@ -72,15 +75,29 @@ when rendering is needed. Check that the result contains relevant substance,
 not a login wall, anti-bot shell, empty list, consent screen, or generic error.
 Apply the bounded retry/fallback rule and log unresolved gaps.
 
-④ Quant records every accepted finding using every field in
-`references/evidence-contract.md`. Keep observed facts, source claims,
-inferences, and hypotheses distinct. Deduplicate repeated syndication and note
-whether corroboration is independent.
+④ Quant records every accepted finding using these exact fields: `claim`,
+`source_url`, `source_title`, `published_or_observed_at`, `source_lane`,
+`evidence`, `signal_type`, `corroboration`, `confidence`, and `limitations`.
+`source_lane` must be `primary`, `independent`, `community`, or
+`browser_fallback`; `signal_type` must be `observed_fact`, `source_claim`,
+`inference`, or `hypothesis`. `corroboration` may name only independent,
+accepted Evidence Matrix rows, otherwise use `none`—snippets and access gaps
+never corroborate a row.
+Rows may come only from opened targets with substantive evidence. A search
+snippet, login wall, empty response, or failed fetch belongs in the coverage
+and failure log—not in the Evidence Matrix. Keep observed facts, source claims,
+inferences, and hypotheses distinct. For each row, read `claim` and `evidence`
+alone: if the evidence does not directly support the whole claim, narrow the
+claim or reject the row; do not add subjective qualifiers absent from the
+source. A listed price supports price availability, not buyer
+pain, adoption, or willingness to pay. Deduplicate repeated syndication and
+note whether corroboration is independent.
 
-⑤ Orchestrator compares supporting and contradicting evidence, reports lane
-coverage and limitations, and chooses one outcome: **proceed**, **validate
-cheaply**, or **stop**. Confidence must follow evidence quality and coverage,
-not the number of search results.
+⑤ Orchestrator returns, in order: **Decision**, the ten-field **Evidence
+Matrix**, **Contradictions and uncertainty**, **Coverage report** (including
+failed attempts and fallbacks), and **Next validation step**. Choose one
+outcome: **proceed**, **validate cheaply**, or **stop**. Confidence must follow
+evidence quality and coverage, not the number of search results.
 
 ## Pitfalls
 
