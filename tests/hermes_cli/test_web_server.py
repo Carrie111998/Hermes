@@ -1175,6 +1175,14 @@ class TestWebServerEndpoints:
     def test_put_honcho_first_save_merges_into_resolved_config(self, monkeypatch, tmp_path):
         # With no profile-local file, a save merges into the resolved global config.
         monkeypatch.setenv("HOME", str(tmp_path))
+        # resolve_global_config_path() is ``Path.home() / ".honcho" / ...``, and
+        # Path.home() reads USERPROFILE on Windows — it ignores $HOME entirely.
+        # Setting HOME alone therefore did NOT redirect the global config there,
+        # so this test read and WROTE the developer's real ~/.honcho/config.json
+        # (and then failed on the merge assertion because the seeded fixture
+        # lived in tmp_path). Patch the resolver's actual input so the isolation
+        # holds on every platform.
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
         from hermes_constants import get_hermes_home
 
         global_path = tmp_path / ".honcho" / "config.json"

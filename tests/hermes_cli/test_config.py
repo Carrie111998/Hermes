@@ -589,6 +589,47 @@ class TestSaveAndLoadRoundtrip:
             assert saved["platforms"]["email"]["unauthorized_dm_behavior"] == "pair"
 
 
+def _env_i_sh_argv(script: str):
+    """argv running *script* under a clean POSIX shell, or None if unavailable.
+
+    ``env -i sh -c`` proves a written ``.env`` survives ``set -a; . file``,
+    which is the contract the quoting fix exists for. Native Windows has no
+    ``env`` on PATH at all (Git ships one, but only ``Git\\cmd`` is on PATH by
+    default), so a bare ``["env", "-i", "sh", ...]`` raised
+    ``FileNotFoundError: [WinError 2]`` and the shell-sourcing half of these
+    tests never ran on this platform.
+
+    Two probe-verified Windows details:
+      * ``env`` and ``sh`` are resolved off Git's ``usr/bin`` next to the
+        bash.exe the product itself resolves (same lookup as the product's
+        ``resolve_windows_git_bash``, so WSL's ``System32\\bash.exe`` — which
+        cannot see ``C:\\`` paths — never wins).
+      * ``sh`` MUST be passed as an absolute path: ``env -i`` wipes PATH and
+        MSYS ``env`` has no built-in default-PATH fallback, so a bare ``"sh"``
+        exits 127 with ``env: 'sh': No such file or directory``.
+    """
+    if os.name != "nt":
+        return ["env", "-i", "sh", "-c", script]
+    from pathlib import Path as _Path
+
+    from hermes_cli._subprocess_compat import resolve_windows_git_bash
+
+    bash = resolve_windows_git_bash()
+    if not bash:
+        return None
+    bash_dir = _Path(bash).parent
+    for candidate in (
+        bash_dir,
+        bash_dir.parent / "usr" / "bin",
+        bash_dir.parent.parent / "usr" / "bin",
+    ):
+        env_exe = candidate / "env.exe"
+        sh_exe = candidate / "sh.exe"
+        if env_exe.exists() and sh_exe.exists():
+            return [str(env_exe), "-i", str(sh_exe), "-c", script]
+    return None
+
+
 class TestSaveEnvValueSecure:
     def test_save_env_value_writes_without_stdout(self, tmp_path, capsys):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
@@ -717,15 +758,14 @@ class TestSaveEnvValueSecure:
             assert load_env()["TERMINAL_SSH_KEY"] == path
 
             # Shell source must round-trip (this is what the bug broke).
+            argv = _env_i_sh_argv(
+                f"set -a; . '{env_path}'; set +a; "
+                f'printf "%s" "$TERMINAL_SSH_KEY"'
+            )
+            if argv is None:
+                pytest.skip("no POSIX env+sh available to verify shell sourcing")
             r = subprocess.run(
-                [
-                    "env",
-                    "-i",
-                    "sh",
-                    "-c",
-                    f"set -a; . '{env_path}'; set +a; "
-                    f'printf "%s" "$TERMINAL_SSH_KEY"',
-                ],
+                argv,
                 capture_output=True,
                 text=True,
             )
@@ -751,15 +791,13 @@ class TestSaveEnvValueSecure:
             assert parsed["TABBY_KEY"] == value
             assert load_env()["TABBY_KEY"] == value
 
+            argv = _env_i_sh_argv(
+                f"set -a; . '{env_path}'; set +a; " f'printf "%s" "$TABBY_KEY"'
+            )
+            if argv is None:
+                pytest.skip("no POSIX env+sh available to verify shell sourcing")
             r = subprocess.run(
-                [
-                    "env",
-                    "-i",
-                    "sh",
-                    "-c",
-                    f"set -a; . '{env_path}'; set +a; "
-                    f'printf "%s" "$TABBY_KEY"',
-                ],
+                argv,
                 capture_output=True,
                 text=True,
             )

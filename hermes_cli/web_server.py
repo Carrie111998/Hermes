@@ -11031,7 +11031,7 @@ async def _read_session_import_body(request: Request) -> bytes:
 
 
 def _import_sessions_for_profile(profile: Optional[str], sessions: List[Dict[str, Any]]) -> Dict[str, Any]:
-    db = _open_session_db_for_profile(profile)
+    db = _open_session_db_for_profile(profile, write=True)
     try:
         return db.import_sessions(sessions)
     finally:
@@ -11081,7 +11081,7 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
             detail="ids must contain at most 500 entries",
         )
     def _delete() -> int:
-        db = _open_session_db_for_profile(body.profile)
+        db = _open_session_db_for_profile(body.profile, write=True)
         try:
             return db.delete_sessions(body.ids)
         finally:
@@ -11156,7 +11156,7 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
     the two delete endpoints' DB-vs-disk behaviour consistent.
     """
     def _delete() -> int:
-        db = _open_session_db_for_profile(profile)
+        db = _open_session_db_for_profile(profile, write=True)
         try:
             return db.delete_empty_sessions()
         finally:
@@ -11197,19 +11197,42 @@ async def get_session_stats(profile: Optional[str] = None):
         db.close()
 
 
-def _open_session_db_for_profile(profile: Optional[str]):
-    """Open a SessionDB for read paths, optionally for another profile.
+def _open_session_db_for_profile(profile: Optional[str], *, write: bool = False):
+    """Open a SessionDB, optionally for another profile.
 
     ``profile`` None/empty → this process's own ``state.db`` (the common,
     single-profile case). A named profile opens that profile's on-disk
     ``state.db`` directly so the primary backend can serve cross-profile reads
     (transcripts, detail) without spawning that profile's backend.
+
+    ``write=True`` is REQUIRED by every mutating endpoint (delete, rename,
+    import, prune). The read-only attach is a ``file:...?mode=ro`` connection,
+    so a write through it fails with "attempt to write a readonly database" —
+    and read-only is also unable to open a ``state.db`` that does not exist
+    yet, which is the normal state of a fresh install. Both were live 500s on
+    every session delete/rename until the per-file test cap stopped hiding
+    this file's failures.
     """
+    import sqlite3
+
     from hermes_state import SessionDB
-    if not profile:
-        return SessionDB(read_only=True)
-    _name, home = _cron_profile_home(profile)
-    return SessionDB(db_path=Path(home) / "state.db", read_only=True)
+    kwargs = {}
+    if profile:
+        kwargs["db_path"] = Path(_cron_profile_home(profile)[1]) / "state.db"
+    if write:
+        return SessionDB(**kwargs)
+    # SessionDB(read_only=True) documents that the DB "must already exist +
+    # be initialised" — a mode=ro connection cannot create one, which is the
+    # normal state of a fresh install. Try the read-only attach first (it
+    # takes no write lock, the whole point of it) and only fall back to the
+    # read-write open, which initialises the file, when it genuinely is not
+    # there. Attempt-then-degrade rather than an exists() pre-check: the
+    # pre-check both races a concurrent create and silently downgrades reads
+    # to read-write whenever the file is briefly absent.
+    try:
+        return SessionDB(read_only=True, **kwargs)
+    except sqlite3.OperationalError:
+        return SessionDB(**kwargs)
 
 
 @app.get("/api/sessions/{session_id}")
@@ -11291,7 +11314,7 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
     # opening its state.db directly. Remote profiles never reach here — the
     # desktop routes their DELETE to the remote backend. Omit for current/default.
     def _delete():
-        db = _open_session_db_for_profile(profile)
+        db = _open_session_db_for_profile(profile, write=True)
         try:
             # Resolve exact ids / unique prefixes like every other session endpoint
             # (detail, messages, rename, export all do). A session that no longer
@@ -11329,7 +11352,7 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
     restores the session. Either field may be omitted. ``profile`` targets
     another profile's session.
     """
-    db = _open_session_db_for_profile(body.profile)
+    db = _open_session_db_for_profile(body.profile, write=True)
     try:
         sid = db.resolve_session_id(session_id)
         if not sid:
@@ -11425,7 +11448,7 @@ def _prune_sessions(body: SessionPrune):
     if has_window or (_attr_filters_set and not _older_than_explicit):
         _effective_older_than = None
     profile_home = _cron_profile_home(body.profile)[1] if body.profile else get_hermes_home()
-    db = _open_session_db_for_profile(body.profile)
+    db = _open_session_db_for_profile(body.profile, write=True)
     try:
         filters = dict(
             older_than_days=_effective_older_than,

@@ -2419,8 +2419,8 @@ class SessionDB:
         try:
             if read_only:
                 # Read-only attach for cross-profile aggregation: SELECT-only,
-                # so we skip schema init entirely (no DDL, no FTS probe, no
-                # column reconcile). Crucially this takes NO write lock, so
+                # so we skip schema *setup* entirely (no DDL, no column
+                # reconcile). Crucially this takes NO write lock, so
                 # polling another profile's live DB on every sidebar refresh
                 # never contends with that profile's running backend. The DB
                 # must already exist + be initialised (callers guard on
@@ -2434,6 +2434,33 @@ class SessionDB:
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
+                # The FTS *probe* is NOT schema setup and must still run:
+                # search_messages() short-circuits to [] whenever
+                # _fts_enabled is False, so skipping it made every search
+                # through a read-only handle silently return no results
+                # (dashboard /api/sessions/search returned nothing at all).
+                # _fts_table_probe is a bare `SELECT * FROM t LIMIT 0`, so it
+                # is safe on a mode=ro connection and takes no write lock.
+                probe_cursor = self._conn.cursor()
+                try:
+                    self._fts_enabled = (
+                        self._fts_table_probe(probe_cursor, "messages_fts") is True
+                    )
+                    if self._fts_enabled and not _message_trigram_disabled():
+                        self._trigram_available = (
+                            self._fts_table_probe(
+                                probe_cursor, "messages_fts_trigram"
+                            )
+                            is True
+                        )
+                except sqlite3.DatabaseError:
+                    # A corrupt/absent FTS shadow on someone else's DB must not
+                    # take down a read-only attach: degrade to no-FTS, which is
+                    # exactly what this branch did before the probe existed.
+                    self._fts_enabled = False
+                    self._trigram_available = False
+                finally:
+                    probe_cursor.close()
                 return
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
