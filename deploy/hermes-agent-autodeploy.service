@@ -1,0 +1,61 @@
+# hermes-agent-autodeploy.service — oneshot pull-and-restart, driven by
+# hermes-agent-autodeploy.timer. Companion to hermes-gateway.service.
+#
+# It fast-forwards a hermes-agent checkout to its tracked branch and restarts
+# the gateway ONLY when the checkout moved (see hermes-agent-autodeploy.sh).
+# The restart lives here rather than in `hermes cron` on purpose: the cron
+# lifecycle_guard blocks jobs from restarting the gateway they run under.
+#
+# ── System-level install (dedicated host, User=hermes) ───────────────────
+#   install -m 755 deploy/hermes-agent-autodeploy.sh /usr/local/bin/
+#   install -m 600 /dev/stdin /etc/hermes/autodeploy.env <<'ENV'
+#   HERMES_REPO_DIR=/home/hermes/.hermes/hermes-agent
+#   HERMES_RESTART_UNIT=hermes-gateway.service
+#   HERMES_VENV_SYNC=.venv/bin/pip install -e .
+#   # SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
+#   ENV
+#   cp deploy/hermes-agent-autodeploy.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now hermes-agent-autodeploy.timer
+#
+# ── User-level install (rootless, systemctl --user) ──────────────────────
+#   Drop the two units in ~/.config/systemd/user/, set
+#   HERMES_SYSTEMCTL_ARGS=--user and an EnvironmentFile with your paths, then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now hermes-agent-autodeploy.timer
+#   (For a user unit, change the EnvironmentFile path below to one you own,
+#   e.g. %h/.config/hermes/autodeploy.env.)
+#
+# Verify:  systemctl [--user] start hermes-agent-autodeploy.service
+#          journalctl [--user] -u hermes-agent-autodeploy.service -n 30
+
+[Unit]
+Description=Hermes Agent auto-deploy (fast-forward tracked branch, restart gateway on change)
+After=network-online.target
+Wants=network-online.target
+# A failed deploy must not crash-loop the timer. StartLimit* belong in [Unit]
+# on modern systemd — placing them in [Service] is silently ignored.
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=oneshot
+# Point this at a file (mode 600) carrying HERMES_REPO_DIR and friends. The
+# leading '-' makes a missing file non-fatal so `systemctl start` still runs
+# with whatever is already in the environment.
+EnvironmentFile=-/etc/hermes/autodeploy.env
+ExecStart=/usr/local/bin/hermes-agent-autodeploy.sh
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hermes-agent-autodeploy
+
+# --- Hardening (mirrors hermes-gateway.service) ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target
