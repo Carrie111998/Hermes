@@ -1821,28 +1821,34 @@ class TestConcurrentToolExecution:
         tc2 = _mock_tool_call(name="web_search", arguments='{"q":"beta"}', call_id="c2")
         tc3 = _mock_tool_call(name="web_search", arguments='{"q":"gamma"}', call_id="c3")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2, tc3])
-        messages = []
+        messages = [{"role": "user", "content": "compare all three results"}]
+        agent._persist_user_message_idx = 0
 
         call_log = []
 
         def fake_handle(name, args, task_id, **kwargs):
-            call_log.append(name)
+            call_log.append((name, kwargs.get("user_task")))
             return json.dumps({"result": args.get("q", "")})
 
         with patch("run_agent.handle_function_call", side_effect=fake_handle):
             agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
 
-        assert len(messages) == 3
+        assert len(messages) == 4
+        assert call_log == [
+            ("web_search", "compare all three results"),
+            ("web_search", "compare all three results"),
+            ("web_search", "compare all three results"),
+        ]
         # Results must be in original order
-        assert messages[0]["tool_call_id"] == "c1"
-        assert messages[1]["tool_call_id"] == "c2"
-        assert messages[2]["tool_call_id"] == "c3"
+        assert messages[1]["tool_call_id"] == "c1"
+        assert messages[2]["tool_call_id"] == "c2"
+        assert messages[3]["tool_call_id"] == "c3"
         # All should be tool messages
-        assert all(m["role"] == "tool" for m in messages)
+        assert all(m["role"] == "tool" for m in messages[1:])
         # Content should contain the query results
-        assert "alpha" in messages[0]["content"]
-        assert "beta" in messages[1]["content"]
-        assert "gamma" in messages[2]["content"]
+        assert "alpha" in messages[1]["content"]
+        assert "beta" in messages[2]["content"]
+        assert "gamma" in messages[3]["content"]
 
     def test_concurrent_none_args_rejected_without_crash(self, agent):
         """Concurrent executor must not crash on arguments=None. Current
@@ -1930,14 +1936,22 @@ class TestConcurrentToolExecution:
 
     def test_invoke_tool_dispatches_to_handle_function_call(self, agent):
         """_invoke_tool should route regular tools through handle_function_call."""
+        messages = [{"role": "user", "content": "search the current release"}]
+        agent._persist_user_message_idx = 0
         with patch("run_agent.handle_function_call", return_value="result") as mock_hfc:
-            result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
+            result = agent._invoke_tool(
+                "web_search",
+                {"q": "test"},
+                "task-1",
+                messages=messages,
+            )
             mock_hfc.assert_called_once_with(
                 "web_search", {"q": "test"}, "task-1",
                 tool_call_id=None,
                 session_id=agent.session_id,
                 turn_id="",
                 api_request_id="",
+                user_task="search the current release",
                 enabled_tools=list(agent.valid_tool_names),
                 skip_pre_tool_call_hook=True,
                 skip_tool_request_middleware=True,
@@ -1946,6 +1960,59 @@ class TestConcurrentToolExecution:
                 tool_request_middleware_trace=[],
             )
             assert result == "result"
+
+    @pytest.mark.parametrize("quiet_mode", [True, False])
+    def test_sequential_registry_tool_forwards_current_user_task(
+        self,
+        agent,
+        quiet_mode,
+    ):
+        agent.quiet_mode = quiet_mode
+        agent._persist_user_message_idx = 0
+        messages = [{"role": "user", "content": "update my active profile"}]
+        tool_call = _mock_tool_call(
+            name="web_search",
+            arguments='{"query":"hello"}',
+            call_id="c1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+
+        with patch("run_agent.handle_function_call", return_value="ok") as mock_hfc:
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        assert mock_hfc.call_args.kwargs["user_task"] == "update my active profile"
+
+    def test_current_user_task_fails_closed_without_valid_turn_anchor(self, agent):
+        from agent.agent_runtime_helpers import current_user_task
+
+        messages = [
+            {"role": "user", "content": "stale request"},
+            {"role": "assistant", "content": "prior answer"},
+        ]
+
+        for invalid_anchor in (None, False, True, -1, 1, 2, "0"):
+            agent._persist_user_message_idx = invalid_anchor
+            assert current_user_task(agent, messages) is None
+
+    def test_current_user_task_flattens_current_multimodal_message(self, agent):
+        from agent.agent_runtime_helpers import current_user_task
+
+        agent._persist_user_message_idx = 1
+        messages = [
+            {"role": "user", "content": "stale request"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this profile"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AAAA"},
+                    },
+                ],
+            },
+        ]
+
+        assert current_user_task(agent, messages) == "[1 image] describe this profile"
 
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")
@@ -2930,6 +2997,7 @@ class TestRunConversation:
         assert result["api_calls"] == 2
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
+        assert mock_handle_function_call.call_args.kwargs["user_task"] == "search something"
 
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):

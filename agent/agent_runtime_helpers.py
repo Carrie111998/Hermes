@@ -2911,6 +2911,42 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             )
 
 
+def current_user_task(
+    agent,
+    messages: Optional[List[Dict[str, Any]]],
+) -> Optional[str]:
+    """Return the current turn's user text for registry tool dispatch.
+
+    The turn builder owns ``_persist_user_message_idx`` and re-anchors it after
+    context compression.  Do not fall back to an older user message when that
+    anchor is absent or invalid: tools that require the originating request
+    must fail closed rather than inherit stale session context.
+    """
+    if not isinstance(messages, list):
+        return None
+
+    user_message_idx = getattr(agent, "_persist_user_message_idx", None)
+    if (
+        isinstance(user_message_idx, bool)
+        or not isinstance(user_message_idx, int)
+        or user_message_idx < 0
+        or user_message_idx >= len(messages)
+    ):
+        return None
+
+    user_message = messages[user_message_idx]
+    if not isinstance(user_message, dict) or user_message.get("role") != "user":
+        return None
+
+    from agent.codex_responses_adapter import _summarize_user_message_for_log
+
+    task = _summarize_user_message_for_log(
+        user_message.get("content"),
+        sep="\n",
+    ).strip()
+    return task or None
+
+
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
                  tool_call_id: Optional[str] = None, messages: list = None,
                  pre_tool_block_checked: bool = False,
@@ -3132,6 +3168,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 session_id=agent.session_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                user_task=current_user_task(agent, messages),
                 enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
                 skip_pre_tool_call_hook=True,
                 skip_tool_request_middleware=True,

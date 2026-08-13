@@ -2048,6 +2048,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _spinner_result = None
             try:
                 def _execute(next_args: dict) -> Any:
+                    from agent.agent_runtime_helpers import current_user_task
+
                     return _ra().handle_function_call(
                         function_name,
                         next_args,
@@ -2057,6 +2059,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         turn_id=getattr(agent, "_current_turn_id", "") or "",
                         api_request_id=getattr(agent, "_current_api_request_id", "")
                         or "",
+                        user_task=current_user_task(agent, messages),
                         enabled_tools=(
                             list(agent.valid_tool_names)
                             if agent.valid_tool_names
@@ -2127,6 +2130,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         else:
             try:
                 def _execute(next_args: dict) -> Any:
+                    from agent.agent_runtime_helpers import current_user_task
+
                     return _ra().handle_function_call(
                         function_name,
                         next_args,
@@ -2136,6 +2141,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         turn_id=getattr(agent, "_current_turn_id", "") or "",
                         api_request_id=getattr(agent, "_current_api_request_id", "")
                         or "",
+                        user_task=current_user_task(agent, messages),
                         enabled_tools=(
                             list(agent.valid_tool_names)
                             if agent.valid_tool_names
