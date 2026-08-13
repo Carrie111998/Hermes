@@ -871,7 +871,13 @@ class TestEscapeNativeToolArg:
         ops.search("needle", path=r"C:\Users\alice\project")
         rg_cmds = [c for c in commands if "rg " in c or c.startswith("rg")]
         assert rg_cmds, f"no rg command captured in: {commands}"
-        assert any("'C:/Users/alice/project'" in c for c in rg_cmds), rg_cmds
+        # Accept either single-quoted (legacy _escape_native_tool_arg) or
+        # unquoted (shlex.quote via _quote_rg_path) — both are valid native
+        # C:/ form for rg. The functional invariant is no /c/... MSYS mangling.
+        assert any(
+            "C:/Users/alice/project" in c
+            for c in rg_cmds
+        ), rg_cmds
         assert all("/c/Users" not in c for c in rg_cmds), rg_cmds
 
     def test_shell_linter_uses_native_form(self, mock_env, monkeypatch):
