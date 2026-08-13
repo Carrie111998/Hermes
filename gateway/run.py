@@ -644,6 +644,22 @@ def _format_exec_approval_fallback(
     )
 
 
+def _approval_send_succeeded(send_result: Any) -> tuple[bool, str | None]:
+    """Return whether a plain-text approval prompt was actually delivered.
+
+    The gateway approval queue treats notification failure differently from a
+    human timeout. Button-based approval already checks SendResult.success.
+    Plain-text fallback must do the same, or platforms such as Signal can fail
+    the send while the protected-write gate still waits 300 seconds for an
+    answer the user never saw.
+    """
+    if send_result is None:
+        return True, None
+    if getattr(send_result, "success", True):
+        return True, None
+    return False, getattr(send_result, "error", None) or "approval prompt send failed"
+
+
 def _gateway_provider_error_reply(text: str) -> str:
     """Map raw provider/API errors to a short user-safe Telegram reply."""
     if _GATEWAY_AUTH_ERROR_RE.search(text):
@@ -5366,9 +5382,13 @@ class TurnRunner:
                     log_message="Approval text-send scheduling error",
                 )
                 if _approval_send_fut is not None:
-                    _approval_send_fut.result(timeout=15)
+                    _approval_send_result = _approval_send_fut.result(timeout=15)
+                    _ok, _err = _approval_send_succeeded(_approval_send_result)
+                    if not _ok:
+                        raise RuntimeError(_err or "approval prompt send failed")
             except Exception as _e:
                 logger.error("Failed to send approval request: %s", _e)
+                raise
 
         # Keep real user text separate from API-only recovery guidance.  If
         # an auto-continue note is prepended below, persist the original
