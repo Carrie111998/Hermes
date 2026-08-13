@@ -58,7 +58,7 @@ describe('MessageContextMenu', () => {
     vi.restoreAllMocks()
   })
 
-  it('renders children as-is when no text is selected', () => {
+  it('renders children and keeps the menu closed when no text is selected', async () => {
     mockSelection('')
 
     render(
@@ -66,8 +66,18 @@ describe('MessageContextMenu', () => {
         <div data-testid="child">Hello</div>
       </MessageContextMenu>
     )
+
+    // Children always render — the wrapper stays mounted so the DOM tree
+    // is stable across selection changes (no mid-drag remounts).
     expect(screen.getByTestId('child')).toBeTruthy()
-    // No selection → no Radix ContextMenu wrapper → no menu items.
+
+    // No selection → trigger is disabled → right-click shows nothing from us.
+    const child = screen.getByTestId('child')
+    openContextMenu(child)
+
+    await act(async () => {
+      await Promise.resolve()
+    })
     expect(screen.queryByText('Add as context')).toBeNull()
   })
 
@@ -80,9 +90,8 @@ describe('MessageContextMenu', () => {
       </MessageContextMenu>
     )
 
-    // Drag-select completes → browser fires selectionchange → component
-    // mounts the Radix wrapper. Wrap in act so the re-render flushes and
-    // the trigger node is fresh before we right-click it.
+    // Drag-select completes → browser fires selectionchange → the trigger
+    // enables. Wrap in act so the re-render flushes before we right-click.
     await act(async () => {
       document.dispatchEvent(new Event('selectionchange'))
     })

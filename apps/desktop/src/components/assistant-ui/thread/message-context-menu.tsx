@@ -12,69 +12,79 @@ interface MessageContextMenuProps {
   messageId?: string
 }
 
+interface SelectionSnapshot {
+  text: string
+  anchor: Element | null
+}
+
+const EMPTY_SNAPSHOT: SelectionSnapshot = { text: '', anchor: null }
+
 /** Shared right-click context menu for message blocks (user + assistant).
  *  When text is selected, the standard Copy / Select All actions stay,
  *  with "Add as context" (stages a chip) and "Paste as text" (inserts
  *  quoted text into the composer) added below — an addition, not a
- *  replacement. When no text is selected, the native context menu is
- *  preserved (and the user-message reaction picker keeps its own
- *  right-click behavior). */
+ *  replacement.
+ *
+ *  The Radix wrapper is ALWAYS mounted and only the trigger's `disabled`
+ *  flag follows the selection. Swapping the tree in and out on every
+ *  selectionchange (the earlier design) unmounted the DOM nodes under the
+ *  cursor mid-drag, which trashed the live browser selection (highlight
+ *  jumped to a big unrelated area) and caused layout flicker. A stable
+ *  tree with a disabled trigger keeps the native context menu when
+ *  nothing is selected — without ever remounting the children. */
 export function MessageContextMenu({ children, messageId }: MessageContextMenuProps) {
   const { t } = useI18n()
-  const hasSelectionRef = useRef(false)
-  const selectionAnchorRef = useRef<Element | null>(null)
-  const [, forceUpdate] = useState(0)
+  const [hasSelection, setHasSelection] = useState(false)
+  const snapshotRef = useRef<SelectionSnapshot>(EMPTY_SNAPSHOT)
 
-  // Keep the ref in sync with the live selection so the render decision
-  // (ContextMenu wrapper vs plain children) is always correct by the time
-  // the user right-clicks. selectionchange fires on drag-end, click-away,
-  // and programmatic clears — every path that changes the selection.
-  // Both ref writes are DOM-selection mirrors, not atom mirrors: the
-  // listener is the ONLY source of truth, so the rule is waived here.
-  // eslint-disable-next-line no-restricted-syntax
+  // Track the live selection so the trigger's `disabled` flag follows it.
+  // selectionchange fires on drag-end, click-away, and programmatic clears —
+  // every path that changes the selection. State (not a ref) so the flag is
+  // reactive, and the updater bails out when the value hasn't actually
+  // flipped so steady-state selection changes don't re-render at all.
   useEffect(() => {
     const sync = () => {
       const selection = window.getSelection()
-      const hasSelection = Boolean(selection && !selection.isCollapsed && selection.toString().trim().length > 0)
-
-      if (hasSelection !== hasSelectionRef.current) {
-        hasSelectionRef.current = hasSelection
-        forceUpdate(n => n + 1)
-      }
-
-      // Capture the anchor while the selection is alive — "Select All"
-      // scopes itself to the message body the user highlighted, and the
-      // DOM anchor can outlive the live selection once the menu takes focus.
-      if (selection?.anchorNode) {
-        const anchor = selection.anchorNode
-        selectionAnchorRef.current = anchor.nodeType === 1 ? (anchor as Element) : anchor.parentElement
-      }
+      const next = Boolean(selection && !selection.isCollapsed && selection.toString().trim().length > 0)
+      setHasSelection(previous => (previous === next ? previous : next))
     }
-
     document.addEventListener('selectionchange', sync)
 
     return () => document.removeEventListener('selectionchange', sync)
   }, [])
 
-  const getSelectedText = useCallback((): string => {
+  // Snapshot the selection at right-click time — before the menu takes
+  // focus and could clear or move it. The trigger composes this handler
+  // ahead of Radix's own, so it runs first in every mode.
+  const captureSnapshot = useCallback((event: React.MouseEvent) => {
     const selection = window.getSelection()
-
-    return selection?.toString().trim() ?? ''
-  }, [])
-
-  const handleCopy = useCallback(() => {
-    const text = getSelectedText()
+    const text = selection?.toString().trim() ?? ''
 
     if (!text) {
+      snapshotRef.current = EMPTY_SNAPSHOT
+
       return
     }
 
-    void writeClipboardText(text)
-  }, [getSelectedText])
+    const anchor = selection!.anchorNode
+
+    snapshotRef.current = {
+      text,
+      anchor: anchor?.nodeType === 1 ? (anchor as Element) : (anchor?.parentElement ?? null)
+    }
+  }, [])
+
+  const handleCopy = useCallback(() => {
+    if (!snapshotRef.current.text) {
+      return
+    }
+
+    void writeClipboardText(snapshotRef.current.text)
+  }, [])
 
   const handleSelectAll = useCallback(() => {
     const selection = window.getSelection()
-    const anchor = selectionAnchorRef.current
+    const anchor = snapshotRef.current.anchor
 
     if (!selection || !anchor) {
       return
@@ -97,17 +107,15 @@ export function MessageContextMenu({ children, messageId }: MessageContextMenuPr
   }, [])
 
   const handleAddAsContext = useCallback(() => {
-    const text = getSelectedText()
-
-    if (!text) {
+    if (!snapshotRef.current.text) {
       return
     }
 
-    addComposerTextAttachment(text, messageId)
-  }, [getSelectedText, messageId])
+    addComposerTextAttachment(snapshotRef.current.text, messageId)
+  }, [messageId])
 
   const handlePasteAsText = useCallback(() => {
-    const text = getSelectedText()
+    const text = snapshotRef.current.text
 
     if (!text) {
       return
@@ -119,18 +127,13 @@ export function MessageContextMenu({ children, messageId }: MessageContextMenuPr
       .join('\n')
 
     requestComposerInsert(quoted + '\n\n', { mode: 'block' })
-  }, [getSelectedText])
-
-  // No selection → render children directly so the browser's native
-  // context menu (Copy, Select All, etc.) works as expected — and the
-  // user-message reaction picker keeps its own right-click handler.
-  if (!hasSelectionRef.current) {
-    return <>{children}</>
-  }
+  }, [])
 
   return (
     <ContextMenu>
-      <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
+      <ContextMenuTrigger asChild disabled={!hasSelection} onContextMenu={captureSnapshot}>
+        {children}
+      </ContextMenuTrigger>
       <ContextMenuContent>
         <ContextMenuItem onSelect={handleCopy}>{t.common.copy}</ContextMenuItem>
         <ContextMenuItem onSelect={handleSelectAll}>{t.common.selectAll}</ContextMenuItem>
