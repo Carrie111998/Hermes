@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import socket
 import threading
 from contextlib import asynccontextmanager
@@ -13,6 +14,36 @@ import pytest
 
 
 pytest.importorskip("mcp.client.auth.oauth2", reason="MCP SDK OAuth support required")
+
+
+def _drive_http_callback(handler_cls, path):
+    handler = handler_cls.__new__(handler_cls)
+    handler.path = path
+    handler.wfile = io.BytesIO()
+    handler.send_response = lambda _status: None
+    handler.send_header = lambda _name, _value: None
+    handler.end_headers = lambda: None
+    handler.do_GET()
+
+
+def test_callback_first_writer_wins_in_both_directions(monkeypatch):
+    """Paste and HTTP callback cannot overwrite each other's terminal result."""
+    import tools.mcp_oauth as mod
+
+    handler_cls, paste_first = mod._make_callback_handler()
+    monkeypatch.setattr("sys.stdin", io.StringIO("skip\n"))
+    mod._paste_callback_reader(paste_first)
+    _drive_http_callback(handler_cls, "/callback?code=http-code&state=http-state")
+    assert paste_first["error"] == mod._USER_SKIPPED_SENTINEL
+    assert paste_first["auth_code"] is None
+
+    handler_cls, http_first = mod._make_callback_handler()
+    _drive_http_callback(handler_cls, "/callback?code=http-code&state=http-state")
+    monkeypatch.setattr("sys.stdin", io.StringIO("code=paste-code&state=paste-state\n"))
+    mod._paste_callback_reader(http_first)
+    assert http_first["auth_code"] == "http-code"
+    assert http_first["state"] == "http-state"
+    assert http_first["error"] is None
 
 
 def test_callback_skip_completed_at_deadline_wins_over_timeout(monkeypatch):

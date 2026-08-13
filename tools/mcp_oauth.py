@@ -675,6 +675,27 @@ class HermesTokenStorage:
 # ---------------------------------------------------------------------------
 
 
+def _commit_callback_result(
+    result: dict[str, Any],
+    *,
+    auth_code: str | None,
+    state: str | None,
+    error: str | None,
+) -> bool:
+    """Atomically commit the first terminal callback result."""
+    # Direct helper callers historically pass only the three public fields;
+    # production handlers install this lock eagerly. ``setdefault`` preserves
+    # that unit/public seam while converging concurrent callers on one lock.
+    lock = result.setdefault("_winner_lock", threading.Lock())
+    with lock:
+        if result["auth_code"] is not None or result["error"] is not None:
+            return False
+        result["auth_code"] = auth_code
+        result["state"] = state
+        result["error"] = error
+        return True
+
+
 def _make_callback_handler() -> tuple[type, dict]:
     """Create a per-flow callback HTTP handler class with its own result dict.
 
@@ -683,7 +704,12 @@ def _make_callback_handler() -> tuple[type, dict]:
     OAuth redirect arrives.  Each call returns a fresh pair so concurrent
     flows don't stomp on each other.
     """
-    result: dict[str, Any] = {"auth_code": None, "state": None, "error": None}
+    result: dict[str, Any] = {
+        "auth_code": None,
+        "state": None,
+        "error": None,
+        "_winner_lock": threading.Lock(),
+    }
 
     class _Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
@@ -692,19 +718,19 @@ def _make_callback_handler() -> tuple[type, dict]:
             state = params.get("state", [None])[0]
             error = params.get("error", [None])[0]
 
-            result["auth_code"] = code
-            result["state"] = state
-            result["error"] = error
+            won = _commit_callback_result(
+                result, auth_code=code, state=state, error=error
+            )
 
             body = (
                 (
                     "<html><body><h2>Authorization Successful</h2>"
                     "<p>You can close this tab and return to Hermes.</p></body></html>"
                 )
-                if code
+                if won and code
                 else (
                     "<html><body><h2>Authorization Failed</h2>"
-                    f"<p>Error: {error or 'unknown'}</p></body></html>"
+                    f"<p>Error: {error or 'authorization already resolved'}</p></body></html>"
                 )
             )
             self.send_response(200)
@@ -1096,18 +1122,18 @@ def _paste_callback_reader(
     if not line:
         return
 
-    # Skip if HTTP listener already won.
-    if result.get("auth_code") is not None or result.get("error") is not None:
-        return
-
     # Skip token: user explicitly opted out of authorization. Mark the
     # result with a sentinel error string that _wait_for_callback maps
     # to OAuthNonInteractiveError (already handled by mcp_tool.py as a
     # non-fatal "skip this server and continue startup" path).
     if line.lower() in _SKIP_TOKENS:
-        if result.get("auth_code") is not None or result.get("error") is not None:
+        if not _commit_callback_result(
+            result,
+            auth_code=None,
+            state=None,
+            error=_USER_SKIPPED_SENTINEL,
+        ):
             return
-        result["error"] = _USER_SKIPPED_SENTINEL
         print(
             "  OAuth skipped. Run `hermes mcp login <server>` later to "
             "authenticate, or set ``enabled: false`` on that server in "
@@ -1144,13 +1170,8 @@ def _paste_callback_reader(
         )
         return
 
-    # One more race-check before writing.
-    if result.get("auth_code") is not None or result.get("error") is not None:
+    if not _commit_callback_result(result, auth_code=code, state=state, error=error):
         return
-
-    result["auth_code"] = code
-    result["state"] = state
-    result["error"] = error
     if code:
         print("  Got authorization code from paste — completing flow.", file=sys.stderr)
 
