@@ -267,6 +267,22 @@ By default (`cron.wrap_response: true`), cron deliveries are wrapped with:
 
 The `[SILENT]` prefix in a cron response suppresses delivery entirely — useful for jobs that only need to write to files or perform side effects.
 
+### Opt-in Slack section delivery
+
+Set `cron.split_section_messages: true` together with `cron.wrap_response: false`
+to deliver a Slack cron result with two or more recognized top-level sections as
+ordered messages in the same resolved channel and thread. Recognized boundaries
+are Slack emphasis-only heading lines (`*Heading*` or `_Heading_`) and Markdown
+H1--H3 lines. Code fences are ignored. This is delivery-time segmentation of one
+cron execution and one model result; it does not create another gateway, job, or
+model call.
+
+The option is default-off, applies only to Slack text-only deliveries, and falls
+back to one message for malformed/no/excessive sections. Media and non-Slack
+deliveries retain their aggregate delivery behavior. If a later section cannot
+be confirmed, the scheduler reports partial delivery and does not resend the
+combined result.
+
 ### Session Isolation
 
 Cron deliveries are NOT mirrored into gateway session conversation history. They exist only in the cron job's own session. This prevents message alternation violations in the target chat's conversation.

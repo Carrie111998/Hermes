@@ -372,6 +372,25 @@ cron:
   wrap_response: false
 ```
 
+### Sectioned Slack delivery
+
+For reports that need separate Slack messages per top-level section, opt in with
+both settings below:
+
+```yaml
+# ~/.hermes/config.yaml
+cron:
+  wrap_response: false
+  split_section_messages: true
+```
+
+One cron execution and one model response are still used. Hermes sends valid
+top-level Slack (`*Heading*`, `_Heading_`) or Markdown (`#` through `###`) report
+sections sequentially to the same Slack channel/thread. It ignores heading-like
+lines in fenced code blocks and safely falls back to one message for no, malformed,
+or excessive sections. This setting is default-off, is Slack-only, and does not
+split `MEDIA:` deliveries.
+
 ### Continuable jobs (reply to a cron delivery)
 
 By default a cron delivery is fire-and-forget: the message is sent, but it does
