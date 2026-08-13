@@ -56,10 +56,16 @@ In `C:\Users\diego\laptop-monitor.tests.ps1`, immediately **before** the closing
 ```powershell
     # browser-harness _chrome_running() fix-revert guard (2026-08-13). The catalog row's
     # -Test AND -Detail both call Get-BrowserHarnessChromeRunningFixStatus, which calls
-    # Get-BrowserHarnessAdminFileState, so BOTH must be extracted or the row throws
-    # CommandNotFoundException and kills every section below it.
-    'Get-BrowserHarnessAdminFileState', 'Get-BrowserHarnessChromeRunningFixStatus',
+    # Get-BrowserHarnessAdminFileState, so BOTH must end up extracted or the row throws
+    # CommandNotFoundException and kills every section below it. Task 2 adds the second
+    # name when that function lands -- see the ordering note below.
+    'Get-BrowserHarnessAdminFileState'
 ```
+
+**Register only the function that exists.** The extraction loop (`:687-700`) collects
+missing names and hard-exits the whole suite before any later section runs. Listing
+`Get-BrowserHarnessChromeRunningFixStatus` here, one task before it exists, drops the
+run from ~1889 passing to 128 and hides every other section. Task 2 adds it.
 
 - [ ] **Step 2: Write the failing test**
 
@@ -217,6 +223,21 @@ cp C:/Users/diego/laptop-monitor.ps1 C:/Users/diego/AppData/Local/Temp/claude/C-
 - Consumes: `Get-BrowserHarnessAdminFileState -Path <string> -> string` (Task 1).
 - Produces: `Get-BrowserHarnessChromeRunningFixStatus [-DevExe] [-DevSitePackages] [-DevSrcAdmin] [-UvToolAdmin] -> pscustomobject` with fields `activeSource` (`'dev-editable'`|`'uv-tool'`), `activePath`, `activeState`, `fallbackPath`, `fallbackState`, `psutil`, `state` (`'healthy'`|`'down'`|`'unknown'`), `detail`. Task 3's catalog row calls it from both `-Test` and `-Detail`.
 
+- [ ] **Step 0: Register the function name — but only after it exists**
+
+Task 1 deliberately left `Get-BrowserHarnessChromeRunningFixStatus` out of `$required`,
+because the extraction loop (`laptop-monitor.tests.ps1:687-700`) hard-exits the whole
+suite on any missing name. **Write the function first (Step 3 below), then** replace the
+placeholder comment Task 1 left in `$required` with:
+
+```powershell
+    'Get-BrowserHarnessAdminFileState', 'Get-BrowserHarnessChromeRunningFixStatus'
+```
+
+Delete Task 1's ordering note above it — it describes a state that no longer exists.
+If you add the name before the function exists, the suite drops from ~1889 passing to
+128 and every section below extraction goes unrun.
+
 - [ ] **Step 1: Write the failing test**
 
 Append to the same test section, after the Task 1 asserts:
@@ -326,14 +347,35 @@ $bhS6 = Get-BhStatus -Tree $bhT6
 Assert 'bh-fixguard: missing psutil does NOT affect the verdict' ($bhS6.state -eq 'healthy') "state=$($bhS6.state)"
 Assert 'bh-fixguard: missing psutil is reported in the detail'   ($bhS6.detail -match 'psutil') "detail=$($bhS6.detail)"
 
-# Case 7 -- an unreadable .pth must not silently redirect the grade to a phantom path;
-# it degrades to the conventional src location.
+# Case 7 -- an ABSENT .pth degrades to the conventional src location.
+#
+# NOTE (amended 2026-08-13 after review): this case was originally commented as
+# testing an "unreadable" .pth, which it does not -- deleting the file makes
+# $pth.Count 0, so the try/catch around Get-Content is never entered and the
+# catch{} fail-soft path goes unexercised. Case 8 below covers that branch. A
+# guard whose own failure mode is a silent no-op is the exact bug class this
+# work exists to catch, so the two cases must stay distinct.
 $bhT7 = New-BhTree -Root (Join-Path $bhRoot 't7') -Dev 'ok' -Uv 'ok' -DevExe $true
 Remove-Item -LiteralPath (Join-Path $bhT7.DevSitePackages '__editable__.browser_harness-0.1.8.pth') -Force
 $bhS7 = Get-BhStatus -Tree $bhT7
 Assert 'bh-fixguard: absent .pth falls back to the conventional src path' (
     ($bhS7.activePath -eq $bhT7.DevSrcAdmin) -and ($bhS7.state -eq 'healthy')
 ) "activePath=$($bhS7.activePath) state=$($bhS7.state)"
+
+# Case 8 -- an UNREADABLE .pth reaches the same fallback through the catch{} block.
+# The .pth path is created as a DIRECTORY on purpose: Get-ChildItem -Filter still
+# matches it, so $pth.Count is 1 and the try IS entered, but Get-Content on a
+# directory throws ("Access to the path ... is denied") and the catch fires. That
+# is the only way to prove the fail-soft path actually works -- Case 7 reaches the
+# same answer via the count-zero branch without touching it. Do not "fix" this
+# into a file; it would silently revert the coverage to Case 7's branch.
+$bhT8 = New-BhTree -Root (Join-Path $bhRoot 't8') -Dev 'ok' -Uv 'ok' -DevExe $true
+Remove-Item -LiteralPath (Join-Path $bhT8.DevSitePackages '__editable__.browser_harness-0.1.8.pth') -Force
+New-Item -ItemType Directory -Path (Join-Path $bhT8.DevSitePackages '__editable__.browser_harness-0.1.8.pth') -Force | Out-Null
+$bhS8 = Get-BhStatus -Tree $bhT8
+Assert 'bh-fixguard: unreadable .pth (directory) falls back to the conventional src path via the catch block' (
+    ($bhS8.activePath -eq $bhT8.DevSrcAdmin) -and ($bhS8.state -eq 'healthy')
+) "activePath=$($bhS8.activePath) state=$($bhS8.state)"
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -569,13 +611,23 @@ $components += Probe-Component -Name 'browser-harness _chrome_running() fix pres
     -Detail { (Get-BrowserHarnessChromeRunningFixStatus).detail }
 ```
 
+- [ ] **Step 3b: Bump the catalog-size literal**
+
+Added 2026-08-13 after implementation: adding a row makes the catalog bigger than
+`$script:PassProbeTotal` (`laptop-monitor.ps1:9116`), a **manually-maintained literal**
+used for the "N of \<total\> probed" truncation wording. Two pre-existing AST guards
+(`passtotal` and the session-bridge wiring assert) fail until it matches. Bump it by one
+(95 → 96) and add a dated history comment above it, newest on top, matching the
+`# 97 -> 95 on 2026-08-13` entry already there — including its 35-space continuation
+indent. The `passtotal` assert is ground truth for the count; do not guess it.
+
 - [ ] **Step 4: Run the tests to verify they pass**
 
 ```bash
 powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\diego\laptop-monitor.tests.ps1 -SkipLive -SkipDocker -NoLease
 ```
 
-Expected: every `bh-fixguard:` assert PASS, the `probe-budget: catalog row '...vip-scan gate...' carries -AlwaysRun` assert PASS, `0 failed`.
+Expected: every `bh-fixguard:` assert PASS, the `probe-budget: catalog row '...vip-scan gate...' carries -AlwaysRun` assert PASS, and only the one known pre-existing `Resolve-RealPython` failure.
 
 - [ ] **Step 5: Confirm the live row is green against the real machine**
 

@@ -260,3 +260,60 @@ scenario the fixtures did not model.
 - Catalog rows this one is modelled on: `laptop-monitor.ps1:11871` (Codex OAuth
   sentinel), `:12160` (cloudflared drift), `:12172` (SR-470 canary); helper
   pattern at `:7971`
+
+## Verified 2026-08-13
+
+### The marker strings match the real artifact
+
+A scratch tree was built holding genuine files copied out of the two real
+installs (never the reverse): the dev-editable `admin.py` was the true
+pre-fix body from
+`...\uv\tools\browser-harness\Lib\site-packages\browser_harness\admin.py.bak-pre-chromerunning-fix-20260813`
+(45264 bytes, defective), and the uv-tool `admin.py` was the current fixed
+copy from `C:\Users\diego\Developer\browser-harness\src\browser_harness\admin.py`
+(48270 bytes). `Get-BrowserHarnessChromeRunningFixStatus`, AST-extracted from
+`laptop-monitor.ps1` and dot-sourced (never the whole file, which would run a
+full probe sweep), graded this tree:
+
+    state         : down
+    activeSource  : dev-editable
+    activeState   : reverted
+    fallbackState : ok
+    detail        : REVERTED: the ACTIVE copy ...\bh-e2e\dev\src\browser_harness\admin.py
+                    has lost _chrome_running_via_psutil/_PROCESS_SCAN_TIMEOUT. ... Restore
+                    from git 1a36129 (branch fix/chrome-running-timeout-false-negative) in
+                    C:\Users\diego\Developer\browser-harness, or from
+                    admin.py.bak-pre-chromerunning-fix-20260813.
+
+This is the result that matters: the guard is not a silent no-op against the
+real defective body. Had this printed `healthy`, the conclusion would have
+been that the marker strings do not match the real file and the entire
+four-task effort was worthless — it did not.
+
+### The inverse holds against all three real files directly
+
+`Get-BrowserHarnessAdminFileState`, run on the genuine files with no scratch
+copying, graded exactly:
+
+    REAL fixed  -> ok
+    REAL .bak   -> reverted
+    REAL uvtool -> ok
+
+confirming both live installs (`Developer\browser-harness` and the uv-tool
+site-packages copy) carry the fix, and the preserved `.bak` still reads as
+the reverted original.
+
+### The live catalog row and the installs are green
+
+After the scratch tree was deleted, `grep -c "_chrome_running_via_psutil"`
+against both real `admin.py` files returned `2` for each, and
+`git status --porcelain` in `C:\Users\diego\Developer\browser-harness` printed
+nothing — the live installs were never written to, only read from.
+
+### Regression suite
+
+`laptop-monitor.tests.ps1 -SkipLive -SkipDocker -NoLease` →
+**1918 passed, 1 failed, 9 skipped**. The one failure is the pre-existing,
+unrelated `Resolve-RealPython` extraction gap ("every function an extracted
+function INVOKES is itself extracted", invoked by `Restart-CodexProxy`) —
+not touched by this guard.
