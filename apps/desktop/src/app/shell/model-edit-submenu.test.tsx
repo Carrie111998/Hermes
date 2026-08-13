@@ -31,6 +31,8 @@ function renderSubmenu(opts: {
   onSelectModel?: (model: string) => void
   onSetOptions: (patch: { effort?: string; fast?: boolean }) => void
   reasoning: boolean
+  reasoningEfforts?: string[]
+  reasoningToggle?: boolean
 }) {
   return render(
     <DropdownMenu open>
@@ -47,6 +49,8 @@ function renderSubmenu(opts: {
             onSetOptions={opts.onSetOptions}
             provider="p1"
             reasoning={opts.reasoning}
+            reasoningEfforts={opts.reasoningEfforts}
+            reasoningToggle={opts.reasoningToggle}
           />
         </DropdownMenuSub>
       </DropdownMenuContent>
@@ -77,6 +81,19 @@ describe('ModelEditSubmenu reports edits without performing them', () => {
     fireEvent.click(screen.getByRole('switch'))
 
     expect(onSetOptions).toHaveBeenCalledWith({ effort: 'none' })
+  })
+
+  it('shows only supported effort rows and omits an unsupported Off toggle', () => {
+    renderSubmenu({
+      fastControl: { kind: 'none' },
+      onSetOptions: vi.fn(),
+      reasoning: true,
+      reasoningEfforts: ['low', 'high', 'max'],
+      reasoningToggle: false
+    })
+
+    expect(screen.queryByRole('switch')).toBeNull()
+    expect(screen.getAllByRole('menuitemradio').map(row => row.textContent)).toEqual(['Low', 'High', 'Max'])
   })
 
   it('thinking: toggling back on restores the row level, not the hardcoded default', () => {

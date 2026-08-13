@@ -36,6 +36,16 @@ export function reasoningEffortLabel(effort: string): string {
 export const isReasoningEffort = (value: string): value is ReasoningEffort =>
   REASONING_EFFORTS.includes(normalize(value) as ReasoningEffort)
 
+export function supportedReasoningEfforts(values?: readonly string[]): readonly ReasoningEffort[] {
+  if (values === undefined) {
+    return REASONING_EFFORTS
+  }
+
+  const supported = new Set(values.map(normalize))
+  const filtered = REASONING_EFFORTS.filter(value => supported.has(value))
+  return filtered.length > 0 ? filtered : [DEFAULT_REASONING_EFFORT]
+}
+
 /** Thinking is on unless a level explicitly says otherwise; an empty value
  *  means "inherit", so it resolves through `fallback` first. */
 export const isThinkingEnabled = (effort: string, fallback: string = DEFAULT_REASONING_EFFORT): boolean =>

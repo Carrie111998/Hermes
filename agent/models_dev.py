@@ -584,6 +584,8 @@ class ModelCapabilities:
     context_window: int = 200000
     max_output_tokens: int = 8192
     model_family: str = ""
+    reasoning_efforts: tuple[str, ...] | None = None
+    reasoning_toggle: bool | None = None
 
 
 def _get_provider_models(provider: str) -> Optional[Dict[str, Any]]:
@@ -660,6 +662,30 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
     else:
         supports_vision = bool(entry.get("attachment", False))
     supports_reasoning = bool(entry.get("reasoning", False))
+    reasoning_efforts: tuple[str, ...] | None = None
+    reasoning_toggle: bool | None = None
+    reasoning_options = entry.get("reasoning_options")
+    if isinstance(reasoning_options, list):
+        effort_values: list[str] = []
+        has_known_option = False
+        toggle_supported = False
+        for option in reasoning_options:
+            if not isinstance(option, dict):
+                continue
+            option_type = str(option.get("type") or "").strip().lower()
+            if option_type == "toggle":
+                has_known_option = True
+                toggle_supported = True
+            elif option_type == "effort" and isinstance(option.get("values"), list):
+                has_known_option = True
+                effort_values.extend(
+                    str(value).strip().lower()
+                    for value in option["values"]
+                    if isinstance(value, str) and value.strip()
+                )
+        if has_known_option:
+            reasoning_efforts = tuple(dict.fromkeys(effort_values))
+            reasoning_toggle = toggle_supported
 
     # Extract limits
     limit = entry.get("limit", {})
@@ -681,6 +707,8 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
         context_window=context_window,
         max_output_tokens=max_output_tokens,
         model_family=model_family,
+        reasoning_efforts=reasoning_efforts,
+        reasoning_toggle=reasoning_toggle,
     )
 
 

@@ -7,7 +7,8 @@ import {
   REASONING_EFFORT_VALUES,
   REASONING_EFFORTS,
   reasoningEffortLabel,
-  resolveReasoningEffort
+  resolveReasoningEffort,
+  supportedReasoningEfforts
 } from './reasoning-effort'
 
 describe('reasoning-effort', () => {
@@ -49,5 +50,19 @@ describe('reasoning-effort', () => {
     // Off selects nothing on the scale.
     expect(resolveReasoningEffort('none')).toBe('')
     expect(resolveReasoningEffort('bogus')).toBe(DEFAULT_REASONING_EFFORT)
+  })
+})
+
+describe('supportedReasoningEfforts', () => {
+  it('filters known model metadata in canonical order', () => {
+    expect(supportedReasoningEfforts(['max', 'low', 'high'])).toEqual(['low', 'high', 'max'])
+  })
+
+  it('uses medium as the single scale value for binary reasoning', () => {
+    expect(supportedReasoningEfforts([])).toEqual(['medium'])
+  })
+
+  it('keeps the full scale when metadata is unknown', () => {
+    expect(supportedReasoningEfforts(undefined)).toBe(REASONING_EFFORTS)
   })
 })

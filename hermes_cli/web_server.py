@@ -6317,6 +6317,8 @@ def get_model_info(profile: Optional[str] = None):
                     "supports_tools": mc.supports_tools,
                     "supports_vision": mc.supports_vision,
                     "supports_reasoning": mc.supports_reasoning,
+                    "reasoning_efforts": list(mc.reasoning_efforts) if mc.reasoning_efforts is not None else None,
+                    "reasoning_toggle": mc.reasoning_toggle,
                     "context_window": mc.context_window,
                     "max_output_tokens": mc.max_output_tokens,
                     "model_family": mc.model_family,

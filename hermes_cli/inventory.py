@@ -419,10 +419,11 @@ def _apply_capabilities(rows: list[dict]) -> None:
 
     for row in rows:
         slug = row.get("slug") or ""
-        caps: dict[str, dict[str, bool]] = {}
+        caps: dict[str, dict] = {}
 
         for model in row.get("models") or []:
             reasoning = True
+            meta = None
             if get_model_capabilities is not None and slug:
                 try:
                     meta = get_model_capabilities(slug, model)
@@ -431,10 +432,14 @@ def _apply_capabilities(rows: list[dict]) -> None:
                 except Exception:
                     reasoning = True
 
-            caps[model] = {
+            model_caps = {
                 "fast": bool(model_supports_fast_mode(model)),
                 "reasoning": reasoning,
             }
+            if meta is not None and meta.reasoning_efforts is not None:
+                model_caps["reasoning_efforts"] = list(meta.reasoning_efforts)
+                model_caps["reasoning_toggle"] = bool(meta.reasoning_toggle)
+            caps[model] = model_caps
 
         row["capabilities"] = caps
 

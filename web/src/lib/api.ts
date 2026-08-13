@@ -2352,6 +2352,8 @@ export interface ModelInfoResponse {
     supports_tools?: boolean;
     supports_vision?: boolean;
     supports_reasoning?: boolean;
+    reasoning_efforts?: string[] | null;
+    reasoning_toggle?: boolean | null;
     context_window?: number;
     max_output_tokens?: number;
     model_family?: string;
@@ -2370,6 +2372,12 @@ export interface ModelOptionProvider {
   source?: string;
   warning?: string;
   authenticated?: boolean;
+  capabilities?: Record<string, {
+    fast: boolean;
+    reasoning: boolean;
+    reasoning_efforts?: string[];
+    reasoning_toggle?: boolean;
+  }>;
 }
 
 export interface ModelOptionsResponse {

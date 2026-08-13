@@ -371,6 +371,51 @@ class TestGetModelCapabilities:
         assert caps is not None
         assert caps.supports_vision is True
 
+    def test_reasoning_options_preserve_efforts_and_toggle_support(self):
+        registry = {
+            "deepseek": {
+                "id": "deepseek",
+                "models": {
+                    "deepseek-v4-flash": {
+                        "id": "deepseek-v4-flash",
+                        "reasoning": True,
+                        "reasoning_options": [
+                            {"type": "toggle"},
+                            {"type": "effort", "values": ["low", "high", "max"]},
+                        ],
+                    },
+                },
+            },
+        }
+
+        with patch("agent.models_dev.fetch_models_dev", return_value=registry):
+            caps = get_model_capabilities("deepseek", "deepseek-v4-flash")
+
+        assert caps is not None
+        assert caps.reasoning_efforts == ("low", "high", "max")
+        assert caps.reasoning_toggle is True
+
+    def test_missing_reasoning_options_remains_unknown(self):
+        registry = {
+            "deepseek": {
+                "id": "deepseek",
+                "models": {
+                    "future-model": {
+                        "id": "future-model",
+                        "reasoning": True,
+                        "reasoning_options": [],
+                    },
+                },
+            },
+        }
+
+        with patch("agent.models_dev.fetch_models_dev", return_value=registry):
+            caps = get_model_capabilities("deepseek", "future-model")
+
+        assert caps is not None
+        assert caps.reasoning_efforts is None
+        assert caps.reasoning_toggle is None
+
 
 
 
