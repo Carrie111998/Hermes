@@ -5999,7 +5999,26 @@ class BasePlatformAdapter(ABC):
         This allows new messages to be processed even while an agent is running,
         enabling interruption support.
         """
+        # Synthetic runtime handoffs need an admission receipt: returning from
+        # this method normally only means dispatch was attempted, not that a
+        # target turn was started or queued.  Keep the receipt on the event so
+        # ordinary platform callers retain the existing fire-and-forget API.
+        _runtime_admission = event.metadata.get("_hermes_runtime_admission")
+        _is_complement_handoff = (
+            event.internal
+            and isinstance(_runtime_admission, dict)
+            and _runtime_admission.get("queue_as_followup") is True
+        )
+
+        def _record_runtime_admission(accepted: bool, mode: str, error: str = "") -> None:
+            if not _is_complement_handoff:
+                return
+            _runtime_admission.update({"accepted": bool(accepted), "mode": mode})
+            if error:
+                _runtime_admission["error"] = error
+
         if not self._message_handler:
+            _record_runtime_admission(False, "rejected", "message handler is unavailable")
             return
 
         coerce_plaintext_gateway_command(event)
@@ -6105,7 +6124,7 @@ class BasePlatformAdapter(ABC):
             # Same shape as the /approve deadlock fix (PR #4926) — both
             # cases are "agent thread blocked on Event.wait, message must
             # reach the resolver before being treated as a new turn."
-            if not cmd:
+            if not cmd and not _is_complement_handoff:
                 try:
                     from tools import clarify_gateway as _clarify_mod
                     _has_text_clarify = (
@@ -6148,7 +6167,7 @@ class BasePlatformAdapter(ABC):
                         )
                     return
 
-            if self._busy_session_handler is not None:
+            if not _is_complement_handoff and self._busy_session_handler is not None:
                 try:
                     if await self._busy_session_handler(event, session_key):
                         return
@@ -6161,9 +6180,10 @@ class BasePlatformAdapter(ABC):
             if event.message_type == MessageType.PHOTO:
                 logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
                 merge_pending_message_event(self._pending_messages, session_key, event)
+                _record_runtime_admission(True, "queued")
                 return  # Don't interrupt now - will run after current task completes
 
-            if self._is_queue_text_debounce_candidate(event):
+            if not _is_complement_handoff and self._is_queue_text_debounce_candidate(event):
                 logger.debug(
                     "[%s] New text message while session %s is active — "
                     "debouncing follow-up (busy_text_mode=queue, window=%.2fs)",
@@ -6185,6 +6205,7 @@ class BasePlatformAdapter(ABC):
                     event,
                     merge_text=event.message_type == MessageType.TEXT,
                 )
+            _record_runtime_admission(True, "queued")
             return  # Don't process now - will be handled after current task finishes
         
         # Mark session as active BEFORE spawning background task to close
@@ -6194,7 +6215,12 @@ class BasePlatformAdapter(ABC):
         # pattern — set the guard synchronously, not inside the task.)
         # _start_session_processing installs the guard AND the owner-task
         # mapping atomically so stale-lock detection works.
-        self._start_session_processing(event, session_key)
+        started = self._start_session_processing(event, session_key)
+        _record_runtime_admission(
+            started,
+            "started" if started else "rejected",
+            "failed to create target processing task" if not started else "",
+        )
     
     @staticmethod
     def _get_human_delay() -> float:

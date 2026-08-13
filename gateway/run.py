@@ -17108,10 +17108,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 notice = f"{notice}\n\n{session_info}"
                         except Exception:
                             pass
-                        await adapter.send(
+                        send_result = await adapter._send_with_retry(
                             source.chat_id, notice,
                             metadata=self._thread_metadata_for_source(source),
                         )
+                        if not send_result.success:
+                            logger.warning(
+                                "Auto-reset notification send returned failure for %s: %s",
+                                self._session_key_for_source(source),
+                                send_result.error,
+                            )
             except Exception as e:
                 logger.debug("Auto-reset notification failed (non-fatal): %s", e)
 

@@ -115,6 +115,68 @@ def _debounced_event(adapter: BasePlatformAdapter, session_key: str) -> MessageE
     return adapter._text_debounce[session_key].event
 
 
+def _a2a_event(text: str = "handoff") -> tuple[MessageEvent, dict]:
+    admission = {
+        "kind": "agent2agent",
+        "queue_as_followup": True,
+        "accepted": False,
+        "mode": "pending",
+    }
+    event = _make_event(text, chat_type="group", thread_id="16844")
+    event.internal = True
+    event.metadata["_hermes_runtime_admission"] = admission
+    return event, admission
+
+
+@pytest.mark.asyncio
+async def test_a2a_handoff_acknowledges_started_runtime_task():
+    adapter = _make_adapter()
+    event, admission = _a2a_event()
+    started: list[tuple[MessageEvent, str]] = []
+
+    def _fake_start(received, session_key, *, interrupt_event=None):
+        started.append((received, session_key))
+        return True
+
+    adapter._start_session_processing = _fake_start  # type: ignore[method-assign]
+    await adapter.handle_message(event)
+
+    assert started and started[0][0] is event
+    assert admission["accepted"] is True
+    assert admission["mode"] == "started"
+
+
+@pytest.mark.asyncio
+async def test_a2a_handoff_acknowledges_queue_and_skips_busy_interceptors():
+    adapter = _make_adapter()
+    event, admission = _a2a_event()
+    session_key = build_session_key(event.source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._busy_session_handler = AsyncMock(return_value=True)
+
+    with patch("tools.clarify_gateway.get_pending_for_session", return_value=object()):
+        await adapter.handle_message(event)
+
+    adapter._busy_session_handler.assert_not_awaited()
+    assert adapter._pending_messages[session_key] is event
+    assert session_key not in adapter._text_debounce
+    assert admission["accepted"] is True
+    assert admission["mode"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_a2a_handoff_rejects_when_runtime_handler_is_unavailable():
+    adapter = _make_adapter()
+    adapter._message_handler = None
+    event, admission = _a2a_event()
+
+    await adapter.handle_message(event)
+
+    assert admission["accepted"] is False
+    assert admission["mode"] == "rejected"
+    assert admission["error"] == "message handler is unavailable"
+
+
 @pytest.mark.asyncio
 async def test_non_dm_message_does_not_wait_for_topic_recovery_executor(monkeypatch):
     """Group messages must not queue behind the shared thread pool.
@@ -260,5 +322,3 @@ def test_command_messages_bypass_debounce_even_in_queue_mode():
     adapter = _make_adapter()
     assert not adapter._is_queue_text_debounce_candidate(_make_event(""))
     assert not adapter._is_queue_text_debounce_candidate(_make_event("/stop"))
-
-
