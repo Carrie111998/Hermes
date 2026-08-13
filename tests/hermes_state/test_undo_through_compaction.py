@@ -496,3 +496,73 @@ def test_rewind_through_compaction_limits_to_nearest_boundary(db):
     ).fetchone()[0]
     assert projection_rewound == 2
 
+
+def _make_cli(db, sid, history):
+    """Bare :class:`cli.HermesCLI` with just the attributes ``undo_last``
+    touches (pattern from tests/cli/test_cli_copy_command.py)."""
+    from cli import HermesCLI
+
+    cli = HermesCLI.__new__(HermesCLI)
+    cli._session_db = db
+    cli.session_id = sid
+    cli.agent = None
+    cli.conversation_history = history
+    return cli
+
+
+def test_cli_undo_last_reloads_pre_compaction_history(db, capsys):
+    """CLI ``/undo`` across a compaction boundary (#81130) — the three novel
+    pieces of ``HermesCLI.undo_last``:
+
+    * the in-memory ``conversation_history`` is reloaded from the DB after
+      ``rewind_through_compaction`` revives the pre-compaction rows (the
+      stale truncated slice must NOT survive);
+    * the ``boundary_note`` announcing the revived rows is printed;
+    * the ``remaining`` count reflects the reloaded transcript.
+    """
+    sid = "sess-cli-undo"
+    # display_kind-stamped compaction summary (production-faithful) so the
+    # /undo picker excludes it and N resolves against real pre-compaction
+    # turns only.
+    _seed_and_compact(db, sid, 4, "Compressed earlier turns. Resume here.")
+
+    # Pre-undo sanity: the live set is the compacted summary, not the
+    # original turns — the bug state.
+    pre_undo_live = [
+        m["content"] for m in _live_messages(db, sid) if m.get("role") == "user"
+    ]
+    assert pre_undo_live == ["Compressed earlier turns. Resume here."]
+
+    # The CLI's in-memory transcript is stale — it still holds the
+    # pre-compaction turns while the DB has already been compacted. That is
+    # exactly the state undo_last's post-compaction reload exists to heal:
+    # after the rewind, the revived rows "aren't represented in memory at
+    # all" (cli.py undo_last comment).
+    history = []
+    for i in range(4):
+        history.append({"role": "user", "content": f"q{i}"})
+        history.append({"role": "assistant", "content": f"a{i}"})
+
+    cli = _make_cli(db, sid, history)
+    # n=2 steps past the live compaction summary and lands on the first
+    # pre-compaction turn in the include_compacted picker (q2), routing
+    # through rewind_through_compaction.
+    cli.undo_last(n=2, prefill=False)
+
+    # 1) conversation_history reloaded from the DB: the revived
+    #    pre-compaction turns are present, the compacted summary is not.
+    user_contents = [
+        m["content"] for m in cli.conversation_history if m.get("role") == "user"
+    ]
+    assert user_contents == ["q0", "q1", "q2", "q3"]
+    assert "Compressed earlier turns" not in " ".join(user_contents)
+    assert len(cli.conversation_history) == 8
+
+    # 2) boundary_note present in the printed output.
+    out = capsys.readouterr().out
+    assert "revived 8 pre-compaction row(s)" in out
+    assert "compaction summary discarded" in out
+
+    # 3) remaining count matches the reloaded transcript.
+    assert "8 message(s) remaining in history." in out
+
