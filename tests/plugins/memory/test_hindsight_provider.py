@@ -88,6 +88,7 @@ def _make_mock_client():
         return_value=SimpleNamespace(text="Synthesized answer")
     )
     client.aretain_batch = AsyncMock()
+    client.update_memory = AsyncMock(return_value={"state": "invalidated"})
     client.aclose = AsyncMock()
     return client
 
@@ -233,11 +234,12 @@ class TestSchemas:
         assert "content" in RETAIN_SCHEMA["parameters"]["required"]
 
 
-    def test_get_tool_schemas_returns_three(self, provider):
+    def test_get_tool_schemas_returns_five(self, provider):
         schemas = provider.get_tool_schemas()
-        assert len(schemas) == 3
+        assert len(schemas) == 5
         names = {s["name"] for s in schemas}
-        assert names == {"hindsight_retain", "hindsight_recall", "hindsight_reflect"}
+        assert names == {"hindsight_retain", "hindsight_recall", "hindsight_reflect",
+                         "hindsight_invalidate", "hindsight_restore"}
 
     def test_context_mode_returns_no_tools(self, provider_with_config):
         p = provider_with_config(memory_mode="context")
@@ -461,6 +463,59 @@ class TestToolHandlers:
             "hindsight_unknown", {}
         ))
         assert "error" in result
+
+    def test_invalidate_success(self, provider):
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_invalidate",
+            {"memory_id": "abc123ab-c123-4def-5678-90abcdef1234", "reason": "stale model routing"}
+        ))
+        assert "invalidated" in result["result"]
+        provider._client.update_memory.assert_called_once()
+        call_kwargs = provider._client.update_memory.call_args.kwargs
+        assert call_kwargs["bank_id"] == "test-bank"
+        assert call_kwargs["memory_id"] == "abc123ab-c123-4def-5678-90abcdef1234"
+        req = call_kwargs["update_memory_request"]
+        assert req.state == "invalidated"
+        assert req.reason == "stale model routing"
+
+    def test_invalidate_missing_memory_id(self, provider):
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_invalidate", {}
+        ))
+        assert "error" in result
+        assert "memory_id" in result["error"]
+
+    def test_invalidate_invalid_memory_id(self, provider):
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_invalidate", {"memory_id": "../../evil/path"}
+        ))
+        assert "error" in result
+        assert "Invalid memory_id" in result["error"]
+
+    def test_invalidate_null_byte_memory_id(self, provider):
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_invalidate", {"memory_id": "good\0bad"}
+        ))
+        assert "error" in result
+        assert "Invalid memory_id" in result["error"]
+
+    def test_restore_success(self, provider):
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_restore",
+            {"memory_id": "abc123ab-c123-4def-5678-90abcdef1234"}
+        ))
+        assert "restored" in result["result"]
+        provider._client.update_memory.assert_called_once()
+        call_kwargs = provider._client.update_memory.call_args.kwargs
+        assert call_kwargs["memory_id"] == "abc123ab-c123-4def-5678-90abcdef1234"
+        assert call_kwargs["update_memory_request"].state == "valid"
+
+    def test_restore_missing_memory_id(self, provider):
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_restore", {}
+        ))
+        assert "error" in result
+        assert "memory_id" in result["error"]
 
 
     def test_local_embedded_recall_reconnects_after_idle_shutdown(self, provider, monkeypatch):
@@ -1350,13 +1405,13 @@ class TestClientAutoUpgradeRoutesThroughLazyDeps:
         return calls
 
     def test_upgrade_uses_install_specs_not_subprocess(self, tmp_path, monkeypatch):
-        from plugins.memory.hindsight import _MIN_CLIENT_VERSION
+        from plugins.memory.hindsight import _CLIENT_REQUIREMENT
         from tools.lazy_deps import InstallSpecsResult
 
         calls = self._init_with_outdated_client(
             tmp_path, monkeypatch, InstallSpecsResult(ok=True)
         )
-        assert calls == [(f"hindsight-client>={_MIN_CLIENT_VERSION}",)]
+        assert calls == [(_CLIENT_REQUIREMENT,)]
 
     def test_blocked_upgrade_is_nonfatal_and_surfaces_reason(
         self, tmp_path, monkeypatch, caplog
@@ -1372,4 +1427,23 @@ class TestClientAutoUpgradeRoutesThroughLazyDeps:
             )
         assert len(calls) == 1  # attempted exactly once, init still completed
         assert any("runtime installs are disabled" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_above_cap_triggers_reinstall(self, tmp_path, monkeypatch, caplog):
+        """An already-installed client >= _MAX must be re-pinned down."""
+        import importlib.metadata as md
+        import logging
+        from plugins.memory.hindsight import _MAX_CLIENT_VERSION_EXCLUSIVE
+        from plugins.memory.hindsight import _CLIENT_REQUIREMENT
+        from tools.lazy_deps import InstallSpecsResult
+
+        # Simulate an installed client at the cap boundary (needs re-pin).
+        monkeypatch.setattr(md, "version", lambda name: _MAX_CLIENT_VERSION_EXCLUSIVE)
+
+        with caplog.at_level(logging.WARNING):
+            calls = self._init_with_outdated_client(
+                tmp_path, monkeypatch, InstallSpecsResult(ok=True)
+            )
+        assert calls == [(_CLIENT_REQUIREMENT,)]
+        assert any("outside of supported range" in r.getMessage()
                    for r in caplog.records)
