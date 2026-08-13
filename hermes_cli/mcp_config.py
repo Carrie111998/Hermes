@@ -964,7 +964,10 @@ def cmd_mcp_reauth(args):
 def cmd_mcp_configure(args):
     """Reconfigure which tools are enabled for an existing MCP server."""
     import sys as _sys
-    if not _sys.stdin.isatty():
+    requested_tools = getattr(args, "tools", None)
+    select_all = getattr(args, "all", False)
+    non_interactive = requested_tools is not None or select_all
+    if not non_interactive and not _sys.stdin.isatty():
         print("Error: 'hermes mcp configure' requires an interactive terminal.", file=_sys.stderr)
         _sys.exit(1)
     name = args.name
@@ -1032,20 +1035,34 @@ def cmd_mcp_configure(args):
     _info(f"Currently {currently}/{total} tools enabled for '{name}'.")
     print()
 
-    # Interactive checklist
-    from hermes_cli.curses_ui import curses_checklist
+    if requested_tools is not None:
+        requested_names = list(dict.fromkeys(
+            part.strip() for part in requested_tools.split(",") if part.strip()
+        ))
+        unknown = [tool for tool in requested_names if tool not in tool_names]
+        if unknown:
+            label = "tool" if len(unknown) == 1 else "tools"
+            print(
+                f"Error: Unknown {label} for '{name}': {', '.join(unknown)}",
+                file=_sys.stderr,
+            )
+            _sys.exit(1)
+        chosen = {tool_names.index(tool) for tool in requested_names}
+    elif select_all:
+        chosen = set(range(total))
+    else:
+        from hermes_cli.curses_ui import curses_checklist
 
-    labels = [f"{t[0]}  —  {t[1]}" for t in all_tools]
+        labels = [f"{t[0]}  —  {t[1]}" for t in all_tools]
+        chosen = curses_checklist(
+            f"Select tools for '{name}'",
+            labels,
+            pre_selected,
+        )
 
-    chosen = curses_checklist(
-        f"Select tools for '{name}'",
-        labels,
-        pre_selected,
-    )
-
-    if chosen == pre_selected:
-        _info("No changes made.")
-        return
+        if chosen == pre_selected:
+            _info("No changes made.")
+            return
 
     # Update config
     config = load_config()
