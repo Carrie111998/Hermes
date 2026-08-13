@@ -696,6 +696,15 @@ def _commit_callback_result(
         return True
 
 
+def _snapshot_callback_result(
+    result: dict[str, Any],
+) -> tuple[str | None, str | None, str | None]:
+    """Read one lock-consistent terminal callback snapshot."""
+    lock = result.setdefault("_winner_lock", threading.Lock())
+    with lock:
+        return result["auth_code"], result["state"], result["error"]
+
+
 def _make_callback_handler() -> tuple[type, dict]:
     """Create a per-flow callback HTTP handler class with its own result dict.
 
@@ -996,7 +1005,8 @@ def _make_callback_waiter(port: int, timeout: float = 300.0):
         elapsed = 0.0
         try:
             while elapsed < callback_timeout:
-                if result["auth_code"] is not None or result["error"] is not None:
+                auth_code, _state, error = _snapshot_callback_result(result)
+                if auth_code is not None or error is not None:
                     break
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
@@ -1028,17 +1038,18 @@ def _make_callback_waiter(port: int, timeout: float = 300.0):
             if leaked_reserved is not None:
                 leaked_reserved.close()
 
-        if result["error"] == _USER_SKIPPED_SENTINEL:
+        auth_code, state, error = _snapshot_callback_result(result)
+        if error == _USER_SKIPPED_SENTINEL:
             raise OAuthNonInteractiveError("user_skipped")
-        if result["error"]:
-            raise RuntimeError(f"OAuth authorization failed: {result['error']}")
-        if result["auth_code"] is None:
+        if error:
+            raise RuntimeError(f"OAuth authorization failed: {error}")
+        if auth_code is None:
             raise OAuthNonInteractiveError(
                 "OAuth callback timed out — no authorization code received. "
                 "Ensure you completed the browser authorization flow."
             )
 
-        return result["auth_code"], result["state"]
+        return auth_code, state
 
     return _wait
 

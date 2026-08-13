@@ -46,6 +46,40 @@ def test_callback_first_writer_wins_in_both_directions(monkeypatch):
     assert http_first["error"] is None
 
 
+def test_callback_snapshot_waits_for_complete_publication():
+    """Readers cannot observe auth_code before its matching state is published."""
+    import tools.mcp_oauth as mod
+
+    _handler_cls, result = mod._make_callback_handler()
+    lock = result["_winner_lock"]
+    writer_started = threading.Event()
+    release_writer = threading.Event()
+    snapshot_done = threading.Event()
+    observed = []
+
+    def writer():
+        with lock:
+            result["auth_code"] = "code"
+            writer_started.set()
+            release_writer.wait()
+            result["state"] = "state"
+
+    def reader():
+        observed.append(mod._snapshot_callback_result(result))
+        snapshot_done.set()
+
+    writer_thread = threading.Thread(target=writer)
+    reader_thread = threading.Thread(target=reader)
+    writer_thread.start()
+    assert writer_started.wait(1.0)
+    reader_thread.start()
+    assert not snapshot_done.wait(0.05)
+    release_writer.set()
+    writer_thread.join()
+    reader_thread.join()
+    assert observed == [("code", "state", None)]
+
+
 def test_callback_skip_completed_at_deadline_wins_over_timeout(monkeypatch):
     """Final arbitration observes an already-started delayed paste reader."""
     import tools.mcp_oauth as mod
@@ -61,7 +95,12 @@ def test_callback_skip_completed_at_deadline_wins_over_timeout(monkeypatch):
     def delayed_reader(result, _stop_event):
         reader_started.set()
         release_reader.wait()
-        result["error"] = mod._USER_SKIPPED_SENTINEL
+        mod._commit_callback_result(
+            result,
+            auth_code=None,
+            state=None,
+            error=mod._USER_SKIPPED_SENTINEL,
+        )
 
     monkeypatch.setattr(mod, "_paste_callback_reader", delayed_reader)
 
