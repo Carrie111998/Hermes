@@ -350,7 +350,10 @@ async def _resolve_container_fallback(
     # -w0 is GNU-only, so pipe through tr -d for BusyBox.
     # env.execute is a blocking backend exec; keep it off the event loop so a
     # multi-MB base64 read doesn't stall every other coroutine.
-    qp = shlex.quote(str(p))
+    # The exec-read always runs inside the container (POSIX), so quote the
+    # POSIX form of the path: on Windows hosts ``str(Path)`` yields backslash
+    # separators that the Linux container cannot resolve (see #85406).
+    qp = shlex.quote(p.as_posix())
     cmd = f"head -c {_MAX_INGEST_BYTES + 1} < {qp} | base64 | tr -d '\\n'"
 
     last_res: dict = {"returncode": 1, "output": ""}
