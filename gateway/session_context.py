@@ -36,6 +36,7 @@ needs to replace the import + call site:
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
 """
 
+import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Iterator
@@ -59,6 +60,16 @@ _UNSET: Any = object()
 # latch — once any host binds a session, the process stays engaged for life.
 _session_context_engaged: bool = False
 
+# Per-session TERMINAL_CWD snapshot cache (#81451).  A gateway session's cwd
+# is pinned on its first message (see ``set_session_vars``); later messages of
+# the same session reuse the pinned value so a concurrent workdir cron job's
+# transient TERMINAL_CWD write can't leak into the session.  Cron jobs and
+# other session_key="" paths are never cached (they want the current value
+# per run).  Bounded so a long-lived gateway's cache can't grow without limit.
+_session_cwd_cache: dict[str, str] = {}
+_session_cwd_cache_lock = threading.Lock()
+_SESSION_CWD_CACHE_MAX = 2048
+
 
 def session_context_engaged() -> bool:
     """True if any session has been bound via set_session_vars in this process.
@@ -66,6 +77,7 @@ def session_context_engaged() -> bool:
     See the ``_session_context_engaged`` comment for the leak-policy rationale.
     """
     return _session_context_engaged
+
 
 # ---------------------------------------------------------------------------
 # Per-task session variables
@@ -91,7 +103,9 @@ _SESSION_UI_SESSION_ID: ContextVar = ContextVar("HERMES_UI_SESSION_ID", default=
 # ID of the message that triggered the current turn. Used as a reply anchor
 # so background-process notifications stay inside the originating Telegram
 # private-chat topic (those lanes route only with thread id + reply anchor).
-_SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
+_SESSION_MESSAGE_ID: ContextVar = ContextVar(
+    "HERMES_SESSION_MESSAGE_ID", default=_UNSET
+)
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
@@ -119,13 +133,21 @@ _CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 # and any contextvar-unaware path keep working. Stateless adapters opt OUT by
 # setting ``supports_async_delivery = False`` on the adapter class; the gateway
 # propagates that into this contextvar at session-bind time.
-_SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
+_SESSION_ASYNC_DELIVERY: ContextVar = ContextVar(
+    "HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET
+)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
-_CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
-_CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
-_CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
+_CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar(
+    "HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET
+)
+_CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar(
+    "HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET
+)
+_CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar(
+    "HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET
+)
 
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
@@ -282,6 +304,35 @@ def set_session_vars(
         # so the value is stable.
         if cwd:
             resolved_cwd = cwd
+        elif session_key:
+            # Pin the snapshot per session: only the FIRST message that
+            # binds this session reads the process-global TERMINAL_CWD.
+            # Later messages of the same session reuse the pinned value, so
+            # a concurrent cron write that lands mid-conversation cannot
+            # leak into the session (#81451).  Cron jobs and other
+            # session_key="" paths are never cached and always re-snapshot,
+            # preserving their per-run behaviour.
+            with _session_cwd_cache_lock:
+                resolved_cwd = _session_cwd_cache.get(session_key)
+            if resolved_cwd is None:
+                resolved_cwd = snapshot_terminal_cwd()
+                # ``snapshot_terminal_cwd`` always returns either an absolute
+                # path or ""; if both TERMINAL_CWD and os.getcwd() were
+                # unreachable the snapshot would silently drop the session
+                # back to the leaky global on the next read.  Fall back to
+                # the launch dir explicitly so the snapshot is always pinned
+                # to *some* non-empty value.
+                if not resolved_cwd:
+                    import os as _os
+
+                    try:
+                        resolved_cwd = _os.getcwd()
+                    except Exception:
+                        resolved_cwd = ""
+                with _session_cwd_cache_lock:
+                    if len(_session_cwd_cache) >= _SESSION_CWD_CACHE_MAX:
+                        _session_cwd_cache.clear()
+                    _session_cwd_cache[session_key] = resolved_cwd
         else:
             resolved_cwd = snapshot_terminal_cwd()
             # ``snapshot_terminal_cwd`` always returns either an absolute
@@ -292,6 +343,7 @@ def set_session_vars(
             # to *some* non-empty value.
             if not resolved_cwd:
                 import os as _os
+
                 try:
                     resolved_cwd = _os.getcwd()
                 except Exception:
@@ -428,22 +480,20 @@ def get_session_env(name: str, default: str = "") -> str:
 # updated. Mirrors LOCAL_SESSION_SOURCE_IDS in
 # apps/desktop/src/lib/session-source.ts; keep roughly in sync when adding a
 # local or programmatic surface.
-NON_MESSAGING_SESSION_SURFACES = frozenset(
-    {
-        "",
-        "api_server",
-        "cli",
-        "codex",
-        "desktop",
-        "gateway",
-        "kanban",
-        "local",
-        "msgraph_webhook",
-        "tool",
-        "tui",
-        "webhook",
-    }
-)
+NON_MESSAGING_SESSION_SURFACES = frozenset({
+    "",
+    "api_server",
+    "cli",
+    "codex",
+    "desktop",
+    "gateway",
+    "kanban",
+    "local",
+    "msgraph_webhook",
+    "tool",
+    "tui",
+    "webhook",
+})
 
 
 def session_is_messaging_surface() -> bool:
@@ -460,7 +510,9 @@ def session_is_messaging_surface() -> bool:
     """
     import os
 
-    platform = os.getenv("HERMES_PLATFORM") or get_session_env("HERMES_SESSION_PLATFORM", "")
+    platform = os.getenv("HERMES_PLATFORM") or get_session_env(
+        "HERMES_SESSION_PLATFORM", ""
+    )
     source = get_session_env("HERMES_SESSION_SOURCE", "")
     for identity in (platform, source):
         identity = str(identity or "").strip().lower()

@@ -24,10 +24,6 @@ class TestResolveAgentCwd:
         monkeypatch.chdir(os.path.expanduser("~"))
         assert resolve_agent_cwd() == tmp_path
 
-
-
-
-
     def test_propagates_oserror_from_getcwd(self, monkeypatch):
         # The fallback arm calls os.getcwd(), which can raise OSError (deleted cwd).
         # The resolver must NOT swallow it — build_environment_hints owns the
@@ -43,13 +39,9 @@ class TestResolveContextCwd:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         assert resolve_context_cwd() == tmp_path
 
-
-
-
     def test_expands_leading_tilde(self, monkeypatch):
         monkeypatch.setenv("TERMINAL_CWD", "~")
         assert resolve_context_cwd() == Path(os.path.expanduser("~"))
-
 
 
 class TestSessionCwdOverride:
@@ -66,7 +58,6 @@ class TestSessionCwdOverride:
             assert resolve_context_cwd() == other
         finally:
             rt._SESSION_CWD.reset(token)
-
 
     def test_clear_session_cwd_restores_terminal_cwd(self, monkeypatch, tmp_path):
         other = tmp_path / "other"
@@ -169,3 +160,59 @@ class TestSessionContextSnapshot:
         finally:
             clear_session_vars(tokens)
 
+    def test_second_message_reuses_pinned_session_cwd(self, monkeypatch, tmp_path):
+        # The snapshot is pinned per session, not re-taken every message: a
+        # workdir cron write that lands mid-conversation must not leak into a
+        # later message of the same session (#81451).
+        baseline = tmp_path / "baseline"
+        baseline.mkdir()
+        other = tmp_path / "other"
+        other.mkdir()
+        monkeypatch.setenv("TERMINAL_CWD", str(baseline))
+
+        from gateway.session_context import set_session_vars, clear_session_vars
+
+        tokens = set_session_vars(
+            platform="telegram", chat_id="123", session_key="sess-pinned-1"
+        )
+        try:
+            # A concurrent workdir cron writes a different value mid-conversation.
+            monkeypatch.setenv("TERMINAL_CWD", str(other))
+
+            # A SECOND message for the same session must reuse the pinned cwd,
+            # not re-snapshot the cron's transient value.
+            set_session_vars(
+                platform="telegram", chat_id="123", session_key="sess-pinned-1"
+            )
+            assert resolve_context_cwd() == baseline
+            assert resolve_agent_cwd() == baseline
+        finally:
+            clear_session_vars(tokens)
+
+    def test_different_session_snapshots_fresh_cwd(self, monkeypatch, tmp_path):
+        # The pin is per session_key: a different session starting after the
+        # cron write still sees the current TERMINAL_CWD.
+        baseline = tmp_path / "baseline"
+        baseline.mkdir()
+        other = tmp_path / "other"
+        other.mkdir()
+        monkeypatch.setenv("TERMINAL_CWD", str(baseline))
+
+        from gateway.session_context import set_session_vars, clear_session_vars
+
+        tokens_a = set_session_vars(
+            platform="telegram", chat_id="123", session_key="sess-pinned-2a"
+        )
+        try:
+            monkeypatch.setenv("TERMINAL_CWD", str(other))
+            tokens_b = set_session_vars(
+                platform="telegram", chat_id="123", session_key="sess-pinned-2b"
+            )
+            try:
+                # Session A stays pinned to baseline; the brand-new session B
+                # takes a fresh snapshot of the cron's value.
+                assert resolve_context_cwd() == other
+            finally:
+                clear_session_vars(tokens_b)
+        finally:
+            clear_session_vars(tokens_a)
