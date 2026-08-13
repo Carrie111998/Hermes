@@ -7224,6 +7224,9 @@ def has_registered_mcp_tools() -> bool:
         return bool(_mcp_tool_server_names)
 
 
+_REFRESH_UNSET = object()
+
+
 def get_registered_mcp_server_names() -> set:
     """Return the set of MCP server names that have actually registered at
     least one tool into the registry (post-connection, post check_fn/include-
@@ -7238,12 +7241,13 @@ def get_registered_mcp_server_names() -> set:
         return set(_mcp_tool_server_names.values())
 
 
-
 def refresh_agent_mcp_tools(
     agent,
     *,
     enabled_override=None,
     disabled_override=None,
+    allowed_override=_REFRESH_UNSET,
+    denied_override=_REFRESH_UNSET,
     quiet_mode: bool = True,
 ) -> set:
     """Re-derive an already-built agent's tool snapshot from the live registry.
@@ -7296,6 +7300,21 @@ def refresh_agent_mcp_tools(
         enabled = getattr(agent, "enabled_toolsets", None)
         disabled = getattr(agent, "disabled_toolsets", None)
 
+    # Per-tool filters (per-chat presets). A sentinel distinguishes "caller
+    # supplied a value" (including ``None`` = clear the filter, or ``[]`` =
+    # whitelist-nothing-but-core) from "caller said nothing" (reuse the agent's
+    # stored selection). Never coerce ``[]``/``None`` with ``or``.
+    if allowed_override is not _REFRESH_UNSET:
+        allowed = allowed_override
+        agent.allowed_tool_names = allowed
+    else:
+        allowed = getattr(agent, "allowed_tool_names", None)
+    if denied_override is not _REFRESH_UNSET:
+        denied = denied_override
+        agent.denied_tool_names = denied
+    else:
+        denied = getattr(agent, "denied_tool_names", None)
+
     # Capture the registry generation this rebuild is derived from BEFORE the
     # (potentially slow) get_tool_definitions call. Used at publish time to
     # reject a stale write: if two callers race (e.g. the late-refresh daemon
@@ -7313,6 +7332,8 @@ def refresh_agent_mcp_tools(
             enabled_toolsets=enabled,
             disabled_toolsets=disabled,
             quiet_mode=quiet_mode,
+            allowed_tool_names=allowed,
+            denied_tool_names=denied,
         )
         or []
     )

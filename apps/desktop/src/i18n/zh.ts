@@ -2781,6 +2781,8 @@ export const zh: Translations = {
         tokenSummary: (used, max) => `${used} / ${max} Tokens`
       },
       session: '会话',
+      runtimeSessionElapsed: '运行时会话已用时间',
+      openToolPresets: '本次对话发送给模型的工具架构 — 点击编辑预设',
       yoloOn: 'YOLO 已开启 — 自动批准危险命令。Shift+点击可全局切换。',
       yoloOff: 'YOLO 已关闭。Shift+点击可全局切换。',
       modelNone: '无',

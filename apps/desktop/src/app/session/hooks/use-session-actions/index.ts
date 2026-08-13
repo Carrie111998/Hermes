@@ -29,6 +29,7 @@ import {
   $currentProvider,
   $currentReasoningEffort,
   $messages,
+  $newChatToolPreset,
   $newChatWorkspaceTarget,
   $sessions,
   $yoloActive,
@@ -167,7 +168,10 @@ async function desktopSessionCreateParams(cwd: string): Promise<Record<string, u
     effort: $currentReasoningEffort.get().trim(),
     fast: $currentFastMode.get(),
     model: $currentModel.get().trim(),
-    provider: $currentProvider.get().trim()
+    provider: $currentProvider.get().trim(),
+    // Draft-time tool-preset pick for this new chat. Omitted when null so the
+    // backend falls back to the configured default_tool_preset.
+    toolPreset: ($newChatToolPreset.get() ?? '').trim()
   }
 
   const profile = $newChatProfile.get() ?? normalizeProfileKey($activeGatewayProfile.get())
@@ -182,6 +186,7 @@ async function desktopSessionCreateParams(cwd: string): Promise<Record<string, u
       ? { model: selection.model, ...(selection.provider ? { provider: selection.provider } : {}) }
       : {}),
     ...(selection.effort ? { reasoning_effort: selection.effort } : {}),
+    ...(selection.toolPreset ? { tool_preset: selection.toolPreset } : {}),
     fast: selection.fast
   }
 }

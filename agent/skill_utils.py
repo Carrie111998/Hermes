@@ -433,7 +433,10 @@ def _load_raw_config() -> Dict[str, Any]:
     return parsed
 
 
-def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
+def get_disabled_skill_names(
+    platform: str | None = None,
+    extra: "list[str] | set[str] | None" = None,
+) -> Set[str]:
     """Read disabled skill names from config.yaml.
 
     Args:
@@ -443,17 +446,22 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
             disabled list, unioned with the platform-specific list when a
             platform is resolved (a globally-disabled skill stays disabled
             on every platform).
+        extra: Additional per-session disabled skill names (e.g. from a
+            per-chat tool preset). Unioned on top of the config-derived set;
+            an empty list contributes nothing (never re-enables a
+            config-disabled skill).
 
     Reads the config file directly (no CLI config imports) to stay
     lightweight.
     """
+    extra_set = _normalize_string_set(extra) if extra else set()
     parsed = _load_raw_config()
     if not parsed:
-        return set()
+        return set(extra_set)
 
     skills_cfg = parsed.get("skills")
     if not isinstance(skills_cfg, dict):
-        return set()
+        return set(extra_set)
 
     from gateway.session_context import get_session_env
     resolved_platform = (
@@ -467,8 +475,8 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
             resolved_platform
         )
         if platform_disabled is not None:
-            return global_disabled | _normalize_string_set(platform_disabled)
-    return global_disabled
+            return global_disabled | _normalize_string_set(platform_disabled) | extra_set
+    return global_disabled | extra_set
 
 
 def _normalize_string_set(values) -> Set[str]:

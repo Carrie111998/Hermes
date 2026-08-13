@@ -504,6 +504,10 @@ def init_agent(
     max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
+    allowed_tool_names: List[str] = None,
+    denied_tool_names: List[str] = None,
+    disabled_skills: List[str] = None,
+    tool_preset: str = None,
     save_trajectories: bool = False,
     verbose_logging: bool = False,
     quiet_mode: bool = False,
@@ -888,7 +892,16 @@ def init_agent(
     # Store toolset filtering options
     agent.enabled_toolsets = enabled_toolsets
     agent.disabled_toolsets = disabled_toolsets
-    
+    # Per-tool + per-skill filtering (per-chat tool presets). These are the
+    # source of truth for persistence and mid-chat rebuilds. Kept as-is
+    # (None = no filter, [] = whitelist/deny nothing-but-core) — never coerce
+    # an empty list to None, or a chat-only posture silently re-expands.
+    agent.allowed_tool_names = allowed_tool_names
+    agent.denied_tool_names = denied_tool_names
+    agent.disabled_skills = disabled_skills
+    # Display-only preset label ("Chat-only" / "Full" / "Custom" / <name>).
+    agent.tool_preset = tool_preset
+
     # Model response configuration
     agent.max_tokens = max_tokens  # None = use model default
     agent.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
@@ -1499,6 +1512,8 @@ def init_agent(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        allowed_tool_names=allowed_tool_names,
+        denied_tool_names=denied_tool_names,
     )
     
     # Show tool configuration and store valid tool names for validation
@@ -1668,6 +1683,22 @@ def init_agent(
         "reasoning_config": reasoning_config,
         "max_tokens": max_tokens,
     }
+    # Per-chat tool/skill posture snapshot. Persisted at session create and
+    # carried into the DB row so a resume rebuilds the same surface. Use
+    # explicit ``is not None`` so an empty list ([] = chat-only) survives the
+    # round-trip instead of being dropped as "falsy".
+    if enabled_toolsets is not None:
+        agent._session_init_model_config["enabled_toolsets"] = enabled_toolsets
+    if disabled_toolsets is not None:
+        agent._session_init_model_config["disabled_toolsets"] = disabled_toolsets
+    if allowed_tool_names is not None:
+        agent._session_init_model_config["allowed_tool_names"] = allowed_tool_names
+    if denied_tool_names is not None:
+        agent._session_init_model_config["denied_tool_names"] = denied_tool_names
+    if disabled_skills is not None:
+        agent._session_init_model_config["disabled_skills"] = disabled_skills
+    if tool_preset is not None:
+        agent._session_init_model_config["tool_preset"] = tool_preset
     # Persist a process-scoped --yolo launch into the session row so a later
     # `hermes --resume <id>` can restore the bypass (CLI resume paths read
     # model_config.yolo_mode back via SessionDB.session_yolo_enabled).

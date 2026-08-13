@@ -2047,15 +2047,21 @@ def test_load_enabled_toolsets_accepts_plugin_env_after_discovery(monkeypatch):
 
 def test_load_enabled_toolsets_folds_project_into_focus_posture(monkeypatch):
     # Focus-mode coding posture returns before the config fallback, but it's
-    # still a GUI-only resolver — `project` must come along so the desktop keeps
-    # the project tools while sitting in a repo.
+    # still a GUI-only resolver — the client-surface toolsets (`project`,
+    # `tool_presets`) must come along so the desktop keeps them while sitting
+    # in a repo.
     monkeypatch.delenv("HERMES_TUI_TOOLSETS", raising=False)
 
     import agent.coding_context as cc
 
     monkeypatch.setattr(cc, "coding_selection", lambda **_: ["coding", "figma"])
 
-    assert server._load_enabled_toolsets("tui") == ["coding", "figma", "project"]
+    assert server._load_enabled_toolsets("tui") == [
+        "coding",
+        "figma",
+        "project",
+        "tool_presets",
+    ]
 
 
 def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
@@ -2077,17 +2083,19 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
     )
 
-    # Sorted: ["kanban", "memory", "project"]. `kanban` is auto-recovered by
-    # _get_platform_tools (a non-configurable platform toolset in hermes-cli's
-    # universe); `project` is GUI-only, folded in by _load_enabled_toolsets.
-    # Toolsets inside their first release (_RECENTLY_SHIPPED_TOOLSETS) are
-    # back-filled onto saved lists that never offered them — allow those too.
+    # `kanban` is auto-recovered by _get_platform_tools (a non-configurable
+    # platform toolset in hermes-cli's universe); `project` and `tool_presets`
+    # are GUI/client surfaces, folded in by _load_enabled_toolsets via
+    # _gui_surface_toolsets. Toolsets inside their first release
+    # (_RECENTLY_SHIPPED_TOOLSETS) are back-filled onto saved lists that never
+    # offered them — allow those too.
     from hermes_cli.tools_config import _RECENTLY_SHIPPED_TOOLSETS
 
+    base = {"kanban", "memory", "project", "tool_presets"}
     result = server._load_enabled_toolsets()
     assert result is not None
-    assert {"kanban", "memory", "project"} <= set(result)
-    assert set(result) - {"kanban", "memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    assert base <= set(result)
+    assert set(result) - base <= _RECENTLY_SHIPPED_TOOLSETS
     err = capsys.readouterr().err
     assert "ignoring disabled MCP servers" in err
     assert "mcp-off" in err
@@ -2110,10 +2118,11 @@ def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, caps
 
     from hermes_cli.tools_config import _RECENTLY_SHIPPED_TOOLSETS
 
+    base = {"kanban", "memory", "project", "tool_presets"}
     result = server._load_enabled_toolsets()
     assert result is not None
-    assert {"kanban", "memory", "project"} <= set(result)
-    assert set(result) - {"kanban", "memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    assert base <= set(result)
+    assert set(result) - base <= _RECENTLY_SHIPPED_TOOLSETS
     assert "using configured CLI toolsets" in capsys.readouterr().err
 
 

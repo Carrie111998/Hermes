@@ -1718,6 +1718,7 @@ def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
+    extra_disabled_skills: "list[str] | set[str] | None" = None,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -1749,7 +1750,7 @@ def build_skills_system_prompt(
     # Include the resolved platform so per-platform disabled-skill lists
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
-    disabled = get_disabled_skill_names(_platform_hint or None)
+    disabled = get_disabled_skill_names(_platform_hint or None, extra=extra_disabled_skills)
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),

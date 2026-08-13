@@ -42,6 +42,7 @@ import { NotificationsSettings } from './notifications-settings'
 import { PluginsSettings } from './plugins-settings'
 import { PROVIDER_VIEWS, ProvidersSettings, type ProviderView } from './providers-settings'
 import { SessionsSettings } from './sessions-settings'
+import { ToolPresetsSettings } from './tool-presets-settings'
 import type { SettingsPageProps, SettingsView as SettingsViewId } from './types'
 
 const SETTINGS_VIEWS: readonly SettingsViewId[] = [
@@ -53,6 +54,7 @@ const SETTINGS_VIEWS: readonly SettingsViewId[] = [
   'notifications',
   'billing',
   'plugins',
+  'tool-presets',
   'sessions',
   'about'
 ]
@@ -244,6 +246,13 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
         onSelect: () => setActiveView('plugins')
       },
       {
+        active: activeView === 'tool-presets',
+        icon: Wrench,
+        id: 'tool-presets',
+        label: 'Tool Presets',
+        onSelect: () => setActiveView('tool-presets')
+      },
+      {
         active: activeView === 'sessions',
         icon: Archive,
         id: 'sessions',
@@ -330,6 +339,8 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
             <BillingSettings />
           ) : activeView === 'plugins' ? (
             <PluginsSettings />
+          ) : activeView === 'tool-presets' ? (
+            <ToolPresetsSettings />
           ) : (
             <SessionsSettings />
           )}

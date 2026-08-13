@@ -2376,6 +2376,8 @@ export const ja = defineLocale({
         tokenSummary: (used, max) => `${used} / ${max} Tokens`
       },
       session: 'セッション',
+      runtimeSessionElapsed: 'ランタイムセッション経過時間',
+      openToolPresets: 'このチャットでモデルに送信されるツールスキーマ — クリックしてプリセットを編集',
       yoloOn: 'YOLO オン — 危険なコマンドを自動承認中。Shift+クリックで全体に切り替え。',
       yoloOff: 'YOLO オフ。Shift+クリックで全体に切り替え。',
       modelNone: 'なし',

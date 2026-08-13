@@ -107,6 +107,14 @@ export type GatewayEventPayload = {
   // Lets the desktop app map runtime→stored for background sessions it hasn't
   // opened, so the sidebar working indicator updates without opening the chat.
   stored_session_id?: string
+  // session.info — per-chat tool posture (contract §6). `enabled_toolsets` is
+  // `[]` for chat-only (FALSY — never coalesce with `||`), `[...]` for a subset,
+  // or `null` for no override (full). `tool_preset` is a display label only.
+  enabled_toolsets?: string[] | null
+  disabled_toolsets?: string[] | null
+  tool_preset?: string | null
+  tool_count?: number
+  tools_est_tokens?: number
   // moa.reference / moa.aggregating (Mixture of Agents per-model relay)
   label?: string
   index?: number

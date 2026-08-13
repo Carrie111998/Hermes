@@ -89,8 +89,13 @@ class TestResolverPlumbing:
             "coding",
             "desktop_ui",
             "project",
+            "tool_presets",
         ]
-        assert server._load_enabled_toolsets("tui") == ["coding", "project"]
+        assert server._load_enabled_toolsets("tui") == [
+            "coding",
+            "project",
+            "tool_presets",
+        ]
 
     def test_config_path_folds_in_the_session_surface(self, no_desktop_env):
         import agent.coding_context as cc

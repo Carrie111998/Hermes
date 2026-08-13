@@ -1435,11 +1435,15 @@ def _(rid, params: dict) -> dict:
         from toolsets import get_all_toolsets, get_toolset_info
 
         session = _sessions.get(params.get("session_id", ""))
-        enabled = (
-            set(getattr(session["agent"], "enabled_toolsets", []) or [])
-            if session
-            else set(_load_enabled_toolsets() or [])
-        )
+        # Empty-list-vs-None: a chat-only session (enabled_toolsets == []) must
+        # report every toolset as DISABLED, not fall through to "all enabled".
+        # Track the raw selection separately from the truthiness of the set.
+        if session:
+            _raw_enabled = getattr(session["agent"], "enabled_toolsets", None)
+        else:
+            _raw_enabled = _load_enabled_toolsets()
+        _has_selection = _raw_enabled is not None
+        enabled = set(_raw_enabled or [])
 
         items = []
         for name in sorted(get_all_toolsets().keys()):
@@ -1451,7 +1455,7 @@ def _(rid, params: dict) -> dict:
                     "name": name,
                     "description": info["description"],
                     "tool_count": info["tool_count"],
-                    "enabled": name in enabled if enabled else True,
+                    "enabled": (name in enabled) if _has_selection else True,
                     "tools": info["resolved_tools"],
                 }
             )
@@ -1466,15 +1470,28 @@ def _(rid, params: dict) -> dict:
         from model_tools import get_toolset_for_tool, get_tool_definitions
 
         session = _sessions.get(params.get("session_id", ""))
-        enabled = (
-            getattr(session["agent"], "enabled_toolsets", None)
-            if session
-            else _load_enabled_toolsets()
-        )
+        # ``getattr(..., None)`` returns the raw selection, so a chat-only []
+        # is passed through verbatim (never re-expanded). Also honor the
+        # session's per-tool filters so the shown set matches the live agent.
+        if session:
+            _agent = session["agent"]
+            enabled = getattr(_agent, "enabled_toolsets", None)
+            disabled = getattr(_agent, "disabled_toolsets", None)
+            allowed = getattr(_agent, "allowed_tool_names", None)
+            denied = getattr(_agent, "denied_tool_names", None)
+        else:
+            enabled = _load_enabled_toolsets()
+            disabled = allowed = denied = None
         # Pre-assembly list: /tools is a discovery surface and must show
         # tools deferred behind the tool_search bridge (same as the CLI).
-        tools = get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True,
-                                     skip_tool_search_assembly=True)
+        tools = get_tool_definitions(
+            enabled_toolsets=enabled,
+            disabled_toolsets=disabled,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+            allowed_tool_names=allowed,
+            denied_tool_names=denied,
+        )
         sections = {}
 
         for tool in sorted(tools, key=lambda t: t["function"]["name"]):
@@ -1578,11 +1595,14 @@ def _(rid, params: dict) -> dict:
         from toolsets import get_all_toolsets, get_toolset_info
 
         session = _sessions.get(params.get("session_id", ""))
-        enabled = (
-            set(getattr(session["agent"], "enabled_toolsets", []) or [])
-            if session
-            else set(_load_enabled_toolsets() or [])
-        )
+        # Empty-list-vs-None (see tools.list): a chat-only [] must report all
+        # toolsets disabled, not fall through to "all enabled".
+        if session:
+            _raw_enabled = getattr(session["agent"], "enabled_toolsets", None)
+        else:
+            _raw_enabled = _load_enabled_toolsets()
+        _has_selection = _raw_enabled is not None
+        enabled = set(_raw_enabled or [])
 
         items = []
         for name in sorted(get_all_toolsets().keys()):
@@ -1594,7 +1614,7 @@ def _(rid, params: dict) -> dict:
                     "name": name,
                     "description": info["description"],
                     "tool_count": info["tool_count"],
-                    "enabled": name in enabled if enabled else True,
+                    "enabled": (name in enabled) if _has_selection else True,
                 }
             )
         return _ok(rid, {"toolsets": items})
@@ -1958,6 +1978,171 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5002, "command timed out (30s)")
     except Exception as e:
         return _err(rid, 5003, str(e))
+
+
+@method("tools.session_configure")
+def _(rid, params: dict) -> dict:
+    """Set a live session's per-chat tool posture (mid-chat) and persist it.
+
+    Turn-boundary gated: refuses while the session is generating (changing
+    ``agent.tools`` mid-turn breaks the provider prompt cache). Resolves a
+    named preset to lists (ignoring the explicit list fields) or applies the
+    explicit lists verbatim as "Custom". Persists into ``model_config`` and
+    emits ``session.info``. Does NOT write config.yaml or reset the agent.
+    """
+    sid = str(params.get("session_id", "") or "")
+    session = _sessions.get(sid)
+    if session is None:
+        return _err(rid, 4004, "unknown session")
+    if session.get("running"):
+        # Busy — the caller retries at the next turn boundary.
+        return _ok(rid, {"ok": False, "reason": "busy"})
+    agent = session.get("agent")
+    if agent is None:
+        return _err(rid, 4004, "session agent not built")
+
+    try:
+        import tool_presets
+        from agent.agent_runtime_helpers import rebuild_agent_toolsets
+
+        preset_name = params.get("preset")
+        resolved = tool_presets.resolve_preset(preset_name)
+        if resolved is not None:
+            # Known preset (built-in or config) — its resolved lists win; the
+            # explicit list fields in params are ignored.
+            enabled = resolved["enabled_toolsets"]
+            disabled = resolved["disabled_toolsets"]
+            allowed = resolved["allowed_tool_names"]
+            denied = resolved["denied_tool_names"]
+            disabled_skills = resolved["disabled_skills"]
+            tool_preset = resolved["tool_preset"]
+        else:
+            # "Custom" / null — use the explicit lists as given.
+            enabled = params.get("enabled_toolsets")
+            disabled = params.get("disabled_toolsets")
+            allowed = params.get("allowed_tool_names")
+            denied = params.get("denied_tool_names")
+            disabled_skills = params.get("disabled_skills")
+            tool_preset = preset_name if preset_name else None
+
+        tokens = _set_session_context(session.get("session_key"))
+        try:
+            rebuild_agent_toolsets(
+                agent,
+                enabled=enabled,
+                disabled=disabled,
+                allowed=allowed,
+                denied=denied,
+                disabled_skills=disabled_skills,
+                tool_preset=tool_preset,
+                quiet_mode=True,
+            )
+        finally:
+            _clear_session_context(tokens)
+
+        # Persist the new resolved posture into model_config so a resume
+        # rebuilds the same surface, then refresh the stored system prompt.
+        _persist_live_session_runtime(session)
+        _persist_live_session_system_prompt(session)
+
+        info = _session_info(agent, session)
+        _emit("session.info", sid, info)
+        return _ok(rid, {"ok": True, "session": info})
+    except Exception as e:
+        # rebuild_agent_toolsets mutates agent state before republishing tools,
+        # so a failure here can corrupt the live surface — log with a traceback
+        # (not just the terse RPC error) so it's diagnosable in production.
+        logger.error("tools.session_configure failed", exc_info=True)
+        return _err(rid, 5036, str(e))
+
+
+@method("tools.catalog")
+def _(rid, params: dict) -> dict:
+    """Return the full selectable catalog with per-item token estimates."""
+    try:
+        import tool_catalog
+
+        profile = params.get("profile") if isinstance(params, dict) else None
+        return _ok(rid, tool_catalog.build_catalog(profile=profile))
+    except Exception as e:
+        return _err(rid, 5037, str(e))
+
+
+@method("tools.presets_list")
+def _(rid, params: dict) -> dict:
+    """List all selectable presets (2 virtual built-ins + user presets)."""
+    try:
+        import tool_presets
+
+        return _ok(rid, {"presets": tool_presets.list_presets()})
+    except Exception as e:
+        return _err(rid, 5038, str(e))
+
+
+@method("tools.preset_save")
+def _(rid, params: dict) -> dict:
+    """Upsert a preset by name. Reserved built-in names persist as overrides
+    (delete resets them to default). Persists presets."""
+    try:
+        import tool_presets
+
+        preset = params.get("preset") if isinstance(params, dict) else None
+        if not isinstance(preset, dict):
+            return _err(rid, 4019, "preset object required")
+        presets = tool_presets.save_preset(preset)
+        return _ok(rid, {"presets": presets})
+    except ValueError as e:
+        return _err(rid, 4020, str(e))
+    except Exception as e:
+        return _err(rid, 5039, str(e))
+
+
+@method("tools.preset_delete")
+def _(rid, params: dict) -> dict:
+    """Delete a user preset by name. Persists presets."""
+    try:
+        import tool_presets
+
+        name = str(params.get("name", "") or "").strip()
+        if not name:
+            return _err(rid, 4021, "name required")
+        presets = tool_presets.delete_preset(name)
+        return _ok(rid, {"presets": presets})
+    except Exception as e:
+        return _err(rid, 5040, str(e))
+
+
+@method("tools.default_preset_get")
+def _(rid, params: dict) -> dict:
+    """Return the profile's configured default tool preset for NEW chats.
+
+    ``name`` is the stored ``default_tool_preset`` (or null when unset — a new
+    chat then falls through to the platform/coding posture). Empty/unknown names
+    normalize to null so the UI can render "no default" cleanly.
+    """
+    try:
+        import tool_presets
+
+        return _ok(rid, {"name": tool_presets.get_default_preset()})
+    except Exception as e:
+        return _err(rid, 5041, str(e))
+
+
+@method("tools.default_preset_set")
+def _(rid, params: dict) -> dict:
+    """Set (or clear) the profile's default tool preset for NEW chats.
+
+    ``name`` = a known preset name (built-in or user) to make every new chat
+    start with it; null/empty clears the default (new chats fall through to the
+    platform/coding posture). Persists to ``config.yaml`` via load/save.
+    """
+    try:
+        import tool_presets
+
+        name = str(params.get("name") or "").strip()
+        return _ok(rid, {"name": tool_presets.set_default_preset(name or None)})
+    except Exception as e:
+        return _err(rid, 5042, str(e))
 
 
 def register(server) -> None:

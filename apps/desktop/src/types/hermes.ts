@@ -520,6 +520,19 @@ export interface SessionInfo {
   profile?: string
   /** True when {@link profile} is the default profile. */
   is_default_profile?: boolean
+  // ── Per-chat tool posture (contract §6 / shared `SessionToolInfo`) ──────────
+  /** Resolved snapshot of the session's enabled toolsets. `[]` = chat-only
+   *  (zero non-core tools — FALSY, never coalesce with `||`); `[...]` = a
+   *  subset; `null` = no per-session override (full/profile default). */
+  enabled_toolsets?: string[] | null
+  /** Per-session toolset subtractions, or null when unset. */
+  disabled_toolsets?: string[] | null
+  /** Display label only: "Chat-only" | "Full" | "Custom" | <preset name> | null. */
+  tool_preset?: string | null
+  /** `len(agent.tools)` of the live tool surface. */
+  tool_count?: number
+  /** Estimated token cost (chars/4) of the current tool schemas. */
+  tools_est_tokens?: number
 }
 
 export type TimelineDisplayMetadata =

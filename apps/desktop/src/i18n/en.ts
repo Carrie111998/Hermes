@@ -2603,6 +2603,8 @@ export const en: Translations = {
         tokenSummary: (used, max) => `${used} / ${max} Tokens`
       },
       session: 'Session',
+      runtimeSessionElapsed: 'Runtime session elapsed',
+      openToolPresets: 'Tool schemas sent to the model this chat — click to edit presets',
       yoloOn: 'YOLO on — auto-approving dangerous commands. Shift+click toggles globally.',
       yoloOff: 'YOLO off. Shift+click toggles globally.',
       modelNone: 'none',

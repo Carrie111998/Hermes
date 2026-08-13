@@ -2195,6 +2195,8 @@ export interface Translations {
         tokenSummary: (used: string, max: string) => string
       }
       session: string
+      runtimeSessionElapsed: string
+      openToolPresets: string
       yoloOn: string
       yoloOff: string
       modelNone: string

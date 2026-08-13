@@ -44,6 +44,19 @@ export {
   JsonRpcGatewayClient,
   type WebSocketLike
 } from './json-rpc-gateway'
+export type {
+  SessionToolInfo,
+  ToolCatalog,
+  ToolCatalogItem,
+  ToolCatalogMcpServer,
+  ToolCatalogSkill,
+  ToolCatalogToolset,
+  ToolDefaultPresetResult,
+  ToolPreset,
+  ToolPresetsResult,
+  ToolsSessionConfigureParams,
+  ToolsSessionConfigureResult
+} from './json-rpc-gateway'
 export { skillInvocationText } from './skill-scaffold'
 export {
   type HermesSkin,

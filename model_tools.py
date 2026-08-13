@@ -309,6 +309,8 @@ def get_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    allowed_tool_names: Optional[List[str]] = None,
+    denied_tool_names: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -319,6 +321,12 @@ def get_tool_definitions(
         enabled_toolsets: Only include tools from these toolsets.
         disabled_toolsets: Exclude tools from these toolsets (if enabled_toolsets is None).
         quiet_mode: Suppress status prints.
+        allowed_tool_names: Per-tool whitelist applied on top of toolset
+            selection. When not None, only these tool names (plus always-kept
+            core tools) survive. An empty list keeps just the core tools.
+        denied_tool_names: Per-tool blacklist. Tool names listed here are
+            dropped (core tools are never dropped — same protection as
+            ``disabled_toolsets``).
         skip_tool_search_assembly: When True, return the pre-assembly tool list
             (raw schemas for every enabled tool). Used internally by the
             tool_search / tool_describe bridge handlers so they can read the
@@ -358,6 +366,13 @@ def get_tool_definitions(
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
                 profile_scope,
+                # Per-tool filters must key the memo distinctly — allowed_tool_names
+                # of ``[]`` (whitelist nothing but core) must NOT collide with None
+                # (no whitelist), so distinguish the two explicitly. denied uses
+                # the same ``is not None`` discipline for consistency with the
+                # documented invariant, even though [] and None deny-nothing alike.
+                frozenset(allowed_tool_names) if allowed_tool_names is not None else None,
+                frozenset(denied_tool_names) if denied_tool_names is not None else None,
             )
         with _tool_defs_cache_lock:
             cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
@@ -371,7 +386,9 @@ def get_tool_definitions(
             return list(cached)
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+                                       skip_tool_search_assembly=skip_tool_search_assembly,
+                                       allowed_tool_names=allowed_tool_names,
+                                       denied_tool_names=denied_tool_names)
     if quiet_mode and cache_key is not None:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -403,6 +420,8 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    allowed_tool_names: Optional[List[str]] = None,
+    denied_tool_names: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -490,8 +509,34 @@ def _compute_tool_definitions(
     # needed; plugins respect enabled_toolsets / disabled_toolsets like any
     # other toolset.
 
+    # Per-tool whitelist is ADDITIVE: a preset can enable an individual tool
+    # without enabling its whole toolset. These are unioned on top of the
+    # toolset-resolved set (after disabled_toolsets subtraction so an explicit
+    # allow wins over a toolset-level disable).
+    if allowed_tool_names:
+        tools_to_include.update(allowed_tool_names)
+
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+
+    # ── Per-tool blacklist (denied) ───────────────────────────────────────
+    # Drop these individual tools even if a selected toolset would include
+    # them — and even if they are in _HERMES_CORE_TOOLS. Per-tool selection is
+    # fully user-controlled (a preset author may want a chat without, say,
+    # terminal or browser); nothing is force-kept here. Toolset-level core
+    # protection still lives in the disabled_toolsets subtraction above.
+    if denied_tool_names:
+        denied_set = set(denied_tool_names)
+        kept_tools = [
+            td for td in filtered_tools
+            if td.get("function", {}).get("name", "") not in denied_set
+        ]
+        if not quiet_mode and len(kept_tools) != len(filtered_tools):
+            dropped = [
+                t["function"]["name"] for t in filtered_tools if t not in kept_tools
+            ]
+            print(f"🔧 Per-tool filter dropped {len(dropped)} tool(s): {', '.join(dropped)}")
+        filtered_tools = kept_tools
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references

@@ -70,6 +70,28 @@ def _(rid, params: dict) -> dict:
             "priority" if is_truthy_value(params.get("fast")) else ""
         )
 
+    # Per-chat tool preset for a BRAND-NEW chat. Precedence (highest first):
+    #   draft-picked `tool_preset` param  >  configured `default_tool_preset`.
+    # Resolve to the runtime override lists HERE (create-time), never inside
+    # _make_agent, so RESUMED sessions — which restore their own stored posture
+    # from model_config — are never retroactively changed by the default. None
+    # (no param, no configured default, or an unknown name) means "no preset":
+    # the build falls through to the platform/coding posture (_load_enabled_toolsets)
+    # then profile config. resolve_preset preserves [] (chat-only) vs None (Full).
+    create_tool_preset = None
+    try:
+        import tool_presets
+
+        _preset_name = str(params.get("tool_preset") or "").strip()
+        if not _preset_name:
+            # Public accessor for the configured default (normalizes empty/
+            # unknown to None) — avoids reaching for server's private _load_cfg.
+            _preset_name = str(tool_presets.get_default_preset() or "").strip()
+        if _preset_name:
+            create_tool_preset = tool_presets.resolve_preset(_preset_name)
+    except Exception:
+        logger.debug("create-time tool preset resolution failed", exc_info=True)
+
     ready = threading.Event()
     now = time.time()
     lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
@@ -96,6 +118,7 @@ def _(rid, params: dict) -> dict:
             "model_override": session_model_override,
             "create_reasoning_override": create_reasoning_override,
             "create_service_tier_override": create_service_tier_override,
+            "create_tool_preset": create_tool_preset,
             "parent_session_id": parent_session_id,
             "pending_title": title or None,
             "profile_home": str(profile_home) if profile_home is not None else None,

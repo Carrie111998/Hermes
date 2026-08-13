@@ -57,6 +57,7 @@ import {
   setCurrentPersonality,
   setCurrentReasoningEffort,
   setCurrentServiceTier,
+  setCurrentToolPosture,
   setCurrentUsage,
   setMessages,
   setSessions,
@@ -490,6 +491,20 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
           if (typeof payload?.yolo === 'boolean') {
             setYoloActive(payload.yolo)
+          }
+
+          // Per-chat tool posture (contract §6). The backend stamps these on
+          // every session.info; guard on presence so an older backend that
+          // omits them doesn't wipe the pill to "unknown". `enabled_toolsets`
+          // may legitimately be `[]` (chat-only), so test with `in`, never a
+          // falsy check.
+          if (payload && ('tool_preset' in payload || 'enabled_toolsets' in payload || 'tool_count' in payload)) {
+            setCurrentToolPosture({
+              preset: typeof payload.tool_preset === 'string' ? payload.tool_preset : null,
+              enabledToolsets: Array.isArray(payload.enabled_toolsets) ? payload.enabled_toolsets : null,
+              toolCount: typeof payload.tool_count === 'number' ? payload.tool_count : null,
+              toolsEstTokens: typeof payload.tools_est_tokens === 'number' ? payload.tools_est_tokens : null
+            })
           }
         }
 

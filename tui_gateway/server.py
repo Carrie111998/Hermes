@@ -2262,6 +2262,22 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
+                    # Tool preset the desktop draft (or the configured default)
+                    # picked for this brand-new chat, resolved at create-time.
+                    # Splat the resolved axes as the existing *_override kwargs so
+                    # they build into the agent AND persist to model_config (round-
+                    # tripping on later resume). Every axis is passed explicitly —
+                    # including [] (chat-only) and None (Full) — so _make_agent's
+                    # _UNSET discipline keeps those meaningful values distinct from
+                    # "no override".
+                    resolved_preset = current.get("create_tool_preset")
+                    if isinstance(resolved_preset, dict):
+                        kw["enabled_toolsets_override"] = resolved_preset.get("enabled_toolsets")
+                        kw["disabled_toolsets_override"] = resolved_preset.get("disabled_toolsets")
+                        kw["allowed_tool_names_override"] = resolved_preset.get("allowed_tool_names")
+                        kw["denied_tool_names_override"] = resolved_preset.get("denied_tool_names")
+                        kw["disabled_skills_override"] = resolved_preset.get("disabled_skills")
+                        kw["tool_preset_override"] = resolved_preset.get("tool_preset")
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -2853,6 +2869,27 @@ def _ensure_session_db_row(session: dict) -> None:
         # service_tier value to the provider. Persist a durable marker so resume
         # can distinguish that choice from an omitted/inherited tier.
         model_config["service_tier"] = create_service_tier_override or "normal"
+    # Per-chat tool preset resolved at create-time (draft pick or the profile's
+    # default_tool_preset). Persist the resolved snapshot into this FIRST
+    # model_config write — the agent isn't built yet at first prompt.submit — so
+    # a resume restores the same surface even before the agent's own live-persist
+    # runs. Explicit ``is not None`` keeps [] (chat-only) from being dropped and
+    # re-expanded to full tools; matches _runtime_model_config's serialization.
+    resolved_preset = session.get("create_tool_preset")
+    if isinstance(resolved_preset, dict):
+        for _preset_key in (
+            "enabled_toolsets",
+            "disabled_toolsets",
+            "allowed_tool_names",
+            "denied_tool_names",
+            "disabled_skills",
+        ):
+            _preset_val = resolved_preset.get(_preset_key)
+            if _preset_val is not None:
+                model_config[_preset_key] = list(_preset_val)
+        _preset_label = resolved_preset.get("tool_preset")
+        if _preset_label is not None:
+            model_config["tool_preset"] = _preset_label
     # Branch lineage: stamp the same ``_branched_from`` marker the TUI /branch
     # uses so list_sessions_rich keeps the branch listed and the desktop sidebar
     # can nest it under its parent.
@@ -3862,6 +3899,22 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     elif service_tier:
         overrides["service_tier_override"] = service_tier
 
+    # Per-chat tool/skill posture. Restore ONLY keys the stored blob actually
+    # has (``in`` check, never truthiness) so a chat-only session's persisted
+    # ``enabled_toolsets: []`` round-trips as a real override instead of being
+    # dropped and re-expanded to full tools. ``_make_agent`` consumes these
+    # ``*_override`` keys via an _UNSET sentinel.
+    for _cfg_key, _ovr_key in (
+        ("enabled_toolsets", "enabled_toolsets_override"),
+        ("disabled_toolsets", "disabled_toolsets_override"),
+        ("allowed_tool_names", "allowed_tool_names_override"),
+        ("denied_tool_names", "denied_tool_names_override"),
+        ("disabled_skills", "disabled_skills_override"),
+        ("tool_preset", "tool_preset_override"),
+    ):
+        if _cfg_key in model_config:
+            overrides[_ovr_key] = model_config[_cfg_key]
+
     return overrides
 
 
@@ -3922,6 +3975,29 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
         config["service_tier"] = service_tier
     else:
         config.pop("service_tier", None)
+
+    # Per-chat tool/skill posture snapshot (per-chat tool presets). CRITICAL:
+    # use explicit ``is not None`` so an empty list ([] = chat-only) survives
+    # the round-trip — a truthiness check would drop it and silently re-expand
+    # the chat to full tools on the next resume. ``None`` = no override, so the
+    # key is removed to keep the blob terse.
+    for _attr, _key in (
+        ("enabled_toolsets", "enabled_toolsets"),
+        ("disabled_toolsets", "disabled_toolsets"),
+        ("allowed_tool_names", "allowed_tool_names"),
+        ("denied_tool_names", "denied_tool_names"),
+        ("disabled_skills", "disabled_skills"),
+    ):
+        _val = getattr(agent, _attr, None)
+        if _val is not None:
+            config[_key] = list(_val)
+        else:
+            config.pop(_key, None)
+    _preset = getattr(agent, "tool_preset", None)
+    if _preset is not None:
+        config["tool_preset"] = _preset
+    else:
+        config.pop("tool_preset", None)
 
     return config
 
@@ -4251,7 +4327,10 @@ def _gui_surface_toolsets(platform: str) -> set[str]:
     the same backend told the model it was "chatting inside the Hermes desktop
     app". See the surface-capability rule in AGENTS.md.
     """
-    surfaces = {"project"}
+    # ``tool_presets`` carries ``manage_presets`` (per-chat tool/MCP/skill
+    # preset CRUD) — a client-surface concept off _HERMES_CORE_TOOLS, exposed on
+    # exactly the desktop/TUI surfaces that can act on presets.
+    surfaces = {"project", "tool_presets"}
     if platform == "desktop":
         surfaces.add("desktop_ui")
     return surfaces
@@ -5348,6 +5427,32 @@ def _session_info(agent, session: dict | None = None) -> dict:
         warn = _probe_credentials(agent)
         if warn:
             info["credential_warning"] = warn
+
+    # Per-chat tool posture (per-chat tool presets). Report the raw selection so
+    # the desktop can distinguish chat-only ([]) from Full (null). tool_count /
+    # tools_est_tokens summarize the live surface for the header badge.
+    if agent is not None:
+        info["enabled_toolsets"] = getattr(agent, "enabled_toolsets", None)
+        info["disabled_toolsets"] = getattr(agent, "disabled_toolsets", None)
+        info["tool_preset"] = getattr(agent, "tool_preset", None)
+        _agent_tools = getattr(agent, "tools", None) or []
+        info["tool_count"] = len(_agent_tools)
+        try:
+            import json as _json
+
+            _chars = sum(
+                len(_json.dumps(_t, ensure_ascii=False, separators=(",", ":")))
+                for _t in _agent_tools
+            )
+            info["tools_est_tokens"] = int(_chars / 4)
+        except Exception:
+            info["tools_est_tokens"] = 0
+    else:
+        info["enabled_toolsets"] = None
+        info["disabled_toolsets"] = None
+        info["tool_preset"] = None
+        info["tool_count"] = 0
+        info["tools_est_tokens"] = 0
     return info
 
 
@@ -6197,12 +6302,22 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "acp_args": getattr(agent, "acp_args", None) or None,
         "model": getattr(agent, "model", None) or _resolve_model(),
         "max_iterations": _cfg_max_turns(cfg, 25),
-        "enabled_toolsets": getattr(agent, "enabled_toolsets", None)
+        # Empty-list-vs-None: a chat-only parent (enabled_toolsets == []) must
+        # NOT re-expand to full tools here. Only fall back to the platform
+        # default when the parent has genuinely no per-session selection.
         # Detached background tasks declare platform="tui" below: they have no
         # UI session id, so a renderer-routed event has nowhere to land. Resolve
         # their toolsets against that same platform rather than the gateway
         # process's, so they never carry GUI schema they cannot use.
-        or _load_enabled_toolsets("tui"),
+        "enabled_toolsets": (
+            getattr(agent, "enabled_toolsets", None)
+            if getattr(agent, "enabled_toolsets", None) is not None
+            else _load_enabled_toolsets("tui")
+        ),
+        "disabled_toolsets": getattr(agent, "disabled_toolsets", None),
+        "allowed_tool_names": getattr(agent, "allowed_tool_names", None),
+        "denied_tool_names": getattr(agent, "denied_tool_names", None),
+        "disabled_skills": getattr(agent, "disabled_skills", None),
         "quiet_mode": True,
         "verbose_logging": False,
         "ephemeral_system_prompt": getattr(agent, "ephemeral_system_prompt", None)
@@ -6232,6 +6347,12 @@ def _ephemeral_preview_agent_kwargs(agent, task_id: str) -> dict:
     kwargs.update(
         {
             "enabled_toolsets": ["terminal", "file"],
+            # The preview agent has its own fixed toolset — don't inherit the
+            # parent chat's per-tool/skill filters (they may deny terminal/file).
+            "disabled_toolsets": None,
+            "allowed_tool_names": None,
+            "denied_tool_names": None,
+            "disabled_skills": None,
             "session_db": None,
             "skip_memory": True,
         }
@@ -6357,22 +6478,39 @@ def _preview_restart_callbacks(parent: str, task_id: str) -> dict:
 def _reset_session_agent(sid: str, session: dict) -> dict:
     tokens = _set_session_context(session["session_key"])
     try:
-        # /new is a full conversation boundary: session-scoped runtime
-        # overrides (/model, /reasoning, /fast) do NOT carry forward — the
-        # fresh agent re-derives model/provider, reasoning, and service tier
-        # from config.yaml (#48055, #23131). Session pins are cleared below so
-        # a rebuild can't resurrect them. (Global process state is still never
-        # touched — see the cross-session-contamination note in
-        # _apply_model_switch.)
+        # /new is a full conversation boundary: transient runtime overrides
+        # (/model, /reasoning, /fast) do NOT carry forward — the fresh agent
+        # re-derives model/provider, reasoning, and service tier from
+        # config.yaml (#48055, #23131). Session pins are cleared so a rebuild
+        # can't resurrect them. (Global process state is still never touched —
+        # see the cross-session-contamination note in _apply_model_switch.)
         session.pop("model_override", None)
         session.pop("create_reasoning_override", None)
         session.pop("create_service_tier_override", None)
         session.pop("one_turn_model_restore", None)
+        # The chat's tool/skill posture is NOT a transient runtime override: per
+        # the per-chat tool presets contract it is a persistent per-chat
+        # property (resolved snapshot stored in model_config, read on resume).
+        # Preserve it across /new so a reset doesn't silently revert a chat-only
+        # chat to full tools — and so the subsequent model_config persist can't
+        # overwrite the stored posture with the profile default. Read the live
+        # agent's resolved selection and forward it as explicit overrides (the
+        # _UNSET sentinel keeps [] / None distinguishable from "not provided").
+        reset_kw: dict = {}
+        old_agent = session.get("agent")
+        if old_agent is not None:
+            reset_kw["enabled_toolsets_override"] = getattr(old_agent, "enabled_toolsets", None)
+            reset_kw["disabled_toolsets_override"] = getattr(old_agent, "disabled_toolsets", None)
+            reset_kw["allowed_tool_names_override"] = getattr(old_agent, "allowed_tool_names", None)
+            reset_kw["denied_tool_names_override"] = getattr(old_agent, "denied_tool_names", None)
+            reset_kw["disabled_skills_override"] = getattr(old_agent, "disabled_skills", None)
+            reset_kw["tool_preset_override"] = getattr(old_agent, "tool_preset", None)
         new_agent = _make_agent(
             sid,
             session["session_key"],
             session_id=session["session_key"],
             platform_override=_session_source(session),
+            **reset_kw,
         )
     finally:
         _clear_session_context(tokens)
@@ -6471,6 +6609,12 @@ def _schedule_mcp_late_refresh(sid: str, agent) -> None:
     ).start()
 
 
+# Sentinel distinguishing "no per-session tool override supplied" from a real
+# override value of ``None`` or ``[]`` (chat-only). Never use ``x or default``
+# on these axes — an empty list is a meaningful posture, not a missing one.
+_UNSET = object()
+
+
 class _RuntimeFallbackResolution(NamedTuple):
     runtime: dict
     selected_model: str | None
@@ -6543,6 +6687,12 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    enabled_toolsets_override=_UNSET,
+    disabled_toolsets_override=_UNSET,
+    allowed_tool_names_override=_UNSET,
+    denied_tool_names_override=_UNSET,
+    disabled_skills_override=_UNSET,
+    tool_preset_override=_UNSET,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -6672,6 +6822,35 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
+    # Resolve the tool posture with the contract precedence:
+    #   per-session stored override  >  platform/coding-posture  >  profile.
+    # The ``_UNSET`` sentinel keeps an override of ``None`` (Full) or ``[]``
+    # (chat-only) distinguishable from "no override" — a truthiness check here
+    # would silently re-expand a chat-only session to full tools.
+    if enabled_toolsets_override is _UNSET:
+        # Resolve the platform default against this session's own platform so a
+        # session never carries GUI schema it can't use (mirrors the background-
+        # task path); the per-session override still wins when present.
+        _enabled_toolsets = _load_enabled_toolsets(
+            _resolve_agent_platform(platform_override)
+        )
+    else:
+        _enabled_toolsets = enabled_toolsets_override
+    _disabled_toolsets = (
+        None if disabled_toolsets_override is _UNSET else disabled_toolsets_override
+    )
+    _allowed_tool_names = (
+        None if allowed_tool_names_override is _UNSET else allowed_tool_names_override
+    )
+    _denied_tool_names = (
+        None if denied_tool_names_override is _UNSET else denied_tool_names_override
+    )
+    _disabled_skills = (
+        None if disabled_skills_override is _UNSET else disabled_skills_override
+    )
+    _tool_preset = (
+        None if tool_preset_override is _UNSET else tool_preset_override
+    )
     return AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
@@ -6698,7 +6877,12 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
-        enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
+        enabled_toolsets=_enabled_toolsets,
+        disabled_toolsets=_disabled_toolsets,
+        allowed_tool_names=_allowed_tool_names,
+        denied_tool_names=_denied_tool_names,
+        disabled_skills=_disabled_skills,
+        tool_preset=_tool_preset,
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
