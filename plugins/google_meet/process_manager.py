@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from hermes_constants import get_hermes_home
+from hermes_constants import real_executable
 
 # File + directory layout (under $HERMES_HOME):
 #
@@ -161,7 +162,7 @@ def start(
     log_fh = open(log_path, "ab", buffering=0)
     try:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "plugins.google_meet.meet_bot"],
+            [real_executable(), "-m", "plugins.google_meet.meet_bot"],
             stdin=subprocess.DEVNULL,
             stdout=log_fh,
             stderr=subprocess.STDOUT,

@@ -33,6 +33,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
+from hermes_constants import real_executable
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -1201,7 +1202,7 @@ def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict
     project_root = Path(__file__).parent.parent.resolve()
     try:
         result = subprocess.run(
-            [sys.executable, "-c",
+            [real_executable(), "-c",
              "import json; from tools.skills_sync import sync_skills; "
              "r = sync_skills(quiet=True); print(json.dumps(r))"],
             env={**os.environ, "HERMES_HOME": str(profile_dir)},

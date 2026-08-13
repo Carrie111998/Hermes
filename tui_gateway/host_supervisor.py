@@ -22,7 +22,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, real_executable
 from tools.environments.local import hermes_subprocess_env
 
 logger = logging.getLogger(__name__)
@@ -141,7 +141,10 @@ class HostSupervisor:
         autostart: bool = True,
     ) -> None:
         self.registry_path = Path(registry_path) if registry_path is not None else _default_registry_path()
-        self.argv = argv or [sys.executable, "-m", "tui_gateway.compute_host"]
+        # real_executable(), not sys.executable: under Store Python the latter is the
+        # MSIX alias, whose spawn starts SUSPENDED pending AppX activation and strands
+        # the child if this parent dies first (see hermes_constants.real_executable).
+        self.argv = argv or [real_executable(), "-m", "tui_gateway.compute_host"]
         self.cwd = Path(cwd) if cwd is not None else _repo_root()
         self.env = env
         self.rpc_sink = rpc_sink or (lambda _obj: None)

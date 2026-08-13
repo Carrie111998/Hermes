@@ -13,6 +13,8 @@ import shutil
 import sys
 from typing import Optional, Sequence
 
+from hermes_constants import real_executable
+
 from hermes_cli._parser import (
     PRE_ARGPARSE_INHERITED_FLAGS,
     build_top_level_parser,
@@ -141,7 +143,10 @@ def build_relaunch_argv(
     if bin_path:
         argv = [bin_path]
     else:
-        argv = [sys.executable, "-m", "hermes_cli.main"]
+        # real_executable(), not sys.executable: the latter is the MSIX alias under
+        # Store Python, and spawning it starts the child SUSPENDED pending AppX
+        # activation (see hermes_constants.real_executable).
+        argv = [real_executable(), "-m", "hermes_cli.main"]
 
     src = list(original_argv) if original_argv is not None else list(sys.argv[1:])
 

@@ -584,6 +584,59 @@ def find_node_executable_on_path(command: str) -> str | None:
     return None
 
 
+_MSIX_ALIAS_MARKER = os.path.join("Microsoft", "WindowsApps").lower()
+
+
+def real_executable() -> str:
+    """Return a spawnable interpreter path for subprocess ``argv[0]``.
+
+    Identical to :data:`sys.executable` everywhere except a Microsoft-Store
+    CPython host on Windows, where that value is an **MSIX app-execution alias**
+    (``%LOCALAPPDATA%\\Microsoft\\WindowsApps\\...\\python.exe``, a 0-byte reparse
+    point) -- reported as ``sys.executable`` **even when the process was started
+    from the real packaged binary**, because Store Python rewrites it. So the
+    value cannot be used to tell how this process was launched.
+
+    Spawning that alias is what creates suspended orphans: AppX starts the
+    packaged child SUSPENDED and resumes it only once the activation handoff
+    completes. If the launching parent dies first nothing ever resumes it, and
+    the process survives indefinitely at ~1.9 MB RSS, 0.0 CPU, one thread, with
+    only ``ntdll.dll`` loaded -- proof it never executed an instruction.
+    ``[sys.executable, "-m", ...]`` is therefore the riskiest spawn shape we have:
+    short-lived children whose parent can die mid-handoff.
+
+    :data:`sys.base_prefix` points at the REAL packaged directory even when
+    ``sys.executable`` is the alias, and it follows Store updates, so nothing
+    version-stamped is hardcoded here.
+
+    THE VERSIONED FILENAME IS LOAD-BEARING. Inside that directory the ACL is per
+    file: ``python3.11.exe``/``pythonw3.11.exe`` (the package's declared entry
+    points) execute, while the unversioned ``python.exe``/``pythonw.exe`` exist
+    but deny execute -- every launch API fails them with ``[WinError 5] Access is
+    denied`` (CreateProcess, ShellExecute, cmd.exe, PowerShell, and the distlib
+    console-script launcher alike). An ``isfile`` check alone will happily hand
+    back a binary that can never be started. Verified 2026-08-13.
+
+    Fail-open: anything unexpected returns ``sys.executable`` unchanged. A spawn
+    carrying the latent race beats no spawn at all.
+    """
+    exe = sys.executable or ""
+    if sys.platform != "win32" or _MSIX_ALIAS_MARKER not in exe.replace("/", "\\").lower():
+        return exe
+
+    base = getattr(sys, "base_prefix", "") or ""
+    if not base:
+        return exe
+
+    # Versioned leaf ONLY -- the unversioned sibling exists but denies execute.
+    leaf = f"python{sys.version_info.major}.{sys.version_info.minor}.exe"
+    candidate = os.path.join(base, leaf)
+    if os.path.isfile(candidate):
+        return candidate
+
+    return exe
+
+
 def find_node_executable(command: str) -> str | None:
     """Resolve a Node.js command, preferring healthy Hermes-managed installs.
 

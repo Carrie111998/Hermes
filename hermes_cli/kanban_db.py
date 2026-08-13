@@ -91,6 +91,7 @@ from typing import Any, Iterable, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
+from hermes_constants import real_executable
 
 _log = logging.getLogger(__name__)
 
@@ -8007,7 +8008,7 @@ def _module_hermes_argv() -> list[str]:
     # ``hermes_cli.main`` is the console-script target declared in
     # pyproject.toml, NOT a top-level ``hermes`` package — there is no
     # ``hermes`` package to import.
-    return [sys.executable, "-m", "hermes_cli.main"]
+    return [real_executable(), "-m", "hermes_cli.main"]
 
 
 def _absolute_hermes_path(path: str) -> str:

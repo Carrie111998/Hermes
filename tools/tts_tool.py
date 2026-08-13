@@ -2003,7 +2003,7 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
 
     synth_script = str(Path(__file__).parent / "neutts_synth.py")
     cmd = [
-        sys.executable, synth_script,
+        real_executable(), synth_script,
         "--text", text,
         "--out", wav_path,
         "--ref-audio", ref_audio,
@@ -2995,6 +2995,7 @@ if __name__ == "__main__":
 # Registry
 # ---------------------------------------------------------------------------
 from tools.registry import registry, tool_error
+from hermes_constants import real_executable
 
 TTS_SCHEMA = {
     "name": "text_to_speech",

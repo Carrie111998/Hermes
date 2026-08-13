@@ -279,6 +279,7 @@ def _checklist_toolset_keys(platform: str) -> Set[str]:
 # module shares the same data.  Kept as dict-of-dicts for backward
 # compatibility with existing ``PLATFORMS[key]["label"]`` access patterns.
 from hermes_cli.platforms import PLATFORMS as _PLATFORMS_REGISTRY
+from hermes_constants import real_executable
 
 PLATFORMS = {
     k: {"label": info.label, "default_toolset": info.default_toolset}
@@ -745,7 +746,7 @@ def _pip_install(
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
 
-    pip_cmd = [sys.executable, "-m", "pip"]
+    pip_cmd = [real_executable(), "-m", "pip"]
     try:
         # Probe for pip; bootstrap via ensurepip if missing (uv venv lacks it).
         # DEVNULL, not capture_output=True: only the returncode is read here.
@@ -764,7 +765,7 @@ def _pip_install(
             # the failure path below stringifies the exception, and
             # CalledProcessError renders the cmd and returncode, not stdout.
             subprocess.run(
-                [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
+                [real_executable(), "-m", "ensurepip", "--upgrade", "--default-pip"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=120, check=True,
                 creationflags=_post_setup_no_window_flags(),

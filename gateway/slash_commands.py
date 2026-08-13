@@ -46,6 +46,7 @@ from utils import (
     base_url_host_matches,
     is_truthy_value,
 )
+from hermes_constants import real_executable
 
 logger = logging.getLogger("gateway.run")
 
@@ -5110,7 +5111,7 @@ class GatewaySlashCommandsMixin:
                 ).strip()
                 subprocess.Popen(
                     [
-                        sys.executable, "-c", helper,
+                        real_executable(), "-c", helper,
                         str(output_path), str(exit_code_path),
                         *hermes_cmd, "update", "--gateway",
                     ],

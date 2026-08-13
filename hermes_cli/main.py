@@ -443,6 +443,10 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Optional
 
+# real_executable(), not sys.executable, for every subprocess argv[0] below: under
+# Store Python sys.executable is the MSIX alias, and spawning it starts the child
+# SUSPENDED pending AppX activation -- a parent that exits first strands it forever.
+from hermes_constants import real_executable
 
 from hermes_cli.subcommands._shared import add_accept_hooks_flag as _add_accept_hooks_flag
 from hermes_cli.subcommands.cron import build_cron_parser
@@ -6820,7 +6824,7 @@ def _update_via_zip(args):
 
     uv_bin = ensure_uv()
 
-    pip_cmd = [sys.executable, "-m", "pip"]
+    pip_cmd = [real_executable(), "-m", "pip"]
     if not uv_bin:
         uv_bin = _ensure_uv_for_termux(pip_cmd)
     if uv_bin:
@@ -6843,7 +6847,7 @@ def _update_via_zip(args):
             )
         except subprocess.CalledProcessError:
             subprocess.run(
-                [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
+                [real_executable(), "-m", "ensurepip", "--upgrade", "--default-pip"],
                 cwd=PROJECT_ROOT,
                 check=True,
             )
@@ -7608,7 +7612,7 @@ def _recover_from_interrupted_install() -> None:
             # known-good pip so at least the plain-pip path below can proceed.
             try:
                 subprocess.run(
-                    [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
+                    [real_executable(), "-m", "ensurepip", "--upgrade", "--default-pip"],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                 )
@@ -7628,7 +7632,7 @@ def _recover_from_interrupted_install() -> None:
                 )
             else:
                 _install_python_dependencies_with_optional_fallback(
-                    [sys.executable, "-m", "pip"],
+                    [real_executable(), "-m", "pip"],
                     group="termux-all" if _is_termux_env() else "all",
                 )
 
@@ -10140,7 +10144,7 @@ def _cmd_update_pip(args):
             # interpreter, matching pip's default behaviour.
             cmd.insert(3, "--system")
     else:
-        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "hermes-agent"]
+        cmd = [real_executable(), "-m", "pip", "install", "--upgrade", "hermes-agent"]
 
     print(f"→ Running: {' '.join(cmd)}")
     run_kwargs = {}
@@ -10477,7 +10481,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     )
                 else:
                     _install_python_dependencies_with_optional_fallback(
-                        [sys.executable, "-m", "pip"], group="all"
+                        [real_executable(), "-m", "pip"], group="all"
                     )
                 _clear_update_incomplete_marker()
                 healthy_after, detail_after = _venv_core_imports_healthy()
@@ -10632,7 +10636,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         uv_bin = ensure_uv()
 
-        pip_cmd = [sys.executable, "-m", "pip"]
+        pip_cmd = [real_executable(), "-m", "pip"]
         if not uv_bin:
             uv_bin = _ensure_uv_for_termux(pip_cmd)
         install_group = "all"
@@ -10655,7 +10659,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # avoiding PEP 668 'externally-managed-environment' errors on Debian/Ubuntu.
             # Some environments lose pip inside the venv; bootstrap it back with
             # ensurepip before trying the editable install.
-            pip_cmd = [sys.executable, "-m", "pip"]
+            pip_cmd = [real_executable(), "-m", "pip"]
             try:
                 subprocess.run(
                     pip_cmd + ["--version"],
@@ -10665,7 +10669,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 )
             except subprocess.CalledProcessError:
                 subprocess.run(
-                    [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
+                    [real_executable(), "-m", "ensurepip", "--upgrade", "--default-pip"],
                     cwd=PROJECT_ROOT,
                     check=True,
                 )
@@ -10699,7 +10703,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         has_desktop_app = _desktop_packaged_executable(desktop_dir) is not None or _desktop_dist_exists(desktop_dir)
         if (desktop_dir / "package.json").exists() and _resolve_node_runtime_npm() and has_desktop_app:
             print("→ Checking if desktop app needs rebuilding...")
-            _desktop_build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
+            _desktop_build_cmd = [real_executable(), "-m", "hermes_cli.main", "desktop", "--build-only"]
             # Capture the (very loud) Electron/vite build output into
             # update.log instead of streaming it to the terminal. On the rare
             # nonzero exit, retry once after waiting again for the venv — this
@@ -12826,7 +12830,7 @@ def cmd_dashboard(args):
             f"preselected). Use --isolated for a dedicated per-profile server."
         )
         reexec_argv = [
-            sys.executable, "-m", "hermes_cli.main",
+            real_executable(), "-m", "hermes_cli.main",
             "-p", "default",
             # Preserve the lean serve path across the re-exec so a named-profile
             # `serve` doesn't silently rebuild the UI as `dashboard`.

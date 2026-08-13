@@ -24,6 +24,7 @@ from typing import Dict, List, Optional
 from events.bus import EventBus
 from events.schema import Event, EventType
 from events.subscribers.base import BaseSubscriber
+from hermes_constants import real_executable
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +75,7 @@ class CriticSubscriber(BaseSubscriber):
             return
 
         cmd: List[str] = [
-            sys.executable,
+            real_executable(),
             str(self.critic_script_path),
             "--cluster",
             f"agent={source},type={failure_type}",

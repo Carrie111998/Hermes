@@ -8,9 +8,10 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any, Optional
+
+from hermes_constants import real_executable
 
 logger = logging.getLogger(__name__)
 
@@ -242,7 +243,9 @@ class WebhookRouteProcessor:
                 return False, None
             argv = [bash, str(path)]
         else:
-            argv = [sys.executable, str(path)]
+            # real_executable(): never spawn the MSIX alias, whose activation
+            # handoff strands the child if we die first (hermes_constants).
+            argv = [real_executable(), str(path)]
 
         try:
             from tools.environments.local import _sanitize_subprocess_env

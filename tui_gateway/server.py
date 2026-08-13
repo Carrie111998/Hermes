@@ -28,6 +28,7 @@ from hermes_cli.env_loader import load_hermes_dotenv
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
+from hermes_constants import real_executable
 from tui_gateway import git_probe
 from tui_gateway.transport import (
     StdioTransport,
@@ -371,8 +372,12 @@ class _SlashWorker:
         self.stderr_tail: list[str] = []
         self.stdout_queue: queue.Queue[dict | None] = queue.Queue()
 
+        # real_executable(), not sys.executable: under Store Python the latter is
+        # the MSIX alias, and spawning it starts the child SUSPENDED pending AppX
+        # activation — if this gateway dies mid-handoff the worker is stranded
+        # forever (see hermes_constants.real_executable).
         argv = [
-            sys.executable,
+            real_executable(),
             "-m",
             "tui_gateway.slash_worker",
             "--session-key",
@@ -13100,7 +13105,8 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"blocked": True, "hint": hint, "code": -1, "output": ""})
     try:
         r = subprocess.run(
-            [sys.executable, "-m", "hermes_cli.main", *argv],
+            # real_executable(): never spawn the MSIX alias (hermes_constants).
+            [real_executable(), "-m", "hermes_cli.main", *argv],
             capture_output=True,
             text=True,
             timeout=min(int(params.get("timeout", 240)), 600),

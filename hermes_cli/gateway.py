@@ -909,8 +909,15 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
         respawn_env_literal=respawn_env_literal,
     )
 
+    # real_executable(), not sys.executable: under Store Python the latter is the
+    # MSIX alias, and spawning it starts the child SUSPENDED pending AppX
+    # activation -- if this process exits mid-handoff the watcher is stranded
+    # forever (see hermes_constants.real_executable). Imported locally: this
+    # module defers its other hermes_constants import too.
+    from hermes_constants import real_executable
+
     watcher_argv = [
-        sys.executable,
+        real_executable(),
         "-c",
         watcher,
         str(old_pid),

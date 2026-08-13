@@ -2791,7 +2791,7 @@ def _resolve_hermes_bin() -> Optional[list[str]]:
         import importlib.util
 
         if importlib.util.find_spec("hermes_cli") is not None:
-            return [sys.executable, "-m", "hermes_cli.main"]
+            return [real_executable(), "-m", "hermes_cli.main"]
     except Exception:
         pass
 
@@ -2888,6 +2888,7 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
 # Used by tools (e.g. send_message) that need to route through a live
 # adapter for plugin platforms.  Set in GatewayRunner.__init__().
 import weakref as _weakref
+from hermes_constants import real_executable
 _gateway_runner_ref: _weakref.ref = lambda: None
 
 

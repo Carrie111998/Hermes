@@ -5547,7 +5547,7 @@ def _install_memory_provider_pip_dependencies(dependencies: List[str]) -> List[D
         command: Any = [uv_path, "pip", "install", "--python", sys.executable, "--quiet", *missing]
         display = f"uv pip install --python {sys.executable} {' '.join(missing)}"
     else:
-        command = [sys.executable, "-m", "pip", "install", "--quiet", *missing]
+        command = [real_executable(), "-m", "pip", "install", "--quiet", *missing]
         display = f"{sys.executable} -m pip install {' '.join(missing)}"
 
     try:
@@ -19390,6 +19390,7 @@ _mount_plugin_api_routes()
 # always mounted — the gate middleware decides whether to enforce auth,
 # not whether the routes exist.
 from hermes_cli.dashboard_auth.routes import router as _dashboard_auth_router  # noqa: E402
+from hermes_constants import real_executable
 app.include_router(_dashboard_auth_router)
 
 mount_spa(app)

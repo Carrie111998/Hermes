@@ -21,6 +21,7 @@ from hermes_constants import get_hermes_home
 
 from plugins.google_meet import process_manager as pm
 from plugins.google_meet.meet_bot import _is_safe_meet_url
+from hermes_constants import real_executable
 
 
 def _auth_state_path() -> Path:
@@ -264,7 +265,7 @@ def _cmd_install(*, realtime: bool, assume_yes: bool) -> int:
     print("\n[2/3] python -m playwright install chromium")
     try:
         res = _sp.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
+            [real_executable(), "-m", "playwright", "install", "chromium"],
             check=False,
         )
         if res.returncode != 0:

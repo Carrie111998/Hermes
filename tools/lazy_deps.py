@@ -78,6 +78,7 @@ import sysconfig
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
+from hermes_constants import real_executable
 
 logger = logging.getLogger(__name__)
 
@@ -686,7 +687,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                 logger.debug("uv invocation failed: %s", e)
 
         # Tier 2: python -m pip (with ensurepip bootstrap if needed)
-        pip_cmd = [sys.executable, "-m", "pip"]
+        pip_cmd = [real_executable(), "-m", "pip"]
         try:
             probe = subprocess.run(
                 pip_cmd + ["--version"],
@@ -703,7 +704,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                 # holds open the capture pipe handles. Raised manually rather
                 # than via check=True, which run_text_capture does not take.
                 bootstrap = run_text_capture(
-                    [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
+                    [real_executable(), "-m", "ensurepip", "--upgrade", "--default-pip"],
                     timeout=120,
                 )
                 if bootstrap.returncode != 0:

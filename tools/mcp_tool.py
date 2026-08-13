@@ -107,6 +107,7 @@ from typing import Callable
 from datetime import datetime
 from typing import Any, Coroutine, Dict, List, Optional
 from urllib.parse import urlparse
+from hermes_constants import real_executable
 
 logger = logging.getLogger(__name__)
 
@@ -694,7 +695,7 @@ def _wrap_command_with_watchdog(command: str, args: list) -> tuple[str, list]:
         command,
         *args,
     ]
-    return sys.executable, watchdog_args
+    return real_executable(), watchdog_args
 
 
 # ---------------------------------------------------------------------------
