@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import urllib.parse
 
@@ -1545,22 +1546,39 @@ def _model_flow_named_custom(config, provider_info):
     # The unexpanded template survives on ``api_key_ref`` — the field
     # ``_custom_provider_api_key_config_value`` already trusts to persist this
     # entry — so key the decision off the template rather than off the
-    # expanded value, and re-resolve through the scope-aware reader. Mirrors
-    # the ``${...}`` handling on the picker path in ``model_switch``.
+    # expanded value, and re-resolve through the scope-aware reader.
     api_key_template = str(provider_info.get("api_key_ref") or "").strip()
     if not api_key_template and isinstance(api_key, str):
         api_key_template = api_key.strip()
-    ref_body = ""
-    if api_key_template.startswith("${") and api_key_template.endswith("}"):
-        ref_body = api_key_template[2:-1]
-    if ref_body and "}" not in ref_body:
-        # Exactly one whole ref. ``[^}]+`` mirrors ``_expand_env_vars``' own
-        # pattern, so a composite such as ``sk-${SUFFIX}`` or ``${A}-${B}``
-        # does not reach here and keeps whatever the expansion produced.
-        ref_var = _env_ref_var_name(ref_body)
-        api_key = (get_env_value(ref_var) or "") if ref_var else ""
+    if "${" in api_key_template:
+        # Rebuild the whole credential from the template by re-running
+        # ``_expand_env_vars``' own ``\${([^}]+)}`` pattern, resolving each
+        # match through the scope-aware reader instead of ``os.environ``.
+        # Substituting every ref — rather than special-casing a template that
+        # happens to be exactly one whole ref — is what makes this cover the
+        # composite (``sk-${SUFFIX}``) and multi-ref (``${A}-${B}``) shapes.
+        # Each ``${...}`` inside those was substituted out of the same
+        # process-global environment, so each is the same cross-profile read;
+        # the surrounding literal text does not make it a different question,
+        # and a composite leaves no ``${`` behind to be recognised by later.
+        unresolved: list[str] = []
+
+        def _scoped_ref(match):
+            ref_var = _env_ref_var_name(match.group(1))
+            value = (get_env_value(ref_var) or "") if ref_var else ""
+            if not value:
+                unresolved.append(match.group(0))
+            return value
+
+        rebuilt = re.sub(r"\${([^}]+)}", _scoped_ref, api_key_template)
+        # Fail closed. A ref this profile cannot resolve — unset, outside the
+        # scope, or a non-env SecretRef source that ``_env_ref_var_name``
+        # declines — leaves a hole in the credential, and a partially built
+        # key must never be sent to the endpoint. Dropping it also re-opens
+        # the ``key_env`` fallback below, which a truthy value would shadow.
+        api_key = "" if unresolved else rebuilt
     elif isinstance(api_key, str) and "${" in api_key:
-        # A composite the expansion could not fully resolve is still a
+        # A placeholder the expansion could not resolve is still a
         # placeholder, never a credential — do not probe with it.
         api_key = ""
 
