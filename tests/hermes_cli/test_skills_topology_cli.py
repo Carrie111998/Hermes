@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -80,23 +79,22 @@ def test_topology_parser_is_read_only_and_supports_json():
     assert not hasattr(args, "deep")
 
 
-def test_topology_loader_requests_the_full_installed_graph(monkeypatch):
+def test_topology_loader_uses_the_shared_installed_inventory(monkeypatch):
     from hermes_cli import skills_topology
     from tools import skills_tool
 
     captured = {}
 
-    def fake_find_all_skills(**kwargs):
+    def fake_inventory(**kwargs):
         captured.update(kwargs)
         return []
 
-    monkeypatch.setattr(skills_tool, "_find_all_skills", fake_find_all_skills)
+    monkeypatch.setattr(skills_tool, "build_installed_skill_inventory", fake_inventory)
 
     skills_topology._load_skill_records(include_disabled=True)
 
     assert captured == {
         "skip_disabled": True,
-        "include_topology": True,
         "include_ineligible": True,
     }
 
@@ -194,7 +192,7 @@ def test_route_parser_rejects_nonpositive_limits(argv):
         _parser().parse_args(argv)
 
 
-def test_route_json_is_stable_and_omits_raw_query(monkeypatch, capsys):
+def test_route_json_is_stable_and_omits_query_and_fingerprint(monkeypatch, capsys):
     from hermes_cli import skills_topology
 
     records = [
@@ -221,9 +219,7 @@ def test_route_json_is_stable_and_omits_raw_query(monkeypatch, capsys):
     payload = json.loads(first_output)
     assert first == second
     assert first_output == second_output
-    assert payload["query_digest"] == hashlib.sha256(
-        b"review private-8675309"
-    ).hexdigest()
+    assert "query_digest" not in payload
     assert [item["name"] for item in payload["route"]] == [
         "plan",
         "review-private-8675309",

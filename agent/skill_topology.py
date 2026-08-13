@@ -8,7 +8,6 @@ normal platform, environment, disabled-skill, and permission gates.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 import re
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -446,7 +445,6 @@ def plan_skill_route(
     budget_chars: int,
 ) -> dict[str, Any]:
     """Select a deterministic, dependency-ordered local skill neighborhood."""
-    digest = hashlib.sha256(str(query).encode("utf-8")).hexdigest()
     diagnostics: list[dict[str, Any]] = []
     if max_skills < 1 or budget_chars < 1:
         if max_skills < 1:
@@ -456,7 +454,6 @@ def plan_skill_route(
         return {
             "version": ROUTE_ARTIFACT_VERSION,
             "status": "blocked",
-            "query_digest": digest,
             "limits": {"max_skills": max_skills, "budget_chars": budget_chars},
             "route": [],
             "total_cost_chars": 0,
@@ -469,6 +466,35 @@ def plan_skill_route(
         _collision_diagnostic(key, records)
         for key, records in collisions.items()
     )
+
+    unreadable_matches = []
+    for record in skills:
+        if record.get("inventory_error") != "skill_content_unavailable":
+            continue
+        score, _ = _score_record(record, str(query))
+        if score:
+            unreadable_matches.append(record)
+    if unreadable_matches:
+        for record in sorted(
+            unreadable_matches,
+            key=lambda item: (_name_key(_record_name(item)), _record_name(item)),
+        ):
+            diagnostics.append(
+                _diagnostic(
+                    "skill_content_unavailable",
+                    f"Skill '{_record_name(record)}' cannot be safely read for route planning.",
+                    skill=_record_name(record),
+                )
+            )
+        return {
+            "version": ROUTE_ARTIFACT_VERSION,
+            "status": "blocked",
+            "limits": {"max_skills": max_skills, "budget_chars": budget_chars},
+            "route": [],
+            "total_cost_chars": 0,
+            "total_cost_bytes": 0,
+            "diagnostics": _sort_diagnostics(diagnostics),
+        }
 
     ranked: list[tuple[int, str, str, Mapping[str, Any], list[str]]] = []
     for key in sorted(by_name):
@@ -495,7 +521,6 @@ def plan_skill_route(
         return {
             "version": ROUTE_ARTIFACT_VERSION,
             "status": "blocked",
-            "query_digest": digest,
             "limits": {"max_skills": max_skills, "budget_chars": budget_chars},
             "route": [],
             "total_cost_chars": 0,
@@ -511,7 +536,6 @@ def plan_skill_route(
         return {
             "version": ROUTE_ARTIFACT_VERSION,
             "status": "no_match",
-            "query_digest": digest,
             "limits": {"max_skills": max_skills, "budget_chars": budget_chars},
             "route": [],
             "total_cost_chars": 0,
@@ -761,7 +785,6 @@ def plan_skill_route(
     return {
         "version": ROUTE_ARTIFACT_VERSION,
         "status": status,
-        "query_digest": digest,
         "limits": {"max_skills": max_skills, "budget_chars": budget_chars},
         "route": route,
         "total_cost_chars": cumulative_chars,

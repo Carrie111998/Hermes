@@ -9,12 +9,11 @@ from agent.skill_topology import audit_topology, plan_skill_route
 
 
 def _load_skill_records(*, include_disabled: bool) -> list[dict[str, Any]]:
-    """Load rich records through the canonical skill scanner."""
-    from tools.skills_tool import _find_all_skills
+    """Load the same rich installed inventory as the model-tool topology path."""
+    from tools.skills_tool import build_installed_skill_inventory
 
-    return _find_all_skills(
+    return build_installed_skill_inventory(
         skip_disabled=include_disabled,
-        include_topology=True,
         include_ineligible=include_disabled,
     )
 
@@ -33,7 +32,6 @@ def _print_diagnostics(diagnostics: list[dict[str, Any]]) -> None:
 
 def _print_route(artifact: dict[str, Any]) -> None:
     print(f"Skill route: {artifact['status']}")
-    print(f"Query digest: {artifact['query_digest']}")
     print(
         f"Budget: {artifact['total_cost_chars']}/"
         f"{artifact['limits']['budget_chars']} characters; "

@@ -830,6 +830,107 @@ def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
 
 
+def _plugin_topology_records(*, include_ineligible: bool) -> List[Dict[str, Any]]:
+    """Return rich records for registered plugin skills without exposing paths.
+
+    Plugin skills are registered outside the local/external scan tree.  Route
+    planning must nevertheless account for exactly the same complete
+    ``SKILL.md`` representation as a rich local scan.  A registered file that
+    cannot be decoded is retained as a matching fail-closed sentinel; the
+    planner reports only its qualified name, never the path or file content.
+    """
+    from agent.skill_topology import parse_topology
+    from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+    records: List[Dict[str, Any]] = []
+    try:
+        discover_plugins()
+        manager = get_plugin_manager()
+        plugin_skills = manager.list_plugin_skill_metadata()
+    except Exception:
+        logger.debug("Plugin skill discovery failed", exc_info=True)
+        return records
+
+    for metadata in plugin_skills:
+        plugin_skill = dict(metadata)
+        registered_frontmatter = plugin_skill.pop("frontmatter", {})
+        if not isinstance(registered_frontmatter, dict):
+            registered_frontmatter = {}
+        name = str(plugin_skill.get("name") or "")
+        if not name:
+            continue
+        inventory_error = None
+        raw_content = b""
+        content = ""
+        try:
+            registered_path = plugin_skill.get("path") or manager.find_plugin_skill(name)
+            path = Path(registered_path)
+            raw_content = path.read_bytes()
+            content = raw_content.decode("utf-8-sig")
+            parsed_frontmatter, _ = _parse_frontmatter(content)
+            # The registered file is authoritative.  Keep registration-time
+            # metadata only for older plugins whose file has no parseable
+            # frontmatter at all.
+            frontmatter = parsed_frontmatter or registered_frontmatter
+        except (KeyError, OSError, UnicodeDecodeError, TypeError, ValueError):
+            # Do not propagate exception strings: they can contain private
+            # local paths.  The route planner treats this matching candidate
+            # as blocked rather than undercharging it from its description.
+            inventory_error = "skill_content_unavailable"
+            frontmatter = registered_frontmatter
+        if not include_ineligible:
+            if not skill_matches_platform(frontmatter):
+                continue
+            if not skill_matches_environment(frontmatter):
+                continue
+            if _is_skill_disabled(name):
+                continue
+
+        metadata_block = frontmatter.get("metadata")
+        hermes_meta = (
+            metadata_block.get("hermes", {})
+            if isinstance(metadata_block, dict)
+            and isinstance(metadata_block.get("hermes"), dict)
+            else {}
+        )
+        record = {
+            "name": name,
+            "description": str(
+                frontmatter.get("description") or plugin_skill.get("description", "")
+            ),
+            "category": str(plugin_skill.get("category") or "plugin"),
+            "tags": _parse_tags(
+                hermes_meta.get("tags") or frontmatter.get("tags", "")
+            ),
+            "topology": parse_topology(hermes_meta.get("topology")),
+        }
+        if inventory_error:
+            record["inventory_error"] = inventory_error
+        else:
+            record["cost_chars"] = len(content)
+            record["cost_bytes"] = len(raw_content)
+        records.append(record)
+    return records
+
+
+def build_installed_skill_inventory(
+    *, skip_disabled: bool = False, include_ineligible: bool = False
+) -> List[Dict[str, Any]]:
+    """Build the one rich installed inventory used by route and audit paths.
+
+    Ordinary ``skills_list()`` listings deliberately do not use this builder:
+    preserving their legacy local/external-only shape also avoids plugin
+    discovery unless callers explicitly request topology-aware work.
+    """
+    records = _find_all_skills(
+        skip_disabled=skip_disabled,
+        include_topology=True,
+        include_ineligible=include_ineligible,
+    )
+    records.extend(_plugin_topology_records(include_ineligible=include_ineligible))
+    return records
+
+
 def skills_list(
     category: str = None,
     task_id: str = None,
@@ -856,68 +957,19 @@ def skills_list(
     try:
         active_skills_dir = _skills_dir()
         if not active_skills_dir.exists():
-            if query is not None:
-                from agent.skill_topology import (
-                    DEFAULT_ROUTE_BUDGET_CHARS,
-                    DEFAULT_ROUTE_LIMIT,
-                    plan_skill_route,
-                )
+            # A topology query may still route a registered plugin skill even
+            # when this profile has no local skills directory yet.  Keep the
+            # legacy no-query side effect (creating the directory) unchanged.
+            if query is None:
+                active_skills_dir.mkdir(parents=True, exist_ok=True)
 
-                artifact = plan_skill_route(
-                    [],
-                    query,
-                    max_skills=(DEFAULT_ROUTE_LIMIT if limit is None else limit),
-                    budget_chars=(
-                        DEFAULT_ROUTE_BUDGET_CHARS
-                        if budget_chars is None
-                        else budget_chars
-                    ),
-                )
-                return json.dumps(
-                    {"success": True, "mode": "route", **artifact},
-                    ensure_ascii=False,
-                )
-            active_skills_dir.mkdir(parents=True, exist_ok=True)
-
-        # Find all skills. Query mode requests the richer topology/cost shape;
-        # the ordinary listing preserves the legacy minimal metadata contract.
-        all_skills = _find_all_skills(include_topology=query is not None)
-        try:
-            from hermes_cli.plugins import discover_plugins, get_plugin_manager
-
-            discover_plugins()
-            for plugin_skill in get_plugin_manager().list_plugin_skill_metadata():
-                plugin_skill = dict(plugin_skill)
-                frontmatter = plugin_skill.pop("frontmatter", {})
-                if not skill_matches_platform(frontmatter):
-                    continue
-                if _is_skill_disabled(plugin_skill["name"]):
-                    continue
-                if query is not None:
-                    from agent.skill_topology import parse_topology
-
-                    metadata = frontmatter.get("metadata")
-                    hermes_meta = (
-                        metadata.get("hermes", {})
-                        if isinstance(metadata, dict)
-                        and isinstance(metadata.get("hermes"), dict)
-                        else {}
-                    )
-                    description = str(plugin_skill.get("description", ""))
-                    plugin_skill.update(
-                        {
-                            "tags": _parse_tags(
-                                hermes_meta.get("tags")
-                                or frontmatter.get("tags", "")
-                            ),
-                            "topology": parse_topology(hermes_meta.get("topology")),
-                            "cost_chars": len(description),
-                            "cost_bytes": len(description.encode("utf-8")),
-                        }
-                    )
-                all_skills.append(plugin_skill)
-        except Exception:
-            logger.debug("Plugin skill listing failed", exc_info=True)
+        # Topology query mode uses the shared rich inventory.  The ordinary
+        # listing must preserve its historical local/external-only behavior.
+        all_skills = (
+            build_installed_skill_inventory()
+            if query is not None
+            else _find_all_skills()
+        )
 
         if query is not None:
             from agent.skill_topology import (

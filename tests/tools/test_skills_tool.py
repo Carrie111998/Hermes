@@ -260,6 +260,261 @@ class TestFindAllSkills:
 
 
 class TestSkillsList:
+    def test_unqueried_listing_does_not_discover_plugin_skills(self, tmp_path, monkeypatch):
+        """The legacy no-query index must remain local/external only."""
+        from hermes_cli import plugins
+
+        calls = []
+        monkeypatch.setattr(plugins, "discover_plugins", lambda: calls.append(True))
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "local")
+            result = json.loads(skills_list())
+
+        assert [item["name"] for item in result["skills"]] == ["local"]
+        assert calls == []
+
+    def test_query_plugin_uses_complete_skill_content_cost_and_environment_gate(
+        self, tmp_path, monkeypatch
+    ):
+        """Plugin candidates use their registered SKILL.md, never a short description."""
+        from hermes_cli import plugins
+
+        plugin_skill = tmp_path / "plugin" / "SKILL.md"
+        plugin_skill.parent.mkdir()
+        plugin_skill.write_bytes(
+            b"\xef\xbb\xbf---\nname: review\ndescription: tiny\n---\n\n" + b"x" * 200
+        )
+        metadata = {
+            "name": "demo:review",
+            "description": "tiny",
+            "category": "plugin",
+            "path": plugin_skill,
+            "frontmatter": {"environments": ["not-a-real-environment"]},
+        }
+        monkeypatch.setattr(plugins, "discover_plugins", lambda: None)
+        monkeypatch.setattr(
+            plugins,
+            "get_plugin_manager",
+            lambda: type("Manager", (), {"list_plugin_skill_metadata": lambda self: [metadata]})(),
+        )
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path / "skills"):
+            result = json.loads(skills_list(query="review", limit=1, budget_chars=100))
+
+        # Unknown environment tags intentionally fail open; the full 200-char
+        # body must therefore exceed the budget rather than being charged as
+        # the five-character description.
+        assert result["status"] == "blocked"
+        assert [item["code"] for item in result["diagnostics"]] == ["budget_omission"]
+
+    def test_query_plugin_ineligible_environment_is_not_routable(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins
+
+        plugin_skill = tmp_path / "plugin" / "SKILL.md"
+        plugin_skill.parent.mkdir()
+        plugin_skill.write_text("---\nname: review\n---\n\nReview", encoding="utf-8")
+        metadata = {
+            "name": "demo:review",
+            "description": "review",
+            "category": "plugin",
+            "path": plugin_skill,
+            "frontmatter": {"environments": ["docker"]},
+        }
+        monkeypatch.setattr(plugins, "discover_plugins", lambda: None)
+        monkeypatch.setattr(
+            plugins,
+            "get_plugin_manager",
+            lambda: type("Manager", (), {"list_plugin_skill_metadata": lambda self: [metadata]})(),
+        )
+        monkeypatch.setattr(skills_tool_module, "skill_matches_environment", lambda _: False)
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path / "skills"):
+            result = json.loads(skills_list(query="review"))
+
+        assert result["status"] == "no_match"
+
+    def test_query_plugin_uses_registered_file_frontmatter_over_stale_metadata(
+        self, tmp_path, monkeypatch
+    ):
+        """Eligibility cannot be bypassed by stale registration metadata."""
+        from hermes_cli import plugins
+
+        plugin_skill = tmp_path / "plugin" / "SKILL.md"
+        plugin_skill.parent.mkdir()
+        plugin_skill.write_text(
+            "---\nname: review\nplatforms: [windows]\nenvironments: [docker]\nmetadata:\n"
+            "  hermes:\n    tags: [review]\n---\n\nReview",
+            encoding="utf-8",
+        )
+        metadata = {
+            "name": "demo:worker",
+            "description": "unrelated",
+            "category": "plugin",
+            "path": plugin_skill,
+            # This stale registration data would make the old route path
+            # consider the plugin a review candidate on every environment.
+            "frontmatter": {"metadata": {"hermes": {"tags": ["review"]}}},
+        }
+        monkeypatch.setattr(plugins, "discover_plugins", lambda: None)
+        monkeypatch.setattr(
+            plugins,
+            "get_plugin_manager",
+            lambda: type("Manager", (), {"list_plugin_skill_metadata": lambda self: [metadata]})(),
+        )
+        monkeypatch.setattr(
+            skills_tool_module,
+            "skill_matches_environment",
+            lambda frontmatter: "docker" not in frontmatter.get("environments", []),
+        )
+        monkeypatch.setattr(
+            skills_tool_module,
+            "skill_matches_platform",
+            lambda frontmatter: "windows" not in frontmatter.get("platforms", []),
+        )
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path / "skills"):
+            result = json.loads(skills_list(query="review"))
+
+        assert result["status"] == "no_match"
+
+    def test_query_plugin_with_unreadable_registered_skill_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import plugins
+
+        metadata = {
+            "name": "demo:review",
+            "description": "review",
+            "category": "plugin",
+            "path": tmp_path / "missing" / "SKILL.md",
+            "frontmatter": {},
+        }
+        monkeypatch.setattr(plugins, "discover_plugins", lambda: None)
+        monkeypatch.setattr(
+            plugins,
+            "get_plugin_manager",
+            lambda: type("Manager", (), {"list_plugin_skill_metadata": lambda self: [metadata]})(),
+        )
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path / "skills"):
+            result = json.loads(skills_list(query="review"))
+
+        assert result["status"] == "blocked"
+        assert [item["code"] for item in result["diagnostics"]] == [
+            "skill_content_unavailable"
+        ]
+
+    def test_mixed_local_external_and_plugin_route_shares_costs_and_dependencies(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import plugins
+
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        _make_skill(local_dir, "local-helper", body="local")
+        external_plan = _make_skill(external_dir, "plan", body="external-plan")
+        plugin_skill = tmp_path / "plugin" / "SKILL.md"
+        plugin_skill.parent.mkdir()
+        plugin_skill.write_text(
+            "---\nname: review\nmetadata:\n  hermes:\n    tags: [review]\n"
+            "    topology:\n      requires: [plan]\n---\n\nplugin-review-body",
+            encoding="utf-8",
+        )
+        metadata = {
+            "name": "demo:review",
+            "description": "short",
+            "category": "plugin",
+            "path": plugin_skill,
+            "frontmatter": {
+                "metadata": {
+                    "hermes": {"tags": ["review"], "topology": {"requires": ["plan"]}}
+                }
+            },
+        }
+        monkeypatch.setattr(plugins, "discover_plugins", lambda: None)
+        monkeypatch.setattr(
+            plugins,
+            "get_plugin_manager",
+            lambda: type("Manager", (), {"list_plugin_skill_metadata": lambda self: [metadata]})(),
+        )
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[external_dir]),
+        ):
+            skills_tool_module._SKILLS_CACHE.clear()
+            result = json.loads(skills_list(query="review", limit=2, budget_chars=10_000))
+
+        assert [item["name"] for item in result["route"]] == ["plan", "demo:review"]
+        assert result["total_cost_chars"] == (
+            len((external_plan / "SKILL.md").read_text(encoding="utf-8"))
+            + len(plugin_skill.read_text(encoding="utf-8-sig"))
+        )
+        assert result["route"][1]["graph_role"] == "root"
+
+    def test_mixed_plugin_collision_blocks_route_without_paths(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins
+
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        _make_skill(external_dir, "plugin-copy", body="external")
+        external_md = external_dir / "plugin-copy" / "SKILL.md"
+        external_md.write_text(
+            external_md.read_text(encoding="utf-8").replace(
+                "name: plugin-copy", "name: demo:review"
+            ),
+            encoding="utf-8",
+        )
+        plugin_skill = tmp_path / "plugin" / "SKILL.md"
+        plugin_skill.parent.mkdir()
+        plugin_skill.write_text("---\nname: review\n---\n\nplugin", encoding="utf-8")
+        metadata = {
+            "name": "demo:review",
+            "description": "review",
+            "category": "plugin",
+            "path": plugin_skill,
+            "frontmatter": {},
+        }
+        monkeypatch.setattr(plugins, "discover_plugins", lambda: None)
+        monkeypatch.setattr(
+            plugins,
+            "get_plugin_manager",
+            lambda: type("Manager", (), {"list_plugin_skill_metadata": lambda self: [metadata]})(),
+        )
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[external_dir]),
+        ):
+            skills_tool_module._SKILLS_CACHE.clear()
+            result = json.loads(skills_list(query="review"))
+
+        assert result["status"] == "blocked"
+        assert [item["code"] for item in result["diagnostics"]] == [
+            "canonical_name_collision"
+        ]
+        assert str(external_dir) not in json.dumps(result)
+        assert str(plugin_skill) not in json.dumps(result)
+
+    def test_rich_inventory_cache_does_not_cross_live_profile_skill_directories(
+        self, tmp_path, monkeypatch
+    ):
+        alpha_home = tmp_path / "alpha"
+        beta_home = tmp_path / "beta"
+        _make_skill(alpha_home / "skills", "alpha")
+        _make_skill(beta_home / "skills", "beta")
+        active_home = [alpha_home]
+        monkeypatch.setattr(skills_tool_module, "get_hermes_home", lambda: active_home[0])
+        skills_tool_module._SKILLS_CACHE.clear()
+
+        alpha = _find_all_skills(include_topology=True)
+        active_home[0] = beta_home
+        beta = _find_all_skills(include_topology=True)
+
+        assert [record["name"] for record in alpha] == ["alpha"]
+        assert [record["name"] for record in beta] == ["beta"]
+
     def test_empty_creates_directory(self, tmp_path):
         skills_dir = tmp_path / "skills"
         with patch("tools.skills_tool.SKILLS_DIR", skills_dir):

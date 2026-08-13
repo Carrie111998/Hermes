@@ -145,15 +145,23 @@ hermes skills route "review this change" --limit 4 --budget-chars 24000 --json
 The planner ranks existing name, category, description, tags, domains, inputs,
 and outputs deterministically, then places transitive requirements before the
 matching root while respecting both limits. It never executes a skill. Route
-JSON contains a SHA-256 query digest, selection reasons, costs, and diagnostics,
-but no dedicated raw-query field. Selected skill metadata may naturally repeat
-query terms. Route decisions are returned to the caller and are not persisted
-in V1.
+JSON contains selection reasons, costs, and diagnostics, but no query, query
+fingerprint, local path, or skill body. Selected skill metadata may naturally
+repeat query terms. Route decisions are returned to the caller and are not
+persisted in V1.
 
 The existing `skills_list` model tool accepts optional `query`, `limit`, and
 `budget_chars` parameters for the same local planner. With no `query`, its
 legacy minimal listing shape is unchanged. Query mode alone includes route
-reasons and normalized topology.
+reasons and normalized topology. Route and topology inventory includes eligible
+registered plugin skills as well as local and configured external skills; route
+budgets always use the full registered `SKILL.md`, not a plugin description.
+
+Topology only knows about installed Hermes skills: local, configured external,
+and registered plugin skills. To connect a central private MCP skill library,
+install one thin adapter skill and let that adapter route and load its own
+canonical library. Hermes does not import that library's full catalog into the
+installed topology inventory.
 
 ### Platform-Specific Skills
 

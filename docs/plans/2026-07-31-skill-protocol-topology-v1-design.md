@@ -17,13 +17,31 @@ come from the real content, and exposes tags plus normalized topology to the
 planner. `skills_list(query=...)` will use this mode and return a route artifact;
 without a query it will follow the existing code path unchanged.
 
-Two read-only CLI actions will share the same planner. `skills route` plans
-against currently eligible skills, while `skills topology` audits the same
-local graph. JSON is deterministically serialized, identifies the query with a
-SHA-256 digest, and has no dedicated raw-query field. Selected skill metadata
-may naturally repeat query terms. Human output shows route order, reasons,
-costs, and diagnostics. No route event is persisted because V1 has no concrete
-reader for a separate event log.
+Two read-only CLI actions and the `skills_list(query=...)` model-tool path
+share one rich installed-inventory builder. `skills route` plans against
+currently eligible local, external, and registered plugin skills, while
+`skills topology` audits that same installed inventory with disabled and
+runtime-ineligible records included for diagnosis. Plugin costs come from the
+complete registered `SKILL.md` with the same UTF-8-sig decoding and byte/character
+accounting as local rich scanning; an unreadable registered file blocks a
+matching route without exposing its path or contents. Ordinary no-query
+`skills_list()` keeps its historical local/external-only listing and does not
+trigger plugin discovery.
+
+JSON is deterministically serialized but contains no query fingerprint: an
+unsalted digest is dictionary-guessable for low-entropy queries and has no
+required V1 reader. Route artifacts contain neither raw queries, local paths,
+nor skill bodies. Selected skill metadata may naturally repeat query terms.
+Human output shows route order, reasons, costs, and diagnostics. No route event
+is persisted because V1 has no concrete reader for a separate event log.
+
+Topology has an intentionally narrow authority boundary. Hermes routes only
+skills installed into the active local tree, configured external directories,
+or registered plugins. A central private MCP skill library is represented by
+one installed thin adapter skill; the adapter owns discovery, routing, and
+loading inside that library. Hermes must not crawl or ingest the library's
+catalog as a second installed inventory, and this design adds no dependency on
+the private library.
 
 Ranking uses explicit weighted field matches: exact name first, then exact
 tags/domains, then inputs/outputs/category, with loose name and description

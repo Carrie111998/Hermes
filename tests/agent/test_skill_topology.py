@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 
 import pytest
@@ -491,7 +490,7 @@ def test_budget_and_limit_omissions_are_explicit():
     assert "limit_omission" in diagnostic_codes(limited)
 
 
-def test_no_match_is_explicit_and_json_artifact_never_contains_raw_query():
+def test_no_match_is_explicit_and_json_artifact_contains_no_query_fingerprint():
     query = "private phrase 8675309"
     result = plan_skill_route(
         [skill("testing", description="Write tests")],
@@ -502,7 +501,7 @@ def test_no_match_is_explicit_and_json_artifact_never_contains_raw_query():
 
     encoded = json.dumps(result, sort_keys=True)
     assert result["status"] == "no_match"
-    assert result["query_digest"] == hashlib.sha256(query.encode("utf-8")).hexdigest()
+    assert "query_digest" not in result
     assert query not in encoded
     assert "8675309" not in encoded
 
