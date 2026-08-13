@@ -33,7 +33,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli.timeouts import get_provider_request_timeout
-from agent.message_sanitization import _FULL_ARGS_LOG_BOUND
+from agent.message_sanitization import (
+    _FULL_ARGS_LOG_BOUND,
+    normalize_tool_transaction_adjacency,
+)
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
@@ -3503,6 +3506,23 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             "Pre-call sanitizer: dropped %d empty/invalid tool_calls field(s) "
             "created during de-duplication",
             dropped_post_dedup_tool_calls,
+        )
+
+    # Global id membership is not enough for Chat Completions: every tool
+    # result must be in the contiguous block immediately following the
+    # assistant that issued it.  De-duplication can keep an early call while
+    # leaving its only result much later in the transcript, which strict
+    # providers reject as "insufficient tool messages".  Canonicalize each
+    # local transaction after all global filtering/dedup passes.
+    messages, inserted_stubs, dropped_local_results = (
+        normalize_tool_transaction_adjacency(messages)
+    )
+    if inserted_stubs or dropped_local_results:
+        _ra().logger.debug(
+            "Pre-call sanitizer: repaired tool transaction adjacency "
+            "(added %d stub result(s), dropped %d misplaced/duplicate result(s))",
+            inserted_stubs,
+            dropped_local_results,
         )
     return messages
 

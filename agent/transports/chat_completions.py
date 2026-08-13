@@ -295,7 +295,9 @@ class ChatCompletionsTransport(ProviderTransport):
                     break
 
         if not needs_sanitize:
-            return messages
+            from agent.message_sanitization import normalize_tool_transaction_adjacency
+
+            return normalize_tool_transaction_adjacency(messages)[0]
 
         sanitized = list(messages)
         for msg_idx, msg in enumerate(messages):
@@ -365,7 +367,12 @@ class ChatCompletionsTransport(ProviderTransport):
                             copied_tool_calls[tc_idx] = copied_tc
                 if copied_tool_calls is not None:
                     mutable_msg()["tool_calls"] = copied_tool_calls
-        return sanitized
+        # Final wire invariant: even if an upstream sanitizer is bypassed or
+        # later middleware reorders history, never emit an assistant tool call
+        # without its complete, immediately adjacent tool-result block.
+        from agent.message_sanitization import normalize_tool_transaction_adjacency
+
+        return normalize_tool_transaction_adjacency(sanitized)[0]
 
     def convert_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Tools are already in OpenAI format — identity."""

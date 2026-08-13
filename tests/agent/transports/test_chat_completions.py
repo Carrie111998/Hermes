@@ -100,6 +100,43 @@ class TestChatCompletionsBasic:
         assert result[0]["content"] == "answer"
         assert "tool_calls" in msgs[0]
 
+    def test_convert_messages_repairs_incomplete_tool_transaction_at_wire_boundary(
+        self, transport
+    ):
+        """The final transport guard enforces local call/result adjacency."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_a",
+                        "type": "function",
+                        "function": {"name": "a", "arguments": "{}"},
+                    },
+                    {
+                        "id": "call_b",
+                        "type": "function",
+                        "function": {"name": "b", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_b", "content": "B"},
+            {"role": "user", "content": "next"},
+            {"role": "tool", "tool_call_id": "call_a", "content": "late A"},
+        ]
+
+        result = transport.convert_messages(msgs)
+
+        assert [msg["tool_call_id"] for msg in result[1:3]] == [
+            "call_a",
+            "call_b",
+        ]
+        assert result[1]["content"] == "[Result unavailable — see context summary above]"
+        assert result[2]["content"] == "B"
+        assert not any(msg.get("content") == "late A" for msg in result)
+        assert msgs[1]["tool_call_id"] == "call_b"
+
     def test_convert_messages_strips_internal_scaffolding_markers(self, transport):
         """Hermes-internal ``_``-prefixed markers must never reach the wire.
 
