@@ -43,13 +43,26 @@ def test_strip_empty_array_on_assistant():
 
 def test_strip_empty_array_empty_content_gets_placeholder():
     """The poison shape from the real incident (68952): content == '' AND
-    tool_calls == []. Stripping the key must not leave an empty non-final
-    assistant message — Anthropic-family providers reject those (the
-    auxiliary path has no repair_empty_non_final_messages backstop)."""
-    msgs = [{"role": "assistant", "content": "", "tool_calls": []}]
+    tool_calls == [], NON-final (followed by a user message). Stripping the
+    key must not leave an empty non-final assistant message —
+    Anthropic-family providers reject those (the auxiliary path has no
+    repair_empty_non_final_messages backstop)."""
+    msgs = [
+        {"role": "assistant", "content": "", "tool_calls": []},
+        {"role": "user", "content": "next"},  # makes the stripped turn non-final
+    ]
     out = _strip_empty_tool_calls(msgs)
     assert "tool_calls" not in out[0]
     assert out[0]["content"] == "(tool call removed)"
+
+
+def test_strip_final_empty_assistant_keeps_empty_content():
+    """An empty FINAL assistant message is legal (mirror of
+    repair_empty_non_final_messages skipping last_idx): stripping must drop
+    tool_calls but leave content unchanged — no placeholder."""
+    msgs = [{"role": "assistant", "content": "", "tool_calls": []}]
+    out = _strip_empty_tool_calls(msgs)
+    assert out == [{"role": "assistant", "content": ""}]
 
 
 def test_strip_none_and_nonlist_values():
