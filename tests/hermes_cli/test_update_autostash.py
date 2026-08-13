@@ -383,6 +383,39 @@ def test_discard_lockfile_churn_restores_lock_when_package_json_clean(tmp_path):
 # Update uses .[all] with fallback to .
 # ---------------------------------------------------------------------------
 
+def _git_argv(cmd):
+    """Return *cmd* with git's ``-c key=value`` pairs removed.
+
+    ``_cmd_update_impl`` builds ``git_cmd = ["git"]`` on POSIX but
+    ``["git", "-c", "windows.appendAtomically=false"]`` on Windows (the
+    loose-object-write workaround), and every git call in the updater is
+    ``git_cmd + [...]``. Mocks and assertions written as exact argv
+    comparisons therefore matched on POSIX and silently missed on Windows:
+    the mock fell through to its catch-all, ``git rev-parse --abbrev-ref
+    HEAD`` came back empty, and the run died at ``int(result.stdout.strip())``
+    with ``ValueError: invalid literal for int() with base 10: ''`` before
+    it ever reached the assertion the test was written for.
+
+    Normalising here keeps the comparisons exact — the full logical argv is
+    still asserted, only the platform-dependent config flags are dropped.
+    """
+    cmd = list(cmd)
+    if not cmd or str(cmd[0]).rsplit("/", 1)[-1].rsplit("\\", 1)[-1] not in (
+        "git",
+        "git.exe",
+    ):
+        return cmd
+    normalised = [cmd[0]]
+    idx = 1
+    while idx < len(cmd):
+        if cmd[idx] == "-c" and idx + 1 < len(cmd):
+            idx += 2  # drop the flag and its key=value argument
+            continue
+        normalised.append(cmd[idx])
+        idx += 1
+    return normalised
+
+
 def _setup_update_mocks(monkeypatch, tmp_path):
     """Common setup for cmd_update tests."""
     (tmp_path / ".git").mkdir()
@@ -394,6 +427,43 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_config, "check_config_version", lambda: (5, 5))
     monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
     monkeypatch.setattr(hermes_main, "_refresh_active_lazy_features", lambda: None)
+    # Never let cmd_update reach the REAL process table. _cmd_update_impl
+    # ends in _kill_stale_dashboard_processes -> _find_stale_dashboard_pids,
+    # which walks psutil.process_iter() and calls cmdline() on every process
+    # on the machine, then terminates whatever matched. Unstubbed on
+    # 2026-08-13 these tests printed
+    #     ⟲ Stopping 4 dashboard process(es) …
+    #         ✓ stopped PID 14284
+    # naming the developer's four live dashboards. Nothing actually died —
+    # the `hermes_main.subprocess.run` mock below intercepted the
+    # `taskkill /PID … /F`, so the ✓ lines were the mock's own returncode 0 —
+    # but the scan is real, it leaks live PIDs into test output that reads
+    # like destruction, and the whole-table cmdline() walk is why these
+    # tests present as "+++ Timeout +++" against the 30s per-test cap under
+    # load. The scan has its own coverage in test_dashboard_process_scan.py.
+    monkeypatch.setattr(
+        hermes_main,
+        "_find_stale_dashboard_pids",
+        lambda **kwargs: hermes_main._DashboardPids(),
+    )
+    # Same reasoning for the two skill-sync reaches near the end of
+    # _cmd_update_impl. `sync_skills()` hashes and copies the real bundled
+    # skill tree (73 skills on this box) and `seed_profile_skills()` spawns a
+    # subprocess per profile — neither is under test here, and together they
+    # are what blows the 30s per-test cap once the git mocks stop failing the
+    # run early: a full-file run died inside tools/skills_sync.py::_dir_hash.
+    # Both are function-local imports in main.py, so patch them at the source
+    # module. list_profiles -> [] also short-circuits the seeding block.
+    monkeypatch.setattr(
+        "tools.skills_sync.sync_skills",
+        lambda **kwargs: {
+            "copied": [],
+            "updated": [],
+            "user_modified": [],
+            "cleaned": [],
+        },
+    )
+    monkeypatch.setattr("hermes_cli.profiles.list_profiles", lambda *a, **kw: [])
 
 
 def test_cmd_update_retries_optional_extras_individually_when_all_fails(monkeypatch, tmp_path, capsys):
@@ -407,6 +477,8 @@ def test_cmd_update_retries_optional_extras_individually_when_all_fails(monkeypa
 
     def fake_run(cmd, **kwargs):
         recorded.append(cmd)
+        # Compare against the platform-independent argv — see _git_argv.
+        cmd = _git_argv(cmd)
         if cmd == ["git", "fetch", "origin", "main"]:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
@@ -456,6 +528,8 @@ def test_cmd_update_succeeds_with_extras(monkeypatch, tmp_path):
 
     def fake_run(cmd, **kwargs):
         recorded.append(cmd)
+        # Compare against the platform-independent argv — see _git_argv.
+        cmd = _git_argv(cmd)
         if cmd == ["git", "fetch", "origin", "main"]:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
@@ -578,7 +652,7 @@ def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path
 
     hermes_main.cmd_update(SimpleNamespace())
 
-    reset_calls = [c for c in recorded if "reset" in c and "--hard" in c]
+    reset_calls = [_git_argv(c) for c in recorded if "reset" in c and "--hard" in c]
     assert len(reset_calls) == 1
     assert reset_calls[0] == ["git", "reset", "--hard", "origin/main"]
 
@@ -699,9 +773,9 @@ def test_cmd_update_fetch_is_scoped_to_target_branch(monkeypatch, tmp_path):
 
     hermes_main.cmd_update(SimpleNamespace())
 
-    fetch_calls = [c for c in recorded if "fetch" in c]
+    fetch_calls = [_git_argv(c) for c in recorded if "fetch" in c]
     assert fetch_calls == [["git", "fetch", "origin", "main"]]
-    assert ["git", "fetch", "origin"] not in recorded
+    assert ["git", "fetch", "origin"] not in [_git_argv(c) for c in recorded]
 
 
 # ---------------------------------------------------------------------------

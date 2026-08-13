@@ -637,6 +637,111 @@ def test_pip_version_probe_passes_through():
     assert r is not None
 
 
+# ──────── PID-targeted killers and psutil terminate/kill ────────
+#
+# Two holes found 2026-08-13 while auditing why
+# ``tests/hermes_cli/test_update_autostash.py`` printed
+# "✓ stopped PID <live dashboard pid>" for four of the developer's real
+# dashboard processes:
+#
+#   1. ``_is_process_killer`` only fires when the command string also
+#      mentions hermes/gateway/python. The Windows reaper in
+#      ``hermes_cli.main._kill_stale_dashboard_processes`` shells out as
+#      ``taskkill /PID <n> /F`` — a bare number, no hermes token — so it
+#      sailed through. Nothing was actually killed in that run (the test
+#      had replaced ``subprocess.run``), but only by luck: any test that
+#      reaches that path with subprocess unmocked terminates whatever the
+#      scan found.
+#   2. ``psutil.Process.terminate()/kill()/send_signal()`` never touch
+#      ``os.kill`` from Python — psutil calls TerminateProcess / the raw
+#      syscall in C — so the ``os.kill`` guard cannot see them at all.
+#
+# Both are now gated on the same ``_is_own_subtree`` allowlist as os.kill.
+
+_FOREIGN_LIVE_PID = 4 if sys.platform == "win32" else 1
+"""A live process that is provably not ours: Windows ``System`` (PID 4),
+POSIX ``init`` (PID 1). PID 1 does NOT exist on Windows, which is why this
+is platform-split — a nonexistent PID is allowlisted by the guard (a
+signal to it is a no-op) and would make these tests silently vacuous."""
+
+
+def _foreign_psutil_process():
+    psutil = pytest.importorskip("psutil")
+    try:
+        return psutil.Process(_FOREIGN_LIVE_PID)
+    except Exception as exc:  # pragma: no cover — platform without it
+        pytest.skip(f"no foreign live PID to probe: {exc}")
+
+
+def test_subprocess_taskkill_bare_foreign_pid_blocked():
+    """``taskkill /PID <live foreign pid> /F`` — no hermes token anywhere.
+
+    This is verbatim the argv ``_kill_stale_dashboard_processes`` builds.
+    """
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["taskkill", "/PID", str(_FOREIGN_LIVE_PID), "/F"])
+
+
+def test_subprocess_posix_kill_bare_foreign_pid_blocked():
+    """The POSIX spelling of the same thing: ``kill -9 <live foreign pid>``."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["kill", "-9", str(_FOREIGN_LIVE_PID)])
+
+
+def test_subprocess_taskkill_stale_pid_passes_through():
+    """A PID that no longer exists cannot hurt anyone — don't block it.
+
+    Tests routinely use invented PIDs (12345, 33940). Blocking those would
+    turn the guard into a source of false failures.
+
+    Spelled against a nonexistent dir so no real ``taskkill`` is ever
+    spawned — the basename still reads as ``taskkill`` to the predicate,
+    and reaching FileNotFoundError (the exec, not the guard) is the
+    pass-through proof on every platform. A bare ``taskkill`` here would
+    put a live process-killer back in this file; one was removed from
+    tests/tools/test_process_registry.py on 2026-06-11 for that reason.
+    Also deliberately not routed through ``_run_allowed``: this venv's
+    interpreter path contains ".hermes", which trips the killer guard's
+    hermes-token rule on its own and would make the assertion vacuous.
+    """
+    # NOT _UNREAL_EXE_DIR: that constant's path contains "hermes", which
+    # trips the killer guard's hermes-token rule by itself.
+    unreal_dir = "C:\\guard-probe-no-such-dir\\bin"
+    with pytest.raises(FileNotFoundError):
+        subprocess.run([unreal_dir + "\\taskkill.exe", "/PID", "424242", "/F"])
+
+
+def test_psutil_terminate_foreign_pid_blocked():
+    proc = _foreign_psutil_process()
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        proc.terminate()
+
+
+def test_psutil_kill_foreign_pid_blocked():
+    proc = _foreign_psutil_process()
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        proc.kill()
+
+
+def test_psutil_send_signal_foreign_pid_blocked():
+    proc = _foreign_psutil_process()
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        proc.send_signal(signal.SIGTERM)
+
+
+def test_psutil_terminate_own_child_passes_through():
+    """The guard must not break the common, legitimate case."""
+    psutil = pytest.importorskip("psutil")
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        psutil.Process(child.pid).terminate()
+        child.wait(timeout=10)
+    finally:
+        if child.poll() is None:  # pragma: no cover — guard regression
+            child.kill()
+            child.wait(timeout=10)
+
+
 # ──────────────────── bypass marker ─────────────────────────────
 
 

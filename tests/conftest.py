@@ -923,6 +923,59 @@ def _live_system_guard(request, monkeypatch):
 
         monkeypatch.setattr(_os, "killpg", _guarded_killpg)
 
+    # ── psutil.Process.terminate / kill / send_signal ──────────────
+    # psutil NEVER routes through Python's ``os.kill``: it calls
+    # TerminateProcess (Windows) or kill(2) (POSIX) from its C extension,
+    # so every guard in this fixture was blind to it. Proven 2026-08-13 —
+    # ``psutil.Process(4).terminate()`` under the guard reached the real
+    # Windows TerminateProcess and was stopped only by the OS's own ACL on
+    # PID 4. Against an ordinary user-owned process (the developer's
+    # dashboard, the live gateway) nothing would have stopped it.
+    # Same ``_is_own_subtree`` allowlist and same bypass marker as os.kill.
+    if _psutil is not None:
+        def _wrap_psutil_kill(method_name):
+            real_method = getattr(_psutil.Process, method_name)
+
+            def _guarded_psutil(self, *args, **kwargs):
+                # send_signal(0) is a pure liveness probe — never destructive.
+                if method_name == "send_signal" and args:
+                    try:
+                        if int(args[0]) == 0:
+                            return real_method(self, *args, **kwargs)
+                    except (TypeError, ValueError):
+                        pass
+                try:
+                    target = int(self.pid)
+                except Exception:
+                    target = -1
+                if _is_own_subtree(target):
+                    return real_method(self, *args, **kwargs)
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked "
+                    f"psutil.Process({target}).{method_name}() — PID is "
+                    "outside the test process subtree. psutil bypasses the "
+                    "os.kill guard entirely (it terminates from C), so this "
+                    "is the only thing standing between a real "
+                    "psutil.process_iter() walk and the developer's live "
+                    "dashboard / gateway. Stub the scan the code under test "
+                    "uses (e.g. hermes_cli.main._find_stale_dashboard_pids, "
+                    "hermes_cli.gateway.find_gateway_pids) rather than "
+                    "letting it reach the real process table, or mark the "
+                    "test with @pytest.mark.live_system_guard_bypass if real "
+                    "termination is genuinely required."
+                )
+
+            _guarded_psutil.__name__ = f"_guarded_psutil_{method_name}"
+            return _guarded_psutil
+
+        for _psutil_method in ("terminate", "kill", "send_signal"):
+            if hasattr(_psutil.Process, _psutil_method):
+                monkeypatch.setattr(
+                    _psutil.Process,
+                    _psutil_method,
+                    _wrap_psutil_kill(_psutil_method),
+                )
+
     # ── Subprocess command-string inspection (whole-line) ──────────
     _HERMES_TOKENS = (
         "hermes-gateway",
@@ -938,6 +991,13 @@ def _live_system_guard(request, monkeypatch):
         "daemon-reload", "try-restart", "reload-or-restart",
     )
     _PROCESS_KILLERS = ("pkill", "killall", "taskkill", "skill", "fuser")
+    # Killers that take a PID rather than a name pattern. ``kill`` is here
+    # and NOT in _PROCESS_KILLERS on purpose: the name-pattern rule below
+    # keys on a hermes/gateway/python token, and "kill" is a common enough
+    # word in an argv that pairing it with that rule would misfire. In the
+    # PID rule it is safe — a PID either resolves to a live foreign process
+    # or it does not.
+    _PID_TARGETED_KILLERS = _PROCESS_KILLERS + ("kill",)
     # Verbs that, applied to the ``gateway`` subcommand, start or tear down a
     # REAL gateway process. ``status`` / ``logs`` / ``health`` / ``install``
     # are deliberately absent — they are read-only or config-only and several
@@ -1193,6 +1253,42 @@ def _live_system_guard(request, monkeypatch):
                     return True
         return False
 
+    def _is_foreign_pid_kill(cmd) -> bool:
+        """True for a killer command naming a LIVE pid outside our subtree.
+
+        ``_is_process_killer`` above only fires when the command string also
+        carries a hermes/gateway/python token, because it is written for the
+        name-pattern form (``pkill -f hermes``). The PID form carries no such
+        token at all:
+
+            subprocess.run(["taskkill", "/PID", "14284", "/F"])   # Windows
+            subprocess.run(["kill", "-9", "14284"])               # POSIX
+
+        which is verbatim what ``hermes_cli.main._kill_stale_dashboard_
+        processes`` builds after walking the real process table. Found
+        2026-08-13, when four ``test_cmd_update_*`` tests printed
+        "✓ stopped PID <n>" for the developer's four live dashboards. Those
+        four survived only because the test had replaced ``subprocess.run``
+        with its own recorder — the guard itself said nothing.
+
+        A PID that does not resolve is allowed: ``_is_own_subtree`` treats a
+        stale PID as harmless, which keeps the invented PIDs tests use
+        (12345, 33940, …) working.
+        """
+        tokens = _cmd_words(cmd)
+        if not tokens:
+            return False
+        if not any(_exe_head(t) in _PID_TARGETED_KILLERS for t in tokens):
+            return False
+        for tok in tokens:
+            stripped = tok.strip("\"'")
+            if not stripped.isdigit():
+                continue
+            pid = int(stripped)
+            if pid > 0 and not _is_own_subtree(pid):
+                return True
+        return False
+
     def _is_gateway_lifecycle_cmd(cmd) -> bool:
         """True for a subprocess that would START or STOP a real gateway.
 
@@ -1286,6 +1382,18 @@ def _live_system_guard(request, monkeypatch):
                 "targeting hermes/python could hit the live gateway. "
                 "Mark with @pytest.mark.live_system_guard_bypass if "
                 "intentional."
+            )
+        if _is_foreign_pid_kill(cmd):
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked "
+                f"subprocess.{name}({cmd!r}) — this terminates a LIVE "
+                "process outside the test subtree by PID. Reaching here "
+                "means the test walked the real process table: stub the "
+                "scan (hermes_cli.main._find_stale_dashboard_pids, "
+                "hermes_cli.gateway.find_gateway_pids) so the code under "
+                "test never sees a real PID, or mark with "
+                "@pytest.mark.live_system_guard_bypass if terminating a "
+                "real foreign process is genuinely the point."
             )
         if _is_package_install(cmd):
             raise RuntimeError(
