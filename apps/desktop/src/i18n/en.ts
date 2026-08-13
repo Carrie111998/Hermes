@@ -36,6 +36,7 @@ export const en: Translations = {
     replace: 'Replace',
     retry: 'Retry',
     run: 'Run',
+    selectAll: 'Select All',
     send: 'Send',
     set: 'Set',
     skip: 'Skip',

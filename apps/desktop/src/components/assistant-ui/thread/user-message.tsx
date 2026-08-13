@@ -3,8 +3,8 @@ import { type FC, type ReactNode, useCallback, useRef, useState } from 'react'
 
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
-import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
 import { MessageContextMenu } from '@/components/assistant-ui/thread/message-context-menu'
+import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
 import { useMessageReactions } from '@/components/assistant-ui/thread/use-message-reactions'
 import { UserMessageText } from '@/components/assistant-ui/thread/user-message-text'
@@ -285,7 +285,25 @@ export const UserMessage: FC<{
                 open={pickerOpen}
                 selected={shownReactions.find(reaction => reaction.author === 'user')?.emoji}
               >
-                <div className="relative w-full">
+                <div
+                  className="relative w-full"
+                  onContextMenu={
+                    // Right-click is the desktop stand-in for iOS touch-and-hold —
+                    // but only when there's nothing selected. A live highlight
+                    // keeps the custom message context menu (Copy / Select All /
+                    // Add as context / Paste as text) instead of the picker.
+                    readOnly || !reactionsEnabled
+                      ? undefined
+                      : event => {
+                          if (hasTextSelection()) {
+                            return
+                          }
+
+                          event.preventDefault()
+                          setPickerOpen(true)
+                        }
+                  }
+                >
                 {readOnly ? (
                   // Spectator transcript: clicking only toggles the clamp so the
                   // full prompt is readable — never opens an edit composer.

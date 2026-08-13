@@ -10,8 +10,8 @@ import {
   ContextMenuTrigger
 } from '@/components/ui/context-menu'
 import { translateNow, useI18n } from '@/i18n'
-import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
 import { attachmentId, pathLabel } from '@/lib/chat-runtime'
+import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
 import { IS_MAC } from '@/lib/keybinds/combo'
 import { cn } from '@/lib/utils'
 import { addComposerAttachment } from '@/store/composer'

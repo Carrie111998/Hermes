@@ -196,6 +196,7 @@ describe('ComposerAttachment text kind', () => {
       textContent: 'some text',
       sourceMessageId: 'msg-1',
     }
+
     expect(attachment.kind).toBe('text')
     expect(attachment.textContent).toBe('some text')
   })

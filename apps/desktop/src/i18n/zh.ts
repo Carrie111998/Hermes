@@ -36,6 +36,7 @@ export const zh: Translations = {
     replace: '替换',
     retry: '重试',
     run: '运行',
+    selectAll: '全选',
     send: '发送',
     set: '设置',
     skip: '跳过',

@@ -82,6 +82,7 @@ export interface Translations {
     replace: string
     retry: string
     run: string
+    selectAll: string
     send: string
     set: string
     skip: string

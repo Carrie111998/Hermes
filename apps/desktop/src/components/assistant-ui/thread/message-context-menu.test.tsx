@@ -15,6 +15,21 @@ vi.mock('@/app/chat/composer/focus', () => ({
   requestComposerInsert: vi.fn(),
 }))
 
+vi.mock('@/components/ui/copy-button', () => ({
+  writeClipboardText: vi.fn().mockResolvedValue(undefined),
+}))
+
+vi.mock('@/i18n', () => ({
+  useI18n: () => ({
+    t: {
+      common: {
+        copy: 'Copy',
+        selectAll: 'Select All',
+      },
+    },
+  }),
+}))
+
 beforeAll(() => {
   Element.prototype.hasPointerCapture ??= () => false
   Element.prototype.setPointerCapture ??= () => undefined
@@ -56,7 +71,7 @@ describe('MessageContextMenu', () => {
     expect(screen.queryByText('Add as context')).toBeNull()
   })
 
-  it('shows context menu items on right-click when text is selected', async () => {
+  it('keeps Copy and Select All alongside the context items when text is selected', async () => {
     mockSelection('Selectable text here')
 
     render(
@@ -75,8 +90,11 @@ describe('MessageContextMenu', () => {
     const child = screen.getByTestId('child')
     openContextMenu(child)
 
-    // Menu items appear in a portal
-    expect(await screen.findByText('Add as context')).toBeTruthy()
+    // Menu items appear in a portal — the standard actions stay, our two
+    // additions follow below the separator.
+    expect(await screen.findByText('Copy')).toBeTruthy()
+    expect(screen.getByText('Select All')).toBeTruthy()
+    expect(screen.getByText('Add as context')).toBeTruthy()
     expect(screen.getByText('Paste as text')).toBeTruthy()
   })
 })
