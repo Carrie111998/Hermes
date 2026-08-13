@@ -84,6 +84,12 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.mcp_endpoint import (
+    MCP_AVAILABLE,
+    asgi_bridge,
+    build_mcp_server,
+    hold_mcp_lifespan,
+)
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
     BasePlatformAdapter,
@@ -2092,12 +2098,38 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
+            # MCP Streamable HTTP (SSE) — mount FastMCP qua ASGI bridge. Auth
+            # Bearer API_SERVER_KEY (scope-aware). Loop đăng ký route trong
+            # connect() tự mirror /p/{profile}/mcp.
+            ("*", "/mcp", self._handle_mcp),
         ]
         if _CRON_AVAILABLE:
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated
             # by a NAS-minted JWT (NOT API_SERVER_KEY).
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
         return routes
+
+    async def _handle_mcp(self, request: "web.Request") -> "web.StreamResponse":
+        """MCP Streamable HTTP (SSE) — auth Bearer API_SERVER_KEY trước khi vào bridge.
+
+        Auth scope-aware: ``_check_auth`` dùng key theo /p/<profile>/ prefix
+        (middleware đã set ``_api_request_profile``). Sai key → 401 JSON.
+        """
+        if not MCP_AVAILABLE:
+            return web.json_response(
+                {"error": {"message": "MCP endpoint unavailable (mcp SDK missing)"}},
+                status=501,
+            )
+        auth_error = self._check_auth(request)
+        if auth_error is not None:
+            return auth_error
+        starlette_app = getattr(self, "_mcp_starlette_app", None)
+        if starlette_app is None:
+            return web.json_response(
+                {"error": {"message": "MCP endpoint not initialized"}},
+                status=503,
+            )
+        return await asgi_bridge(request, starlette_app)
 
     # ------------------------------------------------------------------
     # Session header helpers
@@ -7266,6 +7298,35 @@ class APIServerAdapter(BasePlatformAdapter):
             if hasattr(sweep_task, "add_done_callback"):
                 sweep_task.add_done_callback(self._background_tasks.discard)
 
+            # MCP Streamable HTTP endpoint (native). Build FastMCP app + giữ
+            # lifespan task group (session manager) suốt vòng đời adapter —
+            # request đầu tiên tới /mcp đã có session manager sẵn. Lỗi init
+            # KHÔNG làm API server chết: endpoint trả 503/501 thay vì crash.
+            self._mcp_starlette_app = None
+            self._mcp_lifespan_task = None
+            if MCP_AVAILABLE:
+                try:
+                    self._mcp_server = build_mcp_server()
+                    self._mcp_starlette_app = self._mcp_server.streamable_http_app()
+                    self._mcp_lifespan_task = asyncio.create_task(
+                        hold_mcp_lifespan(self._mcp_server, self._mcp_starlette_app)
+                    )
+                    try:
+                        self._background_tasks.add(self._mcp_lifespan_task)
+                    except TypeError:
+                        pass
+                    if hasattr(self._mcp_lifespan_task, "add_done_callback"):
+                        self._mcp_lifespan_task.add_done_callback(
+                            self._background_tasks.discard
+                        )
+                except Exception:
+                    logger.error(
+                        "[%s] MCP endpoint init failed — /mcp sẽ trả 503/501",
+                        self.name,
+                        exc_info=True,
+                    )
+                    self._mcp_starlette_app = None
+
             # Loud warning when a network-accessible API server runs against an
             # unsandboxed local terminal backend. The API server can drive the
             # agent's terminal/file tools as the host user; on a public bind
@@ -7370,6 +7431,17 @@ class APIServerAdapter(BasePlatformAdapter):
         (OSError: [Errno 24] Too many open files, #37011).
         """
         self._mark_disconnected()
+        # Đóng MCP lifespan task (session manager) trước khi dừng site — tránh
+        # leak task group khi adapter reconnect tạo instance mới.
+        _mcp_task = getattr(self, "_mcp_lifespan_task", None)
+        if _mcp_task is not None:
+            _mcp_task.cancel()
+            try:
+                await _mcp_task
+            except Exception:
+                pass
+            self._mcp_lifespan_task = None
+            self._mcp_starlette_app = None
         if self._response_store is not None:
             try:
                 self._response_store.close()
