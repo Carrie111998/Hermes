@@ -3242,8 +3242,10 @@ def select_provider_and_model(args=None):
             custom_provider_map[key] = {
                 "name": name,
                 "base_url": base_url,
+                "models_url": entry.get("models_url", ""),
                 "api_key": entry.get("api_key", ""),
                 "key_env": entry.get("key_env", ""),
+                "extra_headers": entry.get("extra_headers", {}),
                 "model": entry.get("model", ""),
                 "models": entry.get("models", {}),
                 "discover_models": entry.get("discover_models", True),

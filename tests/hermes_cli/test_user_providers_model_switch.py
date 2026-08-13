@@ -169,6 +169,68 @@ def test_list_authenticated_providers_uses_live_models_for_user_provider(monkeyp
     assert user_prov["total_models"] == 2
 
 
+def test_user_provider_live_model_probe_uses_models_url(monkeypatch):
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+
+    calls = []
+
+    def fake_fetch_api_models(api_key, base_url, **kwargs):
+        calls.append((api_key, base_url, kwargs))
+        return ["catalog-model"]
+
+    monkeypatch.setattr("hermes_cli.models.fetch_api_models", fake_fetch_api_models)
+    monkeypatch.setattr(
+        "hermes_cli.models._load_provider_models_cache", lambda: {}
+    )
+
+    providers = list_authenticated_providers(
+        current_provider="remote-lm-studio",
+        user_providers={
+            "remote-lm-studio": {
+                "base_url": "https://lm.example.com/v1",
+                "models_url": "https://lm.example.com/api/v1/models",
+                "api_key": "local-key",
+            }
+        },
+        custom_providers=[],
+    )
+
+    user_prov = next(p for p in providers if p.get("is_user_defined"))
+    assert calls == [
+        (
+            "local-key",
+            "https://lm.example.com/v1",
+            {
+                "timeout": 5.0,
+                "api_mode": None,
+                "headers": None,
+                "models_url": "https://lm.example.com/api/v1/models",
+            },
+        )
+    ]
+    assert user_prov["models"] == ["catalog-model"]
+
+
+def test_resolve_user_provider_preserves_models_url():
+    from hermes_cli.providers import resolve_provider_full
+
+    provider = resolve_provider_full(
+        "private-gateway",
+        {
+            "private-gateway": {
+                "base_url": "https://inference.example.com/v1",
+                "models_url": "https://catalog.example.com/models",
+            }
+        },
+        [],
+    )
+
+    assert provider is not None
+    assert provider.base_url == "https://inference.example.com/v1"
+    assert provider.models_url == "https://catalog.example.com/models"
+
+
 
 
 
@@ -393,6 +455,69 @@ def test_switch_model_resolves_user_provider_credentials(monkeypatch, tmp_path):
 
     assert result.success is True
     assert result.error_message == ""
+
+
+def test_switch_model_named_provider_validates_with_catalog_config(monkeypatch):
+    """Named providers keep inference routing separate from catalog auth."""
+    validation_calls = []
+    inference_url = "https://inference.example.com/v1"
+    catalog_url = "https://catalog.example.com/models"
+    catalog_headers = {"X-Catalog-Token": "catalog-token"}
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: {
+            "api_key": "gateway-key",
+            "base_url": inference_url,
+            "api_mode": "chat_completions",
+        },
+    )
+
+    def fake_validate(*args, **kwargs):
+        validation_calls.append((args, kwargs))
+        return {
+            "accepted": True,
+            "persist": True,
+            "recognized": True,
+            "message": None,
+        }
+
+    monkeypatch.setattr("hermes_cli.models.validate_requested_model", fake_validate)
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None)
+
+    result = switch_model(
+        raw_input="catalog-model",
+        current_provider="openai-codex",
+        current_model="gpt-5.4",
+        current_base_url="https://chatgpt.com/backend-api/codex",
+        explicit_provider="private-gateway",
+        user_providers={
+            "private-gateway": {
+                "name": "Private Gateway",
+                "base_url": inference_url,
+                "models_url": catalog_url,
+                "api_key": "gateway-key",
+                "extra_headers": catalog_headers,
+            }
+        },
+        custom_providers=[],
+    )
+
+    assert result.success is True
+    assert result.base_url == inference_url
+    assert validation_calls == [
+        (
+            ("catalog-model", "private-gateway"),
+            {
+                "api_key": "gateway-key",
+                "base_url": inference_url,
+                "api_mode": "chat_completions",
+                "models_url": catalog_url,
+                "headers": catalog_headers,
+            },
+        )
+    ]
 
 
 # =============================================================================
