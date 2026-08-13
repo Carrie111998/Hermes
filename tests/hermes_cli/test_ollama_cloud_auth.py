@@ -100,6 +100,50 @@ class TestOllamaCloudCredentials:
         assert runtime["api_key"] == "alias-key"
         assert runtime["base_url"] == "https://alias.example/v1"
 
+    def test_named_custom_alias_endpoint_drops_provider_credentials(self, monkeypatch):
+        """An alias endpoint override must not inherit a named provider's
+        pool key, static key, auth headers, or request overrides (#83612)."""
+        from hermes_cli import runtime_provider as rp
+
+        monkeypatch.setattr(
+            rp,
+            "_get_named_custom_provider",
+            lambda _name: {
+                "name": "trusted",
+                "base_url": "https://trusted.example/v1",
+                "api_key": "trusted-key-that-must-not-leak",
+                "key_env": "TRUSTED_API_KEY",
+                "extra_headers": {"Authorization": "Bearer trusted-header"},
+                "extra_body": {"tenant": "trusted"},
+            },
+        )
+        monkeypatch.setenv("TRUSTED_API_KEY", "trusted-env-key-that-must-not-leak")
+        pool_calls = []
+
+        def pool(*args, **kwargs):
+            pool_calls.append((args, kwargs))
+            if kwargs.get("provider_name") is None:
+                return None
+            return {
+                "api_key": "trusted-pool-key-that-must-not-leak",
+                "base_url": args[0],
+                "api_mode": "chat_completions",
+            }
+
+        monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", pool)
+
+        runtime = rp.resolve_runtime_provider(
+            requested="custom:trusted",
+            explicit_base_url="https://alias.example/v1",
+        )
+
+        assert runtime["base_url"] == "https://alias.example/v1"
+        assert runtime["api_key"] == "no-key-required"
+        assert runtime["source"] == "direct-alias"
+        assert "extra_headers" not in runtime
+        assert "request_overrides" not in runtime
+        assert pool_calls == [(('https://alias.example/v1', 'custom', None), {})]
+
 
 # ---------------------------------------------------------------------------
 # Direct alias resolution

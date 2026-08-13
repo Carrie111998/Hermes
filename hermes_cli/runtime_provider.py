@@ -1127,6 +1127,22 @@ def _resolve_named_custom_runtime(
     if not base_url:
         return None
 
+    # A direct alias may name a configured custom provider for its model/API
+    # mode while deliberately overriding the endpoint.  The named provider's
+    # pool entry, api_key/key_env, and extra_headers are all credentials bound
+    # to the endpoint in that provider entry; none may cross to the alias
+    # endpoint.  Resolve that case as a bare endpoint instead.  Keep the
+    # named-provider path when the routes are the same so ordinary aliases
+    # retain their configured provider behavior.
+    configured_base_url = _normalize_base_url_for_match(custom_provider.get("base_url"))
+    explicit_route = _normalize_base_url_for_match(explicit_base_url)
+    if explicit_route and configured_base_url and explicit_route != configured_base_url:
+        return _resolve_named_custom_runtime(
+            requested_provider="custom",
+            explicit_api_key=explicit_api_key,
+            explicit_base_url=base_url,
+        )
+
     # An explicit alias key is bound to the explicit endpoint.  Do not let a
     # credential-pool entry for the named provider override it: an alias may
     # deliberately target a different host, and substituting the pool key
