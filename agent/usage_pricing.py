@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -8,6 +9,8 @@ from typing import Any, Dict, Literal, Optional
 
 from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
 from utils import base_url_host_matches
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
 
@@ -1244,8 +1247,8 @@ def normalize_usage(
         output_tokens = _to_int(getattr(response_usage, "completion_tokens", 0))
         details = getattr(response_usage, "prompt_tokens_details", None)
         # Primary: OpenAI-style prompt_tokens_details. Fallback: Anthropic-style
-        # top-level fields that some OpenAI-compatible proxies (OpenRouter, Cline)
-        # expose when routing Claude models — without this
+        # top-level fields that some OpenAI-compatible proxies (OpenRouter, Vercel
+        # AI Gateway, Cline) expose when routing Claude models — without this
         # fallback, cache writes are undercounted as 0 and cache reads can be
         # missed when the proxy only surfaces them at the top level.
         # Port of cline/cline#10266.
@@ -1287,6 +1290,24 @@ def normalize_usage(
             reasoning_tokens = _to_int(
                 getattr(completion_details, "reasoning_tokens", 0)
             )
+
+    # Cache observability for MiniMax's Anthropic wire: on MiniMax-M3,
+    # usage.cache_read_input_tokens carries a constant +128 floor and
+    # cache_creation_input_tokens is always 0, so cache_read is NOT a
+    # reliable hit signal — the signal that survives is the input_tokens
+    # drop between consecutive calls. Standard level-gated logger.debug;
+    # enable via logging config to confirm cache behavior.
+    # Docs: https://platform.minimax.io/docs/api-reference/text-prompt-caching
+    if provider_name in {"minimax", "minimax-cn"} and mode == "anthropic_messages":
+        logger.debug(
+            "cache_observability provider=%s mode=%s input_tokens=%s "
+            "output_tokens=%s cache_read_tokens=%s cache_write_tokens=%s "
+            "(note: on MiniMax-M3 cache_read carries a +128 constant "
+            "floor and is not a reliable hit signal — track input_tokens "
+            "drops across calls instead)",
+            provider_name, mode, input_tokens, output_tokens,
+            cache_read_tokens, cache_write_tokens,
+        )
 
     return CanonicalUsage(
         input_tokens=input_tokens,

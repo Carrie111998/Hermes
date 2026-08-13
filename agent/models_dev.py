@@ -168,6 +168,7 @@ PROVIDER_TO_MODELS_DEV: Dict[str, str] = {
     "alibaba": "alibaba",
     "qwen-oauth": "alibaba",
     "copilot": "github-copilot",
+    "ai-gateway": "vercel",
     "opencode-zen": "opencode",
     "opencode-go": "opencode-go",
     "kilocode": "kilo",
@@ -181,6 +182,13 @@ PROVIDER_TO_MODELS_DEV: Dict[str, str] = {
     "xai-oauth": "xai",
     "xiaomi": "xiaomi",
     "nvidia": "nvidia",
+    # Meta Model API (Muse Spark family, api.meta.ai). models.dev keys these
+    # under the "meta" provider id; Hermes' provider is "meta-ai" (and the
+    # api.meta.ai host reverse-maps to "meta-ai"), so without both aliases the
+    # context/pricing lookup misses and muse-spark-* falls back to the generic
+    # 256K default instead of its true 1M window.
+    "meta-ai": "meta",
+    "meta": "meta",
     "groq": "groq",
     "mistral": "mistral",
     "togetherai": "togetherai",
@@ -252,7 +260,12 @@ def _fetch_models_dev_from_network() -> Dict[str, Any]:
 
     Raises on network errors and on an empty/invalid registry payload.
     """
-    response = requests.get(MODELS_DEV_URL, timeout=15)
+    # Tuple (connect, read): a flat timeout=15 let a blackholed connect
+    # stall the first-turn critical path for the full 15 s. 5 s connect
+    # fails fast on unreachable hosts; 10 s read still tolerates a slow
+    # registry response (matches the OpenRouter fetch convention in
+    # agent/model_metadata.py).
+    response = requests.get(MODELS_DEV_URL, timeout=(5, 10))
     response.raise_for_status()
     data = response.json()
     if not isinstance(data, dict) or not data:

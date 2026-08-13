@@ -67,7 +67,7 @@ Every auxiliary task defaults to `auto` — meaning Hermes tries your main model
 
 | Task | When to override |
 |---|---|
-| **Title Gen** | Almost always. A $0.10/M flash model writes session titles as well as Opus. Default config sets this to `google/gemini-3-flash-preview` on OpenRouter. |
+| **Title Gen** | When title latency or cost matters more than matching the main model. Pin a known-good flash model, or set `auxiliary.title_generation.prefer_fast_model: true` to let Hermes choose the provider's fast tier. |
 | **Vision** | When your main model lacks vision support. Point it at `google/gemini-2.5-flash` or `gpt-4o-mini`. |
 | **Compression** | When you're burning reasoning tokens on Opus/M2.7 just to summarize context. A fast chat model does the job at 1/50th the cost. |
 | **Approval** | For `approval_mode: smart` — a fast/cheap model (haiku, flash, gpt-5-mini) decides whether to auto-approve low-risk commands. Expensive models here are waste. |
@@ -155,14 +155,14 @@ When `fallback_chain` is absent, `auto` uses the top-level `fallback_providers` 
 
 ## Per-provider request options
 
-Provider entries (`providers.<name>` or items in the `custom_providers` list) accept two knobs that shape how Hermes talks to the endpoint:
+Provider entries (`providers.<name>` in the `providers:` dict, or items in the legacy `custom_providers` list) accept two knobs that shape how Hermes talks to the endpoint:
 
 **`extra_headers`** — a mapping of extra HTTP headers attached to every LLM request routed to that provider's base URL. They are applied last, after URL/profile defaults and user header overrides, so they survive credential swaps and client rebuilds. Useful for Cloudflare Access service tokens, proxy auth, or custom bearer schemes:
 
 ```yaml
-custom_providers:
-  - name: my-gateway
-    base_url: https://llm.internal.example.com/v1
+providers:
+  my-gateway:
+    api: https://llm.internal.example.com/v1
     api_key: sk-...
     extra_headers:
       CF-Access-Client-Id: "xxxx.access"
@@ -174,9 +174,9 @@ Header values routinely carry credentials — Hermes never logs them. `extra_hea
 **`discover_models`** — set to `false` (default `true`) to skip querying the endpoint's `/models` listing and use only the `models` you configured on the entry. Handy for gateways whose model listing is slow, unreliable, or noisy:
 
 ```yaml
-custom_providers:
-  - name: my-gateway
-    base_url: https://llm.internal.example.com/v1
+providers:
+  my-gateway:
+    api: https://llm.internal.example.com/v1
     discover_models: false
     models:
       - my-finetune-v2
@@ -184,6 +184,10 @@ custom_providers:
 ```
 
 With discovery off, the model picker (`hermes model`, `/model`) shows the configured list instead of a live probe.
+
+:::note Legacy format
+Older configs used a top-level `custom_providers:` list (with `base_url` instead of `api`). It still works and is auto-migrated to the `providers:` dict on `hermes update` (config v12).
+:::
 
 ## When does it take effect?
 
