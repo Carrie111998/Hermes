@@ -597,6 +597,36 @@ def _reset_module_state():
     except Exception:
         pass
 
+    # --- agent.model_metadata — nine module-level caches behind TTLs of
+    #     3600s / 300s / 30s. Nothing cleared these between tests, so a
+    #     metadata or capability lookup in one file decided the answer for
+    #     every later file in the same process. Measured 2026-08-13: this is
+    #     the mechanism behind the ~128 order/timing-dependent failures in
+    #     tests/agent, which pass individually and fail in the hour-long run.
+    #     The suite's own helper reset only two of the nine.
+    try:
+        _mm_mod = sys.modules["agent.model_metadata"]
+        for _name in (
+            "_model_metadata_cache",
+            "_novita_metadata_cache",
+            "_endpoint_model_metadata_cache",
+            "_endpoint_model_metadata_cache_time",
+            "_endpoint_probe_path_cache",
+            "_codex_oauth_context_cache",
+        ):
+            _cache = getattr(_mm_mod, _name, None)
+            if _cache is not None:
+                _cache.clear()
+        # Scalar timestamps: zero rather than clear, so the next lookup reads
+        # as "never fetched" instead of "fetched at an hour ago".
+        for _name in ("_model_metadata_cache_time", "_novita_metadata_cache_time"):
+            if hasattr(_mm_mod, _name):
+                setattr(_mm_mod, _name, 0)
+        if hasattr(_mm_mod, "_codex_oauth_context_cache_time"):
+            _mm_mod._codex_oauth_context_cache_time = 0.0
+    except Exception:
+        pass
+
     # --- tools.file_tools — per-task read history + file-ops cache ---
     try:
         _ft_mod = sys.modules["tools.file_tools"]
