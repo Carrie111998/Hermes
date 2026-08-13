@@ -1241,7 +1241,9 @@ class SessionStore:
     """
     
     def __init__(self, sessions_dir: Path, config: GatewayConfig,
-                 has_active_processes_fn=None):
+                 has_active_processes_fn=None,
+                 is_session_running_fn=None,
+                 has_active_kanban_fn=None):
         self.sessions_dir = sessions_dir
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}
@@ -1275,6 +1277,11 @@ class SessionStore:
         self._transcript_append_failures: Dict[str, int] = {}
         self._fts_rebuild_attempted = False
         self._has_active_processes_fn = has_active_processes_fn
+        # Live-work guards for the *daily* boundary (see _is_session_expired).
+        # Both are optional callables wired in by the gateway runner; when
+        # unset (tests, embedded stores) they simply don't guard anything.
+        self._is_session_running_fn = is_session_running_fn
+        self._has_active_kanban_fn = has_active_kanban_fn
         # Whether to keep writing the legacy sessions.json mirror alongside
         # the primary gateway_routing table in state.db. Default True for
         # backward compatibility; disable via gateway.write_sessions_json.
@@ -1312,7 +1319,45 @@ class SessionStore:
                 exc,
             )
             return True
-    
+
+    def _is_session_running_safe(self, session_key: str) -> bool:
+        """Return whether a session holds an in-flight turn, failing closed.
+
+        Mirrors :meth:`_has_active_processes_safe`: a raising callable means we
+        cannot tell, so we assume the session IS running and keep it alive
+        rather than resetting a conversation mid-turn.
+        """
+        if self._is_session_running_fn is None:
+            return False
+        try:
+            return bool(self._is_session_running_fn(session_key))
+        except Exception as exc:
+            logger.warning(
+                "is_session_running_fn raised for %s; keeping session alive: %s",
+                session_key,
+                exc,
+            )
+            return True
+
+    def _has_active_kanban_safe(self, session_key: str) -> bool:
+        """Return whether live kanban work is attached to a session, failing closed.
+
+        Same contract as :meth:`_is_session_running_safe`. The callable itself
+        swallows benign lookup failures (missing/locked board) and returns
+        False; anything that escapes it is treated as "assume busy".
+        """
+        if self._has_active_kanban_fn is None:
+            return False
+        try:
+            return bool(self._has_active_kanban_fn(session_key))
+        except Exception as exc:
+            logger.warning(
+                "has_active_kanban_fn raised for %s; keeping session alive: %s",
+                session_key,
+                exc,
+            )
+            return True
+
     def _ensure_loaded(self) -> None:
         """Load sessions index from disk if not already loaded."""
         with self._lock:
@@ -2250,6 +2295,23 @@ class SessionStore:
             if now.hour < policy.at_hour:
                 today_reset -= timedelta(days=1)
             if entry.updated_at < today_reset:
+                # The daily boundary fires on wall-clock time, not on user
+                # activity, so it can land squarely on top of live work: a
+                # long-running turn, or a kanban task the session is driving.
+                # ``updated_at`` doesn't move during a turn, so neither guard
+                # is implied by the staleness check above. Both fail closed.
+                if self._is_session_running_safe(entry.session_key):
+                    logger.debug(
+                        "Session %s not expired — turn in flight",
+                        entry.session_key,
+                    )
+                    return False
+                if self._has_active_kanban_safe(entry.session_key):
+                    logger.debug(
+                        "Session %s not expired — active kanban work",
+                        entry.session_key,
+                    )
+                    return False
                 return True
 
         return False

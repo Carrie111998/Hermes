@@ -5952,6 +5952,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         state = self._peek_session_state(session_key)
         return state is not None and state.turn.agent is not None
 
+    def _profile_for_session_key(self, session_key: str) -> str:
+        """Return the profile a session key belongs to.
+
+        Keys are ``agent:<ns>:<platform>:...`` where ``<ns>`` is ``main`` for
+        the default/non-multiplexed namespace (see
+        ``gateway.session._session_key_namespace``) and the profile id
+        otherwise. ``main`` resolves to whichever profile this process is
+        actually serving.
+        """
+        parts = (session_key or "").split(":")
+        ns = parts[1] if len(parts) > 2 and parts[0] == "agent" else ""
+        if not ns or ns == "main":
+            return self._active_profile_name()
+        return ns
+
+    def _has_active_kanban_for_session(self, session_key: str) -> bool:
+        """True when the session's profile has running/blocked kanban tasks.
+
+        A coarse "is this profile mid-work" probe used to hold the daily
+        session-reset boundary open (see ``SessionStore._is_session_expired``).
+        Deliberately best-effort: a missing, locked, or schema-less board means
+        we cannot see any live work, so we return False and let the reset
+        proceed. Only genuine ``running``/``blocked`` rows block it.
+        """
+        try:
+            import sqlite3
+
+            from hermes_cli.kanban_db import kanban_db_path
+            from hermes_cli.profiles import normalize_profile_name
+
+            db_path = kanban_db_path()
+            if not db_path.exists():
+                return False
+            assignee = normalize_profile_name(
+                self._profile_for_session_key(session_key)
+            )
+            # Read-only + short timeout: the dispatcher writes to this DB
+            # constantly and a reset guard must never queue behind it.
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM tasks "
+                    "WHERE status IN ('running', 'blocked') AND assignee = ?",
+                    (assignee,),
+                ).fetchone()
+            finally:
+                conn.close()
+            return bool(row and row[0])
+        except Exception as exc:
+            logger.debug(
+                "Kanban reset guard lookup failed for %s: %s", session_key, exc
+            )
+            return False
+
     def _running_agent_items(self) -> List[tuple]:
         """(session_key, agent) pairs for sessions with a running turn
         (including pending sentinels), matching the old ``_running_agents``
@@ -6024,11 +6078,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _bg_max_age_seconds = (
             _bg_max_age_hours * 3600 if _bg_max_age_hours and _bg_max_age_hours > 0 else None
         )
+        # Two further guards, daily-boundary only: the daily reset fires on
+        # wall-clock time rather than on activity, so it must not cut a turn
+        # that is mid-flight or a profile that is actively working a kanban
+        # board. Both are best-effort probes; see _is_session_expired.
         self.session_store = SessionStore(
             self.config.sessions_dir, self.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(
                 key, max_active_age=_bg_max_age_seconds,
             ),
+            is_session_running_fn=lambda key: self._is_session_running(key),
+            has_active_kanban_fn=lambda key: self._has_active_kanban_for_session(key),
         )
         # One enforced loop-side boundary for the synchronous SessionStore.
         # Sync helpers keep using ``session_store`` directly; async gateway

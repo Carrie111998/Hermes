@@ -497,6 +497,11 @@ class SessionResetPolicy:
     via the `session_reset` section in config.yaml (or gateway.json
     overrides). Changed July 2026 from "both" (24h idle + daily 4am), which
     surprised users who expected their conversations to persist.
+
+    The "daily" boundary additionally refuses to expire a session that has a
+    turn in flight or live kanban work (running/blocked tasks) attached to it
+    — it fires on wall-clock time, so without those guards it could cut a
+    conversation mid-work. See ``SessionStore._is_session_expired``.
     """
     mode: str = "none"  # "daily", "idle", "both", or "none"
     at_hour: int = 4  # Hour for daily reset (0-23, local time)
