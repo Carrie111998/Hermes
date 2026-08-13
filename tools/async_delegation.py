@@ -945,7 +945,12 @@ def _begin_finalization(
     return event_record, interrupt_fn
 
 
-def _finish_finalization(delegation_id: str, status: str) -> None:
+def _finish_finalization(
+    delegation_id: str,
+    status: str,
+    *,
+    release_admission: bool = True,
+) -> None:
     admission_lease_id = ""
     with _records_lock:
         record = _records.get(delegation_id)
@@ -953,6 +958,23 @@ def _finish_finalization(delegation_id: str, status: str) -> None:
             record["status"] = status
             admission_lease_id = str(record.get("admission_lease_id") or "")
         _prune_completed_locked()
+    if release_admission and admission_lease_id:
+        from tools.delegation_admission import release as release_children
+        release_children(admission_lease_id)
+
+
+def _release_admission_for_runner_exit(delegation_id: str) -> None:
+    """Release a lease after a force-finalized runner actually returns.
+
+    A stalled completion is terminal for delivery, but the daemon runner may
+    still be executing after ignoring interruption. Its real-child permits
+    must remain held until that execution ends.
+    """
+    admission_lease_id = ""
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is not None:
+            admission_lease_id = str(record.get("admission_lease_id") or "")
     if admission_lease_id:
         from tools.delegation_admission import release as release_children
         release_children(admission_lease_id)
@@ -1158,6 +1180,7 @@ def dispatch_async_delegation_batch(
             status = "error"
         finally:
             _finalize_batch(delegation_id, combined, status)
+            _release_admission_for_runner_exit(delegation_id)
 
     try:
         # Propagate the dispatching profile to the detached batch children.
@@ -1442,7 +1465,9 @@ def _finalize_stalled(delegation_id: str) -> None:
             },
             "stalled",
         )
-    _finish_finalization(delegation_id, "stalled")
+    # Delivery is terminal, but the daemon runner may still be executing after
+    # ignoring its interrupt. Keep real-child permits until its worker exits.
+    _finish_finalization(delegation_id, "stalled", release_admission=False)
 
 
 def _children_activity_from_token(token: Any, now: float) -> Optional[List]:

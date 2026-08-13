@@ -16,6 +16,7 @@ import time
 import pytest
 
 from tools import async_delegation as ad
+from tools.delegation_admission import active_real_children
 from tools.process_registry import process_registry, format_process_notification
 
 
@@ -362,6 +363,50 @@ def test_stalled_runner_is_interrupted_then_finalized(monkeypatch):
     # If the ignored runner eventually returns, it must not enqueue a second
     # completion for a delegation the monitor already finalized.
     assert _drain_one(timeout=0.5) is None
+
+
+def test_force_finalized_batch_holds_real_child_permits_until_runner_exits(monkeypatch):
+    _fast_stale_monitor(monkeypatch)
+    gate = threading.Event()
+
+    def stuck_batch_runner():
+        gate.wait(timeout=10)
+        return {"results": [{"status": "completed"}]}
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["one", "two"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model=None,
+        session_key="",
+        runner=stuck_batch_runner,
+        interrupt_fn=lambda: None,
+        progress_fn=lambda: (((0, None), (0, None)), False),
+        profile_real_child_ceiling=2,
+    )
+    assert res["status"] == "dispatched"
+    evt = _drain_for(res["delegation_id"], timeout=5.0)
+    assert evt is not None
+    assert evt["status"] == "stalled"
+
+    blocked = ad.dispatch_async_delegation(
+        goal="must wait",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model=None,
+        session_key="",
+        runner=lambda: {"status": "completed"},
+        profile_real_child_ceiling=2,
+    )
+    assert blocked["status"] == "rejected"
+
+    gate.set()
+    deadline = time.time() + 5.0
+    while time.time() < deadline and active_real_children() != 0:
+        time.sleep(0.02)
+    assert active_real_children() == 0
 
 
 def test_progressing_runner_is_never_stalled(monkeypatch):
