@@ -283,6 +283,40 @@ class TestPermissionsDenyFileTools:
         assert file_tools._terminal_env_type_for_task("task") == "vercel_sandbox"
         assert file_tools._uses_container_paths("task") is True
 
+    def test_managed_modal_uses_remote_path_semantics(self, monkeypatch):
+        from tools import terminal_tool
+
+        env = type("ManagedModalEnvironment", (), {})()
+        monkeypatch.setattr(terminal_tool, "_active_environments", {"task": env})
+        monkeypatch.setattr(
+            terminal_tool,
+            "_resolve_container_task_id",
+            lambda task_id: task_id,
+        )
+
+        assert file_tools._terminal_env_type_for_task("task") == "modal"
+        assert file_tools._uses_container_paths("task") is True
+
+    def test_unrecognized_configured_environment_identity_is_unknown(
+        self,
+        monkeypatch,
+    ):
+        from tools import terminal_tool
+
+        monkeypatch.setattr(terminal_tool, "_active_environments", {})
+        monkeypatch.setattr(
+            terminal_tool,
+            "_resolve_container_task_id",
+            lambda task_id: task_id,
+        )
+        monkeypatch.setattr(
+            terminal_tool,
+            "_get_env_config",
+            lambda: {"env_type": "custom_remote"},
+        )
+
+        assert file_tools._terminal_env_type_for_task("task") == "unknown"
+
     def test_unknown_active_environment_identity_fails_closed_before_backend(
         self,
         monkeypatch,
@@ -327,6 +361,54 @@ class TestPermissionsDenyFileTools:
         assert "error" in result
         assert "backend path identity" in result["error"]
         mock_resolve.assert_not_called()
+        mock_realpath.assert_not_called()
+        mock_isfile.assert_not_called()
+        mock_get.assert_not_called()
+
+    def test_unknown_environment_search_fails_closed_before_host_or_backend_probe(
+        self,
+        monkeypatch,
+    ):
+        from tools import terminal_tool
+
+        env = type("CustomRemoteEnvironment", (), {})()
+        monkeypatch.setattr(terminal_tool, "_active_environments", {"task": env})
+        monkeypatch.setattr(
+            terminal_tool,
+            "_resolve_container_task_id",
+            lambda task_id: task_id,
+        )
+        _install_permissions_config(monkeypatch, paths=["secret/**"])
+
+        with (
+            patch(
+                "tools.file_tools._resolve_path_for_task",
+                side_effect=AssertionError("unknown backend must not resolve search paths"),
+            ) as mock_resolve,
+            patch(
+                "tools.file_tools.Path.resolve",
+                side_effect=AssertionError("unknown backend must not resolve host paths"),
+            ) as mock_path_resolve,
+            patch(
+                "tools.file_tools.os.path.realpath",
+                side_effect=AssertionError("unknown backend must not dereference host paths"),
+            ) as mock_realpath,
+            patch(
+                "tools.file_tools.os.path.isfile",
+                side_effect=AssertionError("unknown backend must not probe host file types"),
+            ) as mock_isfile,
+            patch("tools.file_tools._get_file_ops") as mock_get,
+        ):
+            result = json.loads(file_tools.search_tool(
+                "needle",
+                path="/remote/public",
+                task_id="task",
+            ))
+
+        assert "error" in result
+        assert "backend path identity" in result["error"]
+        mock_resolve.assert_not_called()
+        mock_path_resolve.assert_not_called()
         mock_realpath.assert_not_called()
         mock_isfile.assert_not_called()
         mock_get.assert_not_called()
