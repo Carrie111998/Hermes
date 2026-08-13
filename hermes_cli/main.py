@@ -440,6 +440,7 @@ from hermes_cli.sessions_cmd import cmd_sessions  # noqa: F401
 from hermes_cli.subcommands._shared import add_accept_hooks_flag as _add_accept_hooks_flag
 from hermes_cli.subcommands.cron import build_cron_parser
 from hermes_cli.subcommands.sync import build_sync_parser
+from hermes_cli.subcommands.wisdom import build_wisdom_parser
 from hermes_cli.subcommands.gateway import build_gateway_parser
 from hermes_cli.subcommands.profile import build_profile_parser
 from hermes_cli.subcommands.model import build_model_parser
@@ -4828,6 +4829,78 @@ def cmd_sync(args):
 
     print(_json.dumps(result, indent=2, ensure_ascii=False))
     return 0
+
+
+def cmd_wisdom(args):
+    """Wisdom — review and act on skill share candidates (PRD 1, M0)."""
+    import json as _json
+
+    sub = getattr(args, "wisdom_command", None)
+
+    if sub in {None, ""}:
+        print(
+            "usage: hermes wisdom <candidates|run|decline>\n"
+            "\n"
+            "  candidates        Show current share candidates with evidence\n"
+            "  run               Force a share-candidate scoring pass now (dry-run)\n"
+            "  decline <skill>   Stop nominating a skill for sharing",
+            file=sys.stderr,
+        )
+        return 1
+
+    from tools import wisdom_share_pass as wsp
+
+    if sub == "candidates":
+        state = wsp.load_state()
+        candidates = state.get("last_candidates") or []
+        if not candidates:
+            print(
+                "No share candidates yet. The curator's weekly pass scores "
+                "your skills and nominates candidates; run `hermes wisdom run` "
+                "to force a pass now."
+            )
+            return 0
+        print(f"Share candidates (last pass: {state.get('last_run_at', 'never')}):\n")
+        # Re-score to get fresh evidence lines for the stored candidate names.
+        result = wsp.run_share_pass(dry_run=True)
+        for c in result.get("candidates", []):
+            print(f"  {c['evidence']}")
+            print(f"    score: {c['score']}")
+        if result.get("skipped_declined"):
+            print(f"\n  declined (not re-nominated): {', '.join(result['skipped_declined'])}")
+        return 0
+
+    if sub == "run":
+        result = wsp.run_share_pass(dry_run=True)
+        if not result.get("ok"):
+            print(f"share pass failed: {result.get('error')}", file=sys.stderr)
+            return 1
+        candidates = result.get("candidates", [])
+        if not candidates:
+            print("No share candidates found (all skills below the activity floor).")
+            return 0
+        print(f"Share candidates ({len(candidates)}):\n")
+        for c in candidates:
+            print(f"  {c['evidence']}")
+            print(f"    score: {c['score']}")
+        print(
+            f"\n{result.get('skipped_below_floor', 0)} skills below the activity floor."
+        )
+        if result.get("skipped_declined"):
+            print(f"{len(result['skipped_declined'])} declined (not re-nominated).")
+        print(
+            "\nThis is a dry-run — nothing was shared. To share a skill:\n"
+            "  hermes sync propose <skill>"
+        )
+        return 0
+
+    if sub == "decline":
+        skill = args.skill
+        wsp.decline_candidate(skill)
+        print(f"'{skill}' declined — it won't be nominated for sharing again.")
+        return 0
+
+    return 1
 
 
 def cmd_webhook(args):
@@ -11732,6 +11805,7 @@ def main():
     # =========================================================================
     build_cron_parser(subparsers, cmd_cron=cmd_cron)
     build_sync_parser(subparsers, cmd_sync=cmd_sync)
+    build_wisdom_parser(subparsers, cmd_wisdom=cmd_wisdom)
 
     # =========================================================================
     # webhook command  (parser built in hermes_cli/subcommands/webhook.py)
