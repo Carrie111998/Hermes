@@ -3126,6 +3126,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_submission": True,
                 "run_status": True,
                 "run_events_sse": True,
+                "run_context_usage": True,
                 "run_stop": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
@@ -6384,6 +6385,84 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_statuses[run_id] = current
         return current
 
+    @staticmethod
+    def _run_context_usage(agent: Any) -> Dict[str, Any]:
+        """Return context-window telemetry for a completed API run.
+
+        Billing counters aggregate every model call in the run. Context usage
+        is deliberately separate: it describes the most recent prompt tracked
+        by the active context engine. A post-compaction ``-1`` sentinel is
+        reported as unavailable instead of leaking a negative or misleading
+        zero token count to API clients.
+        """
+
+        engine = getattr(agent, "context_compressor", None)
+        status: Dict[str, Any] = {}
+        get_status = getattr(engine, "get_status", None)
+        if callable(get_status):
+            try:
+                candidate = get_status()
+                if isinstance(candidate, dict):
+                    status = candidate
+            except Exception:
+                # Context-engine plugins are trusted code, but their exception
+                # text may still contain provider URLs, headers, or credentials.
+                # This telemetry path must never copy those details into logs.
+                logger.warning(
+                    "Context engine status unavailable for completed API run"
+                )
+
+        def _nonnegative_int(value: Any) -> Optional[int]:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return None
+            return value
+
+        raw_context_tokens = getattr(
+            engine,
+            "last_prompt_tokens",
+            status.get("last_prompt_tokens"),
+        )
+        context_tokens = _nonnegative_int(raw_context_tokens)
+        if context_tokens == 0:
+            context_tokens = None
+
+        context_length = _nonnegative_int(status.get("context_length"))
+        if context_length == 0:
+            context_length = None
+
+        compression_count = _nonnegative_int(status.get("compression_count"))
+        if compression_count is None:
+            compression_count = 0
+
+        declared_source = status.get("context_source")
+        allowed_sources = {"provider_prompt_tokens", "rough_estimate", "unknown"}
+        if isinstance(declared_source, str) and declared_source in allowed_sources:
+            context_source = declared_source
+        elif context_tokens is None:
+            context_source = "unknown"
+        else:
+            last_real_tokens = _nonnegative_int(
+                getattr(engine, "last_real_prompt_tokens", None)
+            )
+            cumulative_prompt_tokens = _nonnegative_int(
+                getattr(agent, "session_prompt_tokens", None)
+            )
+            if last_real_tokens and last_real_tokens == context_tokens:
+                context_source = "provider_prompt_tokens"
+            elif last_real_tokens is None and cumulative_prompt_tokens:
+                # Alternative context engines may not expose the built-in
+                # compressor's last_real_prompt_tokens calibration field.
+                context_source = "unknown"
+            else:
+                context_source = "rough_estimate"
+
+        return {
+            "context_tokens": context_tokens,
+            "context_length": context_length,
+            "compression_count": compression_count,
+            "context_source": context_source,
+        }
+
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
         def _push(event: Dict[str, Any]) -> None:
@@ -6740,6 +6819,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
                             "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
                         }
+                        u.update(self._run_context_usage(agent))
                         return r, u
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
@@ -6773,12 +6853,30 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                    reported_session_id = (
+                        result.get("session_id")
+                        if isinstance(result, dict)
+                        else None
+                    )
+                    effective_session_id = (
+                        reported_session_id
+                        if isinstance(reported_session_id, str)
+                        and reported_session_id.strip()
+                        and len(reported_session_id) <= self._MAX_SESSION_HEADER_LEN
+                        else session_id
+                    )
+                    session_fields: Dict[str, Any] = {
+                        "session_id": effective_session_id,
+                    }
+                    if effective_session_id != session_id:
+                        session_fields["previous_session_id"] = session_id
                     _put_event_if_active({
                         "event": "run.completed",
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "output": final_response,
                         "usage": usage,
+                        **session_fields,
                     })
                     self._set_run_status(
                         run_id,
@@ -6786,6 +6884,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         output=final_response,
                         usage=usage,
                         last_event="run.completed",
+                        **session_fields,
                     )
             except asyncio.CancelledError:
                 self._set_run_status(

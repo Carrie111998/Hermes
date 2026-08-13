@@ -9,6 +9,7 @@ Covers:
 """
 
 import asyncio
+import json
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -17,6 +18,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from agent.context_compressor import ContextCompressor
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
@@ -266,6 +268,87 @@ class TestStartRun:
 
 class TestRunStatus:
 
+    def test_context_usage_distinguishes_provider_measurement_from_estimate(self):
+        compressor = ContextCompressor(
+            model="test/model",
+            quiet_mode=True,
+            config_context_length=200_000,
+        )
+        compressor.update_from_response({
+            "prompt_tokens": 42_000,
+            "completion_tokens": 500,
+            "total_tokens": 42_500,
+        })
+        compressor.compression_count = 2
+        agent = MagicMock()
+        agent.context_compressor = compressor
+        agent.session_prompt_tokens = 42_000
+
+        measured = APIServerAdapter._run_context_usage(agent)
+
+        assert measured == {
+            "context_tokens": 42_000,
+            "context_length": 200_000,
+            "compression_count": 2,
+            "context_source": "provider_prompt_tokens",
+        }
+
+        compressor.last_prompt_tokens = 43_500
+        estimated = APIServerAdapter._run_context_usage(agent)
+        assert estimated["context_tokens"] == 43_500
+        assert estimated["context_source"] == "rough_estimate"
+
+        compressor.last_prompt_tokens = -1
+        awaiting_measurement = APIServerAdapter._run_context_usage(agent)
+        assert awaiting_measurement["context_tokens"] is None
+        assert awaiting_measurement["context_source"] == "unknown"
+
+    def test_context_usage_filters_plugin_fields_and_invalid_source(self):
+        class PluginContextEngine:
+            last_prompt_tokens = 12_000
+            last_real_prompt_tokens = 12_000
+
+            def get_status(self):
+                return {
+                    "last_prompt_tokens": 12_000,
+                    "context_length": 200_000,
+                    "compression_count": 1,
+                    "context_source": {"unexpected": True},
+                    "api_key": "must-not-leave-the-engine",
+                    "prompt": "must-not-leave-the-engine",
+                }
+
+        agent = MagicMock()
+        agent.context_compressor = PluginContextEngine()
+        agent.session_prompt_tokens = 12_000
+
+        usage = APIServerAdapter._run_context_usage(agent)
+
+        assert usage == {
+            "context_tokens": 12_000,
+            "context_length": 200_000,
+            "compression_count": 1,
+            "context_source": "provider_prompt_tokens",
+        }
+
+    def test_context_status_exception_details_are_not_logged(self, caplog):
+        class FailingContextEngine:
+            last_prompt_tokens = 12_000
+            last_real_prompt_tokens = 12_000
+
+            def get_status(self):
+                raise RuntimeError("SENSITIVE_MARKER")
+
+        agent = MagicMock()
+        agent.context_compressor = FailingContextEngine()
+        agent.session_prompt_tokens = 12_000
+
+        usage = APIServerAdapter._run_context_usage(agent)
+
+        assert usage["context_source"] == "provider_prompt_tokens"
+        assert "Context engine status unavailable" in caplog.text
+        assert "SENSITIVE_MARKER" not in caplog.text
+
     @pytest.mark.asyncio
     async def test_status_reflects_explicit_session_id(self, adapter):
         app = _create_runs_app(adapter)
@@ -295,6 +378,120 @@ class TestRunStatus:
                 mock_agent.run_conversation.assert_called_once()
                 assert mock_agent.run_conversation.call_args.kwargs["task_id"] == "space-session"
                 assert status["session_id"] == "space-session"
+
+    @pytest.mark.asyncio
+    async def test_completed_status_exposes_context_and_effective_session(self, adapter):
+        app = _create_runs_app(adapter)
+        compressor = ContextCompressor(
+            model="test/model",
+            quiet_mode=True,
+            config_context_length=272_000,
+        )
+        compressor.update_from_response({
+            "prompt_tokens": 20_054,
+            "completion_tokens": 1_000,
+            "total_tokens": 21_054,
+        })
+        compressor.compression_count = 1
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {
+                    "final_response": "done",
+                    "session_id": "session-after-compaction",
+                }
+                mock_agent.context_compressor = compressor
+                mock_agent.session_prompt_tokens = 20_054
+                mock_agent.session_completion_tokens = 1_000
+                mock_agent.session_total_tokens = 21_054
+                mock_create.return_value = mock_agent
+
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "session_id": "session-before-compaction"},
+                )
+                run_id = (await response.json())["run_id"]
+
+                for _ in range(40):
+                    status_response = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_response.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert status["session_id"] == "session-after-compaction"
+        assert status["previous_session_id"] == "session-before-compaction"
+        assert status["usage"] == {
+            "input_tokens": 20_054,
+            "output_tokens": 1_000,
+            "total_tokens": 21_054,
+            "context_tokens": 20_054,
+            "context_length": 272_000,
+            "compression_count": 1,
+            "context_source": "provider_prompt_tokens",
+        }
+
+    @pytest.mark.asyncio
+    async def test_completed_status_rejects_non_string_effective_session(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {
+                    "final_response": "done",
+                    "session_id": {"private": "must-not-be-serialized"},
+                }
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "session_id": "submitted-session"},
+                )
+                run_id = (await response.json())["run_id"]
+
+                for _ in range(40):
+                    status_response = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_response.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert status["session_id"] == "submitted-session"
+        assert "previous_session_id" not in status
+        assert "must-not-be-serialized" not in json.dumps(status)
+
+    @pytest.mark.asyncio
+    async def test_context_metadata_requires_auth(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        auth_adapter._set_run_status(
+            "run_private",
+            "completed",
+            session_id="private-session",
+            usage={"context_tokens": 12_000, "context_length": 200_000},
+        )
+
+        async with TestClient(TestServer(app)) as cli:
+            status_response = await cli.get("/v1/runs/run_private")
+            events_response = await cli.get("/v1/runs/run_private/events")
+
+            assert status_response.status == 401
+            assert events_response.status == 401
+            assert "private-session" not in await status_response.text()
+            assert "context_tokens" not in await events_response.text()
+
+            authorized_response = await cli.get(
+                "/v1/runs/run_private",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            authorized_status = await authorized_response.json()
+
+        assert authorized_response.status == 200
+        assert authorized_status["session_id"] == "private-session"
+        assert authorized_status["usage"]["context_tokens"] == 12_000
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +527,15 @@ class TestRunEvents:
                 # Should contain run.completed
                 assert "run.completed" in body
                 assert "Hello!" in body
+
+                completed = next(
+                    json.loads(line.removeprefix("data: "))
+                    for line in body.splitlines()
+                    if line.startswith("data: ") and "run.completed" in line
+                )
+                assert completed["session_id"] == run_id
+                assert completed["usage"]["context_tokens"] is None
+                assert completed["usage"]["context_source"] == "unknown"
 
 
     @pytest.mark.asyncio
