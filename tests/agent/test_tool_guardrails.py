@@ -119,16 +119,49 @@ def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution()
 
 
 
-def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():
+def test_successful_identical_signatures_block_even_when_result_hash_changes():
     controller = ToolCallGuardrailController(
-        ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=2)
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=3,
+        )
     )
+    args = {"todos": [{"id": "loop-fix", "content": "same", "status": "in_progress"}]}
 
-    for _ in range(3):
-        assert controller.before_call("write_file", {"path": "/tmp/x", "content": "x"}).action == "allow"
-        assert controller.after_call("write_file", {"path": "/tmp/x", "content": "x"}, "ok", failed=False).action == "allow"
-        assert controller.before_call("custom_tool", {"x": 1}).action == "allow"
-        assert controller.after_call("custom_tool", {"x": 1}, "ok", failed=False).action == "allow"
+    assert controller.before_call("todo", args).action == "allow"
+    assert controller.after_call(
+        "todo",
+        args,
+        '{"todos":[{"id":"loop-fix","content":"same","status":"in_progress"}]}',
+        failed=False,
+    ).action == "allow"
+
+    assert controller.before_call("todo", args).action == "allow"
+    second = controller.after_call(
+        "todo",
+        args,
+        "[Duplicate tool output — same content as a more recent call]",
+        failed=False,
+    )
+    assert second.action == "warn"
+    assert second.code == "no_progress_warning"
+    assert second.count == 2
+
+    assert controller.before_call("todo", args).action == "allow"
+    third = controller.after_call(
+        "todo",
+        args,
+        '{"status":"unchanged","content_returned":false}',
+        failed=False,
+    )
+    assert third.action == "warn"
+    assert third.count == 3
+
+    blocked = controller.before_call("todo", args)
+    assert blocked.action == "block"
+    assert blocked.code == "no_progress_block"
+    assert blocked.count == 3
 
 
 
