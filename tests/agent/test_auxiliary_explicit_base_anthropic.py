@@ -116,3 +116,48 @@ def test_explicit_base_without_anthropic_mode_preserves_v1_rewrite():
     assert client is not None
     assert not isinstance(client, AnthropicAuxiliaryClient)
     assert _client_base_url(client).rstrip("/").endswith("/proxy/v1")
+
+
+def test_api_key_provider_wrap_uses_explicit_override_not_raw_creds_base():
+    """Regression for issue #85535: the generic API-key branch (a built-in
+    named provider like "deepseek" whose fallback_model entry overrides its
+    endpoint via explicit_base_url) must make the Anthropic-wrap decision
+    against the SAME effective base_url the OpenAI client was actually
+    built with, not a stale pre-rewrite value.
+
+    Uses an api.kimi.com/coding override, which _to_openai_base_url()
+    rewrites by APPENDING "/v1" (unlike the /anthropic-suffix case,
+    which STRIPS a marker -- entangled with the separate, not-yet-landed
+    #85532 rewrite-policy fix). Both the pre-rewrite raw_base_url
+    ("https://api.kimi.com/coding") and the post-rewrite base_url used to
+    build the actual client ("https://api.kimi.com/coding/v1") match the
+    "api.kimi.com/coding" wrap heuristic, so the wrap itself doesn't
+    distinguish the bug -- but the EXACT URL string passed to
+    build_anthropic_client does. Before the fix, it received the raw,
+    /v1-less URL: inconsistent with the endpoint the OpenAI client was
+    actually pointed at."""
+    import model_tools  # noqa: F401 -- registers built-in provider profiles
+    from agent.auxiliary_client import resolve_provider_client, AnthropicAuxiliaryClient
+
+    override_base = "https://api.kimi.com/coding"
+    effective_base = "https://api.kimi.com/coding/v1"  # after _to_openai_base_url()
+    fake_anthropic = MagicMock(name="anthropic_sdk_client")
+    with patch(
+        "agent.anthropic_adapter.build_anthropic_client",
+        return_value=fake_anthropic,
+    ) as mock_build:
+        client, model = resolve_provider_client(
+            "deepseek",
+            model="some-model",
+            explicit_base_url=override_base,
+            explicit_api_key="k",
+        )
+
+    assert isinstance(client, AnthropicAuxiliaryClient), (
+        "an explicit_base_url override pointing at an Anthropic-wire "
+        f"endpoint must be wrapped, got {type(client).__name__}"
+    )
+    # The wrap must be built against the SAME effective URL the OpenAI
+    # client was actually constructed with -- not the stale pre-rewrite
+    # value -- so the Anthropic SDK client targets the same endpoint.
+    mock_build.assert_called_once_with("k", effective_base)
