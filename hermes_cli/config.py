@@ -2160,6 +2160,43 @@ def _persist_migration(config: Dict[str, Any]) -> None:
     save_config(config)
 
 
+def _persist_version_stamp(latest_ver: int) -> bool:
+    """Bump ``_config_version`` in place, preserving comments and quoting.
+
+    A version bump with no accompanying content migration is a pure metadata
+    write, but routing it through ``save_config`` re-serialises the whole
+    document with PyYAML — which cannot represent comments at all. Every
+    comment in a hand-curated config.yaml is destroyed by a bump that intended
+    to change one integer.
+
+    That is not hypothetical: a v33 -> v34 bump silently deleted the two lines
+    recording that the dashboard signing secret lives in ``~/.hermes/.env``
+    rather than in the tracked file — the only in-file pointer to its real
+    home, and load-bearing precisely because the secret used to be committed
+    there. The same write also blanked an explicitly-set ``display.personality``
+    via default-stripping.
+
+    ``atomic_roundtrip_yaml_update`` already does the right thing (ruamel
+    round-trip, ``preserve_quotes``, same temp+fsync+replace pattern), so use it
+    for the single-key case. Returns False when the roundtrip path is
+    unavailable or fails, so the caller can fall back rather than skip the bump.
+    """
+    if is_managed():
+        managed_error("save configuration")
+        return True  # handled: managed scope refuses the write by design
+
+    try:
+        from utils import atomic_roundtrip_yaml_update
+
+        atomic_roundtrip_yaml_update(get_config_path(), "_config_version", latest_ver)
+        return True
+    except Exception:
+        # ruamel missing, unparseable YAML, unwritable path -- fall back to the
+        # full re-serialise. Losing comments beats leaving the version stale,
+        # which would re-run the migration on every subsequent invocation.
+        return False
+
+
 def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, Any]:
     """
     Migrate config to latest version, prompting for new required fields.
@@ -2376,9 +2413,13 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
         results["config_added"].extend(field["key"] for field in missing_config)
 
     if current_ver < latest_ver and not floor_refused:
-        config = read_raw_config()
-        config["_config_version"] = latest_ver
-        _persist_migration(config)
+        # Version-only bump: no content migration ran, so mutate the single key
+        # in place and keep the user's comments/quoting. Falls back to the full
+        # re-serialise only if the roundtrip path is unavailable.
+        if not _persist_version_stamp(latest_ver):
+            config = read_raw_config()
+            config["_config_version"] = latest_ver
+            _persist_migration(config)
 
     # ── Skill-declared config vars ──────────────────────────────────────
     # Skills can declare config.yaml settings they need via
