@@ -8,6 +8,7 @@ model / API quota / browser pool from being overwhelmed by a fan-out.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
 
@@ -29,7 +30,14 @@ def isolated_kanban_home_with_profiles(monkeypatch):
 
 
 def _fake_spawn(*args, **kwargs):
-    return 12345
+    from hermes_cli import kanban_db as kb
+
+    return kb._spawn_behind_bootstrap(
+        ["/usr/bin/true"],
+        env=os.environ,
+        cwd=args[1],
+        stdout=subprocess.DEVNULL,
+    )
 
 
 
@@ -96,5 +104,4 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
     assert len(res2.spawned) == 1
     assert len(res2.skipped_per_profile_capped) == 1
     assert res2.spawned[0][0] != spawned_id  # different task this time
-
 

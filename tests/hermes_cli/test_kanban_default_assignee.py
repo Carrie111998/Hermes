@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 
@@ -31,8 +32,15 @@ def isolated_kanban_home(monkeypatch):
 
 
 def _fake_spawn(*args, **kwargs):
-    """Stand-in for the real worker spawn — returns a fake PID."""
-    return 12345
+    """Stand-in using the blocked pending-worker contract."""
+    from hermes_cli import kanban_db as kb
+
+    return kb._spawn_behind_bootstrap(
+        ["/usr/bin/true"],
+        env=os.environ,
+        cwd=args[1],
+        stdout=subprocess.DEVNULL,
+    )
 
 
 
@@ -91,5 +99,4 @@ def test_explicitly_assigned_task_untouched_by_default_assignee(isolated_kanban_
         )
     assert task_id not in res.auto_assigned_default
     assert any(s[0] == task_id and s[1] == "default" for s in res.spawned)
-
 

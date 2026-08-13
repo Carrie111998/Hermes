@@ -13,9 +13,6 @@ Pinning ``TERMINAL_CWD`` to the workspace fixes both.
 
 from __future__ import annotations
 
-import subprocess
-
-
 def _make_task(kb, *, assignee: str = "w"):
     return kb.Task(
         id="t_cwd",
@@ -42,17 +39,16 @@ def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
 
     captured: dict = {}
 
-    class FakeProc:
-        pid = 4242
+    sentinel = object()
 
-    def fake_popen(cmd, *args, **kwargs):
+    def fake_bootstrap(cmd, **kwargs):
         captured["cmd"] = list(cmd)
         captured["env"] = dict(kwargs.get("env") or {})
         captured["cwd"] = kwargs.get("cwd")
-        return FakeProc()
+        return sentinel
 
-    monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    kb._default_spawn(_make_task(kb), workspace)
+    monkeypatch.setattr(kb, "_spawn_behind_bootstrap", fake_bootstrap)
+    assert kb._default_spawn(_make_task(kb), workspace) is sentinel
     return captured
 
 
@@ -75,5 +71,4 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
     # The subprocess cwd and TERMINAL_CWD must agree — both anchor the workspace.
     assert captured["cwd"] == str(workspace)
     assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
-
 

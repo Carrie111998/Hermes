@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -87,12 +88,203 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Literal, Mapping, Optional, Sequence
 
+from hermes_cli.process_bootstrap import (
+    AttemptFenceCapabilityError,
+    AttemptFenceInventoryOverflow,
+    DarwinProcessIdentity,
+    ProcessProvenance,
+    StaleAttemptError,
+    MAX_CANONICAL_BOARD_DBS,
+    _canonical_board_db_paths,
+    _darwin_process_identity,
+    _discover_current_worker_registration,
+    _host_id,
+    _read_registration_rows,
+    _require_attempt_fence_platform,
+    _validated_provenance,
+)
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
+
+
+def _identity_matches(expected: DarwinProcessIdentity) -> bool:
+    """Return whether ``expected`` still names the same live process."""
+    return _darwin_process_identity(expected.pid) == expected
+
+
+class SpawnStartError(RuntimeError):
+    """The blocked bootstrap process could not be started safely."""
+
+
+class UnknownWorkerProcess(RuntimeError):
+    """A pending worker could not be terminated with verified identity."""
+
+
+class UnfencedSpawnContractError(RuntimeError):
+    """A custom spawner returned a legacy result without a process fence."""
+
+
+class SpawnBindError(RuntimeError):
+    """A blocked worker could not be durably associated with its old run."""
+
+
+@dataclass
+class PendingWorkerProcess:
+    """A newly-started worker blocked before exec until its DB bind commits."""
+
+    proc: subprocess.Popen
+    gate_write_fd: int
+    identity: DarwinProcessIdentity
+
+    def _close_gate(self) -> None:
+        fd, self.gate_write_fd = self.gate_write_fd, -1
+        if fd >= 0:
+            os.close(fd)
+
+    def release(self) -> None:
+        try:
+            os.write(self.gate_write_fd, b"1")
+        except BaseException:
+            self.abort()
+            raise
+        finally:
+            self._close_gate()
+
+    def _group_has_live_members(self) -> Optional[bool]:
+        """Return live-member state; zombies are already dead processes."""
+        try:
+            os.killpg(self.identity.pgid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return None
+        try:
+            inspected = subprocess.run(
+                ["ps", "-axo", "pgid=,stat="],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=1,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError, TimeoutError):
+            return None
+        if inspected.returncode != 0:
+            return None
+        states = []
+        for line in inspected.stdout.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[0] == str(self.identity.pgid):
+                states.append(fields[1])
+        if not states:
+            return False
+        return any("Z" not in state for state in states)
+
+    def abort(self) -> None:
+        self._close_gate()
+        import signal
+
+        leader_is_current = _identity_matches(self.identity)
+        if self.proc.poll() is not None:
+            self.proc.wait()
+        elif leader_is_current:
+            try:
+                os.killpg(self.identity.pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired as exc:
+                raise UnknownWorkerProcess(
+                    "cannot safely kill reused process identity"
+                ) from exc
+
+        group_live = self._group_has_live_members()
+        if group_live is False:
+            return
+        if group_live is None:
+            raise UnknownWorkerProcess(
+                "cannot prove pending worker group termination"
+            )
+        if leader_is_current:
+            try:
+                os.killpg(self.identity.pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                group_live = self._group_has_live_members()
+                if group_live is False:
+                    return
+                if group_live is None:
+                    raise UnknownWorkerProcess(
+                        "cannot prove pending worker group termination"
+                    )
+                time.sleep(0.02)
+            raise UnknownWorkerProcess(
+                "verified pending worker group survived SIGKILL"
+            )
+        raise UnknownWorkerProcess("cannot safely kill reused process identity")
+
+
+def _spawn_behind_bootstrap(
+    command: Sequence[str],
+    *,
+    env: Mapping[str, str],
+    cwd: Optional[str],
+    stdout: Any,
+    python_executable: Optional[str] = None,
+) -> PendingWorkerProcess:
+    """Start an isolated bootstrap that cannot exec ``command`` before release."""
+    _require_attempt_fence_platform()
+    read_fd, write_fd = os.pipe()
+    try:
+        proc = subprocess.Popen(  # noqa: S603 - dispatcher-owned argv
+            [
+                python_executable or sys.executable,
+                "-m",
+                "hermes_cli.process_bootstrap",
+                "--gate-fd",
+                str(read_fd),
+                "--",
+                *command,
+            ],
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=subprocess.STDOUT,
+            env=dict(env),
+            pass_fds=(read_fd,),
+            start_new_session=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+        )
+    except BaseException as exc:
+        os.close(read_fd)
+        os.close(write_fd)
+        raise SpawnStartError("worker bootstrap could not start") from exc
+    os.close(read_fd)
+    identity = _darwin_process_identity(proc.pid)
+    if identity is None or identity.pgid != proc.pid:
+        os.close(write_fd)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            raise UnknownWorkerProcess(
+                "bootstrap identity unavailable and process did not exit"
+            ) from exc
+        raise SpawnStartError("worker bootstrap identity is unavailable")
+    return PendingWorkerProcess(proc, write_fd, identity)
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +293,7 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+TERMINAL_FENCE_REAP_LIMIT = 16
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -133,7 +326,6 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
-
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -515,6 +707,7 @@ def set_current_board(slug: str) -> Path:
     so that ``hermes kanban boards switch <typo>`` returns an error
     instead of silently pointing at nothing.
     """
+    _deny_registered_worker_filesystem_control_plane()
     _assert_not_delegated_child_mutation()
     normed = _normalize_board_slug(slug)
     if not normed:
@@ -527,6 +720,7 @@ def set_current_board(slug: str) -> Path:
 
 def clear_current_board() -> None:
     """Remove ``<root>/kanban/current`` so the active board reverts to ``default``."""
+    _deny_registered_worker_filesystem_control_plane()
     _assert_not_delegated_child_mutation()
     try:
         current_board_path().unlink()
@@ -740,6 +934,7 @@ def write_board_metadata(
     project scope; a value sets it (not validated here — the caller resolves
     it against ``projects_db``).
     """
+    _deny_registered_worker_filesystem_control_plane()
     _assert_not_delegated_child_mutation()
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta = read_board_metadata(slug)
@@ -788,6 +983,7 @@ def create_board(
     malformed slug; returns the existing metadata (not an error) if the
     board already exists — matching ``mkdir -p`` semantics.
     """
+    _deny_registered_worker_filesystem_control_plane()
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
@@ -860,6 +1056,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     Returns a summary dict describing what happened (``{"slug", "action",
     "new_path"}``).
     """
+    _deny_registered_worker_filesystem_control_plane()
     _assert_not_delegated_child_mutation()
     normed = _normalize_board_slug(slug)
     if not normed:
@@ -933,6 +1130,9 @@ class Task:
     # (Pre-rename column: ``spawn_failures``.)
     consecutive_failures: int = 0
     worker_pid: Optional[int] = None
+    worker_pgid: Optional[int] = None
+    worker_identity: Optional[str] = None
+    worker_fence: Optional[str] = None
     # Short excerpt of the last failure's error text (any outcome, not
     # just spawn). Pre-rename column: ``last_spawn_error``.
     last_failure_error: Optional[str] = None
@@ -1035,6 +1235,11 @@ class Task:
                 else (row["spawn_failures"] if "spawn_failures" in keys else 0)
             ),
             worker_pid=row["worker_pid"] if "worker_pid" in keys else None,
+            worker_pgid=row["worker_pgid"] if "worker_pgid" in keys else None,
+            worker_identity=(
+                row["worker_identity"] if "worker_identity" in keys else None
+            ),
+            worker_fence=row["worker_fence"] if "worker_fence" in keys else None,
             last_failure_error=(
                 row["last_failure_error"] if "last_failure_error" in keys
                 # Same belt-and-suspenders fallback as consecutive_failures above.
@@ -1109,6 +1314,9 @@ class Run:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     worker_pid: Optional[int]
+    worker_pgid: Optional[int]
+    worker_identity: Optional[str]
+    worker_fence: Optional[str]
     max_runtime_seconds: Optional[int]
     last_heartbeat_at: Optional[int]
     started_at: int
@@ -1133,6 +1341,13 @@ class Run:
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             worker_pid=row["worker_pid"],
+            worker_pgid=row["worker_pgid"] if "worker_pgid" in row.keys() else None,
+            worker_identity=(
+                row["worker_identity"] if "worker_identity" in row.keys() else None
+            ),
+            worker_fence=(
+                row["worker_fence"] if "worker_fence" in row.keys() else None
+            ),
             max_runtime_seconds=row["max_runtime_seconds"],
             last_heartbeat_at=row["last_heartbeat_at"],
             started_at=int(row["started_at"]),
@@ -1211,6 +1426,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- exceeds DEFAULT_FAILURE_LIMIT consecutive non-successes.
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     worker_pid           INTEGER,
+    worker_pgid          INTEGER,
+    worker_identity      TEXT,
+    worker_fence         TEXT,
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
@@ -1317,6 +1535,9 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
+    worker_pgid         INTEGER,
+    worker_identity     TEXT,
+    worker_fence        TEXT,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
     started_at          INTEGER NOT NULL,
@@ -1362,6 +1583,14 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
+);
+
+-- Durable board-local scheduling cursor for the bounded terminal-fence
+-- reaper.  This is not task authority: every cleanup still requires the
+-- raw fence/process tuple and exact CAS below.
+CREATE TABLE IF NOT EXISTS terminal_fence_reap_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    cursor    TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
@@ -2092,6 +2321,7 @@ def repair_db(
     raw, exactly like the guard: a locked healthy DB is not corruption and
     must not be quarantined.
     """
+    _deny_registered_worker_filesystem_control_plane()
     if db_path is not None:
         path = db_path
     else:
@@ -2177,10 +2407,98 @@ def connect(
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
       ``<root>/kanban/current`` → ``default``.
     """
+    prepared_provenance = _prepare_mutation_provenance()
     if db_path is not None:
         path = db_path
     else:
         path = kanban_db_path(board=board)
+
+    if prepared_provenance is not None:
+        try:
+            requested_identity = str(path.resolve(strict=True))
+            registered_identity = str(
+                Path(prepared_provenance.board_db_path).resolve(strict=True)
+            )
+        except OSError as exc:
+            raise RegisteredWorkerControlPlaneError(
+                "registered worker cannot create or initialize a kanban board"
+            ) from exc
+        if requested_identity != registered_identity:
+            raise CrossBoardWorkerMutationError(
+                "registered worker cannot open a different kanban board"
+            )
+        # A registered group may use only an already initialized own-board DB.
+        # Verify the Task-1 fence schema through a read-only handle before the
+        # normal writable connection is opened; never run schema/migrations.
+        uri = f"{Path(requested_identity).as_uri()}?mode=ro"
+        verification = sqlite3.connect(uri, uri=True)
+        try:
+            task_columns = {
+                row[1]
+                for row in verification.execute("PRAGMA table_info(tasks)")
+            }
+            run_columns = {
+                row[1]
+                for row in verification.execute("PRAGMA table_info(task_runs)")
+            }
+            reap_columns = {
+                row[1]
+                for row in verification.execute(
+                    "PRAGMA table_info(terminal_fence_reap_state)"
+                )
+            }
+        finally:
+            verification.close()
+        required_task_columns = {
+            "id",
+            "status",
+            "current_run_id",
+            "claim_lock",
+            "claim_expires",
+            "worker_pid",
+            "worker_pgid",
+            "worker_identity",
+            "worker_fence",
+        }
+        required_run_columns = {
+            "id",
+            "task_id",
+            "status",
+            "claim_lock",
+            "claim_expires",
+            "worker_pid",
+            "worker_pgid",
+            "worker_identity",
+            "worker_fence",
+        }
+        if (
+            not required_task_columns.issubset(task_columns)
+            or not required_run_columns.issubset(run_columns)
+            or not {"singleton", "cursor"}.issubset(reap_columns)
+        ):
+            raise AttemptFenceCapabilityError(
+                "registered worker board lacks the current attempt-fence schema"
+            )
+        conn = _sqlite_connect(Path(requested_identity))
+        try:
+            conn.row_factory = sqlite3.Row
+            with _INIT_LOCK:
+                from hermes_state import apply_wal_with_fallback
+
+                apply_wal_with_fallback(
+                    conn,
+                    db_label=f"kanban.db ({Path(requested_identity).name})",
+                )
+                conn.execute("PRAGMA synchronous=FULL")
+                conn.execute("PRAGMA wal_autocheckpoint=100")
+                conn.execute("PRAGMA foreign_keys=ON")
+                conn.execute("PRAGMA secure_delete=ON")
+                conn.execute("PRAGMA cell_size_check=ON")
+        except Exception:
+            conn.close()
+            raise
+        return conn
+
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -2326,6 +2644,7 @@ def init_db(
     external tools that upgrade an old DB file — can call this to
     force re-migration.
     """
+    _deny_registered_worker_filesystem_control_plane()
     if db_path is not None:
         path = db_path
     else:
@@ -2395,6 +2714,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             )
     if "worker_pid" not in cols:
         _add_column_if_missing(conn, "tasks", "worker_pid", "worker_pid INTEGER")
+    if "worker_pgid" not in cols:
+        _add_column_if_missing(conn, "tasks", "worker_pgid", "worker_pgid INTEGER")
+    if "worker_identity" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "worker_identity", "worker_identity TEXT"
+        )
+    if "worker_fence" not in cols:
+        _add_column_if_missing(conn, "tasks", "worker_fence", "worker_fence TEXT")
     if "last_failure_error" not in cols:
         added = _add_column_if_missing(
             conn, "tasks", "last_failure_error", "last_failure_error TEXT"
@@ -2506,6 +2833,29 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_worker_pgid ON tasks(worker_pgid)"
+    )
+
+    run_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone() is not None
+    if run_table_exists:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        if "worker_pgid" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "worker_pgid", "worker_pgid INTEGER"
+            )
+        if "worker_identity" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "worker_identity", "worker_identity TEXT"
+            )
+        if "worker_fence" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "worker_fence", "worker_fence TEXT"
+            )
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -2555,6 +2905,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         with write_txn(conn):
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
+                "       worker_pgid, worker_identity, worker_fence, "
                 "       max_runtime_seconds, last_heartbeat_at, started_at "
                 "FROM tasks "
                 "WHERE status = 'running' AND current_run_id IS NULL"
@@ -2566,13 +2917,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                     INSERT INTO task_runs (
                         task_id, profile, status,
                         claim_lock, claim_expires, worker_pid,
+                        worker_pgid, worker_identity, worker_fence,
                         max_runtime_seconds, last_heartbeat_at,
                         started_at
-                    ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         row["id"], row["assignee"], row["claim_lock"],
                         row["claim_expires"], row["worker_pid"],
+                        row["worker_pgid"], row["worker_identity"],
+                        row["worker_fence"],
                         row["max_runtime_seconds"], row["last_heartbeat_at"],
                         started,
                     ),
@@ -2650,7 +3004,8 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
-        " worker_pid INTEGER, max_runtime_seconds INTEGER,"
+        " worker_pid INTEGER, worker_pgid INTEGER, worker_identity TEXT,"
+        " worker_fence TEXT, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT)",
@@ -2796,6 +3151,322 @@ _BUSY_MAX_RETRIES = 5
 _BUSY_RETRY_MIN_S = 0.020  # 20ms
 _BUSY_RETRY_MAX_S = 0.150  # 150ms
 
+_AUTH_SENTINEL = object()
+_WRITE_TXN_STACK: ContextVar[tuple[tuple[int, str], ...]] = ContextVar(
+    "hermes_write_txn_stack",
+    default=(),
+)
+
+
+class FencedTargetError(StaleAttemptError):
+    """Raised when a caller does not own a fenced mutation target."""
+
+
+class CrossBoardWorkerMutationError(StaleAttemptError):
+    """Raised when a registered worker addresses a different board."""
+
+
+class RegisteredWorkerControlPlaneError(StaleAttemptError):
+    """Raised when a worker process group invokes a control-plane mutation."""
+
+
+@dataclass(frozen=True)
+class _MutationAuthorization:
+    sentinel: object
+    mode: Literal["manual", "worker"]
+    board_db_identity: str
+    connection_id: int
+    transaction_token: str
+    provenance: ProcessProvenance | None
+
+
+def _board_db_identity(conn: sqlite3.Connection) -> str:
+    row = conn.execute("PRAGMA database_list").fetchone()
+    if row is None:
+        raise StaleAttemptError("kanban connection has no main database")
+    try:
+        raw_path = row["file"]
+    except (IndexError, TypeError):
+        raw_path = row[2]
+    if type(raw_path) is not str or not raw_path:
+        raise StaleAttemptError("kanban connection database identity is unavailable")
+    try:
+        return str(Path(raw_path).resolve(strict=True))
+    except OSError as exc:
+        raise StaleAttemptError("kanban connection database cannot be resolved") from exc
+
+
+def _active_write_txn_token(conn: sqlite3.Connection) -> str:
+    for connection_id, token in reversed(_WRITE_TXN_STACK.get()):
+        if connection_id == id(conn):
+            return token
+    raise RuntimeError("mutation authorization requires active write_txn")
+
+
+def _validate_current_worker_attempt_locked(
+    conn: sqlite3.Connection,
+    provenance: ProcessProvenance,
+) -> None:
+    board_identity = _board_db_identity(conn)
+    try:
+        provenance_board = str(Path(provenance.board_db_path).resolve(strict=True))
+    except OSError as exc:
+        raise StaleAttemptError("registered worker board cannot be resolved") from exc
+    if provenance_board != board_identity:
+        raise CrossBoardWorkerMutationError(
+            "registered worker cannot mutate a different kanban board"
+        )
+
+    leader = provenance.leader_identity
+    cursor = conn.execute(
+        """
+        UPDATE tasks
+           SET id = id
+         WHERE id = ?
+           AND status = 'running'
+           AND current_run_id = ?
+           AND claim_lock = ?
+           AND worker_pid = ?
+           AND worker_pgid = ?
+           AND worker_identity = ?
+           AND worker_fence = ?
+        """,
+        (
+            provenance.task_id,
+            provenance.run_id,
+            provenance.claim_lock,
+            leader.pid,
+            leader.pgid,
+            leader.token,
+            provenance.raw_fence,
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise StaleAttemptError("worker task ownership changed before mutation")
+    run = conn.execute(
+        """
+        SELECT task_id, status, claim_lock, worker_pid, worker_pgid,
+               worker_identity, worker_fence
+          FROM task_runs
+         WHERE id = ?
+        """,
+        (provenance.run_id,),
+    ).fetchone()
+    if run is None or (
+        run["task_id"] != provenance.task_id
+        or run["status"] != "running"
+        or run["claim_lock"] != provenance.claim_lock
+        or run["worker_pid"] != leader.pid
+        or run["worker_pgid"] != leader.pgid
+        or run["worker_identity"] != leader.token
+        or run["worker_fence"] != provenance.raw_fence
+    ):
+        raise StaleAttemptError("worker run ownership changed before mutation")
+
+
+def _validate_authorization_targets(
+    conn: sqlite3.Connection,
+    authorization: _MutationAuthorization,
+    target_task_ids: tuple[str, ...],
+    *,
+    allow_unfenced_worker_targets: bool = False,
+    require_worker_endpoint: bool = False,
+) -> None:
+    target_ids = tuple(sorted({task_id for task_id in target_task_ids if task_id}))
+    if not target_ids:
+        return
+    placeholders = ",".join("?" for _ in target_ids)
+    rows = conn.execute(
+        f"SELECT id, worker_fence FROM tasks WHERE id IN ({placeholders})",
+        target_ids,
+    ).fetchall()
+    provenance_task = (
+        authorization.provenance.task_id
+        if authorization.provenance is not None
+        else None
+    )
+    if (
+        authorization.mode == "worker"
+        and require_worker_endpoint
+        and provenance_task not in target_ids
+    ):
+        raise FencedTargetError(
+            "registered worker graph mutation must include its own task"
+        )
+    for row in rows:
+        if (
+            authorization.mode == "worker"
+            and row["id"] != provenance_task
+            and not allow_unfenced_worker_targets
+        ):
+            raise FencedTargetError(
+                f"registered worker cannot mutate task {row['id']}"
+            )
+        if row["worker_fence"] is None:
+            continue
+        if authorization.mode == "worker" and row["id"] == provenance_task:
+            continue
+        raise FencedTargetError(
+            f"mutation target {row['id']} is owned by another fenced attempt"
+        )
+
+
+def _authorize_mutation_locked(
+    conn: sqlite3.Connection,
+    *,
+    target_task_ids: tuple[str, ...],
+    prepared_provenance: ProcessProvenance | None,
+    existing: _MutationAuthorization | None = None,
+    allow_unfenced_worker_targets: bool = False,
+    require_worker_endpoint: bool = False,
+) -> _MutationAuthorization:
+    token = _active_write_txn_token(conn)
+    board_identity = _board_db_identity(conn)
+    if existing is not None:
+        if (
+            existing.sentinel is not _AUTH_SENTINEL
+            or existing.connection_id != id(conn)
+            or existing.board_db_identity != board_identity
+            or existing.transaction_token != token
+        ):
+            raise StaleAttemptError("invalid scoped mutation authorization")
+        _validate_authorization_targets(
+            conn,
+            existing,
+            target_task_ids,
+            allow_unfenced_worker_targets=True,
+            require_worker_endpoint=require_worker_endpoint,
+        )
+        return existing
+
+    if prepared_provenance is None:
+        authorization = _MutationAuthorization(
+            _AUTH_SENTINEL,
+            "manual",
+            board_identity,
+            id(conn),
+            token,
+            None,
+        )
+    else:
+        _validate_current_worker_attempt_locked(conn, prepared_provenance)
+        authorization = _MutationAuthorization(
+            _AUTH_SENTINEL,
+            "worker",
+            board_identity,
+            id(conn),
+            token,
+            prepared_provenance,
+        )
+    _validate_authorization_targets(
+        conn,
+        authorization,
+        target_task_ids,
+        allow_unfenced_worker_targets=allow_unfenced_worker_targets,
+        require_worker_endpoint=require_worker_endpoint,
+    )
+    return authorization
+
+
+@contextlib.contextmanager
+def _authorized_write_txn(
+    conn: sqlite3.Connection,
+    target_task_ids: tuple[str, ...],
+    *,
+    existing: _MutationAuthorization | None = None,
+):
+    """Open a write transaction and authorize its exact mutation targets."""
+    prepared_provenance = (
+        existing.provenance if existing is not None else _prepare_mutation_provenance()
+    )
+    with write_txn(conn, allow_nested=existing is not None):
+        authorization = _authorize_mutation_locked(
+            conn,
+            target_task_ids=target_task_ids,
+            prepared_provenance=prepared_provenance,
+            existing=existing,
+        )
+        yield authorization
+
+
+def _prepare_mutation_provenance() -> ProcessProvenance | None:
+    """Discover process-group authority without trusting routing environment."""
+    if sys.platform != "darwin":
+        # Component-A dispatch is denied before claim/spawn on unsupported
+        # platforms, so a non-Darwin DB caller can only be a manual/CI caller.
+        return None
+    caller_pid = os.getpid()
+    caller_pgid = os.getpgid(0)
+    caller_identity = _darwin_process_identity(caller_pid)
+    if caller_identity is None or caller_identity.pgid != caller_pgid:
+        raise StaleAttemptError("caller process identity is unavailable")
+    paths = _canonical_board_db_paths()
+    if len(paths) > MAX_CANONICAL_BOARD_DBS:
+        raise AttemptFenceInventoryOverflow(
+            f"canonical board inventory has {len(paths)} databases; "
+            f"maximum is {MAX_CANONICAL_BOARD_DBS}"
+        )
+    matches = []
+    for path in paths:
+        try:
+            matches.extend(
+                (path, row)
+                for row in _read_registration_rows(path, caller_pgid)
+            )
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "no such table" in message or "no such column" in message:
+                # A canonical pre-fence DB cannot contain a worker
+                # registration.  Manual init/migration must remain reachable,
+                # while every DB with the fence schema is still scanned.
+                continue
+            raise StaleAttemptError(
+                "canonical board registration scan failed"
+            ) from exc
+        except sqlite3.Error as exc:
+            raise StaleAttemptError(
+                "canonical board registration scan failed"
+            ) from exc
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise StaleAttemptError("caller process group has ambiguous registrations")
+    path, row = matches[0]
+    return _validated_provenance(path, row, caller_identity)
+
+
+def _deny_registered_worker_control_plane_locked(
+    conn: sqlite3.Connection,
+    prepared_provenance: ProcessProvenance | None,
+) -> None:
+    """Reject control-plane entry from any registered worker process group."""
+    _active_write_txn_token(conn)
+    if prepared_provenance is None:
+        return
+    _validate_current_worker_attempt_locked(conn, prepared_provenance)
+    raise RegisteredWorkerControlPlaneError(
+        "registered workers cannot invoke kanban control-plane mutations"
+    )
+
+
+@contextlib.contextmanager
+def _control_plane_write_txn(conn: sqlite3.Connection):
+    """Authorize an operator/control write under its exact DB transaction."""
+    with write_txn(conn):
+        # Discovery occurs after BEGIN IMMEDIATE.  No dispatcher can add a
+        # registration for this process group between the scan and the write.
+        prepared_provenance = _prepare_mutation_provenance()
+        _deny_registered_worker_control_plane_locked(conn, prepared_provenance)
+        yield
+
+
+def _deny_registered_worker_filesystem_control_plane() -> None:
+    """Reject a registered worker before a control-plane filesystem write."""
+    if _prepare_mutation_provenance() is not None:
+        raise RegisteredWorkerControlPlaneError(
+            "registered workers cannot invoke kanban control-plane mutations"
+        )
+
 
 def _is_busy_error(exc: BaseException) -> bool:
     return isinstance(exc, sqlite3.OperationalError) and (
@@ -2863,31 +3534,39 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         return
 
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    transaction_token = secrets.token_hex(16)
+    stack = _WRITE_TXN_STACK.get()
+    reset_handle = _WRITE_TXN_STACK.set(
+        (*stack, (id(conn), transaction_token))
+    )
     try:
-        yield conn
-    except Exception:
         try:
-            conn.execute("ROLLBACK")
-        except sqlite3.OperationalError:
-            # SQLite has already auto-rolled-back the transaction (typical
-            # under EIO, lock contention, or corruption). Nothing to undo;
-            # do not let this secondary failure shadow the real one.
-            pass
-        raise
-    else:
-        try:
-            _execute_boundary_with_retry(conn, "COMMIT")
+            yield conn
         except Exception:
-            # COMMIT exhausted retries with the txn still open; roll back so the
-            # connection isn't poisoned for the next BEGIN IMMEDIATE.
             try:
                 conn.execute("ROLLBACK")
             except sqlite3.OperationalError:
+                # SQLite has already auto-rolled-back the transaction (typical
+                # under EIO, lock contention, or corruption). Nothing to undo;
+                # do not let this secondary failure shadow the real error.
                 pass
             raise
-        # Post-commit file-length check: header page_count must match actual file pages.
-        # A discrepancy means a torn-extend — raise now rather than silently corrupt.
-        _check_file_length_invariant(conn)
+        else:
+            try:
+                _execute_boundary_with_retry(conn, "COMMIT")
+            except Exception:
+                # COMMIT exhausted retries with the txn still open; roll back so the
+                # connection isn't poisoned for the next BEGIN IMMEDIATE.
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                raise
+            # Post-commit file-length check: header page_count must match actual file pages.
+            # A discrepancy means a torn-extend — raise now rather than silently corrupt.
+            _check_file_length_invariant(conn)
+    finally:
+        _WRITE_TXN_STACK.reset(reset_handle)
 
 
 # ---------------------------------------------------------------------------
@@ -2958,6 +3637,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    _mutation_auth: _MutationAuthorization | None = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3168,6 +3848,10 @@ def create_task(
             )
         skills_list = cleaned
 
+    prepared_provenance = (
+        None if _mutation_auth is not None else _prepare_mutation_provenance()
+    )
+
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
     # and to avoid holding a write lock during the lookup. Race is
@@ -3181,6 +3865,13 @@ def create_task(
             (idempotency_key,),
         ).fetchone()
         if row:
+            with write_txn(conn, allow_nested=True):
+                _authorize_mutation_locked(
+                    conn,
+                    target_task_ids=(row["id"],),
+                    prepared_provenance=prepared_provenance,
+                    existing=_mutation_auth,
+                )
             return row["id"]
 
     now = int(time.time())
@@ -3213,6 +3904,12 @@ def create_task(
             # compose create_task calls under one outer commit so the
             # dispatcher can never observe a partially constructed graph.
             with write_txn(conn, allow_nested=True):
+                _authorize_mutation_locked(
+                    conn,
+                    target_task_ids=tuple(parents),
+                    prepared_provenance=prepared_provenance,
+                    existing=_mutation_auth,
+                )
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -3467,7 +4164,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     Reassign after the current run completes if needed.
     """
     profile = _canonical_assignee(profile)
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -3519,7 +4216,7 @@ def set_model_override(
         raise ValueError("provider_override requires a model_override")
     if not model:
         provider = None
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -3556,7 +4253,7 @@ def set_reasoning_effort(
     running task. Returns True on success.
     """
     effort = normalize_reasoning_effort(effort)
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -3583,7 +4280,15 @@ def set_reasoning_effort(
 def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
+    prepared_provenance = _prepare_mutation_provenance()
     with write_txn(conn):
+        _authorize_mutation_locked(
+            conn,
+            target_task_ids=(parent_id, child_id),
+            prepared_provenance=prepared_provenance,
+            allow_unfenced_worker_targets=True,
+            require_worker_endpoint=True,
+        )
         missing = _find_missing_parents(conn, [parent_id, child_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
@@ -3635,7 +4340,15 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+    prepared_provenance = _prepare_mutation_provenance()
     with write_txn(conn):
+        authorization = _authorize_mutation_locked(
+            conn,
+            target_task_ids=(parent_id, child_id),
+            prepared_provenance=prepared_provenance,
+            allow_unfenced_worker_targets=True,
+            require_worker_endpoint=True,
+        )
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
             (parent_id, child_id),
@@ -3646,12 +4359,14 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
                 {"parent": parent_id, "child": child_id},
             )
         removed = cur.rowcount > 0
-    if removed:
-        # Dependency edge removed — re-evaluate promotion eligibility for the
-        # child immediately.  Matches the contract of complete_task and
-        # unblock_task; without this the child stays stuck in todo until the
-        # next dispatcher tick or a manual `hermes kanban recompute` (issue #22459).
-        recompute_ready(conn)
+        if removed:
+            # Edge deletion and dependent promotion are one logical mutation.
+            # A recompute failure must roll the edge and event back together.
+            recompute_ready(
+                conn,
+                _mutation_auth=authorization,
+                target_task_ids=(child_id,),
+            )
     return removed
 
 
@@ -3740,14 +4455,31 @@ def add_comment(
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    prepared_provenance = _prepare_mutation_provenance()
     now = int(time.time())
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
-        if not conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone():
+        _authorize_mutation_locked(
+            conn,
+            target_task_ids=(task_id,),
+            prepared_provenance=prepared_provenance,
+        )
+        task_row = conn.execute(
+            "SELECT status, current_run_id, worker_fence FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task_row is None:
             raise ValueError(f"unknown task {task_id}")
+        if task_row["worker_fence"] is not None:
+            ended = conn.execute(
+                "SELECT ended_at FROM task_runs WHERE id = ?",
+                (task_row["current_run_id"],),
+            ).fetchone()
+            if task_row["status"] != "running" or (ended and ended["ended_at"]):
+                raise StaleAttemptError(
+                    f"task {task_id} remains owned by an ended fenced attempt"
+                )
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)",
@@ -3892,28 +4624,30 @@ def store_attachment_bytes(
             f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit"
         )
     safe_name = _safe_attachment_name(filename)
-    dest_dir = task_attachments_dir(task_id, board=board)
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_path = _collision_free_path(dest_dir, safe_name)
-    dest_path.write_bytes(data)
-    try:
-        return add_attachment(
-            conn,
-            task_id,
-            filename=dest_path.name,
-            stored_path=str(dest_path.resolve()),
-            content_type=content_type,
-            size=len(data),
-            uploaded_by=uploaded_by,
-        )
-    except Exception:
-        # Don't leave an orphan blob if the metadata insert fails (most
-        # commonly: the task id doesn't exist).
+    with _authorized_write_txn(conn, (task_id,)) as authorization:
+        dest_dir = task_attachments_dir(task_id, board=board)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = _collision_free_path(dest_dir, safe_name)
+        dest_path.write_bytes(data)
         try:
-            dest_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+            return add_attachment(
+                conn,
+                task_id,
+                filename=dest_path.name,
+                stored_path=str(dest_path.resolve()),
+                content_type=content_type,
+                size=len(data),
+                uploaded_by=uploaded_by,
+                _mutation_auth=authorization,
+            )
+        except Exception:
+            # Don't leave an orphan blob if the metadata insert fails (most
+            # commonly: the task id doesn't exist).
+            try:
+                dest_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
 
 def add_attachment(
@@ -3925,6 +4659,7 @@ def add_attachment(
     content_type: Optional[str] = None,
     size: int = 0,
     uploaded_by: Optional[str] = None,
+    _mutation_auth: Optional[_MutationAuthorization] = None,
 ) -> int:
     """Record a file attachment for a task. Returns the new attachment id.
 
@@ -3937,7 +4672,9 @@ def add_attachment(
     if not stored_path or not stored_path.strip():
         raise ValueError("attachment stored_path is required")
     now = int(time.time())
-    with write_txn(conn):
+    with _authorized_write_txn(
+        conn, (task_id,), existing=_mutation_auth,
+    ):
         if not conn.execute(
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
@@ -4010,10 +4747,16 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
     (a missing file is not an error); the metadata row is the source of
     truth for whether an attachment "exists".
     """
+    prepared_provenance = _prepare_mutation_provenance()
     with write_txn(conn):
         att = get_attachment(conn, attachment_id)
         if att is None:
             return None
+        _authorize_mutation_locked(
+            conn,
+            target_task_ids=(att.task_id,),
+            prepared_provenance=prepared_provenance,
+        )
         conn.execute("DELETE FROM task_attachments WHERE id = ?", (attachment_id,))
         _append_event(
             conn, att.task_id, "attachment_removed", {"filename": att.filename}
@@ -4110,9 +4853,12 @@ def _end_run(
                error         = ?,
                metadata      = ?,
                ended_at      = ?,
-               claim_lock    = NULL,
-               claim_expires = NULL,
-               worker_pid    = NULL
+               claim_lock    = CASE WHEN worker_fence IS NULL
+                                    THEN NULL ELSE claim_lock END,
+               claim_expires = CASE WHEN worker_fence IS NULL
+                                    THEN NULL ELSE claim_expires END,
+               worker_pid    = CASE WHEN worker_fence IS NULL
+                                    THEN NULL ELSE worker_pid END
          WHERE id = ?
            AND ended_at IS NULL
         """,
@@ -4127,9 +4873,255 @@ def _end_run(
         ),
     )
     conn.execute(
-        "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
+        "UPDATE tasks SET current_run_id = NULL "
+        "WHERE id = ? AND worker_fence IS NULL",
+        (task_id,),
     )
     return run_id
+
+
+def _fenced_group_state(fence: Mapping[str, Any]) -> Literal[
+    "alive", "dead", "unknown"
+]:
+    """Conservatively classify the process group named by a raw fence."""
+    leader_pid = fence.get("leader_pid")
+    worker_pgid = fence.get("worker_pgid")
+    worker_identity = fence.get("worker_identity")
+    stored_host = fence.get("host")
+    current_host = _host_id()
+    if (
+        isinstance(leader_pid, bool)
+        or not isinstance(leader_pid, int)
+        or leader_pid <= 0
+        or isinstance(worker_pgid, bool)
+        or not isinstance(worker_pgid, int)
+        or worker_pgid <= 0
+        or not isinstance(worker_identity, str)
+        or not worker_identity
+        or not isinstance(stored_host, str)
+        or not stored_host
+        or current_host is None
+        or stored_host != current_host
+    ):
+        return "unknown"
+
+    current = _darwin_process_identity(leader_pid)
+    if (
+        current is not None
+        and current.token == worker_identity
+        and current.pgid == worker_pgid
+    ):
+        return "alive"
+    try:
+        os.killpg(worker_pgid, 0)
+    except PermissionError:
+        return "unknown"
+    except ProcessLookupError:
+        return "dead"
+    except OSError as exc:
+        return "dead" if exc.errno == errno.ESRCH else "unknown"
+    return "alive"
+
+
+class _FenceReapCasLost(RuntimeError):
+    """Internal signal used to roll back a two-row fence reap CAS."""
+
+
+def _decoded_fence(raw_fence: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(raw_fence, str) or not raw_fence:
+        return None
+    try:
+        decoded = json.loads(raw_fence)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _recorded_retry_status(run: Mapping[str, Any]) -> Optional[str]:
+    if run["outcome"] in {"completed", "gave_up"}:
+        return None
+    try:
+        metadata = json.loads(run["metadata"]) if run["metadata"] else {}
+    except (json.JSONDecodeError, TypeError):
+        return None
+    retry_status = metadata.get("retry_status") if isinstance(metadata, dict) else None
+    return retry_status if retry_status in {"todo", "ready", "review"} else None
+
+
+_TERMINAL_FENCE_CANDIDATES_SQL = """
+    SELECT * FROM (
+        SELECT 'task' AS owner_kind, t.id AS owner_id, t.id AS task_id,
+               r.id AS run_id, t.worker_pid, t.worker_pgid,
+               t.worker_identity, t.worker_fence, r.outcome, r.metadata,
+               '0:task:' || t.id AS sort_key
+          FROM tasks t
+          JOIN task_runs r ON r.id = t.current_run_id
+         WHERE t.worker_fence IS NOT NULL
+           AND (t.status <> 'running' OR r.ended_at IS NOT NULL)
+        UNION ALL
+        SELECT 'run' AS owner_kind, r.id AS owner_id, r.task_id,
+               r.id AS run_id, r.worker_pid, r.worker_pgid,
+               r.worker_identity, r.worker_fence, r.outcome, r.metadata,
+               '1:run:' || printf('%020d', r.id) AS sort_key
+         FROM task_runs r
+          LEFT JOIN tasks t ON t.id = r.task_id
+         WHERE r.worker_fence IS NOT NULL
+           AND (t.current_run_id IS NULL OR t.current_run_id <> r.id
+                OR t.claim_lock IS NOT r.claim_lock)
+           AND CASE WHEN json_valid(r.worker_fence)
+                    THEN json_extract(r.worker_fence, '$.reason')
+                    ELSE NULL END = 'spawn_bind_failed'
+    )
+"""
+
+
+def _terminal_fence_candidates(
+    conn: sqlite3.Connection,
+    *,
+    cursor: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Read one bounded, wrapping batch after ``cursor``."""
+    rows = conn.execute(
+        _TERMINAL_FENCE_CANDIDATES_SQL
+        + " WHERE sort_key > ? ORDER BY sort_key LIMIT ?",
+        (cursor, limit),
+    ).fetchall()
+    candidates = [dict(row) for row in rows]
+    remaining = limit - len(candidates)
+    if remaining and cursor:
+        wrapped = conn.execute(
+            _TERMINAL_FENCE_CANDIDATES_SQL
+            + " WHERE sort_key <= ? ORDER BY sort_key LIMIT ?",
+            (cursor, remaining),
+        ).fetchall()
+        candidates.extend(dict(row) for row in wrapped)
+    return candidates
+
+
+def _reserve_terminal_fence_candidates(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Atomically reserve one bounded batch and durably advance its cursor."""
+    with _control_plane_write_txn(conn):
+        state = conn.execute(
+            "SELECT cursor FROM terminal_fence_reap_state WHERE singleton=1"
+        ).fetchone()
+        cursor = state["cursor"] if state is not None else ""
+        candidates = _terminal_fence_candidates(
+            conn,
+            cursor=cursor,
+            limit=limit,
+        )
+        if candidates:
+            conn.execute(
+                """
+                INSERT INTO terminal_fence_reap_state(singleton, cursor)
+                VALUES (1, ?)
+                ON CONFLICT(singleton) DO UPDATE SET cursor=excluded.cursor
+                """,
+                (candidates[-1]["sort_key"],),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM terminal_fence_reap_state WHERE singleton=1"
+            )
+    return candidates
+
+
+def reap_terminal_attempt_fences(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = TERMINAL_FENCE_REAP_LIMIT,
+) -> list[tuple[Literal["task", "run"], str | int]]:
+    """Reap at most ``limit`` proven-dead terminal attempt fences once."""
+    _deny_registered_worker_filesystem_control_plane()
+    bounded_limit = max(0, min(int(limit), TERMINAL_FENCE_REAP_LIMIT))
+    if bounded_limit == 0:
+        return []
+
+    candidates = _reserve_terminal_fence_candidates(
+        conn,
+        limit=bounded_limit,
+    )
+    if not candidates:
+        return []
+
+    reaped: list[tuple[Literal["task", "run"], str | int]] = []
+    for candidate in candidates:
+        fence = _decoded_fence(candidate["worker_fence"])
+        if fence is None or _fenced_group_state(fence) != "dead":
+            continue
+        exact = (
+            candidate["worker_fence"],
+            candidate["worker_pid"],
+            candidate["worker_pgid"],
+            candidate["worker_identity"],
+        )
+        if candidate["owner_kind"] == "run":
+            with _control_plane_write_txn(conn):
+                cur = conn.execute(
+                    """
+                    UPDATE task_runs
+                       SET claim_lock=NULL, claim_expires=NULL,
+                           worker_pid=NULL, worker_pgid=NULL,
+                           worker_identity=NULL, worker_fence=NULL
+                     WHERE id=? AND worker_fence=? AND worker_pid IS ?
+                       AND worker_pgid IS ? AND worker_identity IS ?
+                    """,
+                    (candidate["run_id"], *exact),
+                )
+            if cur.rowcount == 1:
+                reaped.append(("run", int(candidate["run_id"])))
+            continue
+
+        retry_status = _recorded_retry_status(candidate)
+        try:
+            with _control_plane_write_txn(conn):
+                task_cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status=COALESCE(?, status), current_run_id=NULL,
+                           claim_lock=NULL, claim_expires=NULL,
+                           worker_pid=NULL, worker_pgid=NULL,
+                           worker_identity=NULL, worker_fence=NULL
+                     WHERE id=? AND current_run_id=? AND worker_fence=?
+                       AND worker_pid IS ? AND worker_pgid IS ?
+                       AND worker_identity IS ?
+                    """,
+                    (
+                        retry_status,
+                        candidate["task_id"],
+                        candidate["run_id"],
+                        *exact,
+                    ),
+                )
+                if task_cur.rowcount != 1:
+                    raise _FenceReapCasLost
+                run_cur = conn.execute(
+                    """
+                    UPDATE task_runs
+                       SET claim_lock=NULL, claim_expires=NULL,
+                           worker_pid=NULL, worker_pgid=NULL,
+                           worker_identity=NULL, worker_fence=NULL
+                     WHERE id=? AND task_id=? AND worker_fence=?
+                       AND worker_pid IS ? AND worker_pgid IS ?
+                       AND worker_identity IS ?
+                    """,
+                    (
+                        candidate["run_id"],
+                        candidate["task_id"],
+                        *exact,
+                    ),
+                )
+                if run_cur.rowcount != 1:
+                    raise _FenceReapCasLost
+        except _FenceReapCasLost:
+            continue
+        reaped.append(("task", str(candidate["task_id"])))
+    return reaped
 
 
 def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
@@ -4262,13 +5254,18 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
 
 
 def recompute_ready(
-    conn: sqlite3.Connection, failure_limit: int = None,
+    conn: sqlite3.Connection,
+    failure_limit: int = None,
+    *,
+    _mutation_auth: Optional[_MutationAuthorization] = None,
+    target_task_ids: Optional[Iterable[str]] = None,
 ) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
-    Returns the number of tasks promoted.  Opens its own IMMEDIATE txn, so it
-    MUST be called OUTSIDE any open write transaction (plain ``write_txn``
-    raises on nesting); call it after the enclosing txn commits.
+    Returns the number of tasks promoted. Public/operator calls default to the
+    historical board-wide sweep. Authorized nested continuations must pass
+    ``target_task_ids`` so their inherited authority is bounded to the tasks
+    affected by the enclosing mutation.
 
     ``blocked`` tasks are also considered for promotion (so a task
     blocked purely by a parent dependency unblocks itself when the
@@ -4296,11 +5293,36 @@ def recompute_ready(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
-    with write_txn(conn):
-        todo_rows = conn.execute(
+    bounded_ids = (
+        tuple(sorted({str(task_id) for task_id in target_task_ids if task_id}))
+        if target_task_ids is not None
+        else None
+    )
+    prepared_provenance = (
+        _mutation_auth.provenance
+        if _mutation_auth is not None
+        else _prepare_mutation_provenance()
+    )
+    with write_txn(conn, allow_nested=_mutation_auth is not None):
+        sql = (
             "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
-        ).fetchall()
+            "FROM tasks WHERE status IN ('todo', 'blocked') "
+            "AND worker_fence IS NULL"
+        )
+        params: tuple[Any, ...] = ()
+        if bounded_ids is not None:
+            if not bounded_ids:
+                return 0
+            placeholders = ",".join("?" for _ in bounded_ids)
+            sql += f" AND id IN ({placeholders})"
+            params = bounded_ids
+        todo_rows = conn.execute(sql, params).fetchall()
+        _authorize_mutation_locked(
+            conn,
+            target_task_ids=tuple(row["id"] for row in todo_rows),
+            prepared_provenance=prepared_provenance,
+            existing=_mutation_auth,
+        )
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
@@ -4335,16 +5357,21 @@ def recompute_ready(
                     )
                     if failures >= effective_limit:
                         continue
-                    conn.execute(
+                    updated = conn.execute(
                         "UPDATE tasks SET status = ? "
-                        "WHERE id = ? AND status = 'blocked'",
+                        "WHERE id = ? AND status = 'blocked' "
+                        "AND worker_fence IS NULL",
                         (resume_status, task_id),
                     )
                 else:
-                    conn.execute(
-                        "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
+                    updated = conn.execute(
+                        "UPDATE tasks SET status = ? "
+                        "WHERE id = ? AND status = 'todo' "
+                        "AND worker_fence IS NULL",
                         (resume_status, task_id),
                     )
+                if updated.rowcount != 1:
+                    continue
                 _append_event(
                     conn, task_id, "promoted",
                     {"status": resume_status} if resume_status != "ready" else None,
@@ -4383,7 +5410,13 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    with write_txn(conn):
+    with _control_plane_write_txn(conn):
+        fenced = conn.execute(
+            "SELECT worker_fence FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if fenced is not None and fenced["worker_fence"] is not None:
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4439,6 +5472,7 @@ def claim_task(
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
+               AND worker_fence IS NULL
             """,
             (lock, expires, now, task_id),
         )
@@ -4511,7 +5545,13 @@ def claim_review_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    with write_txn(conn):
+    with _control_plane_write_txn(conn):
+        fenced = conn.execute(
+            "SELECT worker_fence FROM tasks WHERE id = ? AND status = 'review'",
+            (task_id,),
+        ).fetchone()
+        if fenced is not None and fenced["worker_fence"] is not None:
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -4539,6 +5579,7 @@ def claim_review_task(
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
+               AND worker_fence IS NULL
             """,
             (lock, expires, now, task_id),
         )
@@ -4681,7 +5722,8 @@ def heartbeat_claim(
     """
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
     lock = claimer or _claimer_id()
-    with write_txn(conn):
+    prepared_provenance = _prepare_mutation_provenance()
+    with _authorized_write_txn(conn, (task_id,)) as authorization:
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
             "WHERE id = ? AND status = 'running' AND claim_lock = ?",
@@ -4696,6 +5738,79 @@ def heartbeat_claim(
                 )
             return True
         return False
+
+
+def _reclaim_proven_dead_fenced_attempt(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    retry_status: str,
+    error: str,
+    payload: dict[str, Any],
+) -> bool:
+    """Atomically close and clear one exact, proven-dead fenced attempt."""
+    now = int(time.time())
+    exact = (
+        row["worker_fence"],
+        row["worker_pid"],
+        row["worker_pgid"],
+        row["worker_identity"],
+    )
+    try:
+        with _control_plane_write_txn(conn):
+            run_cur = conn.execute(
+                """
+                UPDATE task_runs
+                   SET status='reclaimed', outcome='reclaimed', error=?,
+                       metadata=?, ended_at=COALESCE(ended_at, ?),
+                       claim_lock=NULL, claim_expires=NULL,
+                       worker_pid=NULL, worker_pgid=NULL,
+                       worker_identity=NULL, worker_fence=NULL
+                 WHERE id=? AND task_id=? AND worker_fence=?
+                   AND worker_pid IS ? AND worker_pgid IS ?
+                   AND worker_identity IS ?
+                """,
+                (
+                    error[:500],
+                    json.dumps(payload, ensure_ascii=False),
+                    now,
+                    row["current_run_id"],
+                    row["id"],
+                    *exact,
+                ),
+            )
+            if run_cur.rowcount != 1:
+                raise _FenceReapCasLost
+            task_cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status=?, current_run_id=NULL,
+                       claim_lock=NULL, claim_expires=NULL,
+                       worker_pid=NULL, worker_pgid=NULL,
+                       worker_identity=NULL, worker_fence=NULL
+                 WHERE id=? AND current_run_id=? AND worker_fence=?
+                   AND worker_pid IS ? AND worker_pgid IS ?
+                   AND worker_identity IS ?
+                """,
+                (
+                    retry_status,
+                    row["id"],
+                    row["current_run_id"],
+                    *exact,
+                ),
+            )
+            if task_cur.rowcount != 1:
+                raise _FenceReapCasLost
+            _append_event(
+                conn,
+                row["id"],
+                "reclaimed",
+                payload,
+                run_id=int(row["current_run_id"]),
+            )
+    except _FenceReapCasLost:
+        return False
+    return True
 
 
 def release_stale_claims(
@@ -4728,17 +5843,50 @@ def release_stale_claims(
     Returns the number of stale claims actually reclaimed (live-pid
     extensions don't count). Safe to call often.
     """
+    _deny_registered_worker_filesystem_control_plane()
     now = int(time.time())
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
+        "SELECT id, current_run_id, claim_lock, worker_pid, worker_pgid, "
+        "worker_identity, worker_fence, claim_expires, last_heartbeat_at, "
+        "(SELECT ended_at FROM task_runs WHERE id=current_run_id) "
+        "AS run_ended_at "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
         (now,),
     ).fetchall()
     for row in stale:
+        if row["worker_fence"] is not None:
+            if row["run_ended_at"] is not None:
+                continue
+            fence = _decoded_fence(row["worker_fence"])
+            if fence is None or _fenced_group_state(fence) != "dead":
+                continue
+            retry_status = _retry_status_for_run(
+                conn,
+                row["id"],
+                row["current_run_id"],
+            )
+            payload = {
+                "stale_lock": row["claim_lock"],
+                "worker_pid": row["worker_pid"],
+                "claim_expires": int(row["claim_expires"]),
+                "last_heartbeat_at": row["last_heartbeat_at"],
+                "now": now,
+                "retry_status": retry_status,
+                "group_state": "dead",
+            }
+            if _reclaim_proven_dead_fenced_attempt(
+                conn,
+                row,
+                retry_status=retry_status,
+                error=f"stale_lock={row['claim_lock']}",
+                payload=payload,
+            ):
+                reclaimed += 1
+            continue
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
         hb = row["last_heartbeat_at"]
@@ -4757,7 +5905,7 @@ def release_stale_claims(
             and not heartbeat_stale
         ):
             new_expires = now + _resolve_claim_ttl_seconds()
-            with write_txn(conn):
+            with _control_plane_write_txn(conn):
                 cur = conn.execute(
                     "UPDATE tasks SET claim_expires = ? "
                     "WHERE id = ? AND status = 'running' "
@@ -4803,7 +5951,7 @@ def release_stale_claims(
                 reason="ttl_expired_worker_alive",
             )
             continue
-        with write_txn(conn):
+        with _control_plane_write_txn(conn):
             retry_status = _retry_status_for_run(conn, row["id"])
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -4864,8 +6012,13 @@ def reclaim_task(
     Returns True if a reclaim happened, False if the task isn't in a
     reclaimable state (not running, or doesn't exist).
     """
+    _deny_registered_worker_filesystem_control_plane()
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT id, status, current_run_id, claim_lock, worker_pid, "
+        "worker_pgid, worker_identity, worker_fence, "
+        "(SELECT ended_at FROM task_runs WHERE id=current_run_id) "
+        "AS run_ended_at "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -4873,11 +6026,41 @@ def reclaim_task(
     if row["status"] != "running" and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
         return False
+    if row["worker_fence"] is not None:
+        if row["status"] != "running" or row["run_ended_at"] is not None:
+            return False
+        if not isinstance(reason, str) or not reason.strip():
+            return False
+        fence = _decoded_fence(row["worker_fence"])
+        if fence is None or _fenced_group_state(fence) != "dead":
+            return False
+        retry_status = _retry_status_for_run(
+            conn,
+            task_id,
+            row["current_run_id"],
+        )
+        payload = {
+            "manual": True,
+            "reason": reason.strip(),
+            "prev_lock": row["claim_lock"],
+            "retry_status": retry_status,
+            "group_state": "dead",
+        }
+        if not _reclaim_proven_dead_fenced_attempt(
+            conn,
+            row,
+            retry_status=retry_status,
+            error=f"manual_reclaim: {reason.strip()}",
+            payload=payload,
+        ):
+            return False
+        _clear_failure_counter(conn, task_id)
+        return True
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
-    with write_txn(conn):
+    with _control_plane_write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -4936,9 +6119,26 @@ def reassign_task(
     Returns True if the reassign landed. ``profile`` may be ``None`` to
     unassign entirely.
     """
+    _deny_registered_worker_filesystem_control_plane()
     if reclaim_first:
+        target = conn.execute(
+            "SELECT worker_fence FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if (
+            target is not None
+            and target["worker_fence"] is not None
+            and (not isinstance(reason, str) or not reason.strip())
+        ):
+            return False
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
+        still_fenced = conn.execute(
+            "SELECT worker_fence FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if still_fenced is not None and still_fenced["worker_fence"] is not None:
+            return False
     # assign_task handles its own txn + the still-running guard.
     try:
         return assign_task(conn, task_id, profile)
@@ -5127,6 +6327,7 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    prepared_provenance = _prepare_mutation_provenance()
     now = int(time.time())
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
@@ -5144,6 +6345,11 @@ def complete_task(
         )
         if phantom_cards:
             with write_txn(conn):
+                _authorize_mutation_locked(
+                    conn,
+                    target_task_ids=(task_id,),
+                    prepared_provenance=prepared_provenance,
+                )
                 _append_event(
                     conn, task_id, "completion_blocked_hallucination",
                     {
@@ -5163,7 +6369,7 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)) as authorization:
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
         # ``review`` or ``running``.
@@ -5181,9 +6387,12 @@ def complete_task(
                    SET status       = 'done',
                        result       = ?,
                        completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
+                       claim_lock   = CASE WHEN worker_fence IS NULL
+                                           THEN NULL ELSE claim_lock END,
+                       claim_expires= CASE WHEN worker_fence IS NULL
+                                           THEN NULL ELSE claim_expires END,
+                       worker_pid   = CASE WHEN worker_fence IS NULL
+                                           THEN NULL ELSE worker_pid END,
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
@@ -5198,9 +6407,12 @@ def complete_task(
                    SET status       = 'done',
                        result       = ?,
                        completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
+                       claim_lock   = CASE WHEN worker_fence IS NULL
+                                           THEN NULL ELSE claim_lock END,
+                       claim_expires= CASE WHEN worker_fence IS NULL
+                                           THEN NULL ELSE claim_expires END,
+                       worker_pid   = CASE WHEN worker_fence IS NULL
+                                           THEN NULL ELSE worker_pid END,
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
@@ -5284,6 +6496,31 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        scan_text = " ".join(filter(None, [summary, result]))
+        if scan_text:
+            phantom_refs = _scan_prose_for_phantom_ids(conn, scan_text)
+            phantom_refs = [
+                p for p in phantom_refs if p not in set(verified_cards)
+            ]
+            if phantom_refs:
+                _append_event(
+                    conn,
+                    task_id,
+                    "suspected_hallucinated_references",
+                    {
+                        "phantom_refs": phantom_refs,
+                        "source": "completion_summary",
+                    },
+                    run_id=run_id,
+                )
+        _clear_failure_counter(
+            conn, task_id, _mutation_auth=authorization,
+        )
+        recompute_ready(
+            conn,
+            _mutation_auth=authorization,
+            target_task_ids=child_ids(conn, task_id),
+        )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -5295,23 +6532,13 @@ def complete_task(
         # above (shouldn't happen — verified means they exist — but
         # belt-and-suspenders).
         phantom_refs = [p for p in phantom_refs if p not in set(verified_cards)]
-        if phantom_refs:
-            with write_txn(conn):
-                _append_event(
-                    conn, task_id, "suspected_hallucinated_references",
-                    {
-                        "phantom_refs": phantom_refs,
-                        "source": "completion_summary",
-                    },
-                    run_id=run_id,
-                )
+        # The warning event was persisted inside the authorized terminal
+        # transaction above; this post-commit scan is read-only compatibility.
     # Successful completion — wipe the consecutive-failures counter.
     # Failure history stays on the event log for audit; the counter
     # just tracks "is there a current pathology the breaker should
     # care about", and a success resets that question.
-    _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
-    recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
@@ -5842,7 +7069,7 @@ def edit_completed_task_result(
 ) -> bool:
     """Backfill the user-visible result for an already completed task."""
     handoff_summary = summary if summary is not None else result
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
@@ -5936,10 +7163,17 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    prepared_provenance = _prepare_mutation_provenance()
     recurrences = 0
     with write_txn(conn):
+        _authorize_mutation_locked(
+            conn,
+            target_task_ids=(task_id,),
+            prepared_provenance=prepared_provenance,
+        )
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, worker_fence "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
@@ -5965,10 +7199,14 @@ def block_task(
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status        = 'todo',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
+                   SET status        = CASE WHEN worker_fence IS NULL
+                                            THEN 'todo' ELSE status END,
+                       claim_lock    = CASE WHEN worker_fence IS NULL
+                                            THEN NULL ELSE claim_lock END,
+                       claim_expires = CASE WHEN worker_fence IS NULL
+                                            THEN NULL ELSE claim_expires END,
+                       worker_pid    = CASE WHEN worker_fence IS NULL
+                                            THEN NULL ELSE worker_pid END,
                        block_kind    = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
@@ -5982,6 +7220,11 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=(
+                    {"retry_status": "todo"}
+                    if cur_row["worker_fence"] is not None
+                    else None
+                ),
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
@@ -6023,9 +7266,12 @@ def block_task(
                 """
                 UPDATE tasks
                    SET status        = 'triage',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
+                       claim_lock    = CASE WHEN worker_fence IS NULL
+                                            THEN NULL ELSE claim_lock END,
+                       claim_expires = CASE WHEN worker_fence IS NULL
+                                            THEN NULL ELSE claim_expires END,
+                       worker_pid    = CASE WHEN worker_fence IS NULL
+                                            THEN NULL ELSE worker_pid END,
                        block_kind    = ?,
                        block_recurrences = ?
                  WHERE id = ?
@@ -6062,9 +7308,12 @@ def block_task(
                     """
                     UPDATE tasks
                        SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
+                       claim_lock    = CASE WHEN worker_fence IS NULL
+                                            THEN NULL ELSE claim_lock END,
+                       claim_expires = CASE WHEN worker_fence IS NULL
+                                            THEN NULL ELSE claim_expires END,
+                       worker_pid    = CASE WHEN worker_fence IS NULL
+                                            THEN NULL ELSE worker_pid END,
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
@@ -6077,9 +7326,12 @@ def block_task(
                     """
                     UPDATE tasks
                        SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
+                           claim_lock    = CASE WHEN worker_fence IS NULL
+                                                THEN NULL ELSE claim_lock END,
+                           claim_expires = CASE WHEN worker_fence IS NULL
+                                                THEN NULL ELSE claim_expires END,
+                           worker_pid    = CASE WHEN worker_fence IS NULL
+                                                THEN NULL ELSE worker_pid END,
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
@@ -6177,11 +7429,11 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
+            "SELECT assignee, status, claim_lock, current_run_id, worker_fence "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -6255,10 +7507,14 @@ def request_review(
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status        = 'review',
-                   claim_lock    = NULL,
-                   claim_expires = NULL,
-                   worker_pid    = NULL
+               SET status        = CASE WHEN worker_fence IS NULL
+                                         THEN 'review' ELSE status END,
+                   claim_lock    = CASE WHEN worker_fence IS NULL
+                                        THEN NULL ELSE claim_lock END,
+                   claim_expires = CASE WHEN worker_fence IS NULL
+                                        THEN NULL ELSE claim_expires END,
+                   worker_pid    = CASE WHEN worker_fence IS NULL
+                                        THEN NULL ELSE worker_pid END
             """ + assignee_sql + """
              WHERE id = ?
                AND status IN ('running', 'ready')
@@ -6271,13 +7527,17 @@ def request_review(
                 "task is not in running/ready (or expected_run_id did not "
                 "match the current run)",
             )
+        run_metadata = metadata
+        if trow["worker_fence"] is not None:
+            run_metadata = dict(metadata or {})
+            run_metadata["retry_status"] = "review"
         run_id = _end_run(
             conn,
             task_id,
             outcome="review_requested",
             status="review",
             summary=summary,
-            metadata=metadata,
+            metadata=run_metadata,
         )
         if run_id is None and (summary or metadata):
             run_id = _synthesize_ended_run(
@@ -6322,9 +7582,10 @@ def request_changes(
     if not reason:
         return False, "reason is required"
 
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         task_row = conn.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            "SELECT status, assignee, current_run_id, worker_fence "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if task_row is None:
@@ -6389,11 +7650,14 @@ def request_changes(
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status = ?,
+               SET status = CASE WHEN worker_fence IS NULL THEN ? ELSE status END,
                    assignee = COALESCE(?, assignee),
-                   claim_lock = NULL,
-                   claim_expires = NULL,
-                   worker_pid = NULL
+                   claim_lock = CASE WHEN worker_fence IS NULL
+                                     THEN NULL ELSE claim_lock END,
+                   claim_expires = CASE WHEN worker_fence IS NULL
+                                        THEN NULL ELSE claim_expires END,
+                   worker_pid = CASE WHEN worker_fence IS NULL
+                                     THEN NULL ELSE worker_pid END
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
             (new_status, implementer, task_id, int(current_run_id)),
@@ -6406,6 +7670,11 @@ def request_changes(
             outcome="changes_requested",
             status=new_status,
             summary=reason,
+            metadata=(
+                {"retry_status": new_status}
+                if task_row["worker_fence"] is not None
+                else None
+            ),
         )
         _append_event(
             conn,
@@ -6474,7 +7743,7 @@ def promote_task(
     if dry_run:
         return True, None
 
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
             "WHERE id = ? AND status IN ('todo', 'blocked')",
@@ -6552,7 +7821,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     state) holds for the rest of this function's lifetime.
     """
     now = int(time.time())
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         current = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
@@ -6617,7 +7886,7 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     clears it.) Returns False when the task is missing or not in ``review``.
     """
     now = int(time.time())
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         _reclaim_dangling_run(
             conn, task_id, statuses=("review",), now=now,
             note="invariant recovery on review reopen",
@@ -6735,6 +8004,7 @@ def invalidate_descendants_for_parent_reopen(
     now = int(time.time())
     invalidated: list[dict[str, Any]] = []
     terminations: list[tuple[Optional[int], Optional[str]]] = []
+    prepared_provenance = _prepare_mutation_provenance()
     with write_txn(conn, allow_nested=True):
         rows = conn.execute(
             """
@@ -6752,6 +8022,11 @@ def invalidate_descendants_for_parent_reopen(
             """,
             (task_id,),
         ).fetchall()
+        _authorize_mutation_locked(
+            conn,
+            target_task_ids=(task_id, *(row["id"] for row in rows)),
+            prepared_provenance=prepared_provenance,
+        )
         for row in rows:
             previous_status = row["status"]
             if previous_status not in {"ready", "review", "running", "done"}:
@@ -6868,7 +8143,7 @@ def specify_triage_task(
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)) as authorization:
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
@@ -6922,12 +8197,16 @@ def specify_triage_task(
             "specified",
             {"changed_fields": changed_fields} if changed_fields else None,
         )
+        recompute_ready(
+            conn,
+            _mutation_auth=authorization,
+            target_task_ids=(task_id,),
+        )
     # Outside the write_txn above, so we don't nest BEGIN IMMEDIATE — the
     # ready-promotion pass opens its own IMMEDIATE txn. This runs the same
     # logic the dispatcher would on its next tick, so a specified task
     # with no open parents flips straight to 'ready' here instead of
     # idling in 'todo' until the next sweep.
-    recompute_ready(conn)
     return True
 
 
@@ -7022,7 +8301,7 @@ def decompose_triage_task(
     # _append_event calls.
     now = int(time.time())
     child_ids: list[str] = []
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)) as authorization:
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path "
             "FROM tasks WHERE id = ?",
@@ -7154,21 +8433,31 @@ def decompose_triage_task(
             },
         )
 
+        if auto_promote:
+            recompute_ready(
+                conn,
+                _mutation_auth=authorization,
+                target_task_ids=(*child_ids, task_id),
+            )
+
     # Outside the write_txn: promote parent-free children to 'ready'
     # so the dispatcher picks them up on its next tick. Same pattern
     # specify_triage_task uses.  When auto_promote is False children
     # stay in 'todo' until the user manually promotes them — useful
     # for manual-review-first workflows.
-    if auto_promote:
-        recompute_ready(conn)
     return child_ids
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)) as authorization:
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
-            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "    claim_lock = CASE WHEN worker_fence IS NULL "
+            "                      THEN NULL ELSE claim_lock END, "
+            "    claim_expires = CASE WHEN worker_fence IS NULL "
+            "                         THEN NULL ELSE claim_expires END, "
+            "    worker_pid = CASE WHEN worker_fence IS NULL "
+            "                      THEN NULL ELSE worker_pid END "
             "WHERE id = ? AND status != 'archived'",
             (task_id,),
         )
@@ -7183,10 +8472,14 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
+        recompute_ready(
+            conn,
+            _mutation_auth=authorization,
+            target_task_ids=child_ids(conn, task_id),
+        )
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
-    recompute_ready(conn)
     return True
 
 
@@ -7197,7 +8490,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     tasks must be explicitly archived first so accidental data loss requires a
     second deliberate action.
     """
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
@@ -7226,7 +8519,12 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     Returns ``True`` if the task existed and was deleted, ``False``
     if the task was not found.
     """
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)) as authorization:
+        if authorization.mode == "worker":
+            raise RegisteredWorkerControlPlaneError(
+                "registered workers cannot delete their own registration row"
+            )
+        affected_children = child_ids(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -7235,7 +8533,11 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
-    recompute_ready(conn)
+        recompute_ready(
+            conn,
+            _mutation_auth=authorization,
+            target_task_ids=affected_children,
+        )
     return True
 
 
@@ -7545,7 +8847,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
 def set_workspace_path(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> None:
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         conn.execute(
             "UPDATE tasks SET workspace_path = ? WHERE id = ?",
             (str(path), task_id),
@@ -7555,7 +8857,7 @@ def set_workspace_path(
 def set_branch_name(
     conn: sqlite3.Connection, task_id: str, branch_name: str
 ) -> None:
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         conn.execute(
             "UPDATE tasks SET branch_name = ? WHERE id = ?",
             (str(branch_name), task_id),
@@ -7576,14 +8878,17 @@ def schedule_task(
     human action, or automation can later call ``unblock_task`` to re-gate them
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
                SET status       = 'scheduled',
-                   claim_lock   = NULL,
-                   claim_expires= NULL,
-                   worker_pid   = NULL
+                   claim_lock   = CASE WHEN worker_fence IS NULL
+                                       THEN NULL ELSE claim_lock END,
+                   claim_expires= CASE WHEN worker_fence IS NULL
+                                        THEN NULL ELSE claim_expires END,
+                   worker_pid   = CASE WHEN worker_fence IS NULL
+                                       THEN NULL ELSE worker_pid END
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked')
         """
@@ -7990,7 +9295,7 @@ def _defer_reclaim_for_live_worker(
     duplicate is what lets the throttled worker finally die.
     """
     grace = now + RECLAIM_DEFER_GRACE_SECONDS
-    with write_txn(conn):
+    with _control_plane_write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
             "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
@@ -8031,7 +9336,7 @@ def heartbeat_worker(
     should be heartbeating (not running, or claim expired).
     """
     now = int(time.time())
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         if expected_run_id is None:
             cur = conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? "
@@ -8082,6 +9387,7 @@ def enforce_max_runtime(
     test hook; defaults to ``os.kill`` on POSIX.
     """
     import signal
+    _deny_registered_worker_filesystem_control_plane()
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -8094,7 +9400,7 @@ def enforce_max_runtime(
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
-        "  AND t.worker_pid IS NOT NULL"
+        "  AND t.worker_pid IS NOT NULL AND t.worker_fence IS NULL"
     ).fetchall()
     for row in rows:
         lock = row["claim_lock"] or ""
@@ -8135,14 +9441,15 @@ def enforce_max_runtime(
                 except (ProcessLookupError, OSError):
                     pass
 
-        with write_txn(conn):
+        with _control_plane_write_txn(conn):
             retry_status = _retry_status_for_run(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
+                "  AND worker_pid = ? AND claim_lock IS ? "
+                "  AND worker_fence IS NULL",
                 (retry_status, tid, pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
@@ -8219,6 +9526,7 @@ def detect_stale_running(
     immediately).  ``signal_fn`` is a test hook; defaults to ``os.kill``
     on POSIX.
     """
+    _deny_registered_worker_filesystem_control_plane()
     if stale_timeout_seconds <= 0:
         return []
 
@@ -8231,7 +9539,7 @@ def detect_stale_running(
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running'"
+        "WHERE t.status = 'running' AND t.worker_fence IS NULL"
     ).fetchall()
 
     for row in rows:
@@ -8266,14 +9574,14 @@ def detect_stale_running(
             )
             continue
 
-        with write_txn(conn):
+        with _control_plane_write_txn(conn):
             retry_status = _retry_status_for_run(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ?",
+                "  AND claim_lock IS ? AND worker_fence IS NULL",
                 (retry_status, tid, row["claim_lock"]),
             )
             if cur.rowcount != 1:
@@ -8347,10 +9655,12 @@ def reconcile_orphaned_running(
     """
     now = int(time.time())
     reconciled: list[str] = []
+    _deny_registered_worker_filesystem_control_plane()
     rows = conn.execute(
         "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
         "WHERE status = 'running' "
-        "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
+        "  AND (claim_lock IS NULL OR claim_expires IS NULL) "
+        "  AND worker_fence IS NULL"
     ).fetchall()
     for row in rows:
         tid = row["id"]
@@ -8363,13 +9673,14 @@ def reconcile_orphaned_running(
                 "pid %s is alive on this host — deferring", tid, pid,
             )
             continue
-        with write_txn(conn):
+        with _control_plane_write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ? AND claim_expires IS ?",
+                "  AND claim_lock IS ? AND claim_expires IS ? "
+                "  AND worker_fence IS NULL",
                 (tid, row["claim_lock"], row["claim_expires"]),
             )
             if cur.rowcount != 1:
@@ -8521,6 +9832,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
     """
+    _deny_registered_worker_filesystem_control_plane()
     crashed: list[str] = []
     rate_limited: list[str] = []
     # Per-crash details collected inside the main txn, used after it
@@ -8531,10 +9843,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # counter (see the post-txn loop below).
     crash_details: list[tuple[str, int, str, bool, str]] = []
     # (task_id, pid, claimer, protocol_violation, error_text)
-    with write_txn(conn):
+    with _control_plane_write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "WHERE status = 'running' AND worker_pid IS NOT NULL "
+            "AND worker_fence IS NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -8623,7 +9936,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
+                "  AND worker_pid = ? AND claim_lock IS ? "
+                "  AND worker_fence IS NULL",
                 (retry_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
@@ -8776,6 +10090,8 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -8823,13 +10139,27 @@ def _record_task_failure(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
+            "SELECT consecutive_failures, status, max_retries, current_run_id, "
+            "claim_lock "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
             return False
+        if expected_run_id is not None and (
+            row["current_run_id"] != expected_run_id
+            or row["claim_lock"] != expected_claim_lock
+        ):
+            return False
+        if expected_run_id is not None:
+            run_owner = conn.execute(
+                "SELECT 1 FROM task_runs WHERE id=? AND task_id=? "
+                "AND status='running' AND claim_lock=? AND ended_at IS NULL",
+                (expected_run_id, task_id, expected_claim_lock),
+            ).fetchone()
+            if run_owner is None:
+                return False
         retry_status = (
             _retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim
@@ -8854,8 +10184,13 @@ def _record_task_failure(
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
-                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, "
+                    "UPDATE tasks SET status = 'blocked', "
+                    "claim_lock = CASE WHEN worker_fence IS NULL "
+                    "THEN NULL ELSE claim_lock END, "
+                    "claim_expires = CASE WHEN worker_fence IS NULL "
+                    "THEN NULL ELSE claim_expires END, "
+                    "worker_pid = CASE WHEN worker_fence IS NULL "
+                    "THEN NULL ELSE worker_pid END, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('running', 'ready', 'review')",
                     (failures, error[:500], task_id),
@@ -8904,8 +10239,14 @@ def _record_task_failure(
             if release_claim:
                 # Spawn path: restore the claimed source phase + clear claim.
                 conn.execute(
-                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, "
+                    "UPDATE tasks SET status = CASE WHEN worker_fence IS NULL "
+                    "THEN ? ELSE status END, "
+                    "claim_lock = CASE WHEN worker_fence IS NULL "
+                    "THEN NULL ELSE claim_lock END, "
+                    "claim_expires = CASE WHEN worker_fence IS NULL "
+                    "THEN NULL ELSE claim_expires END, "
+                    "worker_pid = CASE WHEN worker_fence IS NULL "
+                    "THEN NULL ELSE worker_pid END, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
                     (retry_status, failures, error[:500], task_id),
@@ -8959,6 +10300,391 @@ def _record_spawn_failure(
     )
 
 
+def _handle_spawn_start_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    error: str,
+    run_id: int,
+    claim_lock: str,
+    failure_limit: int = None,
+) -> bool:
+    """Record a pre-process spawn failure through the bounded retry path."""
+    return _record_task_failure(
+        conn,
+        task_id,
+        error,
+        outcome="spawn_failed",
+        failure_limit=failure_limit,
+        release_claim=True,
+        end_run=True,
+        expected_run_id=run_id,
+        expected_claim_lock=claim_lock,
+    )
+
+
+def _worker_fence_for_pending(
+    pending: PendingWorkerProcess,
+    *,
+    run_id: int,
+    claim_lock: str,
+    reason: str,
+) -> str:
+    host = _host_id()
+    if host is None:
+        raise AttemptFenceCapabilityError("worker host identity is unavailable")
+    return json.dumps(
+        {
+            "run_id": run_id,
+            "claim_lock": claim_lock,
+            "host": host,
+            "leader_pid": pending.identity.pid,
+            "worker_pgid": pending.identity.pgid,
+            "worker_identity": pending.identity.token,
+            "reason": reason,
+            "created_at": int(time.time()),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _bind_pending_worker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pending: PendingWorkerProcess,
+    *,
+    run_id: int,
+    claim_lock: str,
+) -> str | Literal[False]:
+    """Atomically bind a blocked process to the exact claimed task and run."""
+    if not _identity_matches(pending.identity):
+        return False
+    raw_fence = _worker_fence_for_pending(
+        pending,
+        run_id=run_id,
+        claim_lock=claim_lock,
+        reason="running",
+    )
+    try:
+        with _control_plane_write_txn(conn):
+            task_cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET worker_pid=?, worker_pgid=?, worker_identity=?, worker_fence=?
+                 WHERE id=? AND status='running' AND current_run_id=?
+                   AND claim_lock=? AND worker_fence IS NULL
+                """,
+                (
+                    pending.identity.pid,
+                    pending.identity.pgid,
+                    pending.identity.token,
+                    raw_fence,
+                    task_id,
+                    run_id,
+                    claim_lock,
+                ),
+            )
+            if task_cur.rowcount != 1:
+                raise _FenceReapCasLost
+            run_cur = conn.execute(
+                """
+                UPDATE task_runs
+                   SET worker_pid=?, worker_pgid=?, worker_identity=?, worker_fence=?
+                 WHERE id=? AND task_id=? AND status='running'
+                   AND claim_lock=? AND worker_fence IS NULL AND ended_at IS NULL
+                """,
+                (
+                    pending.identity.pid,
+                    pending.identity.pgid,
+                    pending.identity.token,
+                    raw_fence,
+                    run_id,
+                    task_id,
+                    claim_lock,
+                ),
+            )
+            if run_cur.rowcount != 1:
+                raise _FenceReapCasLost
+            _append_event(
+                conn,
+                task_id,
+                "spawned",
+                {"pid": pending.identity.pid},
+                run_id=run_id,
+            )
+    except _FenceReapCasLost:
+        return False
+    return raw_fence
+
+
+def _record_and_abort_failed_bind(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pending: PendingWorkerProcess,
+    *,
+    run_id: int,
+    claim_lock: str,
+) -> str:
+    """Fence only the losing run, then synchronously terminate its process."""
+    recorded = False
+    try:
+        raw_fence = _worker_fence_for_pending(
+            pending,
+            run_id=run_id,
+            claim_lock=claim_lock,
+            reason="spawn_bind_failed",
+        )
+        with _control_plane_write_txn(conn):
+            cur = conn.execute(
+                """
+                UPDATE task_runs
+                   SET worker_pid=?, worker_pgid=?, worker_identity=?, worker_fence=?
+                 WHERE id=? AND task_id=? AND status='running'
+                   AND claim_lock=? AND worker_fence IS NULL AND ended_at IS NULL
+                """,
+                (
+                    pending.identity.pid,
+                    pending.identity.pgid,
+                    pending.identity.token,
+                    raw_fence,
+                    run_id,
+                    task_id,
+                    claim_lock,
+                ),
+            )
+            recorded = cur.rowcount == 1
+    finally:
+        pending.abort()
+    if not recorded:
+        raise SpawnBindError("failed bind could not fence the losing run")
+    return raw_fence
+
+
+def _invoke_worker_spawn(
+    spawn_fn: Any,
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str],
+) -> Any:
+    """Invoke a worker spawner while retaining the legacy two-arg signature."""
+    import inspect
+
+    try:
+        sig = inspect.signature(spawn_fn)
+        if "board" in sig.parameters:
+            return spawn_fn(task, workspace, board=board)
+    except (TypeError, ValueError):
+        pass
+    return spawn_fn(task, workspace)
+
+
+def _record_post_bind_release_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    error: str,
+    run_id: int,
+    claim_lock: str,
+    raw_fence: str,
+    failure_limit: int,
+) -> bool:
+    """Terminalize one exact bound attempt while retaining its dead fence."""
+    now = int(time.time())
+    with _control_plane_write_txn(conn):
+        task = conn.execute(
+            "SELECT status, current_run_id, claim_lock, worker_pid, worker_pgid, "
+            "worker_identity, worker_fence, consecutive_failures, max_retries "
+            "FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        run = conn.execute(
+            "SELECT task_id, status, claim_lock, worker_pid, worker_pgid, "
+            "worker_identity, worker_fence, ended_at "
+            "FROM task_runs WHERE id=?",
+            (run_id,),
+        ).fetchone()
+        exact = (
+            task is not None
+            and run is not None
+            and task["status"] == "running"
+            and task["current_run_id"] == run_id
+            and task["claim_lock"] == claim_lock
+            and task["worker_fence"] == raw_fence
+            and run["task_id"] == task_id
+            and run["status"] == "running"
+            and run["claim_lock"] == claim_lock
+            and run["worker_fence"] == raw_fence
+            and run["ended_at"] is None
+            and (
+                task["worker_pid"],
+                task["worker_pgid"],
+                task["worker_identity"],
+            )
+            == (
+                run["worker_pid"],
+                run["worker_pgid"],
+                run["worker_identity"],
+            )
+        )
+        if not exact:
+            raise SpawnBindError(
+                "post-bind release failure lost exact attempt ownership"
+            )
+        retry_status = _retry_status_for_run(conn, task_id, run_id)
+        failures = int(task["consecutive_failures"]) + 1
+        effective_limit = (
+            int(task["max_retries"])
+            if task["max_retries"] is not None
+            else int(failure_limit)
+        )
+        blocked = failures >= effective_limit
+        task_status = "blocked" if blocked else retry_status
+        outcome = "gave_up" if blocked else "spawn_failed"
+        metadata = {
+            "failures": failures,
+            "retry_status": retry_status,
+            "trigger_outcome": "spawn_failed" if blocked else None,
+        }
+        task_cur = conn.execute(
+            "UPDATE tasks SET status=?, consecutive_failures=?, "
+            "last_failure_error=? WHERE id=? AND status='running' "
+            "AND current_run_id=? AND claim_lock=? AND worker_fence=?",
+            (
+                task_status,
+                failures,
+                error[:500],
+                task_id,
+                run_id,
+                claim_lock,
+                raw_fence,
+            ),
+        )
+        run_cur = conn.execute(
+            "UPDATE task_runs SET status=?, outcome=?, error=?, metadata=?, "
+            "ended_at=? WHERE id=? AND task_id=? AND status='running' "
+            "AND claim_lock=? AND worker_fence=? AND ended_at IS NULL",
+            (
+                outcome,
+                outcome,
+                error[:500],
+                json.dumps(metadata, ensure_ascii=False),
+                now,
+                run_id,
+                task_id,
+                claim_lock,
+                raw_fence,
+            ),
+        )
+        if task_cur.rowcount != 1 or run_cur.rowcount != 1:
+            raise SpawnBindError(
+                "post-bind release failure CAS changed during transition"
+            )
+        _append_event(
+            conn,
+            task_id,
+            outcome,
+            {
+                "error": error[:500],
+                "failures": failures,
+                "retry_status": retry_status,
+            },
+            run_id=run_id,
+        )
+    return blocked
+
+
+def _spawn_bind_and_release(
+    conn: sqlite3.Connection,
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str],
+    spawn_fn: Any,
+    failure_limit: int,
+) -> tuple[bool, bool]:
+    """Start a claimed worker, bind it atomically, then release its gate.
+
+    Returns ``(spawned, auto_blocked)``.  A ``None`` result remains the
+    compatibility seam for test/no-process spawners; every real process must
+    be represented by ``PendingWorkerProcess`` so it cannot execute unfenced.
+    """
+    if task.current_run_id is None or not task.claim_lock:
+        raise SpawnBindError("claimed task has no exact run/claim ownership")
+    pending: Optional[PendingWorkerProcess] = None
+    bound_fence: Optional[str] = None
+    try:
+        candidate = _invoke_worker_spawn(
+            spawn_fn,
+            task,
+            workspace,
+            board=board,
+        )
+        if candidate is None:
+            return True, False
+        if not isinstance(candidate, PendingWorkerProcess):
+            if type(candidate) is int:
+                detail = "legacy integer spawn result is unfenced"
+            else:
+                detail = "spawn result is not a pending worker process"
+            raise UnfencedSpawnContractError(detail)
+        pending = candidate
+        bind_result = _bind_pending_worker(
+            conn,
+            task.id,
+            pending,
+            run_id=task.current_run_id,
+            claim_lock=task.claim_lock,
+        )
+        if bind_result is False:
+            _record_and_abort_failed_bind(
+                conn,
+                task.id,
+                pending,
+                run_id=task.current_run_id,
+                claim_lock=task.claim_lock,
+            )
+            pending = None
+            return False, False
+        bound_fence = bind_result
+        pending.release()
+        pending = None
+        return True, False
+    except (UnknownWorkerProcess, SpawnBindError):
+        raise
+    except Exception as exc:
+        if bound_fence is not None:
+            if pending is None:
+                raise SpawnBindError(
+                    "bound worker ownership disappeared before release cleanup"
+                ) from exc
+            pending.abort()
+            pending = None
+            auto_blocked = _record_post_bind_release_failure(
+                conn,
+                task.id,
+                error=str(exc),
+                run_id=task.current_run_id,
+                claim_lock=task.claim_lock,
+                raw_fence=bound_fence,
+                failure_limit=failure_limit,
+            )
+        else:
+            auto_blocked = _handle_spawn_start_failure(
+                conn,
+                task.id,
+                error=str(exc),
+                run_id=task.current_run_id,
+                claim_lock=task.claim_lock,
+                failure_limit=failure_limit,
+            )
+        return False, auto_blocked
+    finally:
+        if pending is not None:
+            pending.abort()
+
+
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
@@ -8966,7 +10692,7 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
     """
-    with write_txn(conn):
+    with _control_plane_write_txn(conn):
         conn.execute(
             "UPDATE tasks SET worker_pid = ? WHERE id = ?",
             (int(pid), task_id),
@@ -8980,7 +10706,12 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
 
 
-def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
+def _clear_failure_counter(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    _mutation_auth: Optional[_MutationAuthorization] = None,
+) -> None:
     """Reset the unified consecutive-failures counter.
 
     Called from ``complete_task`` on successful completion — a fresh
@@ -8990,7 +10721,9 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     about whether the run will succeed, so we need to let timeouts and
     crashes accumulate across spawn boundaries.
     """
-    with write_txn(conn):
+    with _authorized_write_txn(
+        conn, (task_id,), existing=_mutation_auth,
+    ):
         conn.execute(
             "UPDATE tasks SET consecutive_failures = 0, "
             "last_failure_error = NULL WHERE id = ?",
@@ -9256,6 +10989,9 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    _deny_registered_worker_filesystem_control_plane()
+    if not dry_run:
+        _require_attempt_fence_platform()
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
@@ -9322,9 +11058,9 @@ def _dispatch_once_locked(
       3. Reclaim crashed running tasks (host-local PID no longer alive).
       3. Promote todo -> ready where all parents are done.
       4. For each ready task with an assignee, atomically claim and call
-         ``spawn_fn(task, workspace_path, board) -> Optional[int]``. The
-         return value (if any) is recorded as ``worker_pid`` so subsequent
-         ticks can detect crashes before the TTL expires.
+         ``spawn_fn(task, workspace_path, board)``. Real process spawners
+         return a blocked ``PendingWorkerProcess``; the dispatcher binds its
+         exact process fence before releasing it to execute.
 
     Spawn failures are counted per-task. After ``failure_limit`` consecutive
     failures the task is auto-blocked with the last error as its reason —
@@ -9345,6 +11081,8 @@ def _dispatch_once_locked(
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
+    if not dry_run:
+        reap_terminal_attempt_fences(conn)
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
@@ -9462,7 +11200,7 @@ def _dispatch_once_locked(
                 # 'assigned' event so the board state matches what just happened.
                 if not dry_run:
                     try:
-                        with write_txn(conn):
+                        with _control_plane_write_txn(conn):
                             conn.execute(
                                 "UPDATE tasks SET assignee = ? WHERE id = ? "
                                 "AND (assignee IS NULL OR assignee = '')",
@@ -9539,7 +11277,7 @@ def _dispatch_once_locked(
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
             if not dry_run:
-                with write_txn(conn):
+                with _control_plane_write_txn(conn):
                     _append_event(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
@@ -9581,20 +11319,18 @@ def _dispatch_once_locked(
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            did_spawn, auto = _spawn_bind_and_release(
+                conn,
+                claimed,
+                str(workspace),
+                board=board,
+                spawn_fn=_spawn,
+                failure_limit=failure_limit,
+            )
+            if not did_spawn:
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+                continue
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -9611,6 +11347,8 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except (UnknownWorkerProcess, SpawnBindError):
+            raise
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -9663,7 +11401,7 @@ def _dispatch_once_locked(
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
             if not dry_run:
-                with write_txn(conn):
+                with _control_plane_write_txn(conn):
                     _append_event(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
@@ -9709,23 +11447,26 @@ def _dispatch_once_locked(
         )
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            did_spawn, auto = _spawn_bind_and_release(
+                conn,
+                claimed,
+                str(workspace),
+                board=board,
+                spawn_fn=_spawn,
+                failure_limit=failure_limit,
+            )
+            if not did_spawn:
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+                continue
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
             if _per_profile_cap is not None and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except (UnknownWorkerProcess, SpawnBindError):
+            raise
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -10029,20 +11770,18 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
-) -> Optional[int]:
-    """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
+) -> Optional[PendingWorkerProcess]:
+    """Start ``hermes -p <profile> chat -q ...`` behind a release gate.
 
-    Returns the spawned child's PID so the dispatcher can detect crashes
-    before the claim TTL expires. The child's completion is still observed
-    via the ``complete`` / ``block`` transitions the worker writes itself;
-    the PID check is a safety net for crashes, OOM kills, and Ctrl+C.
+    The returned bootstrap is blocked before exec. The dispatcher durably
+    binds its PID, PGID, start identity, and raw attempt fence to the exact
+    task/run ownership before it releases that gate.
 
     ``board`` pins the child's kanban context to that board: the child's
     ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
     vars all resolve to the same board the dispatcher claimed the task
     from. Workers cannot accidentally see other boards.
     """
-    import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
@@ -10215,28 +11954,21 @@ def _default_spawn(
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
     try:
-        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
+        return _spawn_behind_bootstrap(
             cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
             env=env,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            cwd=workspace if os.path.isdir(workspace) else None,
+            stdout=log_f,
         )
-    except FileNotFoundError:
+    except SpawnStartError as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
+            raise RuntimeError(
+                "`hermes` executable not found on PATH. "
+                "Install Hermes Agent or activate its venv before running the kanban dispatcher."
+            ) from exc
+        raise
+    finally:
         log_f.close()
-        raise RuntimeError(
-            "`hermes` executable not found on PATH. "
-            "Install Hermes Agent or activate its venv before running the kanban dispatcher."
-        )
-    # NOTE: we intentionally do NOT close log_f here — we want Popen's
-    # child process to keep writing after this function returns.  The
-    # handle is kept alive by the child's inheritance.  The parent's
-    # reference goes out of scope and is GC'd, but the OS-level FD stays
-    # open in the child until the child exits.
-    return proc.pid
 
 
 # ---------------------------------------------------------------------------
@@ -10258,6 +11990,7 @@ def run_daemon(
     ``stop_event`` (a :class:`threading.Event`) and ``on_tick`` (a
     callable receiving the :class:`DispatchResult`) are test hooks.
     """
+    _deny_registered_worker_filesystem_control_plane()
     import signal
     import threading
 
@@ -10291,6 +12024,8 @@ def run_daemon(
                     on_tick(res)
                 except Exception:
                     pass
+        except (UnknownWorkerProcess, SpawnBindError):
+            raise
         except Exception:
             # Don't let any single tick kill the daemon.
             import traceback
@@ -10701,7 +12436,7 @@ def add_notify_sub(
     """
     now = int(time.time())
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
@@ -10904,7 +12639,7 @@ def remove_notify_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
 ) -> bool:
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs WHERE task_id = ? "
             "AND platform = ? AND chat_id = ? AND thread_id = ?",
@@ -10985,7 +12720,7 @@ def claim_unseen_events_for_sub(
     ``new_cursor`` on success or call :func:`rewind_notify_cursor` if delivery
     failed before any terminal unsubscribe removed the row.
     """
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         row = conn.execute(
             "SELECT last_event_id FROM kanban_notify_subs "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
@@ -11022,7 +12757,7 @@ def advance_notify_cursor(
     thread_id: Optional[str] = None,
     new_cursor: int,
 ) -> None:
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
@@ -11046,7 +12781,7 @@ def rewind_notify_cursor(
     claim. This keeps retry behavior for transient send failures without
     clobbering newer progress.
     """
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         cur = conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
@@ -11070,8 +12805,9 @@ def gc_events(
     in a terminal state (``done`` or ``archived``). Returns the number of
     rows deleted. Running / ready / blocked tasks keep their full event
     history."""
+    _deny_registered_worker_filesystem_control_plane()
     cutoff = int(time.time()) - int(older_than_seconds)
-    with write_txn(conn):
+    with _control_plane_write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
             "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))",
@@ -11089,6 +12825,7 @@ def gc_worker_logs(
     log files live on disk, not in SQLite. Scoped to ``board`` (defaults
     to the active board) — per-board isolation means deleting logs from
     board A cannot touch board B's logs."""
+    _deny_registered_worker_filesystem_control_plane()
     log_dir = worker_logs_dir(board=board)
     if not log_dir.exists():
         return 0

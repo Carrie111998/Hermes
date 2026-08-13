@@ -239,22 +239,21 @@ class TestConnectionIsolation:
 class TestWorkerSpawnEnv:
     """Ensure the dispatcher pins ``HERMES_KANBAN_BOARD`` / DB / workspaces on spawn.
 
-    We monkey-patch ``subprocess.Popen`` to capture the child env without
+    We monkey-patch the bootstrap seam to capture the child env without
     actually spawning anything.
     """
 
     def test_default_spawn_sets_env_vars(self, fresh_home, monkeypatch):
         captured = {}
 
-        class FakeProc:
-            pid = 12345
+        sentinel = object()
 
-        def fake_popen(cmd, *args, **kwargs):
+        def fake_bootstrap(cmd, **kwargs):
             captured["cmd"] = cmd
             captured["env"] = kwargs.get("env", {})
-            return FakeProc()
+            return sentinel
 
-        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(kb, "_spawn_behind_bootstrap", fake_bootstrap)
         kb.create_board("spawntest")
 
         task = kb.Task(
@@ -275,7 +274,10 @@ class TestWorkerSpawnEnv:
             tenant=None,
         )
 
-        kb._default_spawn(task, str(fresh_home / "ws"), board="spawntest")
+        assert (
+            kb._default_spawn(task, str(fresh_home / "ws"), board="spawntest")
+            is sentinel
+        )
 
         env = captured["env"]
         assert env["HERMES_KANBAN_BOARD"] == "spawntest"
@@ -341,6 +343,5 @@ class TestCLI:
         assert titlesA == ["Task A"]
         assert titlesB == ["Task B"]
         assert titlesD == []
-
 
 

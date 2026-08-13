@@ -15,12 +15,26 @@ computed for.
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+from tests.attempt_fence_helpers import (
+    create_bound_attempt,
+    logical_board_snapshot,
+    process_tuple,
+)
+
+
+darwin_only = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="libproc fence is macOS-only",
+)
 
 
 @pytest.fixture
@@ -41,6 +55,21 @@ def kanban_home(tmp_path, monkeypatch):
 def conn(kanban_home):
     with kb.connect() as c:
         yield c
+
+
+@pytest.fixture
+def worker_identity():
+    leader = subprocess.Popen(["sleep", "60"], process_group=0)
+    identity = kb._darwin_process_identity(leader.pid)
+    assert identity is not None
+    try:
+        yield identity
+    finally:
+        try:
+            os.killpg(identity.pgid, 9)
+        except ProcessLookupError:
+            pass
+        leader.wait(timeout=5)
 
 
 def test_stale_crash_reset_rejected_for_reclaimed_task(conn):
@@ -111,3 +140,209 @@ def test_genuine_crash_still_reclaims(conn):
     assert tid in crashed
     final = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
     assert final["status"] in ("ready", "blocked", "todo")
+
+
+@pytest.mark.parametrize("group_state", ["alive", "unknown"])
+@darwin_only
+def test_stale_fenced_claim_is_never_mutated_without_proven_death(
+    conn,
+    monkeypatch,
+    group_state,
+    worker_identity,
+):
+    task_id, _claimed, _raw = create_bound_attempt(
+        conn,
+        leader_identity=worker_identity,
+    )
+    conn.execute(
+        "UPDATE tasks SET claim_expires=0 WHERE id=?",
+        (task_id,),
+    )
+    conn.commit()
+    before = logical_board_snapshot(conn)
+    monkeypatch.setattr(kb, "_fenced_group_state", lambda _fence: group_state)
+
+    assert kb.release_stale_claims(conn) == 0
+    assert logical_board_snapshot(conn) == before
+
+
+@pytest.mark.parametrize(
+    ("group_state", "reason"),
+    [("alive", "operator checked"), ("unknown", "operator checked"), ("dead", None)],
+)
+@darwin_only
+def test_manual_fenced_reclaim_requires_death_and_reason(
+    conn,
+    monkeypatch,
+    group_state,
+    reason,
+    worker_identity,
+):
+    task_id, _claimed, _raw = create_bound_attempt(
+        conn,
+        leader_identity=worker_identity,
+    )
+    before = logical_board_snapshot(conn)
+    monkeypatch.setattr(kb, "_fenced_group_state", lambda _fence: group_state)
+
+    assert not kb.reclaim_task(conn, task_id, reason=reason)
+    assert logical_board_snapshot(conn) == before
+
+
+@darwin_only
+def test_fenced_reassign_reclaim_requires_explicit_reason(
+    conn, monkeypatch, worker_identity,
+):
+    task_id, _claimed, _raw = create_bound_attempt(
+        conn,
+        leader_identity=worker_identity,
+    )
+    before = logical_board_snapshot(conn)
+    monkeypatch.setattr(kb, "_fenced_group_state", lambda _fence: "dead")
+
+    assert not kb.reassign_task(
+        conn,
+        task_id,
+        "yonatan",
+        reclaim_first=True,
+    )
+    assert logical_board_snapshot(conn) == before
+
+
+@darwin_only
+def test_manual_fenced_reclaim_clears_only_proven_dead_exact_owner(
+    conn,
+    monkeypatch,
+    worker_identity,
+):
+    task_id, claimed, _raw = create_bound_attempt(
+        conn,
+        leader_identity=worker_identity,
+    )
+    monkeypatch.setattr(kb, "_fenced_group_state", lambda _fence: "dead")
+
+    assert kb.reclaim_task(conn, task_id, reason="verified process-group death")
+    task = kb.get_task(conn, task_id)
+    assert task.status == "ready"
+    assert process_tuple(task) == (None, None, None, None, None, None)
+    run = conn.execute(
+        "SELECT outcome, claim_lock, worker_pid, worker_pgid, worker_identity, "
+        "worker_fence FROM task_runs WHERE id=?",
+        (claimed.current_run_id,),
+    ).fetchone()
+    assert tuple(run) == ("reclaimed", None, None, None, None, None)
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='reclaimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    assert "verified process-group death" in event["payload"]
+
+
+@darwin_only
+def test_manual_reclaim_cannot_reopen_a_terminal_fenced_outcome(
+    conn,
+    monkeypatch,
+    worker_identity,
+):
+    task_id, claimed, _raw = create_bound_attempt(
+        conn,
+        leader_identity=worker_identity,
+    )
+    conn.execute(
+        "UPDATE tasks SET status='done', result='finished' WHERE id=?",
+        (task_id,),
+    )
+    conn.execute(
+        "UPDATE task_runs SET status='done', outcome='completed' WHERE id=?",
+        (claimed.current_run_id,),
+    )
+    conn.commit()
+    before = logical_board_snapshot(conn)
+    monkeypatch.setattr(kb, "_fenced_group_state", lambda _fence: "dead")
+
+    assert not kb.reclaim_task(conn, task_id, reason="already terminal")
+    assert logical_board_snapshot(conn) == before
+    assert kb.reap_terminal_attempt_fences(conn) == [("task", task_id)]
+    assert kb.get_task(conn, task_id).status == "done"
+
+
+@pytest.mark.parametrize(
+    "recovery",
+    ["max_runtime", "stale", "orphan", "crashed"],
+)
+@darwin_only
+def test_legacy_recovery_paths_never_mutate_a_fenced_attempt(
+    conn,
+    monkeypatch,
+    recovery,
+    worker_identity,
+):
+    task_id, claimed, raw = create_bound_attempt(
+        conn,
+        leader_identity=worker_identity,
+    )
+    host_lock = f"{kb._claimer_id().split(':', 1)[0]}:legacy-recovery"
+    fence = json.loads(raw)
+    fence["claim_lock"] = host_lock
+    raw = json.dumps(fence, sort_keys=True, separators=(",", ":"))
+    conn.execute(
+        "UPDATE tasks SET claim_lock=?, worker_fence=? WHERE id=?",
+        (host_lock, raw, task_id),
+    )
+    conn.execute(
+        "UPDATE task_runs SET claim_lock=?, worker_fence=? WHERE id=?",
+        (host_lock, raw, claimed.current_run_id),
+    )
+    if recovery == "max_runtime":
+        conn.execute(
+            "UPDATE tasks SET max_runtime_seconds=1, started_at=1 WHERE id=?",
+            (task_id,),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at=1 WHERE task_id=?",
+            (task_id,),
+        )
+    elif recovery == "stale":
+        conn.execute(
+            "UPDATE tasks SET started_at=1, last_heartbeat_at=NULL WHERE id=?",
+            (task_id,),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at=1 WHERE task_id=?",
+            (task_id,),
+        )
+    elif recovery == "orphan":
+        conn.execute(
+            "UPDATE tasks SET claim_expires=NULL WHERE id=?",
+            (task_id,),
+        )
+    else:
+        conn.execute(
+            "UPDATE tasks SET started_at=1 WHERE id=?",
+            (task_id,),
+        )
+    conn.commit()
+    before = logical_board_snapshot(conn)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    signals = []
+
+    if recovery == "max_runtime":
+        result = kb.enforce_max_runtime(
+            conn,
+            signal_fn=lambda pid, sig: signals.append((pid, sig)),
+        )
+    elif recovery == "stale":
+        result = kb.detect_stale_running(
+            conn,
+            stale_timeout_seconds=1,
+            signal_fn=lambda pid, sig: signals.append((pid, sig)),
+        )
+    elif recovery == "orphan":
+        result = kb.reconcile_orphaned_running(conn)
+    else:
+        result = kb.detect_crashed_workers(conn)
+
+    assert result == []
+    assert signals == []
+    assert logical_board_snapshot(conn) == before

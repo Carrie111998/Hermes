@@ -156,6 +156,29 @@ def finalize_turn(
         if _kanban_task:
             try:
                 from hermes_cli import kanban_db as _kb
+                from hermes_cli.config import load_config as _load_config
+
+                raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+                claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+                if (
+                    not raw_run_id
+                    or not raw_run_id.isascii()
+                    or not raw_run_id.isdecimal()
+                    or raw_run_id.startswith("0")
+                    or not claim_lock
+                    or not claim_lock.strip()
+                ):
+                    raise _kb.StaleAttemptError(
+                        "kanban finalizer lacks exact attempt ownership"
+                    )
+                expected_run_id = int(raw_run_id)
+                raw_limit = (_load_config().get("kanban") or {}).get(
+                    "failure_limit", _kb.DEFAULT_FAILURE_LIMIT
+                )
+                if type(raw_limit) is int and raw_limit > 0:
+                    failure_limit = raw_limit
+                else:
+                    failure_limit = _kb.DEFAULT_FAILURE_LIMIT
                 _conn = _kb.connect()
                 try:
                     _kb._record_task_failure(
@@ -168,12 +191,15 @@ def finalize_turn(
                             "iterations"
                         ),
                         outcome="timed_out",
+                        failure_limit=failure_limit,
                         release_claim=True,
                         end_run=True,
                         event_payload_extra={
                             "budget_used": api_call_count,
                             "budget_max": agent.max_iterations,
                         },
+                        expected_run_id=expected_run_id,
+                        expected_claim_lock=claim_lock,
                     )
                     logger.info(
                         "recorded budget-exhausted failure for task %s (%d/%d)",

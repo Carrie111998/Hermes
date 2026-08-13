@@ -26,14 +26,13 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
 
     captured = {}
 
-    class _Proc:
-        pid = 4321
+    sentinel = object()
 
-    def _fake_popen(cmd, **kwargs):
+    def _fake_bootstrap(cmd, **kwargs):
         captured["env"] = kwargs["env"]
-        return _Proc()
+        return sentinel
 
-    monkeypatch.setattr("subprocess.Popen", _fake_popen)
+    monkeypatch.setattr(kb, "_spawn_behind_bootstrap", _fake_bootstrap)
     monkeypatch.setattr(kb, "_retag_legacy_worker_sessions", lambda _root: None)
     monkeypatch.setattr(kb, "worker_logs_dir", lambda board=None: tmp_path / "logs")
 
