@@ -10,7 +10,9 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock
 
-from tools.delegate_tool import delegate_task
+import pytest
+
+from tools.delegate_tool import _delegation_source_platform, delegate_task
 
 
 def _parent_agent(
@@ -518,6 +520,193 @@ model:
     assert observed["target_platform"] == "telegram"
     assert "computer_use" in observed["target_toolsets"]
     assert "computer_use" not in _parent_agent(enabled_toolsets=["file"]).enabled_toolsets
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("desktop", "cli"),
+        ("tui", "cli"),
+        ("dashboard", "cli"),
+        ("hermes_browser", "cli"),
+        ("browser", "cli"),
+        ("telegram", "telegram"),
+        ("discord", "discord"),
+        ("cron", "cron"),
+        ("api_server", "api_server"),
+        ("webhook", "webhook"),
+        ("future_private_surface", "future_private_surface"),
+    ],
+)
+def test_delegation_source_platform_normalizes_only_explicit_private_app_surfaces(
+    source, expected
+):
+    assert _delegation_source_platform(_parent_agent(platform=source)) == expected
+
+
+def test_desktop_named_profile_resolves_cli_terminal_and_file(monkeypatch, tmp_path):
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_profile(
+        hermes_home,
+        "forge-shaped-specialist",
+        """
+platform_toolsets:
+  cli:
+    - terminal
+    - file
+agent:
+  disabled_toolsets: []
+model:
+  provider: target-provider
+  default: target-default
+""",
+    )
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "target-provider",
+            "base_url": "https://target.invalid/v1",
+            "api_key": "in-memory-test-key",
+            "api_mode": "chat_completions",
+        },
+    )
+
+    def _fake_build(**kwargs):
+        observed.update(kwargs)
+        return SimpleNamespace(
+            model=kwargs["model"],
+            _delegate_role="leaf",
+            session_id="desktop-forge-shaped-child",
+        )
+
+    monkeypatch.setattr("tools.delegate_tool._build_child_preserving_parent_tools", _fake_build)
+    monkeypatch.setattr(
+        "tools.delegate_tool._run_single_child",
+        lambda task_index, goal, child, parent_agent: {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": "done",
+            "api_calls": 0,
+            "duration_seconds": 0,
+            "_child_role": "leaf",
+            "_child_cost_usd": 0.0,
+        },
+    )
+
+    result = json.loads(
+        delegate_task(
+            goal="Perform a no-op capability probe",
+            profile="forge-shaped-specialist",
+            required_toolsets=["terminal", "file"],
+            parent_agent=_parent_agent(platform="desktop"),
+        )
+    )
+
+    assert result["results"][0]["status"] == "completed"
+    assert observed["target_platform"] == "cli"
+    target_toolsets = cast(list[str], observed["target_toolsets"])
+    assert {"terminal", "file"}.issubset(set(target_toolsets))
+
+
+@pytest.mark.parametrize(
+    "disabled_toolset",
+    [
+        "video",
+        "computer_use",
+        "messaging",
+        "delegation",
+        "cronjob",
+        "project",
+        "image_gen",
+        "video_gen",
+        "tts",
+        "homeassistant",
+        "spotify",
+        "discord",
+        "discord_admin",
+        "yuanbao",
+    ],
+)
+def test_desktop_piper_disabled_toolsets_still_refuse_preflight(
+    monkeypatch, tmp_path, disabled_toolset
+):
+    """Piper is the current specialist with explicit disabled toolsets."""
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_profile(
+        hermes_home,
+        "piper",
+        """
+platform_toolsets:
+  cli:
+    - terminal
+    - file
+    - computer_use
+    - delegation
+    - cronjob
+    - project
+    - image_gen
+    - video_gen
+    - tts
+    - homeassistant
+    - spotify
+    - discord
+    - discord_admin
+    - yuanbao
+    - video
+    - messaging
+agent:
+  disabled_toolsets:
+    - video
+    - computer_use
+    - messaging
+    - delegation
+    - cronjob
+    - project
+    - image_gen
+    - video_gen
+    - tts
+    - homeassistant
+    - spotify
+    - discord
+    - discord_admin
+    - yuanbao
+model:
+  provider: fake
+  default: fake-model
+""",
+    )
+    counters = {"provider": 0, "child": 0}
+
+    def _forbidden_provider(*_args, **_kwargs):
+        counters["provider"] += 1
+        raise AssertionError("disabled capability must fail before provider lookup")
+
+    def _forbidden_child(*_args, **_kwargs):
+        counters["child"] += 1
+        raise AssertionError("disabled capability must fail before child construction")
+
+    monkeypatch.setattr("tools.delegate_tool._resolve_delegation_credentials", _forbidden_provider)
+    monkeypatch.setattr("tools.delegate_tool._build_child_preserving_parent_tools", _forbidden_child)
+
+    result = json.loads(
+        delegate_task(
+            goal="Attempt a disabled Piper capability",
+            profile="piper",
+            required_toolsets=[disabled_toolset],
+            parent_agent=_parent_agent(platform="desktop"),
+        )
+    )
+
+    assert "error" in result
+    assert "target profile 'piper'" in result["error"]
+    assert disabled_toolset in result["error"]
+    assert counters == {"provider": 0, "child": 0}
 
 
 def test_batch_preflight_uses_top_level_defaults_and_reports_every_missing_toolset(

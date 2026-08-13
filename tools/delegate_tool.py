@@ -3273,13 +3273,26 @@ def _normalize_delegation_model(value: Any, *, task_index: int) -> Optional[str]
     return value.strip()
 
 
+_PRIVATE_APP_CLI_CAPABILITY_SURFACES = frozenset(
+    {"desktop", "tui", "dashboard", "hermes_browser", "browser"}
+)
+
+
 def _delegation_source_platform(parent_agent) -> str:
-    """Return the originating surface for platform-specific target config."""
+    """Return the explicit capability surface used for target preflight.
+
+    Private first-party application shells share the CLI capability policy.
+    Messaging, automation/API, and unknown surfaces retain their own identity so
+    they continue to resolve explicitly or fail closed.
+    """
     raw_platform = getattr(parent_agent, "platform", "cli")
     if raw_platform == "subagent":
         raw_platform = getattr(parent_agent, "_delegate_origin_platform", None) or raw_platform
     if isinstance(raw_platform, str) and raw_platform.strip():
-        return raw_platform.strip().lower()
+        normalized = raw_platform.strip().lower()
+        if normalized in _PRIVATE_APP_CLI_CAPABILITY_SURFACES:
+            return "cli"
+        return normalized
     return "cli"
 
 
