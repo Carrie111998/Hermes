@@ -10,6 +10,8 @@ const ensureGatewayForProfile = vi.fn(async () => undefined)
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const $gateway = atom<unknown>({ id: 'live-socket' })
 const resetStarmapGraph = vi.fn()
+const invalidateMcpSuggestionIndex = vi.fn()
+const invalidateSkillSuggestionIndex = vi.fn()
 
 vi.mock('@/store/gateway', () => ({ $gateway, ensureGatewayForProfile, openGatewayForProfile }))
 vi.mock('@/hermes', () => ({
@@ -18,6 +20,8 @@ vi.mock('@/hermes', () => ({
 }))
 vi.mock('@/lib/query-client', () => ({ invalidateProfileScopedQueries: vi.fn() }))
 vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
+vi.mock('@/store/suggestion-providers/mcp', () => ({ invalidateMcpSuggestionIndex }))
+vi.mock('@/store/suggestion-providers/skill', () => ({ invalidateSkillSuggestionIndex }))
 
 const { $activeGatewayProfile, $profiles, ensureGatewayProfile, prewarmProfileBackend, refreshProfiles } =
   await import('./profile')
@@ -55,6 +59,8 @@ beforeEach(() => {
   vi.stubGlobal('window', { hermesDesktop: { getConnection } })
   vi.mocked(invalidateProfileScopedQueries).mockClear()
   resetStarmapGraph.mockClear()
+  invalidateMcpSuggestionIndex.mockClear()
+  invalidateSkillSuggestionIndex.mockClear()
 })
 
 afterEach(() => {
@@ -116,6 +122,28 @@ describe('profile-scoped cache invalidation', () => {
 
     expect(invalidateProfileScopedQueries).toHaveBeenCalled()
     expect(resetStarmapGraph).toHaveBeenCalledTimes(1)
+  })
+
+  it('drops the composer suggestion-provider caches (MCP configured-servers, skill index) on profile switch', () => {
+    // Regression: these are profile-scoped REST reads with their own
+    // TTL cache, outside invalidateProfileScopedQueries' React Query
+    // cache — a stale hit re-offers "Add <server>" for one already
+    // configured on the new profile, or points a skill pill at the
+    // wrong profile's skill.
+    $activeGatewayProfile.set('coder')
+
+    expect(invalidateMcpSuggestionIndex).toHaveBeenCalledTimes(1)
+    expect(invalidateSkillSuggestionIndex).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not invalidate the suggestion caches when re-set to the same profile', () => {
+    // beforeEach already routed to 'default'; setting the same value again
+    // must be a no-op, matching invalidateProfileScopedQueries/
+    // resetStarmapGraph's existing "real change only" guard.
+    $activeGatewayProfile.set('default')
+
+    expect(invalidateMcpSuggestionIndex).not.toHaveBeenCalled()
+    expect(invalidateSkillSuggestionIndex).not.toHaveBeenCalled()
   })
 })
 
