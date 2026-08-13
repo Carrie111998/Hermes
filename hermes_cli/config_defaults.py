@@ -1570,7 +1570,7 @@ DEFAULT_CONFIG = {
             # "base_url": "",  # override DEEPINFRA_BASE_URL for TTS only
         },
         "nvidia": {
-            "base_url": "https://877104f7-e885-42b9-8de8-f6e4c6303969.invocation.api.nvcf.nvidia.com",
+            "base_url": "",  # empty = resolve Magpie's current hosted endpoint from the NVIDIA speech catalog
             "voice": "Magpie-Multilingual.EN-US.Aria",
             "language": "en-US",
             "sample_rate_hz": 44100,
@@ -1639,9 +1639,9 @@ DEFAULT_CONFIG = {
             # "base_url": "",  # override DEEPINFRA_BASE_URL for STT only
         },
         "nvidia": {
-            "model": "parakeet-tdt-0.6b-v2",
-            "tdt_base_url": "https://d3fe9151-442b-4204-a70d-5fcc597fd610.invocation.api.nvcf.nvidia.com",
-            "ctc_base_url": "https://1598d209-5e27-4d3c-8079-4751568b1081.invocation.api.nvcf.nvidia.com",
+            "model": "parakeet-tdt-default",  # stable catalog ID; hosted deployment may rotate
+            "tdt_base_url": "",  # empty = resolve the current hosted endpoint from the NVIDIA speech catalog
+            "ctc_base_url": "",  # empty = resolve the current hosted endpoint from the NVIDIA speech catalog
             "language": "en-US",
             "boosted_words": [],
             "boosted_words_score": None,

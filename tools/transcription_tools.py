@@ -131,6 +131,8 @@ NVIDIA_CTC_ASR_BASE_URL = (
 )
 DEFAULT_NVIDIA_ASR_MODEL = "parakeet-tdt-0.6b-v2"
 FALLBACK_NVIDIA_ASR_MODEL = "parakeet-ctc-1.1b-asr"
+NVIDIA_TDT_CATALOG_MODEL = "nvidia/parakeet-tdt-default"
+NVIDIA_CTC_CATALOG_MODEL = "nvidia/parakeet-ctc-1.1b-asr"
 
 SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".oga", ".opus", ".aac", ".flac", ".caf"}
 LOCAL_NATIVE_AUDIO_FORMATS = {".wav", ".aiff", ".aif"}
@@ -2754,9 +2756,11 @@ def _transcribe_deepinfra(
 # ---------------------------------------------------------------------------
 
 
-def _nvidia_asr_form_fields(nvidia_config: Dict[str, Any]) -> list[tuple[str, str]]:
+def _nvidia_asr_form_fields(
+    nvidia_config: Dict[str, Any], *, default_language: str = "en-US"
+) -> list[tuple[str, str]]:
     fields = [
-        ("language", str(nvidia_config.get("language") or "en-US")),
+        ("language", str(nvidia_config.get("language") or default_language)),
         ("response_format", "json"),
     ]
     boosted_words = nvidia_config.get("boosted_words", [])
@@ -2806,20 +2810,53 @@ def _transcribe_nvidia(file_path: str, model_name: str) -> Dict[str, Any]:
     if not isinstance(nvidia_config, dict):
         nvidia_config = {}
 
-    tdt_base_url = str(
-        nvidia_config.get("tdt_base_url") or NVIDIA_TDT_ASR_BASE_URL
-    ).strip().rstrip("/")
-    ctc_base_url = str(
-        nvidia_config.get("ctc_base_url") or NVIDIA_CTC_ASR_BASE_URL
-    ).strip().rstrip("/")
-    endpoints = (
-        [(ctc_base_url, FALLBACK_NVIDIA_ASR_MODEL)]
-        if "ctc" in model_name.lower()
-        else [
-            (tdt_base_url, DEFAULT_NVIDIA_ASR_MODEL),
-            (ctc_base_url, FALLBACK_NVIDIA_ASR_MODEL),
-        ]
+    from tools.nvidia_speech_catalog import (
+        load_nvidia_speech_catalog,
+        resolve_nvidia_hosted_http_model,
     )
+
+    configured_tdt_url = str(nvidia_config.get("tdt_base_url") or "").strip().rstrip("/")
+    configured_ctc_url = str(nvidia_config.get("ctc_base_url") or "").strip().rstrip("/")
+    # Old Hermes releases wrote the bundled hosted URLs into config.yaml.
+    # Treat those exact values as unpinned defaults so existing installations
+    # gain catalog rotation; every other value remains an explicit self-hosted
+    # override and keeps the pre-catalog request behavior.
+    tdt_override = configured_tdt_url if configured_tdt_url not in {"", NVIDIA_TDT_ASR_BASE_URL} else ""
+    ctc_override = configured_ctc_url if configured_ctc_url not in {"", NVIDIA_CTC_ASR_BASE_URL} else ""
+    catalog = load_nvidia_speech_catalog() if not (tdt_override and ctc_override) else {}
+
+    def hosted_endpoint(
+        *, catalog_model: str, fallback_url: str, fallback_model: str, override: str
+    ) -> Optional[tuple[str, str, str]]:
+        if override:
+            return (override, fallback_model, "en-US")
+        if catalog:
+            resolved = resolve_nvidia_hosted_http_model(catalog_model, modality="asr")
+            if resolved is None:
+                # The stable model may currently be gRPC-only. Hermes HTTP
+                # must not invent a route from a gRPC function ID.
+                return None
+            return (
+                resolved.base_url,
+                resolved.model_id.removeprefix("nvidia/"),
+                resolved.default_language or "en-US",
+            )
+        return (fallback_url, fallback_model, "en-US")
+
+    tdt_endpoint = hosted_endpoint(
+        catalog_model=NVIDIA_TDT_CATALOG_MODEL,
+        fallback_url=NVIDIA_TDT_ASR_BASE_URL,
+        fallback_model=DEFAULT_NVIDIA_ASR_MODEL,
+        override=tdt_override,
+    )
+    ctc_endpoint = hosted_endpoint(
+        catalog_model=NVIDIA_CTC_CATALOG_MODEL,
+        fallback_url=NVIDIA_CTC_ASR_BASE_URL,
+        fallback_model=FALLBACK_NVIDIA_ASR_MODEL,
+        override=ctc_override,
+    )
+    endpoints = [ctc_endpoint] if "ctc" in model_name.lower() else [tdt_endpoint, ctc_endpoint]
+    endpoints = [endpoint for endpoint in endpoints if endpoint is not None]
 
     upload_path = Path(file_path)
     temporary_directory = None
@@ -2855,10 +2892,12 @@ def _transcribe_nvidia(file_path: str, model_name: str) -> Dict[str, Any]:
 
         import requests
 
-        fields = _nvidia_asr_form_fields(nvidia_config)
         errors = []
-        for base_url, resolved_model in endpoints:
+        for base_url, resolved_model, default_language in endpoints:
             try:
+                fields = _nvidia_asr_form_fields(
+                    nvidia_config, default_language=default_language
+                )
                 with upload_path.open("rb") as audio_file:
                     response = requests.post(
                         f"{base_url}/v1/audio/transcriptions",

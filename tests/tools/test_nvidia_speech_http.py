@@ -14,6 +14,11 @@ def clean_nvidia_env(monkeypatch):
         "HERMES_SESSION_PLATFORM",
     ):
         monkeypatch.delenv(key, raising=False)
+    # Existing provider tests exercise the bundled offline fallback. Catalog
+    # behavior has focused tests below and never reaches the network here.
+    monkeypatch.setattr(
+        "tools.nvidia_speech_catalog.load_nvidia_speech_catalog", lambda: {}
+    )
 
 
 def _response(*, status=200, payload=None, content=b"", text=""):
@@ -169,3 +174,115 @@ def test_asr_conversion_is_noninteractive_and_hides_windows_console(tmp_path):
     assert result["success"] is True
     assert run.call_args.kwargs["stdin"] is subprocess.DEVNULL
     assert run.call_args.kwargs["creationflags"] == windows_hide_flags()
+
+
+def test_asr_uses_catalog_http_fallback_when_tdt_is_grpc_only(tmp_path, monkeypatch):
+    from tools.transcription_tools import DEFAULT_NVIDIA_ASR_MODEL, _transcribe_nvidia
+
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"RIFF-test")
+    catalog = {
+        "models": [
+            {
+                "id": "nvidia/parakeet-tdt-default",
+                "modality": "asr",
+                "status": "transitioning",
+                "cloud": {"transport": "grpc"},
+            },
+            {
+                "id": "nvidia/parakeet-ctc-1.1b-asr",
+                "modality": "asr",
+                "status": "active",
+                "cloud": {
+                    "transport": "http",
+                    "baseUrl": "https://catalog-ctc.invocation.api.nvcf.nvidia.com",
+                    "defaultLanguage": "en-GB",
+                },
+            },
+        ]
+    }
+    monkeypatch.setattr(
+        "tools.nvidia_speech_catalog.load_nvidia_speech_catalog", lambda: catalog
+    )
+
+    with patch(
+        "tools.transcription_tools._resolve_provider_key", return_value="nvapi-test"
+    ), patch(
+        "tools.transcription_tools._load_stt_config",
+        return_value={"nvidia": {"language": ""}},
+    ), patch(
+        "requests.post", return_value=_response(payload={"text": "catalog transcript"})
+    ) as post:
+        result = _transcribe_nvidia(str(audio), DEFAULT_NVIDIA_ASR_MODEL)
+
+    assert result["success"] is True
+    assert result["model"] == "parakeet-ctc-1.1b-asr"
+    assert post.call_count == 1
+    assert post.call_args.args[0].startswith(
+        "https://catalog-ctc.invocation.api.nvcf.nvidia.com/"
+    )
+    assert ("language", "en-GB") in post.call_args.kwargs["data"]
+
+
+def test_asr_preserves_explicit_self_hosted_endpoint(tmp_path, monkeypatch):
+    from tools.transcription_tools import DEFAULT_NVIDIA_ASR_MODEL, _transcribe_nvidia
+
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"RIFF-test")
+    load_catalog = MagicMock(side_effect=AssertionError("catalog should not be loaded"))
+    monkeypatch.setattr(
+        "tools.nvidia_speech_catalog.load_nvidia_speech_catalog", load_catalog
+    )
+    config = {
+        "nvidia": {
+            "tdt_base_url": "http://127.0.0.1:9000",
+            "ctc_base_url": "http://127.0.0.1:9001",
+        }
+    }
+
+    with patch(
+        "tools.transcription_tools._resolve_provider_key", return_value="local-placeholder"
+    ), patch(
+        "tools.transcription_tools._load_stt_config", return_value=config
+    ), patch(
+        "requests.post", return_value=_response(payload={"text": "local transcript"})
+    ) as post:
+        result = _transcribe_nvidia(str(audio), DEFAULT_NVIDIA_ASR_MODEL)
+
+    assert result["success"] is True
+    assert post.call_args.args[0] == "http://127.0.0.1:9000/v1/audio/transcriptions"
+    load_catalog.assert_not_called()
+
+
+def test_magpie_uses_catalog_endpoint(tmp_path, monkeypatch):
+    from tools.tts_tool import _generate_nvidia_tts
+
+    catalog = {
+        "models": [
+            {
+                "id": "nvidia/magpie-tts-multilingual",
+                "modality": "tts",
+                "status": "active",
+                "cloud": {
+                    "transport": "http",
+                    "baseUrl": "https://catalog-magpie.invocation.api.nvcf.nvidia.com",
+                    "defaultLanguage": "multi",
+                },
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        "tools.nvidia_speech_catalog.load_nvidia_speech_catalog", lambda: catalog
+    )
+    output = tmp_path / "speech.wav"
+
+    with patch(
+        "tools.tts_tool._resolve_provider_key", return_value="nvapi-test"
+    ), patch("requests.post", return_value=_response(content=b"RIFF-test")) as post:
+        _generate_nvidia_tts("Hello", str(output), {"nvidia": {"language": ""}})
+
+    assert post.call_args.args[0] == (
+        "https://catalog-magpie.invocation.api.nvcf.nvidia.com/v1/audio/synthesize"
+    )
+    fields = {name: value[1] for name, value in post.call_args.kwargs["files"]}
+    assert fields["language"] == "multi"

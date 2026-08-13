@@ -248,6 +248,7 @@ DEFAULT_XAI_TEXT_NORMALIZATION_DEFAULT = False
 NVIDIA_MAGPIE_TTS_BASE_URL = (
     "https://877104f7-e885-42b9-8de8-f6e4c6303969.invocation.api.nvcf.nvidia.com"
 )
+NVIDIA_MAGPIE_CATALOG_MODEL = "nvidia/magpie-tts-multilingual"
 DEFAULT_NVIDIA_TTS_VOICE = "Magpie-Multilingual.EN-US.Aria"
 DEFAULT_NVIDIA_TTS_LANGUAGE = "en-US"
 DEFAULT_NVIDIA_TTS_SAMPLE_RATE = 44100
@@ -1992,12 +1993,23 @@ def _generate_nvidia_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     nvidia_config = tts_config.get("nvidia", {})
     if not isinstance(nvidia_config, dict):
         nvidia_config = {}
-    base_url = str(
-        nvidia_config.get("base_url") or NVIDIA_MAGPIE_TTS_BASE_URL
-    ).strip().rstrip("/")
+    configured_base_url = str(nvidia_config.get("base_url") or "").strip().rstrip("/")
+    base_url = configured_base_url
+    catalog_language = None
+    if configured_base_url in {"", NVIDIA_MAGPIE_TTS_BASE_URL}:
+        from tools.nvidia_speech_catalog import resolve_nvidia_hosted_http_model
+
+        hosted_model = resolve_nvidia_hosted_http_model(
+            NVIDIA_MAGPIE_CATALOG_MODEL, modality="tts"
+        )
+        if hosted_model is not None:
+            base_url = hosted_model.base_url
+            catalog_language = hosted_model.default_language
+        else:
+            base_url = NVIDIA_MAGPIE_TTS_BASE_URL
     voice = str(nvidia_config.get("voice") or DEFAULT_NVIDIA_TTS_VOICE).strip()
     language = str(
-        nvidia_config.get("language") or DEFAULT_NVIDIA_TTS_LANGUAGE
+        nvidia_config.get("language") or catalog_language or DEFAULT_NVIDIA_TTS_LANGUAGE
     ).strip()
     sample_rate = int(
         nvidia_config.get("sample_rate_hz") or DEFAULT_NVIDIA_TTS_SAMPLE_RATE
