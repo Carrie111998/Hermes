@@ -672,6 +672,11 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
         "provider_override": task.provider_override,
+        "review_required": task.review_required,
+        "reviewer_profile": task.reviewer_profile,
+        "canonical_implementer": task.canonical_implementer,
+        "review_cycle": task.review_cycle,
+        "candidate_sha": task.candidate_sha,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -718,6 +723,11 @@ def _handle_show(args: dict, **kw) -> str:
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
+                    "review_required": t.review_required,
+                    "reviewer_profile": t.reviewer_profile,
+                    "canonical_implementer": t.canonical_implementer,
+                    "review_cycle": t.review_cycle,
+                    "candidate_sha": t.candidate_sha,
                 }
 
             def _run_dict(r):
@@ -943,6 +953,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    approved_candidate_sha=args.get("approved_candidate_sha"),
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -1130,6 +1141,7 @@ def _handle_request_review(args: dict, **kw) -> str:
                 summary=summary,
                 metadata=metadata,
                 reviewer=reviewer,
+                candidate_sha=args.get("candidate_sha"),
                 expected_run_id=_worker_run_id(tid),
                 with_reason=True,
             )
@@ -1184,6 +1196,11 @@ def _handle_request_changes(args: dict, **kw) -> str:
                 conn,
                 tid,
                 reason=reason,
+                reason_code=args.get("reason_code"),
+                finding_ids=args.get("finding_ids"),
+                evidence_refs=args.get("evidence_refs"),
+                rejected_candidate_sha=args.get("rejected_candidate_sha"),
+                required_corrections=args.get("required_corrections"),
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -1192,6 +1209,13 @@ def _handle_request_changes(args: dict, **kw) -> str:
                 )
             landed = kb.get_task(conn, tid)
             run = kb.latest_run(conn, tid)
+            if detail == "recovery_exhausted":
+                return _ok(
+                    task_id=tid,
+                    run_id=run.id if run else None,
+                    status=landed.status if landed else "blocked",
+                    terminal_type="RECOVERY_EXHAUSTED",
+                )
             return _ok(
                 task_id=tid,
                 run_id=run.id if run else None,
@@ -2082,6 +2106,13 @@ KANBAN_COMPLETE_SCHEMA = {
                     "task in-flight so you can fix the path and retry."
                 ),
             },
+            "approved_candidate_sha": {
+                "type": "string",
+                "description": (
+                    "Full immutable candidate SHA approved by this active "
+                    "independent review run. Required for guarded factory cards."
+                ),
+            },
             "board": _board_schema_prop(),
         },
         "required": [],
@@ -2190,6 +2221,13 @@ KANBAN_REQUEST_REVIEW_SCHEMA = {
                 ),
                 "additionalProperties": True,
             },
+            "candidate_sha": {
+                "type": "string",
+                "description": (
+                    "Full immutable candidate SHA. Required for guarded factory "
+                    "cards; abbreviated SHAs are rejected."
+                ),
+            },
             "board": _board_schema_prop(),
         },
         "required": ["summary"],
@@ -2218,6 +2256,29 @@ KANBAN_REQUEST_CHANGES_SCHEMA = {
                     "Specific, actionable changes the implementer must make "
                     "before requesting another review."
                 ),
+            },
+            "reason_code": {
+                "type": "string",
+                "description": "Stable finding class code for guarded review cards.",
+            },
+            "finding_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Stable finding identifiers for guarded review cards.",
+            },
+            "evidence_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Concrete evidence references for guarded review cards.",
+            },
+            "rejected_candidate_sha": {
+                "type": "string",
+                "description": "Exact candidate SHA rejected by this review.",
+            },
+            "required_corrections": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Specific corrections required before re-review.",
             },
             "board": _board_schema_prop(),
         },

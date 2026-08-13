@@ -20,6 +20,7 @@ from typing import Any, Callable, Optional
 
 from agent.i18n import t
 from gateway.kanban_alerts import (
+    collect_review_terminal_event_alerts,
     collect_routed_blocker_incidents,
     reconcile_stale_task_incidents,
     record_dispatch_alerts,
@@ -1948,6 +1949,12 @@ class GatewayKanbanWatchersMixin:
                                 f"blockers:{board}",
                                 [incident for incident in blockers if incident.board == board],
                             )
+                        await asyncio.to_thread(
+                            collect_review_terminal_event_alerts,
+                            alert_notifier,
+                            _kb,
+                            boards=alert_boards,
+                        )
                         if dispatch_allowed:
                             record_dispatch_alerts(
                                 alert_notifier,

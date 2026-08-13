@@ -15,6 +15,7 @@ from gateway.kanban_alerts import (
     intake_incident,
     reconcile_stale_task_incidents,
     record_dispatch_alerts,
+    project_review_terminal_events,
 )
 from hermes_cli import kanban_db as kb
 
@@ -39,6 +40,95 @@ class ListingAdapter(RecordingAdapter):
             {"id": "alerts-id", "name": "alerts", "type": "channel"},
             {"id": "blockers-id", "name": "blockers", "type": "channel"},
         ]
+
+
+def test_review_terminal_projection_is_typed_event_keyed_and_order_independent(
+    tmp_path,
+):
+    adapter = RecordingAdapter()
+    notifier = _notifier(tmp_path, adapter)
+    genuine = kb.Event(
+        id=41,
+        task_id="t_decision",
+        run_id=7,
+        kind="blocked",
+        payload={
+            "alert_required": True,
+            "reason": "maintainer must choose the public contract",
+            "terminal_type": "GENUINE_DECISION",
+        },
+        created_at=1,
+    )
+    routine = kb.Event(
+        id=42,
+        task_id="t_routine",
+        run_id=8,
+        kind="changes_requested",
+        payload={"reason": "add a boundary test"},
+        created_at=2,
+    )
+    exhausted = kb.Event(
+        id=43,
+        task_id="t_exhausted",
+        run_id=9,
+        kind="review_budget_exhausted",
+        payload={
+            "alert_required": True,
+            "reason": "third independent finding",
+            "terminal_type": "RECOVERY_EXHAUSTED",
+        },
+        created_at=3,
+    )
+
+    project_review_terminal_events(
+        notifier,
+        board="default",
+        events=[exhausted, routine, genuine, exhausted, genuine],
+        active_decision_task_ids={"t_decision"},
+    )
+    asyncio.run(notifier.flush())
+    project_review_terminal_events(
+        notifier,
+        board="default",
+        events=[genuine, exhausted],
+        active_decision_task_ids={"t_decision"},
+    )
+    asyncio.run(notifier.flush())
+
+    assert len(adapter.sent) == 2
+    assert adapter.sent[0][0] == "blockers-id"
+    assert "t_decision" in adapter.sent[0][1]
+    assert "Action required" in adapter.sent[0][1]
+    assert adapter.sent[1][0] == "alerts-id"
+    assert "t_exhausted" in adapter.sent[1][1]
+    assert "final receipt" in adapter.sent[1][1]
+    state = json.loads((tmp_path / "kanban-alerts.json").read_text(encoding="utf-8"))
+    assert set(state["active"]) == {"kanban-event:default:41"}
+    assert set(state["recent"]) == {
+        "kanban-event:default:41",
+        "kanban-event:default:43",
+    }
+
+    project_review_terminal_events(
+        notifier,
+        board="default",
+        events=[genuine, exhausted],
+        active_decision_task_ids=set(),
+    )
+    asyncio.run(notifier.flush())
+    project_review_terminal_events(
+        notifier,
+        board="default",
+        events=[exhausted, genuine],
+        active_decision_task_ids=set(),
+    )
+    asyncio.run(notifier.flush())
+
+    assert len(adapter.sent) == 3
+    assert adapter.sent[2] == (
+        "blockers-id",
+        "✅ Kanban genuine decision resolved: default/t_decision.",
+    )
 
 
 def test_authoritative_intake_filters_raw_github_and_dedupes_root_cause():

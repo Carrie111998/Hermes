@@ -608,6 +608,7 @@ Multi-profile, multi-project collaboration board. Each install can host many boa
 | `boards rename <slug> "<name>"` | Change a board's display name. Slug is immutable. |
 | `boards rm <slug>` | Archive (default) or hard-delete a board. `--delete` skips the archive step. Archived boards move to `boards/_archived/<slug>-<ts>/`. Refused for `default`. |
 | `create "<title>"` | Create a new task on the active board. Flags: `--body`, `--assignee`, `--parent` (repeatable), `--workspace scratch\|worktree\|dir:<path>`, `--tenant`, `--priority`, `--triage`, `--idempotency-key`, `--max-runtime`, `--max-retries`, `--skill` (repeatable). |
+| `factory "<title>"` | Create one project-worktree card with a guarded executor-to-verifier review lane. Requires `--project` and permanent `--idempotency-key`; defaults to `--executor executor --verifier verifier`. |
 | `list` / `ls` | List tasks on the active board. Filter with `--mine`, `--assignee`, `--status`, `--tenant`, `--archived`, `--json`. |
 | `show <id>` | Show a task with comments and events. `--json` for machine output. |
 | `assign <id> <profile>` | Assign or reassign. Use `none` to unassign. Refused while task is running. |
@@ -615,10 +616,10 @@ Multi-profile, multi-project collaboration board. Each install can host many boa
 | `unlink <parent> <child>` | Remove a dependency. |
 | `claim <id>` | Atomically claim a ready task. Prints resolved workspace path. |
 | `comment <id> "<text>"` | Append a comment. The next worker that claims the task reads it as part of its `kanban_show()` response. |
-| `complete <id>` | Mark task done. Flags: `--result`, `--summary`, `--metadata`. |
+| `complete <id>` | Mark task done. Flags: `--result`, `--summary`, `--metadata`, `--approved-candidate-sha` (required for guarded cards). |
 | `block <id> "<reason>"` | Mark task blocked for human input. Also appends the reason as a comment. |
-| `request-review <id>` | Move a task to `review` with a reviewer handoff — NOT a block. Flags: `--summary`, `--metadata`, `--reviewer` (reassigns before review dispatch). |
-| `request-changes <id> <reason>` | Reviewer verdict for an active review run: close the review attempt and route the task back to its original implementer. |
+| `request-review <id>` | Move a task to `review` with a reviewer handoff — NOT a block. Flags: `--summary`, `--metadata`, `--reviewer` (reassigns before review dispatch), `--candidate-sha` (required for guarded cards). |
+| `request-changes <id> <reason>` | Reviewer verdict for an active review run: close the review attempt and route the task back to its original implementer. Guarded cards also require `--reason-code`, `--finding-id`, `--evidence-ref`, `--rejected-candidate-sha`, and `--required-correction`. |
 | `reopen-review <id>...` | Send review task(s) back for changes (`review` → ready/todo). Flag: `--reason` (appended as a comment). |
 | `schedule <id> "<reason>"` | Park time-delay/follow-up work in `scheduled` so it is not shown as a human blocker. |
 | `unblock <id>` | Restore a blocked task to its source phase (`review` or `ready`), or `todo` while dependencies remain open. |

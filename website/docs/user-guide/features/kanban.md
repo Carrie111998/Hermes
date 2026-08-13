@@ -264,6 +264,27 @@ key. For event-driven intake, prefer stable keys such as
 `intake:<board>:<source>:<source-id>`; a materially different event needs a new
 source ID rather than reuse of an old key.
 
+### Guarded factory intake
+
+Use `factory` for one project-scoped coding card with a native executor and
+independent verifier lane:
+
+```bash
+hermes kanban factory "Fix the cache race" \
+    --project reader \
+    --idempotency-key "issue:reader:482" \
+    --executor executor \
+    --verifier verifier
+```
+
+The project must already have a primary Git repository. Hermes creates one
+worktree-backed card and reuses the existing permanent idempotency key on
+replay. The executor must request review with the full candidate SHA. The
+verifier can approve only that exact candidate from its active review run.
+The first two change requests return the same card to its canonical executor;
+a third finding blocks it as `recovery_exhausted` and emits one final operations
+receipt. Existing tasks keep their original permissive lifecycle.
+
 ### Bulk CLI verbs
 
 All the lifecycle verbs accept multiple ids so you can clean up a batch
@@ -739,6 +760,9 @@ hermes kanban create "<title>" [--body ...] [--assignee <profile>]
                                 [--goal] [--goal-max-turns N]
                                 [--skill <name>]...
                                 [--json]
+hermes kanban factory "<title>" --project <id-or-slug> --idempotency-key <key>
+                                [--executor executor] [--verifier verifier]
+                                [--body ...] [--tenant <name>] [--priority N] [--json]
 hermes kanban list [--mine] [--assignee P] [--status S] [--tenant T] [--archived]
         [--workflow-template-id <id>] [--current-step-key <key>]
         [--sort created|created-desc|priority|priority-desc|status|assignee|title|updated]
@@ -757,13 +781,17 @@ hermes kanban claim <id> [--ttl SECONDS]
 hermes kanban comment <id> "<text>" [--author NAME]
 
 # Bulk verbs — accept multiple ids:
-hermes kanban complete <id>... [--result "..."]
+hermes kanban complete <id>... [--result "..."] [--approved-candidate-sha <sha>]
 hermes kanban block <id> "<reason>" [--ids <id>...]
 hermes kanban unblock <id>...
 hermes kanban archive <id>...
 
 hermes kanban request-review <id> [--summary "..."] [--metadata JSON] [--reviewer PROFILE]
+                                 [--candidate-sha <sha>]
 hermes kanban request-changes <id> "<required changes>"               # active reviewer -> implementer
+                              [--reason-code <code>] [--finding-id <id>]...
+                              [--evidence-ref <ref>]... --rejected-candidate-sha <sha>
+                              [--required-correction <text>]...
 hermes kanban reopen-review  <id>... [--reason "..."]                 # changes requested: 'review' -> ready/todo
 
 hermes kanban tail <id>                                # follow a single task's event stream

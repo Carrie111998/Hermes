@@ -1135,11 +1135,13 @@ def _set_status_direct(
     with kanban_db.write_txn(conn):
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
-            "SELECT status, current_run_id, worker_pid, claim_lock "
+            "SELECT status, current_run_id, worker_pid, claim_lock, block_kind "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if prev is None:
+            return False
+        if prev["block_kind"] == "recovery_exhausted" and new_status != "archived":
             return False
 
         if prev["status"] == "running" and new_status == "ready":

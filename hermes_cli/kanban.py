@@ -81,6 +81,11 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "review_required": t.review_required,
+        "reviewer_profile": t.reviewer_profile,
+        "canonical_implementer": t.canonical_implementer,
+        "review_cycle": t.review_cycle,
+        "candidate_sha": t.candidate_sha,
     }
 
 
@@ -401,6 +406,25 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "to skip the brief running-to-blocked transition.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
+    p_factory = sub.add_parser(
+        "factory",
+        help="Publish one project-scoped executor→verifier same-card task",
+    )
+    p_factory.add_argument("title", help="Task title")
+    p_factory.add_argument("--body", default=None, help="Optional opening post")
+    p_factory.add_argument("--project", required=True, help="Existing project id or slug")
+    p_factory.add_argument(
+        "--idempotency-key",
+        required=True,
+        help="Permanent board-local source-event key",
+    )
+    p_factory.add_argument("--executor", default="executor", help="Implementation profile")
+    p_factory.add_argument("--verifier", default="verifier", help="Independent review profile")
+    p_factory.add_argument("--tenant", default=None, help="Tenant namespace")
+    p_factory.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
+    p_factory.add_argument("--created-by", default="user", help="Recorded creator")
+    p_factory.add_argument("--json", action="store_true", help="Emit JSON output")
+
     # --- swarm ---
     p_swarm = sub.add_parser(
         "swarm",
@@ -600,6 +624,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument(
+        "--approved-candidate-sha",
+        default=None,
+        help="Full candidate SHA approved by the active independent review run",
+    )
 
     p_edit = sub.add_parser(
         "edit",
@@ -676,6 +705,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="JSON object with structured reviewer handoff facts.",
     )
     p_request_review.add_argument(
+        "--candidate-sha",
+        default=None,
+        help="Full immutable candidate SHA (required for factory review cards).",
+    )
+    p_request_review.add_argument(
         "--force", action="store_true",
         help=(
             "Override the live-claim guard: move a running, claimed task to "
@@ -691,6 +725,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_request_changes.add_argument(
         "reason", nargs="+", help="Concrete changes required before re-review",
     )
+    p_request_changes.add_argument("--reason-code", default=None)
+    p_request_changes.add_argument("--finding-id", action="append", default=[])
+    p_request_changes.add_argument("--evidence-ref", action="append", default=[])
+    p_request_changes.add_argument("--rejected-candidate-sha", default=None)
+    p_request_changes.add_argument("--required-correction", action="append", default=[])
 
     p_reopen_review = sub.add_parser(
         "reopen-review",
@@ -1111,6 +1150,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         handlers = {
             "init":     _cmd_init,
             "create":   _cmd_create,
+            "factory":  _cmd_factory,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
             "ls":       _cmd_list,
@@ -1186,6 +1226,7 @@ def _profile_author() -> str:
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init",
     "create",
+    "factory",
     "swarm",
     "assign",
     "reclaim",
@@ -1607,6 +1648,31 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    return 0
+
+
+def _cmd_factory(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        task_id = kb.create_factory_task(
+            conn,
+            title=args.title,
+            body=args.body,
+            project_id=args.project,
+            idempotency_key=args.idempotency_key,
+            executor=args.executor,
+            verifier=args.verifier,
+            created_by=args.created_by or _profile_author(),
+            priority=args.priority,
+            tenant=args.tenant,
+        )
+        task = kb.get_task(conn, task_id)
+    if getattr(args, "json", False):
+        print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
+    else:
+        print(
+            f"Factory task {task_id} ({task.assignee} → {task.reviewer_profile}, "
+            f"project={task.project_id})"
+        )
     return 0
 
 
@@ -2301,6 +2367,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 summary=summary,
                 metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),
+                approved_candidate_sha=getattr(args, "approved_candidate_sha", None),
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
@@ -2452,6 +2519,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             summary=summary,
             metadata=metadata,
             reviewer=reviewer,
+            candidate_sha=getattr(args, "candidate_sha", None),
             expected_run_id=_worker_run_id_for(tid),
             force=bool(getattr(args, "force", False)),
             with_reason=True,
@@ -2480,6 +2548,11 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             conn,
             tid,
             reason=reason,
+            reason_code=getattr(args, "reason_code", None),
+            finding_ids=getattr(args, "finding_id", None),
+            evidence_refs=getattr(args, "evidence_ref", None),
+            rejected_candidate_sha=getattr(args, "rejected_candidate_sha", None),
+            required_corrections=getattr(args, "required_correction", None),
             expected_run_id=_worker_run_id_for(tid),
         )
         if not ok:
@@ -2488,6 +2561,9 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+        if detail == "recovery_exhausted":
+            print(f"Recovery exhausted for {tid}; card blocked")
+            return 0
         print(
             f"Requested changes for {tid}"
             + (f"; routed to {detail}" if detail else "")

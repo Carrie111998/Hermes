@@ -121,6 +121,7 @@ def intake_incident(event: KanbanAlertIntake) -> Optional[KanbanAlertIncident]:
 
 _ACTIONABLE_BLOCK_KINDS = frozenset({"needs_input", "capability"})
 _ROUTED_BLOCK_KINDS = _ACTIONABLE_BLOCK_KINDS | {"dependency"}
+_REVIEW_TERMINAL_TYPES = frozenset({"GENUINE_DECISION", "RECOVERY_EXHAUSTED"})
 
 
 def _one_line(value: Any, *, limit: int = 300) -> str:
@@ -128,6 +129,138 @@ def _one_line(value: Any, *, limit: int = 300) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def project_review_terminal_events(
+    notifier: "KanbanAlertNotifier",
+    *,
+    board: str,
+    events: Iterable[Any],
+    active_decision_task_ids: Optional[set[str]] = None,
+) -> None:
+    """Project typed native review terminals into the persistent alert plane.
+
+    Native event ids are board-local identities, so they are the dedupe key.
+    Sorting and collapsing ids makes duplicate/reordered poll results inert.
+    """
+    unique: dict[int, Any] = {}
+    for event in events:
+        try:
+            event_id = int(event.id)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        unique.setdefault(event_id, event)
+
+    for event_id in sorted(unique):
+        event = unique[event_id]
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        terminal_type = str(payload.get("terminal_type") or "").strip().upper()
+        if payload.get("alert_required") is not True:
+            continue
+        if terminal_type not in _REVIEW_TERMINAL_TYPES:
+            continue
+        task_id = str(getattr(event, "task_id", "") or "")
+        reason = _one_line(payload.get("reason"), limit=200)
+        details = f" — {reason}" if reason else ""
+        key = f"kanban-event:{board}:{event_id}"
+        if terminal_type == "GENUINE_DECISION":
+            if (
+                active_decision_task_ids is not None
+                and task_id not in active_decision_task_ids
+            ):
+                notifier.resolve_incident(
+                    key,
+                    recovery_message=(
+                        f"✅ Kanban genuine decision resolved: {board}/{task_id}."
+                    ),
+                )
+                continue
+            incident = KanbanAlertIncident(
+                key=key,
+                route="blockers",
+                message=(
+                    f"🛑 Kanban review needs a genuine decision: {board}/{task_id}"
+                    f"{details}\nAction required: review the card and record the decision."
+                ),
+                recovery_message=(
+                    f"✅ Kanban genuine decision resolved: {board}/{task_id}."
+                ),
+                allow_dm=True,
+                board=board,
+                task_id=task_id,
+            )
+            notifier.open_incident("review-terminal", incident)
+        else:
+            incident = KanbanAlertIncident(
+                key=key,
+                route="automation",
+                message=(
+                    f"✅ Kanban recovery final receipt: {board}/{task_id} closed "
+                    f"after the bounded review repair budget was exhausted{details}"
+                ),
+                board=board,
+                task_id=task_id,
+            )
+            notifier.queue_once(incident)
+
+
+def collect_review_terminal_event_alerts(
+    notifier: "KanbanAlertNotifier",
+    kb_module: Any,
+    *,
+    boards: Iterable[str],
+) -> None:
+    """Read a bounded tail of typed review events from each native board."""
+    for board in boards:
+        conn = None
+        try:
+            conn = kb_module.connect(board=board)
+            rows = conn.execute(
+                "SELECT * FROM task_events "
+                "WHERE kind IN ('blocked', 'block_loop_detected', "
+                "'review_budget_exhausted') ORDER BY id DESC LIMIT ?",
+                (_MAX_STATE_ENTRIES,),
+            ).fetchall()
+            events = []
+            for row in reversed(rows):
+                try:
+                    payload = json.loads(row["payload"]) if row["payload"] else None
+                except (json.JSONDecodeError, TypeError):
+                    payload = None
+                events.append(
+                    kb_module.Event(
+                        id=int(row["id"]),
+                        task_id=row["task_id"],
+                        run_id=(
+                            int(row["run_id"])
+                            if row["run_id"] is not None
+                            else None
+                        ),
+                        kind=row["kind"],
+                        payload=payload,
+                        created_at=int(row["created_at"]),
+                    )
+                )
+            active_decision_task_ids = {
+                task.id
+                for task in kb_module.list_tasks(conn, status="blocked")
+                if task.block_kind in {"authority", "integrity"}
+            }
+            project_review_terminal_events(
+                notifier,
+                board=board,
+                events=events,
+                active_decision_task_ids=active_decision_task_ids,
+            )
+        except Exception as exc:
+            logger.warning(
+                "kanban alerts: cannot inspect review terminals on board %s: %s",
+                board,
+                exc,
+            )
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 def collect_routed_blocker_incidents(
@@ -525,6 +658,16 @@ class KanbanAlertNotifier:
         now = self._now()
         last_sent = float(self._state["recent"].get(incident.key) or 0.0)
         if last_sent and now - last_sent < self.settings.cooldown_seconds:
+            return
+        self._state["pending_transients"].setdefault(
+            incident.key,
+            {**asdict(incident), "last_attempt_at": 0.0},
+        )
+        self._save_state()
+
+    def queue_once(self, incident: KanbanAlertIncident) -> None:
+        """Queue an immutable event receipt exactly once across restarts."""
+        if incident.key in self._state["recent"]:
             return
         self._state["pending_transients"].setdefault(
             incident.key,
