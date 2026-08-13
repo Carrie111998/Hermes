@@ -11619,16 +11619,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     def _handle_quota_command(self, cmd_original: str):
         """Dispatch `/quota` — show subscription quota status and warnings.
 
-        Mirrors ``/usage``'s arg parsing shape but takes no subcommands: any
-        stray args are ignored and full quota data is always rendered (never
-        gated by ``quota.suppress_warnings`` — issue #6567).
+        Takes no subcommands: stray args are ignored and the full quota status
+        is always shown (``self._show_quota``), never gated by
+        ``quota.suppress_warnings`` (issue #6567).
         """
-        parts = cmd_original.split()
-        args = [p.lower() for p in parts[1:]]
-        if args:
-            # /quota takes no subcommands; ignore unknown args gracefully and
-            # always show the full quota status.
-            pass
         self._show_quota()
 
     def _usage_reset(self, force: bool = False):
@@ -11822,11 +11816,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     def _show_quota(self):
         """`/quota` — subscription quota status and warnings.
 
-        ALWAYS renders full data: the account-usage block is shown regardless
-        of provider availability (fail-open), and warning lines come from
-        ``startup_warning_lines`` which ignores ``quota.suppress_warnings`` so
-        the user is never blinded by an explicit ``/quota`` invocation (issue
-        #6567 acceptance criterion).
+        Always renders full data. When no provider (or no snapshot is
+        available) a short note is printed and the method returns; otherwise
+        the full account-usage block plus warning lines render. Warning lines
+        come from ``startup_warning_lines``, which ignores
+        ``quota.suppress_warnings`` so an explicit ``/quota`` invocation is
+        never blinded (issue #6567 acceptance criterion).
+
+        The snapshot is TTL-cached (≤10 min) by the engine; ``/quota``
+        intentionally uses the cached fetch (fast explicit query) — the
+        display rendered here is still the full account-usage block + warnings.
         """
         agent = self.agent
         provider = getattr(agent, "provider", None) or getattr(self, "provider", None)
@@ -11841,14 +11840,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         snapshot = None
         if provider:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
-                try:
-                    snapshot = _pool.submit(
-                        fetch_quota_snapshot, provider,
-                        base_url=base_url, api_key=api_key,
-                    ).result(timeout=10.0)
-                except (concurrent.futures.TimeoutError, Exception):
-                    snapshot = None
+            _pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            try:
+                snapshot = _pool.submit(
+                    fetch_quota_snapshot, provider,
+                    base_url=base_url, api_key=api_key,
+                ).result(timeout=10.0)
+            except Exception:
+                snapshot = None
+            finally:
+                # wait=False: a stuck provider fetch must never block the main
+                # thread past the .result() timeout (review finding).
+                _pool.shutdown(wait=False, cancel_futures=True)
 
         if not provider or snapshot is None:
             print("  No quota data for the current provider — /usage shows session usage and rate limits.")
@@ -11881,14 +11884,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 fetch_quota_snapshot,
                 quota_warning_lines,
             )
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
-                try:
-                    snapshot = _pool.submit(
-                        fetch_quota_snapshot, provider,
-                        base_url=base_url, api_key=api_key,
-                    ).result(timeout=10.0)
-                except (concurrent.futures.TimeoutError, Exception):
-                    snapshot = None
+            _pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            try:
+                snapshot = _pool.submit(
+                    fetch_quota_snapshot, provider,
+                    base_url=base_url, api_key=api_key,
+                ).result(timeout=10.0)
+            except Exception:
+                snapshot = None
+            finally:
+                # wait=False: a stuck provider fetch must never block the main
+                # thread past the .result() timeout (review finding).
+                _pool.shutdown(wait=False, cancel_futures=True)
             for line in quota_warning_lines(snapshot, CLI_CONFIG):
                 print(line)
         except Exception:

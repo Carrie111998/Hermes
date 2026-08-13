@@ -627,14 +627,18 @@ class CLIAgentSetupMixin:
             base_url = getattr(agent, "base_url", None) or getattr(self, "base_url", None)
             api_key = getattr(agent, "api_key", None) or getattr(self, "api_key", None)
             config = getattr(self, "config", None)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
-                try:
-                    snapshot = _pool.submit(
-                        fetch_quota_snapshot, provider,
-                        base_url=base_url, api_key=api_key,
-                    ).result(timeout=10.0)
-                except (concurrent.futures.TimeoutError, Exception):
-                    snapshot = None
+            _pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            try:
+                snapshot = _pool.submit(
+                    fetch_quota_snapshot, provider,
+                    base_url=base_url, api_key=api_key,
+                ).result(timeout=10.0)
+            except Exception:
+                snapshot = None
+            finally:
+                # wait=False: a stuck provider fetch must never block the main
+                # thread past the .result() timeout (review finding).
+                _pool.shutdown(wait=False, cancel_futures=True)
             for line in startup_warning_lines(snapshot, config):
                 print(line)
         except Exception:

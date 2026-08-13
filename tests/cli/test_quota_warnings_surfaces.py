@@ -237,3 +237,28 @@ def test_show_quota_no_data_note_when_no_provider(monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert "No quota data for the current provider" in out
+
+
+# ── /quota dispatch ──────────────────────────────────────────────────────────
+
+
+def test_handle_quota_command_delegates_to_show_quota():
+    """`/quota` is a thin dispatch: stray args are ignored and `_show_quota` is
+    invoked exactly once (issue #6567 Task C — dead-code removal).
+
+    The spy is installed as a plain instance attribute, which Python looks up
+    at call time — so the bound `_handle_quota_command` calls it without ever
+    touching the real (network-bound) `_show_quota`.
+    """
+    calls = []
+
+    def _spy():
+        calls.append(True)
+
+    stub = _make_stub()
+    _bind(cli_mod.HermesCLI, stub, "_handle_quota_command")
+    stub._show_quota = _spy
+
+    stub._handle_quota_command("/quota whatever")
+
+    assert calls == [True]
