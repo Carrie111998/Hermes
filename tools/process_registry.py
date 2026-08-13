@@ -2660,6 +2660,22 @@ def _format_age(seconds: float) -> str:
     return f"{h}h" if m == 0 else f"{h}h{m}m"
 
 
+def _settlement_line(child_session_id: str, status: str) -> str:
+    """One line telling the parent which durable child settled and how.
+
+    Mirrors the continuation-manager pattern from the TS subagent package
+    (durable childId + settlement summary): the parent knows the child by
+    ``child_session_id`` (a persisted session id it can re-read via
+    session_search), so the notice names that id, not an ephemeral handle.
+    """
+    subject = f"Child {child_session_id}"
+    if status in ("completed", "success"):
+        return f"{subject} finished (status={status})."
+    if status == "interrupted":
+        return f"{subject} was stopped before it finished (status=interrupted)."
+    return f"{subject} failed before it finished (status={status})."
+
+
 def _format_async_delegation(evt: dict) -> str:
     """Format an async-delegation completion into a self-contained re-injection.
 
@@ -2735,6 +2751,14 @@ def _format_async_delegation(evt: dict) -> str:
                 header += f", {r['duration_seconds']}s"
             header += ") ---"
             lines.append(header)
+            # Continuable-children v1: settlement notice keyed by the durable
+            # child session id (re-readable via session_search READ).
+            _r_csid = r.get("child_session_id")
+            if isinstance(_r_csid, str) and _r_csid:
+                _settle = _settlement_line(_r_csid, r_status)
+                if isinstance(r.get("subagent_id"), str):
+                    _settle += f" (subagent_id={r['subagent_id']})"
+                lines.append(_settle)
             if r_status in ("completed", "success") and r_summary:
                 lines.append(r_summary)
             elif r_summary:
@@ -2776,6 +2800,14 @@ def _format_async_delegation(evt: dict) -> str:
         lines.append(f"Toolsets: {', '.join(toolsets)}")
     lines.append(f"Role: {role}   Model: {model}")
     lines.append(f"Status: {status}   API calls: {api_calls}   Duration: {duration}s")
+    # Continuable-children v1: settlement notice keyed by the durable child
+    # session id (re-readable via session_search READ).
+    _csid = evt.get("child_session_id")
+    if isinstance(_csid, str) and _csid:
+        _settle = _settlement_line(_csid, status)
+        if isinstance(evt.get("subagent_id"), str):
+            _settle += f" (subagent_id={evt['subagent_id']})"
+        lines.append(_settle)
     lines.append("--- RESULT ---")
     if status in ("completed", "success") and summary:
         lines.append(summary)

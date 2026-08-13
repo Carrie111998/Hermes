@@ -1339,6 +1339,13 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Continuable-children v1 opt-in (default OFF). When True the child's
+    # durable session id (+ ephemeral subagent id) are exposed on every
+    # result entry and on the background dispatch payload, so the parent
+    # can name the child, receive a settlement notice keyed by id, and
+    # re-read its full transcript later. Default mode stays byte-identical:
+    # no id fields are emitted unless this flag is set.
+    continuable: bool = False,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1684,6 +1691,11 @@ def _build_child_agent(
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
+    # Continuable-children v1: the durable-id opt-in rides on the child so
+    # every entry-construction site in _run_single_child (and every event
+    # that relays the child's identity) sees the same flag without extra
+    # plumbing. Absent/False → the default wire shape is untouched.
+    child._continuable = bool(continuable)
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
     # → NULL). Mirrors /branch's ``_branched_from`` pattern — see
@@ -2085,6 +2097,37 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
             cap,
             spill_path or "none",
         )
+
+
+def _continuable_child_ids(child) -> Optional[Dict[str, str]]:
+    """Return ``{child_session_id, subagent_id}`` for a continuable child, else None.
+
+    The durable id is the child's own AIAgent session id — the same row
+    persisted in the shared session DB (``parent_session_id`` links it to
+    the parent), so it survives process death and can be re-read later via
+    ``session_search`` READ (``session_id=<id>``). Emitted ONLY when the
+    child was spawned with the continuable opt-in; the default path stays
+    byte-identical. Strict ``is True`` / ``isinstance`` guards keep
+    MagicMock test doubles (which auto-create truthy attributes) on the
+    default path.
+    """
+    if getattr(child, "_continuable", False) is not True:
+        return None
+    session_id = getattr(child, "session_id", "")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    ids: Dict[str, str] = {"child_session_id": session_id}
+    subagent_id = getattr(child, "_subagent_id", None)
+    if isinstance(subagent_id, str) and subagent_id:
+        ids["subagent_id"] = subagent_id
+    return ids
+
+
+def _attach_continuable_ids(entry: Dict[str, Any], child) -> None:
+    """Fold continuable child ids into *entry* in place (no-op by default)."""
+    ids = _continuable_child_ids(child)
+    if ids:
+        entry.update(ids)
 
 
 def _run_single_child(
@@ -2536,6 +2579,7 @@ def _run_single_child(
                     f"{_late_pending_steer}]"
                 )
             _attach_worktree(_error_entry)
+            _attach_continuable_ids(_error_entry, child)
             return _error_entry
         finally:
             # Shut down executor without waiting — if the child thread
@@ -2868,6 +2912,7 @@ def _run_single_child(
                 logger.debug("Progress callback completion failed: %s", e)
 
         _attach_worktree(entry)
+        _attach_continuable_ids(entry, child)
         return entry
 
     except Exception as exc:
@@ -2904,6 +2949,7 @@ def _run_single_child(
             )
         # _attach_worktree defaults to a no-op when isolation never engaged.
         _attach_worktree(_error_entry)
+        _attach_continuable_ids(_error_entry, child)
         return _error_entry
 
     finally:
@@ -3215,6 +3261,12 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    # Continuable-children v1 opt-in (default OFF): when True every child
+    # result entry carries the child's durable session id (child_session_id)
+    # plus its ephemeral subagent_id, the background dispatch payload names
+    # the children up-front, and the settlement notice is keyed by id. The
+    # default mode is byte-identical to today — no id fields are emitted.
+    continuable: Optional[bool] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -3228,6 +3280,11 @@ def delegate_task(
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    The 'continuable' parameter (default false) opts children into a
+    durable identity: result entries carry child_session_id/subagent_id,
+    background dispatches name their children up-front, and the
+    settlement notice is keyed by id.
 
     Returns JSON with results array, one entry per task.
     """
@@ -3254,6 +3311,14 @@ def delegate_task(
     # as one message once ALL children finish — the chat is not blocked while
     # they run.
     background = is_truthy_value(background, default=False) if background is not None else False
+
+    # Continuable-children v1: explicit opt-in, off by default. The model may
+    # request it via the schema param; direct Python callers pass it through.
+    continuable = (
+        is_truthy_value(continuable, default=False)
+        if continuable is not None
+        else False
+    )
 
     # Depth limit — configurable via delegation.max_spawn_depth,
     # default 2 for parity with the original MAX_DEPTH constant.
@@ -3440,6 +3505,7 @@ def delegate_task(
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
             role=effective_role,
+            continuable=continuable,
         )
         # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.
@@ -3858,6 +3924,25 @@ def delegate_task(
                 "goals": _goals,
                 "note": note,
             }
+            # Continuable-children v1: name every child up-front (durable
+            # session id + ephemeral subagent id) so the parent knows which
+            # ids to expect on the settlement notice and can re-read a
+            # child's full transcript later via session_search READ
+            # (session_id=<child_session_id>).
+            if continuable:
+                payload["children"] = [
+                    {
+                        "task_index": i,
+                        "goal": t["goal"],
+                        "child_session_id": str(
+                            getattr(c, "session_id", "") or ""
+                        ),
+                        "subagent_id": str(
+                            getattr(c, "_subagent_id", "") or ""
+                        ),
+                    }
+                    for (i, t, c) in children
+                ]
             if live_paths:
                 payload["live_transcripts"] = list(live_paths)
                 payload["live_transcripts_hint"] = (
@@ -4365,6 +4450,21 @@ DELEGATE_TASK_SCHEMA = {
                     "backward compatibility."
                 ),
             },
+            "continuable": {
+                "type": "boolean",
+                "description": (
+                    "Optional (default false): give each child a durable "
+                    "identity. When true, every result entry carries "
+                    "child_session_id (the child's persisted session id) and "
+                    "subagent_id, and a background dispatch names its children "
+                    "up-front. The settlement notice is then keyed by id — you "
+                    "will see 'Child <id> finished (status=...)' — and you can "
+                    "re-read a child's full transcript any time later via "
+                    "session_search with session_id=<child_session_id>. "
+                    "When false (default), results are identical to previous "
+                    "behavior."
+                ),
+            },
         },
         "required": [],
     },
@@ -4426,6 +4526,7 @@ registry.register(
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
+        continuable=args.get("continuable"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

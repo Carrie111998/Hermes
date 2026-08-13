@@ -985,6 +985,14 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
+    # Continuable-children v1: the durable child session id (+ ephemeral
+    # subagent id) ride on the completion event so the settlement notice can
+    # name the child. Absent on non-continuable children (default path
+    # unchanged).
+    if isinstance(result.get("child_session_id"), str):
+        evt["child_session_id"] = result["child_session_id"]
+    if isinstance(result.get("subagent_id"), str):
+        evt["subagent_id"] = result["subagent_id"]
     # Routing origin captured at dispatch (see _capture_routing_origin):
     # additive, lets the gateway reconstruct a full SessionSource (incl.
     # scope_id for relay tenant egress) when its own caches are cold.

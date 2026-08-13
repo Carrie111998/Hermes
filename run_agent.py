@@ -7918,6 +7918,7 @@ class AIAgent:
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
             background=(not _is_subagent),
+            continuable=function_args.get("continuable"),
             parent_agent=self,
         )
 
