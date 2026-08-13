@@ -17,7 +17,6 @@ import {
   toSessionRows
 } from '@/lib/session-date-groups'
 import { sessionBucketLabel } from '@/lib/time'
-import { cn } from '@/lib/utils'
 import { sessionPinId } from '@/store/session'
 import { $sessionDotStateById, hasLiveTurn } from '@/store/session-dot-state'
 
@@ -168,6 +167,10 @@ interface SidebarSessionsSectionProps {
   // grouping is active — the flat recents list opts in; dense tree surfaces
   // (pinned, projects, messaging) keep the one-line row.
   card?: boolean
+  /** When provided, the virtualized flat list scrolls in this external
+   *  element (the sidebar's shared scroll container) instead of owning a
+   *  nested scroller. Virtualization only activates in this mode. */
+  getScrollElement?: () => HTMLElement | null
 }
 
 export function SidebarSessionsSection({
@@ -210,7 +213,8 @@ export function SidebarSessionsSection({
   dndSensors,
   showProfileTags = false,
   grouping = 'none',
-  card = false
+  card = false,
+  getScrollElement
 }: SidebarSessionsSectionProps) {
   const { t } = useI18n()
   const dividerLabels = t.sidebar.dateDivider
@@ -356,13 +360,17 @@ export function SidebarSessionsSection({
   // Pinned never virtualizes. Virtualization needs a bounded viewport to
   // measure against, and Pinned deliberately has none — however many chats you
   // pin, all of them render and the sidebar's own scroll carries the length.
+  // Also require a shared scroll element: without one, VirtualSessionList
+  // would own overflow-y-auto + overscroll-contain and latch the wheel
+  // mid-list inside the outer sidebar scroller (#84964).
   const flatVirtualized =
     !pinned &&
     !showEmptyState &&
     !groups?.length &&
     !projectOverview?.length &&
     !projectContent &&
-    sessions.length >= VIRTUALIZE_THRESHOLD
+    sessions.length >= VIRTUALIZE_THRESHOLD &&
+    Boolean(getScrollElement)
 
   // First paint into the grouped view (e.g. the app restoring the Projects tab)
   // has flat recents in `sessions` but no tree yet. Show skeletons rather than
@@ -455,6 +463,7 @@ export function SidebarSessionsSection({
         card={card}
         className={contentClassName}
         dividerAction={dividerAction}
+        getScrollElement={getScrollElement}
         onArchiveSession={onArchiveSession}
         onBranchSession={onBranchSession}
         onDeleteSession={onDeleteSession}
@@ -485,11 +494,11 @@ export function SidebarSessionsSection({
     inner = flatRows.map(row => renderListRow(row, false, dividerAction))
   }
 
-  // The virtualizer owns its own scroller, so suppress the wrapper's overflow
-  // to avoid a double scroll container. Both axes: `overflow-y-visible` next
-  // to the inherited `overflow-x-hidden` computes to `auto` (CSS spec), which
-  // kept a phantom 4px scrollbar gutter and cut every row short on the right.
-  const resolvedContentClassName = cn(contentClassName, flatVirtualized && 'overflow-visible')
+  // flatVirtualized now implies shared-scroll mode: the virtualizer never
+  // owns a scroller here, so the wrapper needs no overflow suppression.
+  // Do not add per-axis overflow classes — a single-axis overflow forces
+  // the other axis from `visible` to `auto` and recreates a nested port.
+  const resolvedContentClassName = contentClassName
 
   return (
     <SidebarGroup className={rootClassName}>
