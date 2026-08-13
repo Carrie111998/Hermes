@@ -2386,6 +2386,35 @@ class TestAuxiliaryTaskExtraBody:
             "thinking": {"type": "disabled"}, "metadata": {"user_id": "u1"},
         }
 
+    def test_anthropic_aux_strips_response_format(self):
+        """#85624: response_format must never reach the Messages API.
+
+        It is an OpenAI chat.completions-only field. Bedrock rejects unknown
+        body keys with 'response_format: Extra inputs are not permitted',
+        which made every title_generation call fail on Bedrock/Anthropic.
+        """
+        api_kwargs = self._run_anthropic_adapter(
+            call_extra_body={
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "session_title", "strict": True},
+                },
+            },
+        )
+        # Nothing survived, so no extra_body should be attached at all.
+        assert "response_format" not in (api_kwargs.get("extra_body") or {})
+        assert "extra_body" not in api_kwargs
+
+    def test_anthropic_aux_strips_response_format_keeps_siblings(self):
+        """Stripping response_format must not drop legitimate vendor fields."""
+        api_kwargs = self._run_anthropic_adapter(
+            call_extra_body={
+                "response_format": {"type": "json_object"},
+                "metadata": {"user_id": "u1"},
+            },
+        )
+        assert api_kwargs["extra_body"] == {"metadata": {"user_id": "u1"}}
+
 
 
 

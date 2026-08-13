@@ -1945,6 +1945,16 @@ class AsyncCodexAuxiliaryClient:
         self._real_client = sync_wrapper._real_client
 
 
+# Caller-supplied ``extra_body`` keys that must never reach the Anthropic
+# Messages API. These are OpenAI chat.completions request fields with no
+# Messages-API equivalent; strict endpoints (Bedrock) reject unknown body keys
+# outright rather than ignoring them, turning a best-effort hint into a hard
+# HTTP 400. ``reasoning`` is additionally translated into the native
+# ``thinking`` field by build_anthropic_kwargs, so forwarding it would
+# double-specify reasoning.
+_ANTHROPIC_UNSUPPORTED_EXTRA_BODY_KEYS = frozenset({"reasoning", "response_format"})
+
+
 class _AnthropicCompletionsAdapter:
     """OpenAI-client-compatible adapter for Anthropic Messages API."""
 
@@ -2045,18 +2055,30 @@ class _AnthropicCompletionsAdapter:
         # form is the documented Anthropic SDK passthrough for non-standard
         # request body keys; merge on top of whatever build_anthropic_kwargs
         # already produced (e.g. fast-mode ``speed``) so call-time settings
-        # survive. Two exclusions:
+        # survive. Three exclusions:
         #   - ``reasoning``: the OpenAI-shaped config dict is TRANSLATED into
         #     the native ``thinking`` field above (build_anthropic_kwargs);
         #     forwarding the raw field alongside would double-specify
         #     reasoning and 400 on strict gateways.
+        #   - ``response_format``: OpenAI chat.completions-only. The Messages
+        #     API expresses structured output through tools/prefill and has no
+        #     such field, so forwarding it is never useful and is actively
+        #     fatal on strict endpoints — Bedrock rejects unknown body keys
+        #     with ``response_format: Extra inputs are not permitted``, which
+        #     made every ``title_generation`` call fail on Bedrock/Anthropic
+        #     (title_generator sends a json_schema format unconditionally).
+        #     Callers already tolerate an unconstrained reply: the title
+        #     prompt demands a bare JSON object and ``_extract_title_text``
+        #     falls back to a loose JSON scan, so dropping the hint degrades
+        #     gracefully instead of failing the request.
         #   - ``_``-prefixed keys: private Hermes plumbing (_reasoning_config
         #     et al.), never wire fields.
         caller_extra_body = kwargs.get("extra_body")
         if caller_extra_body and isinstance(caller_extra_body, dict):
             passthrough = {
                 k: v for k, v in caller_extra_body.items()
-                if k != "reasoning" and not str(k).startswith("_")
+                if k not in _ANTHROPIC_UNSUPPORTED_EXTRA_BODY_KEYS
+                and not str(k).startswith("_")
             }
             if passthrough:
                 existing = anthropic_kwargs.get("extra_body") or {}
