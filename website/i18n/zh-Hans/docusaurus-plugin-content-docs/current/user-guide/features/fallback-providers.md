@@ -47,6 +47,7 @@ fallback_model:
 
 | 提供商 | 值 | 要求 |
 |----------|-------|-------------|
+| AI Gateway | `ai-gateway` | `AI_GATEWAY_API_KEY` |
 | OpenRouter | `openrouter` | `OPENROUTER_API_KEY` |
 | Nous Portal | `nous` | `hermes setup --portal`（全新安装）或 `hermes auth add nous`（OAuth） |
 | OpenAI Codex | `openai-codex` | `hermes model`（ChatGPT OAuth） |
@@ -62,7 +63,6 @@ fallback_model:
 | GMI Cloud | `gmi` | `GMI_API_KEY`（可选：`GMI_BASE_URL`） |
 | StepFun | `stepfun` | `STEPFUN_API_KEY`（可选：`STEPFUN_BASE_URL`） |
 | Ollama Cloud | `ollama-cloud` | `OLLAMA_API_KEY` |
-| Google Gemini（OAuth） | `google-gemini-cli` | `hermes model`（Google OAuth；可选：`HERMES_GEMINI_PROJECT_ID`） |
 | Google AI Studio | `gemini` | `GOOGLE_API_KEY`（别名：`GEMINI_API_KEY`） |
 | xAI（Grok） | `xai`（别名 `grok`） | `XAI_API_KEY`（可选：`XAI_BASE_URL`） |
 | xAI Grok OAuth（SuperGrok） | `xai-oauth`（别名 `grok-oauth`） | `hermes model` → xAI Grok OAuth（浏览器登录；需 SuperGrok 订阅） |
