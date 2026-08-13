@@ -190,6 +190,30 @@ def agent_env():
                 del sys.modules[name]
         sys.modules.update(_purged)
 
+        # Restoring sys.modules is NOT enough. `import a.b as x` binds the
+        # PARENT PACKAGE ATTRIBUTE, while `from a.b import y` reads
+        # sys.modules. The fresh import above rebound agent.file_safety (and
+        # every other submodule) on the `agent` package object, so leaving
+        # those in place hands one caller the restored module and the other the
+        # fresh one — two live copies of the same module.
+        #
+        # That is exactly how test_file_safety_credentials failed: its fixture
+        # patched _hermes_home_path on the package-attribute copy while the
+        # code under test read the sys.modules copy, so a credential-block
+        # assertion saw an unpatched guard. Measured 2026-08-13; the symptom
+        # only appears once another file (test_file_safety) has also imported
+        # the module, which is why it read as a two-file interaction.
+        for name, module in _purged.items():
+            parent_name, _, child = name.rpartition(".")
+            if not parent_name:
+                continue
+            parent = sys.modules.get(parent_name)
+            if parent is not None and getattr(parent, child, None) is not module:
+                try:
+                    setattr(parent, child, module)
+                except Exception:
+                    pass
+
 
 def _tool_results(handler) -> list[str]:
     out = []
