@@ -439,3 +439,130 @@ def test_job_listing_exposes_latest_execution(monkeypatch, tmp_path):
     listed = jobs.list_jobs(include_disabled=True)
     assert listed[0]["latest_execution"]["id"] == record["id"]
     assert listed[0]["latest_execution"]["status"] == "running"
+
+
+def _backdate_running_row(executions, record, source="direct", pid_alive=False):
+    """Insert a stale, dead-owner running row exactly like the fleet-analyst
+    85bc89e5241f breach: source=direct, status=running, started_at >2h ago,
+    owner pid provably dead (process_started_at mismatch so _owner_is_live is
+    False even though the pid number may belong to the live test process).
+
+    The row's ``process_id`` is set to a foreign value (not this process's
+    ``_PROCESS_ID``) — reproducing the real gap where the owner was a *different*
+    gateway process that died, so the per-tick terminalizer (which skips
+    ``_PROCESS_ID``) actually has to evaluate it.
+    """
+    import sqlite3
+    from cron.executions import _process_start_time
+
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            """UPDATE executions SET source=?, status='running',
+               started_at=datetime('now','-3 hours'),
+               finished_at=NULL,
+               pid=?, process_started_at=?, process_id='a-dead-gateway'
+               WHERE id=?""",
+            (
+                source,
+                os.getpid(),
+                -1 if not pid_alive else _process_start_time(os.getpid()),
+                record["id"],
+            ),
+        )
+    return executions.list_executions(job_id=record["job_id"])[0]
+
+
+def test_stale_source_direct_running_row_terminalized_by_sweep(monkeypatch, tmp_path):
+    """RED->GREEN for t_84b68726: a stale source=direct running row whose owner
+    pid is dead must be terminalized by the per-tick sweep — closing the class
+    that recover_interrupted_executions() at startup alone misses when the row
+    was created after the last restart."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("fleet-analyst-job", source="direct")
+    executions.mark_execution_running(record["id"])
+    stale = _backdate_running_row(executions, record)
+    assert stale["status"] == "running"
+    assert stale["finished_at"] is None
+
+    changed = executions.terminalize_stale_executions()
+    assert changed == 1
+    after = executions.latest_execution("fleet-analyst-job")
+    assert after["status"] == "unknown"
+    assert after["finished_at"]
+    assert "stale source=direct" in (after["error"] or "")
+
+
+def test_young_source_direct_running_row_not_terminalized(monkeypatch, tmp_path):
+    """Bound the sweep: a running row that started <2h ago is left alone —
+    the terminalizer must not reclaim a legitimately-still-running job."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("fresh-direct", source="direct")
+    executions.mark_execution_running(record["id"])
+    # started_at is now (just set), so under the 2h floor; owner pid is the
+    # live test process so _owner_is_live is True as well — both guards hold.
+    assert executions.terminalize_stale_executions() == 0
+    assert executions.latest_execution("fresh-direct")["status"] == "running"
+
+
+def test_terminalizer_skips_live_remote_owner(monkeypatch, tmp_path):
+    """A stale-running row whose owner pid is genuinely alive (matching
+    start-time) must NOT be terminalized — the sweep only fires on provably-dead
+    owners, never on a live pid on another box."""
+    import sqlite3
+    from cron.executions import _process_start_time
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("live-owner-job", source="direct")
+    pid = os.getpid()
+    start = _process_start_time(pid)
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            """UPDATE executions SET status='running',
+               started_at=datetime('now','-3 hours'),
+               finished_at=NULL,
+               pid=?, process_started_at=?, process_id=?
+               WHERE id=?""",
+            (pid, start, "a-different-gateway", record["id"]),
+        )
+    assert executions.terminalize_stale_executions() == 0
+    assert executions.latest_execution("live-owner-job")["status"] == "running"
+
+
+def test_terminalized_row_is_probe_visible_and_idempotent(monkeypatch, tmp_path):
+    """The terminalizer increments the probe-visible counter and is idempotent:
+    re-running the sweep on the now-terminal row is a no-op (0)."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    # counter is module-global and accumulates across tests in-process — reset
+    # so the assertion is about THIS call, not prior tests' terminalizations.
+    executions._stale_terminalized_counter = 0
+    record = executions.create_execution("probe-job", source="direct")
+    executions.mark_execution_running(record["id"])
+    _backdate_running_row(executions, record)
+
+    assert executions.terminalize_stale_executions() == 1
+    assert executions.stale_terminalized_count() == 1
+    # Idempotency: the row is now 'unknown', the sweep must not re-touch it.
+    assert executions.terminalize_stale_executions() == 0
+    assert executions.stale_terminalized_count() == 1
+    stats = executions.stale_terminalization_stats()
+    assert stats["terminalized"] == 1
+    assert len(stats["recent_terminalizations"]) == 1
+    rec = stats["recent_terminalizations"][0]
+    # content-free probe: opaque job_key, no raw pid/job_id leak
+    assert rec["job_key"].startswith("sha256:")
+    assert "job_id" not in rec
+    assert "pid" not in rec
+
+
+def test_recovery_alone_does_not_close_post_restart_row(monkeypatch, tmp_path):
+    """RED-first invariant: recover_interrupted_executions() is only invoked at
+    gateway restart, so it cannot be what closes a row created after the last
+    restart. The per-tick terminalizer is the independent closer of the class
+    (it succeeds where recovery-at-startup is structurally absent between
+    restarts)."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("post-restart-row", source="direct")
+    executions.mark_execution_running(record["id"])
+    _backdate_running_row(executions, record)
+    assert executions.terminalize_stale_executions() == 1
+    assert executions.latest_execution("post-restart-row")["status"] == "unknown"

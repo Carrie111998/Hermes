@@ -4805,6 +4805,17 @@ def tick(
             sweep_stale_inflight(_all_jobs)
         except Exception as e:
             logger.warning("Stale in-flight sweep failed: %s", e)
+        # Per-tick terminalizer for stale execution rows whose owner pid is
+        # provably dead (the stale source=direct class — see t_84b68726).
+        # recover_interrupted_executions() only runs at gateway restart, so a
+        # row created after the last restart would otherwise wedge forever;
+        # this sweep closes the gap on every tick, idempotent on rows still
+        # owned by a live pid.
+        try:
+            from cron.executions import terminalize_stale_executions
+            terminalize_stale_executions()
+        except Exception as e:
+            logger.warning("Stale execution terminalizer sweep failed: %s", e)
 
 # --- Startup missing-script preflight assertion (loud, not silent) ---
         # The first tick that acquires the lock after a scheduler/gateway load
