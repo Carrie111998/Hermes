@@ -528,6 +528,34 @@ def _notify_session_boundary(
         pass
 
 
+def _notify_pending_session_reset(
+    old_session_id: str, new_session_id: str
+) -> None:
+    """Emit an explicit rotation reset after the old session is finalized."""
+    pending = None
+    with _sessions_lock:
+        for session in _sessions.values():
+            if (
+                session.get("session_key") == new_session_id
+                and session.get("boundary_old_session_id") == old_session_id
+                and session.pop("boundary_reset_pending", False)
+            ):
+                session["boundary_reset_emitted"] = True
+                pending = session
+                break
+    if pending is None:
+        return
+    _notify_session_boundary(
+        "on_session_reset",
+        new_session_id,
+        _session_source(pending),
+        reason=pending.get("boundary_reason"),
+        old_session_id=old_session_id,
+        new_session_id=new_session_id,
+        cwd=str(pending.get("boundary_cwd") or ""),
+    )
+
+
 def _claim_active_session_slot(
     session_key: str,
     *,
@@ -764,6 +792,13 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
             else (_persisted_session_cwd(session) or "")
         ),
     )
+    if session.get("boundary_old_session_id") and session.get(
+        "boundary_new_session_id"
+    ):
+        _notify_pending_session_reset(
+            str(session["boundary_old_session_id"]),
+            str(session["boundary_new_session_id"]),
+        )
 
     # Mark session ended in DB so it doesn't linger as a ghost row in /resume.
     # Use session_id (from agent.session_id) not session_key — after compression,
@@ -2321,19 +2356,22 @@ def _start_agent_build(sid: str, session: dict) -> None:
             with _sessions_lock:
                 if sid in _sessions:
                     _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
-            _notify_session_boundary(
-                "on_session_reset",
-                key,
-                _session_source(current),
-                reason=current.get("boundary_reason"),
-                old_session_id=current.get("boundary_old_session_id"),
-                new_session_id=key if current.get("boundary_old_session_id") else None,
-                cwd=(
-                    str(current.get("boundary_cwd") or "")
-                    if "boundary_cwd" in current
-                    else (_persisted_session_cwd(current) or "")
-                ),
-            )
+            if not current.get("boundary_reset_pending") and not current.get(
+                "boundary_reset_emitted"
+            ):
+                _notify_session_boundary(
+                    "on_session_reset",
+                    key,
+                    _session_source(current),
+                    reason=current.get("boundary_reason"),
+                    old_session_id=current.get("boundary_old_session_id"),
+                    new_session_id=key if current.get("boundary_old_session_id") else None,
+                    cwd=(
+                        str(current.get("boundary_cwd") or "")
+                        if "boundary_cwd" in current
+                        else (_persisted_session_cwd(current) or "")
+                    ),
+                )
 
             info = _session_info(agent, current)
             cfg_warn = _probe_config_health(_load_cfg())
@@ -6847,19 +6885,22 @@ def _init_session(
         if sid in _sessions:
             _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
     _reset_session = _sessions.get(sid, {})
-    _notify_session_boundary(
-        "on_session_reset",
-        key,
-        _session_source(_reset_session),
-        reason=_reset_session.get("boundary_reason"),
-        old_session_id=_reset_session.get("boundary_old_session_id"),
-        new_session_id=key if _reset_session.get("boundary_old_session_id") else None,
-        cwd=(
-            str(_reset_session.get("boundary_cwd") or "")
-            if "boundary_cwd" in _reset_session
-            else (_persisted_session_cwd(_reset_session) or "")
-        ),
-    )
+    if not _reset_session.get("boundary_reset_pending") and not _reset_session.get(
+        "boundary_reset_emitted"
+    ):
+        _notify_session_boundary(
+            "on_session_reset",
+            key,
+            _session_source(_reset_session),
+            reason=_reset_session.get("boundary_reason"),
+            old_session_id=_reset_session.get("boundary_old_session_id"),
+            new_session_id=key if _reset_session.get("boundary_old_session_id") else None,
+            cwd=(
+                str(_reset_session.get("boundary_cwd") or "")
+                if "boundary_cwd" in _reset_session
+                else (_persisted_session_cwd(_reset_session) or "")
+            ),
+        )
     _emit("session.info", sid, _session_info(agent, _sessions.get(sid, {})))
     _schedule_mcp_late_refresh(sid, agent)
 

@@ -3757,6 +3757,10 @@ def test_explicit_session_rotation_emits_transition_and_cwd(monkeypatch, tmp_pat
             },
         )
         assert closed["result"]["closed"] is True
+        assert [c[0] for c in calls] == [
+            "on_session_finalize",
+            "on_session_reset",
+        ]
         finalize = next(c for c in calls if c[0] == "on_session_finalize")
         assert finalize[1] == "stored-old"
         assert finalize[3] == {
@@ -3765,6 +3769,9 @@ def test_explicit_session_rotation_emits_transition_and_cwd(monkeypatch, tmp_pat
             "new_session_id": new_stored,
             "cwd": str(tmp_path),
         }
+        reset = next(c for c in calls if c[0] == "on_session_reset")
+        assert reset[1] == new_stored
+        assert reset[3] == finalize[3]
     finally:
         server._sessions.pop(new_runtime, None)
 
