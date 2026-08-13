@@ -14442,9 +14442,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         store, allow-all flags — stays the single source of truth.
 
         ``profile_name`` binds the callback to the secondary adapter's own
-        multiplex profile, so its ``SessionSource`` resolves that profile's
-        secret scope instead of falling back to the active profile.
+        multiplex profile. Adapter callbacks can run before the scoped message
+        handler (Signal read receipts do), so capture only the owning profile's
+        home here and rebuild its secret scope for each authorization check.
+        This keeps long-lived listener tasks from retaining a stale connect-time
+        allowlist while leaving single-profile and other primary adapters on
+        their legacy environment path.
         """
+        auth_profile_home: Optional[Path] = None
+        if (
+            platform == Platform.SIGNAL
+            and getattr(self.config, "multiplex_profiles", False)
+        ):
+            try:
+                if profile_name:
+                    from hermes_cli.profiles import get_profile_dir
+
+                    auth_profile_home = get_profile_dir(profile_name)
+                else:
+                    # The primary Signal adapter owns the process runner's
+                    # home. Do not resolve its display name through
+                    # get_profile_dir(): custom HERMES_HOME paths are reported
+                    # as the synthetic profile name "custom".
+                    auth_profile_home = Path(get_hermes_home())
+            except Exception:
+                # Match the existing profile-handler factory: a path-resolution
+                # failure preserves the legacy callback rather than disabling
+                # adapter authorization globally.
+                auth_profile_home = None
+
         def check(
             user_id: str,
             chat_type: Optional[str] = None,
@@ -14459,6 +14485,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_id=user_id,
                 profile=profile_name,
             )
+            if auth_profile_home is not None:
+                with _profile_runtime_scope(auth_profile_home):
+                    return self._is_user_authorized(source)
             return self._is_user_authorized(source)
         return check
 

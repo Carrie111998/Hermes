@@ -412,18 +412,22 @@ class TestSignalReadReceipts:
         ],
     )
     def test_secondary_receipt_auth_does_not_borrow_primary_env(
-        self, monkeypatch, primary_env, primary_value
+        self, monkeypatch, tmp_path, primary_env, primary_value
     ):
-        """A scoped multiplex auth miss must not fall back to another profile."""
+        """The callback installs its owner scope instead of borrowing primary env."""
         from agent.secret_scope import (
-            reset_secret_scope,
             set_multiplex_active,
-            set_secret_scope,
         )
         from gateway.config import GatewayConfig
         from gateway.run import GatewayRunner
 
         monkeypatch.setenv(primary_env, primary_value)
+        profile_home = tmp_path / "work"
+        profile_home.mkdir()
+        (profile_home / ".env").write_text(
+            "UNRELATED=secondary-only\n",
+            encoding="utf-8",
+        )
         adapter = _make_signal_adapter(monkeypatch, send_read_receipts=True)
         runner = object.__new__(GatewayRunner)
         runner.config = GatewayConfig(multiplex_profiles=True)
@@ -436,21 +440,143 @@ class TestSignalReadReceipts:
         runner.pairing_stores["work"].is_approved.return_value = False
         adapter.gateway_runner = runner
         adapter._signal_transport_profile_name = "work"
-        adapter.set_authorization_check(
-            runner._make_adapter_auth_check(
-                Platform.SIGNAL,
-                profile_name="work",
+        with patch(
+            "hermes_cli.profiles.get_profile_dir",
+            return_value=profile_home,
+        ):
+            adapter.set_authorization_check(
+                runner._make_adapter_auth_check(
+                    Platform.SIGNAL,
+                    profile_name="work",
+                )
             )
-        )
 
         event = _make_receipt_event(adapter)
         set_multiplex_active(True)
-        scope_token = set_secret_scope({"UNRELATED": "secondary-only"})
         try:
             assert adapter._read_receipt_target(event) is None
         finally:
-            reset_secret_scope(scope_token)
             set_multiplex_active(False)
+
+    @pytest.mark.parametrize(
+        ("stale_env", "stale_value"),
+        [
+            ("SIGNAL_ALLOWED_USERS", "+15551239999"),
+            ("SIGNAL_ALLOW_ALL_USERS", "true"),
+            ("GATEWAY_ALLOWED_USERS", "+15551239999"),
+            ("GATEWAY_ALLOW_ALL_USERS", "true"),
+        ],
+    )
+    def test_primary_receipt_auth_does_not_borrow_stale_process_env(
+        self, monkeypatch, tmp_path, stale_env, stale_value
+    ):
+        """Primary receipt auth reloads the active profile before ingress auth."""
+        from agent.secret_scope import set_multiplex_active
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setenv(stale_env, stale_value)
+        profile_home = tmp_path / "custom-hermes-home"
+        profile_home.mkdir()
+        (profile_home / ".env").write_text(
+            "SIGNAL_ALLOWED_USERS=someone-else\n",
+            encoding="utf-8",
+        )
+        adapter = _make_signal_adapter(monkeypatch, send_read_receipts=True)
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.adapters = {Platform.SIGNAL: adapter}
+        runner._profile_adapters = {}
+        runner.pairing_store = MagicMock()
+        runner.pairing_store.is_approved.return_value = False
+        runner.pairing_stores = {}
+        adapter.gateway_runner = runner
+
+        with patch("gateway.run.get_hermes_home", return_value=profile_home):
+            adapter.set_authorization_check(
+                runner._make_adapter_auth_check(Platform.SIGNAL)
+            )
+
+        set_multiplex_active(True)
+        try:
+            assert adapter._read_receipt_target(_make_receipt_event(adapter)) is None
+        finally:
+            set_multiplex_active(False)
+
+    def test_primary_receipt_auth_reloads_live_profile_allowlist(
+        self, monkeypatch, tmp_path
+    ):
+        """A listener callback sees allowlist grants and revocations after connect."""
+        from agent.secret_scope import set_multiplex_active
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+
+        for key in (
+            "SIGNAL_ALLOWED_USERS",
+            "SIGNAL_ALLOW_ALL_USERS",
+            "GATEWAY_ALLOWED_USERS",
+            "GATEWAY_ALLOW_ALL_USERS",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        profile_home = tmp_path / "custom-hermes-home"
+        profile_home.mkdir()
+        env_path = profile_home / ".env"
+        env_path.write_text(
+            "SIGNAL_ALLOWED_USERS=+15551239999\n",
+            encoding="utf-8",
+        )
+        adapter = _make_signal_adapter(monkeypatch, send_read_receipts=True)
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.adapters = {Platform.SIGNAL: adapter}
+        runner._profile_adapters = {}
+        runner.pairing_store = MagicMock()
+        runner.pairing_store.is_approved.return_value = False
+        runner.pairing_stores = {}
+        adapter.gateway_runner = runner
+
+        with patch("gateway.run.get_hermes_home", return_value=profile_home):
+            adapter.set_authorization_check(
+                runner._make_adapter_auth_check(Platform.SIGNAL)
+            )
+
+        event = _make_receipt_event(adapter)
+        set_multiplex_active(True)
+        try:
+            assert adapter._read_receipt_target(event) == (
+                "05668cf3-8ffa-467e-9b24-f5eefa5cf475",
+                1777600696077,
+            )
+            env_path.write_text(
+                "SIGNAL_ALLOWED_USERS=someone-else\n",
+                encoding="utf-8",
+            )
+            assert adapter._read_receipt_target(event) is None
+        finally:
+            set_multiplex_active(False)
+
+    def test_single_profile_receipt_auth_keeps_process_env(self, monkeypatch):
+        """The legacy single-profile environment contract is unchanged."""
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setenv("SIGNAL_ALLOWED_USERS", "+15551239999")
+        adapter = _make_signal_adapter(monkeypatch, send_read_receipts=True)
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=False)
+        runner.adapters = {Platform.SIGNAL: adapter}
+        runner._profile_adapters = {}
+        runner.pairing_store = MagicMock()
+        runner.pairing_store.is_approved.return_value = False
+        adapter.gateway_runner = runner
+        adapter.set_authorization_check(
+            runner._make_adapter_auth_check(Platform.SIGNAL)
+        )
+
+        assert adapter._read_receipt_target(_make_receipt_event(adapter)) == (
+            "05668cf3-8ffa-467e-9b24-f5eefa5cf475",
+            1777600696077,
+        )
 
     @pytest.mark.asyncio
     async def test_note_to_self_is_not_acknowledged(self, monkeypatch):
