@@ -1,6 +1,7 @@
 """Tests for hermes_cli.doctor."""
 
 import os
+import shutil
 import sys
 import types
 import io
@@ -59,6 +60,43 @@ def _fake_install_probe(names, entrypoints, python=None, env=None):
     }
 
 
+_WHICH_MEMO: dict = {}
+
+
+def _memoizing_which(delegate):
+    """Wrap ``shutil.which`` in a memo keyed on every input it actually reads.
+
+    ``which`` is a pure function of ``(cmd, mode, path, $PATH, $PATHEXT, cwd)``
+    -- on Windows it walks ``$PATH`` crossed with ``$PATHEXT`` and stats each
+    candidate, plus the current directory. Measured here at ~19ms a call, and
+    ``run_doctor`` makes ~25 of them per invocation (``_safe_which`` alone:
+    335 calls / 6.29s across this file), so it was ~0.5s on every full-run
+    test -- pure host probing that no test asserts on.
+
+    The key carries the full input tuple, so this is a memo and not a stub:
+    the tests that blank ``PATH`` to make a lookup fail (see
+    ``TestGitHubTokenCheck``) get their own cache entry and the real answer.
+    Tests that patch ``shutil.which`` themselves still win -- their
+    ``monkeypatch`` runs after this autouse fixture.
+
+    *delegate* is read from ``shutil`` at fixture time rather than captured at
+    import, and is part of the cache key, so if anything ever installs its own
+    session-scoped ``which`` this memo serves that function's answers instead
+    of silently bypassing it.
+    """
+
+    def _which(cmd, mode=os.F_OK | os.X_OK, path=None):
+        key = (
+            delegate, cmd, mode, path,
+            os.environ.get("PATH"), os.environ.get("PATHEXT"), os.getcwd(),
+        )
+        if key not in _WHICH_MEMO:
+            _WHICH_MEMO[key] = delegate(cmd, mode=mode, path=path)
+        return _WHICH_MEMO[key]
+
+    return _which
+
+
 def _fast_agent_browser_runnable(path):
     """``hermes_constants.agent_browser_runnable`` minus the ``--version`` spawn.
 
@@ -94,6 +132,14 @@ def _stub_doctor_externals(request, monkeypatch):
     Classes that deliberately exercise the real gh probe opt out by setting
     ``exercises_real_gh_probe = True`` (see ``TestGitHubTokenCheck``).
 
+    The ``shutil.which`` memo is deliberately NOT mirrored into
+    ``tests/hermes_cli/conftest_doctor_externals.py``, which otherwise carries
+    the same three stubs. It should help every sibling module that calls
+    ``run_doctor`` (they pay the same ~25 lookups per invocation), but that was
+    not measured here and this helper's own docstring records a sibling-wide
+    refactor that had to be reverted -- so it stays local until someone A/Bs
+    the siblings.
+
     It also stubs ``model_tools`` in ``sys.modules``. ``run_doctor`` only wants
     ``check_tool_availability``/``TOOLSET_REQUIREMENTS`` from it, behind a
     ``try/except`` that degrades to "Could not check tool availability", and no
@@ -120,6 +166,7 @@ def _stub_doctor_externals(request, monkeypatch):
 
     monkeypatch.setattr(_install_doctor, "doctor_section_lines", _stubbed_section_lines)
     monkeypatch.setattr(doctor_mod, "agent_browser_runnable", _fast_agent_browser_runnable)
+    monkeypatch.setattr(shutil, "which", _memoizing_which(shutil.which))
 
     if not getattr(request.instance, "exercises_real_gh_probe", False):
         monkeypatch.setattr(doctor_mod, "_gh_authenticated", lambda: False)
@@ -2158,7 +2205,27 @@ class TestNpmAuditIsOptIn:
     they moved behind `--audit`. A dropped check must still be *visible*.
     """
 
-    def _run(self, monkeypatch, args):
+    def _run(self, monkeypatch, tmp_path, args):
+        # Point doctor at a temp HERMES_HOME. ``run_doctor`` reads the
+        # module-level ``HERMES_HOME`` constant (cached at import time), not
+        # the env var, so without this these two tests probed the developer's
+        # REAL ~/.hermes -- and its state.db, which on this box is 5.1 GB. The
+        # health probe then ran to its full 5s budget and raised
+        # StateDbProbeTimeout, making these the two slowest items in the file
+        # (6.29s and 6.22s against a 30s per-test cap, versus a 1.08s median).
+        # Same hazard TestGitHubTokenCheck._isolate_home documents; nothing
+        # here asserts on the state.db section.
+        #
+        # PROJECT_ROOT is deliberately NOT isolated: the npm audit targets are
+        # resolved from it, and pointing it at an empty tmp dir would make
+        # ``test_audit_flag_runs_them_with_the_on_demand_budget`` skip
+        # unconditionally instead of asserting on a real target list.
+        home = tmp_path / ".hermes"
+        home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
         audited = []
         monkeypatch.setattr(
             doctor_mod,
@@ -2170,14 +2237,14 @@ class TestNpmAuditIsOptIn:
             doctor_mod.run_doctor(args)
         return buf.getvalue(), audited
 
-    def test_default_run_skips_the_audits_but_says_so(self, monkeypatch):
-        out, audited = self._run(monkeypatch, Namespace(fix=False))
+    def test_default_run_skips_the_audits_but_says_so(self, monkeypatch, tmp_path):
+        out, audited = self._run(monkeypatch, tmp_path, Namespace(fix=False))
 
         assert audited == [], "a default `hermes doctor` must not run npm audit"
         assert "hermes doctor --audit" in out, "the skip must be discoverable"
 
-    def test_audit_flag_runs_them_with_the_on_demand_budget(self, monkeypatch):
-        _, audited = self._run(monkeypatch, Namespace(fix=False, audit=True))
+    def test_audit_flag_runs_them_with_the_on_demand_budget(self, monkeypatch, tmp_path):
+        _, audited = self._run(monkeypatch, tmp_path, Namespace(fix=False, audit=True))
 
         if not audited:
             pytest.skip("no npm on PATH / no node_modules in this checkout")
