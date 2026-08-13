@@ -2515,9 +2515,12 @@ def _manage_thinking_signatures(
     stripping, message merging) invalidates the signature, causing HTTP 400
     "Invalid signature in thinking block".
 
-    Signatures are Anthropic-proprietary.  Third-party endpoints (MiniMax,
-    Azure AI Foundry, AWS Bedrock, self-hosted proxies) cannot validate them
-    and will reject them outright.  Kimi's /coding and DeepSeek's /anthropic
+    Signatures are Anthropic-proprietary.  Third-party endpoints (Azure AI
+    Foundry, AWS Bedrock, self-hosted proxies) cannot validate them and will
+    reject them outright.  MiniMax's Anthropic-compatible endpoints accept
+    their own signed thinking blocks back verbatim (interleaved thinking), so
+    they take the replay-as-is path below rather than being stripped.  Kimi's
+    /coding and DeepSeek's /anthropic
     endpoints speak the Anthropic protocol upstream but require unsigned
     thinking blocks (synthesised from ``reasoning_content``) to round-trip on
     replayed assistant tool-call messages.  See hermes-agent#13848 (Kimi) and
@@ -2553,6 +2556,13 @@ def _manage_thinking_signatures(
         if _is_kimi_family_endpoint(base_url, model):
             # Kimi does not enforce thinking signatures — replay as-is
             # (shared cleanup below still strips cache markers + the internal flag).
+            pass
+        elif _is_minimax_anthropic_endpoint(base_url):
+            # MiniMax is an interleaved-thinking model: it signs its thinking
+            # blocks and accepts them back verbatim on replayed assistant turns.
+            # Stripping them here loses the prior round's reasoning and measurably
+            # degrades agentic performance. Replay as-is (shared cleanup below
+            # still strips cache markers + the internal flag). See hermes-agent#85251.
             pass
         elif _is_deepseek_anthropic_endpoint(base_url):
             # DeepSeek: strip signed, preserve unsigned.
