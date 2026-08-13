@@ -2329,15 +2329,22 @@ function resolveGitBinary() {
   const localAppData = process.env.LOCALAPPDATA || ''
   const candidates = []
 
+  // Prefer the real `bin\git.exe` over the `cmd\git.exe` shim: the shim
+  // re-execs the real git in a fresh console, which flashes a visible window
+  // on Windows even when the spawn passed `windowsHide`. The real binary
+  // honours the hidden-console flag, so it must come first.
   if (localAppData) {
-    candidates.push(path.join(localAppData, 'hermes', 'git', 'cmd', 'git.exe'))
     candidates.push(path.join(localAppData, 'hermes', 'git', 'bin', 'git.exe'))
+    candidates.push(path.join(localAppData, 'hermes', 'git', 'cmd', 'git.exe'))
   }
 
+  candidates.push(path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Git', 'bin', 'git.exe'))
   candidates.push(path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Git', 'cmd', 'git.exe'))
+  candidates.push(path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Git', 'bin', 'git.exe'))
   candidates.push(path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Git', 'cmd', 'git.exe'))
 
   if (localAppData) {
+    candidates.push(path.join(localAppData, 'Programs', 'Git', 'bin', 'git.exe'))
     candidates.push(path.join(localAppData, 'Programs', 'Git', 'cmd', 'git.exe'))
   }
 
