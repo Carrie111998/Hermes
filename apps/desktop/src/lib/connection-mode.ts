@@ -17,6 +17,7 @@
  */
 
 import type { HermesConnection } from '@/global'
+import { $connection } from '@/store/session'
 
 export type HermesConnectionMode = 'local' | 'remote'
 
@@ -63,4 +64,17 @@ export function withConnectionMode(
   }
 
   return { ...params, connection_mode: mode }
+}
+
+/**
+ * The one announcement helper every gateway-request door shares.
+ *
+ * Reads the live `$connection` at CALL time (so a retry announces the mode of
+ * the connection it actually lands on) and stamps it via `withConnectionMode`.
+ * Both `useGatewayRequest` (app/hook callers) and the plugin SDK's
+ * `host.request` go through here — a request door that skips it lets a plugin
+ * drive a Desktop session whose skills/MCP context never learns the mode.
+ */
+export function announceConnectionMode(method: string, params: Record<string, unknown>): Record<string, unknown> {
+  return withConnectionMode(method, params, resolveConnectionMode($connection.get()))
 }

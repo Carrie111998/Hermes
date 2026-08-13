@@ -26,6 +26,7 @@ import type { ClientSessionState } from '@/app/types'
 import { $narrowViewport } from '@/components/pane-shell/tree/store'
 import { onGatewayEvent } from '@/contrib/events'
 import { deleteProfile, getLogs, getStatus, type HermesGateway } from '@/hermes'
+import { announceConnectionMode } from '@/lib/connection-mode'
 import {
   $gateway,
   openGatewayForAgent,
@@ -401,7 +402,10 @@ export const host = {
   ): Promise<T> => requestPluginProfile<T>(route, method, params),
 
   /** Gateway JSON-RPC — sessions, config, skills, cron, kanban, everything
-   *  the app itself uses. Lazy: resolves the LIVE socket per call. */
+   *  the app itself uses. Lazy: resolves the LIVE socket per call. Session and
+   *  prompt RPCs announce the live Desktop connection mode through the same
+   *  helper `useGatewayRequest` uses, so a plugin-driven session's skills/MCP
+   *  context sees the mode a hook-driven one would (#82140). */
   request: async <T>(method: string, params: Record<string, unknown> = {}): Promise<T> => {
     const gateway = $gateway.get()
 
@@ -409,7 +413,7 @@ export const host = {
       throw new Error('Hermes gateway unavailable')
     }
 
-    return gateway.request<T>(method, params)
+    return gateway.request<T>(method, announceConnectionMode(method, params))
   },
 
   /** The LIVE gateway instance for the active profile (null before the first

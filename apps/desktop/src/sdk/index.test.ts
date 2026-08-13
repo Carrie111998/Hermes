@@ -1,8 +1,15 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import type { HermesConnection } from '@/global'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { host } from '@/sdk'
-import { setActiveSessionId, setAwaitingResponse, setBusy } from '@/store/session'
+import { $gateway } from '@/store/gateway'
+import {
+  setActiveSessionId,
+  setAwaitingResponse,
+  setBusy,
+  setConnection
+} from '@/store/session'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 
 describe('host.state turn flags', () => {
@@ -105,5 +112,67 @@ describe('host.state turn flags', () => {
     expect(host.state.awaitingResponse.get()).toBe(false)
 
     $sessionTiles.set([])
+  })
+})
+
+/**
+ * The plugin SDK's `host.request` door must announce the Desktop connection
+ * mode on session/prompt RPCs exactly like `useGatewayRequest` does — it used
+ * to send straight through `$gateway.get().request()`, letting a runtime
+ * plugin create or drive a session whose skills/MCP context never learned the
+ * mode (#82187 follow-up review, item 3).
+ */
+
+const conn = (mode?: 'local' | 'remote') =>
+  ({ baseUrl: 'http://127.0.0.1:8787', mode }) as unknown as HermesConnection
+
+describe('host.request connection-mode announcement', () => {
+  afterEach(() => {
+    $gateway.set(null as never)
+    setConnection(null)
+  })
+
+  const installGateway = () => {
+    const request = vi.fn().mockResolvedValue('ok')
+    $gateway.set({ request } as never)
+
+    return request
+  }
+
+  it.each(['session.create', 'session.resume', 'prompt.submit'])(
+    'stamps the live mode onto %s',
+    async method => {
+      setConnection(conn('remote'))
+      const request = installGateway()
+
+      await expect(host.request(method, { text: 'hi' })).resolves.toBe('ok')
+      expect(request).toHaveBeenCalledWith(method, { connection_mode: 'remote', text: 'hi' })
+    }
+  )
+
+  it('leaves unrelated RPCs untouched', async () => {
+    setConnection(conn('remote'))
+    const request = installGateway()
+    const params = { limit: 3 }
+
+    await host.request('session.list', params)
+
+    expect(request).toHaveBeenCalledWith('session.list', params)
+  })
+
+  it('adds no key when the mode is unknown', async () => {
+    // Null descriptor (reconnect window / older shell): omit rather than
+    // clear, matching withConnectionMode semantics.
+    const request = installGateway()
+
+    await host.request('prompt.submit', { text: 'hi' })
+
+    expect(request).toHaveBeenCalledWith('prompt.submit', { text: 'hi' })
+  })
+
+  it('still throws when no gateway socket is live', async () => {
+    setConnection(conn('remote'))
+
+    await expect(host.request('prompt.submit', {})).rejects.toThrow('Hermes gateway unavailable')
   })
 })

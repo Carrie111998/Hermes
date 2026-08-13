@@ -3,10 +3,10 @@ import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useRef } from 'react'
 
 import type { HermesGateway } from '@/hermes'
-import { resolveConnectionMode, withConnectionMode } from '@/lib/connection-mode'
+import { announceConnectionMode } from '@/lib/connection-mode'
 import { $gateway, ensureActiveGatewayOpen, isActivePrimary } from '@/store/gateway'
 import { $activeGatewayProfile } from '@/store/profile'
-import { $connection, $gatewayState, setConnection } from '@/store/session'
+import { $gatewayState, setConnection } from '@/store/session'
 
 export function useGatewayRequest() {
   const gatewayState = useStore($gatewayState)
@@ -113,11 +113,11 @@ export function useGatewayRequest() {
       }
 
       // Announce the live connection mode on session/prompt RPCs (#82140).
-      // Resolved per attempt, not per call: $connection is kept in lockstep
-      // with the active profile by syncConnectionToActiveProfile and is
-      // rewritten by the reconnect below, so re-reading on the retry sends the
-      // mode of the connection the retry actually lands on.
-      const announce = () => withConnectionMode(method, rawParams, resolveConnectionMode($connection.get()))
+      // Resolved per attempt, not per call: $connection is published in the
+      // same synchronous frame as a profile switch (ensureGatewayProfile) and
+      // is rewritten by the reconnect below, so re-reading on the retry sends
+      // the mode of the connection the retry actually lands on.
+      const announce = () => announceConnectionMode(method, rawParams)
 
       try {
         return await gateway.request<T>(method, announce(), timeoutMs, signal)
