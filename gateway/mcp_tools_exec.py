@@ -324,6 +324,7 @@ def register_execution_tools(mcp: Any) -> None:
         v = validate_path(path)
         if not v["ok"]:
             return {"error": v["error"]}
+        _audit_event({"type": "tool", "action": "execute", "tool": "read_file", "identity": _get_identity(ctx)})
         try:
             data = await asyncio.to_thread(Path(v["path"]).read_text, encoding="utf-8")
             return {"content": data[:_MAX_BUFFER]}
@@ -339,6 +340,7 @@ def register_execution_tools(mcp: Any) -> None:
         v = validate_path(path)
         if not v["ok"]:
             return {"error": v["error"]}
+        _audit_event({"type": "tool", "action": "execute", "tool": "write_file", "identity": _get_identity(ctx)})
         try:
             p = Path(v["path"])
             await asyncio.to_thread(p.parent.mkdir, parents=True, exist_ok=True)
@@ -357,6 +359,7 @@ def register_execution_tools(mcp: Any) -> None:
         v = validate_path(target)
         if not v["ok"]:
             return {"error": v["error"]}
+        _audit_event({"type": "tool", "action": "execute", "tool": "list_files", "identity": _get_identity(ctx)})
         try:
             entries = sorted(
                 Path(v["path"]).iterdir(), key=lambda p: p.name.lower()
@@ -385,6 +388,7 @@ def register_execution_tools(mcp: Any) -> None:
         v = validate_path(target)
         if not v["ok"]:
             return {"error": v["error"]}
+        _audit_event({"type": "tool", "action": "execute", "tool": "search_files", "identity": _get_identity(ctx)})
         results = []
 
         def _walk(root: str) -> None:
@@ -416,6 +420,7 @@ def register_execution_tools(mcp: Any) -> None:
 
         if not url or not re.match(r"^https?://", url, re.I):
             return {"error": "url must be http(s)"}
+        _audit_event({"type": "tool", "action": "execute", "tool": "http_request", "identity": _get_identity(ctx)})
         try:
             import aiohttp
 
@@ -446,6 +451,7 @@ def register_execution_tools(mcp: Any) -> None:
         err = _rate_guard(ctx, "docker_ps")
         if err:
             return err
+        _audit_event({"type": "tool", "action": "execute", "tool": "docker_ps", "identity": _get_identity(ctx)})
         r = await _run_subprocess(
             ["docker", "ps", "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}"],
             15000,
@@ -466,6 +472,7 @@ def register_execution_tools(mcp: Any) -> None:
             return err
         if not name:
             return {"error": "name is required"}
+        _audit_event({"type": "tool", "action": "execute", "tool": "docker_logs", "identity": _get_identity(ctx)})
         r = await _run_subprocess(
             ["docker", "logs", "--tail", str(int(tail or 100)), name], 15000
         )
