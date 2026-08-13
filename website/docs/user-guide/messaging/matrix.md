@@ -232,7 +232,8 @@ curl -X POST 'https://your-server/_matrix/client/v3/login' \
   -H "Content-Type: application/json" \
   -d '{
     "type": "m.login.token",
-    "token": "PASTE_YOUR_LOGIN_TOKEN_HERE"
+    "token": "PASTE_YOUR_LOGIN_TOKEN_HERE",
+    "initial_device_display_name": "Hermes Agent"
   }' 
 ```
 
