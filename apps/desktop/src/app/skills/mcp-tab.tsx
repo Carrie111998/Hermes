@@ -29,6 +29,7 @@ import {
 import { type Translations, useI18n } from '@/i18n'
 import { brandFor, brandGlyphStyle } from '@/lib/mcp-brands'
 import { completeMcpDesktopOAuth } from '@/lib/mcp-dashboard-oauth'
+import { readMcpInputValue } from '@/lib/mcp-input'
 import { countEnabledTools, isToolEnabled, toggleToolInServer } from '@/lib/mcp-tool-filter'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
@@ -1442,12 +1443,13 @@ function McpCatalog({
                         </span>
                         <Input
                           className="h-7 text-xs"
-                          onChange={event =>
+                          onChange={event => {
+                            const value = readMcpInputValue(event)
                             setEnvDrafts(prev => ({
                               ...prev,
-                              [entry.name]: { ...prev[entry.name], [env.name]: event.currentTarget.value }
+                              [entry.name]: { ...prev[entry.name], [env.name]: value }
                             }))
-                          }
+                          }}
                           type="password"
                           value={draft[env.name] ?? ''}
                         />
