@@ -13,6 +13,7 @@ import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import {
   type ComposerAttachment,
   type ComposerDraftSyncMode,
+  markMainComposerDraftScope,
   onComposerDraftSyncRequest,
   reloadPersistedDrafts,
   stashSessionDraft,
@@ -21,6 +22,7 @@ import {
 import { isBrowsingHistory } from '@/store/composer-input-history'
 import { clearDraftSuggestions, sampleComposerDraft } from '@/store/composer-suggestions'
 
+import { markComposerMounted } from '../../hooks/composer-attach-presence'
 import {
   cloneAttachments,
   DRAFT_PERSIST_DEBOUNCE_MS,
@@ -404,10 +406,19 @@ export function useComposerDraft({
     pendingDraftPersistRef.current = null
     draftScopeRef.current = activeQueueSessionKey
 
+    // Publish the MAIN composer's stash key for out-of-page senders
+    // (host.attachFileToComposer): they stage into this session's draft.
+    // Sticky across unmount on purpose — see markMainComposerDraftScope.
+    if (target === 'main') {
+      markMainComposerDraftScope(activeQueueSessionKey)
+    }
+
+    const unmark = markComposerMounted(target)
     const { attachments, text } = takeSessionDraft(activeQueueSessionKey)
     loadIntoComposer(text, attachments)
 
     return () => {
+      unmark()
       const latestText = syncDraftFromEditor()
       const editing = queueEditStateRef.current
 
@@ -423,7 +434,7 @@ export function useComposerDraft({
       // lingers in the map and re-appears stale on the way back.
       clearDraftSuggestions(sessionIdRef.current)
     }
-  }, [activeQueueSessionKey]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [activeQueueSessionKey, target]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // The HUD handoff's two verbs. Entering HUD mode flushes this editor's text
   // into the shared stash so the HUD's composer boots with it; leaving repaints
