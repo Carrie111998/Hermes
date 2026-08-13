@@ -4135,11 +4135,19 @@ class PluginManager:
                 group_eps = [ep for ep in eps if ep.group == ENTRY_POINTS_GROUP]
 
             for ep in group_eps:
+                from hermes_cli.entrypoint_kind import classify_entrypoint
+                kind = classify_entrypoint(ep)
+                # "unknown" → the manager's safe default is standalone: it
+                # owns general plugins, and an unresolvable entry point is
+                # treated as a general plugin (historical behavior).
+                if kind == "unknown":
+                    kind = "standalone"
                 manifest = PluginManifest(
                     name=ep.name,
                     source="entrypoint",
                     path=ep.value,
                     key=ep.name,
+                    kind=kind,
                 )
                 manifests.append(manifest)
         except Exception as exc:
