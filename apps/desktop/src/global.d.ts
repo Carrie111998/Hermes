@@ -70,7 +70,8 @@ declare global {
         open: (request?: { sessionId?: null | string; profile?: null | string }) => Promise<{ ok: boolean }>
         close: () => Promise<{ ok: boolean }>
         setIgnoreMouse: (ignore: boolean) => void
-        moveBy: (delta: { x: number; y: number }) => void
+        moveBy: (delta: { x: number; y: number; width: number; height: number }) => void
+        setBounds: (bounds: { x: number; y: number; width: number; height: number }) => void
         setVibrancy: (on: boolean) => Promise<{ ok: boolean }>
         setSession: (sessionId: null | string) => void
         onGoto: (callback: (sessionId: string) => void) => () => void
@@ -197,6 +198,13 @@ declare global {
       }
       revealLogs: () => Promise<{ ok: boolean; path: string; error?: string }>
       getRecentLogs: () => Promise<{ path: string; lines: string[] }>
+      /** Persist a renderer error-boundary catch to desktop.log (fire-and-forget). */
+      reportRendererError?: (report: {
+        label: string
+        boundary: string
+        message: string
+        componentStack: string
+      }) => void
       readDir: (path: string) => Promise<HermesReadDirResult>
       gitRoot?: (path: string) => Promise<string | null>
       // Reveal a path in the OS file manager (Finder / Explorer).
@@ -264,6 +272,10 @@ declare global {
           // number — for badging a list of sessions in one request instead of
           // one `pr view` per checkout.
           prList: (repoPath: string, branches: string[], numbers?: number[]) => Promise<HermesRepoPullRequests>
+          // A pasted PR review/issue comment URL resolved to its structured
+          // context (author, body, file + line anchor, diff hunk). Null when
+          // gh can't answer — the paste stays a plain URL.
+          fetchPrComment: (repoPath: string, url: string) => Promise<HermesPrComment | null>
           createPr: (repoPath: string) => Promise<{ url: string }>
         }
         // Repo-first discovery: scan bounded roots for git repos (depth-capped).
@@ -498,6 +510,7 @@ export interface DesktopUpdateProgress {
 
 export interface HermesConnection {
   baseUrl: string
+  darwinMajor?: number
   isFullscreen: boolean
   // The live, RESOLVED connection mode. Only ever 'local' or 'remote' — a
   // 'cloud' saved-config entry resolves to a 'remote' connection under the hood
@@ -531,6 +544,7 @@ export interface HermesActiveWork {
 }
 
 export interface HermesWindowState {
+  darwinMajor?: number
   isFullscreen: boolean
   isMinimized?: boolean
   isVisible?: boolean
@@ -559,6 +573,14 @@ export interface DesktopConnectionConfig {
   remoteOauthConnected: boolean
   remoteTokenPreview: string | null
   remoteTokenSet: boolean
+  // Whether OS-keychain-backed encryption (Electron safeStorage) is currently
+  // available on this machine. When false, a persisted remote token can only be
+  // stored as plain text on disk (with an explicit opt-in).
+  secureTokenStorage: boolean
+  // Whether the currently-persisted remote token is stored with encoding
+  // 'plain' (i.e. plain text on disk in connection.json), which happens when
+  // the user opted in on a machine without secure storage.
+  remoteTokenPlainText: boolean
   remoteUrl: string
   // For a 'cloud' connection: the persisted Hermes Cloud org (slug or id) the
   // connected instance was discovered under, so Settings → Gateway can reopen
@@ -579,6 +601,10 @@ export interface DesktopConnectionConfigInput {
   profile?: null | string
   remoteAuthMode?: 'oauth' | 'token'
   remoteToken?: string
+  // When true and secure (OS-keychain) storage is unavailable, persist the
+  // remote token as plain text on disk instead of failing. Requires an explicit
+  // user opt-in from the renderer.
+  allowPlainTextToken?: boolean
   remoteUrl?: string
   // For a 'cloud' connection: the selected Hermes Cloud org (slug or id) to
   // persist so Settings can reopen into it. Ignored for remote/local modes.
@@ -956,6 +982,21 @@ export interface HermesRepoPullRequests {
   prs: HermesBranchPullRequest[]
 }
 
+// A PR review/issue comment resolved from a pasted GitHub URL — the composer's
+// review-comment attachment context. `path`/`line`/`diffHunk` are empty for
+// conversation-tab (issue) comments; `line` is null when the comment is
+// outdated and only `original_line` remained.
+export interface HermesPrComment {
+  author: string
+  body: string
+  diffHunk: string
+  kind: 'issue' | 'review'
+  line: null | number
+  path: string
+  prNumber: number
+  startLine: null | number
+  url: string
+}
 // gh availability/auth + the current branch's PR — drives the review pane's PR
 // button (disabled when gh isn't ready, "Open PR" vs "Create PR" otherwise).
 export interface HermesReviewShipInfo {
