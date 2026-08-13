@@ -519,6 +519,97 @@ async def test_run_agent_reports_actual_agent_runtime_not_requested_metadata(ada
 
 
 @pytest.mark.asyncio
+async def test_confirmed_runtime_lock_accepts_custom_provider_by_name(adapter, monkeypatch):
+    """A lock requested by provider NAME must not fail on the resolved KIND.
+
+    Providers are picked by name -- "9router" is what config.yaml keys and what
+    /api/model/options advertises -- but resolve_runtime_provider() answers
+    with the kind, and every custom provider resolves to "custom".  Comparing
+    the requested name against the agent's resolved kind rejected turns that
+    had routed exactly right ("expected provider=9router model=local; actual
+    provider=custom model=local"), which made the lock unusable on any
+    deployment whose main provider is a custom one.  _create_agent records the
+    name the run resolved from, so either spelling is a match.
+    """
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+
+        def __init__(self):
+            self.session_id = "custom-provider-session"
+            self.provider = "custom"
+            self.model = "local"
+            self._hermes_api_runtime = {
+                "provider": "custom",
+                "provider_name": "9router",
+                "model": "local",
+                "route_source": "session_model_lock",
+            }
+
+        def run_conversation(self, user_message, conversation_history, task_id):
+            return {"final_response": "ok", "session_id": self.session_id}
+
+    monkeypatch.setattr(adapter, "_create_agent", lambda **kwargs: FakeAgent())
+
+    result, _usage = await adapter._run_agent(
+        user_message="hello",
+        conversation_history=[],
+        session_id="custom-provider-session",
+        route={"provider": "9router", "model": "local"},
+        requested_runtime={"provider": "9router", "model": "local"},
+        route_source="session_model_lock",
+        confirmed_runtime_lock=True,
+    )
+
+    # The response still reports what actually ran, not what was asked for.
+    assert result["runtime"]["provider"] == "custom"
+    assert result["runtime"]["model"] == "local"
+    assert result["runtime"]["requested"] == {"provider": "9router", "model": "local"}
+
+
+@pytest.mark.asyncio
+async def test_confirmed_runtime_lock_rejects_a_different_provider_name(adapter, monkeypatch):
+    """Name-matching must not become a way to pass any lock.
+
+    Two custom providers both resolve to the kind "custom", so the kind alone
+    can no longer prove the locked one was used -- the recorded name has to
+    disagree for the guard to still fire.
+    """
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+
+        def __init__(self):
+            self.session_id = "other-custom-session"
+            self.provider = "custom"
+            self.model = "local"
+            self._hermes_api_runtime = {
+                "provider": "custom",
+                "provider_name": "some-other-router",
+                "model": "local",
+                "route_source": "session_model_lock",
+            }
+
+        def run_conversation(self, user_message, conversation_history, task_id):
+            return {"final_response": "ok", "session_id": self.session_id}
+
+    monkeypatch.setattr(adapter, "_create_agent", lambda **kwargs: FakeAgent())
+
+    with pytest.raises(RuntimeError, match="confirmed model lock runtime mismatch"):
+        await adapter._run_agent(
+            user_message="hello",
+            conversation_history=[],
+            session_id="other-custom-session",
+            route={"provider": "9router", "model": "local"},
+            requested_runtime={"provider": "9router", "model": "local"},
+            route_source="session_model_lock",
+            confirmed_runtime_lock=True,
+        )
+
+
+@pytest.mark.asyncio
 async def test_confirmed_runtime_lock_rejects_actual_runtime_mismatch(adapter, monkeypatch):
     class FakeAgent:
         session_prompt_tokens = 0

@@ -2737,6 +2737,13 @@ class APIServerAdapter(BasePlatformAdapter):
         # override > session-persisted model > global) — the rule 7dd00bb47d
         # had to re-fix here after it diverged from gateway/run.py.
         from hermes_cli.model_switch import resolve_effective_model
+        # The provider NAME this turn ends up running on, spelled the way a
+        # caller spells it (config key, model-picker slug, /api/model/options
+        # entry).  ``runtime_kwargs["provider"]`` holds the resolved KIND
+        # instead -- every custom provider collapses to "custom" -- so the two
+        # are not comparable.  The confirmed-lock check in ``_run_agent`` used
+        # to compare them anyway; see the note there.
+        applied_provider_name = _clean_request_string(runtime_kwargs.get("provider"))
         if session_override:
             override_model = resolve_effective_model(session_override, None, model)
             session_provider = _clean_request_string(session_override.get("provider"))
@@ -2750,6 +2757,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
             _apply_runtime_agent_overrides(runtime_kwargs, session_override)
             model = override_model
+            applied_provider_name = (
+                session_provider or current_provider or applied_provider_name
+            )
             if route or request_model or request_provider:
                 logger.debug(
                     "api_server request selection skipped: session /model override wins for %s",
@@ -2769,6 +2779,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if provider_runtime:
                 _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
             model = resolve_effective_model(None, session_row_model, model)
+            applied_provider_name = current_provider or applied_provider_name
             if request_model or request_provider:
                 logger.debug(
                     "api_server request selection skipped: session-persisted model wins for %s",
@@ -2802,6 +2813,7 @@ class APIServerAdapter(BasePlatformAdapter):
             elif effective_provider and effective_provider != current_provider:
                 runtime_kwargs["provider"] = effective_provider
             model = effective_model
+            applied_provider_name = effective_provider or applied_provider_name
             # Per-route explicit transport secrets/base URLs win within the
             # route contract after provider resolution.
             if route_api_key:
@@ -2920,6 +2932,11 @@ class APIServerAdapter(BasePlatformAdapter):
         agent = AIAgent(**agent_kwargs)
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
+            # Kept alongside the resolved kind so a confirmed lock can be
+            # verified against the name it was requested under.  Never
+            # surfaced to clients: _sanitize_runtime_metadata builds the
+            # response payload from scratch.
+            "provider_name": applied_provider_name or "",
             "model": getattr(agent, "model", None) or model,
             "route_source": (
                 "session_model_lock"
@@ -6327,9 +6344,31 @@ class APIServerAdapter(BasePlatformAdapter):
                                 (route or {}).get("model")
                                 or (requested_runtime or {}).get("model")
                             )
+                            # A lock is requested by provider NAME (what the
+                            # model picker and /api/model/options show), while
+                            # ``actual_provider`` is the resolved provider KIND
+                            # -- resolve_runtime_provider("9router") answers
+                            # "custom", as does every other custom provider.
+                            # Comparing the two failed runs that had routed
+                            # exactly right: a lock on 9router reported
+                            # "expected provider=9router model=local; actual
+                            # provider=custom model=local" and refused a turn
+                            # whose model had resolved perfectly, which made
+                            # the lock unusable on any deployment whose main
+                            # provider is a custom one.  _create_agent records
+                            # the name the run actually resolved from, so a
+                            # match on either spelling is a match.
+                            applied_provider_name = self._clean_runtime_id(
+                                runtime.get("provider_name"), max_len=80
+                            )
+                            provider_matches = (
+                                not expected_provider
+                                or actual_provider == expected_provider
+                                or applied_provider_name == expected_provider
+                            )
                             mismatched = (
-                                (expected_provider and actual_provider != expected_provider)
-                                or (expected_model and actual_model != expected_model)
+                                not provider_matches
+                                or bool(expected_model and actual_model != expected_model)
                             )
                             if mismatched:
                                 raise RuntimeError(
