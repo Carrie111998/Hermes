@@ -10934,6 +10934,74 @@ def _unresolved_run_stats(conn: sqlite3.Connection) -> dict:
     }
 
 
+#: Reason prefix a worker writes when it blocks a finished implementation to
+#: hand it to a reviewer. Same literal the ``review_dependency_deadlock``
+#: diagnostic matches on (kanban_diagnostics.py), deliberately: two definitions
+#: of "waiting for review" that could drift apart would be worse than one.
+_REVIEW_REQUIRED_REASON_PREFIX = "review-required:"
+
+def _awaiting_review_stats(
+    conn: sqlite3.Connection, human_stopped_statuses: list[str]
+) -> int:
+    """How many needs-input rows are waiting on a review, not on the operator.
+
+    ``request-review`` moves a finished implementation to ``review``, and its
+    own CLI help ends with "NOT a block". A worker that instead calls
+    ``kanban_block(kind="needs_input", reason="review-required: ...")`` leaves
+    the row in ``blocked``, which the review dispatcher never claims -- it
+    claims ``status = 'review'`` only. The row is then unreachable by any
+    autonomous step and indistinguishable, in the queue count, from a genuine
+    question for the operator.
+
+    The ``review_dependency_deadlock`` diagnostic already recognises this exact
+    reason prefix, but only fires when the stalled parent is starving a ``todo``
+    child, so it stays silent on a row whose subtree happens to be empty.
+    Measured across all four live boards: 28 rows carry the prefix, one has a
+    waiting child. This counts the population; the diagnostic keeps reporting
+    the starvation case.
+
+    Deliberately a strict subset of the ``needs_input`` count above -- same
+    ``block_kind`` and same ``blocked``/``triage`` scope -- so the two numbers
+    reconcile and the remainder is a real "waiting on a person" figure. Counts
+    only: no id, title, or reason text leaves this function.
+    """
+    placeholders = ", ".join("?" for _ in human_stopped_statuses)
+    rows = conn.execute(
+        "SELECT p.id FROM tasks p "
+        f"WHERE p.block_kind = 'needs_input' AND p.status IN ({placeholders})",
+        human_stopped_statuses,
+    ).fetchall()
+
+    awaiting = 0
+    for row in rows:
+        # Both kinds carry the reason that set the block currently in force.
+        # `blocked` alone is not enough: BLOCK_RECURRENCE_LIMIT re-routes a
+        # repeatedly-blocked row to `triage` and records the new reason under
+        # `block_loop_detected`, so reading only `blocked` would answer with a
+        # superseded reason -- and `triage` is half of this function's own
+        # population. Ordered by `id`, not `created_at`: block and re-block
+        # land in the same second routinely, which is exactly when the
+        # distinction matters.
+        event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind IN ('blocked', 'block_loop_detected') "
+            "ORDER BY id DESC LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        if event is None:
+            continue
+        try:
+            payload = json.loads(event["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        reason = str(payload.get("reason") or "").strip().lower()
+        if reason.startswith(_REVIEW_REQUIRED_REASON_PREFIX):
+            awaiting += 1
+    return awaiting
+
+
 def _needs_input_stats(conn: sqlite3.Connection) -> dict:
     """Cost of the unanswered human question: count, staleness, and blast radius.
 
@@ -11087,11 +11155,22 @@ def _needs_input_stats(conn: sqlite3.Connection) -> dict:
     needs_input_rows, oldest_needs_input, needs_input_children = _for_kind("needs_input")
     capability_rows, oldest_capability, capability_children = _for_kind("capability")
     untyped_rows, oldest_untyped, untyped_children = _for_kind(None)
+    awaiting_review_rows = _awaiting_review_stats(conn, human_stopped_statuses)
 
     return {
         "needs_input_rows": needs_input_rows,
         "oldest_needs_input_row_last_touch_at": oldest_needs_input,
         "needs_input_downstream_rows": needs_input_children,
+        # The subset of the queue above that is waiting on a REVIEW, not on the
+        # operator. `request-review` exists for exactly this and its own help
+        # says "NOT a block", but a worker that blocks with `needs_input` and a
+        # `review-required:` reason lands here instead: `review` is the only
+        # status the review dispatcher claims, so nothing ever picks the row up.
+        # Measured across all four live boards the day this was added: 28 of 53
+        # needs-input rows, and zero rows in `review` anywhere. Reporting the
+        # whole queue as one number tells an operator that 53 things need them
+        # when most need a handoff that silently never happens.
+        "needs_input_awaiting_review_rows": awaiting_review_rows,
         # A hard wall the agent cannot pass: no access, missing credentials, an
         # action no AI agent can perform. The schema calls it "genuinely
         # human-only", so it belongs in the same queue as needs_input but is a
@@ -11200,6 +11279,11 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         # Distinct other (non-done/archived) rows gated behind any row above
         # as a task_links child -- the cost of the unanswered question.
         "needs_input_downstream_rows": needs_input["needs_input_downstream_rows"],
+        # Strict subset of `needs_input_rows`: the part waiting on a review
+        # handoff that no dispatcher will ever make, rather than on a person.
+        "needs_input_awaiting_review_rows": needs_input[
+            "needs_input_awaiting_review_rows"
+        ],
         # The other two kinds the schema comment (kanban_db.py:110-125) routes
         # to a human. `capability` is a hard wall -- no access, missing creds,
         # an action no AI agent can perform, "genuinely human-only". An

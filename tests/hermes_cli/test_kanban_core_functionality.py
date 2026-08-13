@@ -1835,3 +1835,86 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         conn.close()
 
 
+def test_board_stats_separates_review_handoffs_from_questions_for_a_person(kanban_home):
+    """`needs_input` conflates two different asks until the reason is read.
+
+    `request-review` moves a finished implementation to `review`, and its own
+    CLI help ends with "NOT a block". A worker that blocks with `needs_input`
+    and a `review-required:` reason leaves the row in `blocked`, which the
+    review dispatcher never claims — so it waits forever on a handoff nobody
+    will make, while the queue counts it as a question for the operator.
+    """
+    with kb.connect() as conn:
+
+        def _blocked(title, *, reason, kind="needs_input"):
+            task_id = kb.create_task(conn, title=title, assignee="builder")
+            kb.claim_task(conn, task_id)
+            assert kb.block_task(conn, task_id, reason=reason, kind=kind)
+            return task_id
+
+        _blocked(
+            "done, waiting on a reviewer",
+            reason="review-required: implementation complete, reviewer approval needed",
+        )
+        # Case matters as little here as it does to the diagnostic that shares
+        # this prefix, so an upper-case writer must not escape the count.
+        _blocked("shouted the same handoff", reason="REVIEW-REQUIRED: same ask, louder")
+        _blocked(
+            "genuinely needs a person",
+            reason="needs_work: pick a staging origin; the agent cannot choose one",
+        )
+        _blocked("blocked with no reason recorded at all", reason=None)
+        # A different kind entirely: never in the needs-input population, so it
+        # can never reach the review subset either.
+        _blocked(
+            "a wall the agent cannot pass",
+            reason="review-required: not even this",
+            kind="capability",
+        )
+
+        stats = kb.board_stats(conn)
+
+    assert stats["needs_input_rows"] == 4
+    assert stats["needs_input_awaiting_review_rows"] == 2
+    # The remainder is the number that actually belongs to a person. Reporting
+    # only the total told an operator four things needed them when two needed a
+    # dispatch that silently never happens.
+    assert stats["needs_input_rows"] - stats["needs_input_awaiting_review_rows"] == 2
+    # A strict subset of the queue above, never a parallel count.
+    assert stats["needs_input_awaiting_review_rows"] <= stats["needs_input_rows"]
+    # `capability` keeps its own bucket and contributes nothing here.
+    assert stats["capability_rows"] == 1
+
+def test_a_later_block_reason_replaces_an_earlier_one_in_the_review_split(kanban_home):
+    """Only the reason currently in force decides, whichever event carries it.
+
+    Re-blocking trips BLOCK_RECURRENCE_LIMIT, which routes the row to `triage`
+    and records the new reason under `block_loop_detected` rather than
+    `blocked`. Reading only `blocked` events would answer with the superseded
+    reason — and `triage` is half of this count's own population.
+    """
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="reviewed, then sent back", assignee="builder"
+        )
+        kb.claim_task(conn, task_id)
+        assert kb.block_task(
+            conn, task_id, reason="review-required: first pass done", kind="needs_input"
+        )
+        assert kb.board_stats(conn)["needs_input_awaiting_review_rows"] == 1
+
+        # The reviewer returned it: the same row is now a question for a person,
+        # and a stale earlier reason must not keep it in the review bucket.
+        assert kb.unblock_task(conn, task_id)
+        kb.claim_task(conn, task_id)
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="needs_work: which origin should this use?",
+            kind="needs_input",
+        )
+
+        stats = kb.board_stats(conn)
+
+    assert stats["needs_input_rows"] == 1
+    assert stats["needs_input_awaiting_review_rows"] == 0
