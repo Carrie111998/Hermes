@@ -152,12 +152,20 @@ class TestVacuumUsesPassive:
         vacuum_calls = [
             c for c in tracking_conn.execute_calls if c.strip().upper() == "VACUUM"
         ]
-        assert truncate_calls == []
+        # PASSIVE before VACUUM (shared-phase safety, #45383); a single
+        # TRUNCATE strictly AFTER the VACUUM is intentional (#84884): VACUUM
+        # rewrites every page through the WAL, and vacuum() already holds the
+        # exclusive lock, so truncating there cannot race a sibling writer.
         assert passive_calls == ["PRAGMA wal_checkpoint(PASSIVE)"]
         assert vacuum_calls == ["VACUUM"]
+        assert len(truncate_calls) <= 1
         assert tracking_conn.execute_calls.index(
             passive_calls[0]
         ) < tracking_conn.execute_calls.index(vacuum_calls[0])
+        for t in truncate_calls:
+            assert tracking_conn.execute_calls.index(
+                t
+            ) > tracking_conn.execute_calls.index(vacuum_calls[0])
 
     def test_optimize_storage_uses_passive_after_vacuum(self, db):
         """optimize_fts_storage() checkpoints PASSIVE after its VACUUM."""
