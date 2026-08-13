@@ -3326,6 +3326,13 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if task_status == "triage":
+                    _append_event(
+                        conn,
+                        task_id,
+                        "triage_fresh_intake",
+                        {"source": "create"},
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -6550,6 +6557,16 @@ _BLOCK_LOOP_ESCALATED_SQL = (
     "AND e2.kind = 'triage_escalation_recovered'), 0))"
 )
 
+_AUTO_DECOMPOSABLE_TRIAGE_SQL = (
+    "EXISTS (SELECT 1 FROM task_events marker "
+    "WHERE marker.task_id = tasks.id "
+    "AND marker.kind IN ('triage_fresh_intake', "
+    "'triage_escalation_recovered') "
+    "AND marker.id > COALESCE((SELECT MAX(stop.id) FROM task_events stop "
+    "WHERE stop.task_id = tasks.id "
+    "AND stop.kind IN ('block_loop_detected', 'decomposed', 'specified')), 0))"
+)
+
 
 def is_block_loop_escalated(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when ``task_id`` reached ``triage`` via the unblock-loop
@@ -6569,8 +6586,40 @@ def is_block_loop_escalated(conn: sqlite3.Connection, task_id: str) -> bool:
     return row is not None
 
 
+def is_auto_decomposable_triage(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether ``task_id`` carries a current automation grant.
+
+    Fresh intake and explicit escalation recovery each append a durable marker.
+    A later block-loop, decomposition, or specification consumes that marker.
+    Legacy/unclassified triage rows therefore fail closed instead of entering
+    the automatic decomposer after an upgrade.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ? AND status = 'triage' AND "
+        + _AUTO_DECOMPOSABLE_TRIAGE_SQL,
+        (task_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _recover_escalated_triage_task_in_txn(
+    conn: sqlite3.Connection, task_id: str,
+) -> bool:
+    """Record escalation recovery inside the caller's write transaction."""
+    cur = conn.execute(
+        "UPDATE tasks "
+        "SET block_kind = NULL, block_recurrences = 0 "
+        "WHERE id = ? AND status = 'triage' AND " + _BLOCK_LOOP_ESCALATED_SQL,
+        (task_id,),
+    )
+    if cur.rowcount != 1:
+        return False
+    _append_event(conn, task_id, "triage_escalation_recovered", None)
+    return True
+
+
 def recover_escalated_triage_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Audited operator acknowledgment for a block-loop-escalated card.
+    """Audited operator acknowledgment for block-loop-escalated triage.
 
     Clears ``block_kind`` and resets ``block_recurrences`` so the card is
     auto-decomposable again with a fresh loop budget, and appends a
@@ -6578,23 +6627,29 @@ def recover_escalated_triage_task(conn: sqlite3.Connection, task_id: str) -> boo
     recurrence reset is essential: without it, one re-block would instantly
     re-hit ``BLOCK_RECURRENCE_LIMIT`` and re-escalate the card.
 
-    Deliberately not restricted to ``status='triage'``: a successful manual
-    ``decompose_task`` transitions the card out of triage (todo/ready)
-    BEFORE calling this to record the acknowledgment, and the escalation
-    event predicate is the semantic gate in every path. Returns False when
-    the card is not escalated (or was already recovered).
+    Returns False when the card is not currently escalated in ``triage``.
+    Decomposition uses the same primitive inside its own write transaction,
+    so the recovery receipt and graph/status transition commit atomically.
     """
     with write_txn(conn):
-        cur = conn.execute(
-            "UPDATE tasks "
-            "SET block_kind = NULL, block_recurrences = 0 "
-            "WHERE id = ? AND " + _BLOCK_LOOP_ESCALATED_SQL,
-            (task_id,),
-        )
-        if cur.rowcount != 1:
-            return False
-        _append_event(conn, task_id, "triage_escalation_recovered", None)
-        return True
+        return _recover_escalated_triage_task_in_txn(conn, task_id)
+
+
+def _has_open_descendants(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether ``task_id`` already owns non-terminal downstream work."""
+    row = conn.execute(
+        "WITH RECURSIVE descendants(id) AS ("
+        "  SELECT child_id FROM task_links WHERE parent_id = ? "
+        "  UNION "
+        "  SELECT task_links.child_id FROM task_links "
+        "  JOIN descendants ON task_links.parent_id = descendants.id"
+        ") "
+        "SELECT 1 FROM descendants "
+        "JOIN tasks ON tasks.id = descendants.id "
+        "WHERE tasks.status NOT IN ('done', 'archived') LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return row is not None
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -6904,6 +6959,9 @@ def specify_triage_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     author: Optional[str] = None,
+    auto_promote: bool = True,
+    recover_escalation: bool = False,
+    reject_open_descendants: bool = False,
 ) -> bool:
     """Flesh out a triage task and promote it to ``todo``.
 
@@ -6920,6 +6978,10 @@ def specify_triage_task(
     ``author`` is recorded on an audit comment only when at least one of
     ``title`` / ``body`` / ``assignee`` actually changed — avoids noisy
     comment spam for status-only promotions.
+
+    ``recover_escalation`` writes the recovery receipt in this same
+    transaction. ``reject_open_descendants`` prevents a spec fallback from
+    replacing an existing governed graph while the LLM call was in flight.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
@@ -6931,6 +6993,12 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
+        if reject_open_descendants and _has_open_descendants(conn, task_id):
+            raise ValueError("task already has an open governed child graph")
+        if recover_escalation and not _recover_escalated_triage_task_in_txn(
+            conn, task_id,
+        ):
+            raise ValueError("triage escalation is no longer active")
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
@@ -6983,7 +7051,8 @@ def specify_triage_task(
     # logic the dispatcher would on its next tick, so a specified task
     # with no open parents flips straight to 'ready' here instead of
     # idling in 'todo' until the next sweep.
-    recompute_ready(conn)
+    if auto_promote:
+        recompute_ready(conn)
     return True
 
 
@@ -6995,6 +7064,8 @@ def decompose_triage_task(
     children: list[dict],
     author: Optional[str] = None,
     auto_promote: bool = True,
+    recover_escalation: bool = False,
+    reject_open_descendants: bool = False,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -7020,7 +7091,8 @@ def decompose_triage_task(
 
     Validation of titles/assignees happens inside the same write_txn as
     the inserts so a malformed entry aborts the whole decomposition
-    cleanly (no orphan children).
+    cleanly (no orphan children). Recovery acknowledgment and the
+    no-existing-graph check are also inside that transaction when enabled.
     """
     if not children:
         return None
@@ -7088,6 +7160,12 @@ def decompose_triage_task(
             return None
         if root_row["status"] != "triage":
             return None
+        if reject_open_descendants and _has_open_descendants(conn, task_id):
+            raise ValueError("task already has an open governed child graph")
+        if recover_escalation and not _recover_escalated_triage_task_in_txn(
+            conn, task_id,
+        ):
+            raise ValueError("triage escalation is no longer active")
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out
         # of a code-gen task lands in the parent's project dir/worktree
