@@ -82,6 +82,34 @@ def test_shell_wrappers_match_but_echo_does_not(tmp_path, monkeypatch):
     assert echoed is None
 
 
+def test_pytest_venv_executables_match_canonical_suite(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _python_project(tmp_path)
+
+    commands = (
+        "uv run pytest",
+        ".venv/bin/python -m pytest",
+        ".venv/bin/pytest",
+        "/opt/project/.venv/bin/python3.11 -m pytest",
+        r".venv\Scripts\pytest.exe",
+        r".venv\Scripts\python.exe -m pytest",
+        ".venv/Scripts/pytest.exe",
+        ".venv/Scripts/python.exe -m pytest",
+    )
+
+    for command in commands:
+        evidence = classify_verification_command(
+            command,
+            cwd=tmp_path,
+            session_id="s1",
+            exit_code=0,
+        )
+        assert evidence is not None, command
+        assert evidence.canonical_command == "pytest", command
+        assert evidence.kind == "test", command
+        assert evidence.scope == "full", command
+
+
 
 
 def test_temp_script_records_ad_hoc_evidence_without_canonical_suite(tmp_path, monkeypatch):

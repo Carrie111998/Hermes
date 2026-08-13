@@ -200,6 +200,20 @@ def _strip_command_prefix(tokens: list[str]) -> list[str]:
     return remaining
 
 
+def _normalize_python_test_executable(tokens: list[str]) -> list[str]:
+    """Normalize venv-qualified Python/pytest executables for suite matching."""
+    if not tokens:
+        return tokens
+    executable = _clean_token(tokens[0])
+    basename = executable.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if basename in {"pytest", "pytest.exe"}:
+        return ["pytest", *tokens[1:]]
+    if re.fullmatch(r"python(?:3(?:\.\d+)?)?(?:\.exe)?", basename):
+        normalized = "python" if basename in {"python", "python.exe"} else "python3"
+        return [normalized, *tokens[1:]]
+    return tokens
+
+
 def _equivalent_needles(needle: list[str]) -> list[list[str]]:
     """Return command spellings equivalent to the detected canonical command."""
     candidates = [needle]
@@ -227,12 +241,17 @@ def _find_canonical_match(command: str, canonical_commands: list[str]) -> Option
     """Return ``(canonical, trailing_args)`` for the first detected command."""
 
     segments = _split_segment_tokens(command)
+    for windows_tokens in _split_segment_tokens(command, posix=False):
+        if windows_tokens not in segments:
+            segments.append(windows_tokens)
     for canonical in canonical_commands:
         needle = _canonical_tokens(canonical)
         if not needle:
             continue
         for tokens in segments:
-            candidate_tokens = _strip_command_prefix(tokens)
+            candidate_tokens = _normalize_python_test_executable(
+                _strip_command_prefix(tokens)
+            )
             for candidate in _equivalent_needles(needle):
                 if candidate_tokens[:len(candidate)] == candidate:
                     return canonical, candidate_tokens[len(candidate):]
