@@ -1,7 +1,14 @@
 # browser-harness `_chrome_running()` fix-revert guard — design
 
 **Date:** 2026-08-13
-**Status:** designed, not yet implemented
+**Status:** implemented and verified 2026-08-13 (see "Verified" below)
+
+> Sections below describe the design as approved. Implementation and review
+> changed two things: the test harness AST-extracts functions rather than
+> dot-sourcing, so helper defaults live in `param()` blocks and each helper must
+> be registered in `$required` **only after it exists**; and the `.pth` fail-soft
+> path needed its own test case. **Where this document and `laptop-monitor.ps1`
+> disagree, the script is authoritative.**
 
 ## Problem
 
@@ -131,10 +138,12 @@ One helper plus one catalog row.
 ### `Get-BrowserHarnessChromeRunningFixStatus`
 
 Placed beside `Get-CloudflaredVersionStatus`. Returns a `pscustomobject`:
-`{ activeSource; activePath; activeState; fallbackState; psutil; state; detail }`.
+`{ activeSource; activePath; activeState; fallbackPath; fallbackState; psutil; state; detail }`.
 
-Every path is a parameter with a real-path default, so Pester drives it against
-tempdir fixtures and never reads the live installs.
+Every path is a parameter with a real-path default, so the tests drive it against
+tempdir fixtures and never read the live installs. (`laptop-monitor.tests.ps1` is
+**not** Pester — it is a custom `Assert -Name -Condition -Detail` harness that
+AST-extracts the functions under test.)
 
 **Resolution mirrors the orchestrator, deliberately.** If
 `Developer\browser-harness\.venv\Scripts\browser-harness.exe` exists, the active
@@ -219,7 +228,8 @@ or .bak-pre-chromerunning-fix-20260813.
 
 ## Testing
 
-Pester cases in `laptop-monitor.tests.ps1`, hermetic against tempdir fixtures:
+Cases in `laptop-monitor.tests.ps1` (custom `Assert` harness, not Pester),
+hermetic against tempdir fixtures:
 
 - Both copies hold the markers → `healthy`, detail names the active copy.
 - Active copy reverted → `down`, detail contains the restore guidance.
