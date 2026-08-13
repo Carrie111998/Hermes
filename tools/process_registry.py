@@ -46,7 +46,7 @@ _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from hermes_cli.config import get_hermes_home
 
@@ -368,7 +368,8 @@ class ProcessSession:
     """A tracked background process with output buffering."""
     id: str                                     # Unique session ID ("proc_xxxxxxxxxxxx")
     command: str                                 # Original command string
-    task_id: str = ""                           # Task/sandbox isolation key
+    task_id: str = ""                           # Stable task-scoped cleanup owner
+    environment_task_id: str = ""               # Terminal environment/cache key
     session_key: str = ""                       # Gateway session key (for reset protection)
     pid: Optional[int] = None                   # OS process ID
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
@@ -394,6 +395,7 @@ class ProcessSession:
     watcher_message_id: str = ""                # Triggering message id — reply anchor for topic routing
     watcher_interval: int = 0                   # 0 = no watcher configured
     notify_on_complete: bool = False             # Queue agent notification on exit
+    persist_on_abandon: bool = False             # Skip kill_started_since() only
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
@@ -966,11 +968,13 @@ class ProcessRegistry:
     def spawn_local(
         self,
         command: str,
-        cwd: str = None,
+        cwd: Optional[str] = None,
         task_id: str = "",
+        environment_task_id: str = "",
         session_key: str = "",
-        env_vars: dict = None,
+        env_vars: Optional[dict] = None,
         use_pty: bool = False,
+        persist_on_abandon: bool = False,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -978,9 +982,15 @@ class ProcessRegistry:
         Only for TERMINAL_ENV=local. Other backends use spawn_via_env().
 
         Args:
+            task_id: Stable owner used by selective and task-scoped cleanup.
+            environment_task_id: Environment/cache key whose liveness this
+                                 process protects. Defaults to ``task_id`` for
+                                 backward-compatible direct callers.
             use_pty: If True, use a pseudo-terminal via ptyprocess for interactive
                      CLI tools (Codex, Claude Code, Python REPL). Falls back to
                      subprocess.Popen if ptyprocess is not installed.
+            persist_on_abandon: Exempt this background process from abandoned-turn
+                                reaping. Broad cleanup and explicit kill still apply.
         """
         # Guard against the `A && B &` subshell-wait trap (issue #68915).
         # Bash parses ``A && B &`` as ``(A && B) &`` — a subshell that holds
@@ -995,9 +1005,11 @@ class ProcessRegistry:
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
             task_id=task_id,
+            environment_task_id=environment_task_id or task_id,
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            persist_on_abandon=persist_on_abandon,
         )
 
         pty_scope_attempted = False
@@ -1205,10 +1217,12 @@ class ProcessRegistry:
         self,
         env: Any,
         command: str,
-        cwd: str = None,
+        cwd: Optional[str] = None,
         task_id: str = "",
+        environment_task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        persist_on_abandon: bool = False,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -1220,16 +1234,21 @@ class ProcessRegistry:
 
         This is less capable than local spawn (no live stdout pipe, no stdin),
         but it ensures the command runs in the correct sandbox context.
+
+        ``persist_on_abandon`` exempts the process only from abandoned-turn
+        reaping. Explicit kill and broad cleanup retain their normal behavior.
         """
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
             task_id=task_id,
+            environment_task_id=environment_task_id or task_id,
             session_key=session_key,
             cwd=cwd,
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+            persist_on_abandon=persist_on_abandon,
         )
 
         # Run the command in the sandbox with output capture
@@ -2257,7 +2276,11 @@ class ProcessRegistry:
         except Exception:
             return 0
 
-    def list_sessions(self, task_id: str = None, session_key: str = None) -> list:
+    def list_sessions(
+        self,
+        task_id: Optional[str] = None,
+        session_key: Optional[str] = None,
+    ) -> list:
         """List all running and recently-finished processes.
 
         When ``task_id`` is given, processes for that task are included. When
@@ -2271,7 +2294,12 @@ class ProcessRegistry:
         with self._lock:
             all_sessions = list(self._running.values()) + list(self._finished.values())
 
-        all_sessions = [self._refresh_detached_session(s) for s in all_sessions]
+        refreshed_sessions: List[ProcessSession] = []
+        for session in all_sessions:
+            refreshed = self._refresh_detached_session(session)
+            if refreshed is not None:
+                refreshed_sessions.append(refreshed)
+        all_sessions = refreshed_sessions
 
         if task_id or session_key:
             all_sessions = [
@@ -2280,9 +2308,9 @@ class ProcessRegistry:
                 or (session_key and s.session_key == session_key)
             ]
 
-        result = []
+        result: List[Dict[str, Any]] = []
         for s in all_sessions:
-            entry = {
+            entry: Dict[str, Any] = {
                 "session_id": s.id,
                 "command": s.command[:200],
                 "cwd": s.cwd,
@@ -2305,6 +2333,8 @@ class ProcessRegistry:
                 entry["watch_hit"] = s._watch_hits > 0
             if s.notify_on_complete:
                 entry["notify_on_complete"] = True
+            if s.persist_on_abandon:
+                entry["persist_on_abandon"] = True
             if s.exited:
                 entry["exit_code"] = s.exit_code
             if s.detached:
@@ -2314,8 +2344,8 @@ class ProcessRegistry:
 
     # ----- Session/Task Queries (for gateway integration) -----
 
-    def has_active_processes(self, task_id: str) -> bool:
-        """Check if there are active (running) processes for a task_id."""
+    def has_active_processes(self, environment_task_id: str) -> bool:
+        """Check for active processes using an environment/cache key."""
         with self._lock:
             sessions = list(self._running.values())
 
@@ -2324,7 +2354,8 @@ class ProcessRegistry:
 
         with self._lock:
             return any(
-                s.task_id == task_id and not s.exited
+                (s.environment_task_id or s.task_id) == environment_task_id
+                and not s.exited
                 for s in self._running.values()
             )
 
@@ -2392,6 +2423,17 @@ class ProcessRegistry:
                 if s.task_id == task_id and not s.exited
             )
 
+    def snapshot_running_ids_for_session(self, session_key: str) -> tuple[str, ...]:
+        """Capture process IDs registered to a stable gateway session key."""
+        if not session_key:
+            return ()
+        with self._lock:
+            return tuple(
+                session.id
+                for session in self._running.values()
+                if session.session_key == session_key and not session.exited
+            )
+
     def kill_started_since(
         self,
         task_id: str,
@@ -2399,18 +2441,48 @@ class ProcessRegistry:
         *,
         source: str,
     ) -> int:
-        """Kill processes created for ``task_id`` after a prior snapshot.
+        """Kill post-snapshot processes unless abandonment-exempt.
 
         ``consume_output`` is forced on: abandoned-turn output must not
         enqueue a synthetic follow-up that revives work the timeout
-        deliberately stopped.
+        deliberately stopped. Sessions explicitly marked
+        ``persist_on_abandon`` are the sole exception; broader cleanup APIs do
+        not honor that exemption.
         """
-        return self.kill_all(
-            task_id,
-            exclude_ids=frozenset(baseline_ids or ()),
+        baseline = frozenset(baseline_ids or ())
+        with self._lock:
+            targets = [
+                session
+                for session in self._running.values()
+                if session.task_id == task_id
+                and session.id not in baseline
+                and not session.exited
+                and not session.persist_on_abandon
+            ]
+        return self._kill_sessions(
+            targets,
             source=source,
             consume_output=True,
         )
+
+    def _kill_sessions(
+        self,
+        sessions: Iterable[ProcessSession],
+        *,
+        source: str,
+        consume_output: bool,
+    ) -> int:
+        """Kill a previously selected session snapshot."""
+        killed = 0
+        for session in sessions:
+            result = self.kill_process(
+                session.id,
+                source=source,
+                consume_output=consume_output,
+            )
+            if result.get("status") in {"killed", "already_exited"}:
+                killed += 1
+        return killed
 
     def kill_all(
         self,
@@ -2420,7 +2492,7 @@ class ProcessRegistry:
         source: str = "kill_all",
         consume_output: bool = False,
     ) -> int:
-        """Kill all running processes, optionally filtered by task_id. Returns count killed."""
+        """Kill all running processes, optionally filtered by cleanup owner."""
         with self._lock:
             targets = [
                 s for s in self._running.values()
@@ -2429,16 +2501,11 @@ class ProcessRegistry:
                 and not s.exited
             ]
 
-        killed = 0
-        for session in targets:
-            result = self.kill_process(
-                session.id,
-                source=source,
-                consume_output=consume_output,
-            )
-            if result.get("status") in {"killed", "already_exited"}:
-                killed += 1
-        return killed
+        return self._kill_sessions(
+            targets,
+            source=source,
+            consume_output=consume_output,
+        )
 
     # ----- Cleanup / Pruning -----
 
@@ -2509,6 +2576,7 @@ class ProcessRegistry:
                             "cwd": s.cwd,
                             "started_at": s.started_at,
                             "task_id": s.task_id,
+                            "environment_task_id": s.environment_task_id or s.task_id,
                             "session_key": s.session_key,
                             "watcher_platform": s.watcher_platform,
                             "watcher_chat_id": s.watcher_chat_id,
@@ -2518,6 +2586,7 @@ class ProcessRegistry:
                             "watcher_message_id": s.watcher_message_id,
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
+                            "persist_on_abandon": s.persist_on_abandon,
                             "watch_patterns": s.watch_patterns,
                         })
                 if extra_entries:
@@ -2598,6 +2667,9 @@ class ProcessRegistry:
                 id=entry["session_id"],
                 command=entry.get("command", "unknown"),
                 task_id=entry.get("task_id", ""),
+                environment_task_id=(
+                    entry.get("environment_task_id") or entry.get("task_id", "")
+                ),
                 session_key=entry.get("session_key", ""),
                 pid=pid,
                 host_start_time=recorded_start,
@@ -2614,6 +2686,7 @@ class ProcessRegistry:
                 watcher_message_id=entry.get("watcher_message_id", ""),
                 watcher_interval=entry.get("watcher_interval", 0),
                 notify_on_complete=entry.get("notify_on_complete", False),
+                persist_on_abandon=entry.get("persist_on_abandon", False),
                 watch_patterns=entry.get("watch_patterns", []),
             )
             with self._lock:

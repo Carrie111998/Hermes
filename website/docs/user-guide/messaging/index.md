@@ -530,7 +530,17 @@ display:
 | `error` | Only the final message when the exit code is non-zero |
 | `off` | No process watcher messages at all |
 
-You can also set this via environment variable:
+Process notifications do not change process lifetime. By default, the gateway
+may selectively reap background processes created by an abandoned turn. To
+exempt a tracked process only from that selective `kill_started_since()`
+cleanup, call `terminal(background=true, persist_on_abandon=true)`. The option
+is rejected without `background=true`.
+
+The flag grants no exemption from explicit process kill, broad `kill_all()`
+cleanup, or other lifecycle cleanup. It does not transfer ownership or provide
+durability.
+
+You can also set the notification mode via environment variable:
 
 ```bash
 HERMES_BACKGROUND_NOTIFICATIONS=result

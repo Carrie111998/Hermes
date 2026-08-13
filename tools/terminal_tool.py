@@ -1082,6 +1082,7 @@ Environment state persists: activate a virtualenv or export variables once per s
 
 Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.
 Background: set background=true (returns a session_id). Pair with notify_on_complete=true for bounded tasks; leave silent only for servers/daemons that never exit. Never use nohup/setsid/trailing '&' — use background=true so Hermes tracks the process. After starting a server, verify readiness with a health check, then act in a separate call; no blind sleep loops. Manage with process(action="poll"/"wait").
+Abandoned turns: add persist_on_abandon=true only to exempt this tracked background process from selective cleanup through kill_started_since(). The flag does not transfer ownership or provide durability. process(action="kill"), kill_all(), and other broad cleanup still terminate the process.
 Working directory: use 'workdir' for per-command cwd. When a command changes the session cwd (cd, pushd), the result includes a "cwd" field — trust it instead of prefixing every command with 'cd'.
 PTY: set pty=true for interactive CLIs (they hang without it). Pipe git output to cat if it might page.
 """
@@ -1314,6 +1315,17 @@ def _resolve_container_alias(task_id: str) -> str:
             seen.add(key)
             key = _container_aliases[key]
     return key
+
+
+def _resolve_process_owner_task_id(task_id: Optional[str]) -> str:
+    """Resolve the stable cleanup owner for a tool-call task id.
+
+    Delegate children use their own ``sa-*`` task ids for file/event state but
+    register an existing child→parent container alias. Cleanup belongs to that
+    parent turn/session even when the environment itself collapses to the
+    shared ``"default"`` key.
+    """
+    return _resolve_container_alias(str(task_id or "default"))
 
 
 def _docker_session_isolation_enabled() -> bool:
@@ -2490,6 +2502,18 @@ def _resolve_notification_flag_conflict(
     return watch_patterns, ""
 
 
+def _background_interrupt_result(approval_note: Optional[str] = None) -> str:
+    """Return the standard terminal result for an interrupted background call."""
+    result = {
+        "output": "[Command interrupted]",
+        "exit_code": 130,
+        "error": None,
+    }
+    if approval_note:
+        result["approval"] = approval_note.rstrip(".") + ", then interrupted."
+    return json.dumps(result, ensure_ascii=False)
+
+
 def _resolve_command_cwd(
     *,
     workdir: Optional[str],
@@ -2541,6 +2565,7 @@ def terminal_tool(
     pty: bool = False,
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
+    persist_on_abandon: bool = False,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -2556,6 +2581,9 @@ def terminal_tool(
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
         notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row, watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
+        persist_on_abandon: If True and background=True, skip only
+            kill_started_since(). Explicit process kill and broad cleanup still
+            apply; this does not transfer ownership or provide durability.
 
     Returns:
         str: JSON string with output, exit_code, and error fields
@@ -2586,6 +2614,14 @@ def terminal_tool(
                 "status": "error",
             }, ensure_ascii=False)
 
+        if persist_on_abandon and not background:
+            return tool_error(
+                "persist_on_abandon=true requires background=true.",
+                status="error",
+                output="",
+                exit_code=-1,
+            )
+
         # Get configuration
         config = _get_env_config()
         env_type = config["env_type"]
@@ -2595,6 +2631,12 @@ def terminal_tool(
         # every delegate_task child share one container; only task_ids with
         # a registered env override (RL benchmarks) get isolated sandboxes.
         effective_task_id = _resolve_container_task_id(task_id)
+        # Process cleanup ownership is independent from the environment key.
+        # Shared backends collapse many sessions onto ``"default"`` and
+        # delegate children alias their environment to the parent. Record both:
+        # the alias-resolved parent owns cleanup, while effective_task_id keeps
+        # the actual environment alive.
+        process_task_id = _resolve_process_owner_task_id(task_id)
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config. ``resolve_task_overrides``
@@ -2766,11 +2808,11 @@ def terminal_tool(
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
 
         assert env is not None  # all creation failure paths return above
+        process_environment_task_id = _existing_key or effective_task_id
 
-        # The session key that drives cwd records: get_current_session_key()'s
-        # contextvar doesn't cross tool-worker threads, so fall back to the raw
-        # task_id (which IS the session_key for the top-level agent) — a
-        # stable, thread-safe anchor.
+        # The session key that drives cwd records. Gateway tool executors
+        # propagate this context into worker threads; the task-id fallback keeps
+        # direct and legacy callers anchored when no session context is present.
         from tools.approval import get_current_session_key
 
         session_key = get_current_session_key(default="") or (task_id or "")
@@ -2996,23 +3038,62 @@ def terminal_tool(
                 env_type=env_type,
             )
             try:
+                # A hard interrupt can arrive while this tool thread is doing
+                # guard/environment setup. Background spawns do not have the
+                # foreground executor's polling loop, so honor the thread-local
+                # signal immediately before crossing the spawn boundary. Do not
+                # clear it here: the old turn owns this thread and must remain
+                # interrupted while it unwinds.
+                if is_interrupted():
+                    return _background_interrupt_result(approval_note)
+
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
                         command=command,
                         cwd=effective_cwd,
-                        task_id=effective_task_id,
+                        task_id=process_task_id,
+                        environment_task_id=process_environment_task_id,
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        persist_on_abandon=persist_on_abandon,
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
                         env=env,
                         command=command,
                         cwd=effective_cwd,
-                        task_id=effective_task_id,
+                        task_id=process_task_id,
+                        environment_task_id=process_environment_task_id,
                         session_key=session_key,
+                        persist_on_abandon=persist_on_abandon,
                     )
+
+                # Close the complementary race with reset's fixed-ID snapshot.
+                # If interruption won while spawn was in flight, the process may
+                # have registered after reset took its snapshot. Kill it before
+                # attaching watcher metadata, and consume its output so neither
+                # the reader nor a completion watcher can resurrect the abandoned
+                # turn. If interruption lands after this check, registration
+                # necessarily preceded it and reset's subsequent snapshot sees
+                # the process instead.
+                if is_interrupted():
+                    kill_result = process_registry.kill_process(
+                        proc_session.id,
+                        source="terminal_interrupt",
+                        consume_output=True,
+                    )
+                    kill_status = kill_result.get("status")
+                    failed_start = (
+                        kill_status == "not_found"
+                        and bool(getattr(proc_session, "exited", False))
+                    )
+                    if kill_status not in {"killed", "already_exited"} and not failed_start:
+                        raise RuntimeError(
+                            "interrupt arrived after background spawn but cleanup failed: "
+                            f"{kill_result.get('error') or kill_status or 'unknown error'}"
+                        )
+                    return _background_interrupt_result(approval_note)
 
                 result_data = {
                     "output": "Background process started",
@@ -3021,9 +3102,8 @@ def terminal_tool(
                     "exit_code": 0,
                     "error": None,
                 }
-                # Background spawns detached and returns exit_code 0 immediately;
-                # it never inline-polls is_interrupted(), so the stale-bit kill
-                # cannot occur here and this note never co-occurs with rc=130.
+                if persist_on_abandon:
+                    result_data["persist_on_abandon"] = True
                 if approval_note:
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:
@@ -3774,6 +3854,11 @@ TERMINAL_SCHEMA = {
                 "description": "With background=true: get exactly one notification when the process exits. The right choice for nearly every bounded long task — set it and keep working. MUTUALLY EXCLUSIVE with watch_patterns (watch_patterns is dropped when both are set).",
                 "default": False
             },
+            "persist_on_abandon": {
+                "type": "boolean",
+                "description": "With background=true: exempt this tracked process only from selective abandoned-turn cleanup through kill_started_since(). process(action='kill'), kill_all(), and other broad cleanup still terminate it. This does not transfer ownership or provide durability.",
+                "default": False
+            },
             "watch_patterns": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -3807,6 +3892,7 @@ def _handle_terminal(args, **kw):
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),
         watch_patterns=args.get("watch_patterns"),
+        persist_on_abandon=args.get("persist_on_abandon", False),
     )
 
 

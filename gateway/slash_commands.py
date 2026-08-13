@@ -98,6 +98,47 @@ def _model_switch_skew_guard() -> Optional[str]:
     )
 
 
+def _snapshot_processes_for_session_reset(session_key: str) -> tuple[str, ...]:
+    """Snapshot processes registered to one stable gateway session key."""
+    if not session_key:
+        return ()
+    try:
+        from tools.process_registry import process_registry
+
+        return process_registry.snapshot_running_ids_for_session(session_key)
+    except Exception:
+        logger.warning(
+            "Failed to snapshot background processes for session %s during reset",
+            session_key,
+            exc_info=True,
+        )
+        return ()
+
+
+def _kill_processes_for_session_reset(process_ids: tuple[str, ...]) -> int:
+    """Broadly kill a fixed reset-boundary process snapshot."""
+    from tools.process_registry import process_registry
+
+    killed = 0
+    for process_id in process_ids:
+        try:
+            result = process_registry.kill_process(
+                process_id,
+                source="kill_all",
+                consume_output=False,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to clean background process %s during session reset",
+                process_id,
+                exc_info=True,
+            )
+            continue
+        if result.get("status") in {"killed", "already_exited"}:
+            killed += 1
+    return killed
+
+
 class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
 
@@ -133,6 +174,40 @@ class GatewaySlashCommandsMixin:
         # Snapshot the old entry so on_session_finalize can report the
         # expiring session id before reset_session() rotates it.
         old_entry = self.session_store._entries.get(session_key)
+
+        # Snapshot processes already registered at this reset boundary. Use
+        # the stable gateway session key so cleanup does not depend on a cached
+        # AIAgent (which may have been soft-evicted) or its compression-rotated
+        # session_id. Capturing IDs before the first await keeps a replacement
+        # turn's later processes out of this reset's broad cleanup.
+        _reset_process_ids = _snapshot_processes_for_session_reset(session_key)
+
+        # Process termination can block on remote backends and process-tree
+        # teardown, so run the fixed snapshot off-loop with the same bounded
+        # reset budget used for agent resource cleanup. The worker may continue
+        # after a timeout, but it can only touch the pre-reset IDs above.
+        if _reset_process_ids:
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _kill_processes_for_session_reset,
+                        _reset_process_ids,
+                    ),
+                    timeout=_RESET_CLEANUP_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Background process cleanup for session %s exceeded %ss "
+                    "during reset; proceeding while the worker continues",
+                    session_key,
+                    _RESET_CLEANUP_TIMEOUT_S,
+                )
+            except Exception:
+                logger.warning(
+                    "Background process cleanup failed for session %s during reset",
+                    session_key,
+                    exc_info=True,
+                )
 
         # Close tool resources on the old agent (terminal sandboxes, browser
         # daemons, background processes) before evicting from cache.
