@@ -1482,6 +1482,11 @@ class CredentialPool:
                 if self.provider == "openai-codex":
                     if synced is not entry:
                         entry = synced
+                        if entry.source == "device_code":
+                            # Canonical state changed while this singleton
+                            # alias was stale; never POST its consumed refresh
+                            # token, even when forced.
+                            return entry
                         if not force and not self._entry_needs_refresh(entry):
                             return entry
                     return self._refresh_codex_entry_locked(entry, force=force)
@@ -2096,6 +2101,21 @@ class CredentialPool:
             if entry is not None:
                 self._unmatched_rotation_streak = 0
         return entry
+
+    def select_readonly(self) -> Optional[PooledCredential]:
+        """Select a credential without refresh, cleanup, or persistence."""
+        with self._lock:
+            for entry in self._entries:
+                if entry.auth_type == AUTH_TYPE_API_KEY and not entry.runtime_api_key:
+                    continue
+                if entry.last_status == STATUS_DEAD:
+                    continue
+                if entry.last_status == STATUS_EXHAUSTED:
+                    until = _exhausted_until(entry)
+                    if until is not None and time.time() < until:
+                        continue
+                return entry
+            return None
 
     def _select_under_lock(self) -> Tuple[Optional[PooledCredential], List[tuple]]:
         """Run selection under the lock, returning entry + pending refreshes."""
@@ -2797,7 +2817,12 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
     return changed
 
 
-def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
+def _seed_from_singletons(
+    provider: str,
+    entries: List[PooledCredential],
+    *,
+    persist: bool = True,
+) -> Tuple[bool, Set[str]]:
     changed = False
     active_sources: Set[str] = set()
     auth_store = _load_auth_store()
@@ -3107,6 +3132,38 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
             return changed, active_sources
 
         state = _load_provider_state(auth_store, "openai-codex")
+        if isinstance(state, dict) and isinstance(state.get("tokens"), dict):
+            grant_id = str(state.get(_CODEX_GRANT_ID_KEY) or "").strip()
+            if not grant_id and persist:
+                # Bootstrap the canonical identity while holding the canonical
+                # store lock, before this singleton can be rotated.
+                with auth_mod._provider_state_transaction("openai-codex") as (
+                    active_store, locked_state, source_path
+                ):
+                    if isinstance(locked_state, dict):
+                        grant_id = str(
+                            locked_state.get(_CODEX_GRANT_ID_KEY) or ""
+                        ).strip()
+                        if not grant_id:
+                            grant_id = secrets.token_hex(16)
+                            locked_state[_CODEX_GRANT_ID_KEY] = grant_id
+                            target_store = active_store
+                            if source_path is not None and not _same_path(
+                                source_path, auth_mod._auth_file_path()
+                            ):
+                                target_store = _load_auth_store(source_path)
+                            _store_provider_state(
+                                target_store,
+                                "openai-codex",
+                                locked_state,
+                                set_active=False,
+                            )
+                            _save_auth_store(target_store, target_path=source_path)
+                    state = locked_state
+            else:
+                grant_id = grant_id or None
+        else:
+            grant_id = None
         tokens = state.get("tokens") if isinstance(state, dict) else None
         # Hermes owns its own Codex auth state — we do NOT auto-import from
         # ~/.codex/auth.json at pool-load time.  OAuth refresh tokens are
@@ -3128,6 +3185,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                     "refresh_token": tokens.get("refresh_token"),
                     "base_url": "https://chatgpt.com/backend-api/codex",
                     "last_refresh": state.get("last_refresh"),
+                    "shared_grant_id": grant_id,
                     "label": custom_label or label_from_token(tokens.get("access_token", ""), "device_code"),
                 },
             )
@@ -3429,6 +3487,15 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
 
 def load_pool(provider: str) -> CredentialPool:
+    return _load_pool(provider, persist=True)
+
+
+def load_pool_readonly(provider: str) -> CredentialPool:
+    """Load runtime credential semantics without writing auth or pool files."""
+    return _load_pool(provider, persist=False)
+
+
+def _load_pool(provider: str, *, persist: bool) -> CredentialPool:
     provider = (provider or "").strip().lower()
     raw_entries = read_credential_pool(provider)
     disk_ids = {
@@ -3477,7 +3544,9 @@ def load_pool(provider: str) -> CredentialPool:
         changed = raw_needs_sanitization or raw_needs_auth_normalization or custom_changed
         changed |= _prune_stale_seeded_entries(entries, custom_sources)
     else:
-        singleton_changed, singleton_sources = _seed_from_singletons(provider, entries)
+        singleton_changed, singleton_sources = _seed_from_singletons(
+            provider, entries, persist=persist
+        )
         env_changed, env_sources = _seed_from_env(provider, entries)
         changed = (
             raw_needs_sanitization
@@ -3496,7 +3565,7 @@ def load_pool(provider: str) -> CredentialPool:
         )
         changed |= _normalize_pool_priorities(provider, entries)
 
-    if changed:
+    if changed and persist:
         new_ids = {entry.id for entry in entries}
         write_credential_pool(
             provider,

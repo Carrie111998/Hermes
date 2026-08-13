@@ -402,6 +402,34 @@ def test_canonical_rotations_converge_aliases(profile_and_root):
         assert (alias.access_token, alias.refresh_token) == (f"a{generation}", f"r{generation}")
 
 
+def test_aliases_loaded_before_rotation_adopt_canonical_without_replay(
+    profile_and_root, monkeypatch
+):
+    """A stale singleton-seeded alias must converge by grant identity."""
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(root_path, {"version": 1, "providers": {"openai-codex": {
+        "tokens": {"access_token": "a0", "refresh_token": "r0"}}}})
+    calls = []
+
+    def rotate(access, refresh):
+        calls.append((access, refresh))
+        return {"access_token": "a1", "refresh_token": "r1"}
+
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", rotate)
+    alias_a = CP.load_pool("openai-codex")
+    alias_b = CP.load_pool("openai-codex")
+    entry_a = alias_a._entries[0]
+    entry_b = alias_b._entries[0]
+    assert entry_a.extra["shared_grant_id"] == entry_b.extra["shared_grant_id"]
+
+    alias_a._refresh_entry(entry_a, force=True)
+    assert calls == [("a0", "r0")]
+    alias_b._refresh_entry(entry_b, force=True)
+    assert calls == [("a0", "r0")]
+    assert alias_b._entries[0].refresh_token == "r1"
+
+
 def test_terminal_shared_refresh_quarantines_matching_aliases_only(profile_and_root, monkeypatch):
     profile_path, root_path = profile_and_root
     _write_store(profile_path, {"version": 1, "providers": {"openai-codex": {

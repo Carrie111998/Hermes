@@ -1197,11 +1197,11 @@ def test_codex_capability_preflight_uses_pool_and_blocks_irrecoverable_oauth(mon
 
     class Pool:
         _entries = []
-        def select(self):
+        def select_readonly(self):
             calls.append("select")
             raise auth_mod.AuthError("revoked", provider="openai-codex", code="invalid_grant", relogin_required=True)
 
-    monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: Pool())
+    monkeypatch.setattr("agent.credential_pool.load_pool_readonly", lambda provider: Pool())
     monkeypatch.setattr(kb, "_profile_model_provider", lambda profile: "openai-codex")
     monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda profile: "/tmp")
     reason = kb._codex_capability_failure(task)
@@ -1211,31 +1211,43 @@ def test_codex_capability_preflight_uses_pool_and_blocks_irrecoverable_oauth(mon
 
 def test_non_codex_programmer_route_is_not_capability_gated(monkeypatch):
     task = _make_task(id="openrouter", assignee="programmer", provider_override="openrouter")
-    monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pytest.fail("unexpected pool access"))
+    monkeypatch.setattr("agent.credential_pool.load_pool_readonly", lambda provider: pytest.fail("unexpected pool access"))
     assert kb._codex_capability_failure(task) is None
 
 
-def test_codex_capability_preflight_does_not_create_profile_shadow(monkeypatch):
+def test_codex_capability_preflight_does_not_create_profile_shadow(
+    monkeypatch, tmp_path
+):
+    profile_home = tmp_path / "profiles" / "reviewer"
+    profile_auth = profile_home / "auth.json"
+    global_auth = tmp_path / "root" / "auth.json"
+    global_auth.parent.mkdir(parents=True)
+    global_auth.write_text(json.dumps({
+        "version": 1,
+        "providers": {"openai-codex": {
+            "tokens": {"access_token": "global-a", "refresh_token": "global-r"}
+        }},
+    }), encoding="utf-8")
+    before_global = global_auth.read_bytes()
+    monkeypatch.setattr(auth_mod, "_auth_file_path", lambda: profile_auth)
+    monkeypatch.setattr(auth_mod, "_global_auth_file_path", lambda: global_auth)
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda _: str(profile_home))
     task = _make_task(id="codex", assignee="reviewer", provider_override="openai-codex")
-    class Pool:
-        _entries = []
-        def select(self):
-            return object()
-    monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: Pool())
-    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda profile: "/tmp")
     assert kb._codex_capability_failure(task) is None
+    assert not profile_auth.exists()
+    assert global_auth.read_bytes() == before_global
 
 
 def test_dispatch_once_capability_blocks_codex_before_claim_without_fallback_or_shadow(kanban_home, monkeypatch, tmp_path):
     profile_home = tmp_path / "profiles" / "programmer"
-    class DeadPool:
-        _entries = []
-        def select(self):
-            raise auth_mod.AuthError("revoked", provider="openai-codex", code="invalid_grant", relogin_required=True)
     monkeypatch.setattr(kb, "_profile_model_provider", lambda _: "openai-codex")
     monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda _: str(profile_home))
-    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _: DeadPool())
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    global_auth = tmp_path / "root" / "auth.json"
+    global_auth.parent.mkdir(parents=True)
+    global_auth.write_text(json.dumps({"version": 1}), encoding="utf-8")
+    monkeypatch.setattr(auth_mod, "_auth_file_path", lambda: profile_home / "auth.json")
+    monkeypatch.setattr(auth_mod, "_global_auth_file_path", lambda: global_auth)
     with kb.connect_closing() as conn:
         task_id = kb.create_task(conn, title="codex capability", assignee="programmer")
         result = kb.dispatch_once(conn, dry_run=False, spawn_fn=lambda *args: pytest.fail("claim occurred"))
@@ -1243,8 +1255,9 @@ def test_dispatch_once_capability_blocks_codex_before_claim_without_fallback_or_
         runs = conn.execute("SELECT id FROM task_runs WHERE task_id = ?", (task_id,)).fetchall()
     assert result.spawned == [] and result.skipped_capability[0][0] == task_id
     assert task.status == "blocked" and task.block_kind == "capability"
-    assert "invalid_grant" in task.last_failure_error and runs == []
+    assert "codex_auth_unavailable" in task.last_failure_error and runs == []
     assert not (profile_home / "auth.json").exists()
+    assert global_auth.read_bytes() == b'{"version": 1}'
 
 
 def test_dispatch_once_healthy_codex_pool_claims_through_same_preflight(kanban_home, monkeypatch, tmp_path):
@@ -1252,11 +1265,11 @@ def test_dispatch_once_healthy_codex_pool_claims_through_same_preflight(kanban_h
     spawned = []
     class HealthyPool:
         _entries = [object()]
-        def select(self):
+        def select_readonly(self):
             return self._entries[0]
     monkeypatch.setattr(kb, "_profile_model_provider", lambda _: "openai-codex")
     monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda _: str(profile_home))
-    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _: HealthyPool())
+    monkeypatch.setattr("agent.credential_pool.load_pool_readonly", lambda _: HealthyPool())
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
     with kb.connect_closing() as conn:
         task_id = kb.create_task(conn, title="codex healthy", assignee="programmer")

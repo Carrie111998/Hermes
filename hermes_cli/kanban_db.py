@@ -9211,14 +9211,14 @@ def _codex_capability_failure(task: Task) -> Optional[str]:
         return None
     profile_token = None
     try:
-        from agent.credential_pool import STATUS_EXHAUSTED, load_pool
+        from agent.credential_pool import STATUS_EXHAUSTED, load_pool_readonly
         from hermes_cli.auth import AuthError
         from hermes_cli.profiles import resolve_profile_env
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         if task.assignee:
             profile_token = set_hermes_home_override(resolve_profile_env(task.assignee))
-        pool = load_pool("openai-codex")
-        selected = pool.select()
+        pool = load_pool_readonly("openai-codex")
+        selected = pool.select_readonly()
         if selected is None:
             if any(entry.last_status == STATUS_EXHAUSTED for entry in pool._entries):
                 return None
