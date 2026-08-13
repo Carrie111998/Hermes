@@ -100,7 +100,7 @@ class TestFromGlobalConfig:
     def test_context_tokens_explicit_sets_cap(self, tmp_path):
         """Explicit contextTokens in config sets the cap."""
         config_file = tmp_path / "config.json"
-        config_file.write_text(json.dumps({"apiKey": "***", "contextTokens": 1200}))
+        config_file.write_text(json.dumps({"apiKey": "***", "contextTokens": 1200}), encoding="utf-8")
         config = HonchoClientConfig.from_global_config(config_path=config_file)
         assert config.context_tokens == 1200
 
@@ -119,7 +119,7 @@ class TestFromGlobalConfig:
 
     def test_corrupt_config_falls_back_to_env(self, tmp_path):
         config_file = tmp_path / "config.json"
-        config_file.write_text("not valid json{{{")
+        config_file.write_text("not valid json{{{", encoding="utf-8")
 
         config = HonchoClientConfig.from_global_config(config_path=config_file)
         # Should fall back to from_env without crashing
@@ -151,7 +151,7 @@ class TestResolveConfigPath:
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
         local_cfg = hermes_home / "honcho.json"
-        local_cfg.write_text('{"apiKey": "local"}')
+        local_cfg.write_text('{"apiKey": "local"}', encoding="utf-8")
 
         with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
             result = resolve_config_path()
@@ -167,7 +167,7 @@ class TestResolveConfigPath:
         profile_home = default_home / "profiles" / "work"
         profile_home.mkdir(parents=True)
         default_cfg = default_home / "honcho.json"
-        default_cfg.write_text('{"apiKey": "default-key"}')
+        default_cfg.write_text('{"apiKey": "default-key"}', encoding="utf-8")
 
         monkeypatch.setattr(Path, "home", lambda: fake_home)
         monkeypatch.setenv("HERMES_HOME", str(profile_home))
@@ -233,7 +233,7 @@ class TestObservationModeMigration:
     def test_new_config_defaults_to_directional(self, tmp_path):
         """Config with no host block and no credentials → 'directional' (new default)."""
         cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({}))
+        cfg_file.write_text(json.dumps({}), encoding="utf-8")
         cfg = HonchoClientConfig.from_global_config(config_path=cfg_file)
         assert cfg.observation_mode == "directional"
 
@@ -294,7 +294,7 @@ class TestGetHonchoClient:
         from hermes_constants import get_hermes_home
 
         cfg_yaml = get_hermes_home() / "config.yaml"
-        cfg_yaml.write_text("honcho:\n  timeout: 30\n")
+        cfg_yaml.write_text("honcho:\n  timeout: 30\n", encoding="utf-8")
 
         fake_honcho_1 = MagicMock(name="Honcho_v1")
         fake_honcho_2 = MagicMock(name="Honcho_v2")
@@ -318,7 +318,7 @@ class TestGetHonchoClient:
         mock_h2.assert_not_called()
 
         # Changed timeout — must rebuild
-        cfg_yaml.write_text("honcho:\n  timeout: 300\n")
+        cfg_yaml.write_text("honcho:\n  timeout: 300\n", encoding="utf-8")
         st = cfg_yaml.stat()
         os.utime(cfg_yaml, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
 
@@ -340,7 +340,7 @@ class TestGetHonchoClient:
         managed_dir = tmp_path / "managed"
         managed_dir.mkdir()
         managed_cfg = managed_dir / "config.yaml"
-        managed_cfg.write_text("honcho:\n  timeout: 88\n")
+        managed_cfg.write_text("honcho:\n  timeout: 88\n", encoding="utf-8")
         monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
 
         fake_honcho_1 = MagicMock(name="Honcho_v1")
@@ -361,7 +361,7 @@ class TestGetHonchoClient:
         assert mock_h1.call_args.kwargs["timeout"] == 88.0
 
         # A managed-timeout edit is detected (same-size write, so bump mtime).
-        managed_cfg.write_text("honcho:\n  timeout: 99\n")
+        managed_cfg.write_text("honcho:\n  timeout: 99\n", encoding="utf-8")
         st = managed_cfg.stat()
         os.utime(managed_cfg, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
 
@@ -371,6 +371,37 @@ class TestGetHonchoClient:
         assert client3 is fake_honcho_2
         mock_h2.assert_called_once()
         assert mock_h2.call_args.kwargs["timeout"] == 99.0
+
+    def test_local_dot_form_profile_host_uses_configured_api_key(self, tmp_path, monkeypatch):
+        """Local Honcho auth must respect legacy dot-form host blocks (#37436)."""
+        config_file = tmp_path / "honcho.json"
+        config_file.write_text(json.dumps({
+            "baseUrl": "http://localhost:8000",
+            "hosts": {
+                "hermes.profile_a": {
+                    "workspace": "ws-profile-a",
+                    "apiKey": "jwt-for-local-honcho",
+                }
+            },
+        }), encoding="utf-8")
+        cfg = HonchoClientConfig.from_global_config(
+            host="hermes_profile_a",
+            config_path=config_file,
+        )
+        captured_kwargs = {}
+
+        class FakeHoncho:
+            def __init__(self, **kwargs):
+                captured_kwargs.update(kwargs)
+
+        monkeypatch.setitem(sys.modules, "honcho", types.SimpleNamespace(Honcho=FakeHoncho))
+        with patch("tools.lazy_deps.ensure", return_value=None), \
+             patch("hermes_cli.config.load_config", return_value={}):
+            client = get_honcho_client(cfg)
+
+        assert isinstance(client, FakeHoncho)
+        assert cfg.api_key == "jwt-for-local-honcho"
+        assert captured_kwargs["api_key"] == "jwt-for-local-honcho"
 
 
 class TestResolveSessionNameGatewayKey:
@@ -465,7 +496,7 @@ class TestDialecticDepthParsing:
 
     def test_depth_clamped_high(self, tmp_path):
         config_file = tmp_path / "config.json"
-        config_file.write_text(json.dumps({"apiKey": "***", "dialecticDepth": 10}))
+        config_file.write_text(json.dumps({"apiKey": "***", "dialecticDepth": 10}), encoding="utf-8")
         config = HonchoClientConfig.from_global_config(config_path=config_file)
         assert config.dialectic_depth == 3
 
