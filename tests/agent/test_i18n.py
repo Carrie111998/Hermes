@@ -120,6 +120,14 @@ def test_t_missing_key_in_non_english_falls_back_to_english(tmp_path, monkeypatc
         i18n.reset_language_cache()
 
 
+def test_english_approval_resume_copy_is_voice_compatible():
+    """Gateway approval confirmation should be plain, warm system copy."""
+    text = i18n.t("gateway.approve.once_singular", lang="en")
+    assert text == "✅ Approved — I’m back on it."
+    assert "The agent is resuming" not in text
+    assert "Command approved" not in text
+
+
 
 
 # ---------------------------------------------------------------------------

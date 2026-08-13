@@ -658,6 +658,22 @@ def _format_exec_approval_fallback(
     )
 
 
+def _approval_send_succeeded(send_result: Any) -> tuple[bool, str | None]:
+    """Return whether a plain-text approval prompt was actually delivered.
+
+    The gateway approval queue treats notification failure differently from a
+    human timeout. Button-based approval already checks SendResult.success.
+    Plain-text fallback must do the same, or platforms such as Signal can fail
+    the send while the protected-write gate still waits 300 seconds for an
+    answer the user never saw.
+    """
+    if send_result is None:
+        return True, None
+    if getattr(send_result, "success", True):
+        return True, None
+    return False, getattr(send_result, "error", None) or "approval prompt send failed"
+
+
 def _gateway_provider_error_reply(text: str) -> str:
     """Map raw provider/API errors to a short user-safe Telegram reply."""
     if _GATEWAY_AUTH_ERROR_RE.search(text):
@@ -1494,6 +1510,57 @@ def _select_cached_agent_history(
         if has_unpersisted_row:
             return list(live_history)
     return persisted_history
+
+
+def _bound_long_lived_history(
+    history: List[Dict[str, Any]], max_messages: int,
+) -> List[Dict[str, Any]]:
+    """Return a replay-safe recent tail for a long-lived chat session.
+
+    The complete transcript remains in the session database.  This function
+    only limits the messages sent to the model.  The cut starts at a user
+    message.  This prevents an orphan tool result or assistant tool call at
+    the start of the replay window.
+    """
+    try:
+        limit = int(max_messages)
+    except (TypeError, ValueError):
+        return history
+    if limit < 8 or len(history) <= limit:
+        return history
+
+    start = max(0, len(history) - limit)
+    while start < len(history) and history[start].get("role") != "user":
+        start += 1
+    if start >= len(history):
+        return history
+
+    bounded = list(history[start:])
+    bounded = strip_interrupted_tool_tails(bounded)
+    bounded = strip_dangling_tool_call_tail(bounded)
+    return bounded or history
+
+
+def _long_lived_history_limit(user_config: Any, platform: Any) -> int | None:
+    """Return the configured replay limit for the current platform."""
+    if not isinstance(user_config, dict):
+        return None
+    gateway = user_config.get("gateway")
+    if not isinstance(gateway, dict):
+        return None
+    policy = gateway.get("long_lived_history")
+    if not isinstance(policy, dict) or not policy.get("enabled", False):
+        return None
+    platform_name = str(getattr(platform, "value", platform) or "").lower()
+    platforms = policy.get("platforms", ["signal"])
+    if not isinstance(platforms, list) or platform_name not in {
+        str(item).lower() for item in platforms
+    }:
+        return None
+    try:
+        return int(policy.get("max_messages", 120))
+    except (TypeError, ValueError):
+        return None
 
 
 def _wrap_current_message_with_observed_context(message: Any, observed_context: Optional[str]) -> Any:
@@ -5172,7 +5239,12 @@ class TurnRunner:
                         return
             _deliver_bg_review_message(message)
 
-        agent.background_review_callback = _bg_review_send
+        _bg_review_enabled = bool(
+            ctx.user_config.get("display", {}).get(
+                "background_review_notifications", True
+            )
+        )
+        agent.background_review_callback = _bg_review_send if _bg_review_enabled else None
         # Register the release hook on the adapter so base.py's finally
         # block can fire it after delivering the main response.
         if ctx._status_adapter and ctx.session_key:
@@ -5355,6 +5427,19 @@ class TurnRunner:
                 agent_history = strip_stale_dangerous_confirmations(
                     _selected, now=time.time()
                 )
+
+        _history_limit = _long_lived_history_limit(ctx.user_config, ctx.source.platform)
+        if _history_limit:
+            _unbounded_count = len(agent_history)
+            agent_history = _bound_long_lived_history(agent_history, _history_limit)
+            if len(agent_history) < _unbounded_count:
+                logger.info(
+                    "Bounded long-lived %s replay history for session %s: %d -> %d messages; full transcript remains searchable",
+                    getattr(ctx.source.platform, "value", ctx.source.platform),
+                    ctx.session_key,
+                    _unbounded_count,
+                    len(agent_history),
+                )
         
         # Collect MEDIA paths already in history so we can exclude them
         # from the current turn's extraction. This is compression-safe:
@@ -5459,9 +5544,13 @@ class TurnRunner:
                     log_message="Approval text-send scheduling error",
                 )
                 if _approval_send_fut is not None:
-                    _approval_send_fut.result(timeout=15)
+                    _approval_send_result = _approval_send_fut.result(timeout=15)
+                    _ok, _err = _approval_send_succeeded(_approval_send_result)
+                    if not _ok:
+                        raise RuntimeError(_err or "approval prompt send failed")
             except Exception as _e:
                 logger.error("Failed to send approval request: %s", _e)
+                raise
 
         # Keep real user text separate from API-only recovery guidance.  If
         # an auto-continue note is prepended below, persist the original

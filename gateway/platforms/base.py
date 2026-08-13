@@ -5441,6 +5441,31 @@ class BasePlatformAdapter(ABC):
             return self
         return live_adapter
 
+    _SCRATCH_LINE_RE = re.compile(
+        r"(?im)^(?:\s*(?:[-*]\s*)?)(?:"
+        r"Need\s+(?:install|commit|push|verify|status|todo|objective|maybe)\b.*"
+        r"|Updated the skill library\.\s*"
+        r"|Session restored successfully\.\s*"
+        r")$"
+    )
+    _CODE_SPAN_RE = re.compile(r"`[^`]*`")
+    _CODE_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
+
+    @classmethod
+    def _looks_like_internal_scratch_text(cls, content: str) -> bool:
+        """Return True for planner-note fragments that must not reach chat.
+
+        This is a last-mile guard. Identity instructions can reduce bad output,
+        but platform delivery must still block obvious private scratch notes
+        such as "Need commit push." before they become user-visible messages.
+        Quoted/code spans are allowed so diagnostic explanations can discuss a
+        leak without being blocked.
+        """
+        text = str(content or "")
+        scrubbed = cls._CODE_BLOCK_RE.sub("", text)
+        scrubbed = cls._CODE_SPAN_RE.sub("", scrubbed)
+        return bool(cls._SCRATCH_LINE_RE.search(scrubbed))
+
     async def _send_with_retry(
         self,
         chat_id: str,
@@ -5458,6 +5483,14 @@ class BasePlatformAdapter(ABC):
         network errors, sends the user a brief delivery-failure notice so they
         know to retry rather than waiting indefinitely.
         """
+
+        if self._looks_like_internal_scratch_text(content):
+            logger.error("[%s] Blocked internal scratch text before outbound delivery", self.name)
+            return SendResult(
+                success=False,
+                error="blocked internal scratch text before outbound delivery",
+                error_kind="bad_format",
+            )
 
         result = await self.send(
             chat_id=chat_id,
