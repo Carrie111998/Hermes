@@ -1248,18 +1248,22 @@ class TestBuildJobPromptBumpUse:
 
         with patch("tools.skills_tool.skill_view", side_effect=_skill_view), \
              patch("tools.skill_usage.bump_use") as mock_bump:
-            _build_job_prompt({
-                "id": "cron-task",
-                "skills": ["alpha", "beta"],
-                "prompt": "go",
-            })
+            _build_job_prompt(
+                {
+                    "id": "cron-task",
+                    "skills": ["alpha", "beta"],
+                    "prompt": "go",
+                },
+                session_id="cron-task_20260101_000000",
+            )
 
         assert mock_bump.call_count == 2
         calls = [c[0][0] for c in mock_bump.call_args_list]
         assert "alpha" in calls
         assert "beta" in calls
         assert all(
-            call.kwargs == {"task_id": "cron-task"}
+            call.kwargs
+            == {"task_id": "cron-task", "session_id": "cron-task_20260101_000000"}
             for call in mock_bump.call_args_list
         )
 

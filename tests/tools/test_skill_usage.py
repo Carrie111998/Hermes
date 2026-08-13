@@ -105,6 +105,38 @@ def test_bump_view_increments_and_timestamps(skills_home):
     assert rec["last_viewed_at"] is not None
 
 
+def test_bump_use_records_bounded_recent_session_ids(skills_home):
+    from tools.skill_usage import bump_use, get_record
+
+    for i in range(12):
+        bump_use("my-skill", session_id=f"session-{i}")
+
+    rec = get_record("my-skill")
+    # Newest first, capped at 10 even though 12 sessions used the skill.
+    assert rec["recent_session_ids"] == [f"session-{i}" for i in range(11, 1, -1)]
+
+
+def test_bump_use_moves_repeated_session_id_to_front_without_duplicating(skills_home):
+    from tools.skill_usage import bump_use, get_record
+
+    bump_use("my-skill", session_id="session-a")
+    bump_use("my-skill", session_id="session-b")
+    bump_use("my-skill", session_id="session-a")
+
+    rec = get_record("my-skill")
+    assert rec["recent_session_ids"] == ["session-a", "session-b"]
+
+
+def test_bump_use_without_session_id_leaves_recent_session_ids_untouched(skills_home):
+    from tools.skill_usage import bump_use, get_record
+
+    bump_use("my-skill", session_id="session-a")
+    bump_use("my-skill")
+
+    rec = get_record("my-skill")
+    assert rec["recent_session_ids"] == ["session-a"]
+
+
 def test_skill_reuse_and_post_patch_reuse_are_derived_atomically(
     skills_home,
     monkeypatch,

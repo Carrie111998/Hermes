@@ -40,6 +40,7 @@ _clear_skills_prompt_cache = late("_clear_skills_prompt_cache")
 _config_profile_scope = late("_config_profile_scope")
 _hub_action_name = late("_hub_action_name")
 _installed_hub_identifiers = late("_installed_hub_identifiers")
+_open_session_db_for_profile = late("_open_session_db_for_profile")
 _profile_cli_args = late("_profile_cli_args")
 _profile_scope = late("_profile_scope")
 _skill_meta_to_payload = late("_skill_meta_to_payload")
@@ -395,6 +396,27 @@ async def scan_skill_hub(identifier: str = "", profile: Optional[str] = None):
     return result
 
 
+def _resolve_recent_sessions(db, record):
+    """Resolve a usage record's bounded ``recent_session_ids`` against state.db.
+
+    Stale ids (session deleted/pruned) are omitted rather than cleaned up —
+    the bounded list self-heals on next use.
+    """
+    resolved = []
+    for session_id in record.get("recent_session_ids") or []:
+        session = db.get_session(session_id)
+        if session is None:
+            continue
+        resolved.append({
+            "session_id": session_id,
+            "title": session.get("title"),
+            "source": session.get("source"),
+            "model": session.get("model"),
+            "started_at": session.get("started_at"),
+        })
+    return resolved
+
+
 @router.get("/api/skills")
 async def get_skills(profile: Optional[str] = None):
     from tools.skills_tool import _find_all_skills
@@ -419,12 +441,23 @@ async def get_skills(profile: Optional[str] = None):
             hub_names = _read_hub_installed_names()
         for s in skills:
             s["enabled"] = s["name"] not in disabled
-            s["usage"] = activity_count(usage.get(s["name"], {}))
+            record = usage.get(s["name"], {})
+            s["usage"] = activity_count(record)
             s["provenance"] = (
                 "hub" if s["name"] in hub_names
                 else "bundled" if s["name"] in bundled_names
                 else "agent"
             )
+            s["recent_sessions"] = []
+        try:
+            db = _open_session_db_for_profile(profile, read_only=True)
+        except Exception:
+            return skills
+        try:
+            for s in skills:
+                s["recent_sessions"] = _resolve_recent_sessions(db, usage.get(s["name"], {}))
+        finally:
+            db.close()
         return skills
 
     return await asyncio.to_thread(_run)

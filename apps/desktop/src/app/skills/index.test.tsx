@@ -45,6 +45,17 @@ vi.mock('react-router', async importOriginal => ({
   useNavigate: () => navigateSpy
 }))
 
+function skill(overrides: Record<string, unknown> = {}) {
+  return {
+    name: 'my-skill',
+    category: 'general',
+    description: 'A test skill',
+    enabled: true,
+    provenance: 'agent',
+    ...overrides
+  }
+}
+
 function toolset(overrides: Record<string, unknown> = {}) {
   return {
     name: 'web',
@@ -153,5 +164,84 @@ describe('SkillsView toolset management', () => {
     // Internal route change into the Models section with the aux slot target —
     // consumed by ModelSettings' deep-link highlight. Never an external URL.
     await waitFor(() => expect(navigateSpy).toHaveBeenCalledWith('/settings?tab=config:model&aux=vision'))
+  })
+})
+
+describe('SkillsView skill detail — recent sessions', () => {
+  async function renderSkillsTab() {
+    const { SkillsView } = await import('./index')
+    await act(async () => {
+      render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={['/skills']}>
+            <SkillsView />
+          </MemoryRouter>
+        </QueryClientProvider>
+      )
+    })
+  }
+
+  it('shows recent sessions and navigates to one on click', async () => {
+    getSkills.mockResolvedValue([
+      skill({
+        recent_sessions: [
+          { session_id: 'sess-1', title: 'Debugging the parser', source: 'cli', model: 'gpt-5', started_at: 1000 }
+        ]
+      })
+    ])
+
+    await renderSkillsTab()
+
+    await screen.findByText('Debugging the parser')
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Debugging the parser'))
+    })
+
+    expect(navigateSpy).toHaveBeenCalledWith('/sess-1')
+  })
+
+  it('hides the recent sessions section when the list is empty', async () => {
+    getSkills.mockResolvedValue([skill({ recent_sessions: [] })])
+
+    await renderSkillsTab()
+
+    await screen.findByText('A test skill')
+    expect(screen.queryByText('Recent sessions')).toBeNull()
+  })
+
+  it('shows the model used alongside each session', async () => {
+    getSkills.mockResolvedValue([
+      skill({
+        recent_sessions: [
+          { session_id: 'sess-1', title: 'Debugging the parser', source: 'cli', model: 'gpt-5', started_at: 1000 }
+        ]
+      })
+    ])
+
+    await renderSkillsTab()
+
+    await screen.findByText('Debugging the parser')
+    expect(screen.getByText('gpt-5')).toBeTruthy()
+  })
+
+  it('collapses the section on toggle, hiding the session rows', async () => {
+    getSkills.mockResolvedValue([
+      skill({
+        recent_sessions: [
+          { session_id: 'sess-1', title: 'Debugging the parser', source: 'cli', model: 'gpt-5', started_at: 1000 }
+        ]
+      })
+    ])
+
+    await renderSkillsTab()
+
+    await screen.findByText('Debugging the parser')
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Recent sessions'))
+    })
+
+    expect(screen.queryByText('Debugging the parser')).toBeNull()
   })
 })

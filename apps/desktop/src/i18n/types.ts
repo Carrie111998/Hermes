@@ -923,6 +923,7 @@ export interface Translations {
     archive: string
     skillArchivedTitle: string
     skillArchivedMessage: string
+    recentSessions: string
     hub: {
       searchPlaceholder: string
       search: string

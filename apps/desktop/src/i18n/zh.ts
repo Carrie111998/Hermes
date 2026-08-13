@@ -1262,6 +1262,7 @@ export const zh: Translations = {
     archive: '归档',
     skillArchivedTitle: '技能已归档',
     skillArchivedMessage: '可通过 hermes curator restore 恢复。',
+    recentSessions: '最近的会话',
     hub: {
       searchPlaceholder: '搜索技能中心',
       search: '搜索',

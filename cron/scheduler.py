@@ -2850,6 +2850,7 @@ def _build_job_prompt(
     job: dict,
     prerun_script: Optional[tuple] = None,
     extra_prompt: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
@@ -2864,6 +2865,11 @@ def _build_job_prompt(
             #57331 — salvaged from #57342 by @liuhao1024). Appended to the
             stored prompt under a ``## Run Context`` header for this single
             fire only — never persisted to the job definition.
+        session_id: The durable cron session id this run will execute
+            under (``cron_{job_id}_{timestamp}``), computed by the caller
+            before the session exists. Threaded into ``bump_use()`` so
+            "recent sessions" resolves against the session actually
+            recorded in ``state.db`` rather than the bare job id.
     """
     user_prompt = str(job.get("prompt") or "")
     if extra_prompt:
@@ -3042,7 +3048,11 @@ def _build_job_prompt(
 
         # Bump usage so the curator sees this skill as actively used.
         try:
-            bump_use(skill_name, task_id=str(job.get("id") or "") or None)
+            bump_use(
+                skill_name,
+                task_id=str(job.get("id") or "") or None,
+                session_id=session_id,
+            )
         except Exception:
             logger.debug("Cron job: failed to bump skill usage for '%s'", skill_name, exc_info=True)
 
@@ -3721,9 +3731,11 @@ def run_job(
             )
             return True, silent_doc, SILENT_MARKER, None
 
+    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
     try:
         prompt = _build_job_prompt(
-            job, prerun_script=prerun_script, extra_prompt=extra_prompt
+            job, prerun_script=prerun_script, extra_prompt=extra_prompt,
+            session_id=_cron_session_id,
         )
     except CronPromptInjectionBlocked as block_exc:
         # Assembled prompt (user prompt + loaded skill content) tripped the
@@ -3751,7 +3763,6 @@ def run_job(
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])

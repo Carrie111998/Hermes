@@ -948,6 +948,17 @@ export interface ProfilesResponse {
   profiles: ProfileInfo[]
 }
 
+/** A resolved entry from a skill's bounded recent-session list. Sessions that
+ *  were deleted/pruned from state.db are omitted server-side, so every entry
+ *  here refers to a session that still exists. */
+export interface SkillRecentSession {
+  session_id: string
+  title: null | string
+  source: null | string
+  model: null | string
+  started_at: null | number
+}
+
 export interface SkillInfo {
   category: string
   description: string
@@ -957,6 +968,9 @@ export interface SkillInfo {
   usage?: number
   /** 'agent' = learned/local (editable), 'bundled' = ships with Hermes, 'hub' = installed. */
   provenance?: 'agent' | 'bundled' | 'hub'
+  /** Most recent sessions that used this skill, newest first (bounded, ≤10).
+   *  Absent on older backends. */
+  recent_sessions?: SkillRecentSession[]
 }
 
 export interface ToolsetInfo {

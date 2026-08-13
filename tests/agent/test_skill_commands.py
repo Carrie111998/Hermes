@@ -349,6 +349,7 @@ class TestBuildPreloadedSkillsPrompt:
         bump_use.assert_called_once_with(
             "preloaded-skill",
             task_id="task-preloaded",
+            session_id="task-preloaded",
         )
 
 
@@ -392,7 +393,9 @@ class TestBuildSkillInvocationMessage:
             )
 
         assert msg is not None
-        bump_use.assert_called_once_with("test-skill", task_id="task-slash")
+        bump_use.assert_called_once_with(
+            "test-skill", task_id="task-slash", session_id="task-slash"
+        )
 
 
     def test_uses_shared_skill_loader_for_secure_setup(self, tmp_path, monkeypatch):
@@ -673,7 +676,7 @@ class TestStackedSkillCommands:
             "skill-b",
         ]
         assert all(
-            call.kwargs == {"task_id": "task-stacked"}
+            call.kwargs == {"task_id": "task-stacked", "session_id": "task-stacked"}
             for call in bump_use.call_args_list
         )
 
