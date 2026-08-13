@@ -61,6 +61,7 @@ class TestApplyYamlConfigValidationError:
         # The ValueError was logged at ERROR, not swallowed at debug
         assert any(
             "Configuration error" in record.message
+            and "YAML bridge" in record.message
             and record.levelno == logging.ERROR
             for record in caplog.records
         ), (
@@ -93,13 +94,30 @@ class TestApplyYamlConfigValidationError:
         with patch("gateway.platform_registry.platform_registry", mock_registry):
             from gateway.config import load_gateway_config
 
-            # Should NOT raise — generic handler catches it
-            gw_config = load_gateway_config()
-            assert gw_config is not None
+            # Capture gateway.config at DEBUG to verify the generic
+            # exception handler still fires.
+            with caplog.at_level(logging.DEBUG, logger="gateway.config"):
+                # Should NOT raise — generic handler catches it
+                gw_config = load_gateway_config()
+                assert gw_config is not None
 
         # RuntimeError was NOT logged at ERROR (only ValueError gets ERROR)
         assert not any(
             record.levelno == logging.ERROR
             and "broken_platform" in record.message
             for record in caplog.records
+        ), (
+            "RuntimeError should NOT produce an ERROR log — "
+            f"got: {[(r.levelname, r.message) for r in caplog.records]}"
+        )
+
+        # The generic-exception debug message WAS logged (backward compat)
+        assert any(
+            record.levelno == logging.DEBUG
+            and "apply_yaml_config_fn" in record.message
+            and "broken_platform" in record.message
+            for record in caplog.records
+        ), (
+            "Expected DEBUG log for generic exception from "
+            f"apply_yaml_config_fn, got: {[(r.levelname, r.message) for r in caplog.records]}"
         )
