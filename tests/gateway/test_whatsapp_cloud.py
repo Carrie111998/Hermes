@@ -1028,7 +1028,7 @@ class TestGroupMessageGating:
 
     @pytest.mark.parametrize(
         "configured",
-        ["15559998888", "+15559998888", "+1 555 999 8888", "(555) 999-8888"],
+        ["15559998888", "+15559998888", "+1 555 999 8888", "1 (555) 999-8888"],
     )
     @pytest.mark.asyncio
     async def test_business_number_is_matched_whatever_its_format(self, monkeypatch, configured):
@@ -1048,6 +1048,29 @@ class TestGroupMessageGating:
         )
 
         assert event is not None
+
+    @pytest.mark.asyncio
+    async def test_a_different_number_is_not_the_bot(self, monkeypatch):
+        """Normalization must not blur one number into another.
+
+        A business number configured without its country code normalizes to
+        a genuinely different wa_id than the one mentioned in the text, and
+        must not match. The gate's substring fallback would have matched it
+        (5559998888 occurs inside @15559998888), which is exactly why the
+        mention check is pinned to the full "@<wa_id>" form.
+        """
+        monkeypatch.setenv("WHATSAPP_REQUIRE_MENTION", "true")
+        adapter = _make_adapter()
+        adapter._group_policy = "open"
+        adapter._mention_patterns = []
+
+        event = await adapter._build_message_event_from_cloud(
+            _group_raw(text={"body": "@15559998888 what is the status?"}),
+            {"15551234567": "Alice"},
+            {"display_phone_number": "(555) 999-8888"},   # no country code
+        )
+
+        assert event is None
 
     @pytest.mark.asyncio
     async def test_require_mention_still_drops_unaddressed_group_chatter(self, monkeypatch):
