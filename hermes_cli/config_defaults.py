@@ -1839,6 +1839,15 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Operator-controlled model routing. The model may select only a tier
+        # name exposed by delegate_task's dynamic schema; provider/model and
+        # credentials remain config-owned. Each tier overlays the global route.
+        # ``models`` is accepted for forward-compatible ordered candidates;
+        # this release selects its first non-empty entry deterministically.
+        "routing": {
+            "default_tier": "",
+            "tiers": {},
+        },
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts

@@ -1479,6 +1479,7 @@ def _build_child_agent(
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
+    override_reasoning_effort: Any = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -1713,7 +1714,11 @@ def _build_child_agent(
         # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
         # False (``reasoning_effort: false``) to "" and inherit the parent
         # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
+        delegation_effort = (
+            override_reasoning_effort
+            if override_reasoning_effort is not None
+            else delegation_cfg.get("reasoning_effort")
+        )
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
 
@@ -3431,6 +3436,7 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    tier: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     action: Optional[str] = None,
@@ -3525,16 +3531,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -3561,7 +3557,12 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
+        single_task: Dict[str, Any] = {
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "tier": tier,
+        }
         if output_schema is not None:
             single_task["output_schema"] = output_schema
         task_list = [single_task]
@@ -3589,6 +3590,24 @@ def delegate_task(
         batch_error = _validate_batch_tasks(task_list)
         if batch_error:
             return tool_error(batch_error)
+
+    # Resolve every task independently so a batch can mix operator-defined
+    # routing tiers. The model chooses only a tier NAME; provider, model,
+    # endpoint and credentials remain entirely config-controlled.
+    task_routes: List[Dict[str, Any]] = []
+    for i, task in enumerate(task_list):
+        requested = task.get("tier") or tier
+        try:
+            task_routes.append(
+                _resolve_task_route(cfg, requested, parent_agent)
+            )
+        except ValueError as exc:
+            prefix = (
+                f"Task {i} routing tier {requested!r} invalid"
+                if requested
+                else f"Task {i} delegation route invalid"
+            )
+            return tool_error(f"{prefix}: {exc}")
 
     # T1-24: coerce/validate optional per-task output_schema up front so a
     # malformed schema fails the whole call loudly instead of spawning
@@ -3668,6 +3687,7 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
+        creds = task_routes[i]
         child = _build_child_preserving_parent_tools(
             task_index=i,
             goal=t["goal"],
@@ -3685,6 +3705,7 @@ def delegate_task(
             override_api_mode=creds["api_mode"],
             override_request_overrides=creds.get("request_overrides"),
             override_max_tokens=creds.get("max_output_tokens"),
+            override_reasoning_effort=creds.get("reasoning_effort"),
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
             role=effective_role,
@@ -4236,6 +4257,59 @@ def _resolve_child_credential_pool(
     return None
 
 
+def _configured_routing_tiers(cfg: dict) -> Dict[str, Dict[str, Any]]:
+    """Return valid operator-defined delegation tier overlays."""
+    routing = cfg.get("routing") if isinstance(cfg, dict) else None
+    raw_tiers = routing.get("tiers") if isinstance(routing, dict) else None
+    if not isinstance(raw_tiers, dict):
+        return {}
+    return {
+        str(name).strip(): value
+        for name, value in raw_tiers.items()
+        if str(name).strip() and isinstance(value, dict)
+    }
+
+
+def _resolve_task_route(
+    cfg: dict,
+    requested_tier: Optional[str],
+    parent_agent,
+) -> dict:
+    """Resolve one task through an operator-controlled routing tier.
+
+    Precedence is explicit tier, routing.default_tier, then the global
+    delegation route. Tier dictionaries overlay the global route and accept
+    either ``model`` or a ``models`` list; list selection is deterministic.
+    """
+    routing = cfg.get("routing") if isinstance(cfg, dict) else None
+    tiers = _configured_routing_tiers(cfg)
+    tier_name = str(requested_tier or "").strip()
+    if not tier_name and isinstance(routing, dict):
+        tier_name = str(routing.get("default_tier") or "").strip()
+    if not tier_name:
+        return _resolve_delegation_credentials(cfg, parent_agent)
+    if tier_name not in tiers:
+        available = ", ".join(tiers) if tiers else "none configured"
+        raise ValueError(
+            f"unknown tier {tier_name!r}; available tiers: {available}"
+        )
+
+    route_cfg = dict(cfg)
+    route_cfg.pop("routing", None)
+    tier_cfg = dict(tiers[tier_name])
+    models = tier_cfg.pop("models", None)
+    if not str(tier_cfg.get("model") or "").strip() and isinstance(models, list):
+        selected = next(
+            (str(item).strip() for item in models if str(item).strip()), ""
+        )
+        if selected:
+            tier_cfg["model"] = selected
+    route_cfg.update(tier_cfg)
+    resolved = _resolve_delegation_credentials(route_cfg, parent_agent)
+    resolved["reasoning_effort"] = route_cfg.get("reasoning_effort")
+    return resolved
+
+
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     """Resolve credentials for subagent delegation.
 
@@ -4529,6 +4603,33 @@ def _build_dynamic_schema_overrides() -> dict:
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
 
+    tiers = list(_configured_routing_tiers(_load_config()))
+    tier_description = (
+        "Operator-controlled routing tier. Available tiers: "
+        + ", ".join(tiers)
+        + ". Omit to use delegation.routing.default_tier."
+        if tiers
+        else "No operator-controlled routing tiers are currently configured."
+    )
+    # The nested static objects need copying before dynamic enum injection.
+    tasks_property = dict(overrides_params["properties"]["tasks"])
+    tasks_items = dict(tasks_property["items"])
+    tasks_item_properties = {
+        key: dict(value) for key, value in tasks_items["properties"].items()
+    }
+    tasks_items["properties"] = tasks_item_properties
+    tasks_property["items"] = tasks_items
+    overrides_params["properties"]["tasks"] = tasks_property
+    for tier_property in (
+        overrides_params["properties"]["tier"],
+        tasks_item_properties["tier"],
+    ):
+        tier_property["description"] = tier_description
+        if tiers:
+            tier_property["enum"] = tiers
+        else:
+            tier_property.pop("enum", None)
+
     return {
         "description": _build_top_level_description(),
         "parameters": overrides_params,
@@ -4584,6 +4685,10 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "tier": {
+                            "type": "string",
+                            "description": "Operator-controlled routing tier for this task.",
+                        },
                         "output_schema": {
                             "type": "object",
                             "description": (
@@ -4609,6 +4714,10 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "tier": {
+                "type": "string",
+                "description": "Operator-controlled routing tier for the single task or batch default.",
             },
             "output_schema": {
                 "type": "object",
@@ -4721,6 +4830,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        tier=args.get("tier"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
         action=args.get("action"),

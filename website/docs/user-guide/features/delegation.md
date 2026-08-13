@@ -170,6 +170,52 @@ Resolution order: `delegation.base_url` (direct endpoint) takes precedence, then
 
 Note that the pin is global: `delegate_task` has no per-task model parameter, so every child in a batch runs on the configured delegation model. For quality-sensitive subtasks that need a stronger model, either leave `delegation.model` unset for that session or hand the task to the [kanban board](kanban.md#per-task-model-override), which does support a per-task model override.
 
+### Operator-Controlled Routing Tiers
+
+For mixed-complexity workloads, operators can define named tiers. The model
+may choose only a configured tier name; it cannot supply arbitrary provider,
+model, endpoint, or credential values.
+
+```yaml
+delegation:
+  routing:
+    default_tier: simple
+    tiers:
+      simple:
+        provider: opencode-zen
+        model: big-pickle
+        reasoning_effort: low
+      moderate:
+        provider: opencode-go
+        model: deepseek-v4-flash
+        reasoning_effort: medium
+      substantial:
+        provider: opencode-go
+        model: deepseek-v4-pro
+        reasoning_effort: high
+      hard:
+        provider: openai-codex
+        model: gpt-5.6-sol
+        reasoning_effort: high
+```
+
+The available names are injected dynamically into the `delegate_task` schema:
+
+```python
+delegate_task(goal="Inventory the config", tier="simple", context="...")
+
+delegate_task(tasks=[
+    {"goal": "Inspect the logs", "tier": "moderate", "context": "..."},
+    {"goal": "Review the architecture", "tier": "hard", "context": "..."},
+])
+```
+
+An explicit per-task tier overrides the top-level `tier`; otherwise
+`routing.default_tier` is used. If no tier/default is configured, Hermes falls
+back to the global `delegation.provider` / `delegation.model` route. A tier may
+also specify `models: [...]`; the first non-empty entry is selected
+deterministically in this release.
+
 ## Inherited Tool Access
 
 `delegate_task` does not accept a model-facing `toolsets` parameter. Each subagent inherits the parent's enabled toolsets so the model cannot grant a child capabilities that the parent does not have. Configure the parent's tools before starting the conversation if delegated work needs additional capabilities.
@@ -442,6 +488,9 @@ delegation:
   # worktree_isolation: false               # Give each child its own git worktree (see Worktree Isolation above)
   # max_spawn_depth: 1                      # Tree depth (floor 1, no ceiling, default 1 = flat). Raise to 2 to allow orchestrator children to spawn leaves; 3+ for deeper trees.
   # orchestrator_enabled: true              # Disable to force all children to leaf role.
+  routing:                                # Optional operator-controlled tier routing
+    default_tier: ""
+    tiers: {}
   model: "google/gemini-3-flash-preview"             # Optional provider/model override
   provider: "openrouter"                             # Optional built-in provider
   api_mode: anthropic_messages                       # optional; auto-detected from base_url for anthropic_messages endpoints

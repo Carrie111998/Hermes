@@ -30,6 +30,7 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _resolve_task_route,
 )
 from hermes_state import SessionDB
 
@@ -81,6 +82,216 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_command", props["tasks"]["items"]["properties"])
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
+        self.assertIn("tier", props)
+        self.assertIn("tier", props["tasks"]["items"]["properties"])
+
+    def test_dynamic_tier_enum_is_operator_controlled(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        cfg = {
+            "routing": {
+                "default_tier": "simple",
+                "tiers": {"simple": {}, "hard": {}},
+            }
+        }
+        with patch("tools.delegate_tool._load_config", return_value=cfg):
+            params = _build_dynamic_schema_overrides()["parameters"]
+
+        self.assertEqual(params["properties"]["tier"]["enum"], ["simple", "hard"])
+        self.assertEqual(
+            params["properties"]["tasks"]["items"]["properties"]["tier"]["enum"],
+            ["simple", "hard"],
+        )
+
+    def test_dynamic_tier_enum_never_mutates_static_schema(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        cfg = {"routing": {"tiers": {"simple": {}, "hard": {}}}}
+        with patch("tools.delegate_tool._load_config", return_value=cfg):
+            _build_dynamic_schema_overrides()
+        self.assertNotIn(
+            "enum",
+            DELEGATE_TASK_SCHEMA["parameters"]["properties"]["tier"],
+        )
+        self.assertNotIn(
+            "enum",
+            DELEGATE_TASK_SCHEMA["parameters"]["properties"]["tasks"]["items"]["properties"]["tier"],
+        )
+
+
+class TestDelegationTierRouting(unittest.TestCase):
+    @staticmethod
+    def _passthrough(cfg, _parent):
+        return {
+            "model": cfg.get("model"),
+            "provider": cfg.get("provider"),
+            "base_url": cfg.get("base_url"),
+            "api_key": cfg.get("api_key"),
+            "api_mode": cfg.get("api_mode"),
+        }
+
+    def test_no_routing_uses_global_route(self):
+        cfg = {"provider": "deepseek", "model": "flash"}
+        with patch(
+            "tools.delegate_tool._resolve_delegation_credentials",
+            side_effect=self._passthrough,
+        ):
+            route = _resolve_task_route(cfg, None, _make_mock_parent())
+        self.assertEqual((route["provider"], route["model"]), ("deepseek", "flash"))
+
+    def test_default_tier_overlays_global_route_and_accepts_models_list(self):
+        cfg = {
+            "provider": "deepseek",
+            "model": "flash",
+            "routing": {
+                "default_tier": "moderate",
+                "tiers": {
+                    "moderate": {"provider": "opencode-go", "models": ["kimi-k3"]}
+                },
+            },
+        }
+        with patch(
+            "tools.delegate_tool._resolve_delegation_credentials",
+            side_effect=self._passthrough,
+        ):
+            route = _resolve_task_route(cfg, None, _make_mock_parent())
+        self.assertEqual((route["provider"], route["model"]), ("opencode-go", "kimi-k3"))
+
+    def test_explicit_tier_beats_default(self):
+        cfg = {
+            "routing": {
+                "default_tier": "simple",
+                "tiers": {
+                    "simple": {"provider": "deepseek", "model": "flash"},
+                    "hard": {
+                        "provider": "openai-codex",
+                        "model": "gpt-5.6-sol",
+                        "reasoning_effort": "high",
+                    },
+                },
+            }
+        }
+        with patch(
+            "tools.delegate_tool._resolve_delegation_credentials",
+            side_effect=self._passthrough,
+        ):
+            route = _resolve_task_route(cfg, "hard", _make_mock_parent())
+        self.assertEqual(
+            (route["provider"], route["model"]),
+            ("openai-codex", "gpt-5.6-sol"),
+        )
+        self.assertEqual(route["reasoning_effort"], "high")
+
+    def test_unknown_tier_is_rejected(self):
+        cfg = {"routing": {"tiers": {"simple": {}}}}
+        with self.assertRaisesRegex(ValueError, "available tiers: simple"):
+            _resolve_task_route(cfg, "elite", _make_mock_parent())
+
+    def test_non_dict_tier_entries_are_filtered(self):
+        from tools.delegate_tool import _configured_routing_tiers
+
+        cfg = {
+            "routing": {
+                "tiers": {
+                    "simple": {"provider": "deepseek", "model": "flash"},
+                    "broken": "not-a-dict",
+                    "": {},
+                    "blank-name": None,
+                }
+            }
+        }
+        self.assertEqual(_configured_routing_tiers(cfg), {"simple": cfg["routing"]["tiers"]["simple"]})
+
+    def test_reasoning_effort_false_preserved_through_tier(self):
+        cfg = {
+            "provider": "deepseek",
+            "model": "flash",
+            "routing": {
+                "default_tier": "fast",
+                "tiers": {"fast": {"model": "flash", "reasoning_effort": False}},
+            },
+        }
+        with patch(
+            "tools.delegate_tool._resolve_delegation_credentials",
+            side_effect=self._passthrough,
+        ):
+            route = _resolve_task_route(cfg, None, _make_mock_parent())
+        self.assertIs(route["reasoning_effort"], False)
+
+    def test_empty_models_list_falls_back_to_global_model(self):
+        cfg = {
+            "provider": "deepseek",
+            "model": "flash",
+            "routing": {
+                "default_tier": "placeholder",
+                "tiers": {"placeholder": {"provider": "deepseek", "models": []}},
+            },
+        }
+        with patch(
+            "tools.delegate_tool._resolve_delegation_credentials",
+            side_effect=self._passthrough,
+        ):
+            route = _resolve_task_route(cfg, None, _make_mock_parent())
+        self.assertEqual((route["provider"], route["model"]), ("deepseek", "flash"))
+
+    def test_batch_resolves_each_task_tier_independently(self):
+        cfg = {
+            "max_iterations": 5,
+            "routing": {
+                "default_tier": "simple",
+                "tiers": {
+                    "simple": {"provider": "opencode-zen", "model": "big-pickle"},
+                    "hard": {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+                },
+            },
+        }
+        built = []
+
+        def capture_child(**kwargs):
+            child = MagicMock()
+            child._delegate_role = "leaf"
+            child._subagent_id = f"child-{len(built)}"
+            built.append(kwargs)
+            return child
+
+        def completed(task_index, goal, child, parent_agent, **kwargs):
+            return {
+                "task_index": task_index,
+                "status": "completed",
+                "summary": goal,
+                "api_calls": 1,
+                "duration_seconds": 0.01,
+                "model": built[task_index]["model"],
+                "exit_reason": "completed",
+            }
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch(
+                "tools.delegate_tool._resolve_delegation_credentials",
+                side_effect=self._passthrough,
+            ),
+            patch(
+                "tools.delegate_tool._build_child_preserving_parent_tools",
+                side_effect=capture_child,
+            ),
+            patch("tools.delegate_tool._run_single_child", side_effect=completed),
+            patch("tools.delegate_tool.create_live_transcripts", create=True),
+        ):
+            result = delegate_task(
+                tasks=[
+                    {"goal": "Perform a simple inventory", "tier": "simple"},
+                    {"goal": "Perform a difficult architecture review", "tier": "hard"},
+                ],
+                parent_agent=_make_mock_parent(depth=0),
+            )
+
+        parsed = json.loads(result)
+        self.assertNotIn("error", parsed)
+        self.assertEqual(
+            [(item["override_provider"], item["model"]) for item in built],
+            [("opencode-zen", "big-pickle"), ("openai-codex", "gpt-5.6-sol")],
+        )
 
     def test_top_level_description_compact_and_complete(self):
         """The top-level description must stay compact while keeping every
@@ -1383,6 +1594,37 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertEqual(captured["goal"], "test")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
+
+    def test_tier_is_forwarded_from_live_dispatch_path(self):
+        """The model-facing dispatch must forward the tier parameter.
+
+        Regression: the schema gained 'tier' but run_agent._dispatch_delegate_task
+        did not forward it, so explicit tiers were silently dropped and every
+        child resolved through the default route.
+        """
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {
+                    "goal": "test",
+                    "tier": "hard",
+                    "tasks": [
+                        {"goal": "nested", "tier": "simple"},
+                    ],
+                },
+            )
+
+        self.assertEqual(captured["tier"], "hard")
+        self.assertEqual(captured["tasks"][0]["tier"], "simple")
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
