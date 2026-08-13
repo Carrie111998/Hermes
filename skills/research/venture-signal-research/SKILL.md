@@ -2,7 +2,7 @@
 name: venture-signal-research
 description: "Use when validating venture demand and buyer pain."
 version: 0.1.0
-author: Karl, Codex, and Hermes Agent
+author: Karl (zook111), Codex, and Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
@@ -12,7 +12,7 @@ metadata:
     related_skills: [grounded-citations]
 ---
 
-# Venture Signal Research
+# Venture Signal Research Skill
 
 Turn public-web research into an auditable demand decision. Keep discovery,
 verification, quantification, and synthesis separate so weak snippets or a
