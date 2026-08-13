@@ -158,7 +158,7 @@ _ENV_ASSIGN_RE = re.compile(
 # ``FAL_KEY=…``, ``db_pw=…``) — NOT bare ``password=``/``token=``/``secret=``,
 # which appear in prose, URLs, and form bodies (issue #77484).
 _ENV_ASSIGN_LOWER_RE = re.compile(
-    rf"([a-z0-9_]+(?:_|^)(?:key|pass|pw|token|secret|password|passwd|credential|auth)(?=[^a-z0-9_]|$))\s*=\s*(['\"]?)(\S+)\2",
+    rf"([a-z0-9_]{{1,128}}(?:_|^)(?:key|pass|pw|token|secret|password|passwd|credential|auth)(?=[^a-z0-9_]|$))\s*=\s*(['\"]?)(\S+)\2",
     re.IGNORECASE,
 )
 
@@ -200,14 +200,18 @@ _ENV_LOOKUP_VALUE_RE = re.compile(
 # The ``*`` runs bordering {_SECRET_CFG_NAMES} must stay backtrackable
 # (secret words are matchable by the class, e.g. ``app.api.key=…``).
 _CFG_DOTTED_RE = re.compile(
-    rf"([A-Za-z0-9_\-]++\.[A-Za-z0-9_.\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_.\-]*+"
-    rf"|[A-Za-z0-9_.\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_.\-]*\.[A-Za-z0-9_.\-]++)"
+    rf"([A-Za-z0-9_\-]{{1,256}}+\.[A-Za-z0-9_.\-]{{0,256}}{_SECRET_CFG_NAMES}[A-Za-z0-9_.\-]{{0,256}}+"
+    rf"|[A-Za-z0-9_.\-]{{0,256}}{_SECRET_CFG_NAMES}[A-Za-z0-9_.\-]{{0,256}}\.[A-Za-z0-9_.\-]{{1,256}}+)"
     rf"={_CFG_VALUE}",
     re.IGNORECASE,
 )
 # Line-anchored bare key: ``password=…`` / ``export api_key=…`` at start of line.
+# Match the complete key with a possessive linear scan, then let
+# ``_key_has_secret_keyword`` validate it in the replacement callback. This
+# keeps arbitrarily long real config keys detectable without reintroducing
+# backtracking on long non-matching input.
 _CFG_ANCHORED_RE = re.compile(
-    rf"(^[ \t]*(?:export[ \t]+)?[A-Za-z0-9_\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_\-]*)={_CFG_VALUE}",
+    rf"(^[ \t]*(?:export[ \t]+)?[A-Za-z0-9_\-]++)={_CFG_VALUE}",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -431,7 +435,7 @@ _URL_USERINFO_RE = re.compile(
 # the key is decoded separately for classification. Values stop at query or
 # fragment pair separators; both ``&`` and ``;`` are valid in deployed URLs.
 _STRICT_URL_PARAM_RE = re.compile(
-    r"([?#&;])([A-Za-z0-9_.~+%\-]+)=([^#&;\s\"'<>]*)"
+    r"([?#&;])([A-Za-z0-9_.~+%\-\[\]]+?)(=|%3[dD])([^#&;\s\"'<>]*)"
 )
 
 # Match userinfo in both absolute (``scheme://user:pass@host``) and
@@ -484,72 +488,6 @@ _TOKEN_BODY_CHARS = frozenset(
 _PREFIX_RE = re.compile(
     r"(?<![A-Za-z0-9_-])(" + "|".join(_PREFIX_PATTERNS) + r")(?![A-Za-z0-9_-])"
 )
-# Binary-container framing can sit directly beside a credential and defeat the
-# display redactor's word-boundary guards. This variant recognizes only the
-# real, minimum token witnesses encoded by _PREFIX_PATTERNS; it does not add
-# boundaries, suffixes, or other bytes that are absent from the input.
-_PREFIX_ANYWHERE_RE = re.compile(r"(?:" + "|".join(_PREFIX_PATTERNS) + r")")
-_RAW_SECRET_ASSIGNMENT_RE = re.compile(
-    r"(?P<key>api[ _.\-]?key|token|secret|passwd|password|pass|pw|credential|auth|key)"
-    r"\s*=\s*['\"]?[A-Za-z0-9_./:+@%~!#$^*?\-]",
-    re.IGNORECASE,
-)
-# These short words commonly appear as suffixes in ordinary identifiers
-# (``xkey``, ``oauth``). Require their normal boundary even in framed data.
-_RAW_AMBIGUOUS_ASSIGNMENT_KEYS = frozenset({"auth", "key", "pass", "pw"})
-
-
-def contains_framing_tolerant_secret(text: str) -> bool:
-    """Return whether binary-framed text contains a complete secret witness.
-
-    Known prefixes must satisfy a full pattern from ``_PREFIX_PATTERNS``,
-    including its real minimum body length. Assignments must contain a real
-    secret-key word, ``=``, and at least one real printable value character.
-    A single adjacent identifier character is tolerated only when it is itself
-    preceded by a control byte or a surrogate-preserved binary byte, matching
-    SQLite record headers without treating words such as ``monkey=`` or
-    ``task-...`` as credentials. No boundaries, values, terminators, or other
-    bytes are added to the input.
-    """
-    if not text:
-        return False
-
-    def is_identifier_char(char: str) -> bool:
-        return char.isascii() and (char.isalnum() or char in "_-")
-
-    def is_framing_char(char: str) -> bool:
-        return (
-            _CONTROL_CHARS_RE.fullmatch(char) is not None
-            or 0xDC80 <= ord(char) <= 0xDCFF
-        )
-
-    def has_plain_start(start: int) -> bool:
-        if start == 0 or not is_identifier_char(text[start - 1]):
-            return True
-        return False
-
-    def has_single_framing_char(start: int) -> bool:
-        return (
-            start >= 2
-            and is_identifier_char(text[start - 1])
-            and is_framing_char(text[start - 2])
-        )
-
-    for match in _PREFIX_ANYWHERE_RE.finditer(text):
-        if has_plain_start(match.start()) or has_single_framing_char(match.start()):
-            return True
-    for match in _RAW_SECRET_ASSIGNMENT_RE.finditer(text):
-        start = match.start()
-        if has_plain_start(start):
-            return True
-        if (
-            match.group("key").casefold() not in _RAW_AMBIGUOUS_ASSIGNMENT_KEYS
-            and has_single_framing_char(start)
-        ):
-            return True
-    return False
-
-
 def _mask_control_split_tokens(text: str, mask_fn) -> str:
     """Mask tokens whose body is split by control/zero-width characters.
 
@@ -730,7 +668,8 @@ def _canonical_url_param_name(name: str) -> str:
         if next_value == decoded:
             break
         decoded = next_value
-    return decoded.casefold().replace("-", "_")
+    canonical = decoded.casefold().replace("-", "_")
+    return canonical.split("[", 1)[0]
 
 
 def _redact_strict_url_credentials(text: str) -> str:
@@ -744,7 +683,7 @@ def _redact_strict_url_credentials(text: str) -> str:
     def _redact_param(match: re.Match) -> str:
         if _canonical_url_param_name(match.group(2)) not in _SENSITIVE_QUERY_PARAMS:
             return match.group(0)
-        return f"{match.group(1)}{match.group(2)}=***"
+        return f"{match.group(1)}{match.group(2)}{match.group(3)}***"
 
     def _redact_userinfo(match: re.Match) -> str:
         userinfo = match.group(2)
@@ -945,7 +884,8 @@ def redact_sensitive_text(
             # keyword scan prevents that pathological path on secret-free
             # text.
             if "://" not in text and _CFG_SECRET_WORD_RE.search(text):
-                text = _CFG_DOTTED_RE.sub(_redact_env, text)
+                if "." in text:
+                    text = _CFG_DOTTED_RE.sub(_redact_env, text)
                 text = _CFG_ANCHORED_RE.sub(_redact_env, text)
 
         # JSON fields: "apiKey": "***"  (skip for code files — false positives)
@@ -1458,6 +1398,19 @@ def _reset_plugin_redaction_patterns() -> None:
     with _registry_lock:
         _PLUGIN_PREFIX_PATTERNS.clear()
         _rebuild_prefix_matcher()
+
+
+def has_sensitive_text_hint(text: str) -> bool:
+    """Cheap conservative gate before full secret redaction.
+
+    Every redactor family requires either a known credential prefix or one of
+    these structural markers. False positives intentionally fall through to the
+    full redactor; the gate exists only to skip marker-free binary views.
+    """
+    return _has_known_prefix_substring(text) or any(
+        marker in text
+        for marker in ("=", ":", "+", "@", "?", "#", "&", ";", "BEGIN", "eyJ")
+    )
 
 
 _HTTP_METHOD_SUBSTRINGS = (

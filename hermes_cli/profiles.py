@@ -1903,15 +1903,11 @@ def get_active_profile_name() -> str:
 # Export / Import
 # ---------------------------------------------------------------------------
 
-# Transient entries excluded from every profile export. SQLite WAL, SHM, and
-# rollback-journal sidecars can disappear between copytree's directory scan and
-# file copy while a live database checkpoints, causing the whole export to fail.
-_EXPORT_SQLITE_SUFFIXES = (".db", ".sqlite", ".sqlite3")
-_EXPORT_SQLITE_SIDECAR_SUFFIXES = tuple(
-    f"{database_suffix}{sidecar_suffix}"
-    for database_suffix in _EXPORT_SQLITE_SUFFIXES
-    for sidecar_suffix in ("-shm", "-wal", "-journal")
-)
+# Transient entries excluded from every profile export. SQLite databases are
+# identified by their header, not their filename, so extensionless and custom-
+# suffix databases receive the same snapshot and sidecar policy.
+_SQLITE_HEADER = b"SQLite format 3\x00"
+_SQLITE_SIDECAR_ENDINGS = ("-shm", "-wal", "-journal")
 _EXPORT_TRANSIENT_SUFFIXES = (
     ".sock",
     ".tmp",
@@ -1921,9 +1917,33 @@ _EXPORT_TRANSIENT_SUFFIXES = (
 def _is_transient_export_name(name: str) -> bool:
     """Return True for cache or transient files unsafe to copy live."""
     lowered = name.lower()
-    return name == "__pycache__" or lowered.endswith(
-        _EXPORT_TRANSIENT_SUFFIXES + _EXPORT_SQLITE_SIDECAR_SUFFIXES
-    )
+    return name == "__pycache__" or lowered.endswith(_EXPORT_TRANSIENT_SUFFIXES)
+
+
+def _has_sqlite_header(path: Path) -> bool:
+    """Return whether a regular file has SQLite's canonical file header."""
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        with path.open("rb") as handle:
+            return handle.read(len(_SQLITE_HEADER)) == _SQLITE_HEADER
+    except OSError:
+        return False
+
+
+def _sqlite_sidecars_in_directory(directory: str, contents: list[str]) -> set[str]:
+    """Return sidecars belonging to header-confirmed SQLite files."""
+    available = set(contents)
+    ignored: set[str] = set()
+    for entry in contents:
+        if not _has_sqlite_header(Path(directory) / entry):
+            continue
+        ignored.update(
+            candidate
+            for ending in _SQLITE_SIDECAR_ENDINGS
+            if (candidate := f"{entry}{ending}") in available
+        )
+    return ignored
 
 
 # ---------------------------------------------------------------------------
@@ -2294,9 +2314,10 @@ def _default_export_ignore(root_dir: Path):
 
     def _ignore(directory: str, contents: list) -> set:
         ignored: set = set()
+        sqlite_sidecars = _sqlite_sidecars_in_directory(directory, contents)
         for entry in contents:
             # Universal exclusions (any depth)
-            if _is_transient_export_name(entry):
+            if entry in sqlite_sidecars or _is_transient_export_name(entry):
                 ignored.add(entry)
             # npm lockfiles can appear at root
             elif entry in {"package.json", "package-lock.json"}:
@@ -2389,14 +2410,6 @@ def _safe_copy_export_sqlite_database(source: Path, destination: Path) -> None:
         ) from snapshot_error
 
 
-_SQLITE_RAW_SCAN_CHUNK_BYTES = 64 * 1024
-# Retain a full chunk: before bytes are discarded they are rescanned beside
-# the next chunk, so a boundary-spanning detector witness shorter than one
-# chunk is presented contiguously. UTF-16 needs twice the bytes per character,
-# hence an overlap measured in raw bytes rather than decoded characters.
-_SQLITE_RAW_SCAN_OVERLAP_BYTES = _SQLITE_RAW_SCAN_CHUNK_BYTES
-
-
 def _iter_sqlite_secret_text_views(data: bytes) -> Iterator[str]:
     """Yield bounded text views that can expose ASCII or UTF-16 secrets."""
     yield data.decode("utf-8", errors="surrogateescape")
@@ -2408,47 +2421,364 @@ def _iter_sqlite_secret_text_views(data: bytes) -> Iterator[str]:
                 yield encoded.decode(codec, errors="surrogatepass")
 
 
-def _sqlite_raw_snapshot_contains_secret(snapshot: Path) -> bool:
-    """Stream-scan live and deleted page bytes without rewriting the snapshot."""
-    from agent.redact import contains_framing_tolerant_secret, redact_sensitive_text
+def _redact_profile_export_text(text: str) -> str:
+    """Apply strict redaction for a shareable, non-navigation boundary."""
+    from agent.redact import redact_sensitive_text
 
-    def _contains_secret(text: str) -> bool:
-        # One forced-redactor pass covers assignments, headers, complete
-        # private-key blocks, connection strings, JWTs, and other contextual
-        # patterns using only bytes present in this view. Known vendor prefixes
-        # get one additional regex pass without textual boundary assumptions:
-        # a SQLite record header may itself decode to an ASCII token character.
-        # Both passes are bounded per chunk/view, independent of hint density.
-        return (
-            redact_sensitive_text(text, force=True) != text
-            or contains_framing_tolerant_secret(text)
-        )
+    return redact_sensitive_text(
+        text,
+        force=True,
+        redact_url_credentials=True,
+    )
 
-    with snapshot.open("rb") as handle:
-        header = handle.read(100)
-        if len(header) < 60 or not header.startswith(b"SQLite format 3\x00"):
-            raise OSError("invalid SQLite snapshot header")
-        encoding_id = int.from_bytes(header[56:60], "big")
-        if encoding_id not in {0, 1, 2, 3}:
-            raise OSError(f"unsupported SQLite text encoding: {encoding_id}")
-        handle.seek(0)
 
-        overlap = b""
-        while chunk := handle.read(_SQLITE_RAW_SCAN_CHUNK_BYTES):
-            window = overlap + chunk
-            for text in _iter_sqlite_secret_text_views(window):
-                if _contains_secret(text):
-                    return True
+def _profile_export_text_contains_secret(text: str) -> bool:
+    return _redact_profile_export_text(text) != text
 
-            overlap = window[-_SQLITE_RAW_SCAN_OVERLAP_BYTES:]
+
+def _profile_export_bytes_contain_secret(data: bytes) -> bool:
+    from agent.redact import has_sensitive_text_hint
+
+    for text in _iter_sqlite_secret_text_views(data):
+        if has_sensitive_text_hint(text) and _profile_export_text_contains_secret(text):
+            return True
     return False
 
 
-def _sqlite_snapshot_contains_secret(snapshot: Path, relative: Path) -> bool:
-    """Inspect logical content and raw page residue without mutating a database."""
+_EXPORT_FILE_SCAN_CHUNK_BYTES = 64 * 1024
+_EXPORT_BINARY_SCAN_OVERLAP_BYTES = 64 * 1024
+_EXPORT_MAX_TEXT_RECORD_CHARS = 8 * 1024 * 1024
+
+
+def _is_streaming_utf8_text(path: Path) -> bool:
+    """Validate UTF-8 incrementally while treating NUL-bearing files as binary."""
+    import codecs
+
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    try:
+        with path.open("rb") as handle:
+            while chunk := handle.read(_EXPORT_FILE_SCAN_CHUNK_BYTES):
+                if b"\x00" in chunk:
+                    return False
+                decoder.decode(chunk, final=False)
+        decoder.decode(b"", final=True)
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def _binary_export_file_contains_secret(path: Path) -> bool:
+    """Scan an encoded or binary file with bounded memory and overlap."""
+    overlap = b""
+    with path.open("rb") as handle:
+        while chunk := handle.read(_EXPORT_FILE_SCAN_CHUNK_BYTES):
+            window = overlap + chunk
+            if _profile_export_bytes_contain_secret(window):
+                return True
+            overlap = window[-_EXPORT_BINARY_SCAN_OVERLAP_BYTES:]
+    return False
+
+
+def _redact_export_text_record(record: str, relative: str) -> str:
+    if len(record) > _EXPORT_MAX_TEXT_RECORD_CHARS:
+        raise ValueError(
+            "Refusing profile export because a text record is too large to "
+            f"inspect safely: {relative}"
+        )
+    upper = record.upper()
+    if "-----BEGIN" in upper and "PRIVATE KEY-----" in upper:
+        raise ValueError(
+            f"Refusing profile export because text contains a private key: {relative}"
+        )
+    return _redact_profile_export_text(record)
+
+
+def _stream_scrub_utf8_export_file(path: Path, relative: str) -> None:
+    """Redact a validated UTF-8 file record-by-record with bounded memory."""
+    import stat
+    import tempfile
+
+    original_mode = stat.S_IMODE(path.stat().st_mode)
+    temporary_path = None
+    changed = False
+    carry = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            prefix=f".{path.name}.",
+            suffix=".scrub",
+            dir=path.parent,
+            delete=False,
+        ) as output:
+            temporary_path = Path(output.name)
+            with path.open("r", encoding="utf-8", newline="") as source:
+                while chunk := source.read(_EXPORT_FILE_SCAN_CHUNK_BYTES):
+                    carry += chunk
+                    records = carry.splitlines(keepends=True)
+                    if records and not records[-1].endswith(("\n", "\r")):
+                        incomplete = records.pop()
+                    else:
+                        incomplete = ""
+                    if len(incomplete) > _EXPORT_MAX_TEXT_RECORD_CHARS:
+                        raise ValueError(
+                            "Refusing profile export because a text record is too "
+                            f"large to inspect safely: {relative}"
+                        )
+                    # Keep one complete record beside the next chunk so a
+                    # control-split witness crossing a read boundary remains
+                    # contiguous, but redact the rest as one batch rather than
+                    # invoking the full redactor once per short log line.
+                    carry = (records.pop() if records else "") + incomplete
+                    if records:
+                        batch = "".join(records)
+                        redacted = _redact_export_text_record(batch, relative)
+                        changed = changed or redacted != batch
+                        output.write(redacted)
+                if carry:
+                    redacted = _redact_export_text_record(carry, relative)
+                    changed = changed or redacted != carry
+                    output.write(redacted)
+        if changed:
+            temporary_path.chmod(original_mode)
+            temporary_path.replace(path)
+            temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _sqlite_quote_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _sqlite_quick_check(connection, schema: str) -> None:
     import sqlite3
 
-    from agent.redact import redact_sensitive_text
+    cursor = connection.execute(f"PRAGMA {schema}.quick_check")
+    try:
+        for result in cursor:
+            if result != ("ok",):
+                raise sqlite3.DatabaseError(f"SQLite {schema} quick_check failed")
+    finally:
+        cursor.close()
+
+
+def _sqlite_schema_rows(connection, schema: str) -> list[tuple]:
+    return connection.execute(
+        f"SELECT type, name, tbl_name, sql FROM {schema}.sqlite_schema "
+        "WHERE type IN ('table', 'index', 'view', 'trigger') "
+        "ORDER BY type, name"
+    ).fetchall()
+
+
+def _sqlite_semantic_pragmas(connection, schema: str) -> tuple:
+    names = ("user_version", "application_id", "encoding", "auto_vacuum", "page_size")
+    return tuple(
+        connection.execute(f"PRAGMA {schema}.{name}").fetchone() for name in names
+    )
+
+
+def _sqlite_table_rowid_alias(connection, schema: str, identifier: str) -> Optional[str]:
+    import sqlite3
+
+    column_names = {
+        str(row[1]).casefold()
+        for row in connection.execute(f"PRAGMA {schema}.table_xinfo({identifier})")
+    }
+    for rowid_alias in ("rowid", "_rowid_", "oid"):
+        if rowid_alias.casefold() in column_names:
+            continue
+        try:
+            connection.execute(
+                f"SELECT {rowid_alias} FROM {schema}.{identifier} LIMIT 0"
+            )
+        except sqlite3.OperationalError as exc:
+            if "no such column" not in str(exc).casefold():
+                raise
+            return None
+        return rowid_alias
+    return None
+
+
+def _sqlite_exact_value(value) -> tuple[str, object]:
+    import struct
+
+    if value is None:
+        return ("null", b"")
+    if isinstance(value, int):
+        return ("integer", str(value).encode("ascii"))
+    if isinstance(value, float):
+        return ("real", struct.pack(">d", value))
+    if isinstance(value, str):
+        return ("text", value.encode("utf-8", errors="surrogatepass"))
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return ("blob", bytes(value))
+    raise TypeError(f"Unsupported SQLite value type: {type(value).__name__}")
+
+
+def _sqlite_table_rows_match_exactly(
+    connection,
+    table_name: str,
+    identifier: str,
+) -> bool:
+    source_rowid = _sqlite_table_rowid_alias(connection, "main", identifier)
+    compact_rowid = _sqlite_table_rowid_alias(connection, "compact", identifier)
+    if source_rowid != compact_rowid:
+        return False
+
+    if source_rowid is not None:
+        projection = f"{source_rowid}, *"
+        order_by = source_rowid
+    else:
+        table_info = list(connection.execute(f"PRAGMA main.table_xinfo({identifier})"))
+        primary_key = [
+            (int(row[5]), _sqlite_quote_identifier(str(row[1])))
+            for row in table_info
+            if int(row[5]) > 0
+        ]
+        projection = "*"
+        if primary_key:
+            primary_key.sort()
+            order_by = ", ".join(name for _position, name in primary_key)
+        else:
+            # A rowid table may legally shadow all three rowid aliases without
+            # declaring a primary key. Order by storage type plus SQLite's
+            # canonical SQL literal for every visible column so the two
+            # databases can still be compared deterministically and exactly.
+            columns = [
+                _sqlite_quote_identifier(str(row[1]))
+                for row in table_info
+                if int(row[6]) != 1
+            ]
+            if not columns:
+                raise RuntimeError(
+                    f"Cannot determine stable SQLite row order for table: {table_name}"
+                )
+            order_by = ", ".join(
+                expression
+                for column in columns
+                for expression in (f"typeof({column})", f"quote({column}) COLLATE BINARY")
+            )
+
+    source_cursor = connection.execute(
+        f"SELECT {projection} FROM main.{identifier} ORDER BY {order_by}"
+    )
+    compact_cursor = connection.execute(
+        f"SELECT {projection} FROM compact.{identifier} ORDER BY {order_by}"
+    )
+    try:
+        while True:
+            source_rows = source_cursor.fetchmany(128)
+            compact_rows = compact_cursor.fetchmany(128)
+            if len(source_rows) != len(compact_rows):
+                return False
+            if not source_rows:
+                return True
+            for source_row, compact_row in zip(source_rows, compact_rows):
+                if tuple(map(_sqlite_exact_value, source_row)) != tuple(
+                    map(_sqlite_exact_value, compact_row)
+                ):
+                    return False
+    finally:
+        source_cursor.close()
+        compact_cursor.close()
+
+
+def _verify_compacted_sqlite_semantics(
+    snapshot: Path,
+    compacted: Path,
+    relative: Path,
+) -> None:
+    """Fail closed if VACUUM INTO changed logical database semantics."""
+    import sqlite3
+
+    connection = None
+    attached = False
+    try:
+        uri = f"{snapshot.resolve().as_uri()}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True)
+        connection.execute("ATTACH DATABASE ? AS compact", (str(compacted),))
+        attached = True
+        connection.execute("PRAGMA query_only = ON")
+        _sqlite_quick_check(connection, "main")
+        _sqlite_quick_check(connection, "compact")
+
+        if _sqlite_schema_rows(connection, "main") != _sqlite_schema_rows(
+            connection, "compact"
+        ):
+            raise RuntimeError("schema changed during SQLite export compaction")
+        if _sqlite_semantic_pragmas(connection, "main") != _sqlite_semantic_pragmas(
+            connection, "compact"
+        ):
+            raise RuntimeError("pragmas changed during SQLite export compaction")
+
+        source_tables = [
+            name
+            for (name,) in connection.execute(
+                "SELECT name FROM main.sqlite_schema WHERE type = 'table' ORDER BY name"
+            )
+        ]
+        compact_tables = [
+            name
+            for (name,) in connection.execute(
+                "SELECT name FROM compact.sqlite_schema WHERE type = 'table' ORDER BY name"
+            )
+        ]
+        if source_tables != compact_tables:
+            raise RuntimeError("tables changed during SQLite export compaction")
+
+        for table_name in source_tables:
+            identifier = _sqlite_quote_identifier(table_name)
+            if not _sqlite_table_rows_match_exactly(
+                connection,
+                table_name,
+                identifier,
+            ):
+                raise RuntimeError(
+                    "rows changed during SQLite export compaction: "
+                    f"{table_name}"
+                )
+    except (sqlite3.Error, OSError, UnicodeError) as exc:
+        raise RuntimeError(
+            f"Could not verify compacted SQLite database during profile export: {relative}"
+        ) from exc
+    finally:
+        if connection is not None:
+            if attached:
+                try:
+                    connection.execute("DETACH DATABASE compact")
+                except sqlite3.Error:
+                    pass
+            connection.close()
+
+
+def _compact_export_sqlite_database(
+    snapshot: Path,
+    compacted: Path,
+    relative: Path,
+) -> None:
+    """Rebuild a disposable snapshot to remove deleted-page residue safely."""
+    import sqlite3
+
+    connection = None
+    try:
+        connection = sqlite3.connect(snapshot)
+        connection.execute("VACUUM INTO ?", (str(compacted),))
+    except sqlite3.Error as exc:
+        raise RuntimeError(
+            f"Could not compact SQLite database during profile export: {relative}"
+        ) from exc
+    finally:
+        if connection is not None:
+            connection.close()
+    _verify_compacted_sqlite_semantics(snapshot, compacted, relative)
+
+
+def _sqlite_snapshot_contains_secret(snapshot: Path, relative: Path) -> bool:
+    """Inspect logical content in a compacted disposable database."""
+    import sqlite3
 
     connection = None
     try:
@@ -2456,13 +2786,7 @@ def _sqlite_snapshot_contains_secret(snapshot: Path, relative: Path) -> bool:
         connection = sqlite3.connect(uri, uri=True)
         connection.execute("PRAGMA query_only = ON")
 
-        check_cursor = connection.execute("PRAGMA quick_check")
-        try:
-            for result in check_cursor:
-                if result != ("ok",):
-                    raise sqlite3.DatabaseError("SQLite quick_check failed")
-        finally:
-            check_cursor.close()
+        _sqlite_quick_check(connection, "main")
 
         schema_cursor = connection.execute(
             "SELECT type, name, tbl_name, sql FROM sqlite_schema "
@@ -2475,7 +2799,7 @@ def _sqlite_snapshot_contains_secret(snapshot: Path, relative: Path) -> bool:
                     for value in schema_row:
                         if (
                             isinstance(value, str)
-                            and redact_sensitive_text(value, force=True) != value
+                            and _profile_export_text_contains_secret(value)
                         ):
                             return True
         finally:
@@ -2495,20 +2819,20 @@ def _sqlite_snapshot_contains_secret(snapshot: Path, relative: Path) -> bool:
                             for row in rows:
                                 for value in row:
                                     if isinstance(value, str):
-                                        text = value
+                                        if _profile_export_text_contains_secret(value):
+                                            return True
                                     elif isinstance(value, (bytes, bytearray, memoryview)):
-                                        text = bytes(value).decode(
-                                            "utf-8", errors="surrogateescape"
-                                        )
+                                        if _profile_export_bytes_contain_secret(
+                                            bytes(value)
+                                        ):
+                                            return True
                                     else:
                                         continue
-                                    if redact_sensitive_text(text, force=True) != text:
-                                        return True
                     finally:
                         row_cursor.close()
         finally:
             table_cursor.close()
-        return _sqlite_raw_snapshot_contains_secret(snapshot)
+        return False
     except (sqlite3.Error, OSError, UnicodeError) as exc:
         raise RuntimeError(
             f"Could not safely inspect SQLite database during profile export: {relative}"
@@ -2519,30 +2843,24 @@ def _sqlite_snapshot_contains_secret(snapshot: Path, relative: Path) -> bool:
 
 
 def _snapshot_export_sqlite_databases(source_root: Path, staged_root: Path) -> None:
-    """Replace staged SQLite files with consistent live snapshots.
+    """Replace staged SQLite files with compacted, verified live snapshots.
 
     Export ignores transient WAL/SHM/journal sidecars because they can vanish
     during ``copytree``. Copying only the main database file is not sufficient,
     though: committed rows may still live exclusively in an active WAL. For
-    every staged ``*.db``, ``*.sqlite``, or ``*.sqlite3`` file with a SQLite
-    header, use SQLite's backup API and fail closed if a consistent snapshot
-    cannot be made. Files that merely use one of those suffixes without being
-    SQLite are untouched.
+    every staged regular file with a SQLite header, use SQLite's backup API,
+    rebuild only the disposable snapshot to remove deleted-page residue, verify
+    logical semantics and rowids are unchanged, then inspect all live values.
     """
     import stat
     import tempfile
 
-    sqlite_header = b"SQLite format 3\x00"
     for staged_db in staged_root.rglob("*"):
-        if (
-            staged_db.suffix.lower() not in _EXPORT_SQLITE_SUFFIXES
-            or staged_db.is_symlink()
-            or not staged_db.is_file()
-        ):
+        if staged_db.is_symlink() or not staged_db.is_file():
             continue
         try:
             with staged_db.open("rb") as handle:
-                if handle.read(len(sqlite_header)) != sqlite_header:
+                if handle.read(len(_SQLITE_HEADER)) != _SQLITE_HEADER:
                     continue
             relative = staged_db.relative_to(staged_root)
             source_db = source_root / relative
@@ -2563,6 +2881,13 @@ def _snapshot_export_sqlite_databases(source_root: Path, staged_root: Path) -> N
             delete=False,
         ) as handle:
             snapshot = Path(handle.name)
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{staged_db.name}.",
+            suffix=".compact",
+            dir=staged_db.parent,
+            delete=False,
+        ) as handle:
+            compacted = Path(handle.name)
         try:
             try:
                 _safe_copy_export_sqlite_database(source_db, snapshot)
@@ -2571,15 +2896,17 @@ def _snapshot_export_sqlite_databases(source_root: Path, staged_root: Path) -> N
                     "Could not safely inspect SQLite database during profile export: "
                     f"{relative}"
                 ) from exc
-            if _sqlite_snapshot_contains_secret(snapshot, relative):
+            _compact_export_sqlite_database(snapshot, compacted, relative)
+            if _sqlite_snapshot_contains_secret(compacted, relative):
                 raise ValueError(
                     "Refusing profile export because SQLite database contains "
                     f"secret-shaped content: {relative}"
                 )
-            snapshot.chmod(original_mode)
-            snapshot.replace(staged_db)
+            compacted.chmod(original_mode)
+            compacted.replace(staged_db)
         finally:
             snapshot.unlink(missing_ok=True)
+            compacted.unlink(missing_ok=True)
 
 
 def _scrub_export_secrets(staged: Path) -> None:
@@ -2591,12 +2918,11 @@ def _scrub_export_secrets(staged: Path) -> None:
     ``security.redact_secrets`` / ``HERMES_REDACT_SECRETS`` — share archives
     must not emit raw keys even when the user has disabled live redaction.
 
-    Every valid UTF-8 regular file is inspected regardless of filename. Files
-    containing NUL bytes or invalid UTF-8 are treated as binary and left byte-
-    identical. Profile symlinks are rejected before this function runs.
+    Every regular file is inspected regardless of filename. Valid UTF-8 text is
+    redacted in place. Binary, NUL-bearing, or encoded content is preserved only
+    when its byte views contain no secret witness; otherwise export fails closed.
+    Header-confirmed SQLite files were already compacted and inspected logically.
     """
-    from agent.redact import redact_sensitive_text
-
     for path in staged.rglob("*"):
         if path.is_symlink():
             relative = path.relative_to(staged).as_posix()
@@ -2604,28 +2930,29 @@ def _scrub_export_secrets(staged: Path) -> None:
         if not path.is_file():
             continue
 
+        relative = path.relative_to(staged).as_posix()
         try:
-            with path.open("r", encoding="utf-8", newline="") as handle:
-                text = handle.read()
-        except UnicodeDecodeError:
-            continue
+            with path.open("rb") as handle:
+                if handle.read(len(_SQLITE_HEADER)) == _SQLITE_HEADER:
+                    continue
+            if _is_streaming_utf8_text(path):
+                _stream_scrub_utf8_export_file(path, relative)
+                if _binary_export_file_contains_secret(path):
+                    raise ValueError(
+                        "Refusing profile export because text contains secret-shaped "
+                        f"content that could not be safely redacted: {relative}"
+                    )
+            elif _binary_export_file_contains_secret(path):
+                raise ValueError(
+                    "Refusing profile export because encoded or binary file "
+                    f"contains secret-shaped content: {relative}"
+                )
+        except ValueError:
+            raise
         except OSError as exc:
-            relative = path.relative_to(staged).as_posix()
-            raise RuntimeError(f"Could not inspect profile export file: {relative}") from exc
-
-        if "\x00" in text:
-            continue
-
-        redacted = redact_sensitive_text(text, force=True)
-        if redacted == text:
-            continue
-
-        try:
-            with path.open("w", encoding="utf-8", newline="") as handle:
-                handle.write(redacted)
-        except OSError as exc:
-            relative = path.relative_to(staged).as_posix()
-            raise RuntimeError(f"Could not scrub profile export file: {relative}") from exc
+            raise RuntimeError(
+                f"Could not inspect or scrub profile export file: {relative}"
+            ) from exc
 
 
 def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, str]] = None) -> Path:
@@ -2652,8 +2979,6 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
     base = str(output).removesuffix(".tar.gz").removesuffix(".tgz")
 
     def _stage_extras(staged: Path) -> None:
-        from agent.redact import redact_sensitive_text
-
         for rel, content in (extra_files or {}).items():
             parts = _normalize_profile_archive_parts(rel)
             target = staged.joinpath(*parts)
@@ -2686,7 +3011,7 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
             if target.is_symlink():
                 raise ValueError(f"Refusing symlinked profile export extra: {rel}")
             target.write_text(
-                redact_sensitive_text(content, force=True),
+                _redact_profile_export_text(content),
                 encoding="utf-8",
             )
 
@@ -2721,8 +3046,9 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
 
         def _named_ignore(directory: str, contents: list) -> set:
             ignored: set = set()
+            sqlite_sidecars = _sqlite_sidecars_in_directory(directory, contents)
             for entry in contents:
-                if _is_transient_export_name(entry):
+                if entry in sqlite_sidecars or _is_transient_export_name(entry):
                     ignored.add(entry)
                 elif _is_sensitive_export_entry(directory, entry, profile_dir):
                     ignored.add(entry)

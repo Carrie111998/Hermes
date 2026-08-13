@@ -6,7 +6,6 @@ import pytest
 
 from agent.redact import (
     RedactingFormatter,
-    contains_framing_tolerant_secret,
     mask_secret,
     redact_cdp_url,
     redact_sensitive_text,
@@ -91,42 +90,6 @@ class TestKnownPrefixes:
         assert redact_sensitive_text(text) == text
 
 
-class TestFramingTolerantSecretDetection:
-    @pytest.mark.parametrize(
-        "text",
-        [
-            "task-" + "A" * 20,
-            "mask-" + "B" * 20,
-            "ask-" + "C" * 20,
-            "\udc813task-" + "D" * 20,
-            "xkey=value",
-            "\x01xkey=value",
-            "\udc813xkey=value",
-            "monkey=value",
-            "password=",
-            "API_KEY=",
-            "postgresql://user:",
-        ],
-    )
-    def test_benign_complete_strings_are_not_secret_witnesses(self, text):
-        assert redact_sensitive_text(text, force=True) == text
-        assert not contains_framing_tolerant_secret(text)
-
-    @pytest.mark.parametrize(
-        "text",
-        [
-            "sk-" + "A" * 20,
-            "\x01x" + "sk-" + "A" * 20,
-            "\udc813" + "sk-" + "A" * 20,
-            "\x01xpassword=" + "A" * 17,
-        ],
-    )
-    def test_real_and_framed_secret_witnesses_are_detected(self, text):
-        assert contains_framing_tolerant_secret(text)
-
-
-
-
 class TestEnvAssignments:
     def test_export_api_key(self):
         text = "export OPENAI_API_KEY=sk-proj-abc123def456ghi789jkl012"
@@ -183,6 +146,13 @@ class TestBareSecretEnvSuffixes:
         assert "mysecret" not in result
         assert "opaqueValue" not in result
         assert "username=bob" in result
+
+    def test_long_anchored_config_key_is_redacted(self):
+        key = "a" * 129 + "_password"
+        value = "OpaqueCredential123456"
+        result = redact_sensitive_text(f"{key}={value}", force=True)
+        assert value not in result
+        assert result.startswith(f"{key}=")
 
 
 class TestControlCharSplitTokens:
@@ -536,6 +506,21 @@ class TestStrictUrlCredentialRedaction:
                 "/resume?token=SEMICOLON_SECRET;view=public",
                 "SEMICOLON_SECRET",
                 "/resume?token=***;view=public",
+            ),
+            (
+                "https://x.test/cb?access_token[]=BRACKET_SECRET&view=public",
+                "BRACKET_SECRET",
+                "https://x.test/cb?access_token[]=***&view=public",
+            ),
+            (
+                "https://x.test/cb?access_token%5B%5D=ENC_BRACKET&view=public",
+                "ENC_BRACKET",
+                "https://x.test/cb?access_token%5B%5D=***&view=public",
+            ),
+            (
+                "https://x.test/cb?access_token%3DENC_EQUALS&view=public",
+                "ENC_EQUALS",
+                "https://x.test/cb?access_token%3D***&view=public",
             ),
             (
                 "//user:NET_SECRET@x.test/path",
