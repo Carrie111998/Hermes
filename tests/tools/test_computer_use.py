@@ -1475,6 +1475,23 @@ class TestCuaCliFallbackResolution:
         assert out["isError"] is True
         assert out["structuredContent"]["error"] == "stale target"
 
+    def test_shared_daemon_cli_transport_does_not_append_embedded_socket(self):
+        from tools.computer_use.cua_backend import _AsyncBridge, _CuaDriverSession
+
+        proc = MagicMock(stdout="{}", stderr="", returncode=0)
+        session = _CuaDriverSession(_AsyncBridge())
+        session._embedded_daemon = MagicMock()
+        with patch(
+            "tools.computer_use.cua_backend.resolve_cua_driver_cmd",
+            return_value="/Users/example/.local/bin/cua-driver",
+        ), patch("subprocess.run", return_value=proc) as run:
+            session._call_tool_via_cli(
+                "hotkey", {"pid": 42, "window_id": 7}, timeout=0.1,
+                shared_daemon=True,
+            )
+
+        assert "--socket" not in run.call_args.args[0]
+
 
 class TestClickButtonPassthrough:
     """Surface 5 (NousResearch/hermes-agent#47072) — `middle_click` must

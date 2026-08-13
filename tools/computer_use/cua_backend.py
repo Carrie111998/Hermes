@@ -1526,7 +1526,14 @@ class _CuaDriverSession:
         self._start_lifecycle_locked()
         self._started = True
 
-    def _call_tool_via_cli(self, name: str, args: Dict[str, Any], timeout: float) -> Dict[str, Any]:
+    def _call_tool_via_cli(
+        self,
+        name: str,
+        args: Dict[str, Any],
+        timeout: float,
+        *,
+        shared_daemon: bool = False,
+    ) -> Dict[str, Any]:
         """Fallback transport: invoke ``cua-driver call <tool> <json>`` as a
         subprocess instead of going through the stdio MCP bridge.
 
@@ -1564,7 +1571,7 @@ class _CuaDriverSession:
         child_env = cua_driver_child_env()
         socket_args: List[str] = []
         embedded_daemon = getattr(self, "_embedded_daemon", None)
-        if embedded_daemon is not None:
+        if embedded_daemon is not None and not shared_daemon:
             driver_command = embedded_daemon.proxy_invocation()[0]
             child_env = embedded_daemon.child_env()
             socket_args = ["--socket", embedded_daemon.socket_path]
@@ -3460,7 +3467,9 @@ class CuaDriverBackend(ComputerUseBackend):
             args.setdefault("session", self._session_id)
         try:
             if cli_transport:
-                out = self._session._call_tool_via_cli(name, args, 30.0)
+                out = self._session._call_tool_via_cli(
+                    name, args, 30.0, shared_daemon=True,
+                )
             else:
                 out = self._session.call_tool(name, args)
         except Exception as e:

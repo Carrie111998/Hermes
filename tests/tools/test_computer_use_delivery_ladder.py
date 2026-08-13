@@ -70,7 +70,9 @@ class _FakeSession:
         self.calls.append((name, dict(args)))
         return self._out
 
-    def _call_tool_via_cli(self, name: str, args: Dict[str, Any], timeout: float):
+    def _call_tool_via_cli(
+        self, name: str, args: Dict[str, Any], timeout: float, **kwargs: Any,
+    ):
         self.last_args = args
         self.cli_calls.append((name, dict(args), timeout))
         return self._out
