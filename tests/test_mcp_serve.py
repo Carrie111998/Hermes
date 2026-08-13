@@ -13,6 +13,7 @@ import inspect
 import json
 import os
 import sqlite3
+from pathlib import Path
 import time
 import threading
 from unittest.mock import MagicMock
@@ -1385,3 +1386,78 @@ class TestEventBridgePollE2E:
         """Verify the poll interval constant."""
         from mcp_serve import POLL_INTERVAL
         assert POLL_INTERVAL == 0.2
+
+
+# ---------------------------------------------------------------------------
+# Hermes home resolution (#PROBE)
+# ---------------------------------------------------------------------------
+
+def _block_hermes_constants(monkeypatch):
+    """Force the ``hermes_constants`` import inside ``_hermes_home`` to fail.
+
+    Binding the name to ``None`` in ``sys.modules`` is what makes a subsequent
+    ``import hermes_constants`` raise ``ImportError``, which is the only way to
+    reach the stdlib-only fallback branch without uninstalling the package.
+    """
+    import sys as _sys
+    monkeypatch.setitem(_sys.modules, "hermes_constants", None)
+
+
+def test_hermes_home_prefers_the_profile_aware_helper(tmp_path, monkeypatch):
+    """``get_hermes_home()`` wins over the raw env var, because it knows profiles."""
+    import mcp_serve
+
+    profile_home = tmp_path / "profiles" / "work"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "not-the-profile"))
+    import hermes_constants
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: profile_home)
+
+    assert mcp_serve._hermes_home() == profile_home
+
+
+def test_hermes_home_fallback_honours_the_env_var(tmp_path, monkeypatch):
+    import mcp_serve
+
+    _block_hermes_constants(monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "explicit"))
+
+    assert mcp_serve._hermes_home() == tmp_path / "explicit"
+
+
+def test_hermes_home_fallback_treats_blank_env_as_unset(monkeypatch):
+    """A blank ``HERMES_HOME`` must not resolve to the current directory."""
+    import mcp_serve
+
+    _block_hermes_constants(monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", "   ")
+
+    resolved = mcp_serve._hermes_home()
+    assert resolved.is_absolute()
+    assert resolved != Path(".")
+
+
+def test_hermes_home_fallback_is_platform_native_on_windows(monkeypatch):
+    """On win32 the default is %LOCALAPPDATA%/hermes, never ``~/.hermes``."""
+    import mcp_serve
+
+    _block_hermes_constants(monkeypatch)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setattr(mcp_serve.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(Path("C:/Users/tester/AppData/Local")))
+
+    assert mcp_serve._hermes_home() == Path("C:/Users/tester/AppData/Local") / "hermes"
+
+
+def test_every_state_path_derives_from_one_root(tmp_path, monkeypatch):
+    """The invariant the dedup buys: one root, so the four paths cannot diverge.
+
+    Asserts the relationship between the paths rather than their literal values,
+    so moving or renaming any of them keeps the test meaningful.
+    """
+    import mcp_serve
+
+    root = tmp_path / "one-root"
+    monkeypatch.setattr(mcp_serve, "_hermes_home", lambda: root)
+
+    assert mcp_serve._get_sessions_dir() == root / "sessions"
+    assert mcp_serve._get_sessions_dir().parent == mcp_serve._hermes_home()

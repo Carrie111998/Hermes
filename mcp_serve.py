@@ -60,13 +60,36 @@ except ImportError:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _get_sessions_dir() -> Path:
-    """Return the sessions directory using HERMES_HOME."""
+def _hermes_home() -> Path:
+    """Return the active Hermes home.
+
+    Prefers :func:`hermes_constants.get_hermes_home`, which is profile-aware.
+    The fallback exists because this module keeps its import-time dependencies
+    to the standard library, but it must not be *wrong* where the canonical
+    helper is right: it honours the platform-native default, so a Windows
+    install resolves ``%LOCALAPPDATA%/hermes`` rather than a ``~/.hermes`` that
+    is never written, and it treats an empty ``HERMES_HOME`` as unset rather
+    than resolving to the current directory.
+    """
     try:
         from hermes_constants import get_hermes_home
-        return get_hermes_home() / "sessions"
+        return get_hermes_home()
     except ImportError:
-        return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "sessions"
+        pass
+
+    env_home = os.environ.get("HERMES_HOME", "").strip()
+    if env_home:
+        return Path(env_home)
+    if sys.platform == "win32":
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
+        return base / "hermes"
+    return Path.home() / ".hermes"
+
+
+def _get_sessions_dir() -> Path:
+    """Return the sessions directory using HERMES_HOME."""
+    return _hermes_home() / "sessions"
 
 
 def _get_session_db():
@@ -194,13 +217,7 @@ def _load_sessions_index_from_json() -> dict:
 
 def _load_channel_directory() -> dict:
     """Load the cached channel directory for available targets."""
-    try:
-        from hermes_constants import get_hermes_home
-        directory_file = get_hermes_home() / "channel_directory.json"
-    except ImportError:
-        directory_file = Path(
-            os.environ.get("HERMES_HOME", Path.home() / ".hermes")
-        ) / "channel_directory.json"
+    directory_file = _hermes_home() / "channel_directory.json"
 
     if not directory_file.exists():
         return {}
@@ -460,11 +477,7 @@ class EventBridge:
         db = _get_session_db()
         if not db:
             return
-        try:
-            from hermes_constants import get_hermes_home
-            db_file = get_hermes_home() / "state.db"
-        except ImportError:
-            db_file = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
+        db_file = _hermes_home() / "state.db"
         try:
             self._state_db_mtime = db_file.stat().st_mtime if db_file.exists() else 0.0
         except OSError:
@@ -512,11 +525,7 @@ class EventBridge:
         eliminating the old dual-file (sessions.json + state.db) race that
         could drop brand-new conversations (#8925).
         """
-        try:
-            from hermes_constants import get_hermes_home
-            db_file = get_hermes_home() / "state.db"
-        except ImportError:
-            db_file = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
+        db_file = _hermes_home() / "state.db"
 
         try:
             db_mtime = db_file.stat().st_mtime if db_file.exists() else 0.0
