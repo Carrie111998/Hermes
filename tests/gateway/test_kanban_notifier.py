@@ -354,6 +354,66 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     assert "crashed" in adapter.sent[1]["text"].lower()
 
 
+def test_iteration_exhaustion_notifies_and_wakes_owner_without_retry(tmp_path, monkeypatch):
+    db_path = tmp_path / "iteration-exhausted-wakeup.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        workspace = tmp_path / "preserved-workspace"
+        workspace.mkdir()
+        tid = kb.create_task(
+            conn,
+            title="bounded execution",
+            assignee="worker",
+            session_id="origin-session",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="group",
+            delivery_mode="notify+wake",
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        kb._record_iteration_exhaustion(
+            conn,
+            tid,
+            expected_run_id=claimed.current_run_id,
+            budget_used=60,
+            budget_max=60,
+        )
+    finally:
+        conn.close()
+
+    async def _direct_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    # Keep this focused watcher test deterministic in restricted test
+    # environments where asyncio's default executor cannot complete work.
+    monkeypatch.setattr(asyncio, "to_thread", _direct_to_thread)
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"].lower()
+    assert "iteration budget exhausted (60/60)" in text
+    assert "terminal for this revision" in text
+    assert "no automatic retry" in text
+    assert len(adapter.handled) == 1
+    wake_text = adapter.handled[0].text.lower()
+    assert "iteration exhausted" in wake_text
+    assert "owner replan required" in wake_text
+    assert f"terminal task revision/run: {claimed.current_run_id}" in wake_text
+    assert f"preserved workspace: {workspace}" in wake_text
+    assert "resume policy: never" in wake_text
+
+
 def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
     db_path = tmp_path / "chat-type-wakeup.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))

@@ -147,38 +147,49 @@ def finalize_turn(
         # worker could not complete (rather than treating it as a
         # protocol violation). This applies whether the user-facing fallback
         # came from the summary call or an explicitly pending continuation;
-        # both exhausted the task budget and must advance the failure circuit.
+        # both exhausted the task budget and must terminalize this exact run.
         #
-        # We route through ``_record_task_failure(outcome="timed_out")``
-        # rather than ``kanban_block`` so this counts toward the dispatcher's
-        # consecutive-failure circuit breaker (#29747 gap 2).
+        # Iteration exhaustion is not a wall-clock timeout: retrying the same
+        # revision just repeats an emergency stop while risking its preserved
+        # workspace. Park it for owner replan instead. The run-id guard keeps
+        # a late finalizer from blocking a successor that already owns the card.
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
             try:
                 from hermes_cli import kanban_db as _kb
+                _kanban_run_raw = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+                try:
+                    _kanban_run_id = int(_kanban_run_raw)
+                except (TypeError, ValueError):
+                    _kanban_run_id = None
+                if _kanban_run_id is None:
+                    raise RuntimeError(
+                        "iteration exhaustion requires HERMES_KANBAN_RUN_ID "
+                        "to terminalize the exact task revision"
+                    )
                 _conn = _kb.connect()
                 try:
-                    _kb._record_task_failure(
+                    _closed_run_id = _kb._record_iteration_exhaustion(
                         _conn,
                         _kanban_task,
-                        error=(
-                            f"Iteration budget exhausted "
-                            f"({api_call_count}/{agent.max_iterations}) — "
-                            "task could not complete within the allowed "
-                            "iterations"
-                        ),
-                        outcome="timed_out",
-                        release_claim=True,
-                        end_run=True,
-                        event_payload_extra={
-                            "budget_used": api_call_count,
-                            "budget_max": agent.max_iterations,
-                        },
+                        expected_run_id=_kanban_run_id,
+                        budget_used=api_call_count,
+                        budget_max=agent.max_iterations,
                     )
-                    logger.info(
-                        "recorded budget-exhausted failure for task %s (%d/%d)",
-                        _kanban_task, api_call_count, agent.max_iterations,
-                    )
+                    if _closed_run_id is None:
+                        logger.warning(
+                            "ignored stale iteration exhaustion for task %s "
+                            "run %d (%d/%d)",
+                            _kanban_task, _kanban_run_id,
+                            api_call_count, agent.max_iterations,
+                        )
+                    else:
+                        logger.info(
+                            "recorded terminal iteration exhaustion for task %s "
+                            "run %d (%d/%d)",
+                            _kanban_task, _closed_run_id,
+                            api_call_count, agent.max_iterations,
+                        )
                 finally:
                     try:
                         _conn.close()
