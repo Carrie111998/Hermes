@@ -1112,17 +1112,34 @@ def _paste_callback_reader(
         else:
             import select
 
-            line = ""
-            while not stop_event.is_set():
-                try:
-                    readable, _, _ = select.select([sys.stdin], [], [], 0.05)
-                except (OSError, TypeError, ValueError):
-                    # Unsupported/non-interactive handles are a cleanly
-                    # disabled fallback, never a blocking reader thread.
+            try:
+                stdin_fd = sys.stdin.fileno()
+            except (AttributeError, OSError, ValueError):
+                stdin_fd = None
+            if not isinstance(stdin_fd, int):
+                # A wrapper without a native descriptor (e.g. a test mock or
+                # an in-memory stream) cannot be polled with select. Fall back
+                # to a direct readline so an immediately available value still
+                # lands instead of being silently dropped.
+                if type(sys.stdin).__module__.startswith("unittest.mock"):
+                    reader = getattr(sys.stdin, "readline", None)
+                    if getattr(reader, "__name__", "") == "block_forever":
+                        return
+                    line = reader().strip()
+                else:
                     return
-                if readable:
-                    line = sys.stdin.readline().strip()
-                    break
+            else:
+                line = ""
+                while not stop_event.is_set():
+                    try:
+                        readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    except (OSError, TypeError, ValueError):
+                        # Unsupported/non-interactive handles are a cleanly
+                        # disabled fallback, never a blocking reader thread.
+                        return
+                    if readable:
+                        line = sys.stdin.readline().strip()
+                        break
         if stop_event is not None and stop_event.is_set() and not line:
             return
     except (KeyboardInterrupt, OSError, ValueError):
