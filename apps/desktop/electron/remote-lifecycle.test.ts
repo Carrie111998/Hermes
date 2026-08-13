@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFile as execFileCallback, spawn } from 'node:child_process'
+import { once } from 'node:events'
 import { chmod, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -476,7 +477,7 @@ test.runIf(process.platform !== 'win32')('pidIsOurDashboard accepts a canonical 
       await symlink(process.execPath, pythonPath)
     }
 
-    await writeFile(entrypoint, 'import time\ntime.sleep(30)\n')
+    await writeFile(entrypoint, 'import time\nprint("READY", flush=True)\ntime.sleep(30)\n')
     await chmod(entrypoint, 0o700)
     await writeFile(
       wrapperPath,
@@ -490,6 +491,15 @@ test.runIf(process.platform !== 'win32')('pidIsOurDashboard accepts a canonical 
     await chmod(wrapperPath, 0o700)
 
     child = spawn(wrapperPath, ['serve', '--isolated', '--ssh-owner-nonce', SPAWN_NONCE])
+
+    const ready = await Promise.race([
+      once(child.stdout!, 'data'),
+      once(child, 'error').then(([error]) => Promise.reject(error)),
+      once(child, 'exit').then(([code, signal]) =>
+        Promise.reject(new Error(`uv-venv ownership child exited before readiness (code=${code}, signal=${signal})`))
+      )
+    ])
+    assert.match(String(ready[0]), /READY/)
 
     const ssh = {
       async exec(command: string) {
