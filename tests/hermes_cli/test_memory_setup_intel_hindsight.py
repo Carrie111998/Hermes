@@ -324,3 +324,147 @@ class TestIntelMacosSmokeCheck:
             ),
         )
         assert memory_setup._smoke_import_hindsight_local() == []
+
+
+class TestPostSetupWizardSmokeCheck:
+    """Regression: the interactive ``HindsightMemoryProvider.post_setup``
+    wizard must smoke-check the Intel-macOS slim runtime after a successful
+    install, exactly like the update/heal path.  Before the fix it only
+    installed the deps and printed "✓ Dependencies up to date" — the #81421
+    failure mode (pip reports ok while the resolver backtracks the slim
+    stack to an ancient ``hindsight_api`` without ``LocalSTEmbeddings``, then
+    the daemon crashes with "Unknown embeddings provider: onnx") could slip
+    through a fresh interactive ``hermes memory setup`` undetected.
+
+    These tests drive the REAL wizard end-to-end (mocking only the
+    interactive pickers, stdin, install, and the smoke probe) and assert the
+    smoke check fires on Intel macOS after a successful local_embedded
+    install, and does NOT fire on failed/blocked installs or non-Intel.
+    """
+
+    def _drive_post_setup(
+        self,
+        tmp_path,
+        monkeypatch,
+        *,
+        intel_macos: bool,
+        install_ok: bool,
+        install_blocked: bool = False,
+        smoke_errors=None,
+    ):
+        """Run the REAL ``HindsightMemoryProvider.post_setup`` wizard through
+        the local_embedded flow, returning the patched smoke probe mock.
+
+        Only the interactive/IO seams are mocked (pickers, stdin, install,
+        config.yaml writer, profile-env materializer).  The wizard logic, the
+        mode selection, the dep install, the config persistence via the
+        plugin's own ``save_config``, and the smoke-check wiring all run for
+        real.
+        """
+        import builtins
+        import sys as _sys
+        from types import SimpleNamespace
+
+        from unittest.mock import Mock
+
+        monkeypatch.setattr(hindsight_plugin, "get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(memory_setup, "get_hermes_home", lambda: tmp_path)
+        # Fresh setup: no prior config anywhere, and never fall through to a
+        # real ~/.hindsight on the machine running the tests.
+        monkeypatch.setattr(hindsight_plugin, "_load_config", lambda: {})
+        # Platform gate: isolate from the test host's real architecture.
+        monkeypatch.setattr(memory_setup, "_is_intel_macos", lambda: intel_macos)
+
+        # mode -> local_embedded (index 1), LLM provider -> openai (index 0).
+        picker = iter([1, 0])
+        monkeypatch.setattr(memory_setup, "_curses_select", lambda *a, **k: next(picker))
+
+        monkeypatch.setattr(_sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr("hermes_cli.secret_prompt.masked_secret_prompt", lambda prompt="": "")
+        monkeypatch.setattr(builtins, "input", lambda prompt="": "")
+        monkeypatch.setattr("hermes_cli.config.save_config", lambda config: None)
+        monkeypatch.setattr(
+            hindsight_plugin,
+            "_materialize_embedded_profile_env",
+            lambda config, *, llm_api_key=None: None,
+        )
+
+        def fake_install(specs, timeout=120):
+            return SimpleNamespace(
+                ok=install_ok,
+                blocked=install_blocked,
+                reason="blocked by test" if install_blocked else "",
+                stderr="" if install_ok else "pip exploded",
+            )
+
+        monkeypatch.setattr("tools.lazy_deps.install_specs", fake_install)
+
+        smoke_probe = Mock(return_value=smoke_errors if smoke_errors is not None else [])
+        monkeypatch.setattr(memory_setup, "_smoke_import_hindsight_local", smoke_probe)
+
+        hindsight_plugin.HindsightMemoryProvider().post_setup(str(tmp_path), {"memory": {}})
+        return smoke_probe
+
+    def test_intel_local_embedded_success_fires_smoke(self, tmp_path, monkeypatch):
+        """Healthy smoke probe runs after a successful local_embedded install
+        on Intel macOS."""
+        probe = self._drive_post_setup(
+            tmp_path, monkeypatch, intel_macos=True, install_ok=True
+        )
+        probe.assert_called_once()
+
+    def test_intel_broken_runtime_raises_out_of_wizard(self, tmp_path, monkeypatch):
+        """A backtracked runtime (smoke errors) must raise out of the wizard
+        so a fresh interactive setup cannot claim success on a broken stack."""
+        import pytest
+
+        with pytest.raises(RuntimeError) as excinfo:
+            self._drive_post_setup(
+                tmp_path,
+                monkeypatch,
+                intel_macos=True,
+                install_ok=True,
+                smoke_errors=[
+                    "hindsight_api.LocalSTEmbeddings: AttributeError: the slim "
+                    "runtime shipped an API release that does not expose the "
+                    "configured ONNX embeddings provider (#81421)"
+                ],
+            )
+        assert "Hindsight slim runtime smoke validation failed" in str(excinfo.value)
+
+    def test_failed_install_does_not_fire_smoke(self, tmp_path, monkeypatch):
+        """A failed install must NOT reach the smoke check — mirror of the
+        update path's ``outcome.ok``-only rule (never mask an install
+        failure)."""
+        probe = self._drive_post_setup(
+            tmp_path,
+            monkeypatch,
+            intel_macos=True,
+            install_ok=False,
+            smoke_errors=["boom"],
+        )
+        probe.assert_not_called()
+
+    def test_blocked_install_does_not_fire_smoke(self, tmp_path, monkeypatch):
+        """A blocked install must not reach the smoke check either."""
+        probe = self._drive_post_setup(
+            tmp_path,
+            monkeypatch,
+            intel_macos=True,
+            install_ok=False,
+            install_blocked=True,
+            smoke_errors=["boom"],
+        )
+        probe.assert_not_called()
+
+    def test_non_intel_does_not_fire_smoke(self, tmp_path, monkeypatch):
+        """Apple Silicon / non-macOS must not smoke-check even on a
+        successful local_embedded install (the helper's Intel gate)."""
+        probe = self._drive_post_setup(
+            tmp_path,
+            monkeypatch,
+            intel_macos=False,
+            install_ok=True,
+            smoke_errors=["boom"],
+        )
+        probe.assert_not_called()
