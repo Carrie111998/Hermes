@@ -608,6 +608,16 @@ def should_use_direct_api_call(agent) -> bool:
 # progress tokens change every sample while the request is open.
 _DIRECT_API_ACTIVITY_HEARTBEAT_SECONDS = 15.0
 
+# #85252: escalation budget for a stale inline abort that found no sockets.
+# The shutdown-only abort is a no-op when the pool walk comes back empty
+# (tcp_force_closed=0) — the in-flight request then keeps running until the
+# provider answers or the connection dies on its own (observed 5-11x over
+# the threshold during a provider stall). The watchdog re-sweeps the pool
+# FD-safely for this window, then hard-closes the request client so the
+# blocked recv/send fails instead of waiting for the provider.
+_DIRECT_API_STALE_ESCALATION_WINDOW = 2.0  # seconds
+_DIRECT_API_STALE_ESCALATION_SWEEP_INTERVAL = 0.2  # seconds
+
 
 def _resolve_direct_stale_timeout(agent, api_kwargs: dict) -> float:
     """Stale budget for the inline non-streaming call.
@@ -666,7 +676,16 @@ def direct_api_call(agent, api_kwargs: dict):
     # marks a user/monitor interrupt as the owner of the outcome so a racing
     # stale timer cannot misclassify the kill as provider staleness;
     # ``stale`` is the one-shot stale transition itself.
-    request_state = {"client": None, "done": False, "stale": False, "cancelled": False}
+    # ``tcp_force_closed`` records how many sockets the stale abort actually
+    # shut down (0 → the pool walk found nothing, the request may still be
+    # running — the #85252 escalation depends on this).
+    request_state = {
+        "client": None,
+        "done": False,
+        "stale": False,
+        "cancelled": False,
+        "tcp_force_closed": -1,
+    }
     request_client_lock = threading.Lock()
     activity_hb_stop = threading.Event()
 
@@ -705,11 +724,20 @@ def direct_api_call(agent, api_kwargs: dict):
             request_client = request_state["client"]
             if request_client is not None:
                 try:
-                    agent._abort_request_openai_client(request_client, reason=reason)
+                    shutdown_count = agent._abort_request_openai_client(
+                        request_client, reason=reason
+                    )
+                    # #85252: tcp_force_closed=0 means the abort was a no-op —
+                    # no sockets reached, so the in-flight request may keep
+                    # running. The stale watchdog escalates on that signal.
+                    request_state["tcp_force_closed"] = (
+                        shutdown_count if isinstance(shutdown_count, int) else -1
+                    )
                 except Exception:
                     logger.debug(
                         "Inline request abort failed (%s)", reason, exc_info=True
                     )
+                    request_state["tcp_force_closed"] = 0
             return newly_stale
 
     def _make_client(reason: str, kind: str = "openai"):
@@ -771,6 +799,64 @@ def direct_api_call(agent, api_kwargs: dict):
     stale_timeout = _resolve_direct_stale_timeout(agent, api_kwargs)
     activity_hb.start()
 
+    def _escalate_stale_kill() -> None:
+        """#85252: bound the request even when the stale abort found no sockets.
+
+        A shutdown-only abort is a no-op when the pool walk comes back empty
+        (``tcp_force_closed=0``): the in-flight request then keeps running
+        until the provider answers or the connection dies on its own —
+        observed 5-11x over the threshold during a provider stall. Runs on
+        the watchdog thread after the abort + report:
+
+        1. Re-sweep the pool FD-safely (``shutdown(SHUT_RDWR)`` only) while
+           the request stays blocked — sockets can appear between sweeps
+           (mid-handshake, pool handoff).
+        2. When the grace window expires with the request still blocked,
+           hard-close the request client so the hung recv/send fails instead
+           of waiting for the provider.
+
+        The hard close releases FDs from this (stranger) thread — normally
+        the #29507 FD-recycle hazard. It is justified here because the
+        request-local client has no unwinding owner thread to protect: the
+        owner IS the stuck conversation thread, and a hung *read* has no
+        pending TLS write that could be flushed into a recycled FD. Leaving
+        the request unbounded is the worse failure.
+        """
+        with request_client_lock:
+            if request_state["done"]:
+                return
+            request_client = request_state["client"]
+            force_closed = request_state["tcp_force_closed"]
+        if request_client is None:
+            return
+        deadline = time.time() + _DIRECT_API_STALE_ESCALATION_WINDOW
+        while time.time() < deadline:
+            if force_closed == 0:
+                # The first sweep found no sockets — they may have appeared
+                # since (mid-handshake / pool handoff). Re-sweep; shutdown is
+                # FD-safe and idempotent on already-shut sockets.
+                try:
+                    agent._force_close_tcp_sockets(request_client)
+                except Exception:
+                    logger.debug("Inline stale re-sweep failed", exc_info=True)
+            time.sleep(_DIRECT_API_STALE_ESCALATION_SWEEP_INTERVAL)
+            with request_client_lock:
+                if request_state["done"]:
+                    return
+                request_client = request_state["client"]
+            if request_client is None:
+                return
+        # Still blocked after the grace window: hard close is the only
+        # remaining bound. The reason is not a reuse reason, so the client
+        # is really closed (fresh pool on the retry) — see
+        # _REQUEST_CLIENT_REUSE_REASONS.
+        try:
+            agent._close_request_openai_client(
+                request_client, reason="stale_call_kill_escalation"
+            )
+        except Exception:
+            logger.debug("Inline stale escalation close failed", exc_info=True)
+
     def _on_stale() -> None:
         # Runs on the timer thread. It only aborts the in-flight sockets —
         # it never issues a request — so the inline / no-worker property that
@@ -785,6 +871,9 @@ def direct_api_call(agent, api_kwargs: dict):
             agent, api_kwargs, elapsed, stale_timeout, inline=True
         )
         _touch_stale_kill_activity(agent, elapsed)
+        # #85252: the abort alone may leave the request unbounded when it
+        # found no sockets to shut down — escalate to a hard bound.
+        _escalate_stale_kill()
 
     stale_watchdog = None
     if math.isfinite(stale_timeout) and stale_timeout > 0:

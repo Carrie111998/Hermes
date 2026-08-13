@@ -5216,7 +5216,7 @@ class AIAgent:
             return
         self._close_openai_client(client, reason=reason, shared=False)
 
-    def _abort_request_openai_client(self, client: Any, *, reason: str) -> None:
+    def _abort_request_openai_client(self, client: Any, *, reason: str) -> int:
         """Cross-thread abort: shut sockets down without releasing FDs.
 
         Companion to :meth:`_close_request_openai_client` for stranger-thread
@@ -5229,9 +5229,14 @@ class AIAgent:
         the owning worker thread's pending ``recv``/``send`` with an EOF or
         ``EPIPE`` so it can unwind and close ``client`` from its own context
         — which is where the FD release belongs.
+
+        Returns the number of sockets shut down (0 when none were found —
+        the in-flight request may then keep running until the provider
+        finishes; the inline watchdog uses this to escalate to a hard close,
+        see #85252).
         """
         if client is None:
-            return
+            return 0
         # A pool whose sockets were shut down from a stranger thread must
         # never be reused: poison the cache slot so the owner-thread close
         # discards it and the next create builds a fresh client.
@@ -5259,6 +5264,7 @@ class AIAgent:
                     else ""
                 ),
             )
+            return shutdown_count
         except Exception as exc:
             logger.debug(
                 "OpenAI client abort failed (%s, shared=False) %s error=%s",
@@ -5266,6 +5272,7 @@ class AIAgent:
                 self._client_log_context(),
                 exc,
             )
+            return 0
 
     def _create_request_anthropic_client(self, *, reason: str) -> Any:
         """Build a request-local Anthropic client for one in-flight call.

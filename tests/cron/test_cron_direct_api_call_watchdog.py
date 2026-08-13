@@ -140,6 +140,91 @@ def test_healthy_call_is_untouched_by_the_watchdog():
     )
 
 
+# ---------------------------------------------------------------------------
+# #85252: a stale abort that finds no sockets (tcp_force_closed=0) must
+# escalate — the shutdown-only abort alone leaves the request unbounded.
+# ---------------------------------------------------------------------------
+
+
+def test_stale_abort_finding_no_sockets_escalates_to_hard_close():
+    """The pool walk coming back empty (tcp_force_closed=0) must not leave
+    the in-flight request running past the threshold: the watchdog re-sweeps
+    FD-safely and then hard-closes the request client — the only remaining
+    bound — surfacing a retryable TimeoutError."""
+    agent = _make_agent(stale_timeout=0.2)
+    release = threading.Event()
+    sweeps: list[str] = []
+
+    def _abort_finds_nothing(client, reason):
+        # Production symptom behind #85252: no sockets reachable in the pool.
+        return 0
+
+    def _re_sweep(client):
+        sweeps.append("sweep")
+        return 0
+
+    def _escalation_close(client, **kwargs):
+        # The hard close is what finally breaks the blocked recv.
+        release.set()
+
+    def _stalled(**_kwargs):
+        assert release.wait(timeout=6.0)
+        raise ConnectionError("client closed")
+
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.side_effect = _stalled
+    agent._create_request_openai_client.return_value = fake_client
+    agent._abort_request_openai_client.side_effect = _abort_finds_nothing
+    agent._force_close_tcp_sockets = _re_sweep
+    agent._close_request_openai_client.side_effect = _escalation_close
+
+    started = time.time()
+    with pytest.raises(TimeoutError, match="timed out after"):
+        direct_api_call(agent, {"model": "m", "messages": []})
+    elapsed = time.time() - started
+
+    # The watchdog re-swept while the request stayed blocked, then really
+    # closed the request client with the escalation reason (not the reuse
+    # reason the finally uses on a clean finish).
+    assert sweeps, "watchdog never re-swept the empty pool"
+    assert any(
+        c.kwargs.get("reason") == "stale_call_kill_escalation"
+        for c in agent._close_request_openai_client.call_args_list
+    )
+    # Bounded: threshold + escalation window, not the 5-11x stalls from #85252.
+    assert elapsed < 4.0
+
+
+def test_stale_abort_that_shuts_down_sockets_needs_no_escalation():
+    """When the abort really shut sockets down (tcp_force_closed>0) the
+    request unwinds on its own — no re-sweep, no escalation close."""
+    agent = _make_agent(stale_timeout=0.2)
+    release_after_abort = threading.Event()
+    escalation_close = MagicMock()
+
+    def _abort(client, reason):
+        release_after_abort.set()
+        return 1  # sockets were shut down (tcp_force_closed=1)
+
+    def _stalled(**_kwargs):
+        assert release_after_abort.wait(timeout=5.0)
+        raise ConnectionError("socket shut down")
+
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.side_effect = _stalled
+    agent._create_request_openai_client.return_value = fake_client
+    agent._abort_request_openai_client.side_effect = _abort
+    agent._close_request_openai_client = escalation_close
+
+    with pytest.raises(TimeoutError):
+        direct_api_call(agent, {"model": "m", "messages": []})
+
+    assert not any(
+        c.kwargs.get("reason") == "stale_call_kill_escalation"
+        for c in escalation_close.call_args_list
+    )
+
+
 def test_local_endpoint_infinite_budget_leaves_the_watchdog_disarmed():
     """``_compute_non_stream_stale_timeout`` returns inf for a local endpoint
     on the implicit default — that opt-out must survive on this path too."""
@@ -261,6 +346,49 @@ def test_e2e_cron_turn_is_bounded_through_the_real_agent_routing(monkeypatch):
     # The aborted pool is poisoned, so the killed client is really closed
     # instead of being cached for the retry.
     assert wire.close_calls == 1
+
+
+class _SocketsInvisibleWireClient(_StallingWireClient):
+    """Wire client whose sockets the pool walk can never find.
+
+    The #85252 failure mode: ``force_close_tcp_sockets`` comes back empty
+    (``tcp_force_closed=0``), so the shutdown-only abort is a no-op and only
+    the watchdog's escalation hard close unblocks the stalled request.
+    """
+
+    def _create(self, **_kwargs):
+        if not self.sockets_shut_down.wait(timeout=6.0):
+            raise AssertionError("escalation never shut the stalled request down")
+        raise ConnectionError("client closed")
+
+    def close(self):
+        super().close()
+        # The hard close is what actually breaks the blocked recv here.
+        self.sockets_shut_down.set()
+
+
+def test_e2e_stale_abort_with_invisible_sockets_escalates_to_close(monkeypatch):
+    """Real chain, #85252 variant: the pool walk finds no sockets
+    (tcp_force_closed=0) → the inline watchdog re-sweeps and then hard-closes
+    the request client through the real lifecycle, bounding the cron turn."""
+    wire = _SocketsInvisibleWireClient()
+    agent = _build_cron_agent(monkeypatch)
+    agent.client = wire
+    monkeypatch.setattr(run_agent, "OpenAI", lambda **_kwargs: wire)
+    # No sockets are ever reachable from the pool walk.
+    monkeypatch.setattr(
+        run_agent.AIAgent, "_force_close_tcp_sockets", lambda self, client: 0
+    )
+
+    started = time.time()
+    with pytest.raises(TimeoutError):
+        agent._interruptible_api_call({"model": agent.model, "messages": []})
+    elapsed = time.time() - started
+
+    assert elapsed < 5.0, "cron turn was not bounded by the escalation"
+    # Escalation close + the finally's cleanup close both really close the
+    # wire client (the escalation reason is not a reuse reason).
+    assert wire.close_calls == 2
 
 
 # ---------------------------------------------------------------------------
