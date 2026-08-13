@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 from tools.skill_linter import lint_skill
 from tools.skills_hub import _referenced_support_paths
@@ -18,7 +19,8 @@ SUPPORT_PATHS = {
 
 def _view(name: str, file_path: str | None = None) -> dict:
     reset_skill_view_dedup()
-    return json.loads(skill_view(name, file_path=file_path))
+    with patch("tools.skills_tool.SKILLS_DIR", REPO_ROOT / "skills"):
+        return json.loads(skill_view(name, file_path=file_path))
 
 
 def test_bundled_skill_is_discoverable_with_grounding_relationship() -> None:
