@@ -378,6 +378,33 @@ def check_whatsapp_requirements() -> bool:
         return False
 
 
+def _has_valid_creds(creds_path: Path) -> bool:
+    """Return True only when ``creds.json`` is real, usable pairing state.
+
+    Existence alone is not enough: in ``--pair-only`` mode the bridge writes
+    ``creds.json`` *after* emitting the ``connected`` event and then exits on
+    its own, so a supervisor that kills the bridge on ``connected`` can leave a
+    0-byte (or half-written) ``creds.json`` behind. That truncated file still
+    passes ``Path.exists()``, so a pairing that was actually lost is reported
+    as paired and the gateway proceeds on unusable credentials. Validate that
+    the file is non-empty, parses as JSON, and carries the Baileys identity
+    keys that a genuine pairing always contains.
+    """
+    import json
+
+    try:
+        if creds_path.stat().st_size == 0:
+            return False
+        data = json.loads(creds_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return bool(
+        isinstance(data, dict)
+        and data.get("noiseKey")
+        and data.get("signedIdentityKey")
+    )
+
+
 class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     """
     WhatsApp adapter.
@@ -539,11 +566,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # clear pairing message instead of the watcher
         # silently hammering an unconfigured platform.
         creds_path = self._session_path / "creds.json"
-        if not creds_path.exists():
+        if not _has_valid_creds(creds_path):
             logger.warning(
-                "[%s] WhatsApp is enabled but not paired (no creds.json at %s). "
-                "Pair from the dashboard or run `hermes whatsapp`; remove "
-                "WHATSAPP_ENABLED from your .env to disable.",
+                "[%s] WhatsApp is enabled but not paired (no valid creds.json "
+                "at %s — missing, empty, or truncated). Pair from the dashboard "
+                "or run `hermes whatsapp`; remove WHATSAPP_ENABLED from your "
+                ".env to disable.",
                 self.name, creds_path,
             )
             self._set_fatal_error(
