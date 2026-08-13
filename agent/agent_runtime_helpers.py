@@ -2907,7 +2907,12 @@ def rebuild_agent_toolsets(
     try:
         agent._invalidate_system_prompt()
     except Exception:
-        logger.debug("rebuild_agent_toolsets: system prompt invalidation failed", exc_info=True)
+        # Warn, not debug: on failure the agent runs the NEW tool surface with
+        # the OLD system prompt (stale per-tool guidance + skills index), which
+        # must be visible in production, not silently swallowed.
+        logger.warning(
+            "rebuild_agent_toolsets: system prompt invalidation failed", exc_info=True
+        )
 
     # Kanban lifecycle guidance is toolset-gated and cached once at build; keep
     # it consistent with the new surface (cheap membership test).

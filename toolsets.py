@@ -68,8 +68,12 @@ _HERMES_CORE_TOOLS = [
     # off every CLI/messaging/cron schema (narrow waist).
     # Session history search
     "session_search",
-    # Per-chat tool preset management (read/create/edit presets)
-    "manage_presets",
+    # NOTE: `manage_presets` is deliberately NOT here. Per-chat preset
+    # management is a GUI/coding concept — forcing it into core would ship its
+    # schema on every chat-only session (the exact tokens chat-only exists to
+    # save) and make the dedicated `tool_presets` toolset redundant. It lives in
+    # that toolset (GUI-surfaced via _load_enabled_toolsets) and the coding
+    # posture, mirroring the `project` / `desktop_ui` narrow-waist rule above.
     # Clarifying questions
     "clarify",
     # Code execution + delegation
