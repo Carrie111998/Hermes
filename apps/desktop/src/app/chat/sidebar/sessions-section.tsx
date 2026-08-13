@@ -150,6 +150,9 @@ interface SidebarSessionsSectionProps {
   onReorderSessions?: (ids: string[]) => void
   // Drag-to-reorder for the project overview list (top-level projects).
   onReorderProjects?: (ids: string[]) => void
+  // Drag-to-reorder for the profile groups in the All-profiles aggregate view.
+  // Only profile-mode groups are sortable; source/workspace groups stay static.
+  onReorderGroups?: (ids: string[]) => void
   // Rendered atop the entered-project body (a "back to overview" row).
   projectBackRow?: React.ReactNode
   dndSensors?: ReturnType<typeof useSensors>
@@ -201,6 +204,7 @@ export function SidebarSessionsSection({
   manualOrderIds,
   onReorderSessions,
   onReorderProjects,
+  onReorderGroups,
   projectBackRow,
   dndSensors,
   showProfileTags = false,
@@ -431,15 +435,41 @@ export function SidebarSessionsSection({
       </>
     )
   } else if (groups?.length) {
-    // Profile/source groups never reorder; render them flat with static rows.
-    inner = groups.map(group => (
-      <SidebarWorkspaceGroup
-        group={group}
-        key={group.id}
-        onNewSession={onNewSessionInWorkspace}
-        renderRows={renderRows}
-      />
-    ))
+    // Profile groups (the All-profiles aggregate) reorder by drag when the
+    // caller wires onReorderGroups; the default profile stays a fixture on top,
+    // like Home in the project overview, and rows inside stay static.
+    // Source/workspace groups never reorder — render those flat as before.
+    const reorderableProfileGroups = groups.every(group => group.mode === 'profile') && !!onReorderGroups
+    const fixedGroups = reorderableProfileGroups ? groups.filter(group => group.id === 'default') : groups
+    const sortableGroups = reorderableProfileGroups ? groups.filter(group => group.id !== 'default') : []
+
+    const groupNode = (group: SidebarSessionGroup, sortable: boolean) => {
+      const props = {
+        group,
+        key: group.id,
+        onNewSession: onNewSessionInWorkspace,
+        renderRows
+      }
+
+      return sortable ? <SortableWorkspaceGroup {...props} /> : <SidebarWorkspaceGroup {...props} />
+    }
+
+    inner = (
+      <>
+        {fixedGroups.map(group => groupNode(group, false))}
+        {sortableGroups.length > 1 && onReorderGroups ? (
+          <ReorderableList
+            ids={sortableGroups.map(group => group.id)}
+            onReorder={onReorderGroups}
+            sensors={dndSensors}
+          >
+            {sortableGroups.map(group => groupNode(group, true))}
+          </ReorderableList>
+        ) : (
+          sortableGroups.map(group => groupNode(group, false))
+        )}
+      </>
+    )
   } else if (flatVirtualized) {
     const virtual = (
       <VirtualSessionList
@@ -517,4 +547,8 @@ function SortableSidebarSessionRow(props: SortableSessionRowProps) {
 
 function SortableProjectOverviewRow(props: React.ComponentProps<typeof ProjectOverviewRow>) {
   return <ProjectOverviewRow {...props} {...useSortableBindings(props.project.id)} />
+}
+
+function SortableWorkspaceGroup(props: React.ComponentProps<typeof SidebarWorkspaceGroup>) {
+  return <SidebarWorkspaceGroup {...props} {...useSortableBindings(props.group.id)} />
 }

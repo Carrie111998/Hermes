@@ -171,6 +171,38 @@ export function sortWorktreeGroups(groups: SidebarSessionGroup[]): SidebarSessio
 }
 
 /**
+ * Order the All-profiles sidebar groups: `default` pins first as a fixture (the
+ * root profile, like Home in the project overview), then the named profiles in
+ * the user's dragged order — the SAME order the profile rail persists (see
+ * store/profile `$profileOrder`), so dragging a group here reorders the rail
+ * and the ⌘N hotkeys coherently. Profiles the stored order doesn't know
+ * alphabetise at the tail, so a freshly created profile lands at the end until
+ * the user drags it.
+ */
+export function sortProfileGroups(groups: SidebarSessionGroup[], order: string[]): SidebarSessionGroup[] {
+  const rank = new Map(order.map((name, index) => [name, index]))
+
+  return [...groups].sort((a, b) => {
+    if (a.id === 'default') {
+      return -1
+    }
+
+    if (b.id === 'default') {
+      return 1
+    }
+
+    const ra = rank.get(a.id)
+    const rb = rank.get(b.id)
+
+    if (ra != null && rb != null) {
+      return ra - rb
+    }
+
+    return ra != null ? -1 : rb != null ? 1 : a.label.localeCompare(b.label)
+  })
+}
+
+/**
  * VISUAL enhancer only: inject empty lanes from a live `git worktree list` so a
  * repo shows its branches/worktrees even when they have no Hermes sessions yet.
  * The repo's real session lanes already come fully built from the backend
