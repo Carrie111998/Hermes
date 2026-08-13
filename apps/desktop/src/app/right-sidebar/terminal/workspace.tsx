@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { useEffect } from 'react'
 
 import { $backgroundStatusBySession } from '@/store/composer-status'
+import { $activeGatewayProfile } from '@/store/profile'
 
 import { seedAgentTerminalCommand, syncAgentTerminalSnapshot } from './agent-terminal-stream'
 import { setActiveTerminalId } from './buffer'
@@ -19,6 +20,7 @@ interface TerminalWorkspaceProps {
 export function TerminalWorkspace({ onAddSelectionToChat }: TerminalWorkspaceProps) {
   const terminals = useStore($terminals)
   const activeId = useStore($activeTerminalId)
+  const activeProfile = useStore($activeGatewayProfile)
   const background = useStore($backgroundStatusBySession)
 
   // Mirror the tab selection into the agent reader (read_terminal reads it).
@@ -56,6 +58,7 @@ export function TerminalWorkspace({ onAddSelectionToChat }: TerminalWorkspacePro
             id={term.id}
             key={term.id}
             onAddSelectionToChat={onAddSelectionToChat}
+            profile={term.profile ?? activeProfile}
             restoreCwd={term.restoreCwd}
             reviveBuffer={term.reviveBuffer}
           />

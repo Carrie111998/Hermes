@@ -27,7 +27,7 @@ import {
   terminalTheme
 } from './selection'
 import { prepareTerminalFontFamily } from './terminal-font'
-import { closeTerminal, updateTerminalRestoreCwd, updateTerminalReviveBuffer } from './terminals'
+import { bindTerminalProfile, closeTerminal, updateTerminalRestoreCwd, updateTerminalReviveBuffer } from './terminals'
 import { useTerminalFontController } from './use-terminal-font'
 
 // How many scrollback lines to serialize for relaunch restore. Mirrors VS Code's
@@ -236,6 +236,8 @@ interface UseTerminalSessionOptions {
   /** Only the active tab is visible, owns the agent reader, and runs injections. */
   active: boolean
   onAddSelectionToChat: (text: string, label?: string) => void
+  /** Backend profile captured when this terminal tab was created. */
+  profile?: string
   /** Last observed shell cwd from the previous session; the fresh PTY starts
    *  here (falling back to `cwd`) so a prior `cd` survives a relaunch. */
   restoreCwd?: string
@@ -383,6 +385,7 @@ export function useTerminalSession({
   cwd,
   active,
   onAddSelectionToChat,
+  profile,
   restoreCwd,
   reviveBuffer,
   onShell
@@ -832,12 +835,16 @@ export function useTerminalSession({
       return false
     })
 
-    const startSession = () =>
+    const startSession = () => {
+      if (profile) {
+        bindTerminalProfile(id, profile)
+      }
+
       void terminalApi
         // Prefer the prior session's last cwd so a reopened tab lands where the
         // user last `cd`'d; the main side falls back to the launch cwd (then
         // home) if that dir no longer exists.
-        .start({ cols: term.cols, cwd: initialRestoreCwdRef.current || cwd, rows: term.rows })
+        .start({ cols: term.cols, cwd: initialRestoreCwdRef.current || cwd, profile, rows: term.rows })
         .then(session => {
           if (disposed) {
             void terminalApi.dispose(session.id)
@@ -884,6 +891,7 @@ export function useTerminalSession({
           setStatus('closed')
           term.write(`Terminal failed to start: ${error instanceof Error ? error.message : String(error)}\r\n`)
         })
+    }
 
     // Open + fit + start only once webfonts settle. Fitting with fallback metrics
     // picks the wrong row count, the shell boots at that size, then the real font
@@ -952,7 +960,7 @@ export function useTerminalSession({
     // `id` is stable for the instance's life (keyed by tab id), so listing it
     // doesn't re-create the shell — it just satisfies the deps check for the
     // closeTerminal(id) call in onExit.
-  }, [addSelectionToChat, cwd, id, latestFontFamilyRef, mountedRef])
+  }, [addSelectionToChat, cwd, id, latestFontFamilyRef, mountedRef, profile])
 
   useEffect(() => {
     const term = termRef.current

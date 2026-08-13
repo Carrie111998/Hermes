@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { applyConnectionChange, commitConnectionFailure, resolveTerminalConnection } from './connection-apply'
+import {
+  applyConnectionChange,
+  commitConnectionFailure,
+  resolveTerminalConnection
+} from './connection-apply'
 
 function deferred() {
   let resolve!: () => void
@@ -72,13 +76,17 @@ describe('resolveTerminalConnection', () => {
     const getTarget = vi.fn().mockReturnValueOnce('pending').mockReturnValueOnce(target)
     const ensureBackend = vi.fn(async () => undefined)
 
-    await expect(resolveTerminalConnection(getTarget, ensureBackend)).resolves.toBe(target)
+    await expect(resolveTerminalConnection('venture', getTarget, ensureBackend)).resolves.toBe(target)
+    expect(getTarget).toHaveBeenNthCalledWith(1, 'venture')
+    expect(getTarget).toHaveBeenNthCalledWith(2, 'venture')
     expect(ensureBackend).toHaveBeenCalledOnce()
+    expect(ensureBackend).toHaveBeenCalledWith('venture')
   })
 
   it('does not start a local terminal while configured SSH remains unavailable', async () => {
     await expect(
       resolveTerminalConnection(
+        'venture',
         () => 'pending',
         async () => undefined
       )

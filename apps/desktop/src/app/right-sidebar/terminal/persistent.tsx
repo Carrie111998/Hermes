@@ -7,6 +7,7 @@ import { $layoutTree } from '@/components/pane-shell/tree/store'
 import { markRightPanePerf } from '@/debug/right-pane-events'
 import { createRendererLoopPauseController } from '@/lib/renderer-loop-pause'
 import { $paneStates } from '@/store/panes'
+import { $activeGatewayProfile } from '@/store/profile'
 
 import { $terminalTakeover } from '../store'
 
@@ -64,6 +65,7 @@ const sameRect = (a: Rect | null, b: Rect) =>
 export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalProps) {
   const slot = useStore($slot)
   const terminalTakeover = useStore($terminalTakeover)
+  const activeProfile = useStore($activeGatewayProfile)
   const [rect, setRect] = useState<Rect | null>(null)
   const [ready, setReady] = useState(false)
 
@@ -77,9 +79,9 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
   useEffect(() => {
     if (terminalTakeover && ready) {
       setMounted(true)
-      ensureTerminal()
+      ensureTerminal(activeProfile)
     }
-  }, [terminalTakeover, ready])
+  }, [activeProfile, terminalTakeover, ready])
 
   useLayoutEffect(() => {
     if (!slot) {

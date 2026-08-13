@@ -37,15 +37,15 @@ function commitConnectionFailure(current, starting, commit) {
   return true
 }
 
-async function resolveTerminalConnection(getTarget, ensureBackend) {
-  let target = getTarget()
+async function resolveTerminalConnection(profile, getTarget, ensureBackend) {
+  let target = getTarget(profile)
 
   if (target !== 'pending') {
     return target
   }
 
-  await ensureBackend()
-  target = getTarget()
+  await ensureBackend(profile)
+  target = getTarget(profile)
 
   if (target === 'pending') {
     throw new Error('Remote connection is not ready yet. Try again in a moment.')

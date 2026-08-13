@@ -86,6 +86,7 @@ import {
   remoteRequestMatchesBaseUrl,
   resolveAuthMode,
   resolveProfileBackendRoute,
+  resolveProfileSshScope,
   resolveTestWsUrl,
   savedProfileSsh,
   tokenPreview,
@@ -8725,34 +8726,19 @@ async function teardownSshConnection(profile) {
 
 // CRITICAL: this must mirror resolveRemoteBackend's precedence, not just return
 // any cached SSH state. A per-profile token/OAuth override wins over a global
-// SSH connection — so if the active profile resolves to a NON-SSH backend, the
+// SSH connection — so if the requested profile resolves to a NON-SSH backend, the
 // terminal must NOT fall through to a global SSH host.
-function activeSshTerminalTarget() {
-  const profile = primaryProfileKey()
+function activeSshTerminalTarget(profile) {
   const config = readDesktopConnectionConfig()
+  const scope = resolveProfileSshScope(config, profile, process.env.HERMES_DESKTOP_REMOTE_URL)
 
-  if (profileSshOverride(config, profile)) {
-    const scope = sshScopeKey(profile)
-    const state = sshConnections.get(scope)
-
-    return state && state.ssh ? { ssh: state.ssh, scope } : 'pending'
-  }
-
-  if (profileRemoteOverride(config, profile)) {
+  if (scope === null) {
     return null
   }
 
-  if (process.env.HERMES_DESKTOP_REMOTE_URL) {
-    return null
-  }
+  const state = sshConnections.get(scope)
 
-  if (config.mode === 'ssh') {
-    const state = sshConnections.get('')
-
-    return state && state.ssh ? { ssh: state.ssh, scope: '' } : 'pending'
-  }
-
-  return null
+  return state?.ssh ? { ssh: state.ssh, scope } : 'pending'
 }
 
 function effectiveSshConfigFingerprint(sshConfig) {
@@ -14202,8 +14188,10 @@ ipcMain.handle('hermes:terminal:start', async (event, payload = {}) => {
   const cwd = safeTerminalCwd(payload?.cwd)
   const cols = Math.max(2, Number.parseInt(String(payload?.cols || 80), 10) || 80)
   const rows = Math.max(2, Number.parseInt(String(payload?.rows || 24), 10) || 24)
+  const requestedProfile = String(payload?.profile || '').trim()
+  const profile = PROFILE_NAME_RE.test(requestedProfile) ? requestedProfile : primaryProfileKey()
 
-  const sshTarget = await resolveTerminalConnection(activeSshTerminalTarget, () => ensureBackend(primaryProfileKey()))
+  const sshTarget = await resolveTerminalConnection(profile, activeSshTerminalTarget, ensureBackend)
   const remote = Boolean(sshTarget)
   const remoteState = remote ? sshConnections.get(sshTarget.scope) : null
 

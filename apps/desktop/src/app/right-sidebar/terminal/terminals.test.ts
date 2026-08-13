@@ -5,12 +5,17 @@ const STORAGE_KEY = 'hermes.desktop.terminals.v1'
 
 async function loadTerminalStore() {
   const $currentCwd = atom('/workspace')
+  const $activeGatewayProfile = atom('default')
 
   vi.doMock('@/store/session', () => ({
     $currentCwd
   }))
+  vi.doMock('@/store/profile', () => ({
+    $activeGatewayProfile,
+    normalizeProfileKey: (name: string | null | undefined) => name?.trim() || 'default'
+  }))
 
-  return { ...(await import('./terminals')), $currentCwd }
+  return { ...(await import('./terminals')), $activeGatewayProfile, $currentCwd }
 }
 
 describe('terminal store persistence', () => {
@@ -54,8 +59,65 @@ describe('terminal store persistence', () => {
     // disk (this is what makes app-quit restore reliable).
     expect(JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? '{}')).toEqual({
       activeTerminalId: userId,
-      terminals: [{ auto: false, cwd: '/repo', id: userId, reviveBuffer: 'recent scrollback', title: 'server' }]
+      terminals: [
+        { auto: false, cwd: '/repo', id: userId, profile: 'default', reviveBuffer: 'recent scrollback', title: 'server' }
+      ]
     })
+  })
+
+  it('binds new tabs to the active gateway profile and persists the route', async () => {
+    const { $activeGatewayProfile, $terminals, createTerminal } = await loadTerminalStore()
+    $activeGatewayProfile.set('venture')
+
+    const id = createTerminal('/remote/repo')
+
+    expect($terminals.get().find(term => term.id === id)?.profile).toBe('venture')
+    expect(JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? '{}').terminals[0].profile).toBe('venture')
+  })
+
+  it('migrates a legacy tab once without rebinding it after a profile switch', async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        activeTerminalId: 'legacy',
+        terminals: [{ auto: true, cwd: '/repo', id: 'legacy', title: 'Terminal' }]
+      })
+    )
+    const { $terminals, bindTerminalProfile } = await loadTerminalStore()
+
+    bindTerminalProfile('legacy', 'venture')
+    bindTerminalProfile('legacy', 'jemma')
+
+    expect($terminals.get()[0]?.profile).toBe('venture')
+    expect(JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? '{}').terminals[0].profile).toBe('venture')
+  })
+
+  it('selects the active profile terminal and creates one when that profile has none', async () => {
+    const { $activeGatewayProfile, $activeTerminalId, $terminals, createTerminal, ensureTerminal } =
+      await loadTerminalStore()
+
+    const localId = createTerminal('/windows')
+    $activeGatewayProfile.set('venture')
+
+    ensureTerminal('venture')
+    const remoteId = $activeTerminalId.get()
+
+    expect(remoteId).not.toBe(localId)
+    expect($terminals.get().find(term => term.id === remoteId)?.profile).toBe('venture')
+
+    $activeGatewayProfile.set('default')
+    ensureTerminal('default')
+    expect($activeTerminalId.get()).toBe(localId)
+  })
+
+  it('keeps an explicitly surfaced agent tab active across profile changes', async () => {
+    const { $activeTerminalId, ensureAgentTerminal, ensureTerminal, selectTerminal } = await loadTerminalStore()
+    const agentId = ensureAgentTerminal('proc-1', 'background task')!
+    selectTerminal(agentId)
+
+    ensureTerminal('venture')
+
+    expect($activeTerminalId.get()).toBe(agentId)
   })
 
   it('never attaches a revive buffer to an agent tab', async () => {
@@ -168,6 +230,18 @@ describe('session cwd → terminal tab linking', () => {
 
     $currentCwd.set('')
     expect($activeTerminalId.get()).toBe(activeTab)
+  })
+
+  it('never selects a same-cwd terminal owned by a different profile', async () => {
+    const { $activeGatewayProfile, $activeTerminalId, $currentCwd, createTerminal } = await loadTerminalStore()
+    const localId = createTerminal('/shared')
+    $activeGatewayProfile.set('venture')
+    const remoteId = createTerminal('/remote')
+
+    $currentCwd.set('/shared')
+
+    expect($activeTerminalId.get()).toBe(remoteId)
+    expect($activeTerminalId.get()).not.toBe(localId)
   })
 
   it('stays put when the active tab already lives in the target cwd, and never matches agent tabs', async () => {

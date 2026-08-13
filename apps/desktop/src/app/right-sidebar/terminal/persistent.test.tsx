@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { hiddenPaneProps, PANE_HIDDEN_ATTR } from '@/components/pane-shell/pane-visibility'
 import { $paneStates } from '@/store/panes'
+import { $activeGatewayProfile } from '@/store/profile'
 
 import { $terminalTakeover } from '../store'
 
@@ -11,6 +12,10 @@ import { PersistentTerminal, TerminalSlot } from './persistent'
 
 vi.mock('../store', async () => ({
   $terminalTakeover: (await import('nanostores')).atom(false)
+}))
+
+vi.mock('@/store/profile', async () => ({
+  $activeGatewayProfile: (await import('nanostores')).atom('default')
 }))
 
 vi.mock('./terminals', () => ({
@@ -183,6 +188,7 @@ describe('PersistentTerminal rect tracking', () => {
   afterEach(() => {
     cleanup()
     $terminalTakeover.set(false)
+    $activeGatewayProfile.set('default')
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
     setVisibility(false)
