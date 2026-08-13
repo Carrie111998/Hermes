@@ -344,24 +344,79 @@ def _planned_rows(ledger: DelegationLedger) -> list[Dict[str, Any]]:
     return sorted(ledger.list_requests(state="PLANNED", limit=200), key=lambda row: (row["created_at"], row["request_id"]))
 
 
+_PR_ATTEMPT_ARTIFACT_KINDS = frozenset({"pr", "pr_attempt"})
+
+_RESUME_OK = "ok"
+_RESUME_UNKNOWN = "unknown"
+_RESUME_WRONG_STATE = "wrong-state"
+_RESUME_NO_SHADOW = "no-shadow"
+_RESUME_HAS_PR_ATTEMPT = "has-pr-attempt"
+
+
+def canary_resume_reason(ledger: DelegationLedger, request_id: str) -> str:
+    """Single source of truth for whether ``request_id`` is a bounded canary
+    resume candidate, plus WHY when it is not.
+
+    Returns one of:
+      - ``"ok"``            -- VALIDATED, carries a ``shadow`` artifact, and
+                                carries no ``pr``/``pr_attempt`` artifact.
+      - ``"unknown"``        -- no such request.
+      - ``"wrong-state"``    -- not VALIDATED.
+      - ``"no-shadow"``      -- VALIDATED but never shadow-verified by this
+                                executor (no ``shadow`` artifact).
+      - ``"has-pr-attempt"`` -- VALIDATED with a ``shadow`` artifact, but ALSO
+                                carrying a ``pr`` or ``pr_attempt`` artifact --
+                                durable evidence a PR was already attempted
+                                for this request. Resuming past that risks
+                                opening a second, duplicate PR for the same
+                                request if an earlier canary tick was
+                                hard-killed between recording ``pr_attempt``
+                                (written durably before the PR client is ever
+                                invoked -- see
+                                ``DelegationLedger.count_prs_for_target_since``)
+                                and transitioning to ``PR_OPEN``.
+
+    Shared by ``_canary_resumable_rows`` (executor selection) and the CLI's
+    pre-tick guard (``cli._cmd_executor_canary``) so the two surfaces cannot
+    drift -- see ``is_canary_resumable`` for the plain boolean form. Fail
+    closed: any reason other than ``"ok"`` means NOT resumable. This is the
+    one invariant the whole bounded-resume feature rests on: exactly ONE real
+    PR per request per window.
+    """
+    row = ledger.get_request(request_id)
+    if row is None:
+        return _RESUME_UNKNOWN
+    if row["state"] != "VALIDATED":
+        return _RESUME_WRONG_STATE
+    kinds = {artifact["kind"] for artifact in ledger.artifacts_for(request_id)}
+    if kinds & _PR_ATTEMPT_ARTIFACT_KINDS:
+        return _RESUME_HAS_PR_ATTEMPT
+    if "shadow" not in kinds:
+        return _RESUME_NO_SHADOW
+    return _RESUME_OK
+
+
+def is_canary_resumable(ledger: DelegationLedger, request_id: str) -> bool:
+    """True iff ``request_id`` is a bounded canary resume candidate.
+
+    See ``canary_resume_reason`` for the specific reason when this is False.
+    """
+    return canary_resume_reason(ledger, request_id) == _RESUME_OK
+
+
 def _canary_resumable_rows(ledger: DelegationLedger, request_id: str) -> list[Dict[str, Any]]:
     """The designated request's row, if it is a bounded canary resume candidate.
 
-    A request in VALIDATED is resumable ONLY when it carries a ``shadow``
-    artifact -- durable proof that THIS executor already shadow-verified it
-    in an earlier tick. VALIDATED alone is not that proof (a request can
-    reach VALIDATED only via this same pipeline, but callers must not rely on
-    that as a substitute for checking the artifact -- e.g. test/ops tooling
-    that force-sets state for setup). Fail-closed: no shadow artifact, no
-    resume. Returns a single-element list (or empty) so callers can treat it
+    Delegates to ``is_canary_resumable`` -- see ``canary_resume_reason`` for
+    the full rule (VALIDATED, carries a ``shadow`` artifact, and carries NO
+    ``pr``/``pr_attempt`` artifact). Fail-closed: anything else, no resume.
+    Returns a single-element list (or empty) so callers can treat it
     uniformly alongside ``_planned_rows``.
     """
+    if not is_canary_resumable(ledger, request_id):
+        return []
     row = ledger.get_request(request_id)
-    if row is None or row["state"] != "VALIDATED":
-        return []
-    if not any(artifact["kind"] == "shadow" for artifact in ledger.artifacts_for(request_id)):
-        return []
-    return [row]
+    return [row] if row is not None else []
 
 
 def _target_is_eligible(
@@ -505,15 +560,24 @@ def run_executor_tick(
 
     Selection normally scans only ``PLANNED`` rows. Bounded canary resume is
     the one exception: when ``mode="canary"`` AND ``request_id`` names a
-    request already in ``VALIDATED`` that carries a ``shadow`` artifact (see
-    ``_canary_resumable_rows``), that request becomes selectable again so an
+    request already in ``VALIDATED`` that carries a ``shadow`` artifact and
+    NO ``pr``/``pr_attempt`` artifact (see ``_canary_resumable_rows`` /
+    ``canary_resume_reason``), that request becomes selectable again so an
     operator can shadow-verify a request and then canary that SAME request.
-    The worktree from the shadow run is gone, so a resume still fully
-    rebuilds the worktree, reruns the implementation command, and
-    re-validates before pushing -- it only skips the two lifecycle
-    transitions (``BUILDING``, ``VALIDATED``) the request already passed
-    through, since re-entering ``BUILDING`` from ``VALIDATED`` is not a legal
-    edge. Resume is unreachable in shadow mode and unreachable without a
+    A ``pr``/``pr_attempt`` artifact is durable evidence a PR was already
+    attempted for the request, so it is excluded from resume even if still
+    VALIDATED with a ``shadow`` artifact -- this is what keeps the whole
+    system's binding invariant (exactly ONE real PR per request per window)
+    from depending only on the PR budget precheck. The worktree from the
+    shadow run is gone, so a resume still fully rebuilds the worktree,
+    reruns the implementation command, and re-validates before pushing -- it
+    only skips the two lifecycle transitions (``BUILDING``, ``VALIDATED``)
+    the request already passed through, since re-entering ``BUILDING`` from
+    ``VALIDATED`` is not a legal edge. In their place, the resume path
+    re-reads the request immediately after the lease is held and refuses
+    unless it is still ``VALIDATED`` -- the same authoritative-state
+    guarantee the skipped ``BUILDING`` transition would otherwise provide.
+    Resume is unreachable in shadow mode and unreachable without a
     designated ``request_id``.
     """
     if mode not in {"shadow", "canary"}:
@@ -531,10 +595,12 @@ def run_executor_tick(
     row: Optional[Dict[str, Any]] = None
     candidates = _planned_rows(ledger)
     if mode == "canary" and request_id is not None:
-        # Bounded canary resume candidates: canary-only, designated-only (the
-        # request_id is not None check above the mode=="shadow" case is
-        # never reached here, and the request_id is None early-return above
-        # already ran), and only a VALIDATED row with a shadow artifact.
+        # Resume candidates are added only when BOTH conditions in this `if`
+        # hold: mode is "canary" (shadow never resumes) AND a request_id is
+        # designated (the mode=="canary" and request_id is None case already
+        # returned above, before this line). _canary_resumable_rows applies
+        # the actual eligibility rule (VALIDATED + shadow artifact + no
+        # pr/pr_attempt artifact -- see canary_resume_reason).
         candidates = candidates + _canary_resumable_rows(ledger, request_id)
     if request_id is not None:
         candidates = [c for c in candidates if c["request_id"] == request_id]
@@ -552,8 +618,10 @@ def run_executor_tick(
     resuming = row["state"] == "VALIDATED"
 
     # Canary-only precondition: a durable per-window PR budget, checked before
-    # any mutation so an exhausted budget leaves the request PLANNED (no
-    # transition, fail-closed). Shadow never opens a PR, so it never consumes it.
+    # any mutation so an exhausted budget leaves the request in its current
+    # state with no transition (fail-closed) -- PLANNED on the fresh path,
+    # VALIDATED (still carrying its shadow artifact) on the resume path.
+    # Shadow never opens a PR, so it never consumes the budget.
     if mode == "canary" and _pr_budget_exhausted(ledger, target, row["target_repo"]):
         logger.warning("canary refused: PR budget exhausted for %s", row["target_repo"])
         return {"processed": 0, "errors": 0, "skipped": skipped}
@@ -581,6 +649,24 @@ def run_executor_tick(
         except sqlite3.IntegrityError:
             logger.info("executor tick skipped %s: lease already held by another worker", request_id)
             return {"processed": 0, "errors": 0, "skipped": skipped}
+
+        # Resume-only: the first authoritative re-read of the request's state
+        # after the lease is held. On the fresh path this guarantee comes
+        # from transition(..., "BUILDING") below, which re-reads the row and
+        # raises IllegalTransitionError if it moved under the candidate
+        # snapshot -- but that transition is skipped on resume (VALIDATED ->
+        # BUILDING is not a legal edge), so without this check the resume
+        # path would trust the pre-lease `resuming` snapshot straight through
+        # the rebuild, push, and PR creation below. Refuse here instead, the
+        # same way BUILDING would, before any worktree or remote side effect.
+        if resuming:
+            current = ledger.get_request(request_id)
+            current_state = current["state"] if current is not None else "missing"
+            if current_state != "VALIDATED":
+                raise ExecutorError(
+                    f"resume refused: request {request_id} is no longer VALIDATED "
+                    f"(state={current_state}); refusing to push a stale resume"
+                )
 
         # Transition to BUILDING only after the lease is ours, so no other
         # tick can reach this line for the same row concurrently. It still

@@ -25,10 +25,12 @@ executor-canary is a one-off, explicitly-authorized command that opens ONE
 real GitHub PR. It refuses (exit 2) unless both
 ``--i-understand-this-opens-a-real-pr`` and ``--request-id`` are supplied,
 and only then constructs a real PR client. The designated request must be
-PLANNED, or VALIDATED with a ``shadow`` artifact (a bounded resume of a
-request already shadow-verified by an earlier executor-shadow tick) --
-any other state, or a VALIDATED request without that artifact, refuses
-before the tick and before any PR client is constructed.
+PLANNED, or VALIDATED with a ``shadow`` artifact and no ``pr``/``pr_attempt``
+artifact (a bounded resume of a request already shadow-verified by an
+earlier executor-shadow tick, that has not already had a PR attempted) --
+any other state, a VALIDATED request without a ``shadow`` artifact, or a
+VALIDATED request that already carries ``pr``/``pr_attempt`` evidence,
+refuses before the tick and before any PR client is constructed.
 """
 from __future__ import annotations
 
@@ -134,23 +136,37 @@ def _cmd_executor_canary(args) -> int:
     # A silent processed=0 is indistinguishable from "no eligible target" and
     # is a real operator footgun right when a canary is being run -- most
     # commonly because a prior shadow tick already advanced the SAME request
-    # to VALIDATED. Fail loudly, before the tick (and before GhPrClient is
-    # ever constructed), naming the actual state.
+    # to VALIDATED, or a prior canary attempt already touched it. Fail
+    # loudly, before the tick (and before GhPrClient is ever imported or
+    # constructed), naming the actual state.
     #
-    # run_executor_tick now supports a bounded canary resume: a designated
-    # request in VALIDATED that carries a `shadow` artifact (durable proof
-    # this executor already shadow-verified it) is a legitimate target here,
-    # not an error. VALIDATED without that artifact is still refused --
-    # fail-closed, since it was never shadow-verified.
+    # run_executor_tick supports a bounded canary resume: a designated
+    # request in VALIDATED that carries a `shadow` artifact and NO
+    # `pr`/`pr_attempt` artifact (durable proof this executor already
+    # shadow-verified it, and that a PR was never already attempted for it)
+    # is a legitimate target here, not an error. `canary_resume_reason` is
+    # the single source of truth for this rule -- shared with
+    # executor._canary_resumable_rows so the CLI guard and the tick's own
+    # selection logic cannot drift. Importing it does not import or
+    # construct GhPrClient; that stays deferred below, after this guard.
+    from devflow_delegation.executor import canary_resume_reason
+
     designated = em.ledger.get_request(args.request_id)
     if designated is None:
         print(f"ERROR: unknown request: {args.request_id}", file=sys.stderr)
         return 2
     if designated["state"] == "VALIDATED":
-        has_shadow_artifact = any(
-            artifact["kind"] == "shadow" for artifact in em.ledger.artifacts_for(args.request_id)
-        )
-        if not has_shadow_artifact:
+        reason = canary_resume_reason(em.ledger, args.request_id)
+        if reason == "has-pr-attempt":
+            print(
+                f"ERROR: request {args.request_id} is VALIDATED but already carries a "
+                "pr/pr_attempt artifact (a PR was already attempted for it); it cannot be "
+                "resumed -- resuming would risk opening a second, duplicate PR for the same "
+                "request",
+                file=sys.stderr,
+            )
+            return 2
+        if reason == "no-shadow":
             print(
                 f"ERROR: request {args.request_id} is VALIDATED but was not shadow-verified "
                 "(no shadow artifact); it cannot be resumed. Run executor-shadow for it first, "
@@ -158,12 +174,13 @@ def _cmd_executor_canary(args) -> int:
                 file=sys.stderr,
             )
             return 2
+        # reason == "ok": a legitimate bounded resume candidate; fall through.
     elif designated["state"] != "PLANNED":
         print(
             f"ERROR: request {args.request_id} is in state {designated['state']}, not PLANNED; "
             "canary requires a PLANNED request, or a VALIDATED request that was shadow-verified "
-            "(a prior shadow tick advances a request to VALIDATED and records a shadow artifact, "
-            "which canary can then resume)",
+            "and has no PR attempted yet (a prior shadow tick advances a request to VALIDATED "
+            "and records a shadow artifact, which canary can then resume)",
             file=sys.stderr,
         )
         return 2

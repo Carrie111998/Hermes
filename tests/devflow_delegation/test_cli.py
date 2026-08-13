@@ -288,6 +288,45 @@ def test_executor_canary_cli_validated_without_shadow_artifact_fails_loudly(queu
     assert ledger.get_request(rid)["state"] == "VALIDATED"
 
 
+def test_executor_canary_cli_validated_with_pr_attempt_fails_loudly(queue_mode, capsys, monkeypatch):
+    # Fix C: a designated request that is VALIDATED and carries a `shadow`
+    # artifact (which alone would make it look resumable) but ALSO a
+    # `pr_attempt` artifact -- durable evidence a PR was already attempted,
+    # see the comment on DelegationLedger.count_prs_for_target_since -- must
+    # still be refused fail-loudly, with a diagnostic naming the reason, and
+    # must never construct a PR client. Resuming past that risks opening a
+    # duplicate PR if the earlier tick was hard-killed between recording
+    # pr_attempt and transitioning to PR_OPEN.
+    import devflow_delegation.executor as executor_mod
+    from devflow_delegation.emitter import DelegationEmitter
+    from devflow_delegation.lifecycle import transition
+
+    monkeypatch.setattr("sys.stdin", __import__("io").StringIO(json.dumps(make_delegate_kwargs())))
+    cli.main(["delegate"])
+    ledger = DelegationEmitter().ledger
+    rid = ledger.list_requests()[0]["request_id"]
+    transition(ledger, None, rid, "TRIAGED", actor="operator")
+    assert ledger.record_human_decision(rid, "operator", "approve", "fixture setup", f"token-{rid}")
+    transition(ledger, None, rid, "PLANNED", actor="operator")
+    transition(ledger, None, rid, "BUILDING", actor="operator")
+    transition(ledger, None, rid, "VALIDATED", actor="operator")
+    ledger.add_artifact(rid, "shadow", "paths=1 lines=1 branch=ddp-x title=t")
+    ledger.add_artifact(rid, "pr_attempt", "ddp-x-a1")
+
+    def _boom(*_a, **_k):
+        raise AssertionError("has-pr-attempt request -> GhPrClient must never be constructed")
+
+    monkeypatch.setattr(executor_mod, "GhPrClient", _boom)
+    rc = cli.main([
+        "executor-canary", "--i-understand-this-opens-a-real-pr", "--request-id", rid,
+    ])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert rid in err
+    assert "pr_attempt" in err or "already" in err.lower()
+    assert ledger.get_request(rid)["state"] == "VALIDATED"
+
+
 def test_executor_canary_cli_wrong_state_fails_loudly(queue_mode, capsys, monkeypatch):
     # A designated request in any state other than PLANNED or a
     # shadow-verified VALIDATED (e.g. still TRIAGED) must fail loudly rather

@@ -282,9 +282,10 @@ def test_executor_rejects_above_target_risk_ceiling(tmp_path):
 
 
 def _canary_target(repo, tmp_path, *, command, **overrides):
+    overrides.setdefault("pr_budget", 1)
     return _target(
         repo, tmp_path, command=command,
-        synthetic_fixture=False, canary_real=True, pr_budget=1, risk_ceiling="low",
+        synthetic_fixture=False, canary_real=True, risk_ceiling="low",
         **overrides,
     )
 
@@ -765,6 +766,98 @@ def test_canary_resume_still_refuses_the_live_checkout(tmp_path, monkeypatch):
     assert last_transition["to_state"] == "FAILED"
     assert last_transition["from_state"] == "VALIDATED"
     assert "refuses the live Hermes checkout" in (last_transition["evidence_ref"] or "")
+
+
+def test_canary_does_not_resume_a_validated_request_with_a_pr_attempt_artifact(tmp_path):
+    # Fix A: a VALIDATED + shadow row that also carries `pr_attempt` evidence
+    # (durably recorded immediately before an earlier canary tick invoked the
+    # PR client -- see the comment on
+    # DelegationLedger.count_prs_for_target_since) must NOT be resumable.
+    # Resuming past that risks a second, duplicate PR for the same request if
+    # the earlier tick was hard-killed between recording pr_attempt and
+    # transitioning to PR_OPEN. pr_budget=2 isolates this from the separate
+    # budget precheck: budget alone (count=1 < 2) would NOT block this tick,
+    # so only the resumability predicate can be doing the refusing.
+    repo = _fixture_repo(tmp_path)
+    ledger, request = _planned_ledger(tmp_path)
+    allowlist = _allowlist(_canary_target(repo, tmp_path, command=_write_source_command(), pr_budget=2))
+
+    run_executor_tick(ledger, allowlist, None)  # shadow -> VALIDATED + shadow artifact
+    assert ledger.get_request(request.request_id)["state"] == "VALIDATED"
+    ledger.add_artifact(request.request_id, "pr_attempt", "ddp-some-branch-a1")
+
+    client = FakePrClient()
+    result = run_executor_tick(
+        ledger, allowlist, None, pr_client=client, mode="canary", request_id=request.request_id,
+    )
+
+    assert result == {"processed": 0, "errors": 0, "skipped": 0}
+    assert ledger.get_request(request.request_id)["state"] == "VALIDATED"
+    assert client.calls == []  # no PR client call -- never even reached create_pr
+    assert ledger.lease_for_request(request.request_id) is None
+
+
+def test_canary_does_not_resume_a_validated_request_with_a_pr_artifact(tmp_path):
+    # Same as above for a `pr` artifact (the request already reached a real,
+    # ledger-recorded PR in an earlier canary run).
+    repo = _fixture_repo(tmp_path)
+    ledger, request = _planned_ledger(tmp_path)
+    allowlist = _allowlist(_canary_target(repo, tmp_path, command=_write_source_command(), pr_budget=2))
+
+    run_executor_tick(ledger, allowlist, None)  # shadow -> VALIDATED + shadow artifact
+    assert ledger.get_request(request.request_id)["state"] == "VALIDATED"
+    ledger.add_artifact(request.request_id, "pr", "https://example.test/pr/already")
+
+    client = FakePrClient()
+    result = run_executor_tick(
+        ledger, allowlist, None, pr_client=client, mode="canary", request_id=request.request_id,
+    )
+
+    assert result == {"processed": 0, "errors": 0, "skipped": 0}
+    assert ledger.get_request(request.request_id)["state"] == "VALIDATED"
+    assert client.calls == []
+    assert ledger.lease_for_request(request.request_id) is None
+
+
+def test_canary_resume_refuses_when_state_changes_between_selection_and_lease(tmp_path):
+    # Fix B: on the fresh path, transition(..., "BUILDING") doubles as the
+    # first authoritative re-read of the request's state after the lease is
+    # held -- it raises IllegalTransitionError if the row moved under the
+    # candidate snapshot. The resume path skips that transition (VALIDATED
+    # -> BUILDING is not a legal edge), so without a restored post-lease
+    # check it would trust a pre-lease snapshot straight through the push
+    # and PR creation. Simulate the race by mutating the row's state OUT
+    # from under the tick inside a patched acquire_lease -- i.e. exactly
+    # between candidate selection (a stale VALIDATED+shadow snapshot) and
+    # the lease-held re-read Fix B restores.
+    repo = _fixture_repo(tmp_path)
+    ledger, request = _planned_ledger(tmp_path)
+    allowlist = _allowlist(_target(repo, tmp_path, command=_write_source_command()))
+
+    run_executor_tick(ledger, allowlist, None)  # shadow -> VALIDATED + shadow artifact
+    assert ledger.get_request(request.request_id)["state"] == "VALIDATED"
+
+    real_acquire_lease = ledger.acquire_lease
+
+    def _acquire_then_mutate(*args, **kwargs):
+        lease = real_acquire_lease(*args, **kwargs)
+        # Simulate another process moving the row out of VALIDATED in the
+        # window between the candidate snapshot and the lease-held read.
+        ledger.set_state(request.request_id, "FAILED", terminal_reason="external")
+        return lease
+
+    ledger.acquire_lease = _acquire_then_mutate
+
+    client = FakePrClient()
+    result = run_executor_tick(
+        ledger, allowlist, None, pr_client=client, mode="canary", request_id=request.request_id,
+    )
+
+    assert result == {"processed": 1, "errors": 1, "skipped": 0}
+    # Must refuse BEFORE any push or PR-client call, not merely fail later.
+    assert client.calls == []
+    assert ledger.get_request(request.request_id)["state"] == "FAILED"
+    assert ledger.lease_for_request(request.request_id) is None
 
 
 def test_diff_line_count_reflects_a_fully_deleted_tracked_file(tmp_path):
