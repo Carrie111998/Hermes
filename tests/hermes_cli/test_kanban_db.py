@@ -454,6 +454,45 @@ def test_expired_claim_with_fresh_progress_and_stale_heartbeat_is_extended(
         assert extended[0].payload["progress_stale"] is False
 
 
+def test_progress_receipt_key_is_idempotent_and_still_run_fenced(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="external effect", assignee="worker")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+
+        assert kb.record_progress(
+            conn,
+            task_id,
+            evidence="provider branch exists",
+            expected_run_id=claimed.current_run_id,
+            receipt_key="github-branch:factory/task:" + "a" * 40,
+        ) == 1
+        assert kb.record_progress(
+            conn,
+            task_id,
+            evidence="provider branch exists after replay",
+            expected_run_id=claimed.current_run_id,
+            receipt_key="github-branch:factory/task:" + "a" * 40,
+        ) == 1
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.progress_seq == 1
+        receipts = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "progress"
+        ]
+        assert len(receipts) == 1
+        assert receipts[0].payload is not None
+        assert receipts[0].payload["receipt_key"].startswith("github-branch:")
+        assert kb.record_progress(
+            conn,
+            task_id,
+            evidence="stale worker replay",
+            expected_run_id=claimed.current_run_id + 1,
+            receipt_key="github-branch:factory/task:" + "a" * 40,
+        ) is None
+
+
 def test_expired_foreign_claim_with_fresh_progress_is_extended_without_pid(
     kanban_home, monkeypatch,
 ):

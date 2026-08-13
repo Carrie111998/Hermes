@@ -9406,6 +9406,7 @@ def record_progress(
     *,
     evidence: str,
     expected_run_id: Optional[int] = None,
+    receipt_key: Optional[str] = None,
 ) -> Optional[int]:
     """Persist one run-fenced, explicitly evidenced progress receipt.
 
@@ -9417,8 +9418,34 @@ def record_progress(
     text = str(evidence or "").strip()
     if not text:
         raise ValueError("progress evidence is required")
+    key = str(receipt_key or "").strip() or None
     now = int(time.time())
     with write_txn(conn):
+        owner = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            owner is None
+            or owner["status"] != "running"
+            or (
+                expected_run_id is not None
+                and owner["current_run_id"] != int(expected_run_id)
+            )
+        ):
+            return None
+        if key is not None:
+            for event_row in conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'progress' ORDER BY id",
+                (task_id,),
+            ).fetchall():
+                try:
+                    payload = json.loads(event_row["payload"] or "{}")
+                except (TypeError, ValueError):
+                    continue
+                if payload.get("receipt_key") == key:
+                    return int(payload["seq"])
         if expected_run_id is None:
             cur = conn.execute(
                 "UPDATE tasks SET last_progress_at = ?, progress_seq = progress_seq + 1 "
@@ -9444,11 +9471,14 @@ def record_progress(
                 "UPDATE task_runs SET last_progress_at = ?, progress_seq = ? WHERE id = ?",
                 (now, seq, int(run_id)),
             )
+        payload = {"seq": seq, "evidence": text[:1000]}
+        if key is not None:
+            payload["receipt_key"] = key[:500]
         _append_event(
             conn,
             task_id,
             "progress",
-            {"seq": seq, "evidence": text[:1000]},
+            payload,
             run_id=run_id,
         )
     return seq

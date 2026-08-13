@@ -9,6 +9,7 @@ Verifies:
 from __future__ import annotations
 
 import json
+import subprocess
 import os
 from concurrent.futures import ThreadPoolExecutor
 
@@ -105,6 +106,94 @@ def test_progress_handler_requires_concrete_evidence(worker_env):
 
     payload = json.loads(kt._handle_progress({"evidence": "   "}))
     assert payload["error"] == "evidence is required"
+
+
+def test_factory_landing_handler_reconciles_and_records_each_external_effect(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "executor")
+    monkeypatch.setattr(type(tmp_path), "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="land exact candidate",
+            assignee="executor",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            review_required=True,
+            reviewer_profile="verifier",
+            canonical_implementer="executor",
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="executor:test")
+        assert claimed is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(claimed.claim_lock))
+    candidate = "c" * 40
+
+    def fake_reconcile(repository, **kwargs):
+        assert repository == repo
+        assert kwargs["branch"] == "factory/task"
+        assert kwargs["candidate_sha"] == candidate
+        kwargs["progress"]("branch:factory/task", "pushed exact candidate")
+        kwargs["progress"]("pr:42", "created pull request 42")
+        kwargs["progress"]("branch:factory/task", "pushed exact candidate")
+        return {"pr_number": 42, "candidate_sha": candidate}
+
+    monkeypatch.setattr(
+        "hermes_cli.kanban_landing.reconcile_github_landing", fake_reconcile
+    )
+    payload = json.loads(
+        kt._handle_factory_land(
+            {
+                "candidate_sha": candidate,
+                "branch": "factory/task",
+                "title": "Land exact candidate",
+            }
+        )
+    )
+    assert payload == {
+        "ok": True,
+        "task_id": task_id,
+        "landing": {"pr_number": 42, "candidate_sha": candidate},
+    }
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.progress_seq == 2
+        receipts = [
+            event.payload["evidence"]
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "progress"
+        ]
+        assert receipts == ["pushed exact candidate", "created pull request 42"]
+
+
+def test_factory_landing_handler_rejects_non_guarded_task(worker_env):
+    from tools import kanban_tools as kt
+
+    payload = json.loads(
+        kt._handle_factory_land(
+            {
+                "candidate_sha": "d" * 40,
+                "branch": "factory/task",
+                "title": "Must not land",
+            }
+        )
+    )
+    assert "guarded factory task" in payload["error"]
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):

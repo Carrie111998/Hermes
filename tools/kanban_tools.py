@@ -1330,6 +1330,76 @@ def _handle_progress(args: dict, **kw) -> str:
         return tool_error(f"kanban_progress: {e}")
 
 
+def _handle_factory_land(args: dict, **kw) -> str:
+    """Reconcile one guarded factory candidate with GitHub, crash-safely."""
+    delegated_err = _reject_delegated_child_mutation("kanban_factory_land")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            fence_err = _enforce_worker_lifecycle_fence(
+                conn, tid, "kanban_factory_land"
+            )
+            if fence_err:
+                return fence_err
+            task = kb.get_task(conn, tid)
+            profile = os.environ.get("HERMES_PROFILE") or ""
+            if (
+                task is None
+                or not task.review_required
+                or not task.canonical_implementer
+                or task.assignee != task.canonical_implementer
+                or profile != task.canonical_implementer
+            ):
+                return tool_error(
+                    "kanban_factory_land requires an active guarded factory task "
+                    "owned by its canonical implementer"
+                )
+            if task.workspace_kind != "worktree" or not task.workspace_path:
+                return tool_error(
+                    "kanban_factory_land requires the guarded task's isolated worktree"
+                )
+
+            def _receipt(effect_key: str, evidence: str) -> None:
+                seq = kb.record_progress(
+                    conn,
+                    tid,
+                    evidence=evidence,
+                    expected_run_id=_worker_run_id(tid),
+                    receipt_key=effect_key,
+                )
+                if seq is None:
+                    raise RuntimeError("worker lost its lifecycle fence while landing")
+
+            from hermes_cli.kanban_landing import reconcile_github_landing
+
+            landing = reconcile_github_landing(
+                Path(task.workspace_path),
+                branch=str(args.get("branch") or task.branch_name or ""),
+                candidate_sha=str(args.get("candidate_sha") or ""),
+                title=str(args.get("title") or ""),
+                body=str(args.get("body") or ""),
+                progress=_receipt,
+            )
+            return _ok(task_id=tid, landing=landing)
+        finally:
+            conn.close()
+    except ValueError as exc:
+        return tool_error(f"kanban_factory_land: {exc}")
+    except Exception as exc:
+        logger.exception("kanban_factory_land failed")
+        return tool_error(f"kanban_factory_land: {exc}")
+
+
 def _handle_comment(args: dict, **kw) -> str:
     """Append a comment to a task's thread."""
     delegated_err = _reject_delegated_child_mutation("kanban_comment")
@@ -2462,6 +2532,34 @@ KANBAN_ATTACHMENTS_SCHEMA = {
     },
 }
 
+KANBAN_FACTORY_LAND_SCHEMA = {
+    "name": "kanban_factory_land",
+    "description": (
+        "Reconcile the current guarded factory task's exact candidate with its "
+        "GitHub branch and pull request. Reads remote state before mutation, "
+        "refuses conflicting state, and writes deduplicated durable progress "
+        "receipts after each external effect. Safe to retry after interruption."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "candidate_sha": {
+                "type": "string",
+                "description": "Exact full 40-character candidate commit SHA.",
+            },
+            "branch": {
+                "type": "string",
+                "description": "Stable remote branch; defaults to the task branch.",
+            },
+            "title": {"type": "string", "description": "Pull request title."},
+            "body": {"type": "string", "description": "Optional pull request body."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["candidate_sha", "title"],
+    },
+}
+
 KANBAN_CREATE_SCHEMA = {
     "name": "kanban_create",
     "description": (
@@ -2840,6 +2938,15 @@ registry.register(
     handler=_handle_progress,
     check_fn=_check_kanban_mode,
     emoji="📈",
+)
+
+registry.register(
+    name="kanban_factory_land",
+    toolset="kanban",
+    schema=KANBAN_FACTORY_LAND_SCHEMA,
+    handler=_handle_factory_land,
+    check_fn=_check_kanban_mode,
+    emoji="🚀",
 )
 
 registry.register(
