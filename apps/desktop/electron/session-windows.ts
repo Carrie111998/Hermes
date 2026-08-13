@@ -57,8 +57,11 @@ function chatWindowWebPreferences(preloadPath: string) {
 // onboarding overlays and the global session sidebar. `watch=1` marks a
 // spectator window (e.g. a running subagent's session): the renderer resumes it
 // lazily so the gateway never builds an agent just to stream into it.
-function buildSessionWindowUrl(sessionId: string, { devServer, rendererIndexPath, watch }: any = {}) {
-  const query = `?win=secondary${watch ? '&watch=1' : ''}`
+function buildSessionWindowUrl(sessionId: string, { devServer, profile, rendererIndexPath, watch }: any = {}) {
+  const profileKey = typeof profile === 'string' ? profile.trim() : ''
+  const query = `?win=secondary${watch ? '&watch=1' : ''}${
+    profileKey ? `&profile=${encodeURIComponent(profileKey)}` : ''
+  }`
   const route = `#/${encodeURIComponent(sessionId)}`
 
   if (devServer) {
@@ -104,7 +107,7 @@ function createSessionWindowRegistry() {
     const session = typeof sessionId === 'string' ? sessionId.trim() : ''
     const scope = typeof scopeId === 'string' && scopeId.trim() ? scopeId.trim() : 'primary'
 
-    return session ? `${scope}\u0000${session}` : ''
+    return session ? JSON.stringify([scope, session]) : ''
   }
 
   function openOrFocus(sessionId, factory, { scopeId = 'primary' }: any = {}) {

@@ -73,3 +73,10 @@ export function assertValidProfileName(name: string): void {
     throw new Error(`Invalid profile name: ${String(name)}`)
   }
 }
+
+/** Return a canonical desktop profile name, or null for absent/malformed input. */
+export function normalizeDesktopProfile(value: unknown): null | string {
+  const profile = typeof value === 'string' ? value.trim().toLowerCase() : ''
+
+  return profile && isValidProfileName(profile) ? profile : null
+}

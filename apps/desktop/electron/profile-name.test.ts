@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { isValidProfileName, PROFILE_NAME_RE } from './profile-name'
+import { isValidProfileName, normalizeDesktopProfile, PROFILE_NAME_RE } from './profile-name'
 
 // ---------------------------------------------------------------------------
 // PROFILE_NAME_RE — the raw id regex, exported so main.ts does not keep a
@@ -54,5 +54,16 @@ test('PROFILE_NAME_RE is the raw pattern isValidProfileName uses internally', ()
     if (PROFILE_NAME_RE.test(name) && name !== 'default') {
       assert.equal(isValidProfileName(name), true, `regex accepted but validator rejected "${name}"`)
     }
+  }
+})
+
+test('normalizeDesktopProfile accepts and canonicalizes desktop profile names', () => {
+  assert.equal(normalizeDesktopProfile(' life_2 '), 'life_2')
+  assert.equal(normalizeDesktopProfile('Default'), 'default')
+})
+
+test('normalizeDesktopProfile rejects malformed, absent, and reserved values', () => {
+  for (const profile of ['../life', 'bad profile', '', undefined, 'hermes', 'test', 'tmp', 'root', 'sudo']) {
+    assert.equal(normalizeDesktopProfile(profile), null, String(profile))
   }
 })

@@ -5,7 +5,8 @@ import {
   canOpenSessionWindow,
   listWindowBackendTargets,
   openNewWindow,
-  openSessionInNewWindow
+  openSessionInNewWindow,
+  windowProfileOverride
 } from './windows'
 
 const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
@@ -39,6 +40,20 @@ afterEach(() => {
   } else {
     delete desktopWindow.hermesDesktop
   }
+})
+
+describe('windowProfileOverride', () => {
+  it('returns a canonical valid profile hint', () => {
+    window.history.replaceState({}, '', '/?profile=Life_2')
+    expect(windowProfileOverride()).toBe('life_2')
+  })
+
+  it('treats malformed and reserved profile hints as absent', () => {
+    for (const profile of ['..%2Flife', 'hermes', 'test', 'tmp', 'root', 'sudo']) {
+      window.history.replaceState({}, '', `/?profile=${profile}`)
+      expect(windowProfileOverride()).toBeNull()
+    }
+  })
 })
 
 describe('canOpenSessionWindow', () => {

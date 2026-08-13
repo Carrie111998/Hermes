@@ -85,7 +85,6 @@ import { luminance } from '@/themes/color'
 import { type ThemeMode, useTheme } from '@/themes/context'
 import { isUserTheme, resolveTheme } from '@/themes/user-themes'
 
-import { openSession, openSessionIntentFromModifiers } from '../open-session'
 import {
   AGENTS_ROUTE,
   ARTIFACTS_ROUTE,
@@ -106,6 +105,7 @@ import { prettyName } from '../settings/helpers'
 import { usePaletteContributions } from './contrib'
 import { MarketplaceThemePage } from './marketplace-theme-page'
 import { PetInlineToggle, PetPalettePage } from './pet-palette-page'
+import { openCommandPaletteSession } from './session-open'
 
 interface PaletteItem {
   /** Keybind action id — its live combo renders as a hotkey hint. */
@@ -160,6 +160,7 @@ interface SessionEntry {
   git_branch?: null | string
   id: string
   preview?: string
+  profile?: string
   title: string
 }
 
@@ -380,6 +381,7 @@ const toSessionEntry = (session: SessionRow): SessionEntry => ({
   git_branch: session.git_branch ?? null,
   id: session.id,
   preview: session.preview ?? undefined,
+  profile: session.profile ?? undefined,
   title: sessionTitle(session)
 })
 
@@ -648,8 +650,8 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
   // ⌘/⌃-select / ⌘-Enter = force a new tab; ⇧⌘ = own window. Same door as the
   // sidebar, minus the sidebar's licence to spend main.
   const goSession = useCallback(
-    (sessionId: string) => (event?: { ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean }) => {
-      openSession(sessionId, navigate, openSessionIntentFromModifiers(event, 'stack'))
+    (sessionId: string, profile?: string) => (event?: { ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean }) => {
+      void openCommandPaletteSession(sessionId, profile, event, navigate)
     },
     [navigate]
   )
@@ -1087,7 +1089,7 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
             ...(session.git_branch ? [session.git_branch] : [])
           ],
           label: session.title,
-          runWithEvent: goSession(session.id)
+          runWithEvent: goSession(session.id, session.profile)
         }))
       })
     }

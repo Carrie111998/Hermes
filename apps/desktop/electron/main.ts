@@ -34,7 +34,7 @@ import nodePty from 'node-pty'
 import { classifyActiveRuntime } from './active-runtime-state'
 import { type AsyncLimiter, createAsyncLimiter } from './async-limit'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
-import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
+import { dashboardFallbackArgs, serveBackendArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState, invalidateAndStopBackendAttempt } from './backend-connection-state'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import { isReauthRequiredError, waitForHermesReady } from './backend-health'
@@ -84,6 +84,7 @@ import {
   pathWithGlobalRemoteProfile,
   profileHasRemoteConnection,
   profileRemoteOverride,
+  profileScopedConnection,
   profileSshOverride,
   resolveAuthMode,
   resolveProfileBackendRoute,
@@ -185,6 +186,11 @@ import { createKeepAwake } from './power-save'
 import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
 import {
+  createPrimaryProfileOwner,
+  parseDesktopProfilePreference,
+  resolveEffectivePrimaryProfile
+} from './primary-profile'
+import {
   applyProfileDeleteLifecycle,
   applyProfileRenameLifecycle,
   assertProfileNotRevoked,
@@ -200,7 +206,7 @@ import {
   resolveRouteTarget,
   runProfileMutationPreflight
 } from './profile-delete-routing'
-import { PROFILE_NAME_RE } from './profile-name'
+import { normalizeDesktopProfile, PROFILE_NAME_RE } from './profile-name'
 import { fetchPrimaryProfileSessions } from './profile-session-routing'
 import { isProfileTargetAvailable } from './profile-target-availability'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
@@ -217,6 +223,7 @@ import {
   decideProfileSessionsRoute,
   resolveSenderRequestTarget,
   resolveSenderTarget,
+  resolveSessionOwnerTarget,
   scopedSidebarPathForTarget,
   scopeSidebarResponseForTarget
 } from './sender-target-routing'
@@ -6965,31 +6972,28 @@ function writeDesktopConnectionConfig(config) {
 // preference" and preserves the legacy launch (no --profile flag).
 function readActiveDesktopProfile() {
   try {
-    const raw = fs.readFileSync(DESKTOP_PROFILE_CONFIG_PATH, 'utf8')
-    const parsed = JSON.parse(raw)
-    const name = parsed && typeof parsed.profile === 'string' ? parsed.profile.trim() : ''
-
-    if (name && (name === 'default' || PROFILE_NAME_RE.test(name))) {
-      return name
+    return parseDesktopProfilePreference(fs.readFileSync(DESKTOP_PROFILE_CONFIG_PATH, 'utf8'))
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      return null
     }
-  } catch {
-    // Missing or malformed → no preference.
-  }
 
-  return null
+    throw error
+  }
 }
 
 function writeActiveDesktopProfile(name) {
   const value = typeof name === 'string' ? name.trim() : ''
+  const profile = value ? normalizeDesktopProfile(value) : null
 
-  if (value && value !== 'default' && !PROFILE_NAME_RE.test(value)) {
+  if (value && !profile) {
     throw new Error(`Invalid profile name: ${value}`)
   }
 
   fs.mkdirSync(path.dirname(DESKTOP_PROFILE_CONFIG_PATH), { recursive: true })
-  writeFileAtomic(DESKTOP_PROFILE_CONFIG_PATH, JSON.stringify({ profile: value || null }, null, 2))
+  writeFileAtomic(DESKTOP_PROFILE_CONFIG_PATH, JSON.stringify({ profile }, null, 2))
 
-  return value || null
+  return profile
 }
 
 // Sanitize a connection config into the renderer-facing shape. With no
@@ -8003,6 +8007,12 @@ function stopBackendChild(child) {
   stopBackendChildImpl(child, { forceKillProcessTree, isWindows: IS_WINDOWS })
 }
 
+// Freeze the effective primary profile for one backend lifetime. Legacy
+// active_profile is launch input, not a live routing signal.
+const primaryProfileOwner = createPrimaryProfileOwner(() =>
+  resolveEffectivePrimaryProfile({ desktopProfile: readActiveDesktopProfile(), hermesHome: HERMES_HOME })
+)
+
 // Soft gateway-mode apply: tear down the primary without resetting boot UI or
 // reloading the renderer. The shell stays up; the renderer wipes session lists
 // (so skeletons retrigger) and re-dials. Distinct from hard re-home (profile
@@ -8011,6 +8021,7 @@ function resetHermesConnection({ soft = false } = {}) {
   backendStartFailure = null
   remoteReauthFailure = null
   remoteLiveness.clear()
+  primaryProfileOwner.reset()
   const snapshot = backendConnectionState.invalidateSnapshot()
   stopBackendChild(snapshot.process)
 
@@ -8095,11 +8106,10 @@ async function waitForBackendExit(child, timeoutMs = 5000) {
   })
 }
 
-// The profile the primary (window) backend runs as. readActiveDesktopProfile()
-// returns the desktop's stored preference, or null when unset (legacy launch
-// that defers to active_profile / default).
+// The profile the primary backend actually runs as. The result stays frozen
+// until resetHermesConnection tears that backend down.
 function primaryProfileKey() {
-  return readActiveDesktopProfile() || 'default'
+  return primaryProfileOwner.get()
 }
 
 // Options describing the current connection setup for `resolveProfileBackendRoute`.
@@ -8121,15 +8131,15 @@ function profileRouteOptions(profile) {
 // key is `configured-profile:<name>` so it is distinct from a forced-local
 // route for the same profile.
 async function ensureBackend(profile) {
-  const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
+  const key = normalizeDesktopProfile(profile) ?? primaryProfileKey()
   const route = resolveProfileBackendRoute(key, profileRouteOptions(key))
 
   if (route.backend === 'primary') {
     const connection = await startHermes()
 
-    // A shared backend still owes the caller its profile scope, so renderer-side
-    // WebSocket, filesystem, and cache routing target the selected profile.
-    return route.descriptorProfile ? { ...connection, profile: route.descriptorProfile } : connection
+    // Every connection descriptor carries the effective window profile, even
+    // when several profiles share the primary remote transport.
+    return profileScopedConnection(connection, key, route)
   }
 
   const poolKey = configuredPoolKey(key)
@@ -8756,18 +8766,10 @@ async function startHermes() {
     // Resolve for the desktop's primary profile so a per-profile remote
     // override on the active profile is honored (falls back to env / global).
     const token = crypto.randomBytes(32).toString('base64url')
-    // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
-    const backendArgs = ['serve', '--host', '127.0.0.1', '--port', '0']
-    // Pin the desktop's chosen profile via the global --profile flag. This is
-    // deterministic (it wins over the sticky ~/.hermes/active_profile file) and
-    // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI. An
-    // unset preference keeps the legacy launch so existing installs are
-    // unaffected.
-    const activeProfile = readActiveDesktopProfile()
-
-    if (activeProfile) {
-      backendArgs.unshift('--profile', activeProfile)
-    }
+    // Pin local launch argv to the same frozen owner used for routing and
+    // descriptors. This prevents a changed legacy active_profile file from
+    // relabeling a respawned backend underneath live windows.
+    const backendArgs = serveBackendArgs(primaryProfileKey())
 
     const setup = await runPrimaryBackendStartup({
       connectRemote,
@@ -9111,10 +9113,11 @@ function focusWindow(win) {
 }
 
 function spawnSecondaryWindow({
-  openerWebContentsId,
+  profile,
   sessionId,
+  target,
   watch
-}: { openerWebContentsId?: number; sessionId?: string; watch?: boolean } = {}) {
+}: { profile: string; sessionId?: string; target: BackendTarget; watch?: boolean }) {
   const icon = getAppIconPath()
 
   const win = new BrowserWindow({
@@ -9170,13 +9173,13 @@ function spawnSecondaryWindow({
     recentReloadTimesRef: rendererReloadTimesRef
   })
 
-  // Inherit the opener's backend target so a session pop-out routes to the
-  // same backend as the window that spawned it. Falls back to primary when
-  // the opener has no explicit binding (the registry's default).
+  // Main selected this target from the validated transcript owner before the
+  // helper renderer exists. Bind it once here; later renderer IPC can only use
+  // this target and cannot retarget the window with a profile argument.
   const webContentsId = win.webContents.id
 
-  if (Number.isInteger(openerWebContentsId)) {
-    windowTargets.inheritFromOpener(webContentsId, openerWebContentsId)
+  if (target.kind !== 'primary') {
+    windowTargets.bind(webContentsId, target)
   }
 
   // Clean the binding when the window closes so the webContents.id does not
@@ -9190,6 +9193,7 @@ function spawnSecondaryWindow({
     win,
     buildSessionWindowUrl(sessionId, {
       devServer: DEV_SERVER,
+      profile,
       rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex(),
       watch
     }),
@@ -9202,15 +9206,22 @@ function spawnSecondaryWindow({
 // Open (or focus) a standalone window for a single chat session.
 function createSessionWindow(
   sessionId,
-  { openerWebContentsId, watch = false }: { openerWebContentsId?: number; watch?: boolean } = {}
+  {
+    openerWebContentsId,
+    ownerProfile,
+    watch = false
+  }: { openerWebContentsId?: number; ownerProfile?: null | string; watch?: boolean } = {}
 ) {
-  const scopeId = Number.isInteger(openerWebContentsId)
-    ? serializeTargetId(activeWindowTarget(openerWebContentsId as number))
-    : 'primary'
+  const openerTarget = Number.isInteger(openerWebContentsId)
+    ? activeWindowTarget(openerWebContentsId as number)
+    : makeBackendTarget({ kind: 'primary' })
+  const target = resolveSessionOwnerTarget(openerTarget, ownerProfile, primaryProfileKey())
+  const profile = normalizeDesktopProfile(ownerProfile) ?? (target.kind === 'primary' ? primaryProfileKey() : target.profile)
+  const scopeId = serializeTargetId(target)
 
   return sessionWindows.openOrFocus(
     sessionId,
-    () => spawnSecondaryWindow({ openerWebContentsId, sessionId, watch }),
+    () => spawnSecondaryWindow({ profile, sessionId, target, watch }),
     { scopeId }
   )
 }
@@ -10435,8 +10446,16 @@ ipcMain.handle('hermes:window:openSession', async (event, sessionId, opts) => {
     return { ok: false, error: 'invalid-session-id' }
   }
 
+  const requestedProfile = typeof opts?.profile === 'string' ? opts.profile.trim() : ''
+  const ownerProfile = requestedProfile ? normalizeDesktopProfile(requestedProfile) : null
+
+  if (requestedProfile && !ownerProfile) {
+    return { ok: false, error: 'invalid-profile' }
+  }
+
   createSessionWindow(sessionId.trim(), {
     openerWebContentsId: event.sender.id,
+    ownerProfile,
     watch: opts?.watch === true
   })
 
@@ -10635,16 +10654,16 @@ ipcMain.on('hermes:pet-overlay:control', (_event, payload) => {
 
 // --- HUD mode (chrome-free floating chat) -----------------------------------
 ipcMain.handle('hermes:hud:open', async (event, request) => {
-  const resolution = resolveSenderTarget(
-    activeWindowTarget(event.sender.id),
-    typeof request?.profile === 'string' ? request.profile : null
-  )
+  const requestedProfile = typeof request?.profile === 'string' ? request.profile.trim() : ''
+  const ownerProfile = requestedProfile ? normalizeDesktopProfile(requestedProfile) : null
 
-  if (resolution.conflict) {
-    return { ok: false, error: 'window-backend-target-conflict' }
+  if (requestedProfile && !ownerProfile) {
+    return { ok: false, error: 'invalid-profile' }
   }
 
-  openHudWindow(typeof request?.sessionId === 'string' ? request.sessionId : null, resolution.target)
+  const target = resolveSessionOwnerTarget(activeWindowTarget(event.sender.id), ownerProfile, primaryProfileKey())
+
+  openHudWindow(typeof request?.sessionId === 'string' ? request.sessionId : null, target)
 
   return { ok: true }
 })
