@@ -8026,7 +8026,10 @@ def _recover_core_update_marker_locked() -> None:
 
         uv_bin = ensure_uv()
         if uv_bin:
-            uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+            uv_env = {
+                **os.environ,
+                "VIRTUAL_ENV": str(_resolve_project_venv_dir()),
+            }
             if _is_termux_env(uv_env):
                 uv_env.pop("PYTHONPATH", None)
                 uv_env.pop("PYTHONHOME", None)
@@ -8100,6 +8103,21 @@ def _windows_running_hermes_launcher_locked() -> bool:
     return False
 
 
+def _resolve_project_venv_dir() -> Path:
+    """Resolve the venv used by this checkout, with a legacy fallback.
+
+    Prefer ``.venv`` (the development and official Docker layout), then
+    ``venv`` (the standard installer layout). If neither exists, retain the
+    installer's historical ``venv`` creation target.
+    """
+    for name in (".venv", "venv"):
+        candidate = PROJECT_ROOT / name
+        if candidate.is_dir():
+            return candidate
+
+    return PROJECT_ROOT / "venv"
+
+
 def _default_venv_install_target() -> tuple[list[str], dict[str, str] | None]:
     """Return ``(install_cmd_prefix, env)`` for the project venv when possible."""
     try:
@@ -8109,7 +8127,7 @@ def _default_venv_install_target() -> tuple[list[str], dict[str, str] | None]:
     except Exception:
         uv_bin = None
     if uv_bin:
-        env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+        env = {**os.environ, "VIRTUAL_ENV": str(_resolve_project_venv_dir())}
         if _is_termux_env(env):
             env.pop("PYTHONPATH", None)
             env.pop("PYTHONHOME", None)
@@ -8162,7 +8180,7 @@ def _is_windows() -> bool:
 
 def _venv_scripts_dir() -> Path | None:
     """Return the venv Scripts directory if we're running inside the project venv."""
-    venv_dir = PROJECT_ROOT / "venv"
+    venv_dir = _resolve_project_venv_dir()
     if not venv_dir.is_dir():
         return None
     from hermes_constants import venv_bin_dir
