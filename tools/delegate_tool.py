@@ -788,6 +788,29 @@ def _is_mcp_toolset_name(name: str) -> bool:
     return bool(target and str(target).startswith("mcp-"))
 
 
+def _resolve_parent_toolsets(parent_agent) -> set:
+    """Derive the parent's effective toolset names.
+
+    ``enabled_toolsets=None`` means "all tools enabled" (the default), so in
+    that case the set is reconstructed from the parent's loaded tool names.
+    Shared by ``_build_child_agent`` (for the child intersection) and by the
+    persona ``required_toolsets`` precheck, so both judge availability by
+    exactly the same rule.
+    """
+    parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
+    if parent_enabled is not None:
+        return set(parent_enabled)
+    if parent_agent and hasattr(parent_agent, "valid_tool_names"):
+        import model_tools
+
+        return {
+            ts
+            for name in parent_agent.valid_tool_names
+            if (ts := model_tools.get_toolset_for_tool(name)) is not None
+        }
+    return set(DEFAULT_TOOLSETS)
+
+
 def _expand_parent_toolsets(parent_toolsets: set) -> set:
     """Expand composite toolsets so individual toolset names are recognized.
 
@@ -1335,6 +1358,9 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    # Per-call reasoning effort from a user-authored persona. Takes precedence
+    # over delegation.reasoning_effort; None means "use the config default".
+    reasoning_effort: Optional[str] = None,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1376,22 +1402,8 @@ def _build_child_agent(
 
     # When no explicit toolsets given, inherit from parent's enabled toolsets
     # so disabled tools (e.g. web) don't leak to subagents.
-    # Note: enabled_toolsets=None means "all tools enabled" (the default),
-    # so we must derive effective toolsets from the parent's loaded tools.
+    parent_toolsets = _resolve_parent_toolsets(parent_agent)
     parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
-    if parent_enabled is not None:
-        parent_toolsets = set(parent_enabled)
-    elif parent_agent and hasattr(parent_agent, "valid_tool_names"):
-        # enabled_toolsets is None (all tools) — derive from loaded tool names
-        import model_tools
-
-        parent_toolsets = {
-            ts
-            for name in parent_agent.valid_tool_names
-            if (ts := model_tools.get_toolset_for_tool(name)) is not None
-        }
-    else:
-        parent_toolsets = set(DEFAULT_TOOLSETS)
 
     if toolsets:
         # Intersect with parent — subagent must not gain tools the parent lacks.
@@ -1559,14 +1571,20 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # Resolve reasoning config: persona override > delegation config > parent.
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
     try:
         # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
         # False (``reasoning_effort: false``) to "" and inherit the parent
         # instead of disabling thinking for children.
+        effort_source = "delegation.reasoning_effort"
         delegation_effort = delegation_cfg.get("reasoning_effort")
+        if reasoning_effort is not None:
+            # A persona names the effort its job needs (breadth recon wants a
+            # lower tier than deep review), so it outranks the global default.
+            delegation_effort = reasoning_effort
+            effort_source = "persona reasoning_effort"
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
 
@@ -1575,7 +1593,8 @@ def _build_child_agent(
                 child_reasoning = parsed
             else:
                 logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
+                    "Unknown %s '%s', inheriting parent level",
+                    effort_source,
                     delegation_effort,
                 )
     except Exception as exc:
@@ -3215,6 +3234,7 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    agent: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -3342,6 +3362,67 @@ def delegate_task(
         if batch_error:
             return tool_error(batch_error)
 
+    # Resolve the named persona(s). A persona is a user-authored markdown file
+    # (see agent/subagent_personas.py) that pre-declares the child's system
+    # prompt and, optionally, a narrowed toolset. Capability scoping stays
+    # human-owned: the model may only pick among personas the user already
+    # wrote to disk, and any narrowing is still intersected with the parent's
+    # toolsets downstream, so a persona can never grant a capability the
+    # parent lacks.
+    #
+    # Resolved up front (before any child is built) so a bad persona name or
+    # an unsatisfiable requirement fails the whole call loudly, matching the
+    # output_schema precedent below — rather than spawning some children and
+    # then erroring, or silently ignoring the request.
+    _persona_workdir = None
+    if agent is not None or any(
+        isinstance(t, dict) and t.get("agent") for t in (task_list or [])
+    ):
+        from pathlib import Path as _Path
+
+        _wd = _resolve_workspace_hint(parent_agent)
+        if _wd:
+            _persona_workdir = _Path(_wd)
+
+    task_personas: List[Optional[Dict[str, Any]]] = []
+    for i, task in enumerate(task_list):
+        # Per-task agent wins over the top-level one, so a single batch can
+        # fan out a scout and a critic at once.
+        requested = task.get("agent") or agent
+        if not (requested and str(requested).strip()):
+            task_personas.append(None)
+            continue
+        from agent.subagent_personas import PersonaError, load_persona
+
+        try:
+            persona = load_persona(str(requested), _persona_workdir)
+        except PersonaError as exc:
+            # Name the available personas: an unknown-agent failure is
+            # otherwise indistinguishable from a broken environment and the
+            # model will retry identically.
+            return tool_error(f"Task {i}: {exc}")
+
+        # A persona that declares required_toolsets must actually be able to
+        # receive them. The parent intersection can silently strip a toolset
+        # the persona depends on (e.g. a `coder` spawned beneath a read-only
+        # parent), producing a child that fails opaquely while the user,
+        # reading the persona file, believes it can write.
+        _required = persona.get("required_toolsets") or []
+        if _required:
+            _available = _expand_parent_toolsets(
+                _resolve_parent_toolsets(parent_agent)
+            )
+            _missing = [t for t in _required if t not in _available]
+            if _missing:
+                return tool_error(
+                    f"Task {i}: persona '{persona['name']}' requires toolset(s) "
+                    f"{', '.join(_missing)}, which the parent agent does not "
+                    "have enabled. Subagents can only narrow, never widen, the "
+                    "parent's toolsets — enable them for the parent, or use a "
+                    "persona that does not require them."
+                )
+        task_personas.append(persona)
+
     # T1-24: coerce/validate optional per-task output_schema up front so a
     # malformed schema fails the whole call loudly instead of spawning
     # children that can never satisfy their contract. Runs AFTER the
@@ -3420,15 +3501,31 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
+        # A persona's prompt is prepended to the task context so the child's
+        # role framing arrives ahead of task specifics. The goal stays the
+        # model's; the persona supplies the standing instructions.
+        _persona = task_personas[i] if i < len(task_personas) else None
+        if _persona is not None:
+            _child_context = (
+                f"{_persona['prompt']}\n\n---\n\n{_child_context}"
+                if _child_context
+                else _persona["prompt"]
+            )
         child = _build_child_preserving_parent_tools(
             task_index=i,
             goal=t["goal"],
             context=_child_context,
-            # Subagents always inherit the parent's toolsets; the model
-            # cannot choose or narrow them (no model-facing toolsets arg).
-            toolsets=None,
+            # The model still cannot name toolsets: the only narrowing that
+            # reaches here comes from a user-authored persona file, and
+            # _build_child_agent intersects it with the parent's so it can
+            # only ever reduce capability (ba0bc01d1f).
+            toolsets=(_persona.get("toolsets") if _persona else None),
             model=creds["model"],
-            max_iterations=effective_max_iter,
+            max_iterations=(
+                int(_persona["max_iterations"])
+                if _persona and _persona.get("max_iterations")
+                else effective_max_iter
+            ),
             task_count=n_tasks,
             parent_agent=parent_agent,
             override_provider=creds["provider"],
@@ -3439,6 +3536,7 @@ def delegate_task(
             override_max_tokens=creds.get("max_output_tokens"),
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
+            reasoning_effort=(_persona.get("reasoning_effort") if _persona else None),
             role=effective_role,
         )
         # Attach the validated schema for the completion-side validation
@@ -4319,6 +4417,14 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "agent": {
+                            "type": "string",
+                            "description": (
+                                "Per-task persona override. See top-level "
+                                "'agent'. Lets one batch fan out different "
+                                "personas (e.g. a scout and a critic)."
+                            ),
+                        },
                         "output_schema": {
                             "type": "object",
                             "description": (
@@ -4351,6 +4457,18 @@ DELEGATE_TASK_SCHEMA = {
                     "Optional JSON Schema for the single-goal form — the "
                     "subagent's final answer must validate against it "
                     "(same semantics as tasks[].output_schema)."
+                ),
+            },
+            "agent": {
+                "type": "string",
+                "description": (
+                    "Optional name of a user-authored persona to run this "
+                    "delegation as (e.g. 'scout', 'critic'). Personas are "
+                    "markdown files with YAML frontmatter in "
+                    "~/.hermes/agents/ or <workdir>/.hermes/agents/; each "
+                    "supplies the subagent's standing system prompt and may "
+                    "narrow its toolsets. Omit to use the default worker. On "
+                    "an unknown name the error lists the available personas."
                 ),
             },
             "background": {
@@ -4426,6 +4544,7 @@ registry.register(
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
+        agent=args.get("agent"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
