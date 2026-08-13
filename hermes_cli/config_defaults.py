@@ -2255,6 +2255,14 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Allow cron-spawned agents to use the cronjob toolset (create/edit/
+        # remove scheduled jobs from within a cron run — the "cron-librarian"
+        # pattern). Off by default: the cronjob toolset is policy-denied in
+        # cron context to prevent unattended scheduling loops. Jobs created
+        # this way are user-owned in the same flat jobs table as every other
+        # job. Interactive toolsets (messaging/clarify) stay denied in cron
+        # context regardless of this setting.
+        "allow_agent_scheduling": False,
         # Pre-dispatch configuration validation (T1-26): before constructing
         # any agent machinery for a job, verify the provider API key resolves
         # (unless a fallback chain is configured), attached skills are ready
@@ -2338,6 +2346,11 @@ DEFAULT_CONFIG = {
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.
         "output_retention": 50,
+        # Timeout (seconds) for a no-agent cron script. Also overridable via
+        # HERMES_CRON_SCRIPT_TIMEOUT. Keep this in sync with
+        # cron.scheduler._DEFAULT_SCRIPT_TIMEOUT so config set recognizes the
+        # same setting the scheduler reads.
+        "script_timeout_seconds": 3600,
         # Timeout (seconds) for SessionDB() init inside cron jobs.
         # SessionDB opens/migrates state.db synchronously and has no timeout
         # of its own against a wedged sqlite3.connect. An unbounded hang here
@@ -2423,6 +2436,14 @@ DEFAULT_CONFIG = {
         # to the TTL/crash/stale recovery paths. Set false to keep orphans
         # frozen for manual forensics.
         "reconcile_orphans": True,
+        # Notify subscriptions survive a task reaching ``done`` (completion
+        # is reversible — controllers reopen done work for review
+        # corrections), and are normally removed on archive. On boards that
+        # never archive, the notifier GC purges subscriptions for tasks
+        # that have been ``done`` with no new activity for this many days,
+        # so stale rows don't accumulate and get scanned on every notifier
+        # tick forever. Set 0 to disable the sweep.
+        "done_sub_retention_days": 30,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

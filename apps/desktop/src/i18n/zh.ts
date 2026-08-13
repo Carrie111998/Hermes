@@ -2056,7 +2056,8 @@ export const zh: Translations = {
       'new-session': '新建会话',
       skills: '技能与工具',
       messaging: '消息平台',
-      artifacts: '产物'
+      artifacts: '产物',
+      cron: '定时任务'
     },
     searchAria: '搜索会话',
     searchPlaceholder: '搜索会话…',
@@ -2738,6 +2739,7 @@ export const zh: Translations = {
       gatewayTitle: '网关',
       customizeTitle: '在状态栏中显示',
       hideStatusbar: '隐藏状态栏',
+      resetStatusbar: '恢复默认设置',
       toggleApprovalMode: '审批',
       toggleBackendVersion: '后端版本',
       toggleCommandCenter: '命令中心',

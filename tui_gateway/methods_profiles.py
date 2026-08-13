@@ -89,6 +89,35 @@ def _(rid, params: dict) -> dict:
             }
             if include_sessions:
                 row["last_session"] = _latest_profile_session_row(p.path)
+
+            # Client-agnostic UI metadata (avatars, accent colors, pinned
+            # order, …) — stored server-side in profile.yaml so every
+            # machine connecting to this gateway paints the same roster.
+            try:
+                import yaml as _yaml
+                from pathlib import Path as _Path
+
+                meta_path = _Path(str(p.path)) / "profile.yaml"
+                if meta_path.is_file():
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        raw_meta = _yaml.safe_load(f) or {}
+                    ui_meta = raw_meta.get("ui_meta")
+                    if isinstance(ui_meta, dict) and ui_meta:
+                        row["ui_meta"] = ui_meta
+            except Exception:
+                pass
+
+            # Cheap existence flag so roster UIs know to profiles.get_asset
+            # without a probe call per profile per paint.
+            try:
+                from pathlib import Path as _Path
+
+                assets = _Path(str(p.path)) / "assets"
+                row["has_avatar"] = any(
+                    (assets / f"avatar.{ext}").is_file() for ext in ("png", "jpg", "webp")
+                )
+            except Exception:
+                row["has_avatar"] = False
             out.append(row)
         return _ok(rid, {"profiles": out})
     except Exception as e:
@@ -248,6 +277,386 @@ def _(rid, params: dict) -> dict:
             "mirrored": mirrored,
         },
     )
+
+
+@method("profiles.describe")
+def _(rid, params: dict) -> dict:
+    """Full configuration snapshot of one profile, for an editor UI.
+
+    Params: ``name`` (required). Result:
+    ``{name, description, soul, model: {provider, default}, skills:
+    [{name, enabled}], toolsets: [{name, description, tool_count, enabled}]}``
+
+    Skill enablement mirrors the disabled-list model (installed = enabled
+    unless in ``skills.disabled``). Toolset enablement reports the profile's
+    ``tools.enabled_toolsets`` pin, or every toolset enabled when unpinned.
+    All reads are scoped to the profile via the HERMES_HOME override.
+    """
+    name = str(params.get("name") or "").strip()
+    if not name:
+        return _err(rid, 4063, "name required")
+    try:
+        from pathlib import Path
+
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        profile_dir = Path(get_profile_dir(name))
+        if not profile_dir.is_dir():
+            return _err(rid, 4064, f"profile '{name}' not found")
+
+        token = set_hermes_home_override(str(profile_dir))
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.skills_config import get_disabled_skills
+
+            cfg = load_config() or {}
+            disabled = {s.lower() for s in get_disabled_skills(cfg)}
+
+            installed = []
+            skills_root = profile_dir / "skills"
+            if skills_root.is_dir():
+                for md in sorted(skills_root.rglob("SKILL.md")):
+                    skill_name = md.parent.name
+                    installed.append(
+                        {"name": skill_name, "enabled": skill_name.lower() not in disabled}
+                    )
+
+            from toolsets import get_all_toolsets, get_toolset_info
+
+            tools_cfg = cfg.get("tools") if isinstance(cfg.get("tools"), dict) else {}
+            pinned = tools_cfg.get("enabled_toolsets")
+            pinned_set = (
+                {str(t).strip() for t in pinned if str(t).strip()}
+                if isinstance(pinned, list)
+                else None
+            )
+            toolsets_out = []
+            for ts_name in sorted(get_all_toolsets().keys()):
+                info = get_toolset_info(ts_name) or {}
+                toolsets_out.append(
+                    {
+                        "name": ts_name,
+                        "description": info.get("description") or "",
+                        "tool_count": len(info.get("tools") or []),
+                        "enabled": True if pinned_set is None else ts_name in pinned_set,
+                    }
+                )
+
+            soul_path = profile_dir / "SOUL.md"
+            soul = ""
+            try:
+                if soul_path.is_file():
+                    soul = soul_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+            model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+
+            description = ""
+            try:
+                from hermes_cli.profiles import read_profile_meta
+
+                description = str(read_profile_meta(profile_dir).get("description") or "")
+            except Exception:
+                pass
+
+            return _ok(
+                rid,
+                {
+                    "name": name,
+                    "description": description,
+                    "soul": soul,
+                    "model": {
+                        "provider": str(model_cfg.get("provider") or ""),
+                        "default": str(model_cfg.get("default") or ""),
+                    },
+                    "skills": installed,
+                    "toolsets": toolsets_out,
+                    "toolsets_pinned": pinned_set is not None,
+                },
+            )
+        finally:
+            reset_hermes_home_override(token)
+    except Exception as e:
+        return _err(rid, 5063, str(e))
+
+
+@method("profiles.configure")
+def _(rid, params: dict) -> dict:
+    """Apply configuration changes to a profile (editor Save).
+
+    Params: ``name`` (required) plus any of:
+    ``description`` (str), ``soul`` (str, full SOUL.md replacement),
+    ``model`` + ``provider`` (both required together),
+    ``disabled_skills`` (list[str], replace semantics),
+    ``enabled_toolsets`` (list[str], replace semantics; empty list clears
+    the pin so every toolset is enabled again).
+
+    Each section is applied independently and best-effort; the result
+    reports per-section success so a UI can surface partial failures.
+    """
+    name = str(params.get("name") or "").strip()
+    if not name:
+        return _err(rid, 4063, "name required")
+    try:
+        from pathlib import Path
+
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        profile_dir = Path(get_profile_dir(name))
+        if not profile_dir.is_dir():
+            return _err(rid, 4064, f"profile '{name}' not found")
+
+        applied = {}
+
+        if isinstance(params.get("ui_meta"), dict):
+            # Client-agnostic UI metadata (avatar/pet/etc.), merged key-wise
+            # into profile.yaml's ui_meta block. A key set to None deletes it.
+            # Size-capped: this rides profiles.list on every roster paint, so
+            # large blobs (e.g. raw base64 images) are rejected — persist big
+            # assets elsewhere and store a reference.
+            try:
+                import json as _json
+
+                incoming = params["ui_meta"]
+                if len(_json.dumps(incoming)) > 65536:
+                    applied["ui_meta"] = False
+                else:
+                    import yaml as _yaml
+
+                    meta_path = profile_dir / "profile.yaml"
+                    existing = {}
+                    if meta_path.is_file():
+                        try:
+                            with open(meta_path, "r", encoding="utf-8") as f:
+                                loaded = _yaml.safe_load(f) or {}
+                            if isinstance(loaded, dict):
+                                existing = loaded
+                        except Exception:
+                            existing = {}
+                    current = existing.get("ui_meta")
+                    if not isinstance(current, dict):
+                        current = {}
+                    for key, value in incoming.items():
+                        if value is None:
+                            current.pop(key, None)
+                        else:
+                            current[key] = value
+                    if current:
+                        existing["ui_meta"] = current
+                    else:
+                        existing.pop("ui_meta", None)
+                    from utils import atomic_yaml_write
+
+                    atomic_yaml_write(meta_path, existing, sort_keys=False)
+                    applied["ui_meta"] = True
+            except Exception:
+                applied["ui_meta"] = False
+
+        if isinstance(params.get("soul"), str):
+            try:
+                (profile_dir / "SOUL.md").write_text(params["soul"], encoding="utf-8")
+                applied["soul"] = True
+            except Exception:
+                applied["soul"] = False
+
+        if isinstance(params.get("description"), str):
+            try:
+                from hermes_cli.profiles import write_profile_meta
+
+                write_profile_meta(
+                    profile_dir,
+                    description=params["description"].strip(),
+                    description_auto=False,
+                )
+                applied["description"] = True
+            except Exception:
+                applied["description"] = False
+
+        model = str(params.get("model") or "").strip()
+        provider = str(params.get("provider") or "").strip()
+        if model and provider:
+            try:
+                from hermes_cli.web_routers.profiles import _write_profile_model
+
+                _write_profile_model(profile_dir, provider, model)
+                applied["model"] = True
+            except Exception:
+                applied["model"] = False
+
+        needs_cfg = isinstance(params.get("disabled_skills"), list) or isinstance(
+            params.get("enabled_toolsets"), list
+        )
+        if needs_cfg:
+            token = set_hermes_home_override(str(profile_dir))
+            try:
+                from hermes_cli.config import load_config, save_config
+
+                cfg = load_config() or {}
+
+                if isinstance(params.get("disabled_skills"), list):
+                    try:
+                        from hermes_cli.skills_config import save_disabled_skills
+
+                        wanted = {
+                            str(s).strip()
+                            for s in params["disabled_skills"]
+                            if str(s).strip()
+                        }
+                        save_disabled_skills(cfg, wanted)
+                        applied["skills"] = True
+                        cfg = load_config() or {}
+                    except Exception:
+                        applied["skills"] = False
+
+                if isinstance(params.get("enabled_toolsets"), list):
+                    try:
+                        wanted = [str(t).strip() for t in params["enabled_toolsets"] if str(t).strip()]
+                        tools_cfg = cfg.get("tools") if isinstance(cfg.get("tools"), dict) else {}
+                        if wanted:
+                            tools_cfg["enabled_toolsets"] = sorted(set(wanted))
+                        else:
+                            tools_cfg.pop("enabled_toolsets", None)
+                        cfg["tools"] = tools_cfg
+                        save_config(cfg)
+                        applied["toolsets"] = True
+                    except Exception:
+                        applied["toolsets"] = False
+            finally:
+                reset_hermes_home_override(token)
+
+        return _ok(rid, {"ok": all(applied.values()) if applied else True, "applied": applied})
+    except Exception as e:
+        return _err(rid, 5064, str(e))
+
+
+@method("profiles.set_asset")
+def _(rid, params: dict) -> dict:
+    """Store a small binary asset (e.g. avatar image) in a profile's dir.
+
+    Params: ``name`` (profile), ``asset`` (currently only ``"avatar"``),
+    ``data`` (data URL or raw base64; PNG/JPEG/WebP; decoded size capped at
+    2MB), or ``clear: true`` to delete. Written atomically as
+    ``assets/<asset>.<ext>`` inside the profile directory — server-side, so
+    every client machine sees the same image via ``profiles.get_asset``.
+
+    Result: ``{ok, asset, size}`` (``size`` 0 on clear).
+    """
+    name = str(params.get("name") or "").strip()
+    asset = str(params.get("asset") or "avatar").strip().lower()
+    if not name:
+        return _err(rid, 4063, "name required")
+    if asset not in {"avatar"}:
+        return _err(rid, 4066, f"unknown asset '{asset}' (supported: avatar)")
+    try:
+        import base64
+        import re as _re
+        from pathlib import Path as _Path
+
+        from hermes_cli.profiles import get_profile_dir
+
+        profile_dir = _Path(get_profile_dir(name))
+        if not profile_dir.is_dir():
+            return _err(rid, 4064, f"profile '{name}' not found")
+
+        assets_dir = profile_dir / "assets"
+        exts = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}
+
+        if is_truthy_value(params.get("clear", False)):
+            removed = 0
+            for ext in exts.values():
+                target = assets_dir / f"{asset}.{ext}"
+                if target.is_file():
+                    target.unlink()
+                    removed += 1
+            return _ok(rid, {"ok": True, "asset": asset, "size": 0, "removed": removed})
+
+        data = str(params.get("data") or "")
+        if not data:
+            return _err(rid, 4067, "data required (data URL or base64)")
+
+        mime = "image/png"
+        match = _re.match(r"^data:(image/(?:png|jpeg|webp));base64,(.*)$", data, _re.DOTALL)
+        if match:
+            mime, payload = match.group(1), match.group(2)
+        else:
+            payload = data
+
+        try:
+            blob = base64.b64decode(payload, validate=True)
+        except Exception:
+            return _err(rid, 4068, "data is not valid base64")
+
+        if len(blob) > 2_000_000:
+            return _err(rid, 4069, f"asset too large ({len(blob)} bytes; max 2MB)")
+
+        # Magic-byte check — don't trust the declared mime.
+        if blob[:8] == b"\x89PNG\r\n\x1a\n":
+            mime = "image/png"
+        elif blob[:3] == b"\xff\xd8\xff":
+            mime = "image/jpeg"
+        elif blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
+            mime = "image/webp"
+        else:
+            return _err(rid, 4070, "unsupported image format (PNG/JPEG/WebP only)")
+
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        # One canonical file per asset: clear other extensions first.
+        for ext in exts.values():
+            stale = assets_dir / f"{asset}.{ext}"
+            if stale.is_file():
+                stale.unlink()
+
+        target = assets_dir / f"{asset}.{exts[mime]}"
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_bytes(blob)
+        tmp.replace(target)
+        return _ok(rid, {"ok": True, "asset": asset, "size": len(blob)})
+    except Exception as e:
+        return _err(rid, 5065, str(e))
+
+
+@method("profiles.get_asset")
+def _(rid, params: dict) -> dict:
+    """Fetch a profile asset as a data URL.
+
+    Params: ``name`` (profile), ``asset`` (default ``"avatar"``).
+    Result: ``{found, data?, mime?, size?}`` — ``found: false`` (not an
+    error) when the asset doesn't exist, so roster UIs can probe cheaply.
+    """
+    name = str(params.get("name") or "").strip()
+    asset = str(params.get("asset") or "avatar").strip().lower()
+    if not name:
+        return _err(rid, 4063, "name required")
+    try:
+        import base64
+        from pathlib import Path as _Path
+
+        from hermes_cli.profiles import get_profile_dir
+
+        profile_dir = _Path(get_profile_dir(name))
+        if not profile_dir.is_dir():
+            return _err(rid, 4064, f"profile '{name}' not found")
+
+        mimes = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}
+        for ext, mime in mimes.items():
+            target = profile_dir / "assets" / f"{asset}.{ext}"
+            if target.is_file():
+                blob = target.read_bytes()
+                return _ok(
+                    rid,
+                    {
+                        "found": True,
+                        "mime": mime,
+                        "size": len(blob),
+                        "data": f"data:{mime};base64,{base64.b64encode(blob).decode('ascii')}",
+                    },
+                )
+        return _ok(rid, {"found": False})
+    except Exception as e:
+        return _err(rid, 5066, str(e))
 
 
 def register(server) -> None:

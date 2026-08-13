@@ -1865,7 +1865,8 @@ export const en: Translations = {
       'new-session': 'New session',
       skills: 'Capabilities',
       messaging: 'Messaging',
-      artifacts: 'Artifacts'
+      artifacts: 'Artifacts',
+      cron: 'Scheduled jobs'
     },
     searchAria: 'Search sessions',
     searchPlaceholder: 'Search sessions…',
@@ -2560,6 +2561,7 @@ export const en: Translations = {
       gatewayTitle: 'Gateway',
       customizeTitle: 'Show in status bar',
       hideStatusbar: 'Hide status bar',
+      resetStatusbar: 'Reset to defaults',
       toggleApprovalMode: 'Approvals',
       toggleBackendVersion: 'Backend version',
       toggleCommandCenter: 'Command Center',
