@@ -36,6 +36,21 @@ _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Z
 _YUANBAO_TARGET_RE = re.compile(r"^\s*((?:group|direct):[^:]+)\s*$")
 # Discord snowflake IDs are numeric, same regex pattern as Telegram topic targets.
 _NUMERIC_TOPIC_RE = _TELEGRAM_TOPIC_TARGET_RE
+# Matches the " (N/M)" chunk indicator BasePlatformAdapter.truncate_message()
+# appends to every chunk when a message is split. In the MarkdownV2 send path
+# below, formatting (escaping) runs BEFORE chunking, so this indicator is
+# appended to already-escaped text and its own '(' ')' are never escaped —
+# Telegram then rejects every chunk's MarkdownV2 parse (issue: every
+# multi-chunk MarkdownV2 cron/send_message delivery silently fell back to
+# unstyled plain text, losing all bold/emoji/section formatting). HTML mode
+# has no equivalent requirement (only <, >, & are reserved), so this is
+# MarkdownV2-only.
+_CHUNK_INDICATOR_SUFFIX_RE = re.compile(r' \((\d+)/(\d+)\)$')
+
+
+def _escape_chunk_indicator_mdv2(chunk: str) -> str:
+    """Escape a trailing unescaped ' (N/M)' chunk indicator for MarkdownV2."""
+    return _CHUNK_INDICATOR_SUFFIX_RE.sub(r' \\(\1/\2\\)', chunk)
 # Platforms that address recipients by phone number and accept E.164 format
 # (with a leading '+'). Without this, "+15551234567" fails the isdigit() check
 # below and falls through to channel-name resolution, which has no way to
@@ -1423,6 +1438,11 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             text_chunks = BasePlatformAdapter.truncate_message(
                 formatted, 4096, len_fn=utf16_len
             )
+            if send_parse_mode == ParseMode.MARKDOWN_V2 and len(text_chunks) > 1:
+                # truncate_message() appends a raw " (N/M)" suffix to each
+                # chunk; escape it now that formatting has already run (see
+                # _escape_chunk_indicator_mdv2 above).
+                text_chunks = [_escape_chunk_indicator_mdv2(c) for c in text_chunks]
             for chunk in text_chunks:
                 try:
                     last_msg = await _send_telegram_message_with_retry(
