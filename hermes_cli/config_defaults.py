@@ -1870,6 +1870,10 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Exact absolute directories owned by an MCP authority. Hermes never
+        # scans, lists, routes, audits, costs, or loads skills beneath them.
+        # Keep a thin local adapter skill outside these roots for MCP routing.
+        "central_private_roots": [],
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled

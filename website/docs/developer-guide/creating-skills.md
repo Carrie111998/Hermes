@@ -160,8 +160,11 @@ budgets always use the full registered `SKILL.md`, not a plugin description.
 Topology only knows about installed Hermes skills: local, configured external,
 and registered plugin skills. To connect a central private MCP skill library,
 install one thin adapter skill and let that adapter route and load its own
-canonical library. Hermes does not import that library's full catalog into the
-installed topology inventory.
+canonical library. Configure its filesystem locations under
+`skills.central_private_roots`; Hermes does not import, enumerate, cost, route,
+audit, or exact-load that library through the installed topology inventory.
+The adapter remains an ordinary local skill outside the configured roots and
+points to the independently configured MCP tools.
 
 ### Platform-Specific Skills
 

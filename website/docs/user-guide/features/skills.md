@@ -347,6 +347,28 @@ skills:
 
 Paths support `~` expansion and `${VAR}` environment variable substitution.
 
+### MCP-authoritative corpora
+
+An external directory can contain a private corpus that belongs exclusively to
+an MCP server. Mark that corpus with `skills.central_private_roots` rather than
+relying on a directory name:
+
+```yaml
+skills:
+  external_dirs:
+    - /absolute/path/to/external-skills
+  central_private_roots:
+    - /absolute/path/to/external-skills/mcp-authority-subtree
+```
+
+Roots must be existing, readable, absolute non-symlink directories. Hermes
+prunes the configured subtree even when it is nested inside an external
+directory or reached through a symlink alias. It does not list, load, route,
+audit, or count those skills. Put a thin local adapter skill outside the root
+to guide the model to the separately configured MCP server. Invalid authority
+entries are handled fail-closed where they can be resolved and produce only a
+privacy-safe diagnostic.
+
 ### How it works
 
 - **Create locally, update in place**: New agent-created skills are written to `~/.hermes/skills/`. Existing skills are modified where they are found, including skills under `external_dirs`, when the agent uses `skill_manage` actions such as `patch`, `edit`, `write_file`, `remove_file`, or `delete`.

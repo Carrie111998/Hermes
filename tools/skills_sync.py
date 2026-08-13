@@ -88,7 +88,11 @@ def _build_external_skill_index() -> Set[str]:
     Used to prevent sync_skills from shadowing externally-delegated skills.
     """
     try:
-        from agent.skill_utils import get_external_skills_dirs, _external_dirs_cache_clear
+        from agent.skill_utils import (
+            _external_dirs_cache_clear,
+            get_external_skills_dirs,
+            iter_skill_index_files,
+        )
     except ImportError:
         return set()
 
@@ -97,7 +101,7 @@ def _build_external_skill_index() -> Set[str]:
 
     external_names: Set[str] = set()
     for ext_dir in get_external_skills_dirs():
-        for skill_md in ext_dir.rglob("SKILL.md"):
+        for skill_md in iter_skill_index_files(ext_dir, "SKILL.md"):
             if is_excluded_skill_path(skill_md):
                 continue
             skill_dir = skill_md.parent

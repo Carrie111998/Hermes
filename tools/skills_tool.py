@@ -104,7 +104,7 @@ _SKILLS_CACHE_KEY_DISABLED = "with_disabled"
 _SKILLS_CACHE_KEY_FILTERED = "filtered"
 
 
-def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
+def _skills_scan_signature(dirs_to_scan, disabled, authority_boundary) -> tuple:
     """Cheap change-signature for the skill scan inputs.
 
     O(#dirs + #categories) stat calls, not a recursive walk. Includes the
@@ -134,7 +134,13 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
         except OSError:
             pass
         sig.append((str(d), m))
-    return (tuple(sig), frozenset(disabled), platform)
+    return (
+        tuple(sig),
+        frozenset(disabled),
+        platform,
+        authority_boundary.signature,
+        tuple(str(root) for root in authority_boundary.roots),
+    )
 
 
 # All skills live in ~/.hermes/skills/ (seeded from bundled skills/ on install).
@@ -697,7 +703,12 @@ def _find_all_skills(
     signature changes (dir/category mtimes or the disabled-set) and expires
     after a short TTL to bound staleness from in-place SKILL.md edits.
     """
-    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+    from agent.skill_utils import (
+        get_central_private_skill_roots,
+        get_external_skills_dirs,
+        path_is_within_roots,
+        iter_skill_index_files,
+    )
 
     base_cache_key = (
         _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
@@ -716,8 +727,9 @@ def _find_all_skills(
     if active_skills_dir.exists():
         dirs_to_scan.append(active_skills_dir)
     dirs_to_scan.extend(get_external_skills_dirs())
+    authority_boundary = get_central_private_skill_roots()
 
-    signature = _skills_scan_signature(dirs_to_scan, disabled)
+    signature = _skills_scan_signature(dirs_to_scan, disabled, authority_boundary)
     now = time.monotonic()
 
     cached = _SKILLS_CACHE.get(cache_key)
@@ -737,7 +749,13 @@ def _find_all_skills(
     # Scan local dir first, then external dirs (local takes precedence) —
     # dirs_to_scan already resolved above for the signature.
     for scan_dir in dirs_to_scan:
-        for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
+        if path_is_within_roots(scan_dir, authority_boundary.roots):
+            continue
+        for skill_md in iter_skill_index_files(
+            scan_dir,
+            "SKILL.md",
+            excluded_roots=authority_boundary.roots,
+        ):
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
                 continue
 
@@ -840,6 +858,7 @@ def _plugin_topology_records(*, include_ineligible: bool) -> List[Dict[str, Any]
     planner reports only its qualified name, never the path or file content.
     """
     from agent.skill_topology import parse_topology
+    from agent.skill_utils import is_central_private_skill_path
     from hermes_cli.plugins import discover_plugins, get_plugin_manager
 
     records: List[Dict[str, Any]] = []
@@ -865,6 +884,8 @@ def _plugin_topology_records(*, include_ineligible: bool) -> List[Dict[str, Any]
         try:
             registered_path = plugin_skill.get("path") or manager.find_plugin_skill(name)
             path = Path(registered_path)
+            if is_central_private_skill_path(path):
+                continue
             raw_content = path.read_bytes()
             content = raw_content.decode("utf-8-sig")
             parsed_frontmatter, _ = _parse_frontmatter(content)
@@ -1269,6 +1290,13 @@ def skill_view(
                 ensure_ascii=False,
             )
 
+        from agent.skill_utils import (
+            get_central_private_skill_roots,
+            get_external_skills_dirs,
+            path_is_within_roots,
+        )
+        authority_boundary = get_central_private_skill_roots()
+
         local_category_name: str | None = None
         # ── Qualified name dispatch (plugin skills) ──────────────────
         # Names containing ':' are routed to the plugin skill registry.
@@ -1329,6 +1357,14 @@ def skill_view(
                     )
 
             if plugin_skill_md is not None:
+                if path_is_within_roots(plugin_skill_md, authority_boundary.roots):
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": "This skill is available only through its configured MCP authority.",
+                        },
+                        ensure_ascii=False,
+                    )
                 if not plugin_skill_md.exists():
                     # Stale registry entry — file deleted out of band
                     pm.remove_plugin_skill(name)
@@ -1356,6 +1392,17 @@ def skill_view(
             # Plugin exists but this specific skill is missing?
             available = pm.list_plugin_skills(namespace)
             if available:
+                # A plugin registry can retain candidates that are physically
+                # under an MCP-authority root. Do not turn a qualified miss
+                # into an enumeration of that private corpus.
+                if authority_boundary.roots:
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": "This skill is available only through its configured MCP authority.",
+                        },
+                        ensure_ascii=False,
+                    )
                 return json.dumps(
                     {
                         "success": False,
@@ -1371,8 +1418,6 @@ def skill_view(
             # on-disk `category/skill` path during the local scan below.
             if bare:
                 local_category_name = f"{namespace}/{bare}"
-
-        from agent.skill_utils import get_external_skills_dirs
 
         # The categorized fall-through form (namespace/bare) joins onto each
         # search dir too; re-validate it since `bare` is not namespace-checked.
@@ -1429,10 +1474,14 @@ def skill_view(
             candidates.append((sd, smd))
 
         for search_dir in all_dirs:
+            if path_is_within_roots(search_dir, authority_boundary.roots):
+                continue
             # Strategy 1: direct path (e.g., "mlops/axolotl" or bare "axolotl"
             # at the top of the dir).
             direct_path = search_dir / name
             if (
+                not path_is_within_roots(direct_path, authority_boundary.roots)
+                and
                 not _is_skill_support_path(direct_path)
                 and direct_path.is_dir()
                 and (direct_path / "SKILL.md").exists()
@@ -1449,6 +1498,8 @@ def skill_view(
             if local_category_name:
                 categorized_path = search_dir / local_category_name
                 if (
+                    not path_is_within_roots(categorized_path, authority_boundary.roots)
+                    and
                     not _is_skill_support_path(categorized_path)
                     and categorized_path.is_dir()
                     and (categorized_path / "SKILL.md").exists()
@@ -1466,7 +1517,11 @@ def skill_view(
             # plus frontmatter `name:` lookup. `skills_list()` exposes the
             # frontmatter name, so `skill_view(name)` must accept it too even
             # when the on-disk directory is a shorter category/alias.
-            for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
+            for found_skill_md in iter_skill_index_files(
+                search_dir,
+                "SKILL.md",
+                excluded_roots=authority_boundary.roots,
+            ):
                 if found_skill_md.parent.name == name:
                     _record(found_skill_md.parent, found_skill_md)
                     continue
@@ -1482,7 +1537,11 @@ def skill_view(
             # Exclude skill support docs: references/templates/assets/scripts
             # are loaded through skill_view(skill, file_path=...) and must not
             # shadow or collide with real skills that share the same basename.
-            for found_md in search_dir.rglob(f"{name}.md"):
+            for found_md in iter_skill_index_files(
+                search_dir,
+                f"{name}.md",
+                excluded_roots=authority_boundary.roots,
+            ):
                 if found_md.name != "SKILL.md" and not _is_skill_support_path(
                     found_md
                 ):
@@ -1517,6 +1576,14 @@ def skill_view(
 
         if not skill_md or not skill_md.exists():
             available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
+            if authority_boundary.roots:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": "This skill is available only through its configured MCP authority.",
+                    },
+                    ensure_ascii=False,
+                )
             return json.dumps(
                 {
                     "success": False,

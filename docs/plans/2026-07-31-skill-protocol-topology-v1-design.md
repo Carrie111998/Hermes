@@ -39,9 +39,14 @@ Topology has an intentionally narrow authority boundary. Hermes routes only
 skills installed into the active local tree, configured external directories,
 or registered plugins. A central private MCP skill library is represented by
 one installed thin adapter skill; the adapter owns discovery, routing, and
-loading inside that library. Hermes must not crawl or ingest the library's
-catalog as a second installed inventory, and this design adds no dependency on
-the private library.
+loading inside that library. `skills.central_private_roots` supplies exact
+absolute non-symlink corpus roots; native scans prune them before traversal and
+native exact loads reject them after alias resolution. The boundary is included
+in profile-scoped scan and prompt-cache signatures, so a profile or config
+change cannot retain a prior inventory. Invalid or ambiguous entries are
+diagnosed without paths and remain excluded wherever resolvable. Hermes must
+not crawl or ingest the library's catalog as a second installed inventory, and
+this design adds no dependency on the private library or its MCP package.
 
 Ranking uses explicit weighted field matches: exact name first, then exact
 tags/domains, then inputs/outputs/category, with loose name and description

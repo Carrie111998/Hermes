@@ -9,8 +9,9 @@ import logging
 import os
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from hermes_constants import get_config_path, get_skills_dir, is_termux
 
@@ -114,9 +115,14 @@ def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
     except AttributeError:
         from pathlib import PurePath
         parts = PurePath(str(path)).parts
-    return any(part in EXCLUDED_SKILL_DIRS for part in parts) or is_skill_support_path(
+    if any(part in EXCLUDED_SKILL_DIRS for part in parts) or is_skill_support_path(
         path, root=root
-    )
+    ):
+        return True
+    # Some older callers own their own directory walk. Keep the authority
+    # boundary in this common predicate as a final fail-closed guard while
+    # callers migrate to ``iter_skill_index_files`` for subtree pruning.
+    return is_central_private_skill_path(path)
 
 
 def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
@@ -398,14 +404,14 @@ def _raw_config_cache_clear() -> None:
     _RAW_CONFIG_CACHE.clear()
 
 
-def _load_raw_config() -> Dict[str, Any]:
+def _load_raw_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
     """Read config.yaml with a shared mtime+size keyed cache.
 
     This module intentionally avoids importing ``hermes_cli.config`` on the
     skill prompt/build path. A tiny local cache gives the same repeated-read
     win without pulling the heavier CLI config stack into startup.
     """
-    config_path = get_config_path()
+    config_path = config_path or get_config_path()
     if not config_path.exists():
         return {}
     try:
@@ -488,12 +494,157 @@ def _normalize_string_set(values) -> Set[str]:
 # each trigger a category lookup during banner construction (10+ seconds
 # of pure waste).
 _EXTERNAL_DIRS_CACHE: Dict[Tuple[str, int], List[Path]] = {}
+_CENTRAL_PRIVATE_ROOTS_CACHE: Dict[Tuple[str, int, int], "CentralPrivateSkillRoots"] = {}
+
+
+@dataclass(frozen=True)
+class CentralPrivateSkillRoots:
+    """Resolved native-scan exclusions for MCP-authoritative skill corpora.
+
+    The configured roots are never surfaced to model-facing artifacts. Invalid
+    entries still contribute a best-effort resolved guard so a symlink or a
+    transient permissions failure cannot turn into an inventory bypass.
+    """
+
+    roots: Tuple[Path, ...]
+    diagnostics: Tuple[str, ...]
+    signature: Tuple[str, int, int]
 
 
 def _external_dirs_cache_clear() -> None:
     """Test hook — drop the in-process cache."""
     _EXTERNAL_DIRS_CACHE.clear()
+    _CENTRAL_PRIVATE_ROOTS_CACHE.clear()
     _raw_config_cache_clear()
+
+
+def _safe_resolve_skill_path(path: Path) -> Path:
+    """Resolve aliases for boundary checks without propagating path failures."""
+    try:
+        return path.expanduser().resolve(strict=False)
+    except (OSError, RuntimeError):
+        return path.expanduser().absolute()
+
+
+def _contains_symlink_component(path: Path) -> bool:
+    """Return whether an absolute configured path traverses a symlink."""
+    if not path.is_absolute():
+        return False
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            if current.is_symlink():
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _config_signature(config_path: Path) -> Tuple[str, int, int]:
+    try:
+        stat = config_path.stat()
+        return (str(config_path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return (str(config_path), 0, 0)
+
+
+def get_central_private_skill_roots(
+    config_path: Optional[Path] = None,
+) -> CentralPrivateSkillRoots:
+    """Read strict ``skills.central_private_roots`` exclusions.
+
+    This is an explicit authority boundary, not a directory-name heuristic.
+    Entries must be absolute, non-symlink, readable directories. A malformed
+    entry is diagnosed without ever including its configured path in logs; when
+    it can still be resolved, that location remains guarded fail-closed.
+    """
+    config_path = config_path or get_config_path()
+    signature = _config_signature(config_path)
+    cached = _CENTRAL_PRIVATE_ROOTS_CACHE.get(signature)
+    if cached is not None:
+        return cached
+
+    diagnostics: list[str] = []
+    parsed = _load_raw_config(config_path)
+    skills_cfg = parsed.get("skills") if isinstance(parsed, dict) else None
+    raw_roots = skills_cfg.get("central_private_roots") if isinstance(skills_cfg, dict) else None
+    if raw_roots is None:
+        result = CentralPrivateSkillRoots((), (), signature)
+        _CENTRAL_PRIVATE_ROOTS_CACHE[signature] = result
+        return result
+    entries = raw_roots
+    if not isinstance(entries, list):
+        # A scalar absolute path is still enough information to reserve a
+        # subtree. Treat it as malformed config *and* guard it rather than
+        # allowing the shape error to reveal a private corpus.
+        diagnostics.append("central_private_root_invalid")
+        entries = [entries] if isinstance(entries, str) else []
+
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for entry in entries:
+        if not isinstance(entry, str) or not entry.strip():
+            diagnostics.append("central_private_root_invalid")
+            continue
+        declared = Path(entry)
+        if not declared.is_absolute():
+            diagnostics.append("central_private_root_invalid")
+            continue
+        resolved = _safe_resolve_skill_path(declared)
+        invalid = (
+            _contains_symlink_component(declared)
+            or not declared.is_dir()
+            or not os.access(declared, os.R_OK | os.X_OK)
+        )
+        if invalid:
+            diagnostics.append("central_private_root_invalid")
+        if resolved in seen:
+            diagnostics.append("central_private_root_ambiguous")
+            continue
+        seen.add(resolved)
+        roots.append(resolved)
+
+    for index, root in enumerate(roots):
+        for other in roots[index + 1 :]:
+            if path_is_within_roots(root, (other,)) or path_is_within_roots(other, (root,)):
+                diagnostics.append("central_private_root_ambiguous")
+                break
+
+    unique_diagnostics = tuple(sorted(set(diagnostics)))
+    if unique_diagnostics:
+        logger.warning(
+            "Configured MCP authority roots include invalid or ambiguous entries; "
+            "affected paths remain excluded from native skill discovery."
+        )
+    result = CentralPrivateSkillRoots(tuple(roots), unique_diagnostics, signature)
+    _CENTRAL_PRIVATE_ROOTS_CACHE.clear()
+    _CENTRAL_PRIVATE_ROOTS_CACHE[signature] = result
+    return result
+
+
+def path_is_within_roots(path: Path, roots: Iterable[Path]) -> bool:
+    """Return whether *path* is in a resolved authority subtree."""
+    candidate = _safe_resolve_skill_path(Path(path))
+    for root in roots:
+        try:
+            candidate.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def is_central_private_skill_path(
+    path: Path,
+    *,
+    config_path: Optional[Path] = None,
+) -> bool:
+    """Whether a candidate is reserved for its configured MCP authority."""
+    return path_is_within_roots(
+        path,
+        get_central_private_skill_roots(config_path).roots,
+    )
 
 
 def get_external_skills_dirs() -> List[Path]:
@@ -874,7 +1025,12 @@ def is_skill_description_truncated_for_prompt(frontmatter: Dict[str, Any]) -> bo
 # ── File iteration ────────────────────────────────────────────────────────
 
 
-def iter_skill_index_files(skills_dir: Path, filename: str):
+def iter_skill_index_files(
+    skills_dir: Path,
+    filename: str,
+    *,
+    excluded_roots: Optional[Iterable[Path]] = None,
+):
     """Walk skills_dir yielding sorted paths matching *filename*.
 
     Excludes Hermes metadata, VCS, virtualenv/dependency, cache, and skill
@@ -890,10 +1046,19 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     without any manual cleanup.
     """
     skills_dir_str = str(skills_dir)
+    if excluded_roots is None:
+        excluded_roots = get_central_private_skill_roots().roots
+    excluded_roots = tuple(_safe_resolve_skill_path(Path(root)) for root in excluded_roots)
+    if path_is_within_roots(skills_dir, excluded_roots):
+        return
     active_org = read_active_org_id(skills_dir)
     org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
     matches: list[str] = []
     for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
+        root_path = Path(root)
+        if path_is_within_roots(root_path, excluded_roots):
+            dirs[:] = []
+            continue
         has_skill_md = "SKILL.md" in files
         if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
             dirs.remove(ORG_MIRROR_DIR_NAME)
@@ -905,6 +1070,7 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
             for d in dirs
             if d not in EXCLUDED_SKILL_DIRS
             and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
+            and not path_is_within_roots(root_path / d, excluded_roots)
         ]
         if filename in files:
             matches.append(os.path.join(root, filename))

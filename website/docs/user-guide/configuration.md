@@ -647,6 +647,25 @@ hermes config set skills.config.myplugin.path ~/myplugin-data
 
 For details on declaring config settings in your own skills, see [Creating Skills — Config Settings](/developer-guide/creating-skills#config-settings-configyaml).
 
+### MCP-authoritative skill roots
+
+When a private canonical skill corpus is served through MCP, configure its
+filesystem roots explicitly so Hermes never treats it as a native skill source:
+
+```yaml
+skills:
+  central_private_roots:
+    - /absolute/path/to/canonical-corpus
+```
+
+Each entry must be an existing, readable, absolute directory that is not a
+symlink. Hermes excludes matching paths (including aliases that resolve there)
+from native discovery, prompts, slash commands, listings, routes, topology
+audits, cost accounting, and `skill_view`. Keep one small adapter `SKILL.md`
+outside these roots; the adapter can instruct the model to use the separately
+configured MCP tools. This setting does not configure or invoke MCP servers;
+use the existing `mcp_servers` configuration for that.
+
 ### Guard on agent-created skill writes
 
 When the agent uses `skill_manage` to create, edit, patch, or delete a skill, Hermes can optionally scan the new/updated content for dangerous keyword patterns (credential harvesting, obvious prompt injection, exfil instructions). The scanner is **off by default** — real agent workflows that legitimately touch `~/.ssh/` or mention `$OPENAI_API_KEY` were tripping the heuristic too often. Turn it back on if you want the scanner to prompt you before the agent's skill writes land:

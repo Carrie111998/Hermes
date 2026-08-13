@@ -309,6 +309,7 @@ def _(rid, params: dict) -> dict:
         try:
             from hermes_cli.config import load_config
             from hermes_cli.skills_config import get_disabled_skills
+            from agent.skill_utils import iter_skill_index_files
 
             cfg = load_config() or {}
             disabled = {s.lower() for s in get_disabled_skills(cfg)}
@@ -316,7 +317,7 @@ def _(rid, params: dict) -> dict:
             installed = []
             skills_root = profile_dir / "skills"
             if skills_root.is_dir():
-                for md in sorted(skills_root.rglob("SKILL.md")):
+                for md in iter_skill_index_files(skills_root, "SKILL.md"):
                     skill_name = md.parent.name
                     installed.append(
                         {"name": skill_name, "enabled": skill_name.lower() not in disabled}

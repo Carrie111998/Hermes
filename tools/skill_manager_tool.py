@@ -650,11 +650,15 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     external dirs configured via skills.external_dirs.  Returns
     {"path": Path} or None.
     """
-    from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
+    from agent.skill_utils import (
+        get_all_skills_dirs,
+        is_excluded_skill_path,
+        iter_skill_index_files,
+    )
     for skills_dir in get_all_skills_dirs():
         if not skills_dir.exists():
             continue
-        for skill_md in skills_dir.rglob("SKILL.md"):
+        for skill_md in iter_skill_index_files(skills_dir, "SKILL.md"):
             if is_excluded_skill_path(skill_md):
                 continue
             if skill_md.parent.name == name:
@@ -793,7 +797,19 @@ def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
         if not skills_dir.is_dir():
             continue
         try:
-            for skill_md in skills_dir.rglob("SKILL.md"):
+            from agent.skill_utils import (
+                get_central_private_skill_roots,
+                iter_skill_index_files,
+            )
+
+            authority_boundary = get_central_private_skill_roots(
+                skills_dir.parent / "config.yaml"
+            )
+            for skill_md in iter_skill_index_files(
+                skills_dir,
+                "SKILL.md",
+                excluded_roots=authority_boundary.roots,
+            ):
                 if is_excluded_skill_path(skill_md):
                     continue
                 if skill_md.parent.name == name:
