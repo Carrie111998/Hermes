@@ -50,7 +50,7 @@ No dependencies between agents. Wall-clock time ≈ the slowest single unit, not
 
 ### 3. Check (skeptic — required)
 
-**Checking is its own job.** Do not let the agent that writes the answer be the only one that grades it — a synthesizer asked to both merge and critique will reliably rate its own inputs as sound. Spawn one fresh-context skeptic over the combined worker output *before* synthesis:
+**Checking is its own job.** Do not let the agent that writes the answer be the only one that grades it — a synthesizer asked to both merge and critique will reliably rate its own inputs as sound. Spawn one fresh-context skeptic over the combined worker output *before* synthesis (the canonical prompt is maintained at `references/skeptic-prompt.md` — the `red-team` skill reuses the same file):
 
 > You are a skeptic. Your job is to REFUTE, not to summarize. Here are findings from N parallel work units. For each material claim: is it actually supported by evidence, or asserted confidently without proof? Flag (a) unsupported claims, (b) stale or undated evidence, (c) sources that don't say what the finding claims, (d) conflicts between units, (e) anything mistaking correlation, popularity, or pain for significance. Return SURVIVES / WEAK / REFUTED per claim, with a one-line reason. Default to WEAK when evidence is thin — do not be agreeable.
 
