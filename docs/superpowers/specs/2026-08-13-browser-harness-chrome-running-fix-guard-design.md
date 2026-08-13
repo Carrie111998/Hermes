@@ -116,8 +116,16 @@ tempdir fixtures and never reads the live installs.
 copy is the editable target, read from the `.pth` (falling back to the
 conventional `src\browser_harness\admin.py` when that file is unreadable).
 Otherwise the active copy is the uv-tool `admin.py`. If this resolution ever
-diverges from `harness_exe()`, the guard grades the wrong file — so the
-mirroring is called out in a comment at both ends.
+diverges from the callers', the guard grades the wrong file — so the mirroring
+is called out in a comment at both ends.
+
+**Two cron entrypoints share this resolution**, which is why mirroring it is
+safe rather than a coincidence: `cron_vip_scan_orchestrator.py:62-64` and
+`raw_linkedin_scan_cron_runner.py:27-30` compute the same dev-exe-then-PATH
+fallback, and both call `--doctor` (`:281` and `:269`/`:278` respectively). One
+probe row therefore covers both. `harness_probe.py` and `linkedin_scan.py` are
+run *through* the harness (`browser-harness -c "exec(...)"`), so they inherit
+whichever exe their caller resolved and add no third path.
 
 **Both files are read on every pass regardless of which way resolution went.**
 "Active" and "fallback" are labels applied after resolution, not a choice of
