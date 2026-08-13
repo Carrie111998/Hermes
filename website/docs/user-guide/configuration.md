@@ -124,14 +124,14 @@ updates:
   pre_update_backup: quick       # quick (state snapshot, default) | full (snapshot + HERMES_HOME zip) | off
   backup_keep: 5                 # Keep this many full pre-update backup zips
   apply_approval: true           # Require explicit approval before applying a self-update
-  non_interactive_local_changes: stash  # stash | discard
+  non_interactive_local_changes: stash  # stash | discard | abort
 ```
 
 `apply_approval` defaults to `true`: mutating `hermes update` runs stage a pending request under `<HERMES_HOME>/pending/updates/` instead of pulling immediately. Review with `hermes update pending` (or `/update pending` in the classic CLI), apply with `hermes update approve <id>`, reject with `hermes update reject <id>`, or toggle the gate with `hermes update approval <on|off>`.
 
 `pre_update_backup` is the single pre-update safety knob: `quick` (default) snapshots critical state files (pairing data, cron jobs, config, auth; files over 1 GiB are skipped) into `state-snapshots/`; `full` additionally zips all of `HERMES_HOME` into `backups/` and can add minutes on large homes; `off` disables both. Legacy booleans are honored (`true` → `full`, `false` → `off`).
 
-For git installs, Hermes auto-stashes dirty tracked files and untracked files before checking out the update branch or pulling. Interactive terminal updates prompt before restoring that stash. Non-interactive updates (desktop/chat app, gateway, or `--yes`) use `updates.non_interactive_local_changes`: `stash` restores local source edits after a successful pull, while `discard` drops the update-created stash after a successful pull. Use `discard` only on managed installs where local source edits are never meant to persist.
+For git installs, Hermes normally auto-stashes dirty tracked files and untracked files before checking out the update branch or pulling. Interactive terminal updates prompt before restoring that stash. Non-interactive updates (desktop/chat app, gateway, or `--yes`) use `updates.non_interactive_local_changes`: `stash` restores local source edits after a successful pull, `discard` drops the update-created stash after a successful pull, and `abort` stops before update mutations when the checkout is dirty. Use `discard` only where local edits should be destroyed; use `abort` for managed checkouts that must stay pristine and require human review of unexpected edits.
 
 Before that stash step, Hermes also restores tracked `package-lock.json` diffs left by npm install/build churn. Commit or manually stash intentional lockfile edits before updating.
 

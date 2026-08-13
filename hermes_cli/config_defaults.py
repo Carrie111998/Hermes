@@ -2933,6 +2933,9 @@ DEFAULT_CONFIG = {
         #               Stash-and-drop (not `reset --hard` + `clean -fd`) so
         #               ignored paths — node_modules, venv, build outputs —
         #               are never touched.
+        #   "abort"   — stop before any update mutation when tracked or
+        #               untracked local source changes are present. Intended
+        #               for managed checkouts that must remain pristine.
         "non_interactive_local_changes": "stash",
         # Refresh an already-installed cua-driver during `hermes update`.
         # The refresh is best-effort and macOS-only. Turn this off if the

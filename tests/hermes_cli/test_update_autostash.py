@@ -197,9 +197,10 @@ def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, 
 
 # ---------------------------------------------------------------------------
 # Non-interactive update.non_interactive_local_changes setting
-# (chat app / gateway): "discard" throws stashed changes away, "stash"
-# (default) restores them. Interactive terminal updates ignore the setting
-# and always go through the restore path.
+# (chat app / gateway): "abort" refuses a dirty checkout before mutation,
+# "discard" throws stashed changes away, and "stash" (default) restores them.
+# Interactive terminal updates ignore the setting and always go through the
+# restore path.
 # ---------------------------------------------------------------------------
 
 def _setup_setting_test(monkeypatch, tmp_path, mode):
@@ -229,6 +230,159 @@ def _setup_setting_test(monkeypatch, tmp_path, mode):
     side_effect, recorded = _make_update_side_effect()
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
     return restore_calls, discard_calls, recorded
+
+
+def _init_setting_test_repo(tmp_path):
+    import subprocess
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=True
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "tracked.txt").write_text("committed\n")
+    git("add", "tracked.txt")
+    git("commit", "-qm", "init")
+    return git
+
+
+def test_abort_policy_preserves_dirty_checkout_without_creating_stash(tmp_path, capsys):
+    git = _init_setting_test_repo(tmp_path)
+    (tmp_path / "tracked.txt").write_text("local edit\n")
+    (tmp_path / "untracked.txt").write_text("local untracked\n")
+    before_head = git("rev-parse", "HEAD").stdout
+    before_status = git("status", "--porcelain").stdout
+
+    with pytest.raises(SystemExit, match="2"):
+        hermes_main._abort_update_if_worktree_dirty(["git"], tmp_path)
+
+    assert git("rev-parse", "HEAD").stdout == before_head
+    assert git("status", "--porcelain").stdout == before_status
+    assert git("stash", "list").stdout == ""
+    assert (tmp_path / "tracked.txt").read_text() == "local edit\n"
+    assert (tmp_path / "untracked.txt").read_text() == "local untracked\n"
+    assert "unattended update aborted" in capsys.readouterr().out
+
+
+def test_abort_policy_allows_clean_checkout(tmp_path):
+    _init_setting_test_repo(tmp_path)
+    hermes_main._abort_update_if_worktree_dirty(["git"], tmp_path)
+
+
+def test_noninteractive_abort_runs_before_pre_update_backup(monkeypatch, tmp_path):
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda *a, **kw: {"updates": {"non_interactive_local_changes": "abort"}},
+    )
+    order = []
+
+    def abort_guard(*args, **kwargs):
+        order.append("abort_guard")
+        raise SystemExit(2)
+
+    monkeypatch.setattr(hermes_main, "_abort_update_if_worktree_dirty", abort_guard)
+    monkeypatch.setattr(
+        hermes_main,
+        "_run_pre_update_backup",
+        lambda *args, **kwargs: order.append("backup"),
+    )
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: False)
+
+    with pytest.raises(SystemExit, match="2"):
+        hermes_main._cmd_update_impl(SimpleNamespace(yes=True), gateway_mode=False)
+
+    assert order == ["abort_guard"]
+
+
+def test_clean_noninteractive_abort_continues_into_normal_update_setup(monkeypatch, tmp_path):
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda *a, **kw: {"updates": {"non_interactive_local_changes": "abort"}},
+    )
+    order = []
+    monkeypatch.setattr(
+        hermes_main,
+        "_abort_update_if_worktree_dirty",
+        lambda *args, **kwargs: order.append("abort_guard"),
+    )
+
+    def stop_after_guard(*args, **kwargs):
+        order.append("backup")
+        raise RuntimeError("normal update setup reached")
+
+    monkeypatch.setattr(hermes_main, "_run_pre_update_backup", stop_after_guard)
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: False)
+
+    with pytest.raises(RuntimeError, match="normal update setup reached"):
+        hermes_main._cmd_update_impl(SimpleNamespace(yes=True), gateway_mode=False)
+
+    assert order == ["abort_guard", "backup"]
+
+
+@pytest.mark.parametrize("mode", ["stash", "discard"])
+def test_existing_noninteractive_modes_do_not_use_abort_guard(
+    monkeypatch, tmp_path, mode
+):
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda *a, **kw: {"updates": {"non_interactive_local_changes": mode}},
+    )
+    abort_calls = []
+    monkeypatch.setattr(
+        hermes_main,
+        "_abort_update_if_worktree_dirty",
+        lambda *args, **kwargs: abort_calls.append(1),
+    )
+
+    def stop_at_normal_setup(*args, **kwargs):
+        raise RuntimeError("normal setup")
+
+    monkeypatch.setattr(hermes_main, "_run_pre_update_backup", stop_at_normal_setup)
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: False)
+
+    with pytest.raises(RuntimeError, match="normal setup"):
+        hermes_main._cmd_update_impl(SimpleNamespace(yes=True), gateway_mode=False)
+
+    assert abort_calls == []
+
+
+def test_interactive_update_ignores_abort_policy(monkeypatch, tmp_path):
+    import sys
+
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda *a, **kw: {"updates": {"non_interactive_local_changes": "abort"}},
+    )
+    abort_calls = []
+    monkeypatch.setattr(
+        hermes_main,
+        "_abort_update_if_worktree_dirty",
+        lambda *args, **kwargs: abort_calls.append(1),
+    )
+
+    def stop_at_normal_setup(*args, **kwargs):
+        raise RuntimeError("normal setup")
+
+    monkeypatch.setattr(hermes_main, "_run_pre_update_backup", stop_at_normal_setup)
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: False)
+
+    with patch.object(sys.stdin, "isatty", return_value=True), patch.object(
+        sys.stdout, "isatty", return_value=True
+    ), pytest.raises(RuntimeError, match="normal setup"):
+        hermes_main._cmd_update_impl(SimpleNamespace(yes=False), gateway_mode=False)
+
+    assert abort_calls == []
 
 
 

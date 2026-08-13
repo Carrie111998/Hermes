@@ -5093,6 +5093,7 @@ def _clear_bytecode_cache(root: Path) -> int:
 # hermes_cli.main._run_pre_update_backup, ...) keep resolving unchanged.
 from hermes_cli.update_cmd import (  # noqa: F401
     _add_upstream_remote,
+    _abort_update_if_worktree_dirty,
     _atomic_replace_dir,
     _capture_head_sha,
     _cmd_update_check,
