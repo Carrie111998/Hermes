@@ -167,16 +167,17 @@ class TestEditMessageFormatting:
         assert _posted_message(adapter) == "*bold* and _italic_"
 
     @pytest.mark.asyncio
-    async def test_edit_matches_send_formatting_exactly(self):
-        """The two paths must not disagree, or a streamed reply changes
-        appearance the moment it is finalized by a send."""
-        raw = "# Title\n**bold** `code` ~~struck~~"
+    async def test_edit_applies_the_full_conversion(self):
+        """Asserted against literal expected output, not against
+        format_message() itself -- comparing the two would pass for any
+        implementation, including a broken one."""
         adapter = _edit_adapter()
 
-        await adapter.edit_message("chat1", "msg1", raw)
-        edited = _posted_message(adapter)
+        await adapter.edit_message(
+            "chat1", "msg1", "# Title\n**bold** ~~struck~~ [text](http://x)"
+        )
 
-        assert edited == adapter.format_message(raw)
+        assert _posted_message(adapter) == "*Title*\n*bold* ~struck~ text (http://x)"
 
     @pytest.mark.asyncio
     async def test_edit_preserves_code_fences(self):
@@ -187,6 +188,35 @@ class TestEditMessageFormatting:
         await adapter.edit_message("chat1", "msg1", raw)
 
         assert "```\n**not bold**\n```" in _posted_message(adapter)
+
+    @pytest.mark.asyncio
+    async def test_streaming_prefixes_never_corrupt_the_frame(self):
+        """edit_message is the only caller fed PARTIAL text.
+
+        send() only ever sees a complete message; a streamed edit sees
+        prefixes, which routinely carry an unmatched ``**`` or an unclosed
+        backtick. Those must pass through untouched rather than emit a stray
+        delimiter, and the final frame must equal the fully converted message.
+        """
+        adapter = _edit_adapter()
+        full = "Here is **bold** and `code` done"
+
+        for cut in range(1, len(full) + 1):
+            adapter._http_session.post.reset_mock()
+            await adapter.edit_message("chat1", "msg1", full[:cut])
+            frame = _posted_message(adapter)
+            # A prefix may be converted or verbatim, but never gains a
+            # delimiter that was not derivable from the text it was given.
+            assert frame.count("_") <= full[:cut].count("_") + full[:cut].count("*")
+            assert "**" not in frame or "**" in full[:cut]
+
+        assert _posted_message(adapter) == "Here is *bold* and `code` done"
+
+    @pytest.mark.parametrize("partial", ["**bold", "*ital", "`code", "a ** b"])
+    def test_unbalanced_delimiters_pass_through(self, partial):
+        """Mid-stream fragments with unclosed markers are left alone."""
+        adapter = _make_adapter()
+        assert adapter.format_message(partial) == partial
 
     @pytest.mark.asyncio
     async def test_edit_does_not_double_convert(self):
