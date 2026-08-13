@@ -1524,17 +1524,45 @@ def _model_flow_named_custom(config, provider_info):
 
     from hermes_cli.config import _env_ref_var_name, get_env_value
 
-    # An unresolved ``${VAR}`` / ``${env:VAR}`` config ref is a placeholder,
-    # not a credential: ``_expand_env_vars`` deliberately keeps the literal
-    # verbatim when the variable is not set, "so callers can detect them".
-    # This caller did not — the placeholder is truthy, so it was accepted as
-    # the key and sent as the bearer token, and it also shadowed the
-    # ``key_env`` fallback below. Resolve it through the same scope-aware
-    # reader instead, mirroring the ``${...}`` handling on the picker path in
-    # ``model_switch``.
-    if isinstance(api_key, str) and api_key.startswith("${") and api_key.endswith("}"):
-        ref_var = _env_ref_var_name(api_key[2:-1])
+    # ``provider_info["api_key"]`` is the value *after* ``_expand_env_vars``,
+    # and that expansion resolves ``${VAR}`` straight out of the process-global
+    # ``os.environ`` (``config.py::_env_expand_match``) — it is not scope-aware.
+    # So a ``${VAR}`` config ref reaches this flow in one of two states, and
+    # only one of them is visible in ``api_key``:
+    #
+    #   * variable NOT set — the literal is kept verbatim "so callers can
+    #     detect them". This caller did not: the placeholder is truthy, so it
+    #     was accepted as the key and sent as the bearer token, and it also
+    #     shadowed the ``key_env`` fallback below.
+    #   * variable SET — ``api_key`` is a plain resolved string carrying no
+    #     trace of the ref, so no inspection of it can tell this apart from a
+    #     directly-configured inline key. Its value came from the *process*
+    #     environment, which under the multiplexed gateway is another
+    #     profile's key, and it is about to be sent to this provider's
+    #     ``base_url``. That is the case this flow has to catch, and it is
+    #     precisely the one the placeholder shape cannot see.
+    #
+    # The unexpanded template survives on ``api_key_ref`` — the field
+    # ``_custom_provider_api_key_config_value`` already trusts to persist this
+    # entry — so key the decision off the template rather than off the
+    # expanded value, and re-resolve through the scope-aware reader. Mirrors
+    # the ``${...}`` handling on the picker path in ``model_switch``.
+    api_key_template = str(provider_info.get("api_key_ref") or "").strip()
+    if not api_key_template and isinstance(api_key, str):
+        api_key_template = api_key.strip()
+    ref_body = ""
+    if api_key_template.startswith("${") and api_key_template.endswith("}"):
+        ref_body = api_key_template[2:-1]
+    if ref_body and "}" not in ref_body:
+        # Exactly one whole ref. ``[^}]+`` mirrors ``_expand_env_vars``' own
+        # pattern, so a composite such as ``sk-${SUFFIX}`` or ``${A}-${B}``
+        # does not reach here and keeps whatever the expansion produced.
+        ref_var = _env_ref_var_name(ref_body)
         api_key = (get_env_value(ref_var) or "") if ref_var else ""
+    elif isinstance(api_key, str) and "${" in api_key:
+        # A composite the expansion could not fully resolve is still a
+        # placeholder, never a credential — do not probe with it.
+        api_key = ""
 
     # Resolve key from env var if api_key not set directly. Route the read
     # through ``get_env_value`` so it honours the per-profile secret scope:
