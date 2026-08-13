@@ -88,11 +88,36 @@ def test_unsuppressed_agent_still_fans_out(monkeypatch, tmp_path):
     assert len(ref_runs) == 1
 
 
-def test_background_review_fork_sets_suppress_flag():
-    """The review fork construction pins the flag (source-level guard)."""
+def _module_assigns_suppress_flag(module) -> bool:
+    """True when the module contains a real `<x>._moa_suppress_references = True`
+    assignment. AST-based: a commented-out line does not count (the previous
+    source-string version passed even with the assignment commented out)."""
+    import ast
     import inspect
 
+    tree = ast.parse(inspect.getsource(module))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if (
+                isinstance(target, ast.Attribute)
+                and target.attr == "_moa_suppress_references"
+                and isinstance(node.value, ast.Constant)
+                and node.value.value is True
+            ):
+                return True
+    return False
+
+
+def test_background_review_fork_sets_suppress_flag():
+    """The review fork construction pins the flag."""
     import agent.background_review as background_review
 
-    src = inspect.getsource(background_review)
-    assert "_moa_suppress_references = True" in src
+    assert _module_assigns_suppress_flag(background_review)
+
+
+def test_curator_fork_sets_suppress_flag():
+    import agent.curator as curator
+
+    assert _module_assigns_suppress_flag(curator)

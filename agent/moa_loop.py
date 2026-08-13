@@ -9,6 +9,7 @@ iteration.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import threading
@@ -1079,8 +1080,6 @@ def _extract_tool_call_entries(tool_calls: Any) -> list[tuple[str, str, str]]:
             args_text = fn_args
         elif fn_args is not None:
             try:
-                import json
-
                 args_text = json.dumps(fn_args, ensure_ascii=False)
             except Exception:
                 args_text = str(fn_args)
@@ -1524,6 +1523,15 @@ def _preset_temperature(preset: dict[str, Any], key: str) -> float | None:
 # conversation_loop from here isn't worth the coupling for one string.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
 
+# Echo detection matches on this many leading chars of the advisory
+# instruction rather than the whole string: degraded advisors echo the
+# marker with truncated/reworded tails, but the head survives verbatim.
+# Long enough that legitimate advice cannot start with it by accident,
+# short enough to catch tail-mangled echoes. Echoes truncated below this
+# length slip through here and are caught by the whole-string equality
+# checks instead.
+_ADVISORY_ECHO_ANCHOR_LEN = 60
+
 
 def _is_failed_reference(text: str) -> bool:
     """Return whether a reference output is unusable as advice.
@@ -1552,7 +1560,10 @@ def _is_failed_reference(text: str) -> bool:
         return True
     if "[called tool:" in text or "[tool result:" in text:
         return True
-    if stripped.startswith(_ADVISORY_INSTRUCTION[:60]) or stripped == _INTERRUPT_SCAFFOLD_MARKER:
+    if (
+        stripped.startswith(_ADVISORY_INSTRUCTION[:_ADVISORY_ECHO_ANCHOR_LEN])
+        or stripped == _INTERRUPT_SCAFFOLD_MARKER
+    ):
         return True
     return False
 
