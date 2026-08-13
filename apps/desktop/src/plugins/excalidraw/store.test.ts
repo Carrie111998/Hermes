@@ -6,16 +6,14 @@ const {
   register,
   registerPaneCloser,
   removeTreePane,
-  revealTreePane,
-  collapseTreePane
+  revealTreePane
 } = vi.hoisted(() => ({
   $narrowViewport: { get: () => false, listen: () => () => undefined },
   $registryVersion: { get: () => 0, listen: () => () => undefined, subscribe: () => () => undefined },
   register: vi.fn(),
   registerPaneCloser: vi.fn(),
   removeTreePane: vi.fn(),
-  revealTreePane: vi.fn(),
-  collapseTreePane: vi.fn()
+  revealTreePane: vi.fn()
 }))
 
 vi.mock('@/contrib/registry', () => ({ $registryVersion, registry: { getArea: () => [], register } }))
@@ -23,8 +21,7 @@ vi.mock('@/components/pane-shell/tree/store', () => ({
   $narrowViewport,
   registerPaneCloser,
   removeTreePane,
-  revealTreePane,
-  collapseTreePane
+  revealTreePane
 }))
 
 import { type ExcalidrawDocumentIdentity, excalidrawPaneId } from './identity'
@@ -43,7 +40,6 @@ describe('Excalidraw drawing panes', () => {
     revealTreePane.mockReset()
     registerPaneCloser.mockReset()
     removeTreePane.mockReset()
-    collapseTreePane.mockReset()
     resetExcalidrawDocumentsForTest()
   })
 
@@ -89,8 +85,12 @@ describe('Excalidraw drawing panes', () => {
     ])
   })
 
-  it('minimizes the pane without forgetting its document, registration, or controller', async () => {
-    const controller = { reconcileExternalChange: vi.fn(), waitForSave: vi.fn(), canCloseCleanly: vi.fn() }
+  it('routes tab Close through save-aware drawing removal', async () => {
+    const controller = {
+      reconcileExternalChange: vi.fn(),
+      waitForSave: vi.fn().mockResolvedValue(undefined),
+      canCloseCleanly: vi.fn().mockReturnValue(true)
+    }
     openDrawing(identity, 'fp1')
     setDrawingController(identity, controller)
     const paneId = excalidrawPaneId(identity)
@@ -98,19 +98,13 @@ describe('Excalidraw drawing panes', () => {
 
     close?.()
 
-    expect(collapseTreePane).toHaveBeenCalledWith(paneId)
-    expect(removeTreePane).not.toHaveBeenCalled()
-    expect(register).toHaveBeenCalledTimes(1)
-    expect($excalidrawDocuments.get()).toEqual([
-      expect.objectContaining({ fingerprint: 'fp1', identity, status: 'connected' })
-    ])
+    await vi.waitFor(() => expect(removeTreePane).toHaveBeenCalledWith(paneId))
+    expect(controller.waitForSave).toHaveBeenCalledTimes(1)
+    expect(registerPaneCloser).toHaveBeenLastCalledWith(paneId)
+    expect($excalidrawDocuments.get()).toEqual([])
 
     await handleChangedDocument(identity, 'fp2')
-    expect(controller.reconcileExternalChange).toHaveBeenCalledWith('fp2')
-
-    openDrawing(identity, 'fp3')
-    expect(register).toHaveBeenCalledTimes(1)
-    expect(revealTreePane).toHaveBeenLastCalledWith(paneId)
+    expect(controller.reconcileExternalChange).not.toHaveBeenCalled()
   })
 
   it('reconciles only the matching full identity', async () => {
@@ -127,6 +121,14 @@ describe('Excalidraw drawing panes', () => {
     expect(controller.reconcileExternalChange).toHaveBeenCalledWith('fp4')
   })
 
+  it('closes a pane that failed before its drawing controller mounted', async () => {
+    openDrawing(identity, 'fp1')
+
+    await expect(requestDrawingClose(identity)).resolves.toBe(true)
+
+    expect(removeTreePane).toHaveBeenCalledWith(excalidrawPaneId(identity))
+    expect($excalidrawDocuments.get()).toEqual([])
+  })
   it('waits for saves and keeps conflict panes open unless discard is confirmed', async () => {
     const controller = { reconcileExternalChange: vi.fn(), waitForSave: vi.fn(), canCloseCleanly: vi.fn() }
     openDrawing(identity, 'fp1')
