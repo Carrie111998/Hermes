@@ -306,7 +306,12 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // Palette "Keyboard shortcuts" entry dispatches a custom event (contributions
   // don't have router access); listen and navigate to the settings keybinds tab.
   useEffect(() => {
-    const onOpenKeybinds = () => navigate(`${SETTINGS_ROUTE}?tab=keybinds`)
+    const onOpenKeybinds = () => {
+      if (!isAuxiliaryWindow()) {
+        navigate(`${SETTINGS_ROUTE}?tab=keybinds`)
+      }
+    }
+
     window.addEventListener('hermes:open-keybinds', onOpenKeybinds)
 
     return () => window.removeEventListener('hermes:open-keybinds', onOpenKeybinds)

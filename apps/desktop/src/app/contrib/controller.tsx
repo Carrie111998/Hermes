@@ -12,6 +12,7 @@ import { allPaneIds, group, groupLeafIds, split } from '@/components/pane-shell/
 import { LayoutTreeRoot } from '@/components/pane-shell/tree/renderer'
 import type { DoubleTapContext } from '@/components/pane-shell/tree/renderer/drag-session'
 import {
+  $activePresetId,
   $layoutTree,
   bindPaneVisibility,
   bindToolPaneCollapse,
@@ -26,7 +27,6 @@ import {
   registerPaneCloser,
   registerPaneOpener,
   removeTreePane,
-  resetLayoutTree,
   revealTreePane,
   togglePaneVisible,
   watchContributedPanes
@@ -55,11 +55,20 @@ import {
   SIDEBAR_MAX_WIDTH
 } from '@/store/layout'
 import { runExportProfileFlow, runImportProfileFlow } from '@/store/profile-share'
+import {
+  $ranModeEnabled,
+  disableRanMode,
+  enableRanMode,
+  initializeRanMode,
+  RAN_MODE_PRESET_ID,
+  RAN_MODE_TREE,
+  resetLayoutFromRanMode
+} from '@/store/ran-mode'
 import { $reviewOpen, closeReview, openReview, REVIEW_PANE_ID } from '@/store/review'
 import { $currentCwd, $selectedStoredSessionId, $sessions, $yoloActive, sessionMatchesStoredId } from '@/store/session'
 import { watchSessionPins } from '@/store/session-pin-sync'
 import { $statusbarVisible } from '@/store/statusbar-prefs'
-import { isHudWindow } from '@/store/windows'
+import { isAuxiliaryWindow, isHudWindow } from '@/store/windows'
 
 import type { SessionDragPayload } from '../chat/composer/inline-refs'
 import { watchPreviewTiles } from '../chat/preview-tile'
@@ -229,32 +238,83 @@ registry.registerMany([
 // auto-discovered by discoverBundledPlugins() below.
 // ---------------------------------------------------------------------------
 
+const primaryLayoutChromeContributions = isAuxiliaryWindow()
+  ? []
+  : [
+      {
+        id: 'layout.editMode',
+        area: KEYBINDS_AREA,
+        data: {
+          id: 'layout.editMode',
+          label: 'Toggle layout edit mode',
+          defaults: ['mod+shift+\\'],
+          run: toggleLayoutEditMode
+        } satisfies KeybindContribution
+      },
+      paletteToggle({
+        id: 'layout.editMode',
+        label: 'Toggle layout edit mode',
+        action: 'layout.editMode',
+        icon: LayoutDashboard,
+        keywords: ['layout', 'zones', 'panes', 'edit', 'rearrange'],
+        get: () => $layoutEditMode.get(),
+        set: enabled => $layoutEditMode.set(enabled)
+      }),
+      {
+        id: 'layout.reset',
+        area: PALETTE_AREA,
+        data: {
+          id: 'layout.reset',
+          label: 'Reset layout',
+          icon: LayoutDashboard,
+          keywords: ['layout', 'reset', 'default', 'panes'],
+          run: resetLayoutFromRanMode
+        } satisfies PaletteContribution
+      },
+      paletteToggle({
+        id: 'view.toggleRanMode',
+        label: 'Toggle Ran Mode',
+        action: 'view.toggleRanMode',
+        icon: Zap,
+        keywords: ['ran mode', 'focus', 'chat first', 'quiet', 'workspace', 'preset'],
+        get: () => $ranModeEnabled.get(),
+        set: enabled => {
+          if (enabled) {
+            enableRanMode()
+          } else {
+            disableRanMode()
+          }
+        }
+      }),
+      // Hiding the bar removes the surface that would otherwise offer it back,
+      // so the primary command palette is the guaranteed door in. Auxiliary
+      // renderers must not advertise or mutate this shared preference.
+      paletteToggle({
+        id: 'view.toggleStatusbar',
+        label: 'Toggle status bar',
+        action: 'view.toggleStatusbar',
+        icon: PanelBottom,
+        keywords: ['status bar', 'statusbar', 'bottom bar', 'hide', 'show', 'chrome'],
+        get: () => $statusbarVisible.get(),
+        set: enabled => $statusbarVisible.set(enabled)
+      }),
+      {
+        id: 'keybinds.panel',
+        area: PALETTE_AREA,
+        data: {
+          id: 'keybinds.panel',
+          label: 'Keyboard shortcuts',
+          keywords: ['keybinds', 'shortcuts', 'hotkeys', 'keyboard'],
+          run: () => window.dispatchEvent(new CustomEvent('hermes:open-keybinds'))
+        } satisfies PaletteContribution
+      }
+    ]
+
 registry.registerMany([
+  ...primaryLayoutChromeContributions,
   // Titlebar center stays empty on purpose: session title lives in tabs +
   // sidebar; place/cwd lives in the sidebar project tree. Center is drag
   // chrome (plugins can still contribute to titleBar.center if needed).
-  // Layout edit mode registers through the SAME declarative surfaces plugins
-  // use: a rebindable keybind (collision-checked in the panel) + a ⌘K row
-  // whose hotkey hint tracks the live binding.
-  {
-    id: 'layout.editMode',
-    area: KEYBINDS_AREA,
-    data: {
-      id: 'layout.editMode',
-      label: 'Toggle layout edit mode',
-      defaults: ['mod+shift+\\'],
-      run: toggleLayoutEditMode
-    } satisfies KeybindContribution
-  },
-  paletteToggle({
-    id: 'layout.editMode',
-    label: 'Toggle layout edit mode',
-    action: 'layout.editMode',
-    icon: LayoutDashboard,
-    keywords: ['layout', 'zones', 'panes', 'edit', 'rearrange'],
-    get: () => $layoutEditMode.get(),
-    set: enabled => $layoutEditMode.set(enabled)
-  }),
   // The agent's write -> see loop: rescan <hermes home>/desktop-plugins
   // without relaunching (same-id reloads dispose the previous incarnation).
   {
@@ -267,39 +327,7 @@ registry.registerMany([
       run: () => void discoverRuntimePlugins()
     } satisfies PaletteContribution
   },
-  {
-    id: 'layout.reset',
-    area: PALETTE_AREA,
-    data: {
-      id: 'layout.reset',
-      label: 'Reset layout',
-      icon: LayoutDashboard,
-      keywords: ['layout', 'reset', 'default', 'panes'],
-      run: resetLayoutTree
-    } satisfies PaletteContribution
-  },
-  // Hiding the bar removes the surface that would otherwise offer it back, so
-  // ⌘K is the guaranteed door in (alongside the rebindable ⌘⇧S).
-  paletteToggle({
-    id: 'view.toggleStatusbar',
-    label: 'Toggle status bar',
-    action: 'view.toggleStatusbar',
-    icon: PanelBottom,
-    keywords: ['status bar', 'statusbar', 'bottom bar', 'hide', 'show', 'chrome'],
-    get: () => $statusbarVisible.get(),
-    set: enabled => $statusbarVisible.set(enabled)
-  }),
-  // The keybind panel's non-titlebar door (the keyboard icon is gone).
-  {
-    id: 'keybinds.panel',
-    area: PALETTE_AREA,
-    data: {
-      id: 'keybinds.panel',
-      label: 'Keyboard shortcuts',
-      keywords: ['keybinds', 'shortcuts', 'hotkeys', 'keyboard'],
-      run: () => window.dispatchEvent(new CustomEvent('hermes:open-keybinds'))
-    } satisfies PaletteContribution
-  },
+
   // Profile sharing: bundle the active profile (config, skills, theme, layout)
   // into a portable archive, or adopt someone else's. Both open native dialogs,
   // so the palette closing on select is correct.
@@ -384,14 +412,21 @@ const QUAD_TREE = split(
   [3, 1]
 )
 
-registry.registerMany([
-  { id: 'default', area: 'layouts', title: 'Default', order: 0, data: DEFAULT_TREE },
-  { id: 'focus', area: 'layouts', title: 'Focus', order: 10, data: FOCUS_TREE },
-  { id: 'terminal-deck', area: 'layouts', title: 'Terminal deck', order: 20, data: TERMINAL_TREE },
-  { id: 'quad', area: 'layouts', title: 'Quad', order: 30, data: QUAD_TREE }
-])
+if (!isAuxiliaryWindow()) {
+  registry.registerMany([
+    { id: 'default', area: 'layouts', title: 'Default', order: 0, data: DEFAULT_TREE },
+    { id: RAN_MODE_PRESET_ID, area: 'layouts', title: 'Ran Mode', order: 5, data: RAN_MODE_TREE },
+    { id: 'focus', area: 'layouts', title: 'Focus', order: 10, data: FOCUS_TREE },
+    { id: 'terminal-deck', area: 'layouts', title: 'Terminal deck', order: 20, data: TERMINAL_TREE },
+    { id: 'quad', area: 'layouts', title: 'Quad', order: 30, data: QUAD_TREE }
+  ])
+}
 
 declareDefaultTree(DEFAULT_TREE)
+
+if (!isAuxiliaryWindow()) {
+  void initializeRanMode()
+}
 
 // Bundled plugins load AFTER core, so a same-id contribution from a plugin
 // deliberately overrides the core default (last writer wins). Third-party
@@ -564,17 +599,20 @@ bindToolPaneCollapse(
 // Reads the TREE like every other pane toggle: `$terminalTakeover` stays true
 // behind a stacked sibling tab or a minimized zone, which would light the row
 // "on" for a terminal that isn't on screen.
-registry.register(
-  paletteToggle({
-    id: 'view.showTerminal',
-    label: 'Toggle terminal',
-    action: 'view.showTerminal',
-    icon: Terminal,
-    keywords: ['terminal', 'shell', 'console', 'pty'],
-    get: () => isPaneVisible('terminal'),
-    set: () => togglePaneVisible('terminal')
-  })
-)
+
+if (!isAuxiliaryWindow()) {
+  registry.register(
+    paletteToggle({
+      id: 'view.showTerminal',
+      label: 'Toggle terminal',
+      action: 'view.showTerminal',
+      icon: Terminal,
+      keywords: ['terminal', 'shell', 'console', 'pty'],
+      get: () => isPaneVisible('terminal'),
+      set: () => togglePaneVisible('terminal')
+    })
+  )
+}
 
 // Logs are ⌘K-ONLY chrome: the pane contribution EXISTS only while $logsOpen
 // is on. Off (the default) keeps logs out of the registry and the tree
@@ -696,6 +734,8 @@ function TitlebarSlot({ area, className, style }: TitlebarSlotProps) {
 }
 
 export function ContribController() {
+  const activePresetId = useStore($activePresetId)
+  const ranModeEnabled = useStore($ranModeEnabled)
   const sidebarOpen = useStore($sidebarOpen)
   const statusbarVisible = useStore($statusbarVisible)
 
@@ -714,6 +754,8 @@ export function ContribController() {
   return (
     <SidebarProvider
       className="h-screen min-h-0 flex-col bg-background"
+      data-layout-preset={activePresetId}
+      data-ran-mode={ranModeEnabled ? 'true' : 'false'}
       onOpenChange={setSidebarOpen}
       open={sidebarOpen}
       style={{ '--sidebar-width': '100%' } as CSSProperties}

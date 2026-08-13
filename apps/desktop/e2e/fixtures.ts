@@ -27,7 +27,7 @@ import * as path from 'node:path'
 
 import { _electron, type ElectronApplication, type Page } from '@playwright/test'
 
-import { startMockServer, type MockServerOptions } from './mock-server'
+import { type MockServerOptions, startMockServer } from './mock-server'
 import { installErrorBannerGuard } from './test'
 
 const DESKTOP_ROOT = path.resolve(import.meta.dirname, '..')
@@ -287,7 +287,8 @@ export function findElectron(): string {
   // In dev mode, we use the `electron` binary directly (not the packaged app).
   // The dev:electron script in package.json does exactly this: `electron .`
   // after building. We replicate that here.
-  const localElectron = path.join(REPO_ROOT, 'node_modules', 'electron', 'dist', 'electron')
+  const electronBinary = process.platform === 'win32' ? 'electron.exe' : 'electron'
+  const localElectron = path.join(REPO_ROOT, 'node_modules', 'electron', 'dist', electronBinary)
 
   if (fs.existsSync(localElectron)) {
     return localElectron
@@ -316,25 +317,55 @@ export function findElectron(): string {
  */
 export async function launchDesktop(
   env: Record<string, string>,
+  onWindow?: (page: Page) => void,
 ): Promise<{ app: ElectronApplication; page: Page }> {
   assertDistBuilt()
 
   const electronBin = findElectron()
 
-  // `electron .` loads from the package.json `main` field
-  // (dist/electron-main.mjs after build).
+  // Production main installs the bounded E2E startup observer before creating
+  // any window. This closes the interval before Playwright receives a Page.
   const app = await _electron.launch({
     executablePath: electronBin,
     args: [
-      DESKTOP_ROOT, // `electron .` — the `.` is the desktop package dir
+      DESKTOP_ROOT,
       '--disable-gpu',
       '--no-sandbox',
     ],
-    env,
+    env: {
+      ...env,
+      HERMES_E2E_OBSERVE_RENDERER_STARTUP: '1',
+    },
     cwd: DESKTOP_ROOT,
   })
 
+  if (onWindow) {
+    // Later HUD/secondary/peer windows are observed before test actions can
+    // trigger their creation. The require-hook above covers earlier startup.
+    app.on('window', onWindow)
+  }
+
   const page = await app.firstWindow()
+
+  onWindow?.(page)
+
+  await page.waitForLoadState('domcontentloaded')
+
+  const startupRendererErrors = await app.evaluate(async ({ app: electronApp }) => {
+    const observedApp = electronApp as typeof electronApp & {
+      __hermesE2EStartupRendererErrors?: string[]
+      __hermesE2EStartupRendererPending?: Promise<void>[]
+    }
+
+    await Promise.all(observedApp.__hermesE2EStartupRendererPending ?? [])
+
+    return [...(observedApp.__hermesE2EStartupRendererErrors ?? [])]
+  })
+
+  if (startupRendererErrors.length > 0) {
+    await app.close().catch(() => undefined)
+    throw new Error(`Renderer startup errors:\n${startupRendererErrors.join('\n')}`)
+  }
 
   // Install the error-banner guard so any [role="alert"] that appears
   // during a test is collected and surfaced in afterEach.
@@ -365,6 +396,9 @@ export interface MockBackendOptions {
   extraConfig?: string
   /** Override the mock model's context window for compression scenarios. */
   modelContextLength?: number
+  mockServer?: MockServerOptions
+  /** Observe each renderer as soon as Electron announces the window. */
+  onWindow?: (page: Page) => void
 }
 
 /**
@@ -374,10 +408,6 @@ export interface MockBackendOptions {
  *   3. Launch the desktop app
  *   4. Return handles for test interaction
  */
-export interface MockBackendOptions {
-  mockServer?: MockServerOptions
-}
-
 export async function setupMockBackend(options: MockBackendOptions = {}): Promise<MockBackendFixture> {
   // 1. Start mock server
   const mock = await startMockServer(options.mockServer)
@@ -395,7 +425,7 @@ export async function setupMockBackend(options: MockBackendOptions = {}): Promis
 
   // 3. Build env + launch
   const env = buildAppEnv(sandbox)
-  const { app, page } = await launchDesktop(env)
+  const { app, page } = await launchDesktop(env, options.onWindow)
 
   return {
     app,
@@ -632,6 +662,7 @@ export async function waitForAppReady(fixture: MockBackendFixture | NoProviderFi
       // `position: fixed; inset: 0`. If the hit element or an ancestor
       // is a full-viewport fixed overlay, we're still covered.
       let node: Element | null = el
+
       while (node) {
         const cs = window.getComputedStyle(node)
 

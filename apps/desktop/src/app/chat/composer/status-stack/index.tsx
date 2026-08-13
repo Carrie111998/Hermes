@@ -25,6 +25,8 @@ import {
 } from '@/store/composer-status'
 import { refreshSessionGoal } from '@/store/goals'
 import { $previewStatusBySession, dismissPreviewArtifact } from '@/store/preview-status'
+import { $ranModeEnabled } from '@/store/ran-mode'
+import { ranModeStatusStackMaxClass } from '@/store/ran-mode-presentation'
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { openSessionInNewWindow } from '@/store/windows'
 
@@ -84,6 +86,7 @@ interface ComposerStatusStackProps {
 export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackProps) {
   const { t } = useI18n()
   const navigate = useNavigate()
+  const ranModeEnabled = useStore($ranModeEnabled)
   // Subscribe to THIS session's slice only. Both maps churn on other
   // sessions' activity (subagent ticks, background polls, preview updates in
   // any tile); a whole-map `useStore` re-rendered every mounted stack — one
@@ -226,7 +229,8 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
       // In flow in the dock column, directly above the composer. The dock is
       // bottom-anchored, so this grows upward over the thread without needing
       // to be positioned — and it shares the dock's left edge for free.
-      className="flex max-h-[40vh] min-h-0 flex-col overflow-y-auto"
+      className={cn('flex min-h-0 flex-col overflow-y-auto', ranModeStatusStackMaxClass(ranModeEnabled))}
+      data-composer-status-stack=""
       onPointerDownCapture={() => blurComposerInput()}
     >
       {/* The card paints the shared --composer-fill (rest / scrolled / focused

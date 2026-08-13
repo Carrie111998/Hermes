@@ -456,6 +456,11 @@ export const en: Translations = {
       colorModeDesc: 'Pick a fixed mode or let Hermes follow your system setting.',
       toolViewTitle: 'Tool Call Display',
       toolViewDesc: 'Product hides raw tool payloads; Technical shows full input/output.',
+      ranModeTitle: 'Ran Mode',
+      ranModeDesc:
+        'Chat first. Temporarily minimizes the sessions rail and hides secondary panes and chrome, then restores your exact prior workspace.',
+      statusBarTitle: 'Status Bar',
+      statusBarDesc: 'Show backend, model, and project status along the bottom. Keep it off for a quieter workspace.',
       uiScaleTitle: 'UI Scale',
       uiScaleDesc: (percent: number) =>
         `Scales text and controls across the whole app. Cmd/Ctrl with +, - and 0 also works. Current: ${percent}%.`,

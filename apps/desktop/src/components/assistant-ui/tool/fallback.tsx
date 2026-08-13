@@ -42,6 +42,8 @@ import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { recordPreviewArtifact } from '@/store/preview-status'
 import { sessionApprovalRequest } from '@/store/prompts'
+import { $ranModeEnabled } from '@/store/ran-mode'
+import { shouldAutoOpenToolDiff } from '@/store/ran-mode-presentation'
 import { $toolInlineDiff } from '@/store/tool-diffs'
 import { $toolRowDismissed, dismissToolRow } from '@/store/tool-dismiss'
 import { $anyToolDisclosureOpen, $toolDisclosureOpen, $toolViewMode, setToolDisclosureOpen } from '@/store/tool-view'
@@ -347,6 +349,7 @@ function ToolEntry({ part }: ToolEntryProps) {
   const messageId = useAuiState(s => s.message.id)
   const messageRunning = useAuiState(selectMessageRunning)
   const embedded = useContext(ToolEmbedContext)
+  const ranModeEnabled = useStore($ranModeEnabled)
   const toolViewMode = useStore($toolViewMode)
 
   // `ToolFallback` rebuilds the `part` wrapper each render, defeating the memos
@@ -368,7 +371,14 @@ function ToolEntry({ part }: ToolEntryProps) {
   const sideDiff = useStore($toolInlineDiff(toolCallId ?? ''))
   const inlineDiff = stripInlineDiffChrome(sideDiff) || inlineDiffFromResult(result)
   const isFileEdit = isFileEditTool(toolName)
-  const defaultOpen = Boolean(inlineDiff)
+
+  const defaultOpen = shouldAutoOpenToolDiff({
+    hasInlineDiff: Boolean(inlineDiff),
+    isError: Boolean(isError),
+    isPending,
+    ranModeEnabled
+  })
+
   const open = useDisclosureOpen(disclosureId, defaultOpen)
   const canDismiss = !isPending && !embedded
   // Only animate entries that mount while their message is actively

@@ -23,6 +23,7 @@ import {
   Zap
 } from '@/lib/icons'
 import { notifyError } from '@/store/notifications'
+import { isAuxiliaryWindow } from '@/store/windows'
 
 import { useRouteEnumParam } from '../hooks/use-route-enum-param'
 import { OverlayIconButton } from '../overlays/overlay-chrome'
@@ -57,7 +58,11 @@ const SETTINGS_VIEWS: readonly SettingsViewId[] = [
   'about'
 ]
 
-export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: SettingsPageProps) {
+export function SettingsView(props: SettingsPageProps) {
+  return isAuxiliaryWindow() ? null : <PrimarySettingsView {...props} />
+}
+
+function PrimarySettingsView({ onClose, onConfigSaved, onMainModelChanged }: SettingsPageProps) {
   const { t } = useI18n()
   const navigate = useNavigate()
   const { hash, pathname, search } = useLocation()

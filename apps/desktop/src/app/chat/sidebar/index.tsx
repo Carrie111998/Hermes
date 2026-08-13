@@ -105,6 +105,8 @@ import {
   refreshPullRequests,
   sessionPrKey
 } from '@/store/pull-requests'
+import { $ranModeEnabled } from '@/store/ran-mode'
+import { shouldShowPinnedSection } from '@/store/ran-mode-presentation'
 import { openRouteTile } from '@/store/route-tiles'
 import {
   $cronSessions,
@@ -350,6 +352,7 @@ export function ChatSidebar({
   // dividers; groups apply it to their own lanes.
   const sortOrderIds = useStore($sidebarSessionRankIds)
   const agentsGrouped = grouping === 'project'
+  const ranModeEnabled = useStore($ranModeEnabled)
   const pinnedSessionIds = useStore($pinnedSessionIds)
   const pinsOpen = useStore($sidebarPinsOpen)
   const agentsOpen = useStore($sidebarRecentsOpen)
@@ -1543,7 +1546,8 @@ export function ChatSidebar({
               />
             )}
 
-            {!trimmedQuery && (
+            {!trimmedQuery &&
+              shouldShowPinnedSection({ pinnedCount: pinnedSessions.length, ranModeEnabled }) && (
               <SidebarSessionsSection
                 activeSessionId={activeSidebarSessionId}
                 contentClassName="flex flex-col gap-px rounded-lg pb-2 pt-1"

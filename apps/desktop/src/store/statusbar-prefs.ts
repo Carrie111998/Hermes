@@ -1,4 +1,8 @@
+import { atom } from 'nanostores'
+
 import { Codecs, persistentAtom } from '@/lib/persisted'
+
+import { isAuxiliaryWindow } from './windows'
 
 const STATUSBAR_HIDDEN_STORAGE_KEY = 'hermes.desktop.statusbarHidden'
 const STATUSBAR_VISIBLE_STORAGE_KEY = 'hermes.desktop.statusbarVisible'
@@ -7,7 +11,9 @@ const STATUSBAR_VISIBLE_STORAGE_KEY = 'hermes.desktop.statusbarVisible'
 // — the bar is opt-in. Hiding it unmounts the bar (its 15s status poll goes with
 // it), so the way back is the `view.toggleStatusbar` keybind or the ⌘K row,
 // never the bar itself.
-export const $statusbarVisible = persistentAtom(STATUSBAR_VISIBLE_STORAGE_KEY, false, Codecs.bool)
+export const $statusbarVisible = isAuxiliaryWindow()
+  ? atom(false)
+  : persistentAtom(STATUSBAR_VISIBLE_STORAGE_KEY, false, Codecs.bool)
 
 export function toggleStatusbarVisible() {
   $statusbarVisible.set(!$statusbarVisible.get())
@@ -35,13 +41,15 @@ export const STATUSBAR_HIDDEN_BY_DEFAULT: readonly string[] = [
 // staying off. An empty array is a real value — the user turned everything on —
 // so this uses a sanitizing json codec rather than Codecs.stringArray, which
 // drops the key when empty and would resurrect the defaults on next launch.
-export const $statusbarHiddenIds = persistentAtom<string[]>(
-  STATUSBAR_HIDDEN_STORAGE_KEY,
-  [...STATUSBAR_HIDDEN_BY_DEFAULT],
-  Codecs.json<string[]>(value =>
-    Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string' && id.length > 0) : []
-  )
-)
+export const $statusbarHiddenIds = isAuxiliaryWindow()
+  ? atom<string[]>([...STATUSBAR_HIDDEN_BY_DEFAULT])
+  : persistentAtom<string[]>(
+      STATUSBAR_HIDDEN_STORAGE_KEY,
+      [...STATUSBAR_HIDDEN_BY_DEFAULT],
+      Codecs.json<string[]>(value =>
+        Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string' && id.length > 0) : []
+      )
+    )
 
 export function setStatusbarItemVisible(id: string, visible: boolean) {
   const hidden = $statusbarHiddenIds.get()

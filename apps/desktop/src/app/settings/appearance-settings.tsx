@@ -18,6 +18,7 @@ import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/p
 import { $reactionsEnabled, setReactionsEnabled } from '@/store/reactions-enabled'
 import { $toolViewMode, setToolViewMode } from '@/store/tool-view'
 import { $translucency, setTranslucency } from '@/store/translucency'
+import { isAuxiliaryWindow } from '@/store/windows'
 import { $zoomPercent, setZoomPercent } from '@/store/zoom'
 import { getBaseColors, useTheme } from '@/themes/context'
 import { installVscodeThemeFromMarketplace } from '@/themes/install'
@@ -27,6 +28,8 @@ import { $marketplaceInstalls, isUserTheme, removeUserTheme } from '@/themes/use
 import { MODE_OPTIONS } from './constants'
 import { PetSettings } from './pet-settings'
 import { ListRow, SectionHeading, SettingsContent } from './primitives'
+import { RanModeSetting } from './ran-mode-setting'
+import { StatusbarVisibilitySetting } from './statusbar-visibility-setting'
 import { TerminalFontSetting } from './terminal-font-setting'
 
 function ThemePreview({ name, mode }: { name: string; mode: 'light' | 'dark' }) {
@@ -495,20 +498,26 @@ export function AppearanceSettings() {
             title={a.reactionsTitle}
           />
 
-          <ListRow
-            action={
-              <SegmentedControl
-                onChange={id => {
-                  triggerHaptic('selection')
-                  setToolViewMode(id)
-                }}
-                options={toolOptions}
-                value={toolViewMode}
-              />
-            }
-            description={a.toolViewDesc}
-            title={a.toolViewTitle}
-          />
+          <RanModeSetting />
+
+          <StatusbarVisibilitySetting />
+
+          {!isAuxiliaryWindow() && (
+            <ListRow
+              action={
+                <SegmentedControl
+                  onChange={id => {
+                    triggerHaptic('selection')
+                    setToolViewMode(id)
+                  }}
+                  options={toolOptions}
+                  value={toolViewMode}
+                />
+              }
+              description={a.toolViewDesc}
+              title={a.toolViewTitle}
+            />
+          )}
 
           <ListRow
             action={

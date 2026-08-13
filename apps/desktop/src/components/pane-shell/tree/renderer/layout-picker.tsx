@@ -15,6 +15,7 @@ import { useContributions } from '@/contrib/react/use-contributions'
 import type { Contribution } from '@/contrib/types'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
+import { isAuxiliaryWindow } from '@/store/windows'
 
 import type { LayoutNode } from '../model'
 import { isLayoutNode } from '../model'
@@ -113,6 +114,10 @@ export function LayoutPicker() {
   const presets = useContributions(LAYOUTS_AREA)
   const [name, setName] = useState('')
   const [saving, setSaving] = useState(false)
+
+  if (isAuxiliaryWindow()) {
+    return null
+  }
 
   const templates = presets.filter(p => !isUserPreset(p.id) && isLayoutNode(p.data))
   const custom = presets.filter(p => isUserPreset(p.id) && isLayoutNode(p.data))

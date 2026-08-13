@@ -4,7 +4,6 @@ import { useLocation, useNavigate } from 'react-router'
 
 import { hudTargetSessionId } from '@/app/hud/handoff'
 import { toggleLayoutEditMode } from '@/components/pane-shell/edit-mode'
-import { resetLayoutTree } from '@/components/pane-shell/tree/store'
 import { Button } from '@/components/ui/button'
 import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
@@ -19,6 +18,8 @@ import {
   togglePanesFlipped,
   toggleSidebarOpen
 } from '@/store/layout'
+import { resetLayoutFromRanMode } from '@/store/ran-mode'
+import { isAuxiliaryWindow } from '@/store/windows'
 
 import { appViewForPath, isOverlayView } from '../routes'
 
@@ -141,16 +142,20 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
         leftEdge.toggle()
       }
     },
-    {
-      actionId: 'view.flipPanes',
-      icon: <TitlebarIcon name="arrow-swap" />,
-      id: 'flip-panes',
-      label: t.titlebar.swapSidebarSides,
-      onSelect: () => {
-        triggerHaptic('tap')
-        togglePanesFlipped()
-      }
-    },
+    ...(!isAuxiliaryWindow()
+      ? [
+          {
+            actionId: 'view.flipPanes',
+            icon: <TitlebarIcon name="arrow-swap" />,
+            id: 'flip-panes',
+            label: t.titlebar.swapSidebarSides,
+            onSelect: () => {
+              triggerHaptic('tap')
+              togglePanesFlipped()
+            }
+          }
+        ]
+      : []),
     ...leftTools
   ]
 
@@ -167,26 +172,30 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
 
   // Static system tools — always pinned to the screen's right edge.
   const systemTools: TitlebarTool[] = [
-    {
-      className: 'group/tool',
-      // Hover + held ⌘/Ctrl morphs the glyph into its reset form (see
-      // LayoutGlyph) — the mod-click telegraphs itself before it happens.
-      icon: <LayoutGlyph modHeld={modHeld} />,
-      id: 'layout',
-      label: t.titlebar.layoutEditor,
-      onSelect: event => {
-        if (event?.metaKey || event?.ctrlKey) {
-          triggerHaptic('warning')
-          resetLayoutTree()
+    ...(!isAuxiliaryWindow()
+      ? [
+          {
+            className: 'group/tool',
+            // Hover + held ⌘/Ctrl morphs the glyph into its reset form (see
+            // LayoutGlyph) — the mod-click telegraphs itself before it happens.
+            icon: <LayoutGlyph modHeld={modHeld} />,
+            id: 'layout',
+            label: t.titlebar.layoutEditor,
+            onSelect: (event?: MouseEvent) => {
+              if (event?.metaKey || event?.ctrlKey) {
+                triggerHaptic('warning')
+                resetLayoutFromRanMode()
 
-          return
-        }
+                return
+              }
 
-        triggerHaptic('open')
-        toggleLayoutEditMode()
-      },
-      title: t.titlebar.layoutEditorTitle
-    },
+              triggerHaptic('open')
+              toggleLayoutEditMode()
+            },
+            title: t.titlebar.layoutEditorTitle
+          }
+        ]
+      : []),
     {
       // No `title`: TitlebarToolButton passes `title` to TipKeybindLabel as a
       // text OVERRIDE, so a long sentence there replaces the short label and
@@ -208,16 +217,20 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
       label: hapticsMuted ? t.titlebar.unmuteHaptics : t.titlebar.muteHaptics,
       onSelect: toggleHaptics
     },
-    {
-      actionId: 'nav.settings',
-      icon: <TitlebarIcon name="settings-gear" />,
-      id: 'settings',
-      label: t.titlebar.openSettings,
-      onSelect: () => {
-        triggerHaptic('open')
-        onOpenSettings()
-      }
-    }
+    ...(!isAuxiliaryWindow()
+      ? [
+          {
+            actionId: 'nav.settings',
+            icon: <TitlebarIcon name="settings-gear" />,
+            id: 'settings',
+            label: t.titlebar.openSettings,
+            onSelect: () => {
+              triggerHaptic('open')
+              onOpenSettings()
+            }
+          }
+        ]
+      : [])
   ]
 
   // While a full-screen overlay (settings, command center, …) is open it should

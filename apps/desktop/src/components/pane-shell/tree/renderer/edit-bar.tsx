@@ -12,9 +12,10 @@ import { Button } from '@/components/ui/button'
 import { useI18n } from '@/i18n'
 import { formatCombo } from '@/lib/keybinds/combo'
 import { $bindings, bindingsFor } from '@/store/keybinds'
+import { resetLayoutFromRanMode } from '@/store/ran-mode'
+import { isAuxiliaryWindow } from '@/store/windows'
 
 import { $layoutEditMode } from '../../edit-mode'
-import { resetLayoutTree } from '../store'
 
 import { LayoutPicker } from './layout-picker'
 
@@ -70,7 +71,7 @@ export function TreeEditBar() {
     window.addEventListener('pointerup', onUp, true)
   }, [])
 
-  if (!editMode) {
+  if (!editMode || isAuxiliaryWindow()) {
     return null
   }
 
@@ -97,7 +98,7 @@ export function TreeEditBar() {
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-1.5" onPointerDown={e => e.stopPropagation()}>
-          <Button onClick={resetLayoutTree} size="sm" variant="ghost">
+          <Button onClick={resetLayoutFromRanMode} size="sm" variant="ghost">
             {t.zones.reset}
           </Button>
           <Button onClick={() => $layoutEditMode.set(false)} size="sm" variant="outline">

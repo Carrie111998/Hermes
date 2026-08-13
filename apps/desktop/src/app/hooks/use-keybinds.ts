@@ -58,7 +58,7 @@ import {
   switcherJustClosed
 } from '@/store/session-switcher'
 import { toggleStatusbarVisible } from '@/store/statusbar-prefs'
-import { openNewWindow } from '@/store/windows'
+import { isAuxiliaryWindow, openNewWindow } from '@/store/windows'
 import { useTheme } from '@/themes/context'
 
 import { requestComposerFocus, requestModelMenuToggle, requestVoiceToggle } from '../chat/composer/focus'
@@ -174,7 +174,7 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
   }
 
   handlersRef.current = {
-    'keybinds.openPanel': () => navigate(`${SETTINGS_ROUTE}?tab=keybinds`),
+    'keybinds.openPanel': () => !isAuxiliaryWindow() && navigate(`${SETTINGS_ROUTE}?tab=keybinds`),
 
     'composer.focus': () => requestComposerFocus('active'),
     // Toggle the composer pill's live model dropdown (pane under the pointer,
@@ -188,7 +188,7 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
 
     'nav.commandPalette': toggleCommandPalette,
     'nav.commandCenter': deps.toggleCommandCenter,
-    'nav.settings': () => navigate(SETTINGS_ROUTE),
+    'nav.settings': () => !isAuxiliaryWindow() && navigate(SETTINGS_ROUTE),
     'nav.profiles': () => navigate(PROFILES_ROUTE),
     'nav.skills': () => navigateToWorkspacePage(navigate, SKILLS_ROUTE),
     'nav.messaging': () => navigateToWorkspacePage(navigate, MESSAGING_ROUTE),
@@ -227,14 +227,18 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     // terminal there. The single "secondary panel" toggle.
     'view.toggleRightSidebar': () =>
       layoutHasRootSide('right') ? toggleFileBrowserOpen() : togglePaneVisible('terminal'),
-    'view.toggleReview': toggleReview,
-    'view.toggleStatusbar': toggleStatusbarVisible,
+    'view.toggleReview': isAuxiliaryWindow() ? () => undefined : toggleReview,
+    'view.toggleStatusbar': isAuxiliaryWindow() ? () => undefined : toggleStatusbarVisible,
     'view.showFiles': showFiles,
     'view.toggleHud': () => toggleHud(hudTargetSessionId()),
-    'view.showTerminal': () => togglePaneVisible('terminal'),
+    'view.showTerminal': () => !isAuxiliaryWindow() && togglePaneVisible('terminal'),
     // Create first so the pane's open-effect ensure sees a non-empty set and
     // doesn't also spawn one — net effect is exactly one fresh terminal.
     'view.newTerminal': () => {
+      if (isAuxiliaryWindow()) {
+        return
+      }
+
       createTerminal()
       setTerminalTakeover(true)
     },
@@ -244,7 +248,7 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     'view.nextTerminal': () => isPaneVisible('terminal') && cycleTerminal(1),
     'view.prevTerminal': () => isPaneVisible('terminal') && cycleTerminal(-1),
     'view.closeTerminal': () => isPaneVisible('terminal') && closeActiveTerminal(),
-    'view.flipPanes': togglePanesFlipped,
+    'view.flipPanes': isAuxiliaryWindow() ? () => undefined : togglePanesFlipped,
     // ⌘W: close the focused tab (terminal / preview target / zone tree tab).
     // On the main tab with session tabs stacked, it shifts the next one in —
     // the loader navigates to that session's route (loads it into main). On
