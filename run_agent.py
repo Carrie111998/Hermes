@@ -6496,6 +6496,27 @@ class AIAgent:
         from agent.codex_runtime import run_codex_app_server_turn
         return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
 
+# Set by cli_main() once argv has been handed to fire, so the guard at the top
+# of main() does not re-enter fire on the call fire itself makes.
+_CLI_DISPATCHED = False
+
+
+def _called_with_defaults(bound: dict) -> bool:
+    """True when every parameter of main() is still at its declared default.
+
+    Distinguishes the console-script shim's bare ``main()`` from a programmatic
+    ``main(query=...)``. Without it, any caller running inside a host process
+    whose argv carries unrelated flags (pytest, a wrapper script) would have
+    those flags handed to fire and parsed as agent options.
+    """
+    import inspect
+
+    return all(
+        name in bound and bound[name] == param.default
+        for name, param in inspect.signature(main).parameters.items()
+    )
+
+
 def main(
     query: str = None,
     model: str = "",
@@ -6532,6 +6553,16 @@ def main(
     Toolset Examples:
         - "research": Web search, extract, crawl + vision tools
     """
+    # The `hermes-agent` console script is `run_agent:main`, and its generated
+    # shim calls `main()` with NO arguments -- so `fire.Fire(main)` below (which
+    # only runs under `python run_agent.py`) never sees argv. Without this,
+    # every flag was silently dropped and `--help` ran the demo query against
+    # the live API. Delegate bare-but-flagged invocations to fire, which builds
+    # usage from this signature. `_CLI_DISPATCHED` breaks the recursion: fire
+    # calls back in with parsed kwargs, and that call must not re-delegate.
+    if not _CLI_DISPATCHED and sys.argv[1:] and _called_with_defaults(locals()):
+        return cli_main()
+
     print("🤖 AI Agent with Tool Calling")
     print("=" * 50)
     
@@ -6710,6 +6741,18 @@ def main(
     print("\n👋 Agent execution completed!")
 
 
-if __name__ == "__main__":
+def cli_main():
+    """Console-script entry point: parse argv with fire, then call main().
+
+    Kept separate from `main()` so the latter stays a plain callable for
+    programmatic use. Sets `_CLI_DISPATCHED` so the argv guard at the top of
+    `main()` fires exactly once per process.
+    """
+    global _CLI_DISPATCHED
+    _CLI_DISPATCHED = True
     import fire
-    fire.Fire(main)
+    return fire.Fire(main)
+
+
+if __name__ == "__main__":
+    cli_main()
