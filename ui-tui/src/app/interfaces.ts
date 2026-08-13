@@ -7,6 +7,7 @@ import type {
   BillingCardInfo,
   BillingMutationResponse,
   BillingStateResponse,
+  GatewaySkin,
   SessionCloseResponse,
   SubscriptionPreviewResponse,
   SubscriptionStateResponse,
@@ -340,6 +341,10 @@ export interface UiState {
   showReasoning: boolean
   indicatorStyle: IndicatorStyle
   sid: null | string
+  /** The last gateway skin payload (null before the first gateway.ready).
+   *  Kept alongside the resolved `theme` so components can read skin data
+   *  that has no theme role (spinner verbs/faces, tool_emojis). */
+  skin: GatewaySkin | null
   status: string
   statusBar: StatusBarMode
   streaming: boolean
