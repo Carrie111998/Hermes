@@ -740,3 +740,18 @@ def test_unregister_live_transport_stops_delivery(capture):
     # No live transports left → fell back to stdio.
     assert json.loads(buf.getvalue())["params"]["type"] == "skin.changed"
 
+
+def test_should_reaffirm_yaml_skin_on_connect(server, tmp_path, monkeypatch):
+    """User YAML skins re-affirm; desktop built-ins and missing files do not."""
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setattr(server, "get_hermes_home_override", lambda: None)
+    (tmp_path / "skins").mkdir()
+    (tmp_path / "skins" / "mythos.yaml").write_text("name: mythos\ncolors:\n  background: '#111'\n")
+
+    assert server.should_reaffirm_yaml_skin_on_connect({"name": "mythos"}) is True
+    assert server.should_reaffirm_yaml_skin_on_connect({"name": "nous"}) is False
+    assert server.should_reaffirm_yaml_skin_on_connect({"name": "slate"}) is False
+    assert server.should_reaffirm_yaml_skin_on_connect({"name": "empire"}) is False  # no yaml
+    assert server.should_reaffirm_yaml_skin_on_connect({}) is False
+    assert server.should_reaffirm_yaml_skin_on_connect(None) is False
+
