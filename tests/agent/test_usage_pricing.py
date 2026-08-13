@@ -370,3 +370,24 @@ def test_normalize_usage_native_anthropic_no_cache_observability(caplog):
     assert result.input_tokens == 100
     assert result.cache_read_tokens == 50
     assert result.cache_write_tokens == 10
+def test_openrouter_reported_cost_helper():
+    """_openrouter_reported_cost reads usage.cost and guards bad values."""
+    from agent.conversation_loop import _openrouter_reported_cost
+
+    # OpenRouter returns the real charged amount in usage.cost.
+    resp = SimpleNamespace(usage=SimpleNamespace(cost=0.0142))
+    assert _openrouter_reported_cost(resp) == 0.0142
+
+    # Missing field -> None (caller falls back to estimate).
+    resp_nocost = SimpleNamespace(usage=SimpleNamespace(prompt_tokens=100))
+    assert _openrouter_reported_cost(resp_nocost) is None
+
+    # Non-numeric / NaN / negative -> None (defensive).
+    assert _openrouter_reported_cost(SimpleNamespace(usage=SimpleNamespace(cost="oops"))) is None
+    assert _openrouter_reported_cost(SimpleNamespace(usage=SimpleNamespace(cost=float("nan")))) is None
+    assert _openrouter_reported_cost(SimpleNamespace(usage=SimpleNamespace(cost=float("inf")))) is None
+    assert _openrouter_reported_cost(SimpleNamespace(usage=SimpleNamespace(cost=-1))) is None
+
+    # No usage at all -> None.
+    assert _openrouter_reported_cost(SimpleNamespace(usage=None)) is None
+    assert _openrouter_reported_cost(SimpleNamespace()) is None
