@@ -6,6 +6,8 @@ background reconnection (#31049).
 """
 
 import sys
+import types
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -54,3 +56,107 @@ class TestTelegramUnconfiguredNonRetryable:
         assert adapter.fatal_error_retryable is False
         assert adapter.fatal_error_code == "missing_dependency"
 
+
+def test_lazy_telegram_dependency_rebinds_type_handler(monkeypatch):
+    """Lazy PTB install must rebind every symbol used by handler registration."""
+
+    class FakeUpdate:
+        ALL_TYPES = object()
+
+    class FakeBot:
+        pass
+
+    class FakeMessage:
+        pass
+
+    class FakeInlineKeyboardButton:
+        pass
+
+    class FakeInlineKeyboardMarkup:
+        pass
+
+    class FakeLinkPreviewOptions:
+        pass
+
+    class FakeApplication:
+        pass
+
+    class FakeCommandHandler:
+        pass
+
+    class FakeCallbackQueryHandler:
+        pass
+
+    class FakeMessageHandler:
+        pass
+
+    class FakeTypeHandler:
+        pass
+
+    class FakeHTTPXRequest:
+        pass
+
+    telegram_pkg = types.ModuleType("telegram")
+    telegram_pkg.Update = FakeUpdate
+    telegram_pkg.Bot = FakeBot
+    telegram_pkg.Message = FakeMessage
+    telegram_pkg.InlineKeyboardButton = FakeInlineKeyboardButton
+    telegram_pkg.InlineKeyboardMarkup = FakeInlineKeyboardMarkup
+    telegram_pkg.LinkPreviewOptions = FakeLinkPreviewOptions
+
+    ext_mod = types.ModuleType("telegram.ext")
+    ext_mod.Application = FakeApplication
+    ext_mod.CommandHandler = FakeCommandHandler
+    ext_mod.CallbackQueryHandler = FakeCallbackQueryHandler
+    ext_mod.MessageHandler = FakeMessageHandler
+    ext_mod.TypeHandler = FakeTypeHandler
+    ext_mod.ContextTypes = types.SimpleNamespace(DEFAULT_TYPE=object)
+    ext_mod.filters = types.SimpleNamespace()
+
+    constants_mod = types.ModuleType("telegram.constants")
+    constants_mod.ParseMode = types.SimpleNamespace(MARKDOWN_V2="MarkdownV2")
+    constants_mod.ChatType = types.SimpleNamespace(
+        GROUP="group",
+        SUPERGROUP="supergroup",
+        CHANNEL="channel",
+        PRIVATE="private",
+    )
+
+    request_mod = types.ModuleType("telegram.request")
+    request_mod.HTTPXRequest = FakeHTTPXRequest
+
+    for name, module in {
+        "telegram": telegram_pkg,
+        "telegram.ext": ext_mod,
+        "telegram.constants": constants_mod,
+        "telegram.request": request_mod,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    from tools import lazy_deps
+
+    monkeypatch.setattr(lazy_deps, "ensure", lambda key, prompt=False: None)
+
+    monkeypatch.setattr(telegram_mod, "TELEGRAM_AVAILABLE", False)
+    monkeypatch.setattr(telegram_mod, "Update", Any)
+    monkeypatch.setattr(telegram_mod, "Bot", Any)
+    monkeypatch.setattr(telegram_mod, "Message", Any)
+    monkeypatch.setattr(telegram_mod, "InlineKeyboardButton", Any)
+    monkeypatch.setattr(telegram_mod, "InlineKeyboardMarkup", Any)
+    monkeypatch.setattr(telegram_mod, "LinkPreviewOptions", None)
+    monkeypatch.setattr(telegram_mod, "Application", Any)
+    monkeypatch.setattr(telegram_mod, "CommandHandler", Any)
+    monkeypatch.setattr(telegram_mod, "CallbackQueryHandler", Any)
+    monkeypatch.setattr(telegram_mod, "TypeHandler", Any)
+    monkeypatch.setattr(telegram_mod, "TelegramMessageHandler", Any)
+    monkeypatch.setattr(telegram_mod, "ContextTypes", Any)
+    monkeypatch.setattr(telegram_mod, "filters", None)
+    monkeypatch.setattr(telegram_mod, "ParseMode", None)
+    monkeypatch.setattr(telegram_mod, "ChatType", None)
+    monkeypatch.setattr(telegram_mod, "HTTPXRequest", Any)
+
+    assert telegram_mod.check_telegram_requirements() is True
+    assert telegram_mod.TELEGRAM_AVAILABLE is True
+    assert telegram_mod.TypeHandler is FakeTypeHandler
+    assert telegram_mod.Update is FakeUpdate
+    assert telegram_mod.TelegramMessageHandler is FakeMessageHandler
