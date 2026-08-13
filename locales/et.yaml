@@ -4,11 +4,11 @@
 approval:
   # CLI approval prompt -- shown when a dangerous command needs user review.
   dangerous_header: "⚠️  OHTLIK KÄSK: {description}"
-  choose_long:     "      [o]ühekordselt  |  [s]seansiks  |  [a]alati  |  [d]keeldu"
-  choose_short:    "      [o]ühekordselt  |  [s]seansiks  |  [d]keeldu"
+  choose_long:     "      [o]üks kord  |  [s]seansiks  |  [a]alati  |  [d]keeldu"
+  choose_short:    "      [o]üks kord  |  [s]seansiks  |  [d]keeldu"
   prompt_long:     "      Valik [o/s/a/D]: "
   prompt_short:    "      Valik [o/s/D]: "
-  choose_smart_deny: "      [o]ühekordselt  |  [d]keeldu"
+  choose_smart_deny: "      [o]üks kord  |  [d]keeldu"
   prompt_smart_deny: "      Valik [o/D]: "
   smart_deny_once_inputs: "o,once"
   smart_deny_deny_inputs: "d,deny"
