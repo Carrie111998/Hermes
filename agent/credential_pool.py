@@ -3653,9 +3653,14 @@ def _load_pool(provider: str, *, persist: bool) -> CredentialPool:
         changed = raw_needs_sanitization or raw_needs_auth_normalization or custom_changed
         changed |= _prune_stale_seeded_entries(entries, custom_sources)
     else:
-        singleton_changed, singleton_sources = _seed_from_singletons(
-            provider, entries, persist=persist
-        )
+        if persist:
+            # Preserve the established two-positional-argument call contract
+            # for normal loads; callers and test doubles rely on it.
+            singleton_changed, singleton_sources = _seed_from_singletons(provider, entries)
+        else:
+            singleton_changed, singleton_sources = _seed_from_singletons(
+                provider, entries, persist=False
+            )
         env_changed, env_sources = _seed_from_env(provider, entries)
         changed = (
             raw_needs_sanitization
