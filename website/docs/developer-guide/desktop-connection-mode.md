@@ -99,14 +99,22 @@ The key is absent for non-Desktop sessions, so those requests keep exactly the
 shape they have today. It is also omitted when the installed `mcp` SDK predates
 per-call metadata.
 
-Reading it with the Python SDK:
+Reading it with the Python SDK (FastMCP):
 
 ```python
+from mcp.server.fastmcp import Context, FastMCP
+
+server = FastMCP("file-delivery")
+
 MODE_KEY = "hermes-agent.nousresearch.com/desktop-connection-mode"
 
-@server.call_tool()
-async def handle(name: str, arguments: dict, context) -> list:
-    mode = (context.meta or {}).get(MODE_KEY)
+
+@server.tool()
+async def deliver(path: str, ctx: Context) -> str:
+    meta = ctx.request_context.meta
+    # The key is namespaced (slashes/dots), so it lands in the metadata
+    # model's extra fields rather than as a declared attribute.
+    mode = (meta.model_extra or {}).get(MODE_KEY) if meta is not None else None
     ...
 ```
 
