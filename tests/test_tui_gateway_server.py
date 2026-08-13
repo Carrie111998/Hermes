@@ -5485,8 +5485,8 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         server._run_prompt_submit("rid-a", "sid_a", session, "session-a-turn")
 
         assert nested_started.wait(timeout=5)
-        threads[0].join(timeout=5)
-        assert not threads[0].is_alive()
+        run_thread = session["_run_thread"]
+        assert run_thread.is_alive()
         # Membership, not order: the completion_queue is process-global, and
         # notification pollers leaked by earlier session.init tests in this
         # file legitimately steal-and-requeue foreign-session events (see
@@ -5507,6 +5507,9 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
                 continue
             queued[evt["session_id"]] = evt
         assert set(queued) == {"proc_batch_2", "proc_batch_3"}
+        release_nested.set()
+        run_thread.join(timeout=5)
+        assert not run_thread.is_alive()
     finally:
         release_nested.set()
         for thread in threads:
