@@ -84,6 +84,14 @@ class TestCompressNoOpRegistersIneffective:
             f"Expected ineffective_compression_count >= 1, got {comp._ineffective_compression_count}"
         )
 
+    def test_single_message_middle_is_not_automatic_content(self):
+        comp = _make_compressor(protect_first_n=3, protect_last_n=20)
+        messages = _build_session(2, words_per_turn=10)
+
+        # The protected head/tail leave only one message available to the
+        # compressor; replacing it with a summary is not useful progress.
+        assert comp.has_content_to_compress(messages) is False
+
 
     def test_two_no_ops_block_should_compress(self):
         """After 2 no-op compressions, should_compress returns False."""

@@ -226,6 +226,47 @@ class TestAdapterInit:
         assert captured["checkpoint_max_total_size_mb"] == 321
         assert captured["checkpoint_max_file_size_mb"] == 4
 
+    def test_create_agent_accepts_bounded_request_output_budget(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {"provider": "omlx", "base_url": "http://127.0.0.1:8000"},
+        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "Laguna-S-2.1-oQ4e-fast")
+        monkeypatch.setattr(
+            "gateway.run._load_gateway_config",
+            lambda: {"checkpoints": {"enabled": False}},
+        )
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_reasoning_config",
+            staticmethod(lambda: {"enabled": True}),
+        )
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        agent = adapter._create_agent(
+            session_id="bounded-contract",
+            model_options={
+                "max_output_tokens": 32_768,
+                "reasoning": {"enabled": False},
+                "enabled_toolsets": [],
+                "json_mode": True,
+            },
+        )
+
+        assert isinstance(agent, FakeAgent)
+        assert captured["max_tokens"] == 32_768
+        assert captured["reasoning_config"] == {"enabled": False}
+
 
 # ---------------------------------------------------------------------------
 # Auth checking
@@ -2865,4 +2906,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-

@@ -123,6 +123,20 @@ def test_default_false_hook_is_byte_identical_noop():
 
 
 
+def test_over_threshold_incompressible_floor_skips_noop_compaction():
+    """Token pressure alone must not invoke a compressor with no middle."""
+    compressor = _stub_compressor(threshold_tokens=1)
+    compressor.should_compress = lambda _tokens=None: True
+    compressor.has_content_to_compress = lambda _messages: False
+    agent = _make_agent(compressor)
+
+    ctx = _build(agent)
+
+    assert isinstance(ctx, TurnContext)
+    agent._compress_context.assert_not_called()
+    assert ctx.preflight_compression_blocked is False
+
+
 def test_true_engine_noop_does_not_defeat_retry_loop_blocking():
     """#64382 interplay: an engine pass that no-ops must not touch the
 

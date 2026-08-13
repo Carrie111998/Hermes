@@ -2018,29 +2018,34 @@ def _merge_anchor_into_user_message(target: dict, anchor: dict) -> None:
 
 
 def _insert_real_user_anchor(messages: list, anchor: dict) -> None:
-    """Insert the latest human turn without breaking role alternation."""
+    """Insert the latest human turn after the compaction handoff.
+
+    ``SUMMARY_PREFIX`` tells the model that the first user message after the
+    summary is the active task.  Inserting the anchor before an assistant-role
+    summary therefore makes the preserved objective explicitly historical and
+    leaves the resumed turn with no actionable user request.  This was the
+    source of post-compaction tool dithering: the model could see the work in
+    the summary, but was told not to act on it and had no user turn to answer.
+
+    Append after the retained tail whenever possible.  This is deliberately
+    simpler than trying to choose a slot among assistant/tool pairs: a new
+    user turn after a complete tool exchange is valid, and it remains after
+    the summary for both standalone and merged handoffs.  If the transcript
+    already ends in synthetic user scaffolding, merge the anchor into that
+    turn so strict role-alternating templates are not given adjacent users.
+    """
+
+    from agent.context_compressor import ContextCompressor
 
     def _role(msg: Any) -> Optional[str]:
         return msg.get("role") if isinstance(msg, dict) else None
 
-    # Preferred: the summary boundary — before the first assistant message
-    # not already preceded by a user turn. The left neighbour is then
-    # non-user by construction and the right neighbour is an assistant.
-    for index, message in enumerate(messages):
-        if _role(message) != "assistant":
-            continue
-        previous_role = _role(messages[index - 1]) if index > 0 else None
-        if previous_role != "user":
-            messages.insert(index, anchor)
-            return
-    # Every assistant is user-preceded (or there are none). Appending is
-    # safe whenever the transcript does not already end with a user turn.
+    # Appending is safe whenever the transcript does not already end with a
+    # user turn.  With a compaction summary present this is necessarily after
+    # the summary boundary, even when the summary was merged into a tail row.
     if not messages or _role(messages[-1]) != "user":
         messages.append(anchor)
         return
-    # The transcript ends with a user-role message and no slot avoids
-    # user/user adjacency.
-    from agent.context_compressor import ContextCompressor
 
     if ContextCompressor._is_context_summary_content(
         _message_text(messages[-1])

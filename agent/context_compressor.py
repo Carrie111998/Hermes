@@ -5661,7 +5661,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         """
         compress_start = self._align_boundary_forward(messages, self._protect_head_size(messages))
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
-        return compress_start < compress_end
+        # A one-message middle is not a useful automatic compaction unit: the
+        # summary envelope can be larger than the content it replaces. Wait
+        # for at least two complete messages so a compaction has a meaningful
+        # chance of reducing pressure rather than creating a larger summary
+        # and immediately re-triggering the same turn.
+        return compress_end - compress_start >= 2
 
     # ------------------------------------------------------------------
     # Main compression entry point
