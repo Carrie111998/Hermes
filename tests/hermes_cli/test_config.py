@@ -2036,8 +2036,6 @@ class TestCodexAppServerAutoConfig:
             assert raw["compression"]["codex_app_server_auto"] == "hermes"
 
 
-
-
 class TestHermesImprovedOperationalDefaults:
     """Operational defaults keep long-running gateway agents useful."""
 

@@ -915,3 +915,48 @@ class TestLoadTimeSnapshotSanitization:
         # Block marker appears exactly once, not nested
         assert snapshot.count("[BLOCKED:") == 1
         assert "Clean fact" in snapshot
+
+
+class TestMemoryArchive:
+    def test_replace_archives_superseded_entry(self, store, tmp_path):
+        store.add("memory", "Old durable fact")
+
+        result = store.replace("memory", "Old durable", "New durable fact")
+
+        assert result["success"] is True
+        assert "New durable fact" in store.memory_entries
+        archive = tmp_path / "MEMORY.archive.jsonl"
+        rows = [
+            json.loads(line)
+            for line in archive.read_text(encoding="utf-8").splitlines()
+        ]
+        assert rows[-1]["action"] == "replace"
+        assert rows[-1]["target"] == "memory"
+        assert rows[-1]["content"] == "Old durable fact"
+
+    def test_remove_archives_superseded_user_entry(self, store, tmp_path):
+        store.add("user", "User used to prefer terse replies")
+
+        result = store.remove("user", "terse replies")
+
+        assert result["success"] is True
+        archive = tmp_path / "USER.archive.jsonl"
+        rows = [
+            json.loads(line)
+            for line in archive.read_text(encoding="utf-8").splitlines()
+        ]
+        assert rows[-1]["action"] == "remove"
+        assert rows[-1]["target"] == "user"
+        assert rows[-1]["content"] == "User used to prefer terse replies"
+
+    def test_failed_batch_does_not_archive(self, store, tmp_path):
+        store.add("memory", "Fact A")
+
+        result = store.apply_batch("memory", [
+            {"action": "remove", "old_text": "Fact A"},
+            {"action": "remove", "old_text": "missing"},
+        ])
+
+        assert result["success"] is False
+        assert "Fact A" in store.memory_entries
+        assert not (tmp_path / "MEMORY.archive.jsonl").exists()
