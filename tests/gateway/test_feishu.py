@@ -570,6 +570,35 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(routed.message_id, "om_outbound_bot_msg")
         self.assertIsNone(trusted_source_message_id(routed))
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_card_action_synthetic_command_has_untrusted_source_identity(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import trusted_source_message_id
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "u_human", "user_name": "Human", "user_id_alt": None}
+        )
+        adapter.get_chat_info = AsyncMock(return_value={"name": "Test Chat"})
+        adapter._handle_message_with_guards = AsyncMock()
+
+        event = SimpleNamespace(
+            token="tok_card_action",
+            context=SimpleNamespace(open_chat_id="oc_chat"),
+            operator=SimpleNamespace(open_id="ou_human"),
+            action=SimpleNamespace(tag="button", value={"ticket": "123"}),
+        )
+
+        asyncio.run(adapter._handle_card_action_event(SimpleNamespace(event=event)))
+
+        handler = adapter._handle_message_with_guards
+        getattr(handler, "assert_awaited_once")()
+        routed = getattr(handler, "await_args").args[0]
+        self.assertEqual(routed.message_id, "tok_card_action")
+        self.assertTrue(routed.text.startswith("/card button"))
+        self.assertIsNone(trusted_source_message_id(routed))
+
 
     def test_per_group_allowlist_policy_gates_by_sender(self):
         from gateway.config import PlatformConfig
