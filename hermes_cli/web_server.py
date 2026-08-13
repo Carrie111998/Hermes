@@ -6287,6 +6287,16 @@ def get_model_info(profile: Optional[str] = None):
         if not model_name:
             return dict(_EMPTY_MODEL_INFO, provider=provider)
 
+        # ``model.base_url`` is only set by configs that pin an endpoint at the
+        # top level; the keyed ``providers`` schema puts the URL on the provider
+        # entry instead. Resolve it, because every per-model lookup below is
+        # matched BY BASE URL and does nothing without one.
+        if not base_url:
+            providers_cfg = cfg.get("providers")
+            entry = providers_cfg.get(provider) if isinstance(providers_cfg, dict) else None
+            if isinstance(entry, dict):
+                base_url = str(entry.get("api") or entry.get("base_url") or "")
+
         # Resolve auto-detected context length (pass config_ctx=None to get
         # purely auto-detected value, then separately report the override)
         try:
@@ -6303,6 +6313,27 @@ def get_model_info(profile: Optional[str] = None):
         config_ctx_int = 0
         if isinstance(config_ctx, int) and config_ctx > 0:
             config_ctx_int = config_ctx
+        else:
+            # Per-provider declaration is still a configured override, just
+            # written in the keyed schema: ``providers.<name>.models.<model>.
+            # context_length``. Reading only the top-level ``model.context_length``
+            # left this reporting the auto-detected value as effective, so a
+            # model declared at 1M was published — and rendered — as the
+            # resolution chain's 256K fallback.
+            try:
+                from hermes_cli.config import (
+                    get_compatible_custom_providers,
+                    get_custom_provider_context_length,
+                )
+                declared = get_custom_provider_context_length(
+                    model=model_name,
+                    base_url=base_url,
+                    custom_providers=get_compatible_custom_providers(cfg),
+                )
+                if isinstance(declared, int) and declared > 0:
+                    config_ctx_int = declared
+            except Exception:
+                pass
 
         # Effective is what the agent actually uses
         effective_ctx = config_ctx_int if config_ctx_int > 0 else auto_ctx

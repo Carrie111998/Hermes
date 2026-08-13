@@ -662,7 +662,7 @@ def _effective_context_length() -> int:
     requested profile.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import get_compatible_custom_providers, load_config
 
         cfg = load_config()
         model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
@@ -672,12 +672,46 @@ def _effective_context_length() -> int:
 
         from agent.model_metadata import get_model_context_length
 
+        model = model_cfg.get("default") or model_cfg.get("name") or ""
+        provider = model_cfg.get("provider", "") or ""
+
+        # ``model.base_url`` is only set by configs that pin an endpoint at the
+        # top level. The keyed ``providers`` schema puts it on the provider
+        # entry instead, and this deployment's does: ``model:`` carries only
+        # ``default: normal`` and ``provider: 9router``, while the URL and the
+        # per-model ``context_length: 1000000`` live under
+        # ``providers.9router``. Resolve the endpoint before asking for the
+        # window, because the custom-provider lookup inside
+        # ``get_model_context_length`` matches entries BY BASE URL and silently
+        # does nothing without one.
+        custom_providers = get_compatible_custom_providers(cfg)
+        base_url = model_cfg.get("base_url", "") or ""
+        if not base_url:
+            providers = cfg.get("providers")
+            entry = providers.get(provider) if isinstance(providers, dict) else None
+            if isinstance(entry, dict):
+                base_url = str(entry.get("api") or entry.get("base_url") or "")
+        if not base_url:
+            for entry in custom_providers:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("name") or entry.get("provider_key") or "")
+                if name.strip().lower() == provider.strip().lower():
+                    base_url = str(entry.get("base_url") or "")
+                    break
+
+        # Threading ``custom_providers`` is what makes the declared per-model
+        # window win. Without it (and without the base URL above) an alias no
+        # public registry knows — every 9router combo is one — probed, missed,
+        # and fell through to the chain's 256K default, so a 1M model reported
+        # a 256K window on /api/model/info and in every context breakdown.
         return int(
             get_model_context_length(
-                model=model_cfg.get("default") or model_cfg.get("name") or "",
-                base_url=model_cfg.get("base_url", ""),
-                provider=model_cfg.get("provider", ""),
+                model=model,
+                base_url=base_url,
+                provider=provider,
                 config_context_length=None,
+                custom_providers=custom_providers,
             )
             or 0
         )
