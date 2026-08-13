@@ -170,6 +170,7 @@ export interface SystemBatteryResponse {
 export interface SessionCreateResponse {
   info?: SessionInfo & { config_warning?: string; credential_warning?: string }
   session_id: string
+  stored_session_id?: null | string
 }
 
 export interface SessionResumeResponse {

@@ -26,6 +26,31 @@ from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
+def test_set_session_env_binds_durable_id_and_authoritative_cwd(monkeypatch, tmp_path):
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionContext
+    from tools.terminal_tool import clear_session_cwd, record_session_cwd
+
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    context = SessionContext(
+        source=_make_source(),
+        connected_platforms=[],
+        home_channels={},
+        session_key="route-key",
+        session_id="durable-id",
+    )
+    record_session_cwd("durable-id", str(tmp_path))
+    try:
+        with patch("gateway.session_context.set_session_vars", return_value=[]) as set_vars:
+            runner._set_session_env(context)
+    finally:
+        clear_session_cwd("durable-id")
+
+    assert set_vars.call_args.kwargs["session_id"] == "durable-id"
+    assert set_vars.call_args.kwargs["cwd"] == str(tmp_path)
+
+
 def _make_source() -> SessionSource:
     return SessionSource(
         platform=Platform.TELEGRAM,
