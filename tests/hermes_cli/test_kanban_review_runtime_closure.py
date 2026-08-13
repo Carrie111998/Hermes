@@ -92,6 +92,23 @@ def _approval(candidate_sha: str) -> dict:
     }
 
 
+def _record_approval_receipts(
+    conn, task_id: str, run_id: int, candidate_sha: str
+) -> None:
+    for field, value in _approval(candidate_sha).items():
+        if field == "candidate_sha":
+            continue
+        assert kb.record_review_evidence(
+            conn,
+            task_id,
+            approval_field=field,
+            candidate_sha=candidate_sha,
+            evidence_ref=value["evidence_ref"],
+            evidence=f"verified {field}",
+            expected_run_id=run_id,
+        ) is not None
+
+
 def test_guarded_review_persists_roles_candidate_and_full_lifecycle(conn) -> None:
     task_id = _guarded_task(conn)
     created = kb.get_task(conn, task_id)
@@ -141,6 +158,9 @@ def test_guarded_review_persists_roles_candidate_and_full_lifecycle(conn) -> Non
     assert repair.review_cycle == 1
 
     repaired_review = _request_review(conn, task_id, SHA_2)
+    _record_approval_receipts(
+        conn, task_id, repaired_review.current_run_id, SHA_2
+    )
     assert kb.complete_task(
         conn,
         task_id,
@@ -243,12 +263,59 @@ def test_candidate_sha_is_preserved_and_compared_exactly(conn) -> None:
         approved_candidate_sha=candidate_sha.lower(),
         expected_run_id=review.current_run_id,
     )
+    _record_approval_receipts(conn, task_id, review.current_run_id, candidate_sha)
     assert kb.complete_task(
         conn,
         task_id,
         summary="exact evidence approved",
         metadata=_approval(candidate_sha),
         approved_candidate_sha=candidate_sha,
+        expected_run_id=review.current_run_id,
+    )
+
+
+def test_guarded_completion_rejects_fabricated_or_wrong_run_evidence_refs(
+    conn,
+) -> None:
+    task_id = _guarded_task(conn, key="receipt-resolution")
+    review = _request_review(conn, task_id, SHA_1)
+    approval = _approval(SHA_1)
+
+    assert not kb.complete_task(
+        conn,
+        task_id,
+        summary="caller fabricated plausible evidence refs",
+        metadata=approval,
+        approved_candidate_sha=SHA_1,
+        expected_run_id=review.current_run_id,
+    )
+
+    for field, value in approval.items():
+        if field == "candidate_sha":
+            continue
+        assert kb.record_review_evidence(
+            conn,
+            task_id,
+            approval_field=field,
+            candidate_sha=SHA_1,
+            evidence_ref=value["evidence_ref"],
+            evidence=f"reviewed {field}",
+            expected_run_id=review.current_run_id,
+        ) is not None
+
+    event = [
+        item for item in kb.list_events(conn, task_id)
+        if item.kind == "review_evidence" and item.payload["approval_field"] == "ci"
+    ][-1]
+    assert event.run_id == review.current_run_id
+    assert event.payload["candidate_sha"] == SHA_1
+    assert event.payload["evidence_ref"] == approval["ci"]["evidence_ref"]
+    assert kb.complete_task(
+        conn,
+        task_id,
+        summary="durable current-run receipts resolved",
+        metadata=approval,
+        approved_candidate_sha=SHA_1,
         expected_run_id=review.current_run_id,
     )
 

@@ -14,7 +14,7 @@ Hermes Kanban is a durable task board, shared across all your Hermes profiles, t
 
 The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
 
-- **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_heartbeat`, `kanban_progress`, `kanban_factory_land`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
+- **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_heartbeat`, `kanban_progress`, `kanban_factory_land`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_link`, `kanban_unblock`. The dispatcher gives each worker the task-appropriate subset; `kanban_factory_land` is visible only to the active canonical implementer of a guarded factory card. Orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
 - **You (and scripts, and cron) drive the board through `hermes kanban …`** on the CLI, `/kanban …` as a slash command, or the dashboard. These are for humans and automation — the places without a tool-calling model behind them.
 
 Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
@@ -281,6 +281,11 @@ The project must already have a primary Git repository. Hermes creates one
 worktree-backed card and reuses the existing permanent idempotency key on
 replay. The executor must request review with the full candidate SHA. The
 verifier can approve only that exact candidate from its active review run.
+Before approval, the verifier records separate `provider_review`, `ci`,
+`protected_merge`, `default_branch_containment`, and `cleanup` receipts with
+`kanban_progress`. `kanban_complete` resolves every supplied `evidence_ref`
+against a durable event from the same task, candidate, and active review run;
+caller-authored reference strings alone are not evidence.
 The first two change requests return the same card to its canonical executor;
 a third finding blocks it as `recovery_exhausted` and emits one final operations
 receipt. Existing tasks keep their original permissive lifecycle.
@@ -290,7 +295,9 @@ the existing pull request, remote branch, and CI checks, refuses any mismatched
 candidate, performs only an effect proven absent, and writes a run-fenced progress
 receipt keyed to that exact external effect. Retrying after a crash therefore
 adopts the existing branch/PR and backfills at most one receipt instead of pushing
-or opening a duplicate.
+or opening a duplicate. The task/run/claim fence is re-read immediately before
+each `git push` and `gh pr create`, so a reclaimed executor cannot mutate the
+provider after losing ownership.
 
 ### Bulk CLI verbs
 
@@ -334,11 +341,11 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_list` | List task summaries with filters for `assignee`, `status`, `tenant`, archived visibility, and limit. Intended for orchestrators discovering board work. | — |
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
 | `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
-| `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
+| `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. Guarded cards also require `reason_code`, `finding_ids`, `evidence_refs`, `rejected_candidate_sha`, and `required_corrections`. | `reason` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (implementation blockers), or `authority`/`integrity` (genuine human review escalations). An active review run accepts dependency wait plus authority/integrity; every other kind is rejected with an instruction to use `kanban_request_changes` for routine findings. Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
-| `kanban_progress` | Record one concrete, run-fenced useful-progress receipt. Heartbeats do not advance this clock. | `evidence` |
-| `kanban_factory_land` | Guarded implementers reconcile exact GitHub branch, PR, and CI state with idempotent external-effect receipts. | `candidate_sha`, `title` |
+| `kanban_progress` | Record one concrete, run-fenced useful-progress receipt. Guarded reviewers add `approval_field`, `candidate_sha`, and `evidence_ref` for field-specific approval evidence. Heartbeats do not advance this clock. | `evidence` |
+| `kanban_factory_land` | The active canonical guarded implementer reconciles exact GitHub branch, PR, and CI state with idempotent external-effect receipts. Ordinary workers do not receive this schema. | `candidate_sha`, `title` |
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
 | `kanban_attach_url` | Attach a file to a task by URL. | `url` |
@@ -1251,6 +1258,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 |---|---|---|
 | `spawned` | `{pid}` | Dispatcher successfully started a worker process. |
 | `heartbeat` | `{note?}` | Worker called `hermes kanban heartbeat $TASK` to signal liveness during long operations. |
+| `review_evidence` | `{approval_field, candidate_sha, evidence_ref, evidence, seq}` | An active guarded reviewer recorded one field-specific approval receipt. Completion accepts it only from the same task, candidate, and review run. |
 | `reclaimed` | `{stale_lock}` | Claim TTL expired without a completion; task goes back to `ready`. |
 | `crashed` | `{pid, claimer}` | Worker PID no longer alive but TTL hadn't expired yet. |
 | `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | `max_runtime_seconds` exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. |

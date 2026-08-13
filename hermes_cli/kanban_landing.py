@@ -16,6 +16,7 @@ from typing import Callable, Optional
 _FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 RunCommand = Callable[[list[str], Path], subprocess.CompletedProcess[str]]
 ProgressCallback = Callable[[str, str], object]
+LifecycleFenceCallback = Callable[[], object]
 
 
 class LandingError(RuntimeError):
@@ -32,6 +33,10 @@ def _default_run(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]
         check=False,
         timeout=120,
     )
+
+
+def _noop_lifecycle_fence() -> None:
+    return None
 
 
 def _checked(run: RunCommand, cwd: Path, args: list[str]) -> str:
@@ -119,6 +124,7 @@ def reconcile_github_landing(
     title: str,
     body: str = "",
     progress: Optional[ProgressCallback] = None,
+    before_mutation: LifecycleFenceCallback = _noop_lifecycle_fence,
     run: RunCommand = _default_run,
 ) -> dict:
     """Reconcile one exact candidate branch and pull request, then return facts.
@@ -166,6 +172,7 @@ def reconcile_github_landing(
             f"remote branch {branch} already points at a different candidate {remote_head}"
         )
     if not remote_head:
+        before_mutation()
         _checked(
             run,
             cwd,
@@ -190,6 +197,7 @@ def reconcile_github_landing(
     if len(rows) > 1:
         raise LandingError(f"multiple pull requests exist for branch {branch}; reconcile manually")
     if not rows:
+        before_mutation()
         url = _checked(
             run,
             cwd,

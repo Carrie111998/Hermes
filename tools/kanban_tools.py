@@ -141,6 +141,64 @@ def _check_kanban_board_admin_mode() -> bool:
     return _check_kanban_orchestrator_mode()
 
 
+def _active_guarded_factory_implementer(conn: Any, task_id: str) -> bool:
+    """Resolve factory landing authority from the live task and run rows."""
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+    claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    profile = os.environ.get("HERMES_PROFILE") or ""
+    try:
+        run_id = int(raw_run_id) if raw_run_id else None
+    except (TypeError, ValueError):
+        return False
+    row = conn.execute(
+        "SELECT status, current_run_id, claim_lock, review_required, assignee, "
+        "canonical_implementer FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if (
+        row is None
+        or row["status"] != "running"
+        or run_id is None
+        or row["current_run_id"] != run_id
+        or not claim_lock
+        or row["claim_lock"] != claim_lock
+        or not row["review_required"]
+        or not row["canonical_implementer"]
+        or row["assignee"] != row["canonical_implementer"]
+        or profile != row["canonical_implementer"]
+    ):
+        return False
+    active_run = conn.execute(
+        "SELECT profile, status, ended_at FROM task_runs "
+        "WHERE id = ? AND task_id = ?",
+        (run_id, task_id),
+    ).fetchone()
+    return bool(
+        active_run is not None
+        and active_run["profile"] == row["canonical_implementer"]
+        and active_run["status"] == "running"
+        and active_run["ended_at"] is None
+    )
+
+
+def _check_guarded_factory_mode() -> bool:
+    """Expose landing only to the active canonical guarded implementer."""
+    if _is_delegated_child_context() or not _is_dispatcher_owned_worker():
+        return False
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not task_id:
+        return False
+    conn = None
+    try:
+        _kb, conn = _connect(board=os.environ.get("HERMES_KANBAN_BOARD"))
+        return _active_guarded_factory_implementer(conn, task_id)
+    except Exception:
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -1310,6 +1368,28 @@ def _handle_progress(args: dict, **kw) -> str:
             fence_err = _enforce_worker_lifecycle_fence(conn, tid, "kanban_progress")
             if fence_err:
                 return fence_err
+            approval_keys = ("approval_field", "candidate_sha", "evidence_ref")
+            if any(args.get(key) is not None for key in approval_keys):
+                if not all(str(args.get(key) or "").strip() for key in approval_keys):
+                    return tool_error(
+                        "approval_field, candidate_sha, and evidence_ref are all "
+                        "required for guarded review evidence"
+                    )
+                event_id = kb.record_review_evidence(
+                    conn,
+                    tid,
+                    approval_field=str(args["approval_field"]),
+                    candidate_sha=str(args["candidate_sha"]),
+                    evidence_ref=str(args["evidence_ref"]),
+                    evidence=evidence,
+                    expected_run_id=_worker_run_id(tid),
+                )
+                if event_id is None:
+                    return tool_error(
+                        f"could not record guarded review evidence for {tid} "
+                        "(task, candidate, reviewer run, or lifecycle fence mismatch)"
+                    )
+                return _ok(task_id=tid, review_evidence_id=event_id)
             seq = kb.record_progress(
                 conn,
                 tid,
@@ -1352,14 +1432,7 @@ def _handle_factory_land(args: dict, **kw) -> str:
             if fence_err:
                 return fence_err
             task = kb.get_task(conn, tid)
-            profile = os.environ.get("HERMES_PROFILE") or ""
-            if (
-                task is None
-                or not task.review_required
-                or not task.canonical_implementer
-                or task.assignee != task.canonical_implementer
-                or profile != task.canonical_implementer
-            ):
+            if task is None or not _active_guarded_factory_implementer(conn, tid):
                 return tool_error(
                     "kanban_factory_land requires an active guarded factory task "
                     "owned by its canonical implementer"
@@ -1380,6 +1453,12 @@ def _handle_factory_land(args: dict, **kw) -> str:
                 if seq is None:
                     raise RuntimeError("worker lost its lifecycle fence while landing")
 
+            def _before_mutation() -> None:
+                if not _active_guarded_factory_implementer(conn, tid):
+                    raise RuntimeError(
+                        "worker lost its lifecycle fence while landing"
+                    )
+
             from hermes_cli.kanban_landing import reconcile_github_landing
 
             landing = reconcile_github_landing(
@@ -1389,6 +1468,7 @@ def _handle_factory_land(args: dict, **kw) -> str:
                 title=str(args.get("title") or ""),
                 body=str(args.get("body") or ""),
                 progress=_receipt,
+                before_mutation=_before_mutation,
             )
             return _ok(task_id=tid, landing=landing)
         finally:
@@ -2126,9 +2206,50 @@ KANBAN_COMPLETE_SCHEMA = {
                 "description": (
                     "Free-form dict of structured facts about this "
                     "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
-                    "\"findings\": [...]}. Surfaced to downstream "
-                    "workers alongside ``summary``."
+                    "\"findings\": [...]}. Guarded review approval requires "
+                    "candidate_sha plus provider_review, ci, protected_merge, "
+                    "default_branch_containment, and cleanup receipts. Surfaced "
+                    "to downstream workers alongside ``summary``."
                 ),
+                "properties": {
+                    "candidate_sha": {
+                        "type": "string",
+                        "description": "Exact candidate approved by the review run.",
+                    },
+                    **{
+                        field: {
+                            "type": "object",
+                            "description": (
+                                f"Guarded approval receipt for {field}; it must "
+                                "resolve to review evidence durably recorded by "
+                                "this active review run."
+                            ),
+                            "properties": {
+                                "candidate_sha": {
+                                    "type": "string",
+                                    "description": "Exact reviewed candidate SHA.",
+                                },
+                                "evidence_ref": {
+                                    "type": "string",
+                                    "maxLength": 1000,
+                                    "description": (
+                                        "Reference previously recorded with "
+                                        "kanban_progress for this approval field."
+                                    ),
+                                },
+                            },
+                            "required": ["candidate_sha", "evidence_ref"],
+                        }
+                        for field in (
+                            "provider_review",
+                            "ci",
+                            "protected_merge",
+                            "default_branch_containment",
+                            "cleanup",
+                        )
+                    },
+                },
+                "additionalProperties": True,
             },
             "result": {
                 "type": "string",
@@ -2329,26 +2450,40 @@ KANBAN_REQUEST_CHANGES_SCHEMA = {
             },
             "reason_code": {
                 "type": "string",
-                "description": "Stable finding class code for guarded review cards.",
+                "description": (
+                    "Stable finding class code; required for guarded review cards."
+                ),
             },
             "finding_ids": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Stable finding identifiers for guarded review cards.",
+                "description": (
+                    "Stable finding identifiers; non-empty and required for guarded "
+                    "review cards."
+                ),
             },
             "evidence_refs": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Concrete evidence references for guarded review cards.",
+                "description": (
+                    "Concrete evidence references; non-empty and required for "
+                    "guarded review cards."
+                ),
             },
             "rejected_candidate_sha": {
                 "type": "string",
-                "description": "Exact candidate SHA rejected by this review.",
+                "description": (
+                    "Exact candidate SHA rejected by this review; required for "
+                    "guarded review cards."
+                ),
             },
             "required_corrections": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Specific corrections required before re-review.",
+                "description": (
+                    "Specific corrections required before re-review; non-empty and "
+                    "required for guarded review cards."
+                ),
             },
             "board": _board_schema_prop(),
         },
@@ -2389,7 +2524,10 @@ KANBAN_PROGRESS_SCHEMA = {
     "description": (
         "Record one concrete work-progress receipt for the current run. "
         "Unlike kanban_heartbeat, this advances the stale-recovery progress "
-        "clock and therefore requires specific, externally checkable evidence."
+        "clock and therefore requires specific, externally checkable evidence. "
+        "During guarded review, set approval_field, candidate_sha, and "
+        "evidence_ref together to create a durable field-specific receipt that "
+        "kanban_complete can resolve in this exact review run."
     ),
     "parameters": {
         "type": "object",
@@ -2400,6 +2538,32 @@ KANBAN_PROGRESS_SCHEMA = {
                 "description": (
                     "Specific completed change or verification, such as a test "
                     "result, artifact checksum, commit, or durable state transition."
+                ),
+            },
+            "approval_field": {
+                "type": "string",
+                "enum": [
+                    "provider_review",
+                    "ci",
+                    "protected_merge",
+                    "default_branch_containment",
+                    "cleanup",
+                ],
+                "description": (
+                    "Guarded approval field verified by this receipt. When set, "
+                    "candidate_sha and evidence_ref are also required."
+                ),
+            },
+            "candidate_sha": {
+                "type": "string",
+                "description": "Exact candidate verified by this review receipt.",
+            },
+            "evidence_ref": {
+                "type": "string",
+                "maxLength": 1000,
+                "description": (
+                    "Stable reference the same review run will place in the "
+                    "matching kanban_complete metadata approval field."
                 ),
             },
             "board": _board_schema_prop(),
@@ -2945,7 +3109,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_FACTORY_LAND_SCHEMA,
     handler=_handle_factory_land,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_guarded_factory_mode,
     emoji="🚀",
 )
 

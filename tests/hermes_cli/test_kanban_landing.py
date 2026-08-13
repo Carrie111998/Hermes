@@ -123,6 +123,37 @@ def test_landing_reconciles_before_mutation_and_resumes_without_duplicates(tmp_p
     assert sum(1 for call in runner.calls if call[:3] == ("git", "push", "origin")) == 1
 
 
+def test_landing_fences_immediately_before_each_external_mutation(
+    tmp_path: Path,
+) -> None:
+    runner = ScriptedRunner()
+    timeline: list[str] = []
+
+    def traced_run(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+        timeline.append("command:" + " ".join(args[:3]))
+        return runner(args, cwd)
+
+    def fence() -> None:
+        timeline.append("fence")
+        if timeline.count("fence") == 2:
+            raise RuntimeError("stale factory executor")
+
+    with pytest.raises(RuntimeError, match="stale factory executor"):
+        reconcile_github_landing(
+            tmp_path,
+            branch="factory/task",
+            candidate_sha=CANDIDATE,
+            title="Ship exact candidate",
+            before_mutation=fence,
+            run=traced_run,
+        )
+
+    push_index = timeline.index("command:git push origin")
+    assert timeline[push_index - 1] == "fence"
+    assert timeline[-1] == "fence"
+    assert not any(call[:3] == ("gh", "pr", "create") for call in runner.calls)
+
+
 def test_landing_backfills_receipts_for_preexisting_provider_effects(tmp_path: Path) -> None:
     runner = ScriptedRunner(
         remote_head=CANDIDATE,

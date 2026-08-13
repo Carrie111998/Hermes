@@ -31,7 +31,7 @@ Do not use it for a separate downstream review card. A downstream card is ordina
 ## Prerequisites
 
 - A Kanban worker context with the current task and run identifiers.
-- Native Kanban tools: `kanban_show`, `kanban_comment`, `kanban_complete`, `kanban_request_changes`, and `kanban_block`.
+- Native Kanban tools: `kanban_show`, `kanban_progress`, `kanban_comment`, `kanban_complete`, `kanban_request_changes`, and `kanban_block`.
 - Workspace access through `read_file`, `search_files`, and `terminal` when the deliverable is code.
 - The task's original specification, acceptance criteria, handoff summary, and prior run history must be available through `kanban_show`.
 
@@ -50,7 +50,7 @@ This skill is loaded automatically by the review dispatcher. Start with `kanban_
 |---|---|---|
 | Approve | Acceptance criteria and verification pass | `kanban_complete` |
 | Request changes | Correctable implementation defects remain | `kanban_comment`, then `kanban_request_changes` |
-| Escalate | Human authority or integrity judgment is required | `kanban_block(kind="authority" | "integrity")` |
+| Escalate | Human authority or integrity judgment is required | `kanban_block` with `kind="authority"` or `kind="integrity"` |
 
 A requested-changes transition returns the task to its original implementer. When that implementer requests review again without naming a reviewer, the persisted reviewer provenance routes the re-review back to the same reviewer profile.
 
@@ -111,13 +111,51 @@ For non-code work:
 Approve only when the acceptance criteria are satisfied and the evidence is sufficient. Call:
 
 ```text
+kanban_progress(
+    evidence="Provider review approved the exact candidate.",
+    approval_field="provider_review",
+    candidate_sha="<full-candidate-sha>",
+    evidence_ref="provider-review:<durable-id>"
+)
+kanban_progress(
+    evidence="Required CI checks passed for the exact candidate.",
+    approval_field="ci",
+    candidate_sha="<full-candidate-sha>",
+    evidence_ref="provider-ci:<durable-id>"
+)
+kanban_progress(
+    evidence="Protected merge preserved the exact reviewed head.",
+    approval_field="protected_merge",
+    candidate_sha="<full-candidate-sha>",
+    evidence_ref="provider-merge:<durable-id>"
+)
+kanban_progress(
+    evidence="The default branch contains the exact candidate.",
+    approval_field="default_branch_containment",
+    candidate_sha="<full-candidate-sha>",
+    evidence_ref="default-branch:<durable-id>"
+)
+kanban_progress(
+    evidence="Required local branch/worktree cleanup was verified.",
+    approval_field="cleanup",
+    candidate_sha="<full-candidate-sha>",
+    evidence_ref="cleanup:<durable-id>"
+)
 kanban_complete(
     summary="Reviewed and approved. <what was verified>",
-    metadata={"review_outcome": "approved", "reviewer_checks": [...]}
+    approved_candidate_sha="<full-candidate-sha>",
+    metadata={
+        "candidate_sha": "<full-candidate-sha>",
+        "provider_review": {"candidate_sha": "<full-candidate-sha>", "evidence_ref": "provider-review:<durable-id>"},
+        "ci": {"candidate_sha": "<full-candidate-sha>", "evidence_ref": "provider-ci:<durable-id>"},
+        "protected_merge": {"candidate_sha": "<full-candidate-sha>", "evidence_ref": "provider-merge:<durable-id>"},
+        "default_branch_containment": {"candidate_sha": "<full-candidate-sha>", "evidence_ref": "default-branch:<durable-id>"},
+        "cleanup": {"candidate_sha": "<full-candidate-sha>", "evidence_ref": "cleanup:<durable-id>"}
+    }
 )
 ```
 
-Include the exact checks that passed and any bounded caveat that does not block acceptance.
+Each `evidence_ref` is a lookup key, not caller-authored proof. Record it first with `kanban_progress`; guarded completion resolves every field against a durable receipt from this task, candidate, and active review run. Include the exact checks that passed and any bounded caveat that does not block acceptance.
 
 #### Request changes
 
@@ -134,11 +172,16 @@ Then return the same task to its implementer:
 
 ```text
 kanban_request_changes(
-    reason="<concise summary of the required corrections>"
+    reason="<concise summary of the required corrections>",
+    reason_code="<stable-finding-class>",
+    finding_ids=["<stable-finding-id>"],
+    evidence_refs=["<concrete-evidence-reference>"],
+    rejected_candidate_sha="<full-candidate-sha>",
+    required_corrections=["<specific correction required before re-review>"]
 )
 ```
 
-State where the defect is, how it reproduces, why it violates the task, and what minimum outcome would resolve it. The transition does not use blocker recurrence accounting.
+All five structured fields shown above are required for guarded cards. State where the defect is, how it reproduces, why it violates the task, and what minimum outcome would resolve it. The transition does not use blocker recurrence accounting.
 
 #### Escalate
 

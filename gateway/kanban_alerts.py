@@ -718,7 +718,7 @@ class KanbanAlertNotifier:
             return
         if incident.key in self._state["recent"]:
             return
-        self._state["pending_transients"].setdefault(
+        entry = self._state["pending_transients"].setdefault(
             incident.key,
             {
                 **asdict(incident),
@@ -727,6 +727,7 @@ class KanbanAlertNotifier:
                 "last_attempt_at": 0.0,
             },
         )
+        entry["immutable_once"] = True
         self._save_state()
 
     def begin_startup_baseline(self) -> bool:
@@ -873,6 +874,8 @@ class KanbanAlertNotifier:
             if not delivery:
                 for key, entry in entries:
                     if int(entry.get("attempts") or 0) >= self.settings.max_delivery_attempts:
+                        if entry.get("immutable_once"):
+                            self._state["recent"][key] = self._now()
                         pending.pop(key, None)
                 continue
             batches_sent += 1

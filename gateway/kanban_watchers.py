@@ -496,6 +496,14 @@ class GatewayKanbanWatchersMixin:
                                         "events": events,
                                         "task": task,
                                         "board": slug,
+                                        # Keep the connection selector distinct
+                                        # from the display slug. A pinned
+                                        # HERMES_KANBAN_DB intentionally uses
+                                        # ``None`` here so follow-up cursor and
+                                        # unsubscribe writes return to that
+                                        # exact DB instead of resolving the
+                                        # active board by slug.
+                                        "connect_board": connect_board,
                                     })
                                 except Exception as sub_exc:
                                     # Isolate per-subscription failures so one
@@ -514,6 +522,7 @@ class GatewayKanbanWatchersMixin:
                     sub = d["sub"]
                     task = d["task"]
                     board_slug = d.get("board")
+                    connect_board = d.get("connect_board", board_slug)
                     platform_str = (sub["platform"] or "").lower()
                     try:
                         plat = _Platform(platform_str)
@@ -521,7 +530,7 @@ class GatewayKanbanWatchersMixin:
                         # Unknown platform string; skip and advance cursor so
                         # we don't replay forever.
                         await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
+                            self._kanban_advance, sub, d["cursor"], connect_board,
                         )
                         continue
                     sub_profile = sub.get("notifier_profile") or ""
@@ -545,7 +554,7 @@ class GatewayKanbanWatchersMixin:
                             sub,
                             d["cursor"],
                             d.get("old_cursor", 0),
-                            board_slug,
+                            connect_board,
                         )
                         continue
                     title = (task.title if task else sub["task_id"])[:120]
@@ -767,7 +776,7 @@ class GatewayKanbanWatchersMixin:
                                     "%s on %s after %d consecutive send failures",
                                     sub["task_id"], platform_str, fails,
                                 )
-                                await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+                                await asyncio.to_thread(self._kanban_unsub, sub, connect_board)
                                 sub_fail_counts.pop(sub_key, None)
                             else:
                                 await asyncio.to_thread(
@@ -775,7 +784,7 @@ class GatewayKanbanWatchersMixin:
                                     sub,
                                     d["cursor"],
                                     d.get("old_cursor", 0),
-                                    board_slug,
+                                    connect_board,
                                 )
                             # Rewind the pre-send claim on transient failure so
                             # a later tick can retry. After too many failures,
@@ -890,7 +899,7 @@ class GatewayKanbanWatchersMixin:
                                         "%s on %s after %d consecutive wake failures",
                                         sub["task_id"], platform_str, fails,
                                     )
-                                    await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+                                    await asyncio.to_thread(self._kanban_unsub, sub, connect_board)
                                     sub_fail_counts.pop(sub_key, None)
                                 else:
                                     # Rewind the pre-send claim so the next
@@ -901,7 +910,7 @@ class GatewayKanbanWatchersMixin:
                                         sub,
                                         d["cursor"],
                                         d.get("old_cursor", 0),
-                                        board_slug,
+                                        connect_board,
                                     )
                                 continue
 
@@ -990,7 +999,7 @@ class GatewayKanbanWatchersMixin:
                                         "%s on %s after %d consecutive wake failures",
                                         sub["task_id"], platform_str, fails,
                                     )
-                                    await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+                                    await asyncio.to_thread(self._kanban_unsub, sub, connect_board)
                                     sub_fail_counts.pop(sub_key, None)
                                 else:
                                     # Rewind the pre-send claim so the next
@@ -1001,7 +1010,7 @@ class GatewayKanbanWatchersMixin:
                                         sub,
                                         d["cursor"],
                                         d.get("old_cursor", 0),
-                                        board_slug,
+                                        connect_board,
                                     )
                                 continue
 
@@ -1011,7 +1020,7 @@ class GatewayKanbanWatchersMixin:
                         # mechanism — it prevents re-delivery of the same
                         # event on subsequent ticks.
                         await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
+                            self._kanban_advance, sub, d["cursor"], connect_board,
                         )
                         if not _is_push_adapter:
                             # Nothing left to deliver on this path (the wake,
@@ -1041,7 +1050,7 @@ class GatewayKanbanWatchersMixin:
                                 )
                         if task_terminal:
                             await asyncio.to_thread(
-                                self._kanban_unsub, sub, board_slug,
+                                self._kanban_unsub, sub, connect_board,
                             )
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
@@ -1646,6 +1655,7 @@ class GatewayKanbanWatchersMixin:
             total_by_profile: dict[str, int] = {}
             board_by_profile: dict[str, dict[str, int]] = {}
             if global_limit is not None or max_in_progress_per_profile is not None:
+                census_failed = False
                 for slug in slugs:
                     conn = None
                     try:
@@ -1665,11 +1675,20 @@ class GatewayKanbanWatchersMixin:
                                     total_by_profile.get(assignee, 0) + count
                                 )
                         board_by_profile[slug] = current
-                    except Exception:
-                        continue
+                    except Exception as exc:
+                        logger.error(
+                            "kanban dispatcher: cross-board running census failed "
+                            "on board %s (%s); spawning is disabled for this tick",
+                            slug,
+                            exc,
+                        )
+                        census_failed = True
+                        break
                     finally:
                         if conn is not None:
                             conn.close()
+                if census_failed:
+                    return []
             remaining: Optional[int] = None
             if global_limit is not None:
                 remaining = max(0, int(global_limit) - total_running)

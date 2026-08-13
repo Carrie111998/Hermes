@@ -6041,6 +6041,15 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+_GUARDED_APPROVAL_FIELDS = frozenset({
+    "provider_review",
+    "ci",
+    "protected_merge",
+    "default_branch_containment",
+    "cleanup",
+})
+
+
 def _guarded_review_completion_authorized(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6069,16 +6078,9 @@ def _guarded_review_completion_authorized(
         return False
     if not task["candidate_sha"] or approved_candidate_sha != task["candidate_sha"]:
         return False
-    required_approval_fields = {
-        "provider_review",
-        "ci",
-        "protected_merge",
-        "default_branch_containment",
-        "cleanup",
-    }
     if not isinstance(approval_metadata, dict):
         return False
-    for field in required_approval_fields:
+    for field in _GUARDED_APPROVAL_FIELDS:
         evidence = approval_metadata.get(field)
         if not isinstance(evidence, dict):
             return False
@@ -6113,9 +6115,35 @@ def _guarded_review_completion_authorized(
         )
     except (json.JSONDecodeError, TypeError):
         claimed_payload = {}
-    return (
+    if not (
         isinstance(claimed_payload, dict)
         and claimed_payload.get("source_status") == "review"
+    ):
+        return False
+
+    durable_receipts: set[tuple[str, str]] = set()
+    for event_row in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'review_evidence' ORDER BY id",
+        (task_id, run_id),
+    ).fetchall():
+        try:
+            payload = json.loads(event_row["payload"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("candidate_sha") == task["candidate_sha"]
+            and payload.get("approval_field") in _GUARDED_APPROVAL_FIELDS
+            and isinstance(payload.get("evidence_ref"), str)
+            and payload["evidence_ref"]
+        ):
+            durable_receipts.add(
+                (payload["approval_field"], payload["evidence_ref"])
+            )
+    return all(
+        (field, approval_metadata[field]["evidence_ref"]) in durable_receipts
+        for field in _GUARDED_APPROVAL_FIELDS
     )
 
 
@@ -9490,6 +9518,127 @@ def record_progress(
             run_id=run_id,
         )
     return seq
+
+
+def record_review_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    approval_field: str,
+    candidate_sha: str,
+    evidence_ref: str,
+    evidence: str,
+    expected_run_id: Optional[int],
+) -> Optional[int]:
+    """Persist one field-specific guarded-approval receipt for this review run."""
+    field = str(approval_field or "").strip()
+    candidate = str(candidate_sha or "").strip()
+    reference = str(redact_review_value(evidence_ref or "")).strip()
+    detail = str(redact_review_value(evidence or "")).strip()
+    if field not in _GUARDED_APPROVAL_FIELDS:
+        raise ValueError(
+            "approval_field must be one of "
+            + ", ".join(sorted(_GUARDED_APPROVAL_FIELDS))
+        )
+    if not reference:
+        raise ValueError("evidence_ref is required for guarded review evidence")
+    if len(reference) > 1000:
+        raise ValueError("evidence_ref must be at most 1000 characters")
+    if not detail:
+        raise ValueError("evidence is required for guarded review evidence")
+    if expected_run_id is None:
+        return None
+    try:
+        run_id = int(expected_run_id)
+    except (TypeError, ValueError):
+        return None
+
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status, current_run_id, review_required, reviewer_profile, "
+            "candidate_sha FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            task is None
+            or task["status"] != "running"
+            or task["current_run_id"] != run_id
+            or not task["review_required"]
+            or task["candidate_sha"] != candidate
+            or not task["reviewer_profile"]
+        ):
+            return None
+        active_run = conn.execute(
+            "SELECT profile, status, ended_at FROM task_runs "
+            "WHERE id = ? AND task_id = ?",
+            (run_id, task_id),
+        ).fetchone()
+        if (
+            active_run is None
+            or active_run["profile"] != task["reviewer_profile"]
+            or active_run["status"] != "running"
+            or active_run["ended_at"] is not None
+        ):
+            return None
+        claimed = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'claimed' ORDER BY id DESC LIMIT 1",
+            (task_id, run_id),
+        ).fetchone()
+        try:
+            claimed_payload = json.loads(claimed["payload"] or "{}") if claimed else {}
+        except (json.JSONDecodeError, TypeError):
+            claimed_payload = {}
+        if claimed_payload.get("source_status") != "review":
+            return None
+
+        for event_row in conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'review_evidence' ORDER BY id",
+            (task_id, run_id),
+        ).fetchall():
+            try:
+                payload = json.loads(event_row["payload"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if (
+                payload.get("approval_field") == field
+                and payload.get("candidate_sha") == candidate
+                and payload.get("evidence_ref") == reference
+            ):
+                return int(event_row["id"])
+
+        now = int(time.time())
+        cur = conn.execute(
+            "UPDATE tasks SET last_progress_at = ?, progress_seq = progress_seq + 1 "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+            (now, task_id, run_id),
+        )
+        if cur.rowcount != 1:
+            return None
+        progress_seq = int(
+            conn.execute(
+                "SELECT progress_seq FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()[0]
+        )
+        conn.execute(
+            "UPDATE task_runs SET last_progress_at = ?, progress_seq = ? WHERE id = ?",
+            (now, progress_seq, run_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "review_evidence",
+            {
+                "approval_field": field,
+                "candidate_sha": candidate,
+                "evidence_ref": reference,
+                "evidence": detail[:1000],
+                "seq": progress_seq,
+            },
+            run_id=run_id,
+        )
+        return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
 
 
 def enforce_max_runtime(

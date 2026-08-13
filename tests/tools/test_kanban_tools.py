@@ -108,6 +108,91 @@ def test_progress_handler_requires_concrete_evidence(worker_env):
     assert payload["error"] == "evidence is required"
 
 
+def test_progress_handler_records_run_fenced_guarded_review_receipt(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(type(tmp_path), "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    candidate = "e" * 40
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="review receipt",
+            assignee="executor",
+            review_required=True,
+            reviewer_profile="verifier",
+            canonical_implementer="executor",
+        )
+        implementation = kb.claim_task(conn, task_id, claimer="executor:test")
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="candidate ready",
+            metadata={
+                "candidate_sha": candidate,
+                "current_run_id": implementation.current_run_id,
+                "repository": "nousresearch/hermes-agent",
+                "branch": "factory/review-receipt",
+                "local_gates": ["focused-tests:pass"],
+            },
+            candidate_sha=candidate,
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="verifier:test")
+        assert review is not None
+
+    monkeypatch.setenv("HERMES_PROFILE", "verifier")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(review.claim_lock))
+    args = {
+        "evidence": "CI run 918 passed for the exact candidate",
+        "approval_field": "ci",
+        "candidate_sha": candidate,
+        "evidence_ref": "provider-ci:918",
+    }
+
+    payload = json.loads(kt._handle_progress(args))
+    assert payload["ok"] is True
+    assert payload["task_id"] == task_id
+    with kb.connect() as conn:
+        receipt = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "review_evidence"
+        ]
+        assert len(receipt) == 1
+        assert receipt[0].run_id == review.current_run_id
+        assert receipt[0].payload["approval_field"] == "ci"
+        assert kb.get_task(conn, task_id).progress_seq == 1
+
+    oversized = json.loads(
+        kt._handle_progress({**args, "evidence_ref": "r" * 1001})
+    )
+    assert "at most 1000 characters" in oversized["error"]
+    with kb.connect() as conn:
+        assert len([
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "review_evidence"
+        ]) == 1
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id + 1))
+    stale = json.loads(kt._handle_progress(args))
+    assert "stale worker lifecycle fence" in stale["error"]
+    with kb.connect() as conn:
+        assert len([
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "review_evidence"
+        ]) == 1
+
+
 def test_factory_landing_handler_reconciles_and_records_each_external_effect(
     monkeypatch, tmp_path
 ):
@@ -147,6 +232,7 @@ def test_factory_landing_handler_reconciles_and_records_each_external_effect(
         assert repository == repo
         assert kwargs["branch"] == "factory/task"
         assert kwargs["candidate_sha"] == candidate
+        kwargs["before_mutation"]()
         kwargs["progress"]("branch:factory/task", "pushed exact candidate")
         kwargs["progress"]("pr:42", "created pull request 42")
         kwargs["progress"]("branch:factory/task", "pushed exact candidate")
@@ -181,6 +267,69 @@ def test_factory_landing_handler_reconciles_and_records_each_external_effect(
         assert receipts == ["pushed exact candidate", "created pull request 42"]
 
 
+def test_factory_landing_handler_rechecks_lifecycle_before_mutation(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "executor")
+    monkeypatch.setattr(type(tmp_path), "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="race landing lifecycle",
+            assignee="executor",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            review_required=True,
+            reviewer_profile="verifier",
+            canonical_implementer="executor",
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="executor:test")
+        assert claimed is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(claimed.claim_lock))
+    mutations: list[str] = []
+
+    def fake_reconcile(repository, **kwargs):
+        with kb.connect() as race_conn, kb.write_txn(race_conn):
+            race_conn.execute(
+                "UPDATE tasks SET status = 'ready', current_run_id = NULL, "
+                "claim_lock = NULL WHERE id = ?",
+                (task_id,),
+            )
+        kwargs["before_mutation"]()
+        mutations.append("push")
+        return {}
+
+    monkeypatch.setattr(
+        "hermes_cli.kanban_landing.reconcile_github_landing", fake_reconcile
+    )
+    payload = json.loads(
+        kt._handle_factory_land(
+            {
+                "candidate_sha": "c" * 40,
+                "branch": "factory/task",
+                "title": "Must be fenced",
+            }
+        )
+    )
+
+    assert "lost its lifecycle fence" in payload["error"]
+    assert mutations == []
+
+
 def test_factory_landing_handler_rejects_non_guarded_task(worker_env):
     from tools import kanban_tools as kt
 
@@ -194,6 +343,51 @@ def test_factory_landing_handler_rejects_non_guarded_task(worker_env):
         )
     )
     assert "guarded factory task" in payload["error"]
+
+
+def test_factory_land_schema_is_visible_only_to_active_guarded_implementer(
+    worker_env, monkeypatch, tmp_path
+):
+    import tools.kanban_tools  # noqa: F401
+    from hermes_cli import kanban_db as kb
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    def visible_names() -> set[str]:
+        invalidate_check_fn_cache()
+        definitions = registry.get_definitions(
+            set(resolve_toolset("hermes-cli")), quiet=True
+        )
+        return {
+            item["function"]["name"]
+            for item in definitions
+            if "function" in item
+        }
+
+    assert "kanban_factory_land" not in visible_names()
+
+    guarded_repo = tmp_path / "guarded-repo"
+    guarded_repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(guarded_repo)], check=True)
+    with kb.connect() as conn:
+        guarded_id = kb.create_task(
+            conn,
+            title="guarded landing",
+            assignee="factory-executor",
+            workspace_kind="worktree",
+            workspace_path=str(guarded_repo),
+            review_required=True,
+            reviewer_profile="factory-reviewer",
+            canonical_implementer="factory-executor",
+        )
+        guarded = kb.claim_task(conn, guarded_id, claimer="factory-executor:test")
+        assert guarded is not None
+    monkeypatch.setenv("HERMES_PROFILE", "factory-executor")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", guarded_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(guarded.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(guarded.claim_lock))
+
+    assert "kanban_factory_land" in visible_names()
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):

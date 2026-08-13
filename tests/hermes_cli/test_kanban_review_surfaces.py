@@ -209,6 +209,48 @@ def test_review_tools_are_gated_and_visible_to_kanban_workers(
     assert "authority" in block_kinds
     assert "integrity" in block_kinds
 
+    complete_properties = tools.kanban_tools.KANBAN_COMPLETE_SCHEMA[
+        "parameters"
+    ]["properties"]
+    approval_properties = complete_properties["metadata"]["properties"]
+    assert set(approval_properties) >= {
+        "candidate_sha",
+        "provider_review",
+        "ci",
+        "protected_merge",
+        "default_branch_containment",
+        "cleanup",
+    }
+    for field in (
+        "provider_review",
+        "ci",
+        "protected_merge",
+        "default_branch_containment",
+        "cleanup",
+    ):
+        assert set(approval_properties[field]["properties"]) == {
+            "candidate_sha",
+            "evidence_ref",
+        }
+    progress_properties = tools.kanban_tools.KANBAN_PROGRESS_SCHEMA[
+        "parameters"
+    ]["properties"]
+    assert set(progress_properties) >= {
+        "approval_field",
+        "candidate_sha",
+        "evidence_ref",
+    }
+    changes_properties = tools.kanban_tools.KANBAN_REQUEST_CHANGES_SCHEMA[
+        "parameters"
+    ]["properties"]
+    assert set(changes_properties) >= {
+        "reason_code",
+        "finding_ids",
+        "evidence_refs",
+        "rejected_candidate_sha",
+        "required_corrections",
+    }
+
 
 def test_review_cli_round_trip_preserves_handoff(
     monkeypatch: pytest.MonkeyPatch,
@@ -349,6 +391,29 @@ def test_worker_guidance_distinguishes_same_card_and_downstream_review() -> None
     assert "kanban_request_changes" in skill_text
     assert "approve" in skill_text.lower()
     assert "escalate" in skill_text.lower()
+    assert "`kanban_block` with `kind=\"authority\"` or `kind=\"integrity\"`" in skill_text
+    for tool_name in (
+        "kanban_show",
+        "kanban_progress",
+        "kanban_complete",
+        "kanban_comment",
+        "kanban_request_changes",
+        "kanban_block",
+    ):
+        assert f"`{tool_name}`" in skill_text
+    for field in (
+        "provider_review",
+        "ci",
+        "protected_merge",
+        "default_branch_containment",
+        "cleanup",
+        "reason_code",
+        "finding_ids",
+        "evidence_refs",
+        "rejected_candidate_sha",
+        "required_corrections",
+    ):
+        assert field in skill_text
 
 
 def test_cli_reopen_review_is_transition_first_and_redacts_reason(

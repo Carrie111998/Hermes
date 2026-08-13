@@ -34,6 +34,55 @@ class FailingAdapter(RecordingAdapter):
         return SimpleNamespace(success=False)
 
 
+def test_queue_once_retry_exhaustion_creates_durable_tombstone(tmp_path):
+    adapter = FailingAdapter()
+    settings = KanbanAlertSettings(
+        enabled=True,
+        platform="buzz",
+        automation_channel="#alerts",
+        max_delivery_attempts=1,
+        retry_seconds=0,
+    )
+    notifier = KanbanAlertNotifier(
+        settings,
+        state_path=tmp_path / "once-state.json",
+        adapter_lookup=lambda platform, profile: adapter,
+        resolve_channel=lambda platform, name: "alerts-id",
+        lookup_channel_type=lambda platform, chat_id: "channel",
+        list_known_channels=lambda platform: [
+            {"id": "alerts-id", "name": "alerts", "type": "channel"}
+        ],
+    )
+    incident = KanbanAlertIncident(
+        key="immutable:event:42",
+        route="automation",
+        message="immutable receipt",
+    )
+
+    notifier.queue_once(incident)
+    asyncio.run(notifier.flush())
+    notifier.queue_once(incident)
+    asyncio.run(notifier.flush())
+
+    restarted = KanbanAlertNotifier(
+        settings,
+        state_path=tmp_path / "once-state.json",
+        adapter_lookup=lambda platform, profile: adapter,
+        resolve_channel=lambda platform, name: "alerts-id",
+        lookup_channel_type=lambda platform, chat_id: "channel",
+        list_known_channels=lambda platform: [
+            {"id": "alerts-id", "name": "alerts", "type": "channel"}
+        ],
+    )
+    restarted.queue_once(incident)
+    asyncio.run(restarted.flush())
+
+    assert adapter.sent == [("alerts-id", "immutable receipt")]
+    state = json.loads((tmp_path / "once-state.json").read_text(encoding="utf-8"))
+    assert "immutable:event:42" in state["recent"]
+    assert "immutable:event:42" not in state["pending_transients"]
+
+
 class SideEffectNegativeAckAdapter(RecordingAdapter):
     async def send(self, chat_id: str, content: str, metadata=None) -> object:
         self.sent.append((chat_id, content))
