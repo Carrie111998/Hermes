@@ -943,7 +943,7 @@ def cmd_sessions(args, sessions_parser=None):
             v for k, v in filters.items() if k != "older_than_days"
         ):
             print(
-                "Refusing to archive every ended session: pass at least one "
+                "Refusing to archive every session: pass at least one "
                 "filter (e.g. --newer-than 5h, --source cli, --title codex)."
             )
             return
@@ -957,6 +957,12 @@ def cmd_sessions(args, sessions_parser=None):
         else:
             filters["archived"] = False
 
+        list_candidates = (
+            db.list_archive_candidates
+            if action == "archive"
+            else db.list_prune_candidates
+        )
+
         # Pinned sessions are excluded by default from bulk prune/archive
         # (pin = durable keep). `prune --include-pinned` opts in; archive has
         # no such flag, so archive always spares pinned rows. Surface a count
@@ -964,11 +970,25 @@ def cmd_sessions(args, sessions_parser=None):
         _include_pinned = getattr(args, "include_pinned", False)
         filters["include_pinned"] = _include_pinned
         _count_matches = getattr(db, "count_prune_matches", None)
-        if not _include_pinned and callable(_count_matches):
+        if not _include_pinned and (
+            action == "archive" or callable(_count_matches)
+        ):
             _base = {k: v for k, v in filters.items() if k != "include_pinned"}
             try:
-                _with_pinned = int(_count_matches(**_base, include_pinned=True))
-                _without_pinned = int(_count_matches(**_base, include_pinned=False))
+                if action == "archive":
+                    _with_pinned = len(
+                        list_candidates(**_base, include_pinned=True)
+                    )
+                    _without_pinned = len(
+                        list_candidates(**_base, include_pinned=False)
+                    )
+                else:
+                    _with_pinned = int(
+                        _count_matches(**_base, include_pinned=True)
+                    )
+                    _without_pinned = int(
+                        _count_matches(**_base, include_pinned=False)
+                    )
                 _pinned_skipped = max(_with_pinned - _without_pinned, 0)
             except TypeError:
                 # A db double without include_pinned support — skip the note.
@@ -987,8 +1007,7 @@ def cmd_sessions(args, sessions_parser=None):
                     f"these filters but will NOT be {_verb_word} (pin is a keep "
                     f"flag). {_optin}"
                 )
-
-        candidates = db.list_prune_candidates(**filters)
+        candidates = list_candidates(**filters)
         # Archive expands each selected row to its compression lineage, which
         # can include open continuations; a direct-open count would therefore
         # describe the eventual archive effect inaccurately.
