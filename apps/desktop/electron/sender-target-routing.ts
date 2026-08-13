@@ -79,6 +79,33 @@ export function resolveSenderTarget(
   }
 }
 
+/**
+ * Resolve the target for a newly-created session/HUD window. The selected
+ * transcript owner may intentionally differ from the opener target, but main
+ * converts that validated profile into a BackendTarget before the child boots.
+ */
+export function resolveSessionOwnerTarget(
+  openerTarget: BackendTarget,
+  ownerProfile: null | string | undefined,
+  primaryProfile: string
+): BackendTarget {
+  const owner = typeof ownerProfile === 'string' ? ownerProfile.trim() : ''
+
+  if (!owner) {
+    return openerTarget
+  }
+
+  if (openerTarget.kind !== 'primary' && openerTarget.profile === owner) {
+    return openerTarget
+  }
+
+  if (owner === primaryProfile) {
+    return makeBackendTarget({ kind: 'primary' })
+  }
+
+  return makeBackendTarget({ kind: 'configured-profile', profile: owner })
+}
+
 interface SenderRequest {
   body?: unknown
   method?: unknown

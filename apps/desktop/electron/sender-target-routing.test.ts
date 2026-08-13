@@ -7,6 +7,7 @@ import {
   decideProfileSessionsRoute,
   resolveSenderRequestTarget,
   resolveSenderTarget,
+  resolveSessionOwnerTarget,
   scopedSidebarPathForTarget,
   scopeSidebarResponseForTarget,
   sessionProfileForTarget
@@ -27,6 +28,37 @@ import {
 // ---------------------------------------------------------------------------
 
 // A primary-bound window behaves as the default: no binding.
+
+test('session owner preserves the opener route when it already owns that profile', () => {
+  const forced = makeBackendTarget({ kind: 'forced-local-profile', profile: 'worker' })
+
+  assert.deepEqual(resolveSessionOwnerTarget(forced, 'worker', 'default'), forced)
+})
+
+test('session owner uses primary only for the frozen primary profile', () => {
+  const primary = makeBackendTarget({ kind: 'primary' })
+
+  assert.deepEqual(resolveSessionOwnerTarget(primary, 'default', 'default'), primary)
+  assert.deepEqual(
+    resolveSessionOwnerTarget(primary, 'worker', 'default'),
+    makeBackendTarget({ kind: 'configured-profile', profile: 'worker' })
+  )
+})
+
+test('session owner overrides a different opener profile with a configured target', () => {
+  const opener = makeBackendTarget({ kind: 'configured-profile', profile: 'worker' })
+
+  assert.deepEqual(
+    resolveSessionOwnerTarget(opener, 'coder', 'default'),
+    makeBackendTarget({ kind: 'configured-profile', profile: 'coder' })
+  )
+})
+
+test('session owner falls back to the opener target when no owner hint is supplied', () => {
+  const opener = makeBackendTarget({ kind: 'configured-profile', profile: 'worker' })
+
+  assert.deepEqual(resolveSessionOwnerTarget(opener, null, 'default'), opener)
+})
 
 test('primary-bound window with no profile arg resolves to primary', () => {
   const result = resolveSenderTarget(makeBackendTarget({ kind: 'primary' }), null)
