@@ -74,11 +74,11 @@ def interactive_setup() -> None:
 
     print()
     print_info("Security: with NO token configured the server binds to 127.0.0.1 only.")
-    print_info("Prefer per-peer tokens (A2A_PEER_TOKENS=\"alice:tok1,bob:tok2\") so each")
+    print_info("Prefer per-peer tokens (A2A_PEER_TOKENS=\"peer-a:<token-a>,peer-b:<token-b>\") so each")
     print_info("remote agent has its own authenticated identity.")
     if prompt_yes_no("Configure tokens to allow REMOTE A2A peers?", False):
         peer_tokens = prompt(
-            "Per-peer tokens (name:token, comma-separated; blank to skip)",
+            "Per-peer tokens (name:<token>, comma-separated; blank to skip)",
             default=get_env_value("A2A_PEER_TOKENS") or "",
         )
         if peer_tokens:

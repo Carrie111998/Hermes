@@ -6,13 +6,15 @@ Design (the #11025 insight, done as a plugin with zero core edits):
     dependency at register() time — avoids the a2a_fleet "register outside a
     loop" bug class).
   - Serves the A2A v1.0 Agent Card at GET /.well-known/agent-card.json (and legacy agent.json).
-  - JSON-RPC at POST /: message/send, message/stream (SSE), tasks/get,
-    tasks/list, tasks/cancel, tasks/subscribe, tasks/pushNotificationConfig/create,
-    tasks/pushNotificationConfig/get, tasks/pushNotificationConfig/list,
-    tasks/pushNotificationConfig/delete.
-  - Push notifications: config accepted inline in message/send
+  - JSON-RPC at POST /: v1.0 SendMessage, SendStreamingMessage (SSE), GetTask,
+    ListTasks, CancelTask, SubscribeToTask, and push-configuration CRUD. Legacy
+    path aliases (message/send, message/stream, tasks/get, tasks/list,
+    tasks/cancel, tasks/subscribe, and the push-configuration paths) are also
+    accepted.
+  - Push notifications: config accepted inline in SendMessage
     (configuration.taskPushNotificationConfig) or via the create method;
-    payloads are v1.0 StreamResponse objects, HMAC-signed.
+    payloads are v1.0 StreamResponse objects, HMAC-signed when a signing
+    secret is configured.
   - Metrics at GET /metrics.
   - Each inbound task is filtered + framed (security.wrap_inbound) and routed
     into the agent's LIVE gateway session via the normal MessageEvent path, so

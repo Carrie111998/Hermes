@@ -19,7 +19,8 @@ Layers (all opt-out-able only by explicit config, never silently):
   5. Audit log         — append-only JSONL of every inbound + outbound exchange
   6. Trusted peers     — optional allow-list restricting which authenticated
                          identities may run tasks
-  7. Push auth         — HMAC-SHA256 webhook signing + SSRF-safe callback URLs
+  7. Push auth         — optional HMAC-SHA256 webhook signing + SSRF-safe
+                         callback URL checks
 """
 
 from __future__ import annotations
@@ -47,7 +48,8 @@ def get_bearer_token() -> str:
 
 
 def get_peer_tokens() -> dict[str, str]:
-    """Parse A2A_PEER_TOKENS ("alice:tok1,bob:tok2") into {token: peer_name}.
+    """Parse A2A_PEER_TOKENS ("peer-a:<token-a>,peer-b:<token-b>") into
+    {token: peer_name}.
 
     Per-peer tokens give each remote agent its own credential, so the identity
     used for rate limiting, trust, and audit is authenticated — not whatever
