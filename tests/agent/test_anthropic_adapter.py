@@ -660,6 +660,77 @@ class TestConvertTools:
 
 class TestConvertMessages:
 
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "https://api.minimax.io/anthropic",
+            "https://api.minimaxi.com/anthropic",
+        ],
+    )
+    def test_minimax_routes_convert_video_url_to_video_block(self, base_url):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this clip."},
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": "https://example.com/clip.mp4"},
+                    },
+                ],
+            }
+        ]
+
+        _, result = convert_messages_to_anthropic(messages, base_url=base_url)
+
+        assert result[0]["content"][1] == {
+            "type": "video",
+            "source": {"type": "url", "url": "https://example.com/clip.mp4"},
+        }
+
+    def test_minimax_route_converts_base64_video_source(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video_url",
+                        "video_url": {
+                            "url": "data:video/quicktime;base64,QQ==",
+                        },
+                    }
+                ],
+            }
+        ]
+
+        _, result = convert_messages_to_anthropic(
+            messages,
+            base_url="https://api.minimax.io/anthropic",
+        )
+
+        assert result[0]["content"][0] == {
+            "type": "video",
+            "source": {
+                "type": "base64",
+                "media_type": "video/quicktime",
+                "data": "QQ==",
+            },
+        }
+
+    def test_non_minimax_route_preserves_video_url_block(self):
+        video_block = {
+            "type": "video_url",
+            "video_url": {"url": "https://example.com/clip.mp4"},
+        }
+        messages = [{"role": "user", "content": [video_block]}]
+
+        _, result = convert_messages_to_anthropic(
+            messages,
+            base_url="https://example.com/anthropic",
+        )
+
+        assert result[0]["content"][0] == video_block
+
 
 
 

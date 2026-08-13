@@ -584,6 +584,12 @@ class ModelCapabilities:
     context_window: int = 200000
     max_output_tokens: int = 8192
     model_family: str = ""
+    input_modalities: Tuple[str, ...] = ()
+
+    @property
+    def supports_video(self) -> bool:
+        """Return whether the model advertises video input."""
+        return "video" in self.input_modalities
 
 
 def _get_provider_models(provider: str) -> Optional[Dict[str, Any]]:
@@ -632,7 +638,8 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
     Extracts from model entry fields:
       - reasoning  (bool)  → supports_reasoning
       - tool_call  (bool)  → supports_tools
-      - attachment (bool)  → supports_vision
+      - attachment (bool)  → supports_vision fallback
+      - modalities.input   → supports_vision, supports_video, input_modalities
       - limit.context (int) → context_window
       - limit.output  (int) → max_output_tokens
       - family     (str)   → model_family
@@ -656,8 +663,14 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
     else:
         input_mods = None
     if isinstance(input_mods, list):
-        supports_vision = "image" in input_mods
+        input_modalities = tuple(
+            str(modality).strip().lower()
+            for modality in input_mods
+            if str(modality).strip()
+        )
+        supports_vision = "image" in input_modalities
     else:
+        input_modalities = ()
         supports_vision = bool(entry.get("attachment", False))
     supports_reasoning = bool(entry.get("reasoning", False))
 
@@ -681,6 +694,7 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
         context_window=context_window,
         max_output_tokens=max_output_tokens,
         model_family=model_family,
+        input_modalities=input_modalities,
     )
 
 
