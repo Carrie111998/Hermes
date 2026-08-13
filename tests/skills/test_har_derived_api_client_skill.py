@@ -11,6 +11,8 @@ Two layers, both stdlib + pytest, no network:
 import importlib.util
 import json
 import re
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -123,8 +125,6 @@ def test_derives_endpoint_and_filters_static(tmp_path, capsys):
     har = tmp_path / "t.har"
     har.write_text(json.dumps(_make_har()), encoding="utf-8")
 
-    import sys
-
     argv = sys.argv
     try:
         sys.argv = ["har_to_client.py", str(har), "--host", "example.com"]
@@ -144,6 +144,60 @@ def test_derives_endpoint_and_filters_static(tmp_path, capsys):
     assert "referer" not in out
     # replay hint carries the browser UA
     assert "User-Agent (send this): Mozilla/5.0 TestBrowser/1.0" in out
+
+
+def test_preserves_scheme_parses_url_query_and_redacts_credentials(tmp_path, capsys):
+    mod = _load_module(DERIVE, "har_to_client_security_undertest")
+    fixture = _make_har()
+    request = fixture["log"]["entries"][0]["request"]
+    request["url"] = "http://api.example.com/v1/items/12345/reviews?q=one&blank="
+    request["queryString"] = []
+    request["headers"].extend([
+        {"name": "Authorization", "value": "Bearer secret-auth-value"},
+        {"name": "X-Goog-API-Key", "value": "secret-api-key-value"},
+        {"name": "X-Custom-Token", "value": "secret-token-value"},
+    ])
+    har = tmp_path / "sensitive.har"
+    har.write_text(json.dumps(fixture), encoding="utf-8")
+
+    argv = sys.argv
+    try:
+        sys.argv = ["har_to_client.py", str(har), "--host", "example.com"]
+        rc = mod.main()
+    finally:
+        sys.argv = argv
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "GET http://api.example.com/v1/items/{id}/reviews" in out
+    assert "q = one" in out
+    assert "blank = " in out
+    assert out.count("[REDACTED]") == 3
+    for secret in ("secret-auth-value", "secret-api-key-value", "secret-token-value"):
+        assert secret not in out
+
+
+def test_cdp_capture_populates_query_string(monkeypatch):
+    sync_api = types.ModuleType("playwright.sync_api")
+    setattr(sync_api, "sync_playwright", object())
+    playwright = types.ModuleType("playwright")
+    monkeypatch.setitem(sys.modules, "playwright", playwright)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+    mod = _load_module(CAPTURE_CDP, "har_capture_cdp_query_undertest")
+
+    class Request:
+        method = "GET"
+        url = "https://example.com/api?q=one&q=two&blank="
+        headers = {}
+        post_data = None
+        resource_type = "xhr"
+
+    entry = mod._har_entry(Request(), None)
+    assert entry["request"]["queryString"] == [
+        {"name": "q", "value": "one"},
+        {"name": "q", "value": "two"},
+        {"name": "blank", "value": ""},
+    ]
 
 
 def test_path_template_collapses_ids():
