@@ -50,12 +50,20 @@ def _critical_snapshot() -> AccountUsageSnapshot:
 
 def _make_stub(provider: str | None = "openai", config=None) -> SimpleNamespace:
     """Minimal stand-in for ``HermesCLI`` carrying exactly what the quota
-    methods read: ``agent``/``provider``/``base_url``/``api_key``/``config``."""
-    agent = SimpleNamespace(provider=provider, base_url=None, api_key=None)
+    methods read: ``agent``/``provider``/``base_url``/``api_key``/``config``.
+
+    Defaults to explicit credentials (a real agent carries the resolved
+    runtime creds) — the probe only fetches the ALREADY-RESOLVED active
+    account and skips when creds are missing (regression:
+    test_cli_provider_resolution.py::test_runtime_resolution_failure_is_not_sticky).
+    """
+    agent = SimpleNamespace(
+        provider=provider, base_url="https://example.com", api_key="test-key"
+    )
     return SimpleNamespace(
         provider=provider,
-        base_url=None,
-        api_key=None,
+        base_url="https://example.com",
+        api_key="test-key",
         agent=agent,
         config=config if config is not None else {},
     )
@@ -146,6 +154,32 @@ def test_pre_turn_warning_no_provider_is_silent(monkeypatch, capsys):
 
     stub = _make_stub(provider=None)
     stub.agent = SimpleNamespace(provider=None, base_url=None, api_key=None)
+    _bind(cli_mod.HermesCLI, stub, "_maybe_emit_pre_turn_quota_warning")
+    stub._maybe_emit_pre_turn_quota_warning()
+
+    assert capsys.readouterr().out == ""
+
+
+def test_pre_turn_warning_no_credentials_is_silent(monkeypatch, capsys):
+    """Provider set but no resolved credentials → no probe, no output.
+
+    The probe only fetches the ALREADY-RESOLVED active account; with missing
+    creds a fetch would trigger runtime-provider credential resolution as a
+    side effect, which an advisory probe must never do (regression:
+    test_cli_provider_resolution.py::test_runtime_resolution_failure_is_not_sticky).
+    """
+    monkeypatch.setattr(
+        "agent.quota_warnings.fetch_quota_snapshot",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not fetch")),
+    )
+    monkeypatch.setattr(cli_mod, "CLI_CONFIG", {})
+
+    stub = _make_stub(provider="openai")
+    stub.agent = SimpleNamespace(
+        provider="openai", base_url=None, api_key=None
+    )
+    stub.base_url = None
+    stub.api_key = None
     _bind(cli_mod.HermesCLI, stub, "_maybe_emit_pre_turn_quota_warning")
     stub._maybe_emit_pre_turn_quota_warning()
 

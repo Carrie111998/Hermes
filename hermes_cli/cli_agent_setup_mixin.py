@@ -622,10 +622,15 @@ class CLIAgentSetupMixin:
             clear_quota_cache()
             agent = self.agent
             provider = getattr(agent, "provider", None) or getattr(self, "provider", None)
-            if not provider:
-                return
             base_url = getattr(agent, "base_url", None) or getattr(self, "base_url", None)
             api_key = getattr(agent, "api_key", None) or getattr(self, "api_key", None)
+            if not (provider and base_url and api_key):
+                # Probe only the ALREADY-RESOLVED active account: calling
+                # fetch_account_usage with missing creds triggers runtime-provider
+                # credential resolution as a side effect (auth/refresh paths), which
+                # an advisory pre-turn probe must never do (regression: broke
+                # test_cli_provider_resolution.py::test_runtime_resolution_failure_is_not_sticky).
+                return
             config = getattr(self, "config", None)
             _pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             try:
