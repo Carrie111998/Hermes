@@ -39,6 +39,96 @@ def _init_git_repo(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
+def test_dispatch_blocks_before_claim_when_required_path_is_absent(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    base_ref = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (kanban_home / "profiles" / "alice").mkdir(parents=True)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Document replay command",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name="docs/replay",
+            base_ref=base_ref,
+            required_paths=["scripts/run-replay.ts"],
+        )
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda *_args, **_kwargs: pytest.fail("spawned")
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.claim_lock is None
+    assert task_id in result.auto_blocked
+    assert "scripts/run-replay.ts" in (task.last_failure_error or "")
+
+
+def test_dispatch_materializes_declared_base_with_required_path(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "run-replay.ts").write_text("export {};\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "scripts/run-replay.ts"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "add replay"], check=True
+    )
+    base_ref = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (kanban_home / "profiles" / "alice").mkdir(parents=True)
+    spawned: list[str] = []
+
+    with kb.connect() as conn:
+        kb.create_task(
+            conn,
+            title="Document replay command",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name="docs/replay",
+            base_ref=base_ref,
+            required_paths=["scripts/run-replay.ts"],
+        )
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda _task, workspace: spawned.append(workspace)
+        )
+
+    assert len(result.spawned) == 1
+    assert len(spawned) == 1
+    assert (Path(spawned[0]) / "scripts" / "run-replay.ts").is_file()
+
+
+def test_create_task_rejects_unsafe_required_path(kanban_home, tmp_path):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="repository-relative"):
+            kb.create_task(
+                conn,
+                title="unsafe prerequisite",
+                workspace_kind="worktree",
+                workspace_path=str(tmp_path),
+                required_paths=["../secret"],
+            )
+
+
 # ---------------------------------------------------------------------------
 # Schema / init
 # ---------------------------------------------------------------------------
