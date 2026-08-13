@@ -380,36 +380,75 @@ def _scan_gateway_pids(
         looks_like_gateway_runtime_command_line,
     )
     current_home = str(get_hermes_home().resolve())
-    # Forward slashes on both sides of the HERMES_HOME= match — see
-    # gateway.status._command_line_belongs_to_profile, which this mirrors.
-    current_home_lc = current_home.lower().replace("\\", "/")
     current_profile_arg = _profile_arg(current_home)
     current_profile_name = (
         current_profile_arg.split()[-1] if current_profile_arg else ""
     )
     current_profile_name_lc = current_profile_name.lower()
 
-    def _matches_current_profile(command: str) -> bool:
-        command_lc = command.lower().replace("\\", "/")
-        if current_profile_name:
-            return (
-                f"--profile {current_profile_name_lc}" in command_lc
-                or f"-p {current_profile_name_lc}" in command_lc
-                or f"hermes_home={current_home_lc}" in command_lc
-            )
+    def _command_context(command: str) -> tuple[str | None, str | None, bool]:
+        """Return effective profile/home arguments from a process command line."""
+        try:
+            argv = shlex.split(command, posix=not is_windows())
+        except ValueError:
+            return None, None, False
 
-        # Default-profile case: no profile flag in argv. Accept as long as
-        # the command doesn't advertise *some other* profile. HERMES_HOME
-        # may be passed via env (not visible in wmic/CIM command line) so
-        # its absence is NOT disqualifying — only a non-matching explicit
-        # HERMES_HOME= in argv is.
-        if "--profile " in command_lc or " -p " in command_lc:
+        def _unquote(value: str) -> str:
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                return value[1:-1]
+            return value
+
+        argv = [_unquote(value) for value in argv]
+        explicit_profile: str | None = None
+        explicit_home: str | None = None
+        profile_seen = False
+        index = 0
+        while index < len(argv):
+            value = argv[index]
+            value_lc = value.lower()
+            if value in {"--profile", "-p"}:
+                profile_seen = True
+                explicit_profile = argv[index + 1] if index + 1 < len(argv) else None
+                index += 2
+                continue
+            if value_lc.startswith("--profile="):
+                profile_seen = True
+                explicit_profile = value.split("=", 1)[1]
+            elif value_lc.startswith("-p="):
+                profile_seen = True
+                explicit_profile = value.split("=", 1)[1]
+            elif value_lc.startswith("hermes_home="):
+                explicit_home = value.split("=", 1)[1]
+            index += 1
+        return explicit_profile, explicit_home, profile_seen
+
+    def _matches_current_profile(command: str) -> bool:
+        explicit_profile, explicit_home, profile_seen = _command_context(command)
+        if profile_seen and explicit_profile is None:
             return False
-        if (
-            "hermes_home=" in command_lc
-            and f"hermes_home={current_home_lc}" not in command_lc
-        ):
-            return False
+
+        if explicit_home is not None:
+            normalized_home = explicit_home.replace("\\", "/")
+            expected_home = current_home.replace("\\", "/")
+            if is_windows():
+                normalized_home = normalized_home.lower()
+                expected_home = expected_home.lower()
+            home_matches = normalized_home == expected_home
+        else:
+            home_matches = False
+
+        if current_profile_name:
+            if profile_seen:
+                return (explicit_profile or "").lower() == current_profile_name_lc
+            return home_matches
+
+        # Default profile: an explicit non-default profile always belongs to
+        # another home. With no profile flag, a conflicting HERMES_HOME also
+        # disqualifies the process; otherwise this is the default invocation.
+        if profile_seen:
+            return (explicit_profile or "").lower() == "default"
+        if explicit_home is not None:
+            return home_matches
         return True
 
     def _matches_gateway_runtime(command: str) -> bool:
@@ -631,8 +670,9 @@ def find_gateway_pids(
             _append_unique_pid(pids, get_running_pid(), _exclude)
         except Exception:
             pass
-    for pid in _get_service_pids():
-        _append_unique_pid(pids, pid, _exclude)
+    if all_profiles:
+        for pid in _get_service_pids():
+            _append_unique_pid(pids, pid, _exclude)
     try:
         include_restart_managers = not supports_systemd_services()
     except Exception:

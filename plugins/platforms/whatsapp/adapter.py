@@ -21,6 +21,7 @@ import os
 import platform
 import re
 import signal
+import socket
 import subprocess
 
 _IS_WINDOWS = platform.system() == "Windows"
@@ -28,6 +29,10 @@ from pathlib import Path
 from typing import Dict, Optional, Any
 
 from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+from hermes_cli.process_safety import (
+    StableProcessHandle,
+    StableProcessHandleUnavailable,
+)
 from hermes_constants import (
     find_node_executable,
     get_hermes_dir,
@@ -62,84 +67,37 @@ logger = logging.getLogger(__name__)
 _OWNER_REPLY_PREFIX = "[owner reply] "
 
 
-def _listener_pids_on_port(port: int) -> list:
-    """PIDs of processes *listening* on ``port`` (POSIX) — never clients.
+def _ensure_bridge_port_available(port: int) -> None:
+    """Fail closed if the bridge bind target is not available.
 
-    This must match only LISTEN sockets. A bare ``lsof -i :PORT`` (or
-    ``fuser PORT/tcp``) also returns *clients* whose connection merely involves
-    that port number — e.g. a browser with a tab open on a local dev server
-    sharing the port. SIGTERMing those closed the user's browser at irregular
-    intervals. Restricting to LISTEN state frees the port for a new bridge
-    without ever touching an unrelated client.
+    Port ownership is never inferred from ``lsof``, ``ss``, ``netstat``, or a
+    process command line.  The only process-signalling path is the guarded
+    bridge pidfile cleanup below.  This probe merely asks the kernel whether a
+    new IPv4 listener can bind the bridge address; an occupied or unverifiable
+    port is preserved and reported explicitly.
     """
-    pids: list = []
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        result = subprocess.run(
-            ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
-            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
-        )
-        for line in result.stdout.strip().splitlines():
-            try:
-                pids.append(int(line))
-            except ValueError:
-                pass
-        if pids:
-            return pids
-    except FileNotFoundError:
-        pass  # lsof not installed — fall through to ss
-    # Fallback: ss (iproute2, present on virtually every modern Linux).
-    try:
-        result = subprocess.run(
-            ["ss", "-ltnHp", f"sport = :{port}"],
-            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
-        )
-        for m in re.finditer(r"pid=(\d+)", result.stdout):
-            pids.append(int(m.group(1)))
-    except FileNotFoundError:
-        pass
-    return pids
+        exclusive_addr_use = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if _IS_WINDOWS and exclusive_addr_use is not None:
+            probe.setsockopt(socket.SOL_SOCKET, exclusive_addr_use, 1)
+        elif not _IS_WINDOWS:
+            # Match normal server restart semantics so closed connections in
+            # TIME_WAIT do not look like a live listener on POSIX.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind(("127.0.0.1", port))
+        probe.listen(1)
+    except OSError as exc:
+        raise RuntimeError(
+            f"WhatsApp bridge port {port} is still in use or unavailable after "
+            "guarded pidfile cleanup; no listener was signalled."
+        ) from exc
+    finally:
+        probe.close()
 
 
-def _kill_port_process(port: int) -> None:
-    """Kill any process *listening* on the given TCP port (a stale bridge)."""
-    try:
-        if _IS_WINDOWS:
-            from hermes_cli._subprocess_compat import windows_hide_flags
-
-            # Use netstat to find the PID bound to this port, then taskkill
-            result = subprocess.run(
-                ["netstat", "-ano", "-p", "TCP"],
-                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
-                creationflags=windows_hide_flags(),
-            )
-            for line in result.stdout.splitlines():
-                parts = line.split()
-                if len(parts) >= 5 and parts[3] == "LISTENING":
-                    local_addr = parts[1]
-                    if local_addr.endswith(f":{port}"):
-                        try:
-                            subprocess.run(
-                                ["taskkill", "/PID", parts[4], "/F"],
-                                capture_output=True, timeout=5,
-                                creationflags=windows_hide_flags(),
-                            )
-                        except subprocess.SubprocessError:
-                            pass
-        else:
-            # POSIX: only ever signal a process LISTENING on the port. A client
-            # whose connection happens to involve this port number (a browser
-            # tab on a local dev server, etc.) must never be killed.
-            for pid in _listener_pids_on_port(port):
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except (ProcessLookupError, PermissionError, OSError):
-                    pass
-    except Exception:
-        pass
-
-
-def _bridge_pid_is_ours(pid: int, session_path: Path, expected_start) -> bool:
-    """True only if ``pid`` is alive AND still our node bridge for this session.
+def _bridge_pid_is_ours(pid: int, expected_start) -> bool:
+    """True only if ``pid`` is alive and has the recorded process identity.
 
     The PID is read from a file written by a previous run.  Once that process
     exits and is reaped the kernel can recycle the number onto an unrelated
@@ -147,26 +105,18 @@ def _bridge_pid_is_ours(pid: int, session_path: Path, expected_start) -> bool:
     which a bare-liveness ``os.kill`` then SIGTERMed, closing the whole browser
     at irregular intervals (every time the flapping bridge restarted).
 
-    Identity is confirmed two ways: the kernel start time captured when we wrote
-    the pidfile (definitive), and — for legacy pidfiles with no baseline — the
-    command line, which must contain ``node`` and this session's unique path.
-    A recycled PID (different start time / different cmdline) is never ours.
+    Identity requires the kernel start time captured when we wrote the pidfile.
+    Legacy PID-only files cannot prove ownership and therefore fail closed.
     """
     from gateway.status import _pid_exists
     if not _pid_exists(pid):
         return False
-    if expected_start is not None:
-        from gateway.status import get_process_start_time
-        # A matching (pid, start time) pair uniquely identifies the process.
-        return get_process_start_time(pid) == expected_start
-    # Legacy pidfile (no recorded start time): fall back to a command-line
-    # signature so a recycled PID is still never signalled.  If we cannot read
-    # the cmdline we refuse to kill rather than risk a stranger.
-    from gateway.status import _read_process_cmdline
-    cmdline = _read_process_cmdline(pid)
-    if not cmdline:
+    if expected_start is None:
         return False
-    return ("node" in cmdline) and (str(session_path) in cmdline)
+    from gateway.status import get_process_start_time
+
+    # A matching (pid, start time) pair uniquely identifies the process.
+    return get_process_start_time(pid) == expected_start
 
 
 def _kill_stale_bridge_by_pidfile(session_path: Path) -> None:
@@ -198,24 +148,50 @@ def _kill_stale_bridge_by_pidfile(session_path: Path) -> None:
         except OSError:
             pass
         return
-    if _bridge_pid_is_ours(pid, session_path, recorded_start):
-        try:
-            os.kill(pid, signal.SIGTERM)
-            logger.info("[whatsapp] Killed stale bridge PID %d from pidfile", pid)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-    else:
-        from gateway.status import _pid_exists
-        if _pid_exists(pid):
-            logger.warning(
-                "[whatsapp] Not killing pidfile PID %d: it is no longer the "
-                "bridge (recycled onto an unrelated process); skipping to avoid "
-                "killing a stranger.", pid,
-            )
+    remove_pidfile = True
     try:
-        pid_file.unlink()
-    except OSError:
+        # Open the kernel handle BEFORE validating PID metadata. Even if the
+        # numeric PID is recycled after this point, the handle remains bound to
+        # the original process identity and can never signal its replacement.
+        with StableProcessHandle.open(pid) as process_handle:
+            if _bridge_pid_is_ours(pid, recorded_start):
+                try:
+                    process_handle.send_signal(signal.SIGTERM)
+                    logger.info(
+                        "[whatsapp] Killed stale bridge PID %d from pidfile", pid
+                    )
+                except (ProcessLookupError, PermissionError, OSError) as exc:
+                    remove_pidfile = isinstance(exc, ProcessLookupError)
+                    logger.warning(
+                        "[whatsapp] Could not signal verified bridge PID %d: %s",
+                        pid,
+                        exc,
+                    )
+            elif process_handle.is_alive():
+                logger.warning(
+                    "[whatsapp] Not killing pidfile PID %d: it is no longer the "
+                    "bridge (recycled onto an unrelated process); skipping to avoid "
+                    "killing a stranger.",
+                    pid,
+                )
+    except ProcessLookupError:
         pass
+    except (StableProcessHandleUnavailable, PermissionError, OSError) as exc:
+        # On a platform where identity cannot be pinned, preserve both the
+        # process and pidfile. The following port preflight will fail closed.
+        remove_pidfile = False
+        logger.warning(
+            "[whatsapp] Not signalling stale bridge PID %d without a stable "
+            "process handle: %s",
+            pid,
+            exc,
+        )
+
+    if remove_pidfile:
+        try:
+            pid_file.unlink()
+        except OSError:
+            pass
 
 
 def _write_bridge_pidfile(session_path: Path, pid: int) -> None:
@@ -674,8 +650,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             
             # Kill any orphaned bridge from a previous gateway run
             _kill_stale_bridge_by_pidfile(self._session_path)
-            _kill_port_process(self._bridge_port)
             await asyncio.sleep(1)
+            _ensure_bridge_port_available(self._bridge_port)
             
             # Start the bridge process in its own process group.
             # Route output to a log file so QR codes, errors, and reconnection

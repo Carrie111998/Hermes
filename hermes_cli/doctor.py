@@ -1118,8 +1118,10 @@ def run_doctor(args):
         if _has_provider_env_config(content):
             check_ok("API key or custom endpoint configured")
         else:
-            check_warn(f"No API key found in {_DHH}/.env")
-            issues.append("Run 'hermes setup' to configure API keys")
+            check_info(
+                f"No API-key/custom-endpoint entry in {_DHH}/.env "
+                "(OAuth, SDK, and external providers are checked separately)"
+            )
     else:
         # Also check project root as fallback
         fallback_env = PROJECT_ROOT / '.env'
@@ -1561,60 +1563,61 @@ def run_doctor(args):
     _section("Auth Providers")
 
     try:
-        from hermes_cli.auth import (
-            get_nous_auth_status_local,
-            get_codex_auth_status,
-            get_minimax_oauth_auth_status,
-        )
+        from . import auth as auth_module
+    except Exception as exc:
+        check_warn("Auth provider imports", f"(could not load: {exc})")
+    else:
+        # Read-only display: refresh-free snapshots — doctor must never trigger
+        # an OAuth refresh as a side effect of a health check. Each provider is
+        # isolated so one broken credential store cannot hide every later row.
+        try:
+            nous_status = auth_module.get_nous_auth_status_local()
+            if nous_status.get("logged_in"):
+                check_ok("Nous Portal auth", "(logged in)")
+            else:
+                check_warn("Nous Portal auth", "(not logged in)")
+        except Exception as exc:
+            check_warn("Nous Portal auth", f"(could not check: {exc})")
 
-        # Read-only display: refresh-free snapshot — doctor must never
-        # trigger an OAuth refresh as a side effect of a health check.
-        nous_status = get_nous_auth_status_local()
-        if nous_status.get("logged_in"):
-            check_ok("Nous Portal auth", "(logged in)")
-        else:
-            check_warn("Nous Portal auth", "(not logged in)")
+        try:
+            codex_status = auth_module.get_codex_auth_status()
+            if codex_status.get("logged_in"):
+                check_ok("OpenAI Codex auth", "(logged in)")
+            else:
+                check_warn("OpenAI Codex auth", "(not logged in)")
+                if codex_status.get("error"):
+                    check_info(codex_status["error"])
+                # Native OAuth uses Hermes' own device-code flow — the Codex CLI
+                # is only needed to import existing tokens from ~/.codex/auth.json.
+                if not _safe_which("codex"):
+                    check_info(
+                        "codex CLI not installed "
+                        "(optional — only required to import tokens "
+                        "from an existing Codex CLI login)"
+                    )
+        except Exception as exc:
+            check_warn("OpenAI Codex auth", f"(could not check: {exc})")
 
-        codex_status = get_codex_auth_status()
-        if codex_status.get("logged_in"):
-            check_ok("OpenAI Codex auth", "(logged in)")
-        else:
-            check_warn("OpenAI Codex auth", "(not logged in)")
-            if codex_status.get("error"):
-                check_info(codex_status["error"])
-            # Native OAuth uses Hermes' own device-code flow — the Codex CLI is
-            # only needed to import existing tokens from ~/.codex/auth.json.
-            # Attach the hint to the Codex auth row so it doesn't read as
-            # remediation for whichever provider happens to print next (#27975).
-            if not _safe_which("codex"):
-                check_info(
-                    "codex CLI not installed "
-                    "(optional — only required to import tokens "
-                    "from an existing Codex CLI login)"
-                )
+        try:
+            minimax_status = auth_module.get_minimax_oauth_auth_status()
+            if minimax_status.get("logged_in"):
+                region = minimax_status.get("region", "global")
+                check_ok("MiniMax OAuth", f"(logged in, region={region})")
+            else:
+                check_warn("MiniMax OAuth", "(not logged in)")
+        except Exception as exc:
+            check_warn("MiniMax OAuth", f"(could not check: {exc})")
 
-        minimax_status = get_minimax_oauth_auth_status()
-        if minimax_status.get("logged_in"):
-            region = minimax_status.get("region", "global")
-            check_ok("MiniMax OAuth", f"(logged in, region={region})")
-        else:
-            check_warn("MiniMax OAuth", "(not logged in)")
-    except Exception as e:
-        check_warn("Auth provider status", f"(could not check: {e})")
-
-    # xAI OAuth — separate try/except so an import failure here cannot
-    # disrupt the already-printed Nous/Codex/Gemini/MiniMax rows above.
-    try:
-        from hermes_cli.auth import get_xai_oauth_auth_status
-        xai_oauth_status = get_xai_oauth_auth_status() or {}
-        if xai_oauth_status.get("logged_in"):
-            check_ok("xAI OAuth", "(logged in)")
-        else:
-            check_warn("xAI OAuth", "(not logged in)")
-            if xai_oauth_status.get("error"):
-                check_info(xai_oauth_status["error"])
-    except Exception:
-        pass
+        try:
+            xai_oauth_status = auth_module.get_xai_oauth_auth_status() or {}
+            if xai_oauth_status.get("logged_in"):
+                check_ok("xAI OAuth", "(logged in)")
+            else:
+                check_warn("xAI OAuth", "(not logged in)")
+                if xai_oauth_status.get("error"):
+                    check_info(xai_oauth_status["error"])
+        except Exception as exc:
+            check_warn("xAI OAuth", f"(could not check: {exc})")
 
     _section("Directory Structure")
     hermes_home = HERMES_HOME

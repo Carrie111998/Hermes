@@ -13,9 +13,25 @@ patches on ``hermes_cli.main`` resolve unchanged.
 """
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
+
+from .process_safety import (
+    StableProcessHandle,
+    StableProcessHandleUnavailable,
+)
+
+
+_DASHBOARD_RUNTIME_PATTERNS = [
+    "hermes dashboard",
+    "hermes_cli.main dashboard",
+    "hermes_cli/main.py dashboard",
+    "hermes serve",
+    "hermes_cli.main serve",
+    "hermes_cli/main.py serve",
+]
 
 
 def _m():
@@ -23,6 +39,30 @@ def _m():
     from hermes_cli import main
 
     return main
+
+
+def _looks_like_dashboard_runtime(command: str, patterns: list[str]) -> bool:
+    """Match a server process, never a dashboard management invocation."""
+    if re.search(r"(?<![\w-])--(?:status|stop)(?![\w-])", command):
+        return False
+    return any(pattern in command for pattern in patterns)
+
+
+def _open_verified_dashboard_handle(pid: int) -> StableProcessHandle:
+    """Pin ``pid`` first, then prove the pinned identity is a dashboard."""
+    handle = StableProcessHandle.open(pid)
+    try:
+        from gateway.status import _read_process_cmdline
+
+        command = _read_process_cmdline(pid)
+        if not command or not _looks_like_dashboard_runtime(
+            command, _DASHBOARD_RUNTIME_PATTERNS
+        ):
+            raise RuntimeError("process identity changed after dashboard scan")
+        return handle
+    except Exception:
+        handle.close()
+        raise
 
 
 def _scan_dashboard_processes(
@@ -53,18 +93,18 @@ def _scan_dashboard_processes(
 
     Returns an empty list on any scan error (missing ps/wmic, timeout, etc.).
     """
-    patterns = [
-        "hermes dashboard",
-        "hermes_cli.main dashboard",
-        "hermes_cli/main.py dashboard",
-        # The headless backend (`hermes serve`) is the same long-lived server
-        # under a different command name — the desktop app spawns it. Reap it
-        # on update for the same frontend/backend-mismatch reason.
-        "hermes serve",
-        "hermes_cli.main serve",
-        "hermes_cli/main.py serve",
-    ]
-    self_pid = os.getpid()
+    patterns = _DASHBOARD_RUNTIME_PATTERNS
+    self_pids = {os.getpid(), os.getppid()}
+    try:
+        import psutil
+
+        self_pids.update(
+            int(ancestor.pid) for ancestor in psutil.Process(os.getpid()).parents()
+        )
+    except Exception:
+        # This scan feeds a process-kill path. If ancestry cannot be proven,
+        # fail closed rather than risk returning the command that launched us.
+        return []
     dashboard_processes: list[tuple[int, str]] = []
 
     try:
@@ -99,14 +139,17 @@ def _scan_dashboard_processes(
                     current_cmd = line[len("CommandLine=") :]
                 elif line.startswith("ProcessId="):
                     pid_str = line[len("ProcessId=") :]
+                    try:
+                        pid = int(pid_str)
+                    except ValueError:
+                        current_cmd = ""
+                        continue
                     if (
-                        any(p in current_cmd for p in patterns)
-                        and int(pid_str) != self_pid
+                        _looks_like_dashboard_runtime(current_cmd, patterns)
+                        and pid not in self_pids
                     ):
-                        try:
-                            dashboard_processes.append((int(pid_str), current_cmd))
-                        except ValueError:
-                            pass
+                        dashboard_processes.append((pid, current_cmd))
+                    current_cmd = ""
         else:
             # Linux / macOS: scan the process table via ps and match against
             # the same explicit patterns list used on Windows.  Using ps
@@ -133,7 +176,10 @@ def _scan_dashboard_processes(
                     except ValueError:
                         continue
                     command = parts[1]
-                    if any(p in command for p in patterns) and pid != self_pid:
+                    if (
+                        _looks_like_dashboard_runtime(command, patterns)
+                        and pid not in self_pids
+                    ):
                         dashboard_processes.append((pid, command))
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
@@ -159,9 +205,9 @@ def _kill_stale_dashboard_processes(
     frontend/backend mismatches (new auth headers the old backend doesn't
     recognise → every API call 401s).
 
-    POSIX: SIGTERM, wait up to ~3s for graceful exit, SIGKILL any survivors.
-    Windows: ``taskkill /PID <pid> /F`` since there's no clean SIGTERM
-    equivalent for background console apps.
+    Linux/WSL: signal through pidfd, wait up to ~3s, then SIGKILL survivors.
+    Windows: terminate through the same ``OpenProcess`` handle used for identity
+    validation. Platforms without a stable process handle fail closed.
 
     Manually-started dashboards are not auto-restarted because we don't know
     the original launch args (--host, --port, --insecure, --tui, --no-open).
@@ -202,16 +248,38 @@ def _kill_stale_dashboard_processes(
     print()
     print(f"⟲ Stopping {len(pids)} dashboard process(es) ({reason})")
 
+    killed: list[int] = []
+    failed: list[tuple[int, str]] = []
+    handles: dict[int, StableProcessHandle] = {}
+
+    # Pin process identities before collecting any more metadata. Validation
+    # happens after the handle opens, so PID recycling can never redirect a
+    # later signal to a replacement process.
+    for pid in pids:
+        try:
+            handles[pid] = _open_verified_dashboard_handle(pid)
+        except ProcessLookupError:
+            killed.append(pid)
+        except (
+            StableProcessHandleUnavailable,
+            PermissionError,
+            OSError,
+            RuntimeError,
+        ) as exc:
+            failed.append((pid, str(exc)))
+
+    active_pids = list(handles)
+
     # Before killing, snapshot systemd cgroup info for each PID so we can
     # restart supervised services after the kill (the cgroup disappears
-    # along with the process).  Only meaningful on Linux, and only when the
+    # along with the process). Only meaningful on Linux, and only when the
     # caller asked for restarts (the `hermes update` path) — `--stop` must
     # stay a stop, not a restart.
     pid_cgroup: dict[int, str | None] = {}
     pid_service: dict[int, str | None] = {}
     pid_cmdline: dict[int, list[str]] = {}
     if restart_managed and sys.platform != "win32":
-        for pid in pids:
+        for pid in active_pids:
             cg_path = _m()._get_pid_cgroup_path(pid)
             pid_cgroup[pid] = cg_path
             pid_service[pid] = _m()._get_systemd_service_for_pid(pid)
@@ -222,66 +290,50 @@ def _kill_stale_dashboard_processes(
                 if cmdline:
                     pid_cmdline[pid] = cmdline
 
-    killed: list[int] = []
-    failed: list[tuple[int, str]] = []
+    import signal as _signal
+    import time as _time
 
-    if sys.platform == "win32":
-        for pid in pids:
+    pending: list[int] = []
+    try:
+        # SIGTERM first — each signal travels through the pinned handle.
+        for pid in active_pids:
             try:
-                result = subprocess.run(
-                    ["taskkill", "/PID", str(pid), "/F"],
-                    capture_output=True,
-                    text=True, encoding="utf-8", errors="replace",
-                    timeout=10,
-                )
-                if result.returncode == 0:
-                    killed.append(pid)
-                else:
-                    failed.append((pid, (result.stderr or result.stdout or "").strip()))
-            except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
-                failed.append((pid, str(e)))
-    else:
-        import signal as _signal
-        import time as _time
-
-        # SIGTERM first — give each process a chance to shut down cleanly
-        # (uvicorn closes its socket, flushes logs, etc.).
-        for pid in pids:
-            try:
-                os.kill(pid, _signal.SIGTERM)
+                handles[pid].send_signal(_signal.SIGTERM)
+                pending.append(pid)
             except ProcessLookupError:
-                # Already gone — count as killed.
                 killed.append(pid)
-            except (PermissionError, OSError) as e:
-                failed.append((pid, str(e)))
+            except (PermissionError, OSError) as exc:
+                failed.append((pid, str(exc)))
 
-        # Poll for exit up to ~3s total.
+        # Poll the same handles for up to ~3s total.
         deadline = _time.monotonic() + 3.0
-        pending = [
-            p for p in pids if p not in killed and p not in {f[0] for f in failed}
-        ]
         while pending and _time.monotonic() < deadline:
             _time.sleep(0.1)
-            still_pending = []
-            # On Windows, os.kill(pid, 0) is NOT a no-op. Route through
-            # the cross-platform existence check.
-            from gateway.status import _pid_exists
+            still_pending: list[int] = []
             for pid in pending:
-                if _pid_exists(pid):
-                    still_pending.append(pid)
-                else:
+                try:
+                    if handles[pid].is_alive():
+                        still_pending.append(pid)
+                    else:
+                        killed.append(pid)
+                except ProcessLookupError:
                     killed.append(pid)
+                except (PermissionError, OSError) as exc:
+                    failed.append((pid, str(exc)))
             pending = still_pending
 
-        # SIGKILL any survivors.
+        # SIGKILL any survivors, still through their original handles.
         for pid in pending:
             try:
-                os.kill(pid, _signal.SIGKILL)
+                handles[pid].send_signal(_signal.SIGKILL)
                 killed.append(pid)
             except ProcessLookupError:
                 killed.append(pid)
-            except (PermissionError, OSError) as e:
-                failed.append((pid, str(e)))
+            except (PermissionError, OSError) as exc:
+                failed.append((pid, str(exc)))
+    finally:
+        for handle in handles.values():
+            handle.close()
 
     for pid in killed:
         print(f"    ✓ stopped PID {pid}")

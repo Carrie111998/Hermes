@@ -20,15 +20,16 @@ import time
 import pytest
 
 import os
+import signal
 import socket
+from unittest.mock import patch
 
 from plugins.platforms.whatsapp.adapter import (
     _bridge_pid_is_ours,
-    _kill_port_process,
     _kill_stale_bridge_by_pidfile,
-    _listener_pids_on_port,
     _write_bridge_pidfile,
 )
+from plugins.platforms.whatsapp import adapter as whatsapp_adapter
 from gateway.status import get_process_start_time, _pid_exists
 
 
@@ -68,7 +69,9 @@ class TestIdentityGuard:
         proc = _spawn_sleeper()
         try:
             _write_bridge_pidfile(tmp_path, proc.pid)
-            _kill_stale_bridge_by_pidfile(tmp_path)
+            with patch("plugins.platforms.whatsapp.adapter.os.kill") as raw_kill:
+                _kill_stale_bridge_by_pidfile(tmp_path)
+                assert all(call.args[1] == 0 for call in raw_kill.call_args_list)
             assert _wait_dead(proc), "the real bridge process should be killed"
             assert not (tmp_path / "bridge.pid").exists()
         finally:
@@ -77,52 +80,50 @@ class TestIdentityGuard:
                 proc.wait()
 
 
-    def test_legacy_pidfile_kills_matching_bridge_cmdline(self, tmp_path):
-        """Legacy pidfile: a PID whose cmdline names node + session IS reaped."""
-        # Shape the cmdline to look like the node bridge for this session.
+    def test_legacy_pidfile_never_authorizes_a_signal(self, tmp_path):
+        """A PID-only legacy file cannot prove identity, even with matching argv."""
         proc = _spawn_sleeper("node", str(tmp_path))
         try:
             (tmp_path / "bridge.pid").write_text(str(proc.pid))  # legacy: pid only
             _kill_stale_bridge_by_pidfile(tmp_path)
-            assert _wait_dead(proc), "a cmdline-confirmed bridge should be killed"
+            assert proc.poll() is None, "an unproven legacy PID must be preserved"
         finally:
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
 
 
-class TestKillPortProcess:
-    """Freeing the bridge port must target only LISTENers, never clients.
+class TestEnsureBridgePortAvailable:
+    """Port cleanup never infers process ownership or signals by listener PID."""
 
-    Root cause of the live Firefox kills: ``lsof -ti :PORT`` (and ``fuser
-    PORT/tcp``) also returned *client* sockets whose connection merely involved
-    the port number. The WhatsApp bridge uses port 3000 by default — a common
-    local dev-server port — so a browser tab on ``localhost:3000`` was matched
-    and SIGTERMed every time the (crash-looping) bridge restarted.
-    """
-
-    def test_listener_lookup_excludes_client_process(self):
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", 0))
-        port = srv.getsockname()[1]
-        srv.listen(5)
-        # A separate process holding a *client* connection to that port.
-        client = subprocess.Popen([
-            sys.executable, "-c",
-            "import socket,time; c=socket.create_connection(('127.0.0.1',%d)); time.sleep(0.2)" % port,
-        ])
+    def test_occupied_port_is_reported_without_signalling_any_process(self):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+        listener.listen(1)
         try:
-            conn, _ = srv.accept()  # establish the client connection
-            pids = _listener_pids_on_port(port)
-            if os.getpid() not in pids:
-                pytest.skip("neither lsof nor ss detected the listener here")
-            # The listener (this process) is found; the client process is NOT —
-            # the LISTEN filter is what spares unrelated clients like a browser.
-            assert client.pid not in pids
-            conn.close()
+            with patch("plugins.platforms.whatsapp.adapter.os.kill") as kill, patch(
+                "plugins.platforms.whatsapp.adapter.subprocess.run"
+            ) as run:
+                with pytest.raises(RuntimeError, match="still in use"):
+                    whatsapp_adapter._ensure_bridge_port_available(port)
+
+            kill.assert_not_called()
+            run.assert_not_called()
         finally:
-            client.kill()
-            client.wait()
-            srv.close()
+            listener.close()
+
+    def test_free_port_needs_no_process_discovery(self):
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+
+        with patch("plugins.platforms.whatsapp.adapter.os.kill") as kill, patch(
+            "plugins.platforms.whatsapp.adapter.subprocess.run"
+        ) as run:
+            whatsapp_adapter._ensure_bridge_port_available(port)
+
+        kill.assert_not_called()
+        run.assert_not_called()
 
