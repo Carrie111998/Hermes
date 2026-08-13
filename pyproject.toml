@@ -363,7 +363,7 @@ plugins = [
 # install stops discovering events/intent_applier/control_center/graphs/
 # pipeline_state/reply_handlers/obs/curator/artifact_surface). `providers`/
 # `providers.*`, `hermes_cli.*`, and `cron.*` are upstream-new — keep them.
-include = ["activity_policy", "activity_policy.*", "activity_telemetry", "activity_telemetry.*", "agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "cron.*", "events", "events.*", "intent_applier", "intent_applier.*", "control_center", "control_center.*", "graphs", "graphs.*", "pipeline_state", "pipeline_state.*", "reply_handlers", "reply_handlers.*", "obs", "obs.*", "curator", "curator.*", "artifact_surface", "artifact_surface.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*", "session_bridge", "session_bridge.*", "devflow_delegation", "devflow_delegation.*", "jobflow_dispatch", "jobflow_dispatch.*"]
+include = ["activity_policy", "activity_policy.*", "activity_telemetry", "activity_telemetry.*", "agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "cron.*", "events", "events.*", "intent_applier", "intent_applier.*", "control_center", "control_center.*", "graphs", "graphs.*", "pipeline_state", "pipeline_state.*", "reply_handlers", "reply_handlers.*", "obs", "obs.*", "curator", "curator.*", "artifact_surface", "artifact_surface.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*", "session_bridge", "session_bridge.*", "devflow_delegation", "devflow_delegation.*", "jobflow_dispatch", "jobflow_dispatch.*", "jobflow_quality", "jobflow_quality.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
