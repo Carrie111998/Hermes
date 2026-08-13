@@ -68,14 +68,6 @@
     "name": "Pipeline Drift Audit"
   },
   {
-    "id": "449bc1b6665c",
-    "name": "jobflow-matcher-shadow"
-  },
-  {
-    "id": "dae5ee06cf9b",
-    "name": "jobflow-matcher-shadow-diff"
-  },
-  {
     "id": "e2201c0a2ba0",
     "name": "curator-nightly"
   },

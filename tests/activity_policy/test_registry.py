@@ -279,3 +279,79 @@ def test_budgets_scale_with_class():
         assert max(by_class["S1"]) < max(by_class["P3"]), (
             "bounded work must not be budgeted like critical generation"
         )
+
+
+class TestPremiumQualityFloors:
+    """Premium-routing Task 1, written against activity IDs that exist.
+
+    The plan asserts on `jobflow.researcher`, `jobflow.matcher.semantic`,
+    `jobflow.tailor.strategy` and `jobflow.application_qc` — four IDs that are
+    not in the registry — and on an `allowed_routes[].tier` field the schema
+    does not have. Corrected here to the real IDs and the real fields, so the
+    intent (a premium workload can never silently resolve to an economy
+    policy) is actually enforced.
+    """
+
+    PREMIUM = (
+        "cron.jobflow.matcher",
+        "cron.jobflow.researcher",
+        "cron.jobflow.applier",
+        "jobflow.tailor.generate",
+    )
+
+    def test_premium_jobflow_activities_are_p3_with_a_premium_floor(self):
+        from activity_policy.registry import ActivityRegistry
+
+        registry = ActivityRegistry.load_default()
+        for activity_id in self.PREMIUM:
+            policy = registry.policies[activity_id]
+            assert policy.execution_class in {"P3", "P4"}, activity_id
+            assert policy.quality_floor == "premium", activity_id
+
+    def test_every_premium_floor_activity_is_a_premium_class(self):
+        """The two fields must not drift apart in either direction."""
+        from activity_policy.registry import ActivityRegistry
+
+        registry = ActivityRegistry.load_default()
+        for activity_id, policy in registry.policies.items():
+            if policy.quality_floor == "premium":
+                assert policy.execution_class in {"P3", "P4"}, activity_id
+            if policy.execution_class in {"P3", "P4"}:
+                assert policy.quality_floor == "premium", activity_id
+
+    def test_premium_activities_do_not_reason_at_the_lowest_effort(self):
+        from activity_policy.registry import ActivityRegistry
+
+        registry = ActivityRegistry.load_default()
+        for activity_id in self.PREMIUM:
+            assert registry.policies[activity_id].reasoning_effort in {"high", "xhigh"}, activity_id
+
+
+class TestRetiredActivitiesAreRemoved:
+    """A policy for a cron that no longer runs is stale weight, not history.
+
+    The matcher shadow programme was retired 2026-08-13 — both crons disabled,
+    graphs/jobflow.py left with no scheduled consumer. Its telemetry rows
+    remain (the store is append-only and that record is worth keeping), but the
+    registry describes what the fleet DOES, and it no longer does this.
+    """
+
+    @pytest.mark.parametrize("retired", (
+        "cron.jobflow.matcher.shadow",
+        "cron.jobflow.matcher.shadow.diff",
+    ))
+    def test_the_retired_shadow_activities_have_no_policy(self, retired):
+        from activity_policy.registry import ActivityRegistry
+
+        registry = ActivityRegistry.load_default()
+        assert retired not in registry.policies
+
+    @pytest.mark.parametrize("alias", (
+        "jobflow-matcher-shadow",
+        "jobflow-matcher-shadow-diff",
+    ))
+    def test_the_retired_shadow_aliases_resolve_to_nothing(self, alias):
+        from activity_policy.registry import ActivityRegistry
+
+        registry = ActivityRegistry.load_default()
+        assert registry.resolve(alias=alias) is None
