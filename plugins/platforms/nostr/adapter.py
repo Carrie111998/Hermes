@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+from collections import OrderedDict
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -38,6 +39,10 @@ DEFAULT_RELAYS = [
     "wss://relay.primal.net",
     "wss://relay.snort.social",
 ]
+
+# Bounded cache of already-processed event ids, so a relay resend or a reconnect
+# replay of the same event (kind 44 or 1059) is not decrypted/dispatched twice.
+MAX_SEEN_EVENTS = 1000
 
 
 class _NotificationHandler(HandleNotification):
@@ -83,6 +88,7 @@ class NostrAdapter(BasePlatformAdapter):
         self.pubkey: Optional[str] = None
         self._listening = False
         self._lock_key: Optional[str] = None
+        self._seen_event_ids: "OrderedDict[str, bool]" = OrderedDict()
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self.nsec:
@@ -121,8 +127,12 @@ class NostrAdapter(BasePlatformAdapter):
             logger.info("Connected to Nostr relays: %s", self.relays)
             return True
 
-        except Exception as e:
-            logger.exception("Failed to connect to Nostr: %s", e)
+        except Exception:
+            # Do NOT interpolate the exception string here. If Keys.parse(self.nsec)
+            # raised, str(e) could embed the raw key material. Log a generic message
+            # and let logger.exception surface the exception detail in the traceback;
+            # surface only a redacted fatal error.
+            logger.exception("Failed to connect to Nostr")
             if self._lock_key:
                 try:
                     from gateway.status import release_scoped_lock
@@ -130,7 +140,7 @@ class NostrAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
                 self._lock_key = None
-            self._set_fatal_error("connect_failed", str(e), retryable=True)
+            self._set_fatal_error("connect_failed", "Failed to connect to Nostr relays", retryable=True)
             return False
 
     async def disconnect(self):
@@ -168,9 +178,32 @@ class NostrAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.exception("Nostr notification handler terminated: %s", e)
 
+    def _mark_seen(self, event_id_hex: str) -> bool:
+        """Record an event id as seen.
+
+        Returns True the first time an id is seen (and records it); False if the
+        id was already processed. The cache is bounded: the oldest entries are
+        evicted once it exceeds MAX_SEEN_EVENTS.
+        """
+        if event_id_hex in self._seen_event_ids:
+            return False
+        self._seen_event_ids[event_id_hex] = True
+        while len(self._seen_event_ids) > MAX_SEEN_EVENTS:
+            self._seen_event_ids.popitem(last=False)
+        return True
+
     async def _process_event(self, event):
         try:
             kind = event.kind().as_u16()
+
+            # Dedup: skip events already processed (relay resend / reconnect replay).
+            try:
+                event_id_hex = event.id().to_hex()
+            except Exception:
+                event_id_hex = None
+            if event_id_hex is not None and not self._mark_seen(event_id_hex):
+                logger.debug("Skipping already-processed Nostr event %s", event_id_hex)
+                return
 
             if kind == 1059:
                 await self._handle_gift_wrap(event)

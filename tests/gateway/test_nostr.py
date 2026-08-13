@@ -468,3 +468,47 @@ class TestNostrProcessEventForeign:
         await adapter._process_event(bad)
         # Listener flag remains set.
         assert True
+
+
+class TestNostrDedup:
+    """A repeated event id (relay resend / reconnect replay) is dispatched once."""
+
+    async def test_duplicate_event_id_dispatched_at_most_once(self):
+        adapter = NostrAdapter(_config())
+        mock_signer = MagicMock()
+        mock_signer.nip44_decrypt = AsyncMock(return_value="decrypted hello")
+        adapter.signer = mock_signer
+
+        handled = []
+
+        async def fake_handle(sender, content, event_id, timestamp):
+            handled.append((sender, content, event_id, timestamp))
+
+        incoming = _event(kind=44, event_id="dup044")
+        with patch.object(adapter, "_handle_incoming_message", fake_handle):
+            await adapter._process_event(incoming)
+            # Relay resend / reconnect replay of the identical event id.
+            await adapter._process_event(incoming)
+
+        assert len(handled) == 1
+        assert handled[0] == ("sender_pubkey", "decrypted hello", "dup044", 1710000000)
+        mock_signer.nip44_decrypt.assert_awaited_once()
+
+    async def test_distinct_event_ids_are_both_dispatched(self):
+        adapter = NostrAdapter(_config())
+        mock_signer = MagicMock()
+        mock_signer.nip44_decrypt = AsyncMock(return_value="decrypted hello")
+        adapter.signer = mock_signer
+
+        handled = []
+
+        async def fake_handle(sender, content, event_id, timestamp):
+            handled.append((sender, content, event_id, timestamp))
+
+        with patch.object(adapter, "_handle_incoming_message", fake_handle):
+            await adapter._process_event(_event(kind=44, event_id="evt-a"))
+            await adapter._process_event(_event(kind=44, event_id="evt-b"))
+
+        assert len(handled) == 2
+        mock_signer.nip44_decrypt.assert_awaited()
+
