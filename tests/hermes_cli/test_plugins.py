@@ -359,10 +359,14 @@ class TestPluginDiscovery:
         mgr.discover_and_load()
         mgr.discover_and_load()  # second call should no-op
 
-        # Filter out bundled plugins — they're always discovered.
+        # Filter out plugins this test did not create. "bundled" ships with
+        # the repo; "entrypoint" comes from whatever hermes_agent.plugins
+        # entry points are registered in the RUNNING interpreter, which no
+        # env var isolates — a dev box with such a package installed (this
+        # one has `plur` -> plur_hermes) otherwise fails these counts.
         non_bundled = {
             n: p for n, p in mgr._plugins.items()
-            if p.manifest.source != "bundled"
+            if p.manifest.source not in ("bundled", "entrypoint")
         }
         assert len(non_bundled) == 1
 
@@ -396,7 +400,7 @@ class TestPluginDiscovery:
         assert mgr._discovered is True
         non_bundled = {
             n: p for n, p in mgr._plugins.items()
-            if p.manifest.source != "bundled"
+            if p.manifest.source not in ("bundled", "entrypoint")
         }
         assert len(non_bundled) == 1
 
@@ -409,10 +413,14 @@ class TestPluginDiscovery:
         mgr = PluginManager()
         mgr.discover_and_load()
 
-        # Filter out bundled plugins — they're always discovered.
+        # Filter out plugins this test did not create. "bundled" ships with
+        # the repo; "entrypoint" comes from whatever hermes_agent.plugins
+        # entry points are registered in the RUNNING interpreter, which no
+        # env var isolates — a dev box with such a package installed (this
+        # one has `plur` -> plur_hermes) otherwise fails these counts.
         non_bundled = {
             n: p for n, p in mgr._plugins.items()
-            if p.manifest.source != "bundled"
+            if p.manifest.source not in ("bundled", "entrypoint")
         }
         assert len(non_bundled) == 0
 
@@ -2023,7 +2031,11 @@ class TestPluginCommands:
         mgr.discover_and_load()
 
         info = mgr.list_plugins()
-        # Filter out bundled plugins — they're always discovered.
+        # Filter out plugins this test did not create. "bundled" ships with
+        # the repo; "entrypoint" comes from whatever hermes_agent.plugins
+        # entry points are registered in the RUNNING interpreter, which no
+        # env var isolates — a dev box with such a package installed (this
+        # one has `plur` -> plur_hermes) otherwise fails these counts.
         cmd_info = [p for p in info if p["name"] == "cmd-plugin"]
         assert len(cmd_info) == 1
         assert cmd_info[0]["commands"] == 1

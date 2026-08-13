@@ -122,7 +122,11 @@ class TestCategoryNamespaceRecursion:
 
         non_bundled = [
             k for k, p in mgr._plugins.items()
-            if p.manifest.source != "bundled"
+            # "entrypoint" plugins come from hermes_agent.plugins entry points
+            # registered in the RUNNING interpreter, which HERMES_HOME cannot
+            # redirect — on a box with such a package installed (this one has
+            # `plur` -> plur_hermes) this asserted [] against ['plur'].
+            if p.manifest.source not in ("bundled", "entrypoint")
         ]
         assert non_bundled == []
 

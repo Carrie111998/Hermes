@@ -126,7 +126,13 @@ class TestPathCompletions:
         assert metas[idx] == "dir"
 
     def test_home_expansion(self, tmp_path, monkeypatch):
+        # _path_completions expands via os.path.expanduser, which on Windows
+        # reads USERPROFILE (then HOMEDRIVE/HOMEPATH) and ignores $HOME
+        # entirely. Setting HOME alone left the expansion pointing at the
+        # developer's REAL home, so this test listed C:\Users\<user> and
+        # asserted against whatever happened to be sitting there.
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         (tmp_path / "testfile.md").touch()
 
         completions = list(SlashCommandCompleter._path_completions("~/test"))

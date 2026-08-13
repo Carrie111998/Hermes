@@ -13,6 +13,24 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _no_entrypoint_plugins(monkeypatch):
+    """Isolate discovery from the RUNNING interpreter's installed packages.
+
+    These tests already stub the other two discovery sources (``_plugins_dir``
+    and ``get_bundled_plugins_dir``) so they can assert exact counts, but
+    ``_discover_all_plugins`` also folds in ``hermes_agent.plugins`` entry
+    points — which come from whatever is pip-installed, and which no env var
+    or tmp_path can redirect. On a box with such a package present (this one
+    registers ``plur`` -> ``plur_hermes``) every count assertion here was off
+    by one. No test in this file asserts on entry-point discovery, so stubbing
+    it completes the isolation the file already intends.
+    """
+    monkeypatch.setattr(
+        "hermes_cli.plugins_cmd._discover_entrypoint_plugins", lambda: []
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
