@@ -1424,7 +1424,105 @@ def _live_system_guard(request, monkeypatch):
                     return True
         return False
 
-    def _check_subprocess_cmd(name, cmd):
+    _DESTRUCTIVE_GIT_VERBS = (
+        "checkout", "reset", "clean", "switch", "stash", "restore",
+    )
+    #: ``git stash list``/``show`` only READ. The mutating forms
+    #: (push/save/pop/apply/drop/clear) are the ones that sweep the working
+    #: tree — and `stash push` is what actually caused the 2026-08-11 and
+    #: 2026-08-12 incidents, via `hermes update`'s autostash.
+    _READONLY_STASH_SUBCOMMANDS = ("list", "show")
+
+    def _is_destructive_git_against_project_root(cmd, kwargs) -> bool:
+        """True for a real (unmocked) ``git checkout``/``reset``/``clean``/
+        ``switch`` whose cwd resolves inside PROJECT_ROOT — this repo's own
+        live checkout.
+
+        A test that forgets to mock ``subprocess.run`` for one of these
+        verbs silently flips the developer's actual branch or discards
+        real uncommitted work (confirmed data loss, 2026-08-11 — see
+        Operations.md's isolated-clone-first rule). ``hermes update``
+        already has its own dedicated check above; this covers the raw
+        git-command case directly, which a test can reach without ever
+        going through ``hermes update`` at all.
+        """
+        cmd_str = _cmd_to_string(cmd)
+        try:
+            tokens = _shlex.split(cmd_str)
+        except ValueError:
+            tokens = cmd_str.split()
+        if not tokens:
+            return False
+        head0 = tokens[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        # Wrapper executables (bash -c "git reset --hard", sudo git ..., etc.)
+        # need full-token scanning; a bare "git ..." argv only needs argv[0].
+        git_tokens = tokens if head0 in _WRAPPER_COMMANDS else tokens[:1]
+        if not any(
+            t.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] == "git" for t in git_tokens
+        ):
+            return False
+        matched = next((t for t in tokens if t in _DESTRUCTIVE_GIT_VERBS), None)
+        if matched is None:
+            return False
+        if matched == "stash":
+            after = tokens[tokens.index("stash") + 1:]
+            # Bare `git stash` == `git stash push`, hence the default.
+            sub = next((t for t in after if not t.startswith("-")), "push")
+            if sub in _READONLY_STASH_SUBCOMMANDS:
+                return False
+        cwd = (kwargs or {}).get("cwd")
+        try:
+            resolved_cwd = Path(cwd).resolve() if cwd else Path.cwd()
+        except Exception:
+            return False
+
+        # `git -C <path> checkout ...` (and --git-dir/--work-tree) retarget the
+        # command at <path> REGARDLESS of cwd, so a cwd-only check sails right
+        # past them. hermes_cli/mcp_catalog.py really does build
+        # `git -C <dest> checkout <ref>`, so this is a live shape, not
+        # hypothetical. Resolve the override relative to cwd and judge THAT.
+        target = None
+        for i, tok in enumerate(tokens):
+            if tok == "-C" and i + 1 < len(tokens):
+                target = tokens[i + 1]
+            elif tok.startswith("--git-dir=") or tok.startswith("--work-tree="):
+                target = tok.split("=", 1)[1]
+            elif tok in ("--git-dir", "--work-tree") and i + 1 < len(tokens):
+                target = tokens[i + 1]
+        if target is not None:
+            try:
+                candidate = Path(target)
+                resolved_cwd = (
+                    candidate if candidate.is_absolute() else resolved_cwd / candidate
+                ).resolve()
+                # A .git directory means the WORK TREE is its parent.
+                if resolved_cwd.name == ".git":
+                    resolved_cwd = resolved_cwd.parent
+            except Exception:
+                return False
+        try:
+            resolved_cwd.relative_to(PROJECT_ROOT)
+        except ValueError:
+            return False
+        return True
+
+    def _check_subprocess_cmd(name, cmd, kwargs=None):
+        if _is_destructive_git_against_project_root(cmd, kwargs):
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked "
+                f"subprocess.{name}({cmd!r}) — this is a real (unmocked) "
+                "destructive git command "
+                "(checkout/reset/clean/switch/stash/restore) "
+                f"whose cwd resolves inside PROJECT_ROOT ({PROJECT_ROOT}), "
+                "this repo's own live checkout. Running it for real would "
+                "flip the developer's actual branch or discard real "
+                "uncommitted work — this happened for real on 2026-08-11. "
+                "Mock subprocess.run/Popen for this call, or pass an "
+                "isolated cwd (e.g. tmp_path) instead of the live checkout. "
+                "Mark with @pytest.mark.live_system_guard_bypass if a real "
+                "git mutation against PROJECT_ROOT is genuinely intended "
+                "(it almost never is)."
+            )
         if _is_blocked_systemctl(cmd):
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
@@ -1479,7 +1577,7 @@ def _live_system_guard(request, monkeypatch):
 
     def _wrap_subprocess(name, real):
         def _guarded(cmd, *args, **kwargs):
-            _check_subprocess_cmd(name, cmd)
+            _check_subprocess_cmd(name, cmd, kwargs)
             return real(cmd, *args, **kwargs)
         _guarded.__name__ = f"_guarded_{name}"
         # Make the wrapper subscriptable like the wrapped callable when
@@ -1497,7 +1595,7 @@ def _live_system_guard(request, monkeypatch):
 
         class _GuardedPopen(real):  # type: ignore[misc, valid-type]
             def __init__(self, cmd, *args, **kwargs):
-                _check_subprocess_cmd("Popen", cmd)
+                _check_subprocess_cmd("Popen", cmd, kwargs)
                 super().__init__(cmd, *args, **kwargs)
 
         _GuardedPopen.__name__ = "Popen"
@@ -1569,12 +1667,12 @@ def _live_system_guard(request, monkeypatch):
 
         async def _guarded_async_exec(program, *args, **kwargs):
             _check_subprocess_cmd(
-                "asyncio.create_subprocess_exec", [program, *args]
+                "asyncio.create_subprocess_exec", [program, *args], kwargs
             )
             return await real_async_exec(program, *args, **kwargs)
 
         async def _guarded_async_shell(cmd, *args, **kwargs):
-            _check_subprocess_cmd("asyncio.create_subprocess_shell", cmd)
+            _check_subprocess_cmd("asyncio.create_subprocess_shell", cmd, kwargs)
             return await real_async_shell(cmd, *args, **kwargs)
 
         monkeypatch.setattr(_asyncio, "create_subprocess_exec", _guarded_async_exec)

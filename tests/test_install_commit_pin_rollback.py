@@ -89,6 +89,7 @@ def _run_pin_block(repo_dir: Path, commit: str, *, force: bool = False) -> str:
     )
     return subprocess.run(
         ["bash", "-c", script],
+        cwd=repo_dir,
         capture_output=True,
         text=True,
         check=True,

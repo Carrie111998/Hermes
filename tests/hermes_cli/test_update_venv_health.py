@@ -116,6 +116,16 @@ def _run_update_until_guard(args):
     ``git_dir = PROJECT_ROOT / ".git"`` — a PROJECT_ROOT sentinel whose
     ``__truediv__`` raises marks 'guard passed'."""
 
+    # Resolve ``hermes_cli.main`` from sys.modules at CALL time, shadowing the
+    # module-level binding above. tests/hermes_cli/test_skills_subparser.py
+    # evicts 'hermes_cli.main' from sys.modules and re-imports it, which
+    # creates a NEW module object. A stale module-level ``cli_main`` then
+    # refers to a dead module and EVERY patch.object below — including the
+    # PROJECT_ROOT sentinel — silently misses, while production code
+    # (update_cmd._m()) resolves the live module and runs a REAL
+    # `git stash push` against this repo. See Operations.md.
+    from hermes_cli import main as cli_main
+
     class _PastGuard(Exception):
         pass
 
