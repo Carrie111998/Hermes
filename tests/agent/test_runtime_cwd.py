@@ -16,7 +16,7 @@ from agent.runtime_cwd import (
 
 
 def test_authoritative_session_cwd_never_uses_process_cwd(monkeypatch, tmp_path):
-    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path / "stale-session"))
     monkeypatch.chdir(tmp_path)
     rt._SESSION_CWD.set(rt._UNSET)
 

@@ -70,7 +70,7 @@ def authoritative_session_cwd(task_id: str | None = None) -> str:
     override = _SESSION_CWD.get()
     if override is not _UNSET:
         return str(override or "").strip()
-    return os.environ.get("TERMINAL_CWD", "").strip()
+    return ""
 
 
 def resolve_agent_cwd() -> Path:
