@@ -700,7 +700,7 @@ class TestPayloadFilters:
                 "/webhooks/scripted", json={"event_type": "test"}, headers=headers
             )
 
-        assert failed.status == 503
+        assert failed.status == 500
         assert retried.status == 202
         await asyncio.sleep(0.05)
         assert [event.text for event in captured] == ["recovered"]

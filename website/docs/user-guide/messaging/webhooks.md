@@ -168,13 +168,15 @@ Use `script` when declarative filters are not enough. Scripts must live under `~
 
 The route payload is sent to stdin as JSON:
 
-Script routes also receive the authenticated request metadata in two bounded
-environment variables: `HERMES_WEBHOOK_EVENT_TYPE` and
-`HERMES_WEBHOOK_DELIVERY_ID`. The delivery ID is resolved from
+After Hermes authenticates the request body, script routes receive bounded
+provider/proxy transport-header metadata in two environment variables:
+`HERMES_WEBHOOK_EVENT_TYPE` and `HERMES_WEBHOOK_DELIVERY_ID`. The delivery ID is resolved from
 `X-GitHub-Delivery`, `svix-id`, or `X-Request-ID` and is the same value Hermes
 uses for idempotency. Script routes reject requests without one of these
 externally supplied identities; Hermes does not synthesize an identity for a
-stateful script. Payload fields cannot override either variable.
+stateful script. Payload fields cannot override either variable. GitHub HMAC
+and generic V2 signatures authenticate the body (and V2's timestamp), not these
+transport headers; deployments must enforce trusted proxy and header handling.
 
 ```python
 # ~/.hermes/scripts/todoist-hermes-label.py
@@ -195,7 +197,8 @@ Script outcomes:
 
 - JSON object stdout replaces the payload used by `prompt` and `deliver_extra`.
 - Non-JSON text stdout is added to the payload as `script_output`.
-- Empty stdout, exact `[SILENT]`, `{"__hermes_ignore__": true}`, timeout, missing script, or nonzero exit code returns HTTP 200 with `{"status":"ignored","reason":"script"}`.
+- Empty stdout, exact `[SILENT]`, or `{"__hermes_ignore__": true}` is an intentional completed ignore: it returns HTTP 200 with `{"status":"ignored","reason":"script"}` and retains the delivery reservation.
+- A timeout, missing script, or nonzero exit is a failed script execution: it returns HTTP 500 after releasing the delivery reservation so the sender can retry the same delivery.
 
 ### Prompt Templates
 

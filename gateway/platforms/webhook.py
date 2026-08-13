@@ -859,7 +859,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
                 return web.json_response(
                     {"error": "Route script execution failed", "route": route_name},
-                    status=503,
+                    status=500,
                 )
             if script_outcome == "ignored":
                 logger.info(
