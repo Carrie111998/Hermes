@@ -283,6 +283,133 @@ class TestPermissionsDenyFileTools:
         assert file_tools._terminal_env_type_for_task("task") == "vercel_sandbox"
         assert file_tools._uses_container_paths("task") is True
 
+    def test_unknown_active_environment_identity_fails_closed_before_backend(
+        self,
+        monkeypatch,
+    ):
+        from tools import terminal_tool
+
+        env = type("CustomRemoteEnvironment", (), {})()
+        monkeypatch.setattr(terminal_tool, "_active_environments", {"task": env})
+        monkeypatch.setattr(
+            terminal_tool,
+            "_resolve_container_task_id",
+            lambda task_id: task_id,
+        )
+        monkeypatch.setattr(
+            terminal_tool,
+            "_get_env_config",
+            lambda: {"env_type": "local"},
+        )
+        _install_permissions_config(monkeypatch, paths=["secret/**"])
+
+        with (
+            patch(
+                "tools.file_tools.Path.resolve",
+                side_effect=AssertionError("unknown backend must not resolve host paths"),
+            ) as mock_resolve,
+            patch(
+                "tools.file_tools.os.path.realpath",
+                side_effect=AssertionError("unknown backend must not dereference host paths"),
+            ) as mock_realpath,
+            patch(
+                "tools.file_tools.os.path.isfile",
+                side_effect=AssertionError("unknown backend must not probe host file types"),
+            ) as mock_isfile,
+            patch("tools.file_tools._get_file_ops") as mock_get,
+        ):
+            result = json.loads(file_tools.read_file_tool(
+                "/remote/secret/file.txt",
+                task_id="task",
+            ))
+
+        assert file_tools._terminal_env_type_for_task("task") == "unknown"
+        assert "error" in result
+        assert "backend path identity" in result["error"]
+        mock_resolve.assert_not_called()
+        mock_realpath.assert_not_called()
+        mock_isfile.assert_not_called()
+        mock_get.assert_not_called()
+
+    def test_unknown_environment_without_path_policy_preserves_backend_behavior(
+        self,
+        monkeypatch,
+    ):
+        from tools import terminal_tool
+
+        env = type("CustomRemoteEnvironment", (), {})()
+        monkeypatch.setattr(terminal_tool, "_active_environments", {"task": env})
+        monkeypatch.setattr(
+            terminal_tool,
+            "_resolve_container_task_id",
+            lambda task_id: task_id,
+        )
+        _install_permissions_config(monkeypatch, paths=[])
+
+        mock_ops = MagicMock()
+        mock_result = MagicMock()
+        mock_result.content = "allowed"
+        mock_result.total_lines = 1
+        mock_result.error = None
+        mock_result.to_dict.return_value = {"content": "allowed", "total_lines": 1}
+        mock_ops.read_file.return_value = mock_result
+
+        with patch("tools.file_tools._get_file_ops", return_value=mock_ops):
+            result = json.loads(file_tools.read_file_tool(
+                "/remote/public/file.txt",
+                task_id="task",
+            ))
+
+        assert result["content"] == "allowed"
+        mock_ops.read_file.assert_called_once()
+
+    def test_backend_discovery_failure_does_not_default_to_local(
+        self,
+        monkeypatch,
+    ):
+        from tools import terminal_tool
+
+        monkeypatch.setattr(
+            terminal_tool,
+            "_resolve_container_task_id",
+            lambda _task_id: (_ for _ in ()).throw(RuntimeError("discovery failed")),
+        )
+        monkeypatch.setattr(
+            terminal_tool,
+            "_get_env_config",
+            lambda: (_ for _ in ()).throw(RuntimeError("config failed")),
+        )
+        monkeypatch.delenv("TERMINAL_ENV", raising=False)
+        _install_permissions_config(monkeypatch, paths=["secret/**"])
+
+        with (
+            patch(
+                "tools.file_tools.Path.resolve",
+                side_effect=AssertionError("failed discovery must not resolve host paths"),
+            ) as mock_resolve,
+            patch(
+                "tools.file_tools.os.path.realpath",
+                side_effect=AssertionError("failed discovery must not dereference host paths"),
+            ) as mock_realpath,
+            patch(
+                "tools.file_tools.os.path.isfile",
+                side_effect=AssertionError("failed discovery must not probe host file types"),
+            ) as mock_isfile,
+            patch("tools.file_tools._get_file_ops") as mock_get,
+        ):
+            result = json.loads(file_tools.read_file_tool(
+                "/remote/secret/file.txt",
+                task_id="task",
+            ))
+
+        assert file_tools._terminal_env_type_for_task("task") == "unknown"
+        assert "error" in result
+        assert "backend path identity" in result["error"]
+        mock_resolve.assert_not_called()
+        mock_realpath.assert_not_called()
+        mock_isfile.assert_not_called()
+        mock_get.assert_not_called()
+
     def test_absolute_candidate_matches_task_anchored_relative_rule(self, monkeypatch):
         _install_permissions_config(monkeypatch, paths=["secret/**"])
 

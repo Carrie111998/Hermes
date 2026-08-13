@@ -168,10 +168,28 @@ def _resolve_path(filepath: str, task_id: str = "default") -> Path | PurePosixPa
 # sessions get the same protection. See references/worktree-cwd-discipline.md.
 _TERMINAL_CWD_SENTINELS = frozenset({"", ".", "./", "auto", "cwd"})
 _CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
+_KNOWN_PATH_BACKENDS = frozenset({
+    "local", "ssh", *_CONTAINER_PATH_BACKENDS_FALLBACK,
+})
+_ENVIRONMENT_CLASS_PATH_BACKENDS = {
+    "localenvironment": "local",
+    "sshenvironment": "ssh",
+    "dockerenvironment": "docker",
+    "singularityenvironment": "singularity",
+    "vercelsandboxenvironment": "vercel_sandbox",
+    "modalenvironment": "modal",
+    "managedmodalenvironment": "modal",
+    "daytonaenvironment": "daytona",
+}
 
 
 def _terminal_env_type_for_task(task_id: str = "default") -> str:
-    """Best-effort terminal backend type for path-resolution decisions."""
+    """Return the authoritative backend identity used for path semantics.
+
+    Unknown active environments and discovery/config failures stay explicit as
+    ``"unknown"``. They must never inherit host/local path semantics merely
+    because ``local`` is the process default.
+    """
     try:
         from tools.terminal_tool import (
             _active_environments,
@@ -180,32 +198,29 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
             _resolve_container_task_id,
         )
 
-        try:
-            container_key = _resolve_container_task_id(task_id)
-        except Exception:
-            container_key = task_id
+        container_key = _resolve_container_task_id(task_id)
         with _env_lock:
             env = _active_environments.get(container_key) or _active_environments.get(task_id)
         if env is not None:
             name = env.__class__.__name__.lower()
-            if "local" in name:
-                return "local"
-            if "ssh" in name:
-                return "ssh"
-            if "docker" in name:
-                return "docker"
-            if "singularity" in name:
-                return "singularity"
-            if "vercel" in name and "sandbox" in name:
-                return "vercel_sandbox"
-            if "modal" in name:
-                return "modal"
-            if "daytona" in name:
-                return "daytona"
+            return _ENVIRONMENT_CLASS_PATH_BACKENDS.get(name, "unknown")
         cfg = _get_env_config()
-        return str(cfg.get("env_type") or os.getenv("TERMINAL_ENV") or "local").lower()
+        configured = str(
+            cfg.get("env_type") or os.getenv("TERMINAL_ENV") or "local"
+        ).strip().lower()
+        return configured if configured in _KNOWN_PATH_BACKENDS else "unknown"
     except Exception:
-        return str(os.getenv("TERMINAL_ENV") or "local").lower()
+        return "unknown"
+
+
+def _unknown_backend_path_identity_error(task_id: str = "default") -> str | None:
+    """Fail closed when file paths cannot be assigned a safe backend dialect."""
+    if _terminal_env_type_for_task(task_id) != "unknown":
+        return None
+    return (
+        "Cannot evaluate permissions.deny.paths because the terminal backend "
+        "path identity is unknown. No backend content operation was attempted."
+    )
 
 
 def _uses_container_paths(task_id: str = "default") -> bool:
@@ -684,6 +699,14 @@ def _check_permissions_deny_path(filepath: str, task_id: str = "default") -> str
         if match is not None:
             return path_deny_error(filepath, match)
 
+        identity_error = (
+            _unknown_backend_path_identity_error(task_id)
+            if configured_patterns
+            else None
+        )
+        if identity_error:
+            return identity_error
+
         is_absolute = (
             os.path.isabs(expanded)
             or posixpath.isabs(expanded)
@@ -749,6 +772,14 @@ def _check_permissions_deny_search_root(filepath: str, task_id: str = "default")
         )
         if match is not None:
             return path_deny_error(filepath, match)
+
+        identity_error = (
+            _unknown_backend_path_identity_error(task_id)
+            if configured_patterns
+            else None
+        )
+        if identity_error:
+            return identity_error
 
         candidates = [expanded]
         try:
