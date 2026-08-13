@@ -17,6 +17,7 @@ from hermes_cli.tools_config import (
     _reconfigure_provider,
     _get_platform_tools,
     _platform_toolset_summary,
+    _print_subprocess_failure_detail,
     _reconfigure_tool,
     _run_post_setup,
     _save_platform_tools,
@@ -31,6 +32,35 @@ from hermes_cli.tools_config import (
 )
 
 
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (SimpleNamespace(returncode=127, stdout="", stderr=""), "exited with code 127"),
+        (SimpleNamespace(returncode=1, stdout="stdout detail", stderr=""), "stdout detail"),
+        (SimpleNamespace(returncode=1, stdout="stdout detail", stderr="\n"), "stdout detail"),
+        (SimpleNamespace(returncode=1, stdout="stdout", stderr="stderr detail"), "stderr detail"),
+    ],
+)
+def test_print_subprocess_failure_detail(monkeypatch, result, expected):
+    import hermes_cli.tools_config as tools_config
+
+    lines = []
+    monkeypatch.setattr(tools_config, "_print_info", lambda msg: lines.append(msg))
+    _print_subprocess_failure_detail(result)
+    assert lines == [f"      {expected}"]
+
+
+@pytest.mark.parametrize("post_setup_key", ["browserbase", "camofox"])
+def test_post_setup_npm_failure_reports_exit_code(monkeypatch, tmp_path, post_setup_key):
+    import hermes_cli.tools_config as tools_config
+
+    lines = []
+    monkeypatch.setattr(tools_config, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("hermes_constants.find_node_executable", lambda name: "npm")
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: SimpleNamespace(returncode=127, stdout="", stderr=""))
+    monkeypatch.setattr(tools_config, "_print_info", lines.append)
+    _run_post_setup(post_setup_key)
+    assert "      exited with code 127" in lines
 
 
 def test_all_invalid_platform_toolsets_logs_runtime_warning(caplog):
