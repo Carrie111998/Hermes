@@ -286,6 +286,14 @@ the gateway rejects that ingress and logs the route and target. It does not run
 the default profile. Traffic that matches no route keeps the historical
 default-profile behavior.
 
+Slash commands (`/new`, `/reset`) and adapter text-batch keys use the same
+routed namespace. If `source.profile` is unset (reconnect, internal source,
+slash-confirm callback), the gateway stamps it from `profile_routes` before
+minting or resetting a key — it does **not** fall back to the process-default
+`agent:main:` session. An owner-routed DM `/new` therefore touches only
+`agent:owner:…`. The first-turn `/sethome` home-channel notice is evaluated
+under that profile's runtime scope, not the multiplexer's default config.
+
 ## Start, stop, or restart all gateways at once
 
 The CLI ships with single-profile lifecycle commands. To act across every
