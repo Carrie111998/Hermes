@@ -1902,6 +1902,13 @@ def _prepare_mcp_registry_for_gateway_agent() -> None:
         logger.warning(
             "Profile-scoped MCP discovery failed before agent build: %s", exc
         )
+        raise
+
+
+def _create_gateway_agent(agent_factory, **kwargs):
+    """Build an agent only after scoped MCP discovery completes."""
+    _prepare_mcp_registry_for_gateway_agent()
+    return agent_factory(**kwargs)
 
 
 def load_gateway_config_for_runner() -> "GatewayConfig":
@@ -4725,8 +4732,8 @@ class TurnRunner:
 
         if agent is None:
             # Config changed or first message — create fresh agent
-            _prepare_mcp_registry_for_gateway_agent()
-            agent = ctx.AIAgent(
+            agent = _create_gateway_agent(
+                ctx.AIAgent,
                 model=turn_route["model"],
                 **turn_route["runtime"],
                 **_checkpoint_agent_kwargs(ctx.user_config),
