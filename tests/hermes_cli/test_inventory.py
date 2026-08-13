@@ -84,6 +84,48 @@ def _nous_row(model: str = "openai/gpt-5.5") -> dict:
     }
 
 
+def test_excluded_models_filters_only_matching_provider_models():
+    rows = [
+        {
+            "slug": "ollama-cloud",
+            "name": "Ollama Cloud",
+            "models": ["deepseek-v4-flash:cloud", "kimi-k2.5", "minimax-m2.5"],
+            "total_models": 3,
+            "is_current": True,
+            "is_user_defined": False,
+            "source": "built-in",
+        },
+        {
+            "slug": "openrouter",
+            "name": "OpenRouter",
+            "models": ["kimi-k2.5"],
+            "total_models": 1,
+            "is_current": False,
+            "is_user_defined": False,
+            "source": "built-in",
+        },
+    ]
+    ctx = ConfigContext(
+        current_provider="ollama-cloud",
+        current_model="deepseek-v4-flash:cloud",
+        current_base_url="https://ollama.com/v1",
+        user_providers={},
+        custom_providers=[],
+        excluded_models={"ollama-cloud": ["KIMI-K2.5", "minimax-m2.5"]},
+    )
+
+    with _list_auth_returning(rows):
+        payload = build_models_payload(ctx)
+
+    by_slug = {row["slug"]: row for row in payload["providers"]}
+    ollama_row = by_slug["ollama-cloud"]
+    openrouter_row = by_slug["openrouter"]
+    assert ollama_row["models"] == ["deepseek-v4-flash:cloud"]
+    assert ollama_row["total_models"] == 1
+    assert openrouter_row["models"] == ["kimi-k2.5"]
+    assert openrouter_row["total_models"] == 1
+
+
 
 
 def test_cli_model_picker_forwards_force_refresh_to_probe_flags():
@@ -509,7 +551,5 @@ def _apply_featured_with_dates(rows, dates: dict[str, str]):
 
     with patch("agent.models_dev.get_model_info", side_effect=_fake_get_model_info):
         inventory._apply_featured(rows)
-
-
 
 

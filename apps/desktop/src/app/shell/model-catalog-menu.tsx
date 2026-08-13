@@ -20,8 +20,12 @@ import { usePointerQuiet } from '@/components/ui/keyboard-first'
 import { Skeleton } from '@/components/ui/skeleton'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
-import { displayModelName, modelDisplayParts } from '@/lib/model-status-label'
+import {
+  type ModelOptionsGatewayRequest,
+  modelOptionsQueryKey,
+  requestModelOptions
+} from '@/lib/model-options'
+import { displayModelName, isExplicitContentModel, modelDisplayParts } from '@/lib/model-status-label'
 import { DEFAULT_REASONING_EFFORT, reasoningEffortLabel } from '@/lib/reasoning-effort'
 import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
@@ -89,6 +93,8 @@ interface ModelCatalogMenuProps {
    *  Off for override surfaces, where a MoA preset isn't a worker model. */
   includeMoa?: boolean
   profile?: string
+  /** Reconnecting/auth-aware request seam supplied by live chat surfaces. */
+  requestGateway?: ModelOptionsGatewayRequest
   /** Session whose catalog to fetch. A live session's catalog can differ from
    *  the profile-global one, and the app invalidates the SESSION-scoped query
    *  key on model changes — a surface bound to a session must pass it or its
@@ -99,6 +105,38 @@ interface ModelCatalogMenuProps {
 interface ProviderGroup {
   families: ModelFamily[]
   provider: ModelOptionProvider
+}
+
+function providerStatus(provider: ModelOptionProvider): { className: string; label: string; title: string } {
+  if (provider.warning) {
+    return {
+      className: 'border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400',
+      label: 'CHECK',
+      title: provider.warning
+    }
+  }
+
+  if (provider.authenticated === false) {
+    return {
+      className: 'border-rose-500/30 bg-rose-500/10 text-rose-600 dark:text-rose-400',
+      label: 'SETUP',
+      title: 'No usable credential is configured for this provider.'
+    }
+  }
+
+  if (provider.authenticated === true) {
+    return {
+      className: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+      label: 'KEY/OAUTH SET',
+      title: 'A credential is configured. This does not guarantee that every listed model has credits or access.'
+    }
+  }
+
+  return {
+    className: 'border-border bg-muted/40 text-(--ui-text-tertiary)',
+    label: 'CATALOG',
+    title: 'Models are listed, but this provider has not reported credential status.'
+  }
 }
 
 /**
@@ -114,6 +152,7 @@ export function ModelCatalogMenu({
   gateway,
   includeMoa = false,
   profile = 'default',
+  requestGateway,
   sessionId = null
 }: ModelCatalogMenuProps) {
   const { t } = useI18n()
@@ -133,7 +172,8 @@ export function ModelCatalogMenu({
     // Gateway-first even with no session: a connected (possibly remote)
     // gateway owns the model catalog, including virtual providers the local
     // REST fallback can't know about (#53817).
-    queryFn: (): Promise<ModelOptionsResponse> => requestModelOptions({ gateway, sessionId })
+    queryFn: (): Promise<ModelOptionsResponse> =>
+      requestModelOptions({ gateway, requestGateway, sessionId })
   })
 
   const loading = modelOptions.isPending && !modelOptions.data
@@ -355,6 +395,7 @@ export function ModelCatalogMenu({
         <div className={cn('max-h-[max(150px,30dvh)] overflow-y-auto py-0.5', quietRows)} ref={listRef}>
           {groups.map(group => {
             const slug = group.provider.slug
+            const status = providerStatus(group.provider)
 
             // Collapsed when the user stored it (and not while searching, which
             // spans every model regardless of collapse state).
@@ -372,6 +413,15 @@ export function ModelCatalogMenu({
                 >
                   <span className="truncate">
                     <HighlightMatches query={search} text={group.provider.name} />
+                  </span>
+                  <span
+                    className={cn(
+                      'ml-auto shrink-0 rounded border px-1 py-px text-[0.5rem] font-semibold leading-none tracking-normal',
+                      status.className
+                    )}
+                    title={status.title}
+                  >
+                    {status.label}
                   </span>
                   <DisclosureCaret
                     className="shrink-0 text-(--ui-text-tertiary) opacity-0 transition group-hover/label:opacity-100"
@@ -414,6 +464,13 @@ export function ModelCatalogMenu({
                       .filter(Boolean)
                       .join(' ')
 
+                    const explicitContent =
+                      isExplicitContentModel(family.id) || Boolean(family.fastId && isExplicitContentModel(family.fastId))
+
+                    const { className: keyboardClassName, ...keyboardProps } = kbRowProps(
+                      `${group.provider.slug}:${family.id}`
+                    )
+
                     // Clicking the row commits the model and closes; the edit
                     // submenu (reasoning/fast) is reached by HOVER, so you can
                     // tweak those without the click dismissing everything.
@@ -428,6 +485,11 @@ export function ModelCatalogMenu({
                     return (
                       <DropdownMenuSub key={`${group.provider.slug}:${family.id}`}>
                         <DropdownMenuSubTrigger
+                          className={cn(
+                            keyboardClassName,
+                            explicitContent &&
+                              'bg-rose-500/5 text-rose-600 data-[state=open]:bg-rose-500/10 dark:text-rose-400'
+                          )}
                           hideChevron
                           onClick={activate}
                           onKeyDown={event => {
@@ -435,12 +497,17 @@ export function ModelCatalogMenu({
                               activate()
                             }
                           }}
-                          {...kbRowProps(`${group.provider.slug}:${family.id}`)}
+                          {...keyboardProps}
                         >
-                          <span className="min-w-0 flex-1 truncate">
+                          <span className={cn('min-w-0 flex-1 truncate', explicitContent && 'font-medium')}>
                             <HighlightMatches query={search} text={name} />
                             {meta ? <span className="text-(--ui-text-tertiary)"> {meta}</span> : null}
                           </span>
+                          {explicitContent ? (
+                            <span className="ml-1 shrink-0 rounded border border-rose-500/30 bg-rose-500/10 px-1 py-px text-[0.5rem] font-bold leading-none tracking-wide text-rose-600 dark:text-rose-400">
+                              NSFW
+                            </span>
+                          ) : null}
                           {isCurrent ? (
                             <Codicon className="ml-auto text-foreground" name="check" size="0.75rem" />
                           ) : null}
@@ -539,7 +606,11 @@ function groupModels(
     }
 
     const matches = (family: ModelFamily) =>
-      `${family.id} ${family.fastId ?? ''} ${provider.name} ${provider.slug} ${displayModelName(family.id)}`
+      `${family.id} ${family.fastId ?? ''} ${provider.name} ${provider.slug} ${displayModelName(family.id)} ${
+        isExplicitContentModel(family.id) || (family.fastId && isExplicitContentModel(family.fastId))
+          ? 'nsfw uncensored explicit'
+          : ''
+      }`
         .toLowerCase()
         .includes(q)
 

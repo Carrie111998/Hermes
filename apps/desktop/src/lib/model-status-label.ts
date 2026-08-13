@@ -95,6 +95,17 @@ export function displayModelName(model: string): string {
   return modelDisplayParts(model).name
 }
 
+/**
+ * Keep the explicit-content marker deliberately conservative: a provider can
+ * serve both general and uncensored models, so only ids that say what they are
+ * get the NSFW treatment. This avoids painting every Venice model as NSFW.
+ */
+export function isExplicitContentModel(model: string): boolean {
+  const id = model.trim().toLowerCase()
+
+  return /(^|[/_.-])(nsfw|uncensored|bypass)([/_.-]|$)/.test(id) || /uncensored[-_]?role[-_]?play/.test(id)
+}
+
 /** Status bar trigger label — model name plus the live session state (effort/fast).
  *  `defaultEffort` is the profile's configured level, used when the surface has
  *  no explicit effort so the label never advertises a default the agent won't use. */

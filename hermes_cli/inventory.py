@@ -53,6 +53,7 @@ class ConfigContext:
     user_providers: dict
     custom_providers: list
     excluded_providers: list = None
+    excluded_models: dict = None
 
     def with_overrides(
         self,
@@ -97,7 +98,11 @@ def load_picker_context() -> ConfigContext:
         current_provider = ""
         current_base_url = ""
     raw = cfg.get("providers")
-    excluded = cfg.get("model_catalog", {}).get("excluded_providers") or []
+    catalog_cfg = cfg.get("model_catalog", {})
+    if not isinstance(catalog_cfg, dict):
+        catalog_cfg = {}
+    excluded = catalog_cfg.get("excluded_providers") or []
+    excluded_models = catalog_cfg.get("excluded_models") or {}
     return ConfigContext(
         current_provider=current_provider,
         current_model=current_model,
@@ -105,6 +110,7 @@ def load_picker_context() -> ConfigContext:
         user_providers=raw if isinstance(raw, dict) else {},
         custom_providers=get_compatible_custom_providers(cfg),
         excluded_providers=excluded if isinstance(excluded, list) else [],
+        excluded_models=excluded_models if isinstance(excluded_models, dict) else {},
     )
 
 
@@ -199,6 +205,34 @@ def build_models_payload(
         for_picker=for_picker,
         excluded_providers=ctx.excluded_providers or [],
     )
+
+    # A provider catalog can contain retired, quota-blocked, or otherwise
+    # unusable model IDs even while the provider itself is healthy. Allow a
+    # profile to hide only those verified-bad IDs without losing the rest of
+    # the provider. Values are matched case-insensitively by provider slug;
+    # the optional "*" bucket applies to every provider.
+    excluded_models = ctx.excluded_models or {}
+    if isinstance(excluded_models, dict):
+        global_excluded = excluded_models.get("*") or []
+        for row in rows:
+            slug = str(row.get("slug") or "").strip().lower()
+            provider_excluded = excluded_models.get(slug) or []
+            blocked = {
+                str(model_id).strip().lower()
+                for model_id in [*global_excluded, *provider_excluded]
+                if str(model_id).strip()
+            }
+            if not blocked:
+                continue
+            original = row.get("models") or []
+            filtered = [
+                model_id
+                for model_id in original
+                if str(model_id).strip().lower() not in blocked
+            ]
+            if len(filtered) < len(original):
+                row["models"] = filtered
+                row["total_models"] = len(filtered)
 
     moa_row = _moa_provider_row(ctx.current_provider)
     if moa_row is not None:

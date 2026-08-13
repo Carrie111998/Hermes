@@ -34,6 +34,8 @@ export function manualPickRemoved(
   return !models.includes(model)
 }
 
+export type ModelOptionsGatewayRequest = <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+
 interface ModelOptionsRequest {
   /** When false, include ambient/unconfigured providers (onboarding/setup
    *  surfaces). Chat pickers default to true so only explicitly configured
@@ -41,6 +43,7 @@ interface ModelOptionsRequest {
   explicitOnly?: boolean
   gateway?: HermesGateway
   refresh?: boolean
+  requestGateway?: ModelOptionsGatewayRequest
   sessionId?: null | string
 }
 
@@ -54,9 +57,10 @@ export function requestModelOptions({
   explicitOnly = true,
   gateway,
   refresh = false,
+  requestGateway,
   sessionId
 }: ModelOptionsRequest): Promise<ModelOptionsResponse> {
-  if (gateway) {
+  if (gateway || requestGateway) {
     const params: Record<string, unknown> = {}
 
     if (sessionId) {
@@ -71,7 +75,11 @@ export function requestModelOptions({
       params.explicit_only = true
     }
 
-    return gateway.request<ModelOptionsResponse>('model.options', params)
+    if (requestGateway) {
+      return requestGateway<ModelOptionsResponse>('model.options', params)
+    }
+
+    return gateway!.request<ModelOptionsResponse>('model.options', params)
   }
 
   return getGlobalModelOptions({ explicitOnly, ...(refresh ? { refresh: true } : {}) })

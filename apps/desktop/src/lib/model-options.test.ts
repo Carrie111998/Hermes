@@ -42,6 +42,30 @@ describe('requestModelOptions', () => {
     })
   })
 
+  it('uses the reconnecting request path instead of a stale gateway instance', async () => {
+    const staleGateway = {
+      request: vi.fn(() => Promise.reject(new Error('Hermes gateway is not connected')))
+    }
+
+    const requestGateway = vi.fn(() => Promise.resolve(globalOptions))
+
+    await expect(
+      requestModelOptions({
+        gateway: staleGateway as never,
+        requestGateway: requestGateway as never,
+        refresh: true,
+        sessionId: 'session-1'
+      })
+    ).resolves.toBe(globalOptions)
+
+    expect(requestGateway).toHaveBeenCalledWith('model.options', {
+      explicit_only: true,
+      refresh: true,
+      session_id: 'session-1'
+    })
+    expect(staleGateway.request).not.toHaveBeenCalled()
+  })
+
   it('falls back to REST when no gateway is connected', async () => {
     await requestModelOptions({ refresh: true })
 

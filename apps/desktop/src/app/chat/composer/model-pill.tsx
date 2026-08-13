@@ -164,7 +164,7 @@ export function ModelPill({
           </Button>
         </DropdownMenuTrigger>
       </Tip>
-      <DropdownMenuContent align="end" className="w-64 p-0" side="top" sideOffset={8}>
+      <DropdownMenuContent align="end" className="w-80 p-0" side="top" sideOffset={8}>
         <ModelMenuCloseContext.Provider value={() => setMenuOpen(false)}>
           {model.modelMenuContent}
         </ModelMenuCloseContext.Provider>
