@@ -329,4 +329,52 @@ describe('useMessageStream interim text sealing', () => {
     const texts = assistantMessages()
     expect(texts.filter(t => t.replace(/\s+/g, ' ').trim() === 'here is the final answer')).toHaveLength(1)
   })
+
+  it('settles a whitespace-equivalent final even after a chained message.start resets the boundary flag (#81422)', async () => {
+    await mountStream()
+    await start()
+
+    // Turn 1 streams text that is sealed as an interim at a tool boundary.
+    await delta('here is the final answer')
+    await interim('here is the final answer')
+    expect(getState().interimBoundaryPending).toBe(true)
+
+    // A chained message.start (goal follow-up / completion drain) lands before
+    // the final message.complete and resets interimBoundaryPending to false
+    // (gateway-event.ts message.start handler) — the exact case the gate
+    // widening in the #81566 follow-up exists for.
+    await start()
+    expect(getState().interimBoundaryPending).toBe(false)
+
+    // The final is whitespace-equivalent to the sealed interim but NOT
+    // trim-equal, so neither the legacy exact-match clause nor the old
+    // `interimBoundaryPending && ...` gate can fire. Only finalContinuesInterim
+    // (which keys on existing.interim itself) recognizes it: settle in place,
+    // one bubble. Under the pre-widening gate this appended a duplicate row.
+    await complete('here  is  the  final  answer ')
+
+    const texts = assistantMessages()
+    expect(texts.filter(t => t.replace(/\s+/g, ' ').trim() === 'here is the final answer')).toHaveLength(1)
+  })
+
+  it('appends a genuinely different final instead of settling it onto an older sealed interim', async () => {
+    await mountStream()
+    await start()
+
+    // An earlier (interrupted) tool-call turn sealed an interim whose final
+    // never matched — it stays interim: true in the message list. A chained
+    // start begins a genuinely new turn whose completion has no textual
+    // relationship to that stale interim. finalContinuesInterim requires a
+    // text match, so the new reply must be appended, never settled onto the
+    // old bubble.
+    await delta('stale interim text')
+    await interim('stale interim text')
+    await start()
+    await complete('the answer is 42')
+
+    const texts = assistantMessages()
+    expect(texts).toContain('stale interim text')
+    expect(texts).toContain('the answer is 42')
+    expect(texts).toHaveLength(2)
+  })
 })
