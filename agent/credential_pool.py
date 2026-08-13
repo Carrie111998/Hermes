@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import random
+import secrets
 import threading
 import time
 import uuid
@@ -43,6 +45,89 @@ from hermes_cli.auth import (
 )
 
 logger = logging.getLogger(__name__)
+
+_CODEX_GRANT_ID_KEY = "shared_grant_id"
+_CODEX_TOKEN_FINGERPRINT_DOMAIN = b"hermes:openai-codex:grant-token:v1:\x00"
+
+
+def _codex_token_fingerprint(token: Any) -> bytes:
+    """Return a non-reversible fingerprint for a Codex token value."""
+    value = str(token or "").strip()
+    if not value:
+        return b""
+    return hashlib.sha256(
+        _CODEX_TOKEN_FINGERPRINT_DOMAIN + value.encode("utf-8")
+    ).digest()
+
+
+def _codex_tokens_match(entry: "PooledCredential", state: Any) -> bool:
+    """Prove an alias came from the canonical state without logging tokens."""
+    if not isinstance(state, dict) or not isinstance(state.get("tokens"), dict):
+        return False
+    tokens = state["tokens"]
+    entry_access = _codex_token_fingerprint(entry.access_token)
+    entry_refresh = _codex_token_fingerprint(entry.refresh_token)
+    state_access = _codex_token_fingerprint(tokens.get("access_token"))
+    state_refresh = _codex_token_fingerprint(tokens.get("refresh_token"))
+    return bool(
+        entry_access
+        and entry_refresh
+        and entry_access == state_access
+        and entry_refresh == state_refresh
+    )
+
+
+def _codex_terminal_global_grant_id() -> str:
+    """Return the canonical Codex grant when its root state is terminal."""
+    try:
+        canonical_path = auth_mod._global_auth_file_path()
+        if canonical_path is None:
+            canonical_path = auth_mod._auth_file_path()
+        with _auth_store_lock(target_path=canonical_path):
+            root_state = _load_provider_state(
+                _load_auth_store(canonical_path), "openai-codex"
+            )
+        if not isinstance(root_state, dict):
+            return ""
+        tokens = root_state.get("tokens")
+        error = root_state.get("last_auth_error")
+        if (
+            not isinstance(tokens, dict)
+            or any(
+                str(tokens.get(key) or "").strip()
+                for key in ("access_token", "refresh_token")
+            )
+            or not isinstance(error, dict)
+            or not error.get("relogin_required")
+        ):
+            return ""
+        return str(root_state.get(_CODEX_GRANT_ID_KEY) or "").strip()
+    except Exception:
+        return ""
+
+
+def _codex_entry_grant_id(payload: Any) -> str:
+    """Read both historical serialized shapes for a shared grant id."""
+    if not isinstance(payload, dict):
+        return ""
+    nested = payload.get("extra")
+    nested_grant = nested.get(_CODEX_GRANT_ID_KEY) if isinstance(nested, dict) else None
+    return str(
+        payload.get(_CODEX_GRANT_ID_KEY) or nested_grant or ""
+    ).strip()
+
+
+def _remove_codex_grant_from_store(store: Dict[str, Any], grant_id: str) -> None:
+    """Remove every serialized alias for one Codex grant, preserving others."""
+    pool = store.get("credential_pool")
+    entries = pool.get("openai-codex") if isinstance(pool, dict) else None
+    if not isinstance(entries, list):
+        return
+    pool["openai-codex"] = [
+        item
+        for item in entries
+        if _codex_entry_grant_id(item) != grant_id
+    ]
 
 
 def _load_config_safe() -> Optional[dict]:
@@ -161,6 +246,7 @@ _EXTRA_KEYS = frozenset({
     "token_type", "scope", "client_id", "portal_base_url", "obtained_at",
     "expires_in", "agent_key_id", "agent_key_expires_in", "agent_key_reused",
     "agent_key_obtained_at", "tls", "secret_source", "secret_fingerprint",
+    "shared_grant_id",
     # Classified failure semantics for the last exhaustion, as decided by
     # agent/error_classifier.py. The raw HTTP status is not enough to size a
     # cooldown: providers return 403 for both an edge throttle (transient,
@@ -229,7 +315,19 @@ class PooledCredential:
         # Rehydrated last_status_at may be an ISO string from to_dict() — normalize to float epoch
         if "last_status_at" in data and isinstance(data["last_status_at"], str):
             data["last_status_at"] = _parse_absolute_timestamp(data["last_status_at"])
-        extra = {k: payload[k] for k in _EXTRA_KEYS if k in payload and payload[k] is not None}
+        extra = {
+            k: payload[k]
+            for k in _EXTRA_KEYS
+            if k in payload and payload[k] is not None
+        }
+        # Older serializers nested metadata under ``extra``.  Keep accepting
+        # that shape for the shared Codex grant identity, while continuing to
+        # emit the canonical top-level form from ``to_dict()``.
+        nested_extra = payload.get("extra")
+        if isinstance(nested_extra, dict):
+            for key in _EXTRA_KEYS:
+                if key not in extra and nested_extra.get(key) is not None:
+                    extra[key] = nested_extra[key]
         data["extra"] = extra
         data.setdefault("id", uuid.uuid4().hex[:6])
         data.setdefault("label", payload.get("source", provider))
@@ -888,89 +986,158 @@ class CredentialPool:
         return entry
 
     def _sync_codex_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
-        """Sync a Codex device_code pool entry from auth.json if tokens differ.
+        """Adopt canonical Codex state without conflating independent grants.
 
-        When a Codex OAuth access token expires (or the ChatGPT account hits
-        its 5h/weekly quota), the pool entry gets marked ``STATUS_EXHAUSTED``
-        with a ``last_error_reset_at`` that can be many hours in the future.
-        Meanwhile the user may run ``hermes model`` / ``hermes auth`` which
-        performs a fresh device-code login and writes new tokens to
-        ``auth.json`` under ``_auth_store_lock``.  Without this sync the pool
-        entry stays frozen until ``last_error_reset_at`` elapses — even
-        though fresh credentials are sitting on disk — and every request
-        fails with "no available entries (all exhausted or empty)".
-
-        Mirrors the Nous/Anthropic resync paths above.  Only applies to
-        device_code-sourced entries; env/API-key-sourced entries have no
-        auth.json shadow to sync from.
+        A ``manual:device_code`` entry is a profile alias only when it resolves
+        to a distinct global auth store.  It may adopt a canonical grant id
+        once when its token pair exactly matches the canonical snapshot; after
+        that point the grant id, not token equality, is the sharing identity.
+        Every read and any identity assignment is protected by the owning
+        auth-store lock.  Token values are never logged.
         """
-        if self.provider != "openai-codex" or entry.source not in ("device_code", "manual:device_code"):
+        if self.provider != "openai-codex":
             return entry
-        try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
-                state = _load_provider_state(auth_store, "openai-codex")
+        if entry.source not in ("device_code", "manual:device_code"):
+            return entry
+
+        def _state_from_store(store: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            providers = store.get("providers")
+            state = providers.get("openai-codex") if isinstance(providers, dict) else None
+            return state if isinstance(state, dict) else None
+
+        def _sync_locked(
+            current: PooledCredential,
+            state: Optional[Dict[str, Any]],
+            store: Dict[str, Any],
+            target_path: Path,
+            *,
+            shared_source: bool,
+        ) -> PooledCredential:
             if not isinstance(state, dict):
-                return entry
+                return current
+            root_grant_id = str(state.get(_CODEX_GRANT_ID_KEY) or "").strip()
+            alias_grant_id = str(
+                current.extra.get(_CODEX_GRANT_ID_KEY) or ""
+            ).strip()
+
+            # A manual alias with a local provider block is independent. Never
+            # make profile-local credentials share merely because their tokens
+            # happen to be equal.
+            if current.source == "manual:device_code" and not shared_source:
+                return current
+
+            if root_grant_id or alias_grant_id:
+                if not root_grant_id or (
+                    alias_grant_id and alias_grant_id != root_grant_id
+                ):
+                    return current
+                if not alias_grant_id:
+                    if not _codex_tokens_match(current, state):
+                        return current
+                    extra = dict(current.extra)
+                    extra[_CODEX_GRANT_ID_KEY] = root_grant_id
+                    updated = replace(current, extra=extra)
+                    self._replace_entry(current, updated)
+                    self._persist()
+                    current = updated
+            elif _codex_tokens_match(current, state):
+                # First contact with an id-less canonical state: create an
+                # opaque, random identity and persist it to the canonical
+                # store. This id remains stable across token rotations.
+                root_grant_id = secrets.token_hex(16)
+                state[_CODEX_GRANT_ID_KEY] = root_grant_id
+                _store_provider_state(
+                    store, "openai-codex", state, set_active=False
+                )
+                _save_auth_store(store, target_path=target_path)
+                extra = dict(current.extra)
+                extra[_CODEX_GRANT_ID_KEY] = root_grant_id
+                updated = replace(current, extra=extra)
+                self._replace_entry(current, updated)
+                self._persist()
+                current = updated
+            else:
+                return current
+
             tokens = state.get("tokens")
             if not isinstance(tokens, dict):
-                return entry
+                return current
             store_access = tokens.get("access_token", "")
             store_refresh = tokens.get("refresh_token", "")
-            # Adopt auth.json tokens when either side differs.  Codex refresh
-            # tokens are single-use too, so a fresh refresh_token from
-            # another process means our entry's pair is consumed/stale.
-            #
-            # Also adopt when the store has a refresh_token but no
-            # access_token — another process may have rotated the pair
-            # and the store entry's access_token was already consumed;
-            # the important signal is the refresh_token difference.
-            entry_access = entry.access_token or ""
-            entry_refresh = entry.refresh_token or ""
-            should_adopt = False
             if store_access and (
-                store_access != entry_access
-                or (store_refresh and store_refresh != entry_refresh)
+                store_access != (current.access_token or "")
+                or (store_refresh and store_refresh != (current.refresh_token or ""))
             ):
-                should_adopt = True
-            elif (
-                store_refresh
-                and store_refresh != entry_refresh
-                and not store_access
-            ):
-                # Store has only a refresh_token (no access_token) —
-                # another process rotated the pair.  Adopt the
-                # refresh_token so we don't replay the consumed one.
-                logger.info(
-                    "Pool entry %s: auth.json has newer refresh_token "
-                    "but no access_token; adopting refresh_token to "
-                    "avoid replaying consumed token",
-                    entry.id,
+                updated = replace(
+                    current,
+                    access_token=store_access,
+                    refresh_token=store_refresh or current.refresh_token,
+                    last_status=None,
+                    last_status_at=None,
+                    last_error_code=None,
+                    last_error_reason=None,
+                    last_error_message=None,
+                    last_error_reset_at=None,
+                    last_refresh=state.get("last_refresh") or current.last_refresh,
                 )
-                should_adopt = True
-
-            if should_adopt:
-                logger.debug(
-                    "Pool entry %s: syncing Codex tokens from auth.json "
-                    "(refreshed by another process)",
-                    entry.id,
-                )
-                field_updates: Dict[str, Any] = {
-                    "access_token": store_access or entry.access_token,
-                    "refresh_token": store_refresh or entry.refresh_token,
-                    "last_status": None,
-                    "last_status_at": None,
-                    "last_error_code": None,
-                    "last_error_reason": None,
-                    "last_error_message": None,
-                    "last_error_reset_at": None,
-                }
-                if state.get("last_refresh"):
-                    field_updates["last_refresh"] = state["last_refresh"]
-                updated = replace(entry, **field_updates)
-                self._replace_entry(entry, updated)
+                self._replace_entry(current, updated)
                 self._persist()
                 return updated
+            if (
+                store_refresh
+                and store_refresh != (current.refresh_token or "")
+                and not store_access
+            ):
+                updated = replace(
+                    current,
+                    refresh_token=store_refresh,
+                    last_status=None,
+                    last_status_at=None,
+                    last_error_code=None,
+                    last_error_reason=None,
+                    last_error_message=None,
+                    last_error_reset_at=None,
+                    last_refresh=state.get("last_refresh") or current.last_refresh,
+                )
+                self._replace_entry(current, updated)
+                self._persist()
+                return updated
+            return current
+
+        try:
+            # ``_refresh_entry`` already owns the active-store lock for
+            # single-use providers.  Re-entering the imported binding makes
+            # tests and alternate lock implementations observe a second
+            # transaction, so this helper uses the auth module's canonical
+            # provider transaction directly and remains safe when called
+            # outside the refresh path too.
+            with auth_mod._provider_state_transaction("openai-codex") as (
+                active_store,
+                state,
+                source_path,
+            ):
+                if not isinstance(state, dict) or source_path is None:
+                    return entry
+                active_path = auth_mod._auth_file_path()
+                source_store = active_store
+                if not _same_path(source_path, active_path):
+                    # The transaction context holds the source-path lock but
+                    # intentionally returns the active store for callers that
+                    # only need read access.  Reload the actual source store
+                    # before any write so root-only metadata and pool rows are
+                    # preserved during write-through.
+                    source_store = _load_auth_store(source_path)
+                    source_state = _state_from_store(source_store)
+                    if not isinstance(source_state, dict):
+                        return entry
+                    state = source_state
+                return _sync_locked(
+                    entry,
+                    state,
+                    source_store,
+                    source_path,
+                    shared_source=not _same_path(source_path, active_path),
+                )
         except Exception as exc:
             logger.debug("Failed to sync Codex entry from auth.json: %s", exc)
         return entry
@@ -1317,7 +1484,7 @@ class CredentialPool:
                         entry = synced
                         if not force and not self._entry_needs_refresh(entry):
                             return entry
-                    return self._refresh_entry_impl(entry, force=force)
+                    return self._refresh_codex_entry_locked(entry, force=force)
                 if (
                     synced.access_token != entry.access_token
                     or synced.refresh_token != entry.refresh_token
@@ -1325,6 +1492,129 @@ class CredentialPool:
                     return synced
                 return self._refresh_entry_impl(synced, force=force)
         return self._refresh_entry_impl(entry, force=force)
+
+    def _refresh_codex_entry_locked(
+        self, entry: PooledCredential, *, force: bool
+    ) -> Optional[PooledCredential]:
+        """Refresh Codex under the canonical root lock when it is shared."""
+        profile_store = _load_auth_store()
+        _, source_path = _load_provider_state_with_source(
+            profile_store, "openai-codex"
+        )
+        alias_grant_id = str(entry.extra.get(_CODEX_GRANT_ID_KEY) or "").strip()
+        global_path = auth_mod._global_auth_file_path()
+        if (
+            alias_grant_id
+            and global_path is not None
+            and source_path is not None
+            and not auth_mod._same_path(source_path, global_path)
+        ):
+            try:
+                root_state = _load_provider_state(
+                    _load_auth_store(global_path), "openai-codex"
+                )
+                if (
+                    isinstance(root_state, dict)
+                    and str(root_state.get(_CODEX_GRANT_ID_KEY) or "").strip()
+                    == alias_grant_id
+                ):
+                    source_path = global_path
+            except Exception:
+                pass
+
+        if (
+            source_path is None
+            or auth_mod._same_path(source_path, auth_mod._auth_file_path())
+            or not alias_grant_id
+        ):
+            return self._refresh_entry_impl(entry, force=force)
+
+        with _auth_store_lock(target_path=source_path):
+            root_store = _load_auth_store(source_path)
+            root_state = _load_provider_state(root_store, "openai-codex")
+            if not isinstance(root_state, dict):
+                return self._refresh_entry_impl(entry, force=force)
+            root_grant_id = str(root_state.get(_CODEX_GRANT_ID_KEY) or "").strip()
+            if not root_grant_id or root_grant_id != alias_grant_id:
+                return self._refresh_entry_impl(entry, force=force)
+            tokens = root_state.get("tokens")
+            if not isinstance(tokens, dict):
+                return self._refresh_entry_impl(entry, force=force)
+            snapshot = (
+                tokens.get("access_token", ""),
+                tokens.get("refresh_token", ""),
+            )
+            return self._refresh_entry_impl(
+                entry,
+                force=force,
+                codex_shared_root=(source_path, snapshot, alias_grant_id),
+            )
+
+    def _quarantine_codex_grant(self, entry: PooledCredential, exc: Exception) -> None:
+        """Quarantine one terminal Codex grant across root, profile, and pool rows."""
+        grant_id = str(entry.extra.get(_CODEX_GRANT_ID_KEY) or "").strip()
+        if not grant_id:
+            return
+        try:
+            global_path = auth_mod._global_auth_file_path()
+            target_path = global_path or auth_mod._auth_file_path()
+            with _auth_store_lock(target_path=target_path):
+                root_store = _load_auth_store(target_path)
+                root_state = _load_provider_state(root_store, "openai-codex")
+                if (
+                    isinstance(root_state, dict)
+                    and str(root_state.get(_CODEX_GRANT_ID_KEY) or "").strip()
+                    == grant_id
+                ):
+                    tokens = root_state.get("tokens")
+                    if not isinstance(tokens, dict):
+                        tokens = {}
+                    tokens.pop("access_token", None)
+                    tokens.pop("refresh_token", None)
+                    root_state["tokens"] = tokens
+                    root_state["last_auth_error"] = {
+                        "provider": "openai-codex",
+                        "code": getattr(exc, "code", "unknown"),
+                        "message": str(exc),
+                        "reason": "credential_pool_refresh_failure",
+                        "relogin_required": True,
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    _store_provider_state(
+                        root_store, "openai-codex", root_state, set_active=False
+                    )
+                    _remove_codex_grant_from_store(root_store, grant_id)
+                    _save_auth_store(root_store, target_path=target_path)
+
+            if global_path is not None:
+                with _auth_store_lock():
+                    profile_store = _load_auth_store()
+                    providers = profile_store.get("providers")
+                    local_state = (
+                        providers.get("openai-codex")
+                        if isinstance(providers, dict)
+                        else None
+                    )
+                    if (
+                        isinstance(local_state, dict)
+                        and str(local_state.get(_CODEX_GRANT_ID_KEY) or "").strip()
+                        == grant_id
+                    ):
+                        providers.pop("openai-codex", None)
+                        _save_auth_store(profile_store)
+        except Exception as clear_exc:
+            logger.debug("Failed to quarantine terminal Codex grant: %s", clear_exc)
+
+        with self._lock:
+            removed_ids = [
+                item.id
+                for item in self._entries
+                if str(item.extra.get(_CODEX_GRANT_ID_KEY) or "").strip() == grant_id
+            ]
+            self._entries = [item for item in self._entries if item.id not in removed_ids]
+            if self._current_id in removed_ids:
+                self._current_id = None
+            self._persist(removed_ids=removed_ids)
 
     def _single_use_refresh_lock_timeout(self) -> float:
         """Lock timeout for single-use-refresh-token providers.
@@ -1346,7 +1636,11 @@ class CredentialPool:
         )
 
     def _refresh_entry_impl(
-        self, entry: PooledCredential, *, force: bool
+        self,
+        entry: PooledCredential,
+        *,
+        force: bool,
+        codex_shared_root: Optional[Tuple[Path, Tuple[Any, Any], str]] = None,
     ) -> Optional[PooledCredential]:
         try:
             if self.provider == "anthropic":
@@ -1572,6 +1866,9 @@ class CredentialPool:
                     logger.debug(
                         "Codex OAuth refresh token is terminally invalid; clearing local token state"
                     )
+                    if codex_shared_root is not None:
+                        self._quarantine_codex_grant(entry, exc)
+                        return None
                     try:
                         with _auth_store_lock():
                             auth_store = _load_auth_store()
@@ -1699,6 +1996,25 @@ class CredentialPool:
         )
         self._replace_entry(entry, updated)
         self._persist()
+        if self.provider == "openai-codex" and codex_shared_root is not None:
+            root_path, snapshot, grant_id = codex_shared_root
+            root_store = _load_auth_store(root_path)
+            root_state = _load_provider_state(root_store, "openai-codex")
+            if (
+                isinstance(root_state, dict)
+                and str(root_state.get(_CODEX_GRANT_ID_KEY) or "").strip() == grant_id
+            ):
+                tokens = root_state.setdefault("tokens", {})
+                if isinstance(tokens, dict):
+                    tokens["access_token"] = updated.access_token
+                    tokens["refresh_token"] = updated.refresh_token
+                    if updated.last_refresh:
+                        root_state["last_refresh"] = updated.last_refresh
+                    _store_provider_state(
+                        root_store, "openai-codex", root_state, set_active=False
+                    )
+                    _save_auth_store(root_store, target_path=root_path)
+            return updated
         # Sync refreshed tokens back to auth.json providers so that
         # _seed_from_singletons() on the next load_pool() sees fresh state
         # instead of re-seeding stale/consumed tokens.
@@ -3126,6 +3442,18 @@ def load_pool(provider: str) -> CredentialPool:
         for payload in raw_entries
     )
     entries = [PooledCredential.from_dict(provider, payload) for payload in raw_entries]
+    if provider == "openai-codex":
+        terminal_grant = _codex_terminal_global_grant_id()
+        if terminal_grant:
+            retained = [
+                entry
+                for entry in entries
+                if str(entry.extra.get(_CODEX_GRANT_ID_KEY) or "").strip()
+                != terminal_grant
+            ]
+            if len(retained) != len(entries):
+                entries = retained
+                raw_needs_sanitization = True
     raw_needs_auth_normalization = any(
         isinstance(payload, dict)
         and _normalize_pool_auth_type(
