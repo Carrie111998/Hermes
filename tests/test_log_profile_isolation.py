@@ -179,3 +179,62 @@ def test_filtr_profilu_laczy_sie_z_filtrem_komponentu_gateway(
     assert "REKORD GATEWAY" in gateway_log
     assert "REKORD AGENTA" not in gateway_log, \
         "gateway.log nadal musi odrzucac rekordy spoza komponentu gateway"
+
+
+def test_gateway_log_tez_jest_izolowany_miedzy_profilami(
+    tmp_path, czysty_stan_logow
+):
+    """Tam gdzie oba filtry dzialaja naraz, oba musza dzialac poprawnie."""
+    hl = czysty_stan_logow
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    glowny = tmp_path / "main"
+    gosc = tmp_path / "profiles" / "guest-x"
+    hl.setup_logging(hermes_home=glowny, mode="gateway")
+    hl.setup_logging(hermes_home=gosc, mode="gateway")
+
+    token = set_hermes_home_override(str(gosc))
+    try:
+        logging.getLogger("gateway.run").info("GATEWAY GOSCIA")
+        logging.getLogger("agent.conversation_loop").info("AGENT GOSCIA")
+    finally:
+        reset_hermes_home_override(token)
+    hl.flush_log_queue()
+
+    assert "GATEWAY GOSCIA" in _tresc(gosc, "gateway.log")
+    assert "GATEWAY GOSCIA" not in _tresc(glowny, "gateway.log")
+    assert "AGENT GOSCIA" not in _tresc(gosc, "gateway.log"), \
+        "filtr komponentu musi dzialac takze w profilu goscia"
+
+
+def test_powtorzony_setup_nie_dubluje_wpisow(tmp_path, czysty_stan_logow):
+    """Deduplikacja po sciezce pliku musi przetrwac nowa logike primary-home."""
+    hl = czysty_stan_logow
+    glowny = tmp_path / "main"
+    for _ in range(3):
+        hl.setup_logging(hermes_home=glowny, mode="gateway")
+
+    logging.getLogger("gateway.run").warning("JEDEN RAZ")
+    hl.flush_log_queue()
+
+    assert _tresc(glowny, "agent.log").count("JEDEN RAZ") == 1, \
+        "wielokrotny setup_logging() nie moze dublowac wpisow"
+
+
+def test_pierwszy_zainicjowany_home_bierze_rekordy_bez_scope(
+    tmp_path, czysty_stan_logow
+):
+    """Semantyka 'first home wins' jest celowa - zakotwicz ja testem."""
+    hl = czysty_stan_logow
+    glowny = tmp_path / "main"
+    gosc = tmp_path / "profiles" / "guest-x"
+    # KOLEJNOSC ODWROTNA: profil goscia inicjalizowany PIERWSZY.
+    hl.setup_logging(hermes_home=gosc, mode="gateway")
+    hl.setup_logging(hermes_home=glowny)
+
+    logging.getLogger("hermes_cli.mem_trim").warning("BEZ SCOPE")
+    hl.flush_log_queue()
+
+    assert "BEZ SCOPE" in _tresc(gosc, "agent.log"), \
+        "rekord bez scope idzie do PIERWSZEGO zainicjowanego home"
+    assert "BEZ SCOPE" not in _tresc(glowny, "agent.log")
