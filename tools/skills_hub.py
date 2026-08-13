@@ -170,6 +170,14 @@ def _referenced_support_paths(skill_md: str) -> Optional[set[str]]:
     paths: set[str] = set()
     for match in _LOCAL_LINK_RE.finditer(normalized):
         raw = unquote(urlsplit(match.group(1).rstrip(".,;:")).path)
+        # Skip glob patterns (``scripts/*``) and directory references
+        # (``scripts/lib/``): they are not downloadable files, and trying to
+        # fetch them 404s, which used to fail the whole install with a
+        # misleading "Could not fetch" error (#85172).
+        if any(ch in raw for ch in "*?[]"):
+            continue
+        if raw.endswith("/"):
+            continue
         try:
             safe = _validate_bundle_rel_path(raw)
         except ValueError:

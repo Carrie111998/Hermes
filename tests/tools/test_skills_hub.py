@@ -28,7 +28,38 @@ from tools.skills_hub import (
     unified_search,
     append_audit_log,
     quarantine_bundle,
+    _referenced_support_paths,
 )
+
+
+# ---------------------------------------------------------------------------
+# _referenced_support_paths
+# ---------------------------------------------------------------------------
+
+
+class TestReferencedSupportPaths:
+    def test_skips_glob_patterns_and_directory_references(self):
+        skill_md = """
+Run the engine:
+```
+python3 scripts/last30days.py
+```
+Install the whole scripts dir: `scripts/*`
+For details see `references/save-html-brief.md`
+Also `scripts/lib/categories.py` and the `scripts/lib/` folder.
+"""
+        assert _referenced_support_paths(skill_md) == {
+            "scripts/last30days.py",
+            "references/save-html-brief.md",
+            "scripts/lib/categories.py",
+        }
+
+    def test_returns_none_on_traversal_attempt(self):
+        skill_md = "see `scripts/../../etc/passwd`"
+        assert _referenced_support_paths(skill_md) is None
+
+    def test_empty_when_no_support_paths(self):
+        assert _referenced_support_paths("Just prose, no links.") == set()
 
 
 # ---------------------------------------------------------------------------
