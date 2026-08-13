@@ -809,6 +809,50 @@ def test_board_param_none_falls_back_to_env(worker_env):
 #   even when the session has a delivery channel.
 # ---------------------------------------------------------------------------
 
+
+def test_create_records_explicit_workspace_request(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = json.loads(
+        kt._handle_create(
+            {
+                "title": "explicit directory",
+                "assignee": "peer",
+                "workspace_kind": "dir",
+                "workspace_path": "/tmp/explicit-directory",
+            }
+        )
+    )
+
+    with kb.connect_closing() as conn:
+        created = next(
+            event
+            for event in kb.list_events(conn, out["task_id"])
+            if event.kind == "created"
+        )
+    assert created.payload is not None
+    assert created.payload["requested_workspace"] == "dir:/tmp/explicit-directory"
+
+
+def test_create_records_omitted_workspace_request_as_null(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = json.loads(
+        kt._handle_create({"title": "implicit scratch", "assignee": "peer"})
+    )
+
+    with kb.connect_closing() as conn:
+        created = next(
+            event
+            for event in kb.list_events(conn, out["task_id"])
+            if event.kind == "created"
+        )
+    assert created.payload is not None
+    assert created.payload["requested_workspace"] is None
+
+
 def _list_subs_for_task(task_id):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()

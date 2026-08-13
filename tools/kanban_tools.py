@@ -1434,6 +1434,11 @@ def _handle_create(args: dict, **kw) -> str:
                     if _self_task is not None and _self_task.project_id:
                         project_id = _self_task.project_id
                         project_source_task_id = _self_task.id
+            from hermes_cli.kanban_workspace import (
+                supersession_warning,
+                workspace_spec,
+            )
+
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1444,6 +1449,11 @@ def _handle_create(args: dict, **kw) -> str:
                 priority=int(priority) if priority is not None else 0,
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
+                requested_workspace=(
+                    workspace_spec(str(requested_workspace_kind), workspace_path)
+                    if requested_workspace_kind is not None
+                    else None
+                ),
                 project_id=project_id,
                 project_source_task_id=project_source_task_id,
                 triage=triage,

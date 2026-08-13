@@ -1572,6 +1572,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind,
             workspace_path=ws_path,
+            requested_workspace=requested_workspace,
             branch_name=branch_name,
             project_id=getattr(args, "project", None),
             tenant=args.tenant,

@@ -1117,9 +1117,10 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 
 | Kind | Payload | When |
 |---|---|---|
-| `created` | `{assignee, status, parents, tenant}` | Task inserted. `run_id` is `NULL`. |
+| `created` | `{assignee, status, parents, tenant, requested_workspace, workspace_kind, workspace_path, branch_name, project_id, …}` | Task inserted. `requested_workspace` is the caller's pre-normalization workspace string (or `null` when omitted); `workspace_kind` and `workspace_path` are the normalized creation state. This event is immutable and its `run_id` is `NULL`. |
 | `promoted` | — | `todo → ready` because all parents hit `done`. `run_id` is `NULL`. |
 | `claimed` | `{lock, expires, run_id}` | Dispatcher atomically claimed a `ready` task for spawn. |
+| `workspace_resolved` | `{previous_path, resolved_path, branch_name}` | Claim-time workspace resolution changed the persisted path. The task-row update and event are atomic; repeated resolution to the same path emits no duplicate event. |
 | `completed` | `{result_len, summary?}` | Worker wrote `--result` / `--summary` and task hit `done`. `summary` is the first-line handoff (400-char cap); full version lives on the run row. If `complete_task` is called on a never-claimed task with handoff fields, a zero-duration run is synthesized so `run_id` still points at something. |
 | `blocked` | `{reason, kind, recurrences}` | Worker or human flipped the task to `blocked`. `kind` is the typed block reason (`needs_input`, `capability`, `transient`, or `null` for a generic block); `recurrences` is the unblock-loop counter. Synthesizes a zero-duration run when called on a never-claimed task with `--reason`. |
 | `dependency_wait` | `{reason, kind}` | Worker blocked with `kind=dependency` — the task is only waiting on another task, so it routes to `todo` (parent-gated, auto-promoted) instead of `blocked`. No human needed. |

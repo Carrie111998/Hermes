@@ -625,6 +625,13 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        from hermes_cli.kanban_workspace import workspace_spec
+
+        requested_workspace = (
+            workspace_spec(payload.workspace_kind, payload.workspace_path)
+            if payload.workspace_kind is not None
+            else None
+        )
         task_id = kanban_db.create_task(
             conn,
             title=payload.title,
@@ -633,6 +640,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             created_by="dashboard",
             workspace_kind=payload.workspace_kind or "scratch",
             workspace_path=payload.workspace_path,
+            requested_workspace=requested_workspace,
             tenant=payload.tenant,
             priority=payload.priority,
             parents=payload.parents,
@@ -650,14 +658,10 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
-        from hermes_cli.kanban_workspace import supersession_warning, workspace_spec
+        from hermes_cli.kanban_workspace import supersession_warning
 
         workspace_warning = supersession_warning(
-            (
-                workspace_spec(payload.workspace_kind, payload.workspace_path)
-                if payload.workspace_kind is not None
-                else None
-            ),
+            requested_workspace,
             task,
         ) if task else None
         if workspace_warning:

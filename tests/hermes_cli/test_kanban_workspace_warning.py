@@ -43,13 +43,20 @@ def test_cli_prints_explicit_workspace_supersession_to_stderr(monkeypatch, capsy
         status="todo",
         assignee=None,
     )
+    captured_kwargs = {}
+
+    def create_task(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return "t_123"
+
     monkeypatch.setattr(kanban.kb, "connect_closing", lambda: nullcontext(object()))
-    monkeypatch.setattr(kanban.kb, "create_task", lambda *args, **kwargs: "t_123")
+    monkeypatch.setattr(kanban.kb, "create_task", create_task)
     monkeypatch.setattr(kanban.kb, "get_task", lambda *args, **kwargs: task)
 
     assert kanban._cmd_create(_create_args()) == 0
 
     captured = capsys.readouterr()
+    assert captured_kwargs["requested_workspace"] == "scratch"
     assert "requested workspace 'scratch'" in captured.err
     assert "project-linked workspace 'worktree:/repo/.worktrees/t_123'" in captured.err
 
@@ -62,10 +69,17 @@ def test_cli_omitted_workspace_inherits_silently(monkeypatch, capsys):
         status="todo",
         assignee=None,
     )
+    captured_kwargs = {}
+
+    def create_task(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return "t_123"
+
     monkeypatch.setattr(kanban.kb, "connect_closing", lambda: nullcontext(object()))
-    monkeypatch.setattr(kanban.kb, "create_task", lambda *args, **kwargs: "t_123")
+    monkeypatch.setattr(kanban.kb, "create_task", create_task)
     monkeypatch.setattr(kanban.kb, "get_task", lambda *args, **kwargs: task)
 
     assert kanban._cmd_create(_create_args(workspace=None)) == 0
 
     assert capsys.readouterr().err == ""
+    assert captured_kwargs["requested_workspace"] is None

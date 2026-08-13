@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
+from argparse import Namespace
 from pathlib import Path
 
 import pytest
 
+from hermes_cli import kanban
 from hermes_cli import kanban_db as kb
 
 
@@ -138,6 +141,56 @@ def test_legacy_claim_time_healing_is_visible_without_rewriting_created_event(
         "resolved_path": str(resolved),
         "branch_name": "wt/legacy-child",
     }
+
+
+def test_claim_heals_legacy_worktree_path_and_records_resolution(
+    kanban_home: Path,
+) -> None:
+    repo = kanban_home / "repo"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test User"],
+        check=True,
+    )
+    (repo / "README.md").write_text("fixture\n")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True
+    )
+    legacy_path = repo
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="legacy worktree child",
+            assignee="coding",
+            workspace_kind="worktree",
+            workspace_path=str(legacy_path),
+        )
+        created_before = _event(conn, task_id, "created")[0]
+
+    assert kanban._cmd_claim(Namespace(task_id=task_id, ttl=60)) == 0
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        created_after = _event(conn, task_id, "created")[0]
+        resolved_events = _event(conn, task_id, "workspace_resolved")
+
+    expected_path = repo / ".worktrees" / task_id
+    assert task is not None
+    assert task.workspace_path == str(expected_path)
+    assert created_after.id == created_before.id
+    assert created_after.payload == created_before.payload
+    assert [event.payload for event in resolved_events] == [
+        {
+            "previous_path": str(legacy_path),
+            "resolved_path": str(expected_path),
+            "branch_name": f"wt/{task_id}",
+        }
+    ]
 
 
 def test_repeated_resolution_does_not_duplicate_event(kanban_home: Path) -> None:

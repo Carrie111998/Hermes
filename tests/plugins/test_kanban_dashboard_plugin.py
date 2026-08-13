@@ -137,6 +137,16 @@ def test_explicit_workspace_supersession_is_returned_as_api_warning(
         "requested workspace 'scratch' was superseded by project-linked "
         f"workspace 'worktree:{data['task']['workspace_path']}'"
     )
+    with kb.connect_closing() as conn:
+        created = next(
+            event
+            for event in kb.list_events(conn, data["task"]["id"])
+            if event.kind == "created"
+        )
+    assert created.payload is not None
+    assert created.payload["requested_workspace"] == "scratch"
+    assert created.payload["workspace_kind"] == "worktree"
+    assert created.payload["workspace_path"] == data["task"]["workspace_path"]
 
 
 def test_omitted_workspace_inherits_project_without_api_warning(client, tmp_path):
@@ -150,8 +160,16 @@ def test_omitted_workspace_inherits_project_without_api_warning(client, tmp_path
         "/api/plugins/kanban/tasks", json={"title": "Implicit workspace"}
     )
 
-    assert response.status_code == 200, response.text
-    assert "warning" not in response.json()
+    data = response.json()
+    assert "warning" not in data
+    with kb.connect_closing() as conn:
+        created = next(
+            event
+            for event in kb.list_events(conn, data["task"]["id"])
+            if event.kind == "created"
+        )
+    assert created.payload is not None
+    assert created.payload["requested_workspace"] is None
 
 
 def test_patch_board_sets_project_directory(client, tmp_path):
