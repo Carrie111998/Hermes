@@ -317,6 +317,10 @@ class SignalAdapter(BasePlatformAdapter):
 
         # Normalize account for self-message filtering
         self._account_normalized = self.account.strip()
+        # Set by GatewayRunner for primary and secondary multiplex transports.
+        # A routed source may only inherit this adapter's receipt policy when
+        # both belong to the same profile.
+        self._signal_transport_profile_name: Optional[str] = None
 
         # Track recently sent message timestamps to prevent echo-back loops
         # in Note to Self / self-chat mode and linked-device group sync-sents.
@@ -952,6 +956,12 @@ class SignalAdapter(BasePlatformAdapter):
         # route to an unserved profile is dropped before auth or hooks. Never
         # acknowledge it through the receiving/default adapter's policy.
         if getattr(source, "profile_route_rejected", False) is True:
+            return None
+        routed_profile = str(getattr(source, "profile", "") or "").strip()
+        transport_profile = str(
+            self._signal_transport_profile_name or ""
+        ).strip()
+        if routed_profile and routed_profile != transport_profile:
             return None
         authorized = self._is_sender_authorized(
             source.user_id,

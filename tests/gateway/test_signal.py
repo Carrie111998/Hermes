@@ -3,6 +3,7 @@ import asyncio
 import base64
 import pytest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, AsyncMock
 from urllib.parse import quote
 
@@ -298,6 +299,108 @@ class TestSignalReadReceipts:
 
         adapter.send_read_receipt.assert_not_awaited()
         assert not adapter._background_tasks
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("route_profile", "served_profiles", "expected_profile", "rejected", "receipted"),
+        [
+            ("work", ["default"], None, True, False),
+            ("work", ["default", "work"], "work", False, False),
+            ("default", ["default"], "default", False, True),
+        ],
+    )
+    async def test_factory_scopes_receipts_to_signal_transport_profile(
+        self,
+        monkeypatch,
+        route_profile,
+        served_profiles,
+        expected_profile,
+        rejected,
+        receipted,
+    ):
+        """The real Signal factory must route before applying receipt policy."""
+        from gateway.profile_routing import ProfileRoute
+        from gateway.run import GatewayRunner
+
+        config = PlatformConfig()
+        config.enabled = True
+        config.extra = {
+            "http_url": "http://localhost:8080",
+            "account": "+15551234567",
+            "send_read_receipts": True,
+        }
+        runner = object.__new__(GatewayRunner)
+        runner.config = SimpleNamespace(
+            group_sessions_per_user=False,
+            thread_sessions_per_user=False,
+            multiplex_profiles=True,
+            profile_routes=[
+                ProfileRoute(
+                    name="signal-chat",
+                    platform="signal",
+                    profile=route_profile,
+                    chat_id="+15551239999",
+                )
+            ],
+        )
+
+        with (
+            patch("gateway.platforms.signal.check_signal_requirements", return_value=True),
+            patch("gateway.platforms.signal.validate_signal_config", return_value=True),
+            patch(
+                "gateway.run._multiplex_profile_homes",
+                return_value=[
+                    (name, Path(f"/profiles/{name}")) for name in served_profiles
+                ],
+            ),
+            patch("hermes_cli.profiles.get_active_profile_name", return_value="default"),
+        ):
+            adapter = runner._create_adapter(Platform.SIGNAL, config)
+            assert adapter is not None
+            adapter.set_authorization_check(
+                lambda user_id, chat_type, chat_id: True
+            )
+            adapter.handle_message = AsyncMock()
+            adapter.send_read_receipt = AsyncMock()
+
+            await adapter._handle_envelope({
+                "envelope": {
+                    "sourceNumber": "+15551239999",
+                    "sourceUuid": "05668cf3-8ffa-467e-9b24-f5eefa5cf475",
+                    "timestamp": 1777600696000,
+                    "dataMessage": {
+                        "message": "hello",
+                        "timestamp": 1777600696077,
+                    },
+                },
+            })
+            await asyncio.sleep(0)
+
+        assert adapter.gateway_runner is runner
+        assert adapter._signal_transport_profile_name == "default"
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.profile == expected_profile
+        assert event.source.profile_route_rejected is rejected
+        if receipted:
+            adapter.send_read_receipt.assert_awaited_once()
+        else:
+            adapter.send_read_receipt.assert_not_awaited()
+
+    def test_secondary_signal_transport_is_profile_stamped(self, monkeypatch):
+        """Secondary reconnects use the same owner-profile receipt boundary."""
+        from gateway.run import GatewayRunner
+
+        runner = MagicMock()
+        adapter = _make_signal_adapter(monkeypatch)
+
+        GatewayRunner._configure_profile_adapter(
+            runner,
+            adapter,
+            "work",
+            Platform.SIGNAL,
+        )
+
+        assert adapter._signal_transport_profile_name == "work"
 
     @pytest.mark.asyncio
     async def test_note_to_self_is_not_acknowledged(self, monkeypatch):
