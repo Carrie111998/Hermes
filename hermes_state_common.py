@@ -86,7 +86,7 @@ _BRANCH_CHILD_SQL = (
     "json_extract(COALESCE({a}.model_config, '{{}}'), '$._branched_from') IS NOT NULL"
     " OR EXISTS (SELECT 1 FROM sessions p"
     "            WHERE p.id = {a}.parent_session_id"
-    "            AND p.end_reason = 'branched'"
+    "            AND p.end_reason IN ('branched', 'session_reset')"
     "            AND {a}.started_at >= p.ended_at)"
 )
 

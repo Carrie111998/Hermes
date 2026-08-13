@@ -1993,6 +1993,125 @@ class TestCompressionChainProjection:
         assert db.get_compression_tip("mid1") == "tip1"
         assert db.get_compression_tip("tip1") == "tip1"
 
+    def test_resolve_resume_session_id_does_not_follow_new_reset_chain(self, db):
+        """A /new (session_reset) chain must NOT redirect resume/transcript
+        loads to the newest descendant: each reset is a deliberate new
+        conversation, and the parent's own transcript stays its history.
+        Regression for the desktop bug where clicking a parent session
+        showed the newest session's messages (#84284)."""
+        import time as _time
+
+        t0 = _time.time() - 3600
+        db.create_session("parent", "cli")
+        db._conn.execute("UPDATE sessions SET started_at=?, ended_at=?, end_reason=? WHERE id=?", (t0, t0 + 100, "session_reset", "parent"))
+        db.append_message("parent", "user", "parent history")
+
+        db.create_session("child", "cli", parent_session_id="parent")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 200, "child"))
+        db.append_message("child", "user", "child conversation")
+        db._conn.commit()
+
+        assert db.resolve_resume_session_id("parent") == "parent"
+        assert db.resolve_resume_session_id("child") == "child"
+
+    def test_resolve_resume_session_id_follows_compression_chain(self, db):
+        """Compression continuations are still followed: the descendant that
+        holds the live messages is the resume target."""
+        import time as _time
+
+        t0 = _time.time() - 3600
+        db.create_session("rootc", "cli")
+        db.append_message("rootc", "user", "pre-compression")
+        db._conn.execute("UPDATE sessions SET started_at=?, ended_at=?, end_reason=? WHERE id=?", (t0, t0 + 100, "compression", "rootc"))
+
+        db.create_session("contc", "cli", parent_session_id="rootc")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 200, "contc"))
+        db.append_message("contc", "user", "continuation")
+        db._conn.commit()
+
+        assert db.resolve_resume_session_id("rootc") == "contc"
+
+    def test_resolve_resume_session_id_compression_empty_head_walk(self, db):
+        """Compression parent with no flushed messages still walks to the
+        child that holds the content (legacy empty-head case)."""
+        import time as _time
+
+        t0 = _time.time() - 3600
+        db.create_session("rootempty", "cli")
+        db._conn.execute("UPDATE sessions SET started_at=?, ended_at=?, end_reason=? WHERE id=?", (t0, t0 + 100, "compression", "rootempty"))
+
+        db.create_session("childfull", "cli", parent_session_id="rootempty")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 200, "childfull"))
+        db.append_message("childfull", "user", "only content here")
+        db._conn.commit()
+
+        assert db.resolve_resume_session_id("rootempty") == "childfull"
+
+    def test_list_sessions_rich_includes_session_reset_children(self, db):
+        """A /new chain (parent ended with session_reset) must be visible in
+        session lists. Regression: the listability filter only allowed
+        branch children, so the current session of a /new chain never
+        appeared in the desktop sidebar while being perfectly functional."""
+        import time as _time
+
+        t0 = _time.time() - 3600
+        db.create_session("reset_parent", "cli")
+        db._conn.execute(
+            "UPDATE sessions SET started_at=?, ended_at=?, end_reason=? WHERE id=?",
+            (t0, t0 + 100, "session_reset", "reset_parent"),
+        )
+        db.create_session("reset_child", "cli", parent_session_id="reset_parent")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 200, "reset_child"))
+        db.append_message("reset_child", "user", "current conversation")
+        db._conn.commit()
+
+        sessions = db.list_sessions_rich(source="cli", limit=20)
+        ids = [s["id"] for s in sessions]
+        assert "reset_parent" in ids
+        assert "reset_child" in ids  # visible even though parent ended with session_reset
+
+    def test_list_sessions_rich_excludes_delegate_children(self, db):
+        """Transient delegate/subagent children (parent ended with
+        agent_close) stay hidden: the widened filter must not surface
+        every child, only deliberate /new conversations."""
+        import time as _time
+
+        t0 = _time.time() - 3600
+        db.create_session("delegate_parent", "cli")
+        db._conn.execute(
+            "UPDATE sessions SET started_at=?, ended_at=?, end_reason=? WHERE id=?",
+            (t0, t0 + 100, "agent_close", "delegate_parent"),
+        )
+        db.create_session("delegate_child", "subagent", parent_session_id="delegate_parent")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 200, "delegate_child"))
+        db._conn.commit()
+
+        sessions = db.list_sessions_rich(source="cli", limit=20)
+        ids = [s["id"] for s in sessions]
+        assert "delegate_parent" in ids
+        assert "delegate_child" not in ids
+
+    def test_list_sessions_rich_still_includes_branch_children(self, db):
+        """Branch children (parent ended with branched) remain visible —
+        no regression from widening the filter."""
+        import time as _time
+
+        t0 = _time.time() - 3600
+        db.create_session("branch_parent", "cli")
+        db._conn.execute(
+            "UPDATE sessions SET started_at=?, ended_at=?, end_reason=? WHERE id=?",
+            (t0, t0 + 100, "branched", "branch_parent"),
+        )
+        db.create_session("branch_child", "cli", parent_session_id="branch_parent")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 200, "branch_child"))
+        db.append_message("branch_child", "user", "branch content")
+        db._conn.commit()
+
+        sessions = db.list_sessions_rich(source="cli", limit=20)
+        ids = [s["id"] for s in sessions]
+        assert "branch_parent" in ids
+        assert "branch_child" in ids
+
 
 
     def test_list_surfaces_tip_for_compressed_root(self, db):

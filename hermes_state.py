@@ -8974,6 +8974,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if row is not None:
                     best = current
 
+                # Only follow children of sessions that ENDED in compression
+                # (`end_reason='compression'`). A `/new`/`/reset` chain ends the
+                # parent with `end_reason='session_reset'` — a deliberate new
+                # conversation whose parent transcript stays its own history.
+                # Following it hijacks resume/transcript loads to the newest
+                # reset descendant (desktop: clicking a parent session showed
+                # the newest session's messages instead). This mirrors
+                # `get_compression_tip()`, which already gates on the parent's
+                # end_reason. See #84284.
+                try:
+                    parent_row = self._conn.execute(
+                        "SELECT end_reason FROM sessions WHERE id = ?",
+                        (current,),
+                    ).fetchone()
+                except Exception:
+                    return session_id
+                if parent_row is None:
+                    break
+                parent_reason = (
+                    parent_row["end_reason"] if hasattr(parent_row, "keys") else parent_row[0]
+                )
+                if parent_reason != "compression":
+                    break
+
                 # Walk to the most-recently-started child — but skip explicit
                 # branch (`_branched_from`), delegate/subagent (`_delegate_from`),
                 # and tool children. They also carry a ``parent_session_id`` yet
