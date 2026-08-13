@@ -1120,10 +1120,10 @@ class TestDelegateHeartbeat(unittest.TestCase):
         """A slow in-flight model wait (api_call_count frozen, no tool) must
         stay alive when last_activity_ts keeps advancing.
 
-        Top-level delegate_task runs in the background; the async stall
-        monitor already treats ticking last_activity_ts as progress. The sync
-        heartbeat path must use the same signal so slow local / long-prefill
-        completions are not mistaken for a wedged idle child.
+        Explicit background delegate_task runs use an async stall monitor that
+        already treats ticking last_activity_ts as progress. The sync heartbeat
+        path must use the same signal so slow local / long-prefill completions
+        are not mistaken for a wedged idle child.
         """
         from tools.delegate_tool import _run_single_child
 
@@ -1257,6 +1257,61 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertEqual(captured["goal"], "test")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
+
+    def test_model_dispatch_waits_for_subagents_by_default(self):
+        """The parent should receive all delegated results before concluding."""
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {"tasks": [{"goal": "research one"}, {"goal": "research two"}]},
+            )
+
+        self.assertIs(captured["background"], False)
+
+    def test_model_dispatch_detaches_only_when_explicitly_requested(self):
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {"goal": "research in background", "background": True},
+            )
+
+        self.assertIs(captured["background"], True)
+
+    def test_orchestrator_always_waits_for_its_workers(self):
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=1)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {"goal": "worker task", "background": True},
+            )
+
+        self.assertIs(captured["background"], False)
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
