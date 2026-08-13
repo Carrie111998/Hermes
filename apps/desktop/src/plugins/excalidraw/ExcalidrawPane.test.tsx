@@ -88,6 +88,15 @@ describe('ExcalidrawPane', () => {
       })
     )
   })
+  it('shows the load failure instead of leaving the pane loading forever', async () => {
+    loadDrawing.mockRejectedValue(new Error('Drawing filesystem does not provide an authoritative fingerprint'))
+
+    render(<ExcalidrawPane identity={identity} />)
+
+    expect(await screen.findByText('Could not load drawing')).toBeTruthy()
+    expect(screen.getByText('Drawing filesystem does not provide an authoritative fingerprint')).toBeTruthy()
+    expect(screen.queryByText('Loading drawing…')).toBeNull()
+  })
   it('registers its controller flush with the window close barrier', async () => {
     let flush: (() => boolean | Promise<boolean>) | undefined
     registerWindowCloseBarrier.mockImplementation((callback: () => boolean | Promise<boolean>) => {
