@@ -448,7 +448,10 @@ class TestPayloadFilters:
             resp = await cli.post(
                 "/webhooks/todoist",
                 json={"task": {"content": "pay bills"}},
-                headers={"X-GitHub-Delivery": "script-transform-1"},
+                headers={
+                    "X-Webhook-Event": "todoist",
+                    "X-GitHub-Delivery": "script-transform-1",
+                },
             )
             assert resp.status == 202
 
@@ -539,6 +542,117 @@ class TestPayloadFilters:
         assert response.status == 400
         adapter._route_processor.run_route_script.assert_not_called()
 
+    @pytest.mark.parametrize(
+        ("headers", "payload"),
+        [
+            ({"X-Request-ID": "delivery-1"}, {"event_type": "payload-authored"}),
+            (
+                {
+                    "X-Webhook-Event": "event",
+                    "X-GitHub-Delivery": "bad\nprimary",
+                    "X-Request-ID": "fallback-id",
+                },
+                {},
+            ),
+            (
+                {"X-Webhook-Event": "bad\ud800event", "X-Request-ID": "delivery-2"},
+                {},
+            ),
+            (
+                {"X-Webhook-Event": "event", "X-Request-ID": "bad\ud800delivery"},
+                {},
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_script_rejects_untrusted_or_invalid_metadata(
+        self, headers, payload
+    ):
+        adapter = _make_adapter(
+            routes={
+                "scripted": {
+                    "secret": _INSECURE_NO_AUTH,
+                    "script": "unused.py",
+                }
+            }
+        )
+        adapter._route_processor.run_route_script = MagicMock()
+        request = _mock_request(
+            headers=headers,
+            body=json.dumps(payload).encode(),
+            match_info={"route_name": "scripted"},
+        )
+
+        response = await adapter._handle_webhook(request)
+
+        assert response.status == 400
+        adapter._route_processor.run_route_script.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("route_extra", "event_type"),
+        [
+            ({"events": ["allowed"]}, "not-allowed"),
+            ({"filters": {"action": "allowed"}}, "event"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_script_validates_delivery_before_ignored_filters(
+        self, route_extra, event_type
+    ):
+        route = {
+            "secret": _INSECURE_NO_AUTH,
+            "script": "unused.py",
+            **route_extra,
+        }
+        adapter = _make_adapter(routes={"scripted": route})
+        adapter._route_processor.run_route_script = MagicMock()
+        request = _mock_request(
+            headers={
+                "X-Webhook-Event": event_type,
+                "X-Request-ID": "bad\x00delivery",
+            },
+            body=b'{"action":"not-allowed"}',
+            match_info={"route_name": "scripted"},
+        )
+
+        response = await adapter._handle_webhook(request)
+
+        assert response.status == 400
+        adapter._route_processor.run_route_script.assert_not_called()
+
+    @pytest.mark.parametrize("delivery_id", ["delivery-2", "  delivery-3  "])
+    @pytest.mark.asyncio
+    async def test_script_accepts_generic_event_and_preserves_delivery_identity(
+        self, delivery_id
+    ):
+        adapter = _make_adapter(
+            routes={
+                "scripted": {
+                    "secret": _INSECURE_NO_AUTH,
+                    "script": "unused.py",
+                }
+            }
+        )
+        adapter._route_processor.run_route_script = MagicMock(
+            return_value=("ignored", None)
+        )
+        request = _mock_request(
+            headers={
+                "X-Webhook-Event": "generic-event",
+                "X-Request-ID": delivery_id,
+            },
+            body=b"{}",
+            match_info={"route_name": "scripted"},
+        )
+
+        response = await adapter._handle_webhook(request)
+
+        assert response.status == 200
+        assert adapter._route_processor.run_route_script.call_args.kwargs == {
+            "event_type": "generic-event",
+            "delivery_id": delivery_id,
+        }
+
     @pytest.mark.asyncio
     async def test_failed_script_releases_delivery_for_retry(
         self, tmp_path, monkeypatch
@@ -573,7 +687,10 @@ class TestPayloadFilters:
             captured.append(event)
 
         adapter.handle_message = _capture
-        headers = {"X-GitHub-Delivery": "retryable-script-1"}
+        headers = {
+            "X-Webhook-Event": "test",
+            "X-GitHub-Delivery": "retryable-script-1",
+        }
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             failed = await cli.post(
@@ -613,7 +730,10 @@ class TestPayloadFilters:
                 }
             }
         )
-        headers = {"X-GitHub-Delivery": "silent-script-1"}
+        headers = {
+            "X-Webhook-Event": "test",
+            "X-GitHub-Delivery": "silent-script-1",
+        }
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             ignored = await cli.post(

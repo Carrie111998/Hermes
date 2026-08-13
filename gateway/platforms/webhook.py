@@ -69,8 +69,22 @@ from gateway.response_filters import is_autonomous_silence_response
 logger = logging.getLogger(__name__)
 
 
-def _contains_control_character(value: str) -> bool:
-    return any(unicodedata.category(char) == "Cc" for char in value)
+def _is_valid_script_metadata(value: Any, max_length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= max_length
+        and not any(
+            unicodedata.category(char) in {"Cc", "Cs"} for char in value
+        )
+    )
+
+
+def _first_present_header(headers: Any, names: tuple[str, ...]) -> Any:
+    for name in names:
+        if name in headers:
+            return headers.get(name)
+    return None
 
 
 def _is_webhook_silence_response(content: Any) -> bool:
@@ -744,14 +758,49 @@ class WebhookAdapter(BasePlatformAdapter):
                     {"error": "Cannot parse body"}, status=400
                 )
 
-        # Check event type filter
-        event_type = (
-            request.headers.get("X-GitHub-Event", "")
-            or request.headers.get("X-GitLab-Event", "")
-            or payload.get("event_type", "")
-            or payload.get("type", "")
-            or "unknown"
-        )
+        script_path = route_config.get("script")
+        if script_path:
+            # Script identity comes from provider/proxy transport headers received
+            # after request authentication, never from payload-authored fields.
+            event_type = _first_present_header(
+                request.headers,
+                ("X-GitHub-Event", "X-GitLab-Event", "X-Webhook-Event"),
+            )
+            delivery_id = _first_present_header(
+                request.headers,
+                ("X-GitHub-Delivery", "svix-id", "X-Request-ID"),
+            )
+            if not _is_valid_script_metadata(
+                event_type, 128
+            ) or not _is_valid_script_metadata(delivery_id, 256):
+                logger.warning(
+                    "[webhook] Script route %s has invalid event or delivery metadata",
+                    route_name,
+                )
+                return web.json_response(
+                    {"error": "Script route requires valid event and delivery metadata"},
+                    status=400,
+                )
+        else:
+            event_type = (
+                request.headers.get("X-GitHub-Event", "")
+                or request.headers.get("X-GitLab-Event", "")
+                or payload.get("event_type", "")
+                or payload.get("type", "")
+                or "unknown"
+            )
+            delivery_id = request.headers.get(
+                "X-GitHub-Delivery",
+                request.headers.get(
+                    "svix-id",
+                    request.headers.get(
+                        "X-Request-ID", str(int(time.time() * 1000))
+                    ),
+                ),
+            )
+
+        # Validate script metadata before either ignored filter outcome, while
+        # reserving the delivery identity only after filters accept the event.
         allowed_events = route_config.get("events", [])
         if allowed_events and event_type not in allowed_events:
             logger.debug(
@@ -780,43 +829,6 @@ class WebhookAdapter(BasePlatformAdapter):
                 }
             )
 
-        # Resolve one canonical, externally supplied identity for script routes.
-        # Stateful scripts must never receive a synthesized identity because it
-        # would let a retry bypass the delivery idempotency boundary.
-        external_delivery_id = next(
-            (
-                value.strip()
-                for name in ("X-GitHub-Delivery", "svix-id", "X-Request-ID")
-                if isinstance((value := request.headers.get(name)), str)
-                and value.strip()
-                and len(value.strip()) <= 256
-                and not _contains_control_character(value)
-            ),
-            None,
-        )
-        script_event_type = (
-            event_type
-            if isinstance(event_type, str)
-            and len(event_type) <= 128
-            and not _contains_control_character(event_type)
-            else None
-        )
-        if route_config.get("script") and (
-            external_delivery_id is None or script_event_type is None
-        ):
-            logger.warning(
-                "[webhook] Script route %s has invalid event or delivery metadata",
-                route_name,
-            )
-            return web.json_response(
-                {"error": "Script route requires valid event and delivery metadata"},
-                status=400,
-            )
-
-        # Preserve the timestamp fallback for non-script generic webhooks while
-        # making script execution and downstream processing share one identity.
-        delivery_id = external_delivery_id or str(int(time.time() * 1000))
-
         # ── Idempotency ─────────────────────────────────────────
         # Check before route scripts so a retried delivery cannot invoke a
         # stateful script more than once.
@@ -828,14 +840,14 @@ class WebhookAdapter(BasePlatformAdapter):
                 status=200,
             )
 
-        if route_config.get("script"):
+        if script_path:
             # run_route_script shells out (subprocess.run, up to its timeout);
             # run it in a worker thread so it can't block the gateway event loop.
             script_outcome, transformed_payload = await asyncio.to_thread(
                 self._route_processor.run_route_script,
-                route_config.get("script"),
+                script_path,
                 payload,
-                event_type=script_event_type,
+                event_type=event_type,
                 delivery_id=delivery_id,
             )
             if script_outcome == "failed":
