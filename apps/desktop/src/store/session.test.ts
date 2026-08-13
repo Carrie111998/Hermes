@@ -16,6 +16,7 @@ import {
   commitWorkspaceCwdForSelectedSession,
   getRememberedRoute,
   getRememberedSessionId,
+  getRememberedWorkspaceCwd,
   mergeSessionPage,
   rememberedSessionProfile,
   resolveComposerSessionKey,
@@ -375,6 +376,18 @@ describe('workspaceCwdForNewSession', () => {
     // never reads the remote keys (nor inherits the sticky local workspace).
     $connection.set(null)
     expect(workspaceCwdForNewSession()).toBe('')
+  })
+
+  it('keeps local workspace memory separate between profiles', () => {
+    $connection.set({ baseUrl: '', mode: 'local', profile: 'dev' } as never)
+    setCurrentCwd('/worktrees/dev-feature')
+
+    $connection.set({ baseUrl: '', mode: 'local', profile: 'ops' } as never)
+    expect(getRememberedWorkspaceCwd()).toBe('')
+
+    setCurrentCwd('/worktrees/ops-maintenance')
+    $connection.set({ baseUrl: '', mode: 'local', profile: 'dev' } as never)
+    expect(getRememberedWorkspaceCwd()).toBe('/worktrees/dev-feature')
   })
 
   it('remembers only the workspace the user picked, not the one they looked at', () => {

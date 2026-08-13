@@ -154,12 +154,13 @@ export function setRememberedRoute(path: null | string, profile: string): void {
 let configuredDefaultProjectDir = ''
 
 function workspaceCwdKey(connection: HermesConnection | null = $connection.get()): string {
+  const profile = encodeURIComponent(connection?.profile?.trim() || 'default')
+
   if (connection?.mode !== 'remote') {
-    return WORKSPACE_CWD_KEY
+    return `${WORKSPACE_CWD_KEY}.local.${profile}`
   }
 
   const base = encodeURIComponent(connection.baseUrl || 'remote')
-  const profile = encodeURIComponent(connection.profile || 'default')
 
   return `${WORKSPACE_CWD_KEY}.remote.${base}.${profile}`
 }
