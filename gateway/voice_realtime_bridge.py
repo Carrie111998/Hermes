@@ -1,22 +1,21 @@
 """Discord gateway ↔ realtime-voice supervisor bridge.
 
-The surface-agnostic consult/steer brain lives in
-:class:`agent.voice_supervisor.VoiceSupervisorController`; this module
-supplies the Discord gateway's :class:`~agent.voice_supervisor.TurnRunner`
-implementation. It re-enters the gateway's normal voice-input pipeline for
-submissions (auth, session binding, transcript echo, agent turn) and reads
-the base adapter's session guards for busy/queue state, so a consult behaves
-exactly like a spoken utterance would.
+Supplies the Discord :class:`~agent.voice_supervisor.TurnRunner` for
+:class:`agent.voice_supervisor.VoiceSupervisorController`. Submissions
+re-enter the gateway voice-input pipeline; busy/queue state comes from the
+adapter session guards.
 
-Controller methods run on realtime-session threads; everything that touches
-the gateway is bridged onto the event loop captured at construction.
+Agent turns are attributed to ``_voice_realtime_last_speaker`` (latched at
+submit), never the ``/voice join`` initiator. No speaker → drop. Gateway
+ops are serialized on the event loop so interrupt-then-submit stays ordered.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Optional
+from concurrent.futures import Future
+from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -29,19 +28,23 @@ class DiscordVoiceTurnRunner:
         self._adapter = adapter
         self._guild_id = guild_id
         self._loop = loop
+        self._active_user_id: int = 0
+        self._op_tail: Optional[Future] = None
 
-    # -- helpers -------------------------------------------------------------
-
-    def _bound_user_id(self) -> int:
-        """The /voice join initiator — consults run under their identity."""
-        source_data = getattr(self._adapter, "_voice_sources", {}).get(self._guild_id) or {}
+    def _speaker_user_id(self) -> int:
+        last = getattr(self._adapter, "_voice_realtime_last_speaker", {}).get(
+            self._guild_id
+        ) or 0
         try:
-            return int(source_data.get("user_id") or 0)
+            return int(last)
         except (TypeError, ValueError):
             return 0
 
+    def _turn_user_id(self) -> int:
+        return self._active_user_id or self._speaker_user_id()
+
     def _session_key(self) -> Optional[str]:
-        user_id = self._bound_user_id()
+        user_id = self._turn_user_id()
         if not user_id:
             return None
         source = self._runner._voice_channel_source(self._adapter, self._guild_id, user_id)
@@ -53,29 +56,44 @@ class DiscordVoiceTurnRunner:
             logger.debug("voice turn runner: session key resolution failed", exc_info=True)
             return None
 
-    # -- TurnRunner protocol ---------------------------------------------------
+    def _enqueue(self, factory: Callable[[], Awaitable[None]]) -> None:
+        """Run *factory* on the gateway loop after any prior op finishes."""
+        prev = self._op_tail
+
+        async def _linked() -> None:
+            if prev is not None:
+                try:
+                    await asyncio.wrap_future(prev, loop=self._loop)
+                except Exception:
+                    pass
+            await factory()
+
+        self._op_tail = asyncio.run_coroutine_threadsafe(_linked(), self._loop)
 
     def submit(self, task: str) -> None:
-        user_id = self._bound_user_id()
+        user_id = self._speaker_user_id()
         if not user_id:
             logger.warning(
-                "voice consult dropped: no bound user for guild %d", self._guild_id
+                "voice consult dropped: no speaker context for guild %d", self._guild_id
             )
             return
-        asyncio.run_coroutine_threadsafe(
-            self._runner._handle_voice_channel_input(self._guild_id, user_id, task),
-            self._loop,
-        )
+        self._active_user_id = user_id
+
+        async def _submit() -> None:
+            await self._runner._handle_voice_channel_input(self._guild_id, user_id, task)
+
+        self._enqueue(_submit)
 
     def interrupt(self) -> None:
         session_key = self._session_key()
         chat_id = getattr(self._adapter, "_voice_text_channels", {}).get(self._guild_id)
         if not session_key or not chat_id:
             return
-        asyncio.run_coroutine_threadsafe(
-            self._adapter.interrupt_session_activity(session_key, str(chat_id)),
-            self._loop,
-        )
+
+        async def _interrupt() -> None:
+            await self._adapter.interrupt_session_activity(session_key, str(chat_id))
+
+        self._enqueue(_interrupt)
 
     def is_busy(self) -> bool:
         session_key = self._session_key()

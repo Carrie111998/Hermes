@@ -733,6 +733,8 @@ class RealtimeVoiceSession:
                 self._barge_hot_frames = 0
                 self._barge_until = time.monotonic() + 4.0
                 self.clear_playout()
+                if self._active_response:
+                    self._send_event({"type": "response.cancel"})
         else:
             self._barge_hot_frames = max(0, self._barge_hot_frames - 1)
 

@@ -731,7 +731,10 @@ class TestLoudBarge:
         h = self._half_duplex_session()
         sess = h.session
         sess._playing = True
+        sess._active_response = True
         sess._playout_q.put(b"\x00\x01")
+        sent = []
+        sess._send_event = lambda event: sent.append(event) or True
         # Calibrate the bleed floor with quiet playback frames.
         sess._current_rms = 300
         for _ in range(5):
@@ -744,6 +747,7 @@ class TestLoudBarge:
         sess._update_barge_detector()
         assert sess.barge_active
         assert sess._playout_q.empty()  # speech was cut
+        assert {"type": "response.cancel"} in sent
 
     def test_bleed_alone_never_triggers(self):
         h = self._half_duplex_session()

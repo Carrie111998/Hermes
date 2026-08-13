@@ -11,42 +11,29 @@ import { notifyError } from '@/store/notifications'
 
 import type { ConversationStatus } from './use-voice-conversation'
 
-/** How often the consult watcher checks whether the turn settled. */
 const CONSULT_POLL_MS = 500
-/** Mirror of the Python controller's function-output payload cap. */
 const MAX_CONSULT_OUTPUT_CHARS = 6000
-/** A consult with no running turn and no reply older than this is provably
- *  dead — fail it out so the session can accept new consults (mirrors the
- *  Python controller's stale-consult self-heal). */
 const STALE_CONSULT_MIN_AGE_MS = 30_000
 
 interface PendingVoiceResponse {
   id: string
   pending: boolean
   text: string
-  /** Triggering user submission for this reply (null/absent = unknown). */
   userText?: string | null
 }
 
 interface RealtimeConversationOptions {
   busy: boolean
   enabled: boolean
-  /** Mint an ephemeral grant (RPC `voice.realtime_token`). Fresh per dial —
-   *  ephemeral credentials are never reused. Resolving null means realtime
-   *  is unavailable and the surface is falling back (not a fatal error). */
+  /** Fresh ephemeral grant per dial; null → fall back to classic voice. */
   requestToken: () => Promise<RealtimeTokenGrant | null>
-  /** Run a consult/steer task as a normal agent turn (no busy gate — the
-   *  submit pipeline owns interrupt semantics). */
   submitTask: (text: string) => Promise<void>
-  /** Interrupt the in-flight turn (Stop-button seam) — steering. */
   onInterrupt?: () => Promise<void> | void
   onFatalError?: () => void
   onStopWord?: () => void
-  /** Whole-utterance stop-phrase check (mirrors voice.stop_phrases). */
   isStopWord: (text: string) => boolean
   pendingResponse: () => PendingVoiceResponse | null
   consumePendingResponse: () => void
-  /** Awaited before the socket/mic opens (wake-word mic release). */
   beforeMicOpen?: () => Promise<void> | void
   failureLabel: string
 }
@@ -57,13 +44,7 @@ interface TrackedConsult {
   at: number
 }
 
-/**
- * The realtime (xAI S2S supervisor) voice conversation: grok-voice converses
- * with near-zero latency and delegates real work to Hermes through
- * consult/steer tool calls; Hermes turns run through the normal prompt
- * pipeline and their results are spoken as summaries. Exposes the same
- * surface as useVoiceConversation so the composer can swap loops.
- */
+/** xAI S2S supervisor loop — same surface as useVoiceConversation. */
 export function useRealtimeVoiceConversation({
   busy,
   enabled,
@@ -87,9 +68,7 @@ export function useRealtimeVoiceConversation({
   const busyRef = useRef(busy)
   busyRef.current = busy
 
-  // Latest-ref for the callback props: the socket lifecycle must depend on
-  // `enabled` only — inline callbacks changing identity per render must
-  // never tear down and re-dial the session.
+  // Keep callbacks out of the socket lifecycle deps (enabled-only).
   const optionsRef = useRef({
     requestToken,
     submitTask,
@@ -139,11 +118,7 @@ export function useRealtimeVoiceConversation({
       return
     }
 
-    // Attribute the reply before speaking it: a turn triggered by a different
-    // submission (the user typed a message mid-consult) must not become the
-    // consult's result. Mark it spoken and keep waiting for the consult
-    // turn's own reply. Containment matches steered continuations; an
-    // unknown trigger (userText null) is treated as the consult's.
+    // Skip unrelated typed turns; unknown trigger (null) counts as the consult's.
     const userText = reply.userText?.trim()
 
     if (userText && userText !== consult.task && !userText.includes(consult.task)) {
@@ -181,8 +156,6 @@ export function useRealtimeVoiceConversation({
         return
       }
 
-      // Self-heal: a consult whose turn died without ever producing a reply
-      // would otherwise block every future consult as "still working".
       const tracked = consultRef.current
 
       if (
@@ -229,14 +202,17 @@ export function useRealtimeVoiceConversation({
         return
       }
 
-      // Retarget: only the steered continuation reports back.
       consultRef.current = { callId: consultRef.current.callId, task: instruction, at: Date.now() }
-      void opts.submitTask(instruction)
 
-      if (busyRef.current) {
-        void opts.onInterrupt?.()
+      const steer = async () => {
+        if (busyRef.current) {
+          await opts.onInterrupt?.()
+        }
+
+        await opts.submitTask(instruction)
       }
 
+      void steer()
       client.sendFunctionOutput(call.callId, 'Steering applied — Hermes is adjusting course.')
 
       return
@@ -262,8 +238,6 @@ export function useRealtimeVoiceConversation({
       }
 
       if (!grant) {
-        // Realtime unavailable (e.g. older backend without the token RPC).
-        // Not fatal: the surface flips to the classic loop on its own.
         teardown()
 
         return
@@ -291,7 +265,6 @@ export function useRealtimeVoiceConversation({
           } else if (clientStatus === 'error') {
             notifyError(new Error(detail ?? 'realtime voice error'), optionsRef.current.failureLabel)
           } else if (clientStatus === 'closed' && clientRef.current) {
-            // Server-side close (token expiry, network) — surface and stop.
             teardown()
             optionsRef.current.onFatalError?.()
           }
@@ -318,8 +291,6 @@ export function useRealtimeVoiceConversation({
     teardown()
   }, [teardown])
 
-  // Consult completion watcher: the turn is done when busy settles and the
-  // reply text finalized — the same signal the classic voice loop uses.
   useEffect(() => {
     if (!enabled) {
       return
@@ -334,7 +305,6 @@ export function useRealtimeVoiceConversation({
     return () => clearInterval(timer)
   }, [completeConsult, enabled])
 
-  // Reflect thinking/listening as Hermes work starts and settles.
   useEffect(() => {
     if (!enabled || !clientRef.current) {
       return
@@ -347,7 +317,6 @@ export function useRealtimeVoiceConversation({
     }
   }, [busy, enabled])
 
-  // enabled drives the lifecycle, mirroring useVoiceConversation.
   useEffect(() => {
     if (enabled) {
       void start()
@@ -367,7 +336,6 @@ export function useRealtimeVoiceConversation({
     })
   }, [])
 
-  // Realtime turns are endpointed by server VAD — no manual stop.
   const stopTurn = useCallback(() => undefined, [])
 
   return { end, level, muted, start, status, stopTurn, toggleMute }

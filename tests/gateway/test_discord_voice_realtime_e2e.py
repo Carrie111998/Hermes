@@ -206,7 +206,8 @@ def test_full_discord_supervisor_loop(xai_server):
     loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
     loop_thread.start()
     adapter = SimpleNamespace(
-        _voice_sources={5: {"user_id": "77"}},
+        _voice_sources={5: {"user_id": "1"}},  # joiner ≠ speaker
+        _voice_realtime_last_speaker={5: 77},
         _voice_text_channels={5: 900},
         _active_sessions={},
         _pending_messages={},

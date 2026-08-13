@@ -46,7 +46,23 @@ def _post(monkeypatch):
     return post
 
 
+@pytest.fixture(autouse=True)
+def _realtime_enabled(monkeypatch):
+    monkeypatch.setattr(
+        srv,
+        "_load_cfg",
+        lambda: {"voice": {"realtime": {"enabled": True, "brain": "supervisor"}}},
+    )
+
+
 class TestTokenMint:
+    def test_disabled_realtime_is_rejected(self, _creds, _post, monkeypatch):
+        monkeypatch.setattr(srv, "_load_cfg", lambda: {"voice": {"realtime": {"enabled": False}}})
+        env = _call({})
+        assert env["error"]["code"] == 4030
+        assert "not enabled" in env["error"]["message"]
+        _post.assert_not_called()
+
     def test_happy_path_returns_token_and_session_config(self, _creds, _post):
         env = _call({})
         result = env["result"]
@@ -69,7 +85,7 @@ class TestTokenMint:
     def test_supervisor_forced_even_when_config_says_ears(self, _creds, _post, monkeypatch):
         monkeypatch.setattr(
             srv, "_load_cfg",
-            lambda: {"voice": {"realtime": {"brain": "ears"}}},
+            lambda: {"voice": {"realtime": {"enabled": True, "brain": "ears"}}},
         )
         session = _call({})["result"]["session_update"]["session"]
         assert "tools" in session  # ears payload has no tools

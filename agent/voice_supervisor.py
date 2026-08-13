@@ -152,12 +152,12 @@ class VoiceSupervisorController:
         self._emit("steer", instruction)
         self._consult["task"] = instruction
         self._consult["at"] = time.monotonic()
-        self._runner.submit(instruction)
         try:
             if self._runner.is_busy():
                 self._runner.interrupt()
         except Exception as e:
             logger.debug("voice steer interrupt failed: %s", e)
+        self._runner.submit(instruction)
         self._session.send_function_output(
             call_id, "Steering applied — Hermes is adjusting course."
         )

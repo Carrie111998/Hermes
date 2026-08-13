@@ -55,6 +55,7 @@ export {
   RealtimeVoiceClient,
   type RealtimeVoiceClientOptions,
   type RealtimeVoiceStatus,
+  resampleFloat32,
   STEER_TOOL_NAME
 } from './realtime-voice'
 export { skillInvocationText } from './skill-scaffold'

@@ -38,10 +38,35 @@ export const ACK_PHRASES: readonly string[] = [
  *  requesting the follow-up response (xAI no-overlap best practice). */
 const QUIET_WAIT_TIMEOUT_MS = 20_000
 const QUIET_POLL_MS = 200
-/** Mic frames ~100 ms apiece (xAI best practice). */
+/** Mic frames ~100 ms apiece at 16 kHz (xAI best practice). */
 const MIC_FRAME_SAMPLES = 1600
 /** WebSocket OPEN readyState without touching the global (absent in jsdom). */
 const WS_OPEN = 1
+
+/** Linear resample — browsers often ignore AudioContext({ sampleRate }). */
+export function resampleFloat32(
+  input: Float32Array,
+  fromRate: number,
+  toRate: number
+): Float32Array {
+  if (fromRate === toRate || input.length === 0) {
+    return input
+  }
+
+  const ratio = fromRate / toRate
+  const outLength = Math.max(1, Math.floor(input.length / ratio))
+  const out = new Float32Array(outLength)
+
+  for (let i = 0; i < outLength; i++) {
+    const src = i * ratio
+    const i0 = Math.floor(src)
+    const i1 = Math.min(i0 + 1, input.length - 1)
+    const frac = src - i0
+    out[i] = input[i0] * (1 - frac) + input[i1] * frac
+  }
+
+  return out
+}
 
 export type RealtimeVoiceStatus =
   | 'connecting'
@@ -362,21 +387,19 @@ export class RealtimeVoiceClient {
   // -- mic capture -------------------------------------------------------------
 
   private async openMic(): Promise<void> {
-    // Browser AEC + noise suppression is what makes full duplex safe on
-    // open speakers (the CLI has neither, hence its half-duplex default).
     this.micStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true }
     })
     this.micContext = new AudioContext({ sampleRate: REALTIME_INPUT_SAMPLE_RATE })
+    const captureRate = this.micContext.sampleRate
     const source = this.micContext.createMediaStreamSource(this.micStream)
-    // ScriptProcessor is deprecated but universal; frames are ~100 ms so the
-    // main-thread cost is negligible (same approach as xAI's web example).
     const node = this.micContext.createScriptProcessor(4096, 1, 1)
     this.micNode = node
     let pcmCarry = new Float32Array(0)
 
     node.onaudioprocess = e => {
-      const input = e.inputBuffer.getChannelData(0)
+      const raw = e.inputBuffer.getChannelData(0)
+      const input = resampleFloat32(raw, captureRate, REALTIME_INPUT_SAMPLE_RATE)
       const merged = new Float32Array(pcmCarry.length + input.length)
       merged.set(pcmCarry)
       merged.set(input, pcmCarry.length)
@@ -392,7 +415,11 @@ export class RealtimeVoiceClient {
     }
 
     source.connect(node)
-    node.connect(this.micContext.destination)
+    // Keep the processor alive without audible mic monitor.
+    const silent = this.micContext.createGain()
+    silent.gain.value = 0
+    node.connect(silent)
+    silent.connect(this.micContext.destination)
   }
 
   private emitMicFrame(frame: Float32Array): void {
@@ -467,10 +494,15 @@ export class RealtimeVoiceClient {
 
     if (bytes.length === 0) {return}
     const pcm = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.length / 2)
-    const buffer = pb.context.createBuffer(1, pcm.length, REALTIME_OUTPUT_SAMPLE_RATE)
-    const channel = buffer.getChannelData(0)
+    const float24k = new Float32Array(pcm.length)
 
-    for (let i = 0; i < pcm.length; i++) {channel[i] = pcm[i] / 32768}
+    for (let i = 0; i < pcm.length; i++) {float24k[i] = pcm[i] / 32768}
+
+    // Provider audio is 24 kHz; resample when the context ignored that rate.
+    const playRate = pb.context.sampleRate
+    const samples = resampleFloat32(float24k, REALTIME_OUTPUT_SAMPLE_RATE, playRate)
+    const buffer = pb.context.createBuffer(1, samples.length, playRate)
+    buffer.getChannelData(0).set(samples)
     const source = pb.context.createBufferSource()
     source.buffer = buffer
     source.connect(pb.context.destination)

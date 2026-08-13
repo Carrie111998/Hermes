@@ -14153,7 +14153,11 @@ def _(rid, params: dict) -> dict:
     """
     import requests
 
-    from tools.voice_realtime import build_session_update, load_realtime_config
+    from tools.voice_realtime import (
+        build_session_update,
+        load_realtime_config,
+        realtime_voice_enabled,
+    )
     from tools.xai_http import resolve_xai_http_credentials
 
     try:
@@ -14164,6 +14168,11 @@ def _(rid, params: dict) -> dict:
 
     cfg = _load_cfg()
     _vc = cfg.get("voice")
+    if not realtime_voice_enabled(_vc if isinstance(_vc, dict) else {}):
+        return _err(
+            rid, 4030,
+            "voice.realtime is not enabled (set voice.realtime.enabled: true)",
+        )
     rt_cfg = load_realtime_config(_vc if isinstance(_vc, dict) else {})
     # Browser surfaces are conversational by definition — a muted ears
     # session is meaningless there, so the payload is always supervisor.

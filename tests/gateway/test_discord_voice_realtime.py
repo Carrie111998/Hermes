@@ -445,15 +445,22 @@ class TestJoinRealtimeGate:
 # DiscordVoiceTurnRunner (gateway side)
 # =====================================================================
 
-def _make_turn_runner(loop):
+def _make_turn_runner(loop, *, speaker_id: int = 77):
     from gateway.voice_realtime_bridge import DiscordVoiceTurnRunner
 
     gateway_runner = MagicMock()
     gateway_runner._handle_voice_channel_input = AsyncMock()
     gateway_runner._voice_channel_source = MagicMock(return_value=SimpleNamespace())
-    gateway_runner._session_key_for_source = MagicMock(return_value="agent:main:discord:chan9:77")
+
+    # Session key must track the user id the runner asks for (speaker, not joiner).
+    def _session_key_for_source(_source):
+        user_id = gateway_runner._voice_channel_source.call_args[0][2]
+        return f"agent:main:discord:chan9:{user_id}"
+
+    gateway_runner._session_key_for_source = MagicMock(side_effect=_session_key_for_source)
     adapter = SimpleNamespace(
-        _voice_sources={5: {"user_id": "77"}},
+        _voice_sources={5: {"user_id": "1"}},  # joiner ≠ speaker
+        _voice_realtime_last_speaker={5: speaker_id},
         _voice_text_channels={5: 900},
         _active_sessions={},
         _pending_messages={},
@@ -464,29 +471,33 @@ def _make_turn_runner(loop):
 
 class TestDiscordVoiceTurnRunner:
     @pytest.mark.asyncio
-    async def test_submit_reenters_voice_input_pipeline(self):
+    async def test_submit_attributes_to_actual_speaker_not_joiner(self):
         loop = asyncio.get_running_loop()
-        runner, gw, _ = _make_turn_runner(loop)
+        runner, gw, adapter = _make_turn_runner(loop, speaker_id=99)
+        assert adapter._voice_sources[5]["user_id"] == "1"  # joiner ≠ speaker
         runner.submit("check the logs")
         for _ in range(50):
             if gw._handle_voice_channel_input.await_count:
                 break
             await asyncio.sleep(0.01)
-        gw._handle_voice_channel_input.assert_awaited_once_with(5, 77, "check the logs")
+        gw._handle_voice_channel_input.assert_awaited_once_with(5, 99, "check the logs")
 
     @pytest.mark.asyncio
-    async def test_submit_without_bound_user_is_dropped(self):
+    async def test_submit_without_speaker_context_is_dropped(self):
         loop = asyncio.get_running_loop()
         runner, gw, adapter = _make_turn_runner(loop)
-        adapter._voice_sources = {}
+        adapter._voice_realtime_last_speaker = {}
         runner.submit("task")
         await asyncio.sleep(0.05)
         gw._handle_voice_channel_input.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_busy_and_queue_read_adapter_guards(self):
+    async def test_busy_and_queue_follow_latched_speaker_session(self):
         loop = asyncio.get_running_loop()
-        runner, _, adapter = _make_turn_runner(loop)
+        runner, _, adapter = _make_turn_runner(loop, speaker_id=77)
+        runner.submit("task")  # latch speaker 77
+        # Another user talks mid-consult — busy/queue must stay on 77.
+        adapter._voice_realtime_last_speaker[5] = 88
         key = "agent:main:discord:chan9:77"
         assert runner.is_busy() is False
         assert runner.is_queue_empty() is True
@@ -498,7 +509,8 @@ class TestDiscordVoiceTurnRunner:
     @pytest.mark.asyncio
     async def test_interrupt_uses_adapter_session_interrupt(self):
         loop = asyncio.get_running_loop()
-        runner, _, adapter = _make_turn_runner(loop)
+        runner, _, adapter = _make_turn_runner(loop, speaker_id=77)
+        runner.submit("task")  # latch speaker before interrupt
         runner.interrupt()
         for _ in range(50):
             if adapter.interrupt_session_activity.await_count:
@@ -533,7 +545,8 @@ def _make_gateway_runner(session, loop):
     runner = object.__new__(GatewayRunner)
     adapter = SimpleNamespace(
         voice_realtime_session=lambda gid: session if gid == 5 else None,
-        _voice_sources={5: {"user_id": "77"}},
+        _voice_sources={5: {"user_id": "1"}},  # joiner ≠ speaker
+        _voice_realtime_last_speaker={5: 77},
         _voice_text_channels={5: 900},
         _active_sessions={},
         _pending_messages={},
@@ -583,9 +596,11 @@ class TestControllerLifecycle:
         assert runner._ensure_voice_realtime_controller(5) is None
         assert runner._voice_realtime_controllers == {}
 
-    def test_function_call_dispatches_consult_through_voice_pipeline(self, bg_loop):
+    def test_function_call_dispatches_consult_as_speaker_not_joiner(self, bg_loop):
         session = _fake_session()
-        runner, _ = _make_gateway_runner(session, bg_loop)
+        runner, adapter = _make_gateway_runner(session, bg_loop)
+        assert adapter._voice_sources[5]["user_id"] == "1"
+        assert adapter._voice_realtime_last_speaker[5] == 77
         submitted = AsyncMock()
         runner._handle_voice_channel_input = submitted  # instance shadow
         runner._handle_voice_channel_function_call(

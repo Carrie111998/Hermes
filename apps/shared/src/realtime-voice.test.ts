@@ -14,7 +14,8 @@ import {
   ACK_PHRASES,
   type RealtimeFunctionCall,
   RealtimeVoiceClient,
-  type RealtimeVoiceStatus
+  type RealtimeVoiceStatus,
+  resampleFloat32
 } from './realtime-voice'
 
 const WS_CONNECTING = 0
@@ -180,6 +181,20 @@ describe('supervisor tool contract', () => {
 
     const spoken = (acks[1].item as { content: { text: string }[] }).content[0].text
     expect(ACK_PHRASES).toContain(spoken)
+  })
+})
+
+describe('resampleFloat32', () => {
+  it('downsamples 48 kHz to 16 kHz without changing identity at equal rates', () => {
+    const identity = new Float32Array([0, 0.5, -0.5, 1])
+    expect(resampleFloat32(identity, 16000, 16000)).toBe(identity)
+
+    // 3:1 decimation of a constant tone stays flat.
+    const src = new Float32Array(4800).fill(0.25)
+    const out = resampleFloat32(src, 48000, 16000)
+    expect(out.length).toBe(1600)
+    expect(out[0]).toBeCloseTo(0.25, 5)
+    expect(out[out.length - 1]).toBeCloseTo(0.25, 5)
   })
 })
 

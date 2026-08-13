@@ -37,14 +37,17 @@ class FakeRunner:
     def __init__(self):
         self.submitted = []
         self.interrupts = 0
+        self.ops = []
         self.busy = False
         self.queue_empty = True
 
     def submit(self, task):
         self.submitted.append(task)
+        self.ops.append(("submit", task))
 
     def interrupt(self):
         self.interrupts += 1
+        self.ops.append(("interrupt",))
 
     def is_busy(self):
         return self.busy
@@ -133,6 +136,11 @@ class TestSteer:
         assert ctrl._consult["call_id"] == "c1"  # result still answers c1
         assert runner.submitted == ["original", "also check logs"]
         assert runner.interrupts == 1
+        # Interrupt must precede the steered submit (avoids cancelling it).
+        assert runner.ops[-2:] == [
+            ("interrupt",),
+            ("submit", "also check logs"),
+        ]
         assert session.outputs[-1][0] == "s1"
         assert "Steering applied" in session.outputs[-1][1]
         assert ("steer", "also check logs") in events

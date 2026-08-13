@@ -1,14 +1,4 @@
-/**
- * Realtime voice call card (dashboard sidebar).
- *
- * Holds the xAI S2S socket directly in the browser (ephemeral token minted by
- * the backend via `voice.realtime_token`; browser AEC → full duplex on
- * speakers). grok-voice converses instantly and delegates real work to Hermes
- * through consult/steer tool calls, which run as turns in a dedicated
- * dashboard voice session on this card's own JSON-RPC sidecar — deliberately
- * NOT the embedded TUI's session, so the two surfaces never fight over one
- * transport. Works from a phone browser too — that's the mobile story.
- */
+/** Dashboard realtime voice call — own sidecar session, not the embedded TUI. */
 
 import { RealtimeVoiceClient, type RealtimeTokenGrant } from "@hermes/shared";
 import { Mic, MicOff, Square } from "lucide-react";
