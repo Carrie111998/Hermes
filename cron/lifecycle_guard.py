@@ -258,7 +258,11 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # OSError: unreadable/long paths. ValueError: embedded NUL byte in
+        # the path itself (os.open rejects NULs with ValueError, not
+        # OSError). A NUL-containing path can never name a real script —
+        # treat it like a missing file: nothing to scan (#76762 follow-up).
         return None, False
     try:
         metadata = os.fstat(descriptor)

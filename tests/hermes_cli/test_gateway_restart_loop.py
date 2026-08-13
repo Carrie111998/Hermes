@@ -695,6 +695,80 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_script_path_with_nul_byte_does_not_crash_guard(self):
+        """#76762 follow-up: a *path* with an embedded NUL byte (from a
+        tokenized binary's decoded contents, or a crafted command line) must
+        not crash the guard with ValueError: embedded null character in path.
+
+        Before the fix, _read_referenced_script() called os.open() on the
+        raw path and only caught OSError — os.open() raises ValueError for
+        NUL-containing paths, so the whole terminal-tool call died with a
+        traceback instead of allowing/blocking the command.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        # A command token that resolves to a path with an embedded NUL.
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "bash /tmp/evil\x00.sh"
+        )
+        assert result is False
+
+    def test_relative_script_path_with_nul_byte_does_not_crash_guard(self):
+        """Same NUL-path robustness for relative references resolved against
+        a cwd (Path(cwd) / token) — the resolve() fallback keeps the raw
+        path, so the read path must tolerate NULs too."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "bash evil\x00.sh", cwd="/tmp"
+        )
+        assert result is False
+
+    def test_nul_path_in_referenced_script_content_does_not_crash_guard(
+        self, tmp_path
+    ):
+        """A shell script whose *content* contains a NUL byte (e.g. a helper
+        written by a binary that leaked a NUL) is treated as binary — skipped
+        as \"nothing to scan\" — and must not crash the recursive walk."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        wrapper = tmp_path / "wrapper.sh"
+        wrapper.write_bytes(b"#!/bin/bash\nbash /tmp/evil\x00.sh\n")
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            f"bash {wrapper}"
+        )
+        assert result is False
+
+    def test_nul_path_script_with_lifecycle_command_is_blocked_not_crashed(
+        self, tmp_path
+    ):
+        """NUL tolerance must not weaken the guard: a script WITHOUT NUL in
+        its content that references a NUL path AND contains a real lifecycle
+        command still blocks (the direct regex runs on the clean content)."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        wrapper = tmp_path / "wrapper.sh"
+        wrapper.write_text(
+            "#!/bin/bash\nbash /tmp/evil_placeholder.sh\nhermes gateway restart\n"
+        )
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            f"bash {wrapper}"
+        )
+        assert result is True
+
+    def test_read_referenced_script_nul_path_returns_none(self):
+        """Direct unit check: _read_referenced_script() treats a NUL path as
+        unreadable (None, False) instead of raising."""
+        from pathlib import Path
+        from cron.lifecycle_guard import _read_referenced_script
+        text, unsafe = _read_referenced_script(Path("/tmp/evil\x00.sh"))
+        assert text is None
+        assert unsafe is False
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""
