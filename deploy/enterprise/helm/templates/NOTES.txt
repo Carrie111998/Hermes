@@ -1,0 +1,30 @@
+Hermes Enterprise ({{ .Chart.Name }} {{ .Chart.Version }}) installed.
+
+Controller (OCC): {{ printf "%s-occ" .Release.Name }} in namespace {{ .Release.Namespace }}
+
+Quickstart:
+
+1. Check the controller:
+
+   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ printf "%s-occ" .Release.Name }}
+
+2. Reach the OCC API locally:
+
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ printf "%s-occ" .Release.Name }} {{ .Values.service.port }}:{{ .Values.service.port }}
+   curl http://localhost:{{ .Values.service.port }}/healthz
+
+3. The controller creates per-org namespaces prefixed
+   "{{ .Values.rbac.namespacePrefix }}" and deploys one Hermes gateway per org
+   at runtime — no extra chart installs needed per org.
+
+{{- if .Values.ingress.enabled }}
+
+Ingress: https://{{ .Values.ingress.host }}{{ .Values.ingress.path }}
+Make sure your OIDC annotations (values: ingress.annotations) are set —
+the OCC API should never be exposed unauthenticated.
+{{- else }}
+
+Ingress is disabled. Enable it with:
+   --set ingress.enabled=true --set ingress.host=occ.example.com
+and add your OIDC auth annotations under ingress.annotations.
+{{- end }}

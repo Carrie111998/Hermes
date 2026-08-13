@@ -1,0 +1,95 @@
+# Default values for hermes-enterprise.
+
+image:
+  repository: ghcr.io/nousresearch/hermes-enterprise
+  tag: ""            # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Gateway pods created by the controller at runtime use this image unless
+# overridden per-org. Usually the same image as the controller.
+gatewayImage:
+  repository: ghcr.io/nousresearch/hermes-enterprise
+  tag: ""            # defaults to .Chart.AppVersion
+
+occ:
+  # OCC API listen port inside the pod.
+  port: 8800
+  # Extra args appended to `python -m enterprise.cli`.
+  extraArgs: []
+  # Extra environment variables for the controller container.
+  env: []
+  #  - name: OCC_LOG_LEVEL
+  #    value: debug
+  # Secret refs (API keys etc.) injected wholesale.
+  envFrom: []
+  #  - secretRef:
+  #      name: hermes-enterprise-secrets
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+# Persistent state (SQLite resource store + audit log) for the controller.
+persistence:
+  enabled: true
+  storageClass: ""   # "" = cluster default
+  accessModes:
+    - ReadWriteOnce
+  size: 5Gi
+  # Mounted at /opt/data (HERMES_HOME).
+  mountPath: /opt/data
+
+serviceAccount:
+  create: true
+  name: ""           # defaults to the release fullname
+  annotations: {}
+
+rbac:
+  create: true
+  # The controller creates and manages resources in namespaces prefixed
+  # "hermes-". Namespaces are not label-scopable in RBAC, so the Role
+  # grants breadth cluster-wide via a ClusterRole; scope enforcement
+  # (the hermes- prefix) is applied by the controller itself.
+  namespacePrefix: hermes-
+
+service:
+  type: ClusterIP
+  port: 8800
+
+ingress:
+  enabled: false
+  className: ""
+  # OIDC enforcement is expected at the ingress layer; supply your
+  # auth-provider annotations here (oauth2-proxy, ingress-nginx
+  # auth-url/auth-signin, etc.).
+  annotations: {}
+  #  nginx.ingress.kubernetes.io/auth-url: "https://oauth2.example.com/oauth2/auth"
+  #  nginx.ingress.kubernetes.io/auth-signin: "https://oauth2.example.com/oauth2/start?rd=$scheme://$host$request_uri"
+  host: occ.example.com
+  path: /
+  pathType: Prefix
+  tls: []
+  #  - secretName: occ-tls
+  #    hosts:
+  #      - occ.example.com
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10000
+  fsGroup: 10000
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL

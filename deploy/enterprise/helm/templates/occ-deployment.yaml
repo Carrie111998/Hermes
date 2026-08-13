@@ -1,0 +1,138 @@
+{{- /* Common helpers inline: fullname = release-name + "-occ" */ -}}
+{{- $fullname := printf "%s-occ" .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- $saName := default $fullname .Values.serviceAccount.name -}}
+{{- if .Values.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $fullname }}-state
+  labels:
+    app.kubernetes.io/name: hermes-enterprise
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: occ
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.accessModes | nindent 4 }}
+  {{- with .Values.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  labels:
+    app.kubernetes.io/name: hermes-enterprise
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: occ
+spec:
+  # SQLite state on a RWO volume: exactly one replica, Recreate strategy
+  # so upgrades never run two writers against the same database file.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hermes-enterprise
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: occ
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hermes-enterprise
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: occ
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ $saName }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: occ
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.occ.extraArgs }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.occ.port }}
+          env:
+            - name: OCC_GATEWAY_IMAGE
+              value: "{{ .Values.gatewayImage.repository }}:{{ .Values.gatewayImage.tag | default .Chart.AppVersion }}"
+            - name: OCC_NAMESPACE_PREFIX
+              value: {{ .Values.rbac.namespacePrefix | quote }}
+            {{- with .Values.occ.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.occ.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.occ.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: state
+              mountPath: {{ .Values.persistence.mountPath }}
+      volumes:
+        - name: state
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ $fullname }}-state
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  labels:
+    app.kubernetes.io/name: hermes-enterprise
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: occ
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+  selector:
+    app.kubernetes.io/name: hermes-enterprise
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: occ

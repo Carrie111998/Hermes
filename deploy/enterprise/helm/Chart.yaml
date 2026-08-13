@@ -1,0 +1,18 @@
+apiVersion: v2
+name: hermes-enterprise
+description: >-
+  Hermes Enterprise control plane (OCC controller). The controller manages
+  per-namespace Hermes gateway deployments at runtime; this chart installs
+  the controller, its state PVC, RBAC, and an optional ingress for the OCC API.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - hermes
+  - agent
+  - enterprise
+home: https://hermes-agent.nousresearch.com
+sources:
+  - https://github.com/NousResearch/hermes-agent
+maintainers:
+  - name: Nous Research
