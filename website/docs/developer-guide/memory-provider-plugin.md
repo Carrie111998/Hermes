@@ -83,6 +83,27 @@ class MyMemoryProvider(MemoryProvider):
 | `on_memory_write(action, target, content)` | Built-in memory writes | Mirror to your backend |
 | `shutdown()` | Process exit | Clean up connections |
 
+## Structured Pre-Compression Context
+
+`on_pre_compress(messages)` may return either a plain string or a `CompressionContext`. Returning a string remains fully supported for backward compatibility.
+
+Use `CompressionContext` when the provider needs to distinguish ordinary context from facts that are especially important to preserve during compression:
+
+```python
+from agent.memory_provider import CompressionContext
+
+def on_pre_compress(self, messages):
+    return CompressionContext(
+        text="Relevant project state",
+        key_facts=[
+            "Python version: 3.11",
+            "Do not modify database schema",
+        ],
+    )
+```
+
+`text` is treated like the legacy string return value. `key_facts` are marked explicitly as important facts before being passed through the existing sanitized compression-context boundary.
+
 ## Config Schema
 
 `get_config_schema()` returns a list of field descriptors used by `hermes memory setup`:

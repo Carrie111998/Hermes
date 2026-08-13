@@ -73,6 +73,7 @@ from agent.context_engine import (
 )
 from agent.model_metadata import estimate_request_tokens_rough
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
+from agent.memory_provider import CompressionContext
 
 logger = logging.getLogger(__name__)
 
@@ -2830,8 +2831,31 @@ def compress_context(
         if agent._memory_manager:
             try:
                 _maybe_ctx = agent._memory_manager.on_pre_compress(messages)
-                if isinstance(_maybe_ctx, str):
+
+                if isinstance(_maybe_ctx, CompressionContext):
+                    _context_parts = []
+
+                    if _maybe_ctx.text and _maybe_ctx.text.strip():
+                        _context_parts.append(_maybe_ctx.text)
+
+                    _key_facts = [
+                        fact.strip()
+                        for fact in _maybe_ctx.key_facts
+                        if isinstance(fact, str) and fact.strip()
+                    ]
+                    if _key_facts:
+                        _context_parts.append(
+                            "MEMORY PROVIDER KEY FACTS:\n"
+                            + "\n".join(f"- {fact}" for fact in _key_facts)
+                        )
+
+                    memory_context = sanitize_memory_context(
+                        "\n\n".join(_context_parts)
+                    )
+
+                elif isinstance(_maybe_ctx, str):
                     memory_context = sanitize_memory_context(_maybe_ctx)
+
             except Exception:
                 pass
 

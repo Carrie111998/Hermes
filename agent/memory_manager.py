@@ -33,7 +33,7 @@ import threading
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import CompressionContext, MemoryProvider
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.registry import tool_error
 
@@ -971,24 +971,41 @@ class MemoryManager:
                     provider.name, e,
                 )
 
-    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> CompressionContext:
         """Notify all providers before context compression.
 
-        Returns combined text from providers to include in the compression
-        summary prompt. Empty string if no provider contributes.
+        Legacy string results are preserved as text. Structured provider
+        results additionally contribute key facts for compression.
         """
-        parts = []
+        text_parts: List[str] = []
+        key_facts: List[str] = []
+
         for provider in self._providers:
             try:
                 result = provider.on_pre_compress(messages)
-                if result and result.strip():
-                    parts.append(result)
+
+                if isinstance(result, CompressionContext):
+                    if result.text and result.text.strip():
+                        text_parts.append(result.text)
+                    key_facts.extend(
+                        fact
+                        for fact in result.key_facts
+                        if isinstance(fact, str) and fact.strip()
+                    )
+                elif isinstance(result, str) and result.strip():
+                    text_parts.append(result)
+
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' on_pre_compress failed: %s",
-                    provider.name, e,
+                    provider.name,
+                    e,
                 )
-        return "\n\n".join(parts)
+
+        return CompressionContext(
+            text="\n\n".join(text_parts),
+            key_facts=key_facts,
+        )
 
     @staticmethod
     def _provider_memory_write_metadata_mode(provider: MemoryProvider) -> str:
