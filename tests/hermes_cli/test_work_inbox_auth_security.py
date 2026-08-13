@@ -274,6 +274,51 @@ def test_work_inbox_credential_can_observe_its_intake_status_only(
     ).status_code == 401
 
 
+def test_work_inbox_status_exposes_only_bounded_contract_failure_path(
+    app_client, strict_board, strong_secret,
+):
+    headers = {"Authorization": f"Bearer {strong_secret}"}
+    submitted = app_client.post(
+        f"/api/plugins/kanban/work-inbox?board={strict_board}",
+        headers=headers,
+        json={
+            "version": 2,
+            "kind": "new_work",
+            "request": {"functional_intent": {"title": "Failed contract"}},
+        },
+    )
+    intake_id = submitted.json()["intake_id"]
+    with kb.connect(board=strict_board) as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE qualification_intake SET status = 'attention_required' WHERE id = ?",
+                (intake_id,),
+            )
+        kb.append_qualification_intake_event(
+            conn,
+            intake_id=intake_id,
+            kind="work_contract_verification_failed",
+            payload={"failure_path": "key_unreadable", "raw": "secret-event-sentinel"},
+        )
+        kb.append_qualification_intake_event(
+            conn,
+            intake_id=intake_id,
+            kind="work_contract_verification_failed",
+            payload={"failure_path": "arbitrary-unsafe-path"},
+        )
+
+    status = app_client.get(
+        "/api/plugins/kanban/work-inbox/status",
+        params={"board": strict_board, "intake_id": intake_id},
+        headers=headers,
+    )
+
+    assert status.status_code == 200, status.text
+    assert status.json()["failure_path"] == "key_unreadable"
+    assert "secret-event-sentinel" not in status.text
+    assert "arbitrary-unsafe-path" not in status.text
+
+
 def test_same_credential_can_answer_clarification_and_retry_attention(
     app_client, strict_board, strong_secret,
 ):

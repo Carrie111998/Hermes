@@ -520,19 +520,52 @@ def decide_product_owner_intake(
         signed = kanban_intake.sign_work_contract(contract)
     except kanban_intake.WorkContractError as exc:
         return invalid_decision([str(exc)])
+    failure_path: Optional[str] = None
+    task_id: Optional[str] = None
     with kanban_db.write_txn(conn):
-        task_id = kanban_intake.materialize_contract(
-            conn, board=board, signed_contract=signed
-        )
-        if not kanban_db.finish_qualification_intake_run(
-            conn,
-            intake_id=intake_id,
-            run_id=int(run["id"]),
-            claim_lock=claim_lock,
-            intake_status="qualified",
-            outcome="qualified",
-        ):
-            raise RuntimeError("Product Owner intake claim changed during materialization")
+        try:
+            task_id = kanban_intake.materialize_contract(
+                conn, board=board, signed_contract=signed
+            )
+        except kanban_intake.WorkContractError as exc:
+            failure_path = kanban_intake.safe_work_contract_failure(exc)
+            if failure_path is None:
+                raise
+            if not kanban_db.finish_qualification_intake_run(
+                conn,
+                intake_id=intake_id,
+                run_id=int(run["id"]),
+                claim_lock=claim_lock,
+                intake_status="attention_required",
+                outcome="work_contract_verification_failed",
+                error=f"work_contract:{failure_path}",
+            ):
+                raise RuntimeError("Product Owner intake claim changed during materialization")
+            kanban_db.append_qualification_intake_event(
+                conn,
+                intake_id=intake_id,
+                run_id=int(run["id"]),
+                kind="work_contract_verification_failed",
+                payload={"failure_path": failure_path},
+            )
+        else:
+            if not kanban_db.finish_qualification_intake_run(
+                conn,
+                intake_id=intake_id,
+                run_id=int(run["id"]),
+                claim_lock=claim_lock,
+                intake_status="qualified",
+                outcome="qualified",
+            ):
+                raise RuntimeError("Product Owner intake claim changed during materialization")
+    if failure_path is not None:
+        return {
+            "status": "attention_required",
+            "intake_id": intake_id,
+            "failure_path": failure_path,
+        }
+    if task_id is None:
+        raise RuntimeError("Product Owner materialization produced no task")
     return {
         "status": "qualified",
         "intake_id": intake_id,

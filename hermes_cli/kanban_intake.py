@@ -16,12 +16,13 @@ import logging
 import os
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import threading
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Literal, Mapping, Optional
 
 from hermes_constants import (
     get_default_hermes_root,
@@ -72,6 +73,62 @@ _INTAKE_WAKERS_LOCK = threading.Lock()
 
 class WorkContractError(ValueError):
     """The Work Contract is missing, invalid, or violates board policy."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure: Optional[WorkContractFailure] = None,
+    ) -> None:
+        self.failure = failure
+        super().__init__(message)
+
+
+WorkContractFailure = Literal[
+    "shape",
+    "canonical_mismatch",
+    "digest_mismatch",
+    "signature_mismatch",
+    "key_unreadable",
+    "io_error",
+]
+
+
+@dataclass(frozen=True)
+class WorkContractVerification:
+    valid: bool
+    failure: WorkContractFailure | None = None
+
+
+class SigningKeyUnreadable(OSError):
+    """The signing key is missing, unsafe, invalid, or unreadable."""
+
+
+def safe_work_contract_failure(exc: BaseException) -> Optional[WorkContractFailure]:
+    """Return only the bounded verification path carried by a contract error."""
+
+    if not isinstance(exc, WorkContractError):
+        return None
+    failure = exc.failure
+    if failure in {
+        "shape",
+        "canonical_mismatch",
+        "digest_mismatch",
+        "signature_mismatch",
+        "key_unreadable",
+        "io_error",
+    }:
+        return failure
+    return None
+
+
+def work_contract_verification_error(failure: WorkContractFailure) -> WorkContractError:
+    """Build the bounded error used at the materialization boundary."""
+
+    return WorkContractError(
+        f"Work Contract verification failed: {failure}",
+        failure=failure,
+    )
 
 
 def _register_intake_waker(callback: Callable[[], None]) -> None:
@@ -224,11 +281,11 @@ def _load_signing_secret(
 
     path = _signing_key_path(hermes_home)
     if path.is_symlink():
-        raise WorkContractError("Work Contract signing key cannot be a symlink")
+        raise SigningKeyUnreadable("Work Contract signing key cannot be a symlink")
     if not create and not path.is_file():
-        raise WorkContractError("Work Contract signing key is missing")
-    path.parent.mkdir(parents=True, exist_ok=True)
+        raise SigningKeyUnreadable("Work Contract signing key is missing")
     if create:
+        path.parent.mkdir(parents=True, exist_ok=True)
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
@@ -246,11 +303,26 @@ def _load_signing_secret(
                     pass
                 raise
     if path.is_symlink() or not path.is_file():
-        raise WorkContractError("Work Contract signing key is not a regular file")
-    _restrict_signing_key_permissions(path)
-    value = path.read_bytes()
+        raise SigningKeyUnreadable("Work Contract signing key is not a regular file")
+    if sys.platform != "win32":
+        try:
+            mode = stat.S_IMODE(path.stat().st_mode)
+        except OSError as exc:
+            raise SigningKeyUnreadable(
+                "Work Contract signing key permissions are unreadable"
+            ) from exc
+        if mode != 0o600:
+            raise SigningKeyUnreadable("Work Contract signing key permissions are unsafe")
+    try:
+        _restrict_signing_key_permissions(path)
+    except (OSError, WorkContractError) as exc:
+        raise SigningKeyUnreadable("Work Contract signing key is unreadable") from exc
+    try:
+        value = path.read_bytes()
+    except OSError as exc:
+        raise SigningKeyUnreadable("Work Contract signing key is unreadable") from exc
     if len(value) < 32:
-        raise WorkContractError("Work Contract signing key is invalid")
+        raise SigningKeyUnreadable("Work Contract signing key is invalid")
     return value
 
 
@@ -290,35 +362,59 @@ def verify_work_contract(
     *,
     secret: Optional[bytes] = None,
     hermes_home: Optional[Path] = None,
-) -> bool:
-    """Fail closed unless canonical JSON, digest, signature, and version agree."""
+) -> WorkContractVerification:
+    """Return one safe path for every Work Contract verification result."""
 
+    if not isinstance(signed_contract, Mapping):
+        return WorkContractVerification(valid=False, failure="shape")
+    contract = signed_contract.get("contract")
+    if not isinstance(contract, Mapping):
+        return WorkContractVerification(valid=False, failure="shape")
     try:
-        if not isinstance(signed_contract, Mapping):
-            return False
-        contract = signed_contract.get("contract")
-        if not isinstance(contract, Mapping):
-            return False
         canonical = canonical_contract_json(contract)
         supplied_canonical = signed_contract.get("canonical_json")
         supplied_digest = signed_contract.get("digest")
         supplied_signature = signed_contract.get("signature")
-        if not all(isinstance(value, str) for value in (
-            supplied_canonical,
-            supplied_digest,
-            supplied_signature,
-        )):
-            return False
+        if not isinstance(supplied_canonical, str):
+            return WorkContractVerification(valid=False, failure="shape")
+        if not isinstance(supplied_digest, str):
+            return WorkContractVerification(valid=False, failure="shape")
+        if not isinstance(supplied_signature, str):
+            return WorkContractVerification(valid=False, failure="shape")
+    except (TypeError, ValueError, WorkContractError):
+        return WorkContractVerification(valid=False, failure="shape")
+    except OSError:
+        return WorkContractVerification(valid=False, failure="io_error")
+
+    try:
         if not hmac.compare_digest(canonical, supplied_canonical):
-            return False
+            return WorkContractVerification(valid=False, failure="canonical_mismatch")
         digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         if not hmac.compare_digest(digest, supplied_digest):
-            return False
+            return WorkContractVerification(valid=False, failure="digest_mismatch")
+    except OSError:
+        return WorkContractVerification(valid=False, failure="io_error")
+    except (TypeError, ValueError):
+        return WorkContractVerification(valid=False, failure="shape")
+
+    try:
         key = _service_secret(secret=secret, hermes_home=hermes_home, create=False)
+    except SigningKeyUnreadable:
+        return WorkContractVerification(valid=False, failure="key_unreadable")
+    except WorkContractError:
+        return WorkContractVerification(valid=False, failure="key_unreadable")
+    except OSError:
+        return WorkContractVerification(valid=False, failure="io_error")
+
+    try:
         expected = hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(expected, supplied_signature)
-    except (OSError, TypeError, ValueError, WorkContractError):
-        return False
+        if not hmac.compare_digest(expected, supplied_signature):
+            return WorkContractVerification(valid=False, failure="signature_mismatch")
+    except OSError:
+        return WorkContractVerification(valid=False, failure="io_error")
+    except (TypeError, ValueError):
+        return WorkContractVerification(valid=False, failure="shape")
+    return WorkContractVerification(valid=True)
 
 
 def materialization_fields(
@@ -341,10 +437,14 @@ def materialization_fields(
         return fields
     if signed_contract is None:
         raise WorkContractError("a valid Work Contract is required on this board")
-    if not verify_work_contract(
+    verification = verify_work_contract(
         signed_contract, secret=secret, hermes_home=hermes_home
-    ):
-        raise WorkContractError("Work Contract signature is invalid")
+    )
+    if not verification.valid:
+        failure = verification.failure
+        if failure is None:
+            raise WorkContractError("Work Contract verification failed")
+        raise work_contract_verification_error(failure)
 
     contract = signed_contract["contract"]
     expected_version = policy.get("contract_version", CONTRACT_VERSION)

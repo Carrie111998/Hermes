@@ -7601,10 +7601,13 @@ def store_work_contract(
 
     from hermes_cli import kanban_intake
 
-    if not kanban_intake.verify_work_contract(
+    verification = kanban_intake.verify_work_contract(
         signed_contract, secret=secret, hermes_home=hermes_home
-    ):
-        raise ValueError("refusing to store an invalid Work Contract")
+    )
+    if not verification.valid:
+        raise ValueError(
+            f"refusing to store an invalid Work Contract: {verification.failure}"
+        )
     contract = signed_contract["contract"]
     digest = signed_contract["digest"]
     contract_id = "wc_" + digest[:24]

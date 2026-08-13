@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import stat
 import subprocess
@@ -64,7 +65,244 @@ def test_service_signature_verifies_and_caller_signature_is_ignored():
     assert signed["signature"] != "caller-controlled"
     assert signed["digest"] != "caller-controlled"
     assert "signature" not in signed["contract"]
-    assert intake.verify_work_contract(signed, secret=secret)
+    assert intake.verify_work_contract(signed, secret=secret).valid
+
+
+@pytest.mark.parametrize(
+    ("mutator", "expected"),
+    [
+        (
+            lambda signed: {**signed, "contract": None},
+            "shape",
+        ),
+        (
+            lambda signed: {**signed, "canonical_json": "canonical-sentinel"},
+            "canonical_mismatch",
+        ),
+        (
+            lambda signed: {**signed, "digest": "digest-sentinel"},
+            "digest_mismatch",
+        ),
+        (
+            lambda signed: {**signed, "signature": "signature-sentinel"},
+            "signature_mismatch",
+        ),
+    ],
+)
+def test_verify_work_contract_returns_exact_failure(mutator, expected):
+    signed = intake.sign_work_contract(_contract(), secret=b"test-only-secret")
+
+    result = intake.verify_work_contract(
+        mutator(copy.deepcopy(signed)), secret=b"test-only-secret"
+    )
+
+    assert result == intake.WorkContractVerification(valid=False, failure=expected)
+
+
+def test_verify_work_contract_reports_unreadable_signing_key_without_checking_signature(
+    tmp_path,
+):
+    signed = intake.sign_work_contract(_contract(), secret=b"test-only-secret")
+
+    result = intake.verify_work_contract(signed, hermes_home=tmp_path)
+
+    assert result == intake.WorkContractVerification(valid=False, failure="key_unreadable")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX key permissions do not apply on Windows")
+def test_verify_work_contract_reports_unsafe_signing_key_as_unreadable(tmp_path):
+    signed = intake.sign_work_contract(_contract(), secret=b"test-only-secret")
+    key_path = tmp_path / intake.SIGNING_KEY_RELATIVE_PATH
+    key_path.parent.mkdir(parents=True)
+    key_path.write_bytes(b"x" * 32)
+    key_path.chmod(0o644)
+
+    result = intake.verify_work_contract(signed, hermes_home=tmp_path)
+
+    assert result == intake.WorkContractVerification(valid=False, failure="key_unreadable")
+
+
+def test_verify_work_contract_maps_non_key_oserror_to_io_error(monkeypatch):
+    signed = intake.sign_work_contract(_contract(), secret=b"test-only-secret")
+    monkeypatch.setattr(
+        intake,
+        "_service_secret",
+        lambda **_: (_ for _ in ()).throw(OSError("io-sentinel")),
+    )
+
+    result = intake.verify_work_contract(signed, secret=b"test-only-secret")
+
+    assert result == intake.WorkContractVerification(valid=False, failure="io_error")
+
+
+def test_verify_work_contract_does_not_report_signature_mismatch_for_key_read_error(
+    monkeypatch,
+):
+    signed = intake.sign_work_contract(_contract(), secret=b"test-only-secret")
+    monkeypatch.setattr(
+        intake,
+        "_service_secret",
+        lambda **_: (_ for _ in ()).throw(PermissionError("read-only-key")),
+    )
+
+    result = intake.verify_work_contract(signed, secret=b"test-only-secret")
+
+    assert result.failure != "signature_mismatch"
+    assert result == intake.WorkContractVerification(valid=False, failure="io_error")
+
+
+def test_materialization_fields_preserves_typed_verification_failure(monkeypatch):
+    monkeypatch.setattr(
+        intake,
+        "verify_work_contract",
+        lambda *_args, **_kwargs: intake.WorkContractVerification(
+            valid=False, failure="io_error"
+        ),
+    )
+
+    with pytest.raises(intake.WorkContractError) as caught:
+        intake.materialization_fields(
+            {"qualification": {"required": True}},
+            signed_contract={"contract": {}},
+            secret=b"test-only-secret",
+        )
+
+    assert caught.value.failure == "io_error"
+    assert intake.safe_work_contract_failure(caught.value) == "io_error"
+
+
+def test_po_materialization_failure_finishes_run_with_only_a_safe_path(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import kanban_po_intake
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    board = "strict"
+    kb.ensure_product_board_defaults(board)
+    metadata_path = kb.board_metadata_path(board)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    conn = kb.connect(board=board)
+    intake_id = kb.create_qualification_intake(
+        conn,
+        raw_request=json.dumps({"kind": "task_create", "request": {"title": "sentinel-request"}}),
+        source="work-inbox",
+    )
+    run = kb.claim_qualification_intake(
+        conn,
+        intake_id,
+        profile="productowner",
+        runtime_identity={
+            "provider": "test-provider",
+            "model": "test-model",
+            "effort": "high",
+            "surface": "work_inbox_intake",
+        },
+    )
+    assert run is not None
+    for name, value in {
+        "HERMES_WORK_INBOX_INTAKE": intake_id,
+        "HERMES_WORK_INBOX_RUN_ID": str(run["id"]),
+        "HERMES_WORK_INBOX_CLAIM_LOCK": run["claim_lock"],
+        "HERMES_PROFILE": "productowner",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    validated = {
+        "work": {
+            "item_kind": "card",
+            "work_type": "story",
+            "title": "sentinel-payload",
+            "outcome": "sentinel-outcome",
+            "scope": [],
+            "out_of_scope": [],
+        },
+        "routing": {
+            "entry_phase": "architecture",
+            "assignee": "architect",
+            "epic_id": None,
+            "dependencies": [],
+        },
+        "entry_assessment": {
+            "reason": "sentinel-canonical",
+            "skipped_phases": [],
+            "evidence": [],
+        },
+        "handover": {
+            "deliverables": [],
+            "required_evidence": [],
+            "done_when": [],
+            "next_phase": "development",
+            "next_role": "developer",
+        },
+        "rules": {"allowed": [], "forbidden": []},
+        "classification": ["framework:story"],
+        "po_evidence": {
+            "surface": "work_inbox_intake",
+            "run_id": int(run["id"]),
+        },
+        "sizing": {
+            "rationale": "sentinel-sizing",
+            "configured_iteration_budget": 500,
+            "estimated_turns": 1,
+            "fits_budget": True,
+        },
+        "requirement_feasibility": {
+            "rationale": "sentinel-feasibility",
+            "achievable_requirements": [],
+            "deferred_findings": [],
+        },
+        "stories": [],
+    }
+    monkeypatch.setattr(
+        "hermes_cli.kanban_qualifier.validate_decision",
+        lambda *_args, **_kwargs: validated,
+    )
+    monkeypatch.setattr(
+        intake,
+        "verify_work_contract",
+        lambda *_args, **_kwargs: intake.WorkContractVerification(
+            valid=False, failure="signature_mismatch"
+        ),
+    )
+
+    try:
+        result = kanban_po_intake.decide_product_owner_intake(
+            conn,
+            board=board,
+            disposition="accepted",
+            reason="sentinel-reason",
+            proposal={},
+        )
+        assert result == {
+            "status": "attention_required",
+            "intake_id": intake_id,
+            "failure_path": "signature_mismatch",
+        }
+        stored_run = kb.get_qualification_intake_run(conn, int(run["id"]))
+        events = kb.list_qualification_intake_events(conn, intake_id)
+    finally:
+        conn.close()
+
+    assert stored_run["outcome"] == "work_contract_verification_failed"
+    assert stored_run["error"] == "work_contract:signature_mismatch"
+    event = next(event for event in events if event["kind"] == "work_contract_verification_failed")
+    assert event["payload"] == {"failure_path": "signature_mismatch"}
+    serialized = json.dumps({"run": stored_run, "events": events, "result": result})
+    for sentinel in (
+        "sentinel-request",
+        "sentinel-payload",
+        "sentinel-outcome",
+        "sentinel-canonical",
+        "sentinel-sizing",
+        "sentinel-feasibility",
+        "sentinel-reason",
+    ):
+        assert sentinel not in serialized
 
 
 @pytest.mark.parametrize(
@@ -82,7 +320,7 @@ def test_mutating_governed_contract_fields_breaks_verification(section, field, v
     signed = intake.sign_work_contract(_contract(), secret=b"test-only-secret")
     signed["contract"][section][field] = value
 
-    assert not intake.verify_work_contract(signed, secret=b"test-only-secret")
+    assert not intake.verify_work_contract(signed, secret=b"test-only-secret").valid
 
 
 @pytest.mark.parametrize("version", [None, 0, 2, "1"])
@@ -98,7 +336,7 @@ def test_signing_secret_is_service_owned_private_and_in_quick_backup_manifest(tm
     signed = intake.sign_work_contract(_contract(), hermes_home=tmp_path)
     secret_path = tmp_path / intake.SIGNING_KEY_RELATIVE_PATH
 
-    assert intake.verify_work_contract(signed, hermes_home=tmp_path)
+    assert intake.verify_work_contract(signed, hermes_home=tmp_path).valid
     assert secret_path.is_file()
     assert stat.S_IMODE(secret_path.stat().st_mode) == 0o600
     assert intake.SIGNING_KEY_RELATIVE_PATH in backup._QUICK_STATE_FILES

@@ -1021,13 +1021,40 @@ def qualify_intake(
         except kanban_intake.WorkContractError as exc:
             validation_errors = (str(exc),)
             continue
-        task_id = kanban_intake.materialize_contract(
-            conn,
-            board=board,
-            signed_contract=signed,
-            secret=secret,
-            hermes_home=hermes_home,
-        )
+        try:
+            task_id = kanban_intake.materialize_contract(
+                conn,
+                board=board,
+                signed_contract=signed,
+                secret=secret,
+                hermes_home=hermes_home,
+            )
+        except kanban_intake.WorkContractError as exc:
+            failure_path = kanban_intake.safe_work_contract_failure(exc)
+            if failure_path is None:
+                raise
+            with kanban_db.write_txn(conn):
+                updated = conn.execute(
+                    "UPDATE qualification_intake "
+                    "SET status = 'attention_required', updated_at = ? "
+                    "WHERE id = ? AND status = 'pending'",
+                    (int(time.time()), intake_id),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError(
+                        "qualification intake changed during materialization"
+                    )
+                kanban_db.append_qualification_intake_event(
+                    conn,
+                    intake_id=intake_id,
+                    kind="work_contract_verification_failed",
+                    payload={"failure_path": failure_path},
+                )
+            return {
+                "status": "attention_required",
+                "intake_id": intake_id,
+                "failure_path": failure_path,
+            }
         story_task_ids = (
             kanban_db.list_epic_members(conn, task_id)
             if decision["work"]["item_kind"] == "epic"
