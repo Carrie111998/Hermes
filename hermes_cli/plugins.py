@@ -65,6 +65,7 @@ from hermes_cli.config import cfg_get, load_config_readonly
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
 from hermes_cli.plugin_capabilities import (  # noqa: F401 — re-exported
     CAPABILITY_REGISTRY,
+    VALID_CAPABILITY_IDS,
     plugin_capability_granted,
 )
 from hermes_cli.plugin_capabilities import (
@@ -290,6 +291,60 @@ VALID_HOOKS: Set[str] = {
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
+ENTRY_POINT_CAPABILITIES_GROUP = "hermes_agent.plugin_capabilities"
+
+
+def _select_entry_point_group(entry_points: Any, group: str) -> list:
+    """Return one metadata entry-point group across supported Python APIs."""
+    if hasattr(entry_points, "select"):
+        return list(entry_points.select(group=group))
+    if isinstance(entry_points, dict):
+        return list(entry_points.get(group, []))
+    return [ep for ep in entry_points if ep.group == group]
+
+
+def discover_entrypoint_manifests() -> List["PluginManifest"]:
+    """Return metadata-only manifests for installed entry-point plugins."""
+    manifests: List[PluginManifest] = []
+    try:
+        eps = importlib.metadata.entry_points()
+        group_eps = _select_entry_point_group(eps, ENTRY_POINTS_GROUP)
+        capability_eps = _select_entry_point_group(
+            eps, ENTRY_POINT_CAPABILITIES_GROUP
+        )
+
+        for ep in group_eps:
+            capabilities = []
+            for capability in VALID_CAPABILITY_IDS:
+                declaration_name = f"{ep.name}.{capability}"
+                if any(
+                    declaration.name == declaration_name
+                    and declaration.value == ep.value
+                    for declaration in capability_eps
+                ):
+                    capabilities.append(capability)
+            dist = getattr(ep, "dist", None)
+            metadata = getattr(dist, "metadata", None)
+            manifests.append(
+                PluginManifest(
+                    name=ep.name,
+                    version=str(getattr(dist, "version", "") or ""),
+                    description=(
+                        str(metadata.get("Summary", "") or "")
+                        if metadata is not None
+                        else ""
+                    ),
+                    source="entrypoint",
+                    path=ep.value,
+                    key=ep.name,
+                    capabilities=_parse_declared_capabilities(
+                        capabilities, ep.name
+                    ),
+                )
+            )
+    except Exception as exc:
+        logger.debug("Entry-point scan failed: %s", exc)
+    return manifests
 
 # System-prompt sections are deliberately more constrained than lifecycle
 # hooks. They become high-trust prompt bytes and are charged on every turn.
@@ -4021,30 +4076,15 @@ class PluginManager:
     # -----------------------------------------------------------------------
 
     def _scan_entry_points(self) -> List[PluginManifest]:
-        """Check ``importlib.metadata`` for pip-installed plugins."""
-        manifests: List[PluginManifest] = []
-        try:
-            eps = importlib.metadata.entry_points()
-            # Python 3.12+ returns a SelectableGroups; earlier returns dict
-            if hasattr(eps, "select"):
-                group_eps = eps.select(group=ENTRY_POINTS_GROUP)
-            elif isinstance(eps, dict):
-                group_eps = eps.get(ENTRY_POINTS_GROUP, [])
-            else:
-                group_eps = [ep for ep in eps if ep.group == ENTRY_POINTS_GROUP]
+        """Read installed plugin and companion capability entry points.
 
-            for ep in group_eps:
-                manifest = PluginManifest(
-                    name=ep.name,
-                    source="entrypoint",
-                    path=ep.value,
-                    key=ep.name,
-                )
-                manifests.append(manifest)
-        except Exception as exc:
-            logger.debug("Entry-point scan failed: %s", exc)
-
-        return manifests
+        Capability declarations live in distribution metadata so discovery is
+        available before importing untrusted plugin code and does not depend on
+        a package-data ``plugin.yaml`` being present.  A declaration entry is
+        named ``<plugin-id>.<capability-id>`` and points at the same object as
+        the corresponding ``hermes_agent.plugins`` entry point.
+        """
+        return discover_entrypoint_manifests()
 
     # -----------------------------------------------------------------------
     # Loading
