@@ -9201,12 +9201,14 @@ def _profile_model_provider(profile: Optional[str]) -> str:
         model = config.get("model") if isinstance(config, dict) else None
         return str(model.get("provider") or "").strip().lower() if isinstance(model, dict) else ""
     except Exception:
-        _log.debug("kanban capability: unable to resolve model provider", exc_info=True)
-        return ""
+        _log.debug("kanban capability: unable to resolve model provider")
+        return "__capability_unavailable__"
 
 
 def _codex_capability_failure(task: Task) -> Optional[str]:
     provider = (task.provider_override or _profile_model_provider(task.assignee)).strip().lower()
+    if provider == "__capability_unavailable__":
+        return "OpenAI Codex OAuth capability unavailable (codex_auth_unavailable); assigned profile capability could not be established. No provider fallback or retry was attempted."
     if provider != "openai-codex":
         return None
     profile_token = None
@@ -9228,10 +9230,14 @@ def _codex_capability_failure(task: Task) -> Optional[str]:
                 relogin_required=True,
             )
     except Exception as exc:
-        if not getattr(exc, "relogin_required", False):
-            return None
-        code = str(getattr(exc, "code", None) or "codex_auth_unavailable")
-        return ("OpenAI Codex OAuth capability unavailable " f"({code}); refresh/re-authenticate the assigned profile with `hermes auth add openai-codex`, then unblock this task. No provider fallback or retry was attempted.")
+        # Preflight is fail-closed: unreadable, malformed, unsupported, or
+        # otherwise unevaluable auth state is never treated as healthy and is
+        # never allowed to fall through to another provider.
+        code = getattr(exc, "code", None)
+        safe_code = str(code).strip() if isinstance(code, str) else ""
+        if not safe_code or any(not (char.isalnum() or char in "_-") for char in safe_code):
+            safe_code = "codex_auth_unavailable"
+        return f"OpenAI Codex OAuth capability unavailable ({safe_code}); credential state could not be safely evaluated. No provider fallback or retry was attempted."
     finally:
         if profile_token is not None:
             reset_hermes_home_override(profile_token)
