@@ -1096,9 +1096,12 @@ def _run_review_in_thread(
                 except Exception:
                     pass
         else:
-            agent._safe_print(
-                f"  💾 L0 review: no changes needed"
-            )
+            # 2026-08-13 用户拍板: L0 无动作时不显示 "no changes needed" 噪音。
+            # 恢复显示 = 把下面这行取消注释。
+            pass
+            # agent._safe_print(
+            #     f"  💾 L0 review: no changes needed"
+            # )
 
     except Exception as e:
         logger.warning("Background memory/skill review failed: %s", e)
