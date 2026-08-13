@@ -95,7 +95,8 @@ export const StatusbarSurface = memo(function StatusbarSurface({
     openCommandCenterSection: actions.openCommandCenterSection,
     requestGateway: actions.requestGateway,
     statusSnapshot,
-    toggleCommandCenter: actions.toggleCommandCenter
+    toggleCommandCenter: actions.toggleCommandCenter,
+    changeSessionCwd: actions.changeSessionCwd
   })
 
   return <StatusbarControls items={statusbarItems} leftItems={leftStatusbarItems} />
