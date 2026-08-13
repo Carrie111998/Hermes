@@ -55,10 +55,12 @@ When the update runs **without a terminal** — from the desktop/chat app's "Upd
 updates:
   non_interactive_local_changes: stash   # default: keep + auto-restore
   # non_interactive_local_changes: discard  # throw local source edits away
+  # non_interactive_local_changes: abort    # stop before changing a dirty checkout
 ```
 
 - `stash` (default) — auto-stash, pull, then auto-restore your changes on top of the updated code. Nothing is lost; if a restore hits conflicts they're preserved in a git stash for manual recovery.
 - `discard` — auto-stash and drop the stash after the pull, so the update always lands on a clean tree. Use this only on machines where you never intend to keep local edits to the Hermes source. It stash-drops (not `git reset --hard` + `git clean -fd`), so ignored paths like `node_modules`, `venv`, and build outputs are never touched.
+- `abort` — if tracked or untracked source changes exist, stop before backups, fetches, stashes, pulls, installs, or gateway restarts. Use this on managed checkouts where unexpected edits require human review.
 
 In the desktop app this is **Settings → Advanced → In-App Update Local Changes**.
 

@@ -1233,6 +1233,31 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
 
     return stash_ref
 
+
+def _abort_update_if_worktree_dirty(git_cmd: list[str], cwd: Path) -> None:
+    """Fail closed before a non-interactive update touches a dirty checkout."""
+    status = subprocess.run(
+        git_cmd + ["status", "--porcelain"],
+        cwd=cwd,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    if status.returncode != 0:
+        print("✗ Could not verify that the Hermes checkout is clean — update aborted.")
+        if status.stderr.strip():
+            print(f"  {status.stderr.strip().splitlines()[0]}")
+        print("  Inspect the checkout manually, then re-run `hermes update`.")
+        sys.exit(2)
+
+    if not status.stdout.strip():
+        return
+
+    print("✗ Local source changes detected — unattended update aborted.")
+    print("  Commit, stash, or remove the changes manually, then re-run `hermes update`.")
+    print("  Policy: updates.non_interactive_local_changes=abort")
+    sys.exit(2)
+
+
 def _resolve_stash_selector(
     git_cmd: list[str], cwd: Path, stash_ref: str
 ) -> Optional[str]:
@@ -3919,28 +3944,50 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # Interactive terminal updates always stash-and-ask (unchanged behavior);
     # only non-interactive updates (desktop/chat app, gateway, `--yes`) consult
     # the `updates.non_interactive_local_changes` config setting to decide
-    # whether to auto-restore stashed local source changes or throw them away.
+    # whether to abort, auto-restore stashed local source changes, or throw
+    # them away.
     _non_interactive_update = (
         gateway_mode
         or assume_yes
         or not (sys.stdin.isatty() and sys.stdout.isatty())
     )
-    discard_local_changes = False
+    local_changes_mode = "stash"
     if _non_interactive_update:
         try:
             from hermes_cli.config import load_config
 
             _update_cfg = (load_config() or {}).get("updates", {})
             if isinstance(_update_cfg, dict):
-                _mode = str(_update_cfg.get("non_interactive_local_changes", "stash")).lower()
-                discard_local_changes = _mode == "discard"
+                _mode = str(
+                    _update_cfg.get("non_interactive_local_changes", "stash")
+                ).lower()
+                if _mode in {"stash", "discard", "abort"}:
+                    local_changes_mode = _mode
         except Exception as exc:
             # Never let a config read failure change the safe default.
             logger.debug("Could not read updates.non_interactive_local_changes: %s", exc)
-            discard_local_changes = False
+
+    discard_local_changes = local_changes_mode == "discard"
+    abort_on_local_changes = local_changes_mode == "abort"
 
     print("⚕ Updating Hermes Agent...")
     print()
+
+    # The abort policy is deliberately checked before backups, gateway pauses,
+    # lockfile normalization, fetches, branch switches, installs, or restarts.
+    # A dirty managed checkout must remain byte-for-byte untouched for a human
+    # to inspect. Interactive updates keep their historical stash-and-prompt
+    # path regardless of this non-interactive setting.
+    if abort_on_local_changes:
+        _early_git_dir = _m().PROJECT_ROOT / ".git"
+        if _early_git_dir.exists():
+            _early_git_cmd = ["git"]
+            if sys.platform == "win32":
+                _early_git_cmd = ["git", "-c", "windows.appendAtomically=false"]
+            _m()._abort_update_if_worktree_dirty(
+                _early_git_cmd,
+                _m().PROJECT_ROOT,
+            )
 
     # On Windows, abort early if another hermes.exe is holding the venv shim
     # open. Continuing would result in a string of WinError 32 warnings and
