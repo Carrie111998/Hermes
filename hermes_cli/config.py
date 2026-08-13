@@ -4924,6 +4924,15 @@ _DYNAMIC_TOP_LEVEL_KEYS = frozenset({
 # accepted because ``PlatformConfig`` carries an open ``extra`` mapping.
 _PLATFORM_CONTAINER_KEYS = frozenset({"platforms"})
 
+# Dotted paths (below the top level) that are open dicts: the schema declares
+# the container, the user supplies the child keys. Validation walks down to
+# the container and then accepts anything beneath it, so
+# ``kanban.default_notify.<board-slug>.platform`` doesn't trip the
+# unknown-key notice for a board name we cannot possibly enumerate.
+_OPEN_DICT_NESTED_PATHS = frozenset({
+    "kanban.default_notify",
+})
+
 
 def _known_top_level_keys() -> set[str]:
     """Return the union of known top-level config keys for validation.
@@ -5024,6 +5033,11 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
     node: Any = DEFAULT_CONFIG.get(top)
     consumed = [top]
     for seg in segments[1:]:
+        # Nested open dicts (``kanban.default_notify.<board>.<field>``):
+        # once we've consumed the container path, the user defines every
+        # segment below it.
+        if ".".join(consumed) in _OPEN_DICT_NESTED_PATHS:
+            return True, None
         # ``gateway.platforms.<name>.<field>`` (and any other nested
         # ``platforms`` container) — the segment after ``platforms`` is a
         # user-supplied platform name, so accept everything below it.

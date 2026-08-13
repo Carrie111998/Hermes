@@ -1463,7 +1463,7 @@ def _handle_create(args: dict, **kw) -> str:
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
-            subscribed = _maybe_auto_subscribe(conn, new_tid)
+            subscribed = _maybe_auto_subscribe(conn, new_tid, board=board)
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
@@ -1481,7 +1481,9 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
-def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
+def _maybe_auto_subscribe(
+    conn: Any, task_id: str, board: Optional[str] = None
+) -> bool:
     """Auto-subscribe the calling session to task completion / block events.
 
     Returns True if a subscription row was written, False otherwise (no
@@ -1511,8 +1513,11 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
       for these rows and posts the completion message into the running
       session.
 
-    - **CLI / cron / test / unattached**: no persistent delivery channel,
-      no-op.
+    - **CLI / cron / orchestrator / test / unattached**: no persistent
+      delivery channel of its own. Falls back to the board's configured
+      default channel (``kanban.default_notify.<board>``) when one exists,
+      so tasks created without a user-facing message behind them are still
+      covered. Boards with no entry stay a no-op, as before.
 
     Failure mode: any exception inside the function is logged at WARNING
     with the offending exception + diagnostic env vars and swallowed.
@@ -1553,7 +1558,23 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                 or os.environ.get("HERMES_SESSION_KEY", "")
             )
             if not session_key:
-                return False  # CLI / cron / test — no persistent channel
+                # CLI / cron / orchestrator — no persistent channel of our
+                # own. Fall back to the board's configured default channel
+                # (kanban.default_notify.<board>) so tasks created without a
+                # user-facing message behind them still get notified when
+                # they block or request review. Unconfigured boards return
+                # False here, preserving the historical no-op.
+                from hermes_cli import kanban_db as _kb_default
+                return _kb_default.apply_default_notify_sub(
+                    conn,
+                    task_id,
+                    board=board,
+                    notifier_profile=(
+                        get_session_env("HERMES_SESSION_PROFILE", "")
+                        or os.environ.get("HERMES_PROFILE")
+                        or None
+                    ),
+                )
             platform = "tui"
             chat_id = session_key
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None

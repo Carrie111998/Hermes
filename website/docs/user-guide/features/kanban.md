@@ -611,7 +611,8 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `auto_decompose_per_tick` | `3` | Cap on decompositions per dispatcher tick. Excess defers to the next tick. |
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
-| `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's completion/block events. The dispatcher still drives the delivery — this only changes whether the caller's chat/key shows up in the notify-sub table. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
+| `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's completion/block events. The dispatcher still drives the delivery — this only changes whether the caller's chat/key shows up in the notify-sub table. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. Also disables `default_notify`. |
+| `default_notify` | `{}` | Per-board fallback notification channel, used when a task is created with **no** live chat context — a detached `hermes kanban create`, a cron script, or an orchestrator agent calling `kanban_create` without a user-facing message behind it. Keyed by board slug; boards with no entry keep the previous no-subscription behaviour. See [Board default notification channel](#board-default-notification-channel). |
 
 And the two auxiliary LLM slots:
 
@@ -1009,6 +1010,49 @@ hermes kanban notify-unsubscribe t_abcd \
 ```
 
 A subscription removes itself automatically once the task reaches `done` or `archived`; no cleanup needed.
+
+### Board default notification channel
+
+Auto-subscribe only works when the creating session *has* a chat to
+subscribe. Tasks created without one — `hermes kanban create` from an SSH
+session, a cron script, an orchestrator agent working outside any chat
+platform — got zero notification coverage, so nobody heard about them when
+they later hit `blocked` or `review_requested` and you had to poll the board
+by hand to find stuck work.
+
+Configure a per-board fallback channel and those tasks get covered too:
+
+```yaml
+# ~/.hermes/config.yaml
+kanban:
+  default_notify:
+    default:                    # board slug
+      platform: slack
+      chat_id: C0BP91D49CH
+      chat_type: channel        # optional: dm / group / channel
+    assemblywatch:              # a second board, its own channel
+      platform: telegram
+      chat_id: "12345678"
+```
+
+Or from the CLI:
+
+```bash
+hermes config set kanban.default_notify.default.platform slack
+hermes config set kanban.default_notify.default.chat_id C0BP91D49CH
+hermes config set kanban.default_notify.default.chat_type channel
+```
+
+Semantics:
+
+- **Fallback only.** A live chat context always wins — creating a task from
+  Slack still notifies *that* Slack conversation, not the board default.
+- **Per board.** Boards are the isolation unit; a board with no entry behaves
+  exactly as before (no subscription, no error).
+- **Idempotent.** The default never produces a duplicate row if the same
+  target is also subscribed explicitly.
+- **Respects the kill switch.** `auto_subscribe_on_create: false` turns off
+  every create-time subscription source, this one included.
 
 ### Multi-profile setups: delivery is profile-owned
 

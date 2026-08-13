@@ -1567,11 +1567,28 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
         )
+        # Detached CLI creation has no live chat context to auto-subscribe
+        # (that path lives in tools/kanban_tools.py::_maybe_auto_subscribe),
+        # so a task created from a terminal or a cron script used to get zero
+        # notification coverage and nobody heard about it when it later
+        # blocked. Fall back to the board's configured default channel, if
+        # any. No entry for this board => no-op, exactly as before.
+        default_notified = kb.apply_default_notify_sub(
+            conn,
+            task_id,
+            notifier_profile=args.created_by or _profile_author(),
+        )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        if default_notified:
+            target = kb.resolve_default_notify() or {}
+            print(
+                f"Notifications: {target.get('platform')}:{target.get('chat_id')} "
+                "(board default)"
+            )
 
         # Warn when the task would sit in `ready` because no dispatcher is
         # present. Only warn on ready+assigned tasks — triage/todo are
