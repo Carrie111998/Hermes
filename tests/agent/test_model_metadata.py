@@ -740,6 +740,63 @@ class TestGetModelContextLength:
             result = get_model_context_length("custom/model")
             assert result == CONTEXT_PROBE_TIERS[0]
 
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.models_dev.lookup_models_dev_context", return_value=None)
+    def test_stale_minimax_cache_32k_is_invalidated(self, mock_models_dev, mock_fetch, tmp_path):
+        """Stale 32K cache entries for MiniMax must not keep tripping the 64K floor."""
+        mock_fetch.return_value = {}
+        cache_file = tmp_path / "cache.yaml"
+        base_url = "https://api.minimax.io/anthropic"
+        with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
+            save_context_length("MiniMax-M2.7", base_url, 32768)
+            result = get_model_context_length(
+                "MiniMax-M2.7",
+                base_url=base_url,
+                provider="minimax",
+            )
+            assert result == 204800
+            assert get_cached_context_length("MiniMax-M2.7", base_url) is None
+
+    @patch("agent.models_dev.lookup_models_dev_context", return_value=None)
+    @patch("agent.model_metadata.fetch_model_metadata")
+    def test_openrouter_32k_underreport_for_minimax_falls_through_to_default(self, mock_fetch, mock_models_dev):
+        """Unknown-provider fallback must reject stale OpenRouter 32K for MiniMax."""
+        mock_fetch.return_value = {
+            "MiniMax-M2.7": {"context_length": 32768}
+        }
+        result = get_model_context_length("MiniMax-M2.7")
+        assert result == 204800
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.models_dev.lookup_models_dev_context", return_value=None)
+    def test_non_minimax_32k_cache_is_still_respected(self, mock_models_dev, mock_fetch, tmp_path):
+        """The stale-32K invalidation must stay narrow and not touch unrelated models."""
+        mock_fetch.return_value = {}
+        cache_file = tmp_path / "cache.yaml"
+        base_url = "http://local"
+        with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
+            save_context_length("qwen3.5:27b", base_url, 32768)
+            result = get_model_context_length(
+                "qwen3.5:27b",
+                base_url=base_url,
+            )
+            assert result == 32768
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata")
+    def test_custom_endpoint_metadata_beats_fuzzy_default(self, mock_endpoint_fetch, mock_fetch):
+        mock_fetch.return_value = {}
+        mock_endpoint_fetch.return_value = {
+            "zai-org/GLM-5-TEE": {"context_length": 65536}
+        }
+
+        result = get_model_context_length(
+            "zai-org/GLM-5-TEE",
+            base_url="https://llm.chutes.ai/v1",
+            api_key="test-key",
+        )
+
+        assert result == 65536
 
     @patch("agent.model_metadata.fetch_model_metadata")
     @patch("agent.model_metadata.fetch_endpoint_model_metadata")
@@ -1145,6 +1202,33 @@ class TestParseContextLimitFromError:
 class TestContextLengthCache:
 
 
+    def test_non_positive_lengths_never_persisted(self, tmp_path):
+        """save_context_length must refuse 0/negative values — a persisted 0
+        short-circuits step 1 (``0 is not None``) and poisons the whole
+        resolution chain downstream (#25812)."""
+        cache_file = tmp_path / "cache.yaml"
+        with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
+            save_context_length("test/model", "http://x", 0)
+            save_context_length("test/model", "http://x", -1)
+            assert get_cached_context_length("test/model", "http://x") is None
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    def test_non_positive_cached_entry_dropped_and_reresolved(self, mock_fetch, tmp_path):
+        """A pre-existing 0 entry (corrupted cache / manual edit) must be
+        invalidated at step 1 and re-resolved instead of returned."""
+        mock_fetch.return_value = {}
+        cache_file = tmp_path / "cache.yaml"
+        with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
+            # Write the poison entry directly — save_context_length now refuses it.
+            cache_file.write_text(
+                "context_lengths:\n  test/model@http://x: 0\n", encoding="utf-8"
+            )
+            assert get_cached_context_length("test/model", "http://x") == 0
+            result = get_model_context_length("test/model", base_url="http://x")
+            assert result > 0
+            assert get_cached_context_length("test/model", "http://x") != 0
+
+
     def test_null_context_lengths_key_returns_empty(self, tmp_path):
         """``context_lengths:`` with no value parses as None — must behave
         like an empty cache instead of crashing every caller (#47135)."""
@@ -1178,6 +1262,41 @@ class TestContextLengthCache:
             save_context_length("unknown/model", "http://local", 65536)
             assert get_model_context_length("unknown/model", base_url="http://local") == 65536
 
+
+    def test_write_failure_leaves_existing_cache_intact(self, tmp_path, monkeypatch):
+        """An interrupted write must not corrupt or wipe the existing cache.
+
+        The old non-atomic ``open(path, "w")`` truncated the file before
+        dumping, so a crash/kill mid-write left empty or partial YAML — and
+        the next load swallowed the error and returned ``{}``, silently
+        wiping EVERY persisted context length. The atomic temp-file +
+        ``os.replace`` write leaves the previous file byte-for-byte intact
+        when the swap fails.
+        """
+        import utils
+        import agent.model_metadata as mm
+
+        cache_file = tmp_path / "cache.yaml"
+        monkeypatch.setattr(mm, "_get_context_cache_path", lambda: cache_file)
+
+        # Seed a valid, populated cache.
+        save_context_length("model-a", "http://a", 64000)
+        original_bytes = cache_file.read_bytes()
+
+        # Simulate a crash during the atomic swap step.
+        def _boom(*_args, **_kwargs):
+            raise OSError("simulated crash during atomic replace")
+
+        monkeypatch.setattr(utils, "atomic_replace", _boom)
+
+        # save_context_length is best-effort and swallows the error.
+        save_context_length("model-b", "http://b", 128000)
+
+        # Original file survives untouched — not truncated or emptied.
+        assert cache_file.read_bytes() == original_bytes
+        assert get_cached_context_length("model-a", "http://a") == 64000
+        # The failed write must not leave a stray temp file behind.
+        assert list(cache_file.parent.glob(".cache_*.tmp")) == []
 
 
 class TestGrok43StaleCacheGuard:
