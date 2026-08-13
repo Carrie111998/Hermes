@@ -16812,6 +16812,7 @@ def _prepare_review_target(
     head_sha = _review_git_output(
         actual_workspace, "rev-parse", "--verify", "HEAD^{commit}"
     )
+    predecessor_base = ""
     if product_review:
         tested_target = _latest_test_target(conn, task_id)
         if tested_target:
@@ -16827,23 +16828,9 @@ def _prepare_review_target(
             raise ReviewTargetPreparationError(
                 "Default review execution contract has no task branch binding"
             )
-        board_meta = read_board_metadata(board)
-        try:
-            contract = repository_contract_for_metadata(board_meta)
-        except RepositoryConfigurationError as exc:
-            raise ReviewTargetPreparationError(
-                f"Default review repository binding is invalid: {exc.code}"
-            ) from exc
-        if contract is None:
-            raise ReviewTargetPreparationError(
-                "Default review execution contract has no repository binding"
-            )
-        if _git_common_dir(contract.repo_root) != _git_common_dir(actual_workspace):
-            raise ReviewTargetPreparationError(
-                "Default review workspace does not match the configured repository"
-            )
         predecessor = conn.execute(
-            "SELECT json_extract(r.metadata, '$.candidate_sha') AS candidate_sha "
+            "SELECT json_extract(r.metadata, '$.candidate_sha') AS candidate_sha, "
+            "json_extract(r.metadata, '$.review_base_sha') AS review_base_sha "
             "FROM task_links l JOIN tasks p ON p.id = l.parent_id "
             "JOIN task_runs r ON r.task_id = p.id "
             "WHERE l.child_id = ? AND p.status = 'done' "
@@ -16872,7 +16859,40 @@ def _prepare_review_target(
             raise ReviewTargetPreparationError(
                 "Default review head does not match the completed predecessor candidate"
             )
-        base_ref = contract.base_ref
+        predecessor_base = str(predecessor["review_base_sha"] or "").strip()
+        if predecessor_base:
+            if not _FULL_GIT_SHA_RE.fullmatch(predecessor_base):
+                raise ReviewTargetPreparationError(
+                    "Default review predecessor has no full review base SHA"
+                )
+            resolved_base = _review_git_output(
+                actual_workspace,
+                "rev-parse",
+                "--verify",
+                f"{predecessor_base}^{{commit}}",
+            )
+            if resolved_base != predecessor_base:
+                raise ReviewTargetPreparationError(
+                    "Default review predecessor base does not resolve exactly"
+                )
+            base_ref = predecessor_base
+        else:
+            board_meta = read_board_metadata(board)
+            try:
+                contract = repository_contract_for_metadata(board_meta)
+            except RepositoryConfigurationError as exc:
+                raise ReviewTargetPreparationError(
+                    f"Default review repository binding is invalid: {exc.code}"
+                ) from exc
+            if contract is None:
+                raise ReviewTargetPreparationError(
+                    "Default review execution contract has no repository binding"
+                )
+            if _git_common_dir(contract.repo_root) != _git_common_dir(actual_workspace):
+                raise ReviewTargetPreparationError(
+                    "Default review workspace does not match the configured repository"
+                )
+            base_ref = contract.base_ref
     base_sha = _review_git_output(
         actual_workspace, "merge-base", base_ref, head_sha
     )
@@ -16880,6 +16900,10 @@ def _prepare_review_target(
         raise ReviewTargetPreparationError("review base is not a full commit SHA")
     if not _FULL_GIT_SHA_RE.fullmatch(head_sha):
         raise ReviewTargetPreparationError("review head is not a full commit SHA")
+    if default_review and predecessor_base and base_sha != predecessor_base:
+        raise ReviewTargetPreparationError(
+            "Default review predecessor base is not an ancestor of the candidate"
+        )
     review_branch = workspace_branch
     _evidence_generated_paths(board, actual_workspace, ReviewTargetPreparationError)
 

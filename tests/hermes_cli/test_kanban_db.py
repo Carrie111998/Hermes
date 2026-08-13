@@ -8190,8 +8190,9 @@ def test_default_review_dispatch_requires_structural_target_contract(
     assert base_sha != head_sha
 
 
+@pytest.mark.parametrize("board_repository", [True, False])
 def test_default_review_dispatch_pins_completed_predecessor_target(
-    kanban_home, tmp_path, all_assignees_spawnable,
+    kanban_home, tmp_path, all_assignees_spawnable, board_repository,
 ):
     board = "default-review-target-pinned"
     repo = tmp_path / "repo"
@@ -8204,7 +8205,8 @@ def test_default_review_dispatch_pins_completed_predecessor_target(
         text=True,
     )
     head_sha = _commit_file(repo, "reviewed.txt", "candidate\n", "candidate")
-    _set_generated_path_policy(board, repo)
+    if board_repository:
+        _set_generated_path_policy(board, repo)
     observed = []
 
     with kb.connect(board=board) as conn:
@@ -8222,11 +8224,14 @@ def test_default_review_dispatch_pins_completed_predecessor_target(
             "UPDATE tasks SET status='done', completed_at=1 WHERE id=?",
             (predecessor_id,),
         )
+        predecessor_metadata = {"candidate_sha": head_sha}
+        if not board_repository:
+            predecessor_metadata["review_base_sha"] = base_sha
         predecessor_run_id = kb._synthesize_ended_run(
             conn,
             predecessor_id,
             outcome="completed",
-            metadata={"candidate_sha": head_sha},
+            metadata=predecessor_metadata,
         )
         tid = kb.create_task(
             conn,
@@ -8281,6 +8286,7 @@ def test_default_review_dispatch_pins_completed_predecessor_target(
         "moved_candidate",
         "wrong_active_profile",
         "absent_predecessor",
+        "nonancestor_base",
     ],
 )
 def test_default_review_dispatch_rejects_invalid_target_contract_before_spawn(
@@ -8289,6 +8295,23 @@ def test_default_review_dispatch_rejects_invalid_target_contract_before_spawn(
     board = f"default-review-invalid-{invalid_contract}"
     repo = tmp_path / "repo"
     _init_git_repo(repo)
+    predecessor_base = None
+    if invalid_contract == "nonancestor_base":
+        subprocess.run(
+            ["git", "-C", str(repo), "checkout", "-b", "unrelated"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        predecessor_base = _commit_file(
+            repo, "unrelated.txt", "unrelated\n", "unrelated"
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "checkout", "main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
     subprocess.run(
         ["git", "-C", str(repo), "checkout", "-b", "review-candidate"],
         check=True,
@@ -8328,6 +8351,8 @@ def test_default_review_dispatch_rejects_invalid_target_contract_before_spawn(
         }
         if invalid_contract == "missing_candidate":
             predecessor_metadata = {}
+        elif predecessor_base is not None:
+            predecessor_metadata["review_base_sha"] = predecessor_base
         kb._synthesize_ended_run(
             conn,
             predecessor_id,
@@ -8377,6 +8402,8 @@ def test_default_review_dispatch_rejects_invalid_target_contract_before_spawn(
     assert task.current_step_key is None
     assert task.last_failure_error is not None
     assert "review target preparation" in task.last_failure_error
+    if invalid_contract == "nonancestor_base":
+        assert "not an ancestor" in task.last_failure_error
 
 
 def test_non_review_source_forbidden_task_remains_outside_default_review_contract(
