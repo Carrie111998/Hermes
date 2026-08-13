@@ -159,8 +159,8 @@ export function FindBar() {
   return (
     <div
       className={cn(
-        'pointer-events-auto fixed right-4 top-[calc(var(--titlebar-height,0px)+0.5rem)] z-50',
-        'flex items-center gap-1 rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-surface-background) px-2 py-1 shadow-md'
+        'pointer-events-auto fixed right-4 top-[calc(var(--titlebar-height,34px)+0.5rem)] z-50',
+        'flex items-center gap-2 rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-surface-background) px-2 py-1.5 shadow-md'
       )}
       role="search"
     >
@@ -184,11 +184,11 @@ export function FindBar() {
       <Tip label={t.findInPage.previous}>
         <button
           aria-label={t.findInPage.previous}
-          className="flex h-5 w-5 items-center justify-center rounded text-(--ui-text-secondary) hover:bg-(--ui-control-hover-background)"
+          className="flex h-7 w-7 items-center justify-center rounded text-(--ui-text-secondary) hover:bg-(--ui-control-hover-background)"
           onClick={findPrevious}
           type="button"
         >
-          <svg height="12" viewBox="0 0 16 16" width="12">
+          <svg height="14" viewBox="0 0 16 16" width="14">
             <path d="M4 10l4-4 4 4" fill="none" stroke="currentColor" strokeWidth="1.5" />
           </svg>
         </button>
@@ -197,11 +197,11 @@ export function FindBar() {
       <Tip label={t.findInPage.next}>
         <button
           aria-label={t.findInPage.next}
-          className="flex h-5 w-5 items-center justify-center rounded text-(--ui-text-secondary) hover:bg-(--ui-control-hover-background)"
+          className="flex h-7 w-7 items-center justify-center rounded text-(--ui-text-secondary) hover:bg-(--ui-control-hover-background)"
           onClick={findNext}
           type="button"
         >
-          <svg height="12" viewBox="0 0 16 16" width="12">
+          <svg height="14" viewBox="0 0 16 16" width="14">
             <path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" strokeWidth="1.5" />
           </svg>
         </button>
@@ -209,11 +209,11 @@ export function FindBar() {
 
       <button
         aria-label={t.common.close}
-        className="flex h-5 w-5 items-center justify-center rounded text-(--ui-text-secondary) hover:bg-(--ui-control-hover-background)"
+        className="flex h-7 w-7 items-center justify-center rounded text-(--ui-text-secondary) hover:bg-(--ui-control-hover-background)"
         onClick={closeFindBar}
         type="button"
       >
-        <svg height="10" viewBox="0 0 12 12" width="10">
+        <svg height="12" viewBox="0 0 12 12" width="12">
           <path d="M1 1l10 10M11 1L1 11" stroke="currentColor" strokeWidth="1.5" />
         </svg>
       </button>
