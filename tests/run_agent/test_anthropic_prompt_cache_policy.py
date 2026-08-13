@@ -378,6 +378,19 @@ class TestLiteLLMOpenAIWire:
         )
         assert agent._anthropic_prompt_cache_policy() == (False, False)
 
+    def test_litellm_path_segment_on_unrelated_host_does_not_cache(self):
+        # Host-only detection: a ``litellm`` substring confined to the URL
+        # path (e.g. a failover path on an unrelated provider) must NOT grant
+        # cache_control. Injecting the marker onto a strict OpenAI-wire host
+        # that rejects unknown keys would fail with HTTP 400 (#84506).
+        agent = _make_agent(
+            provider="custom",
+            base_url="https://api.corp.example.com/v1/litellm-failover",
+            api_mode="chat_completions",
+            model="claude-sonnet-4-6",
+        )
+        assert agent._anthropic_prompt_cache_policy() == (False, False)
+
 
 class TestQwenAlibabaFamily:
     """Qwen on OpenCode/OpenCode-Go/Alibaba — needs cache_control even on OpenAI-wire.

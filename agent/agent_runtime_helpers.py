@@ -2259,10 +2259,15 @@ def anthropic_prompt_cache_policy(
     # above, which returns the native layout.  Detection mirrors the
     # MiniMax provider-or-host pattern: a ``litellm`` substring in the
     # provider id (``custom:litellm``, ``litellm``) or in the base URL
-    # host (self-hosted proxies registered as bare ``custom``).
+    # host (self-hosted proxies registered as bare ``custom``).  The host
+    # check is host-only via ``base_url_hostname`` so a ``litellm`` path
+    # segment on an unrelated host (e.g. ``https://api.corp.com/v1/litellm``)
+    # does not grant cache_control to a provider that may reject the
+    # marker with HTTP 400.
+    litellm_host = base_url_hostname(eff_base_url)
     is_litellm = (
         "litellm" in provider_lower
-        or "litellm" in eff_base_url.lower()
+        or "litellm" in litellm_host
     )
     if is_litellm and is_claude and not is_anthropic_wire:
         return True, False
