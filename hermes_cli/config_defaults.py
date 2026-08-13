@@ -587,6 +587,58 @@ DEFAULT_CONFIG = {
         "max_line_length": 2000,
     },
 
+    # Tool-result relevance profiles. Where `tool_output` caps *size*,
+    # this section filters *relevance*: per tool type, which subset of the
+    # result the agent is likely to need before it is injected into the
+    # context. Each tool declares a result-handling profile:
+    #
+    # - search_files ``bounded_matches``: keep the first N + last N matches
+    #   (or densified text lines), summarize the middle. Most searches'
+    #   signal lives in the first few matches + the boundary ones.
+    # - read_file ``tail_or_head``: when a page is large, keep the head and
+    #   tail (function defs at the top, the answer near the bottom) instead
+    #   of the whole page. Small reads pass through untouched.
+    # - patch / write_file ``summary``: the agent already knows what it asked
+    #   for; keep the compact JSON envelope (success/files/targets), drop
+    #   verbose diff bodies.
+    # - terminal ``smart_tail``: keep the head + tail of the output field
+    #   (banner/version at the top, errors at the bottom), keep all other
+    #   result metadata intact.
+    #
+    # Tools without a profile keep the current behavior (``full``
+    # passthrough). The filter runs BEFORE the size caps and persistence
+    # thresholds, so nothing here raises context above what
+    # ``tool_output`` already allows — it only fills the allowed size with
+    # the relevant parts. Disable the whole system with ``enabled: false``.
+    "tool_result_profiles": {
+        "enabled": True,
+        "tools": {
+            "search_files": {
+                "mode": "bounded_matches",
+                "first_matches": 5,
+                "last_matches": 5,
+                "middle_summary": "{omitted} additional matches omitted — use a narrower pattern or offset to page through them",
+            },
+            "read_file": {
+                "mode": "tail_or_head",
+                "head_lines": 50,
+                "tail_lines": 100,
+                "full_if_under_chars": 4000,
+            },
+            "patch": {
+                "mode": "summary",
+            },
+            "write_file": {
+                "mode": "summary",
+            },
+            "terminal": {
+                "mode": "smart_tail",
+                "head_lines": 50,
+                "tail_lines": 100,
+            },
+        },
+    },
+
     # Tool loop guardrails nudge models when they repeat failed or
     # non-progressing tool calls. Soft warnings are always-on by default;
     # hard stops are opt-in so interactive CLI/TUI sessions keep flowing.

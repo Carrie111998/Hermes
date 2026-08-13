@@ -48,6 +48,7 @@ from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
 )
+from tools.tool_result_profiles import apply_tool_result_filter
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
@@ -1476,6 +1477,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             config=_tool_budget,
         ) if not _is_multimodal_tool_result(function_result) else function_result
 
+        # Tool-aware relevance filter: replace the raw blob with the parts
+        # this tool type's profile says the agent needs (see
+        # ``tools/tool_result_profiles.py``). Runs after persistence so the
+        # full output is still spilled/tracked, and before subdir-hint
+        # injection so appended hint payloads are never trimmed mid-result.
+        if not _is_multimodal_tool_result(function_result):
+            function_result = apply_tool_result_filter(name, function_result)
+
         subdir_hints = agent._subdirectory_hints.check_tool_call(name, args)
         if subdir_hints:
             if _is_multimodal_tool_result(function_result):
@@ -2277,6 +2286,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             env=get_active_env(effective_task_id),
             config=_tool_budget,
         ) if not _is_multimodal_tool_result(function_result) else function_result
+
+        # Tool-aware relevance filter — see the concurrent path for rationale.
+        if not _is_multimodal_tool_result(function_result):
+            function_result = apply_tool_result_filter(function_name, function_result)
 
         # Discover subdirectory context files from tool arguments
         subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)

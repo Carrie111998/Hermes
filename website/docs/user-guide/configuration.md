@@ -745,6 +745,63 @@ tool_output:
   max_lines: 500
 ```
 
+## Tool-Result Relevance Profiles
+
+Where `tool_output` caps tool output by **size**, `tool_result_profiles`
+filters by **relevance**: each tool type declares which portion of its result
+the agent is likely to need, and Hermes keeps only that portion when the
+result is injected into the agent context. The filter runs before the size
+caps and context-persistence thresholds, so it can only shrink what enters
+context — never raise it above what `tool_output` allows. Tools without a
+profile keep the current behavior.
+
+```yaml
+tool_result_profiles:
+  enabled: true
+  tools:
+    search_files:
+      mode: bounded_matches     # keep first N + last N matches
+      first_matches: 5
+      last_matches: 5
+      middle_summary: "{omitted} additional matches omitted — use a narrower pattern or offset to page through them"
+    read_file:
+      mode: tail_or_head        # large pages: head + tail, middle summarized
+      head_lines: 50
+      tail_lines: 100
+      full_if_under_chars: 4000 # small reads pass through untouched
+    patch:
+      mode: summary             # compact envelope; diff bodies dropped
+    write_file:
+      mode: summary
+    terminal:
+      mode: smart_tail          # head + tail of output; metadata kept
+      head_lines: 50
+      tail_lines: 100
+```
+
+Per-tool modes:
+
+- **`bounded_matches`** (`search_files`) — keeps the first `first_matches`
+  and last `last_matches` matches (both the verbose `matches` array and the
+  densified path-grouped text are supported), marks the result `truncated`,
+  and records the omitted count in `_relevance` so the model can page with
+  `offset` for the middle.
+- **`tail_or_head`** (`read_file`) — for pages larger than
+  `full_if_under_chars`, keeps the first `head_lines` and last `tail_lines`
+  (function definitions near the top, the answer near the bottom) and
+  inserts an omitted-lines notice. Small reads pass through untouched.
+- **`summary`** (`patch`, `write_file`) — keeps the compact JSON envelope
+  (success/error, `files_modified`, `resolved_path`, warnings) and drops
+  verbose diff bodies the agent already knows about.
+- **`smart_tail`** (`terminal`) — trims the `output` field to the head and
+  tail (banner/version at the top, errors at the bottom) while leaving all
+  other result metadata (`exit_code`, spill paths, truncation notes) intact,
+  and records the trimmed count in `relevance_note`.
+
+The filter is fail-open: malformed output, unknown tools, unparseable JSON,
+or a disabled section all pass results through unchanged. To disable the
+system entirely, set `tool_result_profiles.enabled: false`.
+
 ## Global Toolset Disable
 
 To suppress specific toolsets across the CLI and every gateway platform in one
