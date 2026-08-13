@@ -12,13 +12,13 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli.profiles import (
-    export_profile,
+from hermes_cli.profile_export import (
     _DEFAULT_EXPORT_EXCLUDE_ROOT,
     _is_sensitive_export_name,
     _sqlite_sidecars_in_directory,
     _verify_compacted_sqlite_semantics,
 )
+from hermes_cli.profiles import export_profile
 
 
 # Long enough to match agent.redact prefix patterns (sk- + 10+ chars).
