@@ -17,6 +17,10 @@ describe('forceLoneHeaderForPanes', () => {
     expect(forceLoneHeaderForPanes(['session-tile:abc'], chrome('main'), noCollapse)).toBe(true)
   })
 
+  it('forces a header for a side pane with an app-owned close action', () => {
+    expect(forceLoneHeaderForPanes(['excalidraw:file'], chrome('right'), noCollapse, () => true)).toBe(true)
+  })
+
   it('forces a header for a lone collapse tool pane', () => {
     expect(
       forceLoneHeaderForPanes(
