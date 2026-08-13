@@ -1,0 +1,26 @@
+# Fork-only override of the root .gitignore's `docs/superpowers/*` rule, which
+# arrived from upstream in 4d5d9fffd0 (PR #56582). Upstream ignores this path;
+# this fork deliberately TRACKS what lives here -- specs, plans, audits,
+# canaries, and rollout evidence are durable design artifacts, not scratch.
+#
+# Why here and not next to the rule in the root .gitignore: upstream edits that
+# file on nearly every release merge, so a fork-only negation there is a
+# recurring conflict point. Patterns in a subdirectory's .gitignore override
+# those from parent directories, and this file un-ignores itself below, so the
+# root file stays byte-identical to upstream.
+#
+# What this fixes: without it, every new spec or plan needed `git add -f`, which
+# cannot be done through the mandatory git-quiet-commit.py wrapper (it has no
+# force-add flag). The workaround was a bare `git add -f` followed by
+# `git-quiet-commit.py --index-as-is`, leaving a staged file in the SHARED index
+# between the two calls. On 2026-08-13 that window was hit and a 365-line spec
+# was swept into a concurrent session's unrelated commit (93486b7d16).
+#
+# New subdirectories stay ignored by default. Add a negation below when a subdir
+# holds durable artifacts; leave it out when it holds scratch or build output.
+!.gitignore
+!specs/
+!plans/
+!audits/
+!canaries/
+!rollout-evidence/
