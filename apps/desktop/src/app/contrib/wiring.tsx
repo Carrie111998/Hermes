@@ -438,6 +438,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const {
     archiveSession,
     branchCurrentSession,
+    branchSessionMessage,
     branchStoredSession,
     createBackendSessionForSend,
     openNewSessionTile,
@@ -607,6 +608,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // the tile TAB menu needs, without touching the primary view).
   useSessionTileDelegate({
     archiveSession,
+    branchSessionMessage,
     branchStoredSession,
     executeSlashCommand,
     removeSession,

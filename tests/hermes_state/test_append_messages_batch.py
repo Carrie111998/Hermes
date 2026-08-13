@@ -113,6 +113,20 @@ class TestAppendMessagesBatch:
     def test_returns_inserted_count(self, db):
         assert db.append_messages_batch("sess-batch", _turn_messages()) == 4
 
+    def test_returns_row_ids_when_requested(self, db):
+        messages = _turn_messages()
+
+        row_ids = db.append_messages_batch("sess-batch", messages, return_row_ids=True)
+
+        assert row_ids == [
+            row[0]
+            for row in db._conn.execute(
+                "SELECT id FROM messages WHERE session_id = ? ORDER BY id",
+                ("sess-batch",),
+            ).fetchall()
+        ]
+        assert len(row_ids) == len(messages)
+
     def test_empty_batch_is_noop(self, db):
         assert db.append_messages_batch("sess-batch", []) == 0
         row = db._conn.execute(

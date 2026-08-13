@@ -547,6 +547,8 @@ export function resetTileRuntimeBindings() {
 export interface SessionTileDelegate {
   /** Archive a stored session (the sidebar's archive, incl. tile cleanup). */
   archiveSession(storedSessionId: string): Promise<void>
+  /** Branch a specific message from a tile's own runtime transcript. */
+  branchMessage(runtimeId: string, storedSessionId: string, messageId: string): Promise<void>
   /** Branch a stored session into a new chat (the sidebar's branch). */
   branchSession(storedSessionId: string): Promise<void>
   /** Delete a stored session (the sidebar's delete, incl. tile cleanup). */

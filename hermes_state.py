@@ -44,7 +44,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
@@ -7784,7 +7784,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         messages: List[Dict[str, Any]],
         compression_lock_holder: Optional[str] = None,
         chunk_rows: Optional[int] = None,
-    ) -> int:
+        return_row_ids: bool = False,
+    ) -> Union[int, List[int]]:
         """Append multiple messages atomically in ONE write transaction.
 
         ``messages`` is a list of dicts in the same shape
@@ -7803,6 +7804,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         as :meth:`append_message` run once for the batch — same session,
         same instant.
 
+        When ``return_row_ids`` is true, return the SQLite row IDs in insert
+        order instead of the inserted count. The live agent uses this to stamp
+        durable identity back onto its in-memory message dicts before a warm
+        session can be branched.
+
         ``chunk_rows`` bounds the transaction size for LARGE copies (branch
         seeds can be thousands of rows; measured: 10k rows ≈ 2.4s inside one
         BEGIN IMMEDIATE because the FTS triggers run per row, which would
@@ -7810,28 +7816,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         the batch commits in chunks of at most that many rows — same
         recovery semantics as the old per-row loops (a mid-copy failure
         leaves a partial seed), just with bounded lock holds. A turn flush
-        never needs it. Returns the inserted row count.
+        never needs it. Returns the inserted row count unless
+        ``return_row_ids`` is true.
         """
         if not messages:
-            return 0
+            return [] if return_row_ids else 0
 
         if chunk_rows is not None and len(messages) > chunk_rows:
             inserted_total = 0
+            inserted_row_ids: List[int] = []
             for start in range(0, len(messages), chunk_rows):
-                inserted_total += self.append_messages_batch(
+                result = self.append_messages_batch(
                     session_id,
                     messages[start:start + chunk_rows],
                     compression_lock_holder=compression_lock_holder,
+                    return_row_ids=return_row_ids,
                 )
-            return inserted_total
+                if return_row_ids:
+                    inserted_row_ids.extend(result)  # type: ignore[arg-type]
+                else:
+                    inserted_total += result  # type: ignore[operator]
+            return inserted_row_ids if return_row_ids else inserted_total
 
         def _do(conn):
             self._check_transcript_write_guards(
                 conn, session_id, compression_lock_holder
             )
-            inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, messages
-            )
+            if return_row_ids:
+                inserted, tool_calls_total, row_ids = self._insert_message_rows(
+                    conn, session_id, messages, return_ids=True
+                )
+            else:
+                inserted, tool_calls_total = self._insert_message_rows(
+                    conn, session_id, messages
+                )
             # One aggregated counter update for the whole batch.
             if tool_calls_total > 0:
                 conn.execute(
@@ -7844,7 +7862,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
                     (inserted, session_id),
                 )
-            return inserted
+            return row_ids if return_row_ids else inserted
 
         # Same criticality as append_message: this IS the turn's transcript.
         return self._execute_write(
@@ -8093,18 +8111,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return row[0] if row else None
 
-    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
+    def _insert_message_rows(
+        self,
+        conn,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        return_ids: bool = False,
+    ) -> Union[Tuple[int, int], Tuple[int, int, List[int]]]:
         """Insert *messages* as fresh active rows for *session_id*.
 
         Shared by :meth:`replace_messages` (delete-then-insert) and
         :meth:`archive_and_compact` (soft-archive-then-insert). Runs inside the
         caller's write transaction (takes the live ``conn``). Returns
-        ``(inserted_count, tool_call_count)``. Does NOT touch sessions.* counters
-        — the caller owns that, since the two flows reconcile counts differently.
+        ``(inserted_count, tool_call_count)``. When ``return_ids`` is true, a
+        third item contains the inserted SQLite row IDs in order. Does NOT
+        touch sessions.* counters — the caller owns that, since the two flows
+        reconcile counts differently.
         """
         now_ts = time.time()
         inserted = 0
         tool_calls_total = 0
+        row_ids: List[int] = []
         for msg in messages:
             role = msg.get("role", "unknown")
             tool_calls = msg.get("tool_calls")
@@ -8146,7 +8173,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             api_content = msg.get("api_content")
 
-            conn.execute(
+            cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
@@ -8177,11 +8204,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ),
             )
             inserted += 1
+            if return_ids:
+                row_ids.append(int(cursor.lastrowid))
             if tool_calls is not None:
                 tool_calls_total += (
                     len(tool_calls) if isinstance(tool_calls, list) else 1
                 )
             now_ts = max(now_ts + 1e-6, message_timestamp + 1e-6)
+        if return_ids:
+            return inserted, tool_calls_total, row_ids
         return inserted, tool_calls_total
 
     def replace_messages(

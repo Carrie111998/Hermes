@@ -6,7 +6,7 @@
   "description": "Native desktop shell for Hermes Agent.",
   "author": "Nous Research",
   "type": "module",
-  "main": "dist/electron-main.mjs",
+  "main": "electron-main-entry.mjs",
   "engines": {
     "node": ">=22.22.0"
   },
@@ -190,6 +190,7 @@
       "dist/**",
       "assets/**",
       "public/**",
+      "electron-main-entry.mjs",
       "package.json"
     ],
     "beforeBuild": "scripts/before-build.mjs",

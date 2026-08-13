@@ -3,7 +3,13 @@ import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 import type { NavigateFunction } from 'react-router'
 
 import { revealTreePane } from '@/components/pane-shell/tree/store'
-import { deleteSession, getAllSessionMessages, getLatestSessionMessages, setSessionArchived } from '@/hermes'
+import {
+  deleteSession,
+  getAllSessionMessages,
+  getLatestSessionMessages,
+  getSessionMessages,
+  setSessionArchived
+} from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
@@ -84,6 +90,7 @@ import {
   patchSessionWorkspace,
   preserveLocalPendingTurnMessages,
   reconcileResumeMessages,
+  resolveDurableRowIdForMessage,
   resolveSessionProfile,
   resolveStoredSession,
   sessionMatchesStoredId,
@@ -114,6 +121,16 @@ interface SessionActionsOptions {
     updater: (state: ClientSessionState) => ClientSessionState,
     storedSessionId?: string | null
   ) => ClientSessionState
+}
+
+/** Inputs for branching from a message rendered inside a background/session tile. */
+export interface BranchSessionMessageOptions {
+  busy: boolean
+  cwd: string
+  messageId: string
+  messages: ChatMessage[]
+  parentStoredId: string
+  sourceSessionId: string
 }
 
 // Stored ids created in THIS renderer run. A brand-new session lives only in the
@@ -1175,13 +1192,18 @@ export function useSessionActions({
   // Shared fork: create a child session seeded with `branchMessages`, linked to
   // `parentStoredId` so it nests under its parent, then open it as its own tab
   // and switch to it — the parent chat stays put (mirrors openNewSessionTile).
+  // `upToRowId` (optional) is the durable DB row id of the message the branch
+  // was cut at. session.branch truncates the parent's raw history by row id —
+  // NOT by a merged-message count, which has no stable mapping onto the raw
+  // rows and silently dropped the conversation tail (branch context-loss bug).
   const forkBranch = useCallback(
     async (
       branchMessages: BranchMessage[],
       sourceSessionId: null | string,
       parentStoredId: null | string,
       cwd?: string,
-      profile?: null | string
+      profile?: null | string,
+      upToRowId?: number
     ): Promise<boolean> => {
       creatingSessionRef.current = true
 
@@ -1196,10 +1218,13 @@ export function useSessionActions({
         await ensureGatewayProfile(profile)
 
         // No title: the backend auto-names the branch from its parent's lineage.
+        // Full-history fork (no row id) omits any truncation; a specific-message
+        // fork names the durable row id so the backend cuts the RAW history at
+        // exactly that row (a merged-message count would land in the wrong place).
         const branched = sourceSessionId
           ? await requestGateway<SessionCreateResponse>('session.branch', {
               session_id: sourceSessionId,
-              count: branchMessages.length
+              ...(upToRowId ? { up_to_row_id: upToRowId } : {})
             })
           : await requestGateway<SessionCreateResponse>('session.create', {
               cols: 96,
@@ -1211,6 +1236,17 @@ export function useSessionActions({
             })
 
         const routedSessionId = branched.stored_session_id ?? branched.session_id
+        // session.branch returns the copied transcript with the child's new
+        // durable row ids. Prefer it over the source ChatMessage objects,
+        // which still carry the parent's row ids in a freshly-created tile.
+        // session.create may not return a transcript, so retain the source
+        // projection as the fallback for that path.
+
+        const initialMessages =
+          sourceSessionId && branched.messages?.length
+            ? toChatMessages(branched.messages)
+            : branchMessages.map(({ source }) => source)
+
         const preview = branchMessages.map(({ content }) => content).find(Boolean) ?? null
         // Draft until submit: nest under the parent at the parent's recency so it
         // doesn't bubble to the top until a real message lands (backend persists
@@ -1236,7 +1272,7 @@ export function useSessionActions({
           branched.session_id,
           state => ({
             ...state,
-            messages: branchMessages.map(({ source }) => source),
+            messages: initialMessages,
             busy: false,
             awaitingResponse: false
           }),
@@ -1296,6 +1332,12 @@ export function useSessionActions({
         ? messages.findIndex(message => message.id === messageId)
         : messages.findLastIndex(message => message.role === 'assistant' || message.role === 'user')
 
+      if (messageId && at < 0) {
+        notifyError(new Error('The selected message is no longer available in this session.'), copy.branchFailed)
+
+        return false
+      }
+
       const start = 0
       const end = at >= 0 ? at + 1 : messages.length
       const branchMessages = toBranchMessages(messages.slice(start, end))
@@ -1313,15 +1355,117 @@ export function useSessionActions({
       // must stay on that thread's backend (cache hit for an open session).
       const profile = await resolveSessionProfile(selectedStoredSessionIdRef.current)
 
+      let upToRowId = messageId && at >= 0 ? messages[at]?.rowId : undefined
+
+      if (messageId && at >= 0 && upToRowId === undefined) {
+        const parentStoredId = selectedStoredSessionIdRef.current
+
+        if (!parentStoredId) {
+          notifyError(new Error('The selected message is not persisted yet.'), copy.branchFailed)
+
+          return false
+        }
+
+        try {
+          const persisted = await getSessionMessages(parentStoredId, profile)
+          upToRowId = resolveDurableRowIdForMessage(messages, at, persisted.messages)
+        } catch (error) {
+          notifyError(error, copy.branchFailed)
+
+          return false
+        }
+
+        if (upToRowId === undefined) {
+          notifyError(
+            new Error('The selected message is not available in the persisted transcript yet.'),
+            copy.branchFailed
+          )
+
+          return false
+        }
+      }
+
       return forkBranch(
         branchMessages,
         activeSessionIdRef.current,
         selectedStoredSessionIdRef.current,
         $currentCwd.get().trim(),
-        profile
+        profile,
+        // Forking from a specific message: name its durable DB row id so the
+        // backend truncates the RAW history at exactly that row. Without an id
+        // (branch the whole chat) no truncation is sent — a merged-message
+        // count has no stable mapping onto the backend's raw rows and used to
+        // silently drop the conversation tail (branch context-loss bug).
+        upToRowId
       )
     },
     [activeSessionIdRef, busyRef, copy, forkBranch, selectedStoredSessionIdRef]
+  )
+
+  // Branch a message rendered by a session tile. Tile transcripts are kept in
+  // the per-runtime cache rather than the primary $messages atom, so the
+  // primary-session callback above cannot be reused here. Always resolve the
+  // target against the tile's own persisted transcript: a freshly-created
+  // branch initially reuses the parent's ChatMessage objects, whose rowId
+  // belongs to the parent database and is therefore invalid in the child.
+  const branchSessionMessage = useCallback(
+    async ({
+      busy,
+      cwd,
+      messageId,
+      messages,
+      parentStoredId,
+      sourceSessionId
+    }: BranchSessionMessageOptions): Promise<boolean> => {
+      if (busy) {
+        notify({ kind: 'warning', title: copy.sessionBusy, message: copy.branchStopCurrent })
+
+        return false
+      }
+
+      const at = messages.findIndex(message => message.id === messageId)
+
+      if (at < 0) {
+        notifyError(new Error('The selected message is no longer available in this session.'), copy.branchFailed)
+
+        return false
+      }
+
+      const branchMessages = toBranchMessages(messages.slice(0, at + 1))
+
+      if (!branchMessages.length) {
+        notify({ kind: 'warning', title: copy.nothingToBranch, message: copy.branchNoText })
+
+        return false
+      }
+
+      clearNotifications()
+
+      let profile: string | undefined
+      let upToRowId: number | undefined
+
+      try {
+        profile = await resolveSessionProfile(parentStoredId)
+        const persisted = await getSessionMessages(parentStoredId, profile)
+        upToRowId = resolveDurableRowIdForMessage(messages, at, persisted.messages)
+      } catch (error) {
+        notifyError(error, copy.branchFailed)
+
+        return false
+      }
+
+      if (upToRowId === undefined) {
+        notifyError(
+          new Error('The selected message is not available in the persisted transcript yet.'),
+          copy.branchFailed
+        )
+
+        return false
+      }
+
+      return forkBranch(branchMessages, sourceSessionId, parentStoredId, cwd.trim(), profile, upToRowId)
+    },
+    [copy, forkBranch]
   )
 
   // Branch any listed session, not just the open one. Reads the target's stored
@@ -1515,6 +1659,7 @@ export function useSessionActions({
   return {
     archiveSession,
     branchCurrentSession,
+    branchSessionMessage,
     branchStoredSession,
     closeSettings,
     createBackendSessionForSend,

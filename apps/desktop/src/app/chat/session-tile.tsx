@@ -175,6 +175,11 @@ function TileChat({
   const onRemoveAttachment = useCallback((id: string) => void removeAttachment(id), [removeAttachment])
   const onRetryResume = useCallback(() => patchSessionTile(storedSessionId, { error: undefined }), [storedSessionId])
 
+  const onBranchInNewChat = useCallback(
+    (messageId: string) => void sessionTileDelegate()?.branchMessage(runtimeId, storedSessionId, messageId),
+    [runtimeId, storedSessionId]
+  )
+
   // Per-tile model menu — rendered under this tile's SessionView so the pill
   // + switch target THIS runtime, not the primary (which may be mid-turn).
   const modelMenuContent = useMemo(
@@ -200,6 +205,7 @@ function TileChat({
           onAddUrl={onAddUrl}
           onAttachDroppedItems={composer.attachDroppedItems}
           onAttachImageBlob={composer.attachImageBlob}
+          onBranchInNewChat={onBranchInNewChat}
           onCancel={actions.cancelRun}
           onDeleteSelectedSession={noop}
           onDismissError={actions.dismissError}

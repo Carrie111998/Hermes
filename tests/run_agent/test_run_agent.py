@@ -117,6 +117,26 @@ def test_flush_persist_override_replaces_api_local_multimodal_note(agent):
     assert api_content[0]["text"] == "[MODEL SWITCH NOTE]\n\nDescribe this screenshot"
 
 
+def test_flush_stamps_durable_row_ids_on_live_messages(agent):
+    agent._session_db = MagicMock()
+    agent._session_db_created = True
+    agent._session_db.append_messages_batch.return_value = [27481, 27482]
+    agent.session_id = "session-123"
+    agent._last_flushed_db_idx = 0
+    agent._persist_user_message_idx = None
+    agent._persist_user_message_override = None
+    agent._persist_user_message_timestamp = None
+
+    messages = [
+        {"role": "user", "content": "1"},
+        {"role": "assistant", "content": "reply"},
+    ]
+
+    agent._flush_messages_to_session_db(messages, [])
+
+    assert [message["_row_id"] for message in messages] == [27481, 27482]
+
+
 def test_direct_session_db_flushes_share_marker_claim(agent):
     """A direct flush cannot interleave its marker check with `_persist_session`."""
     class _BarrierDB:
