@@ -344,6 +344,26 @@ def _planned_rows(ledger: DelegationLedger) -> list[Dict[str, Any]]:
     return sorted(ledger.list_requests(state="PLANNED", limit=200), key=lambda row: (row["created_at"], row["request_id"]))
 
 
+def _canary_resumable_rows(ledger: DelegationLedger, request_id: str) -> list[Dict[str, Any]]:
+    """The designated request's row, if it is a bounded canary resume candidate.
+
+    A request in VALIDATED is resumable ONLY when it carries a ``shadow``
+    artifact -- durable proof that THIS executor already shadow-verified it
+    in an earlier tick. VALIDATED alone is not that proof (a request can
+    reach VALIDATED only via this same pipeline, but callers must not rely on
+    that as a substitute for checking the artifact -- e.g. test/ops tooling
+    that force-sets state for setup). Fail-closed: no shadow artifact, no
+    resume. Returns a single-element list (or empty) so callers can treat it
+    uniformly alongside ``_planned_rows``.
+    """
+    row = ledger.get_request(request_id)
+    if row is None or row["state"] != "VALIDATED":
+        return []
+    if not any(artifact["kind"] == "shadow" for artifact in ledger.artifacts_for(request_id)):
+        return []
+    return [row]
+
+
 def _target_is_eligible(
     row: Dict[str, Any],
     allowlist: Allowlist,
@@ -482,6 +502,19 @@ def run_executor_tick(
     restricts selection to one designated request. ``synthetic_only``, when
     true, further restricts eligibility to ``synthetic_fixture`` targets,
     excluding ``canary_real`` targets even if otherwise eligible.
+
+    Selection normally scans only ``PLANNED`` rows. Bounded canary resume is
+    the one exception: when ``mode="canary"`` AND ``request_id`` names a
+    request already in ``VALIDATED`` that carries a ``shadow`` artifact (see
+    ``_canary_resumable_rows``), that request becomes selectable again so an
+    operator can shadow-verify a request and then canary that SAME request.
+    The worktree from the shadow run is gone, so a resume still fully
+    rebuilds the worktree, reruns the implementation command, and
+    re-validates before pushing -- it only skips the two lifecycle
+    transitions (``BUILDING``, ``VALIDATED``) the request already passed
+    through, since re-entering ``BUILDING`` from ``VALIDATED`` is not a legal
+    edge. Resume is unreachable in shadow mode and unreachable without a
+    designated ``request_id``.
     """
     if mode not in {"shadow", "canary"}:
         return {"processed": 0, "errors": 0, "skipped": 0}
@@ -497,6 +530,12 @@ def run_executor_tick(
     skipped = 0
     row: Optional[Dict[str, Any]] = None
     candidates = _planned_rows(ledger)
+    if mode == "canary" and request_id is not None:
+        # Bounded canary resume candidates: canary-only, designated-only (the
+        # request_id is not None check above the mode=="shadow" case is
+        # never reached here, and the request_id is None early-return above
+        # already ran), and only a VALIDATED row with a shadow artifact.
+        candidates = candidates + _canary_resumable_rows(ledger, request_id)
     if request_id is not None:
         candidates = [c for c in candidates if c["request_id"] == request_id]
     for candidate in candidates:
@@ -510,6 +549,7 @@ def run_executor_tick(
     request_id = row["request_id"]
     target = resolve_target(allowlist, row["target_repo"])
     assert target is not None  # established by _target_is_eligible
+    resuming = row["state"] == "VALIDATED"
 
     # Canary-only precondition: a durable per-window PR budget, checked before
     # any mutation so an exhausted budget leaves the request PLANNED (no
@@ -549,7 +589,14 @@ def run_executor_tick(
         # _mark_failed can advance to FAILED. A failure recorded while still
         # PLANNED would be invisible in the ledger and the request would be
         # reselected and re-fail on every subsequent tick.
-        transition(ledger, bus, request_id, "BUILDING", actor=actor, policy_version=policy_version)
+        #
+        # Skipped on resume: the request is already VALIDATED, and
+        # VALIDATED -> BUILDING is not a legal edge (TRANSITIONS["VALIDATED"]
+        # == {"PR_OPEN", "FAILED"}) -- re-transitioning would raise
+        # IllegalTransitionError. _mark_failed already accepts VALIDATED, so
+        # a boundary/rebuild failure below still correctly reaches FAILED.
+        if not resuming:
+            transition(ledger, bus, request_id, "BUILDING", actor=actor, policy_version=policy_version)
         checkout_path, worktree_base = _validate_target_boundary(target)
         branch = _worktree_name(request_id, int(lease["attempt_count"]))
         worktree_path = worktree_base / branch
@@ -572,7 +619,13 @@ def run_executor_tick(
             raise ExecutorError(evidence)
         for ref in validation.evidence_refs:
             ledger.add_artifact(request_id, "validation", ref)
-        transition(ledger, bus, request_id, "VALIDATED", actor=actor, policy_version=policy_version)
+        # Skipped on resume: the request is already VALIDATED (that is what
+        # made it a resume candidate), and re-transitioning to the same
+        # state is not a legal edge. The rebuild-and-revalidate above still
+        # ran unconditionally -- a resume never pushes a change that was not
+        # freshly re-validated in this tick.
+        if not resuming:
+            transition(ledger, bus, request_id, "VALIDATED", actor=actor, policy_version=policy_version)
 
         if mode == "shadow":
             # Shadow stops here: record the intended outcome and take no remote

@@ -24,7 +24,11 @@ it never constructs a PR client and can never open a PR or push.
 executor-canary is a one-off, explicitly-authorized command that opens ONE
 real GitHub PR. It refuses (exit 2) unless both
 ``--i-understand-this-opens-a-real-pr`` and ``--request-id`` are supplied,
-and only then constructs a real PR client.
+and only then constructs a real PR client. The designated request must be
+PLANNED, or VALIDATED with a ``shadow`` artifact (a bounded resume of a
+request already shadow-verified by an earlier executor-shadow tick) --
+any other state, or a VALIDATED request without that artifact, refuses
+before the tick and before any PR client is constructed.
 """
 from __future__ import annotations
 
@@ -131,17 +135,35 @@ def _cmd_executor_canary(args) -> int:
     # is a real operator footgun right when a canary is being run -- most
     # commonly because a prior shadow tick already advanced the SAME request
     # to VALIDATED. Fail loudly, before the tick (and before GhPrClient is
-    # ever constructed), naming the actual state. This does not add a
-    # resume-from-VALIDATED path; run_executor_tick's own PLANNED-only
-    # selection is unchanged.
+    # ever constructed), naming the actual state.
+    #
+    # run_executor_tick now supports a bounded canary resume: a designated
+    # request in VALIDATED that carries a `shadow` artifact (durable proof
+    # this executor already shadow-verified it) is a legitimate target here,
+    # not an error. VALIDATED without that artifact is still refused --
+    # fail-closed, since it was never shadow-verified.
     designated = em.ledger.get_request(args.request_id)
     if designated is None:
         print(f"ERROR: unknown request: {args.request_id}", file=sys.stderr)
         return 2
-    if designated["state"] != "PLANNED":
+    if designated["state"] == "VALIDATED":
+        has_shadow_artifact = any(
+            artifact["kind"] == "shadow" for artifact in em.ledger.artifacts_for(args.request_id)
+        )
+        if not has_shadow_artifact:
+            print(
+                f"ERROR: request {args.request_id} is VALIDATED but was not shadow-verified "
+                "(no shadow artifact); it cannot be resumed. Run executor-shadow for it first, "
+                "or use a PLANNED request",
+                file=sys.stderr,
+            )
+            return 2
+    elif designated["state"] != "PLANNED":
         print(
             f"ERROR: request {args.request_id} is in state {designated['state']}, not PLANNED; "
-            "canary requires a PLANNED request (a prior shadow tick advances a request to VALIDATED)",
+            "canary requires a PLANNED request, or a VALIDATED request that was shadow-verified "
+            "(a prior shadow tick advances a request to VALIDATED and records a shadow artifact, "
+            "which canary can then resume)",
             file=sys.stderr,
         )
         return 2

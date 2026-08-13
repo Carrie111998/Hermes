@@ -253,11 +253,12 @@ def test_executor_canary_cli_unknown_request_id_fails_loudly(queue_mode, capsys,
     assert "unknown request: dwr_missing" in capsys.readouterr().err
 
 
-def test_executor_canary_cli_wrong_state_fails_loudly(queue_mode, capsys, monkeypatch):
-    # H2: a designated request that exists but is not PLANNED (very commonly
-    # VALIDATED, because a prior shadow tick already advanced it) must also
-    # fail loudly rather than silently reporting processed=0. This is NOT a
-    # resume-from-VALIDATED path -- the request is left exactly as found.
+def test_executor_canary_cli_validated_without_shadow_artifact_fails_loudly(queue_mode, capsys, monkeypatch):
+    # H2 (updated for the bounded canary resume): a designated request that
+    # is VALIDATED WITHOUT a shadow artifact was never shadow-verified by
+    # this executor, so it must still fail loudly rather than silently
+    # reporting processed=0 or being silently resumed. This is fail-closed:
+    # VALIDATED alone is not proof of shadow verification.
     import devflow_delegation.executor as executor_mod
     from devflow_delegation.emitter import DelegationEmitter
     from devflow_delegation.lifecycle import transition
@@ -269,11 +270,37 @@ def test_executor_canary_cli_wrong_state_fails_loudly(queue_mode, capsys, monkey
     transition(ledger, None, rid, "TRIAGED", actor="operator")
     assert ledger.record_human_decision(rid, "operator", "approve", "fixture setup", f"token-{rid}")
     transition(ledger, None, rid, "PLANNED", actor="operator")
-    # Simulate the common real-world cause: a prior shadow tick advanced this
-    # SAME request to VALIDATED (BUILDING -> VALIDATED is a legal lifecycle
-    # transition; set_state here is only test setup, not exercising that
-    # path).
+    # Force VALIDATED WITHOUT ever running a shadow tick (set_state here is
+    # only test setup -- no shadow artifact is ever recorded).
     ledger.set_state(rid, "VALIDATED")
+    assert ledger.artifacts_for(rid) == []
+
+    def _boom(*_a, **_k):
+        raise AssertionError("VALIDATED-without-shadow request -> GhPrClient must never be constructed")
+
+    monkeypatch.setattr(executor_mod, "GhPrClient", _boom)
+    rc = cli.main([
+        "executor-canary", "--i-understand-this-opens-a-real-pr", "--request-id", rid,
+    ])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert f"request {rid} is VALIDATED but was not shadow-verified" in err
+    assert ledger.get_request(rid)["state"] == "VALIDATED"
+
+
+def test_executor_canary_cli_wrong_state_fails_loudly(queue_mode, capsys, monkeypatch):
+    # A designated request in any state other than PLANNED or a
+    # shadow-verified VALIDATED (e.g. still TRIAGED) must fail loudly rather
+    # than silently reporting processed=0.
+    import devflow_delegation.executor as executor_mod
+    from devflow_delegation.emitter import DelegationEmitter
+    from devflow_delegation.lifecycle import transition
+
+    monkeypatch.setattr("sys.stdin", __import__("io").StringIO(json.dumps(make_delegate_kwargs())))
+    cli.main(["delegate"])
+    ledger = DelegationEmitter().ledger
+    rid = ledger.list_requests()[0]["request_id"]
+    transition(ledger, None, rid, "TRIAGED", actor="operator")
 
     def _boom(*_a, **_k):
         raise AssertionError("wrong-state request -> GhPrClient must never be constructed")
@@ -284,8 +311,9 @@ def test_executor_canary_cli_wrong_state_fails_loudly(queue_mode, capsys, monkey
     ])
     assert rc == 2
     err = capsys.readouterr().err
-    assert f"request {rid} is in state VALIDATED, not PLANNED" in err
-    assert "canary requires a PLANNED request" in err
+    assert f"request {rid} is in state TRIAGED, not PLANNED" in err
+    assert "or a VALIDATED request that was shadow-verified" in err
+    assert ledger.get_request(rid)["state"] == "TRIAGED"
 
 
 def test_executor_canary_cli_reaches_a_pr_with_a_fake_client(
@@ -365,6 +393,86 @@ def test_executor_canary_cli_reaches_a_pr_with_a_fake_client(
     assert "mode=canary" in out
     assert "processed=1" in out
     assert "pr=https://example.test/pr/99" in out
+
+
+def test_executor_canary_cli_resumes_a_shadow_validated_request_with_a_fake_client(
+    hermes_root, allowlist_file, tmp_path_factory, capsys, monkeypatch
+):
+    # CLI-level headline flow: executor-shadow advances a request to
+    # VALIDATED and records a shadow artifact; a SUBSEQUENT executor-canary
+    # call designating that same request_id must resume it and reach a real
+    # (fake, injected) PR -- driven end-to-end through cli.main(), never a
+    # real client, never a network call.
+    import io
+
+    import devflow_delegation.executor as executor_mod
+    from devflow_delegation.emitter import DelegationEmitter
+    from devflow_delegation.lifecycle import transition
+    from tests.devflow_delegation.test_executor import _fixture_repo, _write_source_command
+
+    fixture_root = tmp_path_factory.mktemp("ddp-canary-resume-cli")
+    repo = _fixture_repo(fixture_root)
+
+    (hermes_root / "devflow" / "policy.json").write_text(
+        json.dumps({"explicit": {"mode": "queue"}}), encoding="utf-8")
+
+    allowlist = json.loads(allowlist_file.read_text(encoding="utf-8"))
+    allowlist["targets"]["canary_real"] = {
+        "repo": "canary_real",
+        "checkout_path": str(repo),
+        "default_branch": "main",
+        "remote": "origin",
+        "allowed_globs": ["src/**"],
+        "denied_globs": ["**/.env", "secrets/**"],
+        "worktree_base": str(fixture_root / "worktrees"),
+        "test_commands": [["python", "-c", "print('tests passed')"]],
+        "command_timeout_seconds": 30,
+        "required_checks": ["test"],
+        "risk_ceiling": "low",
+        "max_autonomous_action": "create_pr",
+        "executor_enabled": True,
+        "canary_real": True,
+        "pr_budget": 1,
+        "implementation_command": list(_write_source_command()),
+        "github_repo": "example/canary-fixture",
+        "live_gateway_imports": False,
+    }
+    allowlist_file.write_text(json.dumps(allowlist), encoding="utf-8")
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(make_delegate_kwargs(
+        source={"agent": "operator", "kind": "explicit", "finding_id": "f-1"},
+        target={"repo": "canary_real", "subsystem": "src"},
+        severity="low",
+    ))))
+    assert cli.main(["delegate"]) == 0
+
+    ledger = DelegationEmitter().ledger
+    rid = ledger.list_requests()[0]["request_id"]
+    transition(ledger, None, rid, "TRIAGED", actor="operator")
+    assert ledger.record_human_decision(rid, "operator", "approve", "fixture setup", f"token-{rid}")
+    transition(ledger, None, rid, "PLANNED", actor="operator")
+
+    # First: a real shadow tick via the CLI advances it to VALIDATED and
+    # records a shadow artifact. No PR client is ever constructed for this.
+    assert cli.main(["executor-shadow", "--request-id", rid]) == 0
+    capsys.readouterr()  # discard the shadow tick's stdout
+    assert ledger.get_request(rid)["state"] == "VALIDATED"
+    assert any(a["kind"] == "shadow" for a in ledger.artifacts_for(rid))
+
+    class _FakeGhPrClient:
+        def create_pr(self, **kwargs):
+            return {"number": 100, "url": "https://example.test/pr/100"}
+
+    monkeypatch.setattr(executor_mod, "GhPrClient", _FakeGhPrClient)
+
+    rc = cli.main(["executor-canary", "--i-understand-this-opens-a-real-pr", "--request-id", rid])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "mode=canary" in out
+    assert "processed=1" in out
+    assert "pr=https://example.test/pr/100" in out
+    assert ledger.get_request(rid)["state"] == "MERGE_PENDING"
 
 
 def test_gate_cli_records_shadow_decision_without_authority(queue_mode, allowlist_file, capsys, monkeypatch):

@@ -633,6 +633,140 @@ def test_title_with_newlines_and_control_chars_is_sanitized_in_commit_and_pr_tit
     assert "\x07" not in subject and "\x1b" not in subject
 
 
+def test_canary_resumes_a_shadow_validated_request_and_opens_one_pr(tmp_path):
+    # Headline flow (the bug this task fixes): a shadow tick advances a
+    # request to VALIDATED and records a `shadow` artifact; a SUBSEQUENT
+    # canary tick, designated at that same request_id, must be able to pick
+    # it back up, rebuild + revalidate, and open exactly one PR.
+    repo = _fixture_repo(tmp_path)
+    ledger, request = _planned_ledger(tmp_path)
+    allowlist = _allowlist(_target(repo, tmp_path, command=_write_source_command()))
+
+    shadow_result = run_executor_tick(ledger, allowlist, None)  # default mode="shadow"
+    assert shadow_result == {"processed": 1, "errors": 0, "skipped": 0}
+    assert ledger.get_request(request.request_id)["state"] == "VALIDATED"
+    assert any(item["kind"] == "shadow" for item in ledger.artifacts_for(request.request_id))
+
+    client = FakePrClient()
+    result = run_executor_tick(
+        ledger, allowlist, None, pr_client=client, mode="canary", request_id=request.request_id,
+    )
+
+    assert result == {"processed": 1, "errors": 0, "skipped": 0}
+    assert ledger.get_request(request.request_id)["state"] == "MERGE_PENDING"
+    assert len(client.calls) == 1  # exactly one PR opened
+    kinds = {item["kind"] for item in ledger.artifacts_for(request.request_id)}
+    assert {"pr", "pr_number"} <= kinds
+    prs = [item for item in ledger.artifacts_for(request.request_id) if item["kind"] == "pr"]
+    assert len(prs) == 1
+
+
+def test_canary_does_not_resume_a_validated_request_without_a_shadow_artifact(tmp_path):
+    # Fail-closed: VALIDATED alone is not proof of shadow verification. Force
+    # VALIDATED WITHOUT ever running a shadow tick (so no shadow artifact
+    # exists) and confirm canary refuses to touch it.
+    repo = _fixture_repo(tmp_path)
+    ledger, request = _planned_ledger(tmp_path)
+    transition(ledger, None, request.request_id, "BUILDING", actor="operator")
+    transition(ledger, None, request.request_id, "VALIDATED", actor="operator")
+    assert ledger.artifacts_for(request.request_id) == []
+
+    client = FakePrClient()
+    result = run_executor_tick(
+        ledger, _allowlist(_target(repo, tmp_path, command=_write_source_command())), None,
+        pr_client=client, mode="canary", request_id=request.request_id,
+    )
+
+    assert result == {"processed": 0, "errors": 0, "skipped": 0}
+    assert ledger.get_request(request.request_id)["state"] == "VALIDATED"
+    assert client.calls == []
+    assert ledger.lease_for_request(request.request_id) is None
+
+
+def test_shadow_mode_does_not_resume_a_shadow_verified_validated_request(tmp_path):
+    # Resume is canary-only: a shadow tick designated at a request that is
+    # already VALIDATED (with a shadow artifact from an earlier shadow tick)
+    # must be a safe no-op, never re-entering the pipeline.
+    repo = _fixture_repo(tmp_path)
+    ledger, request = _planned_ledger(tmp_path)
+    allowlist = _allowlist(_target(repo, tmp_path, command=_write_source_command()))
+
+    run_executor_tick(ledger, allowlist, None)  # shadow -> VALIDATED + shadow artifact
+    assert ledger.get_request(request.request_id)["state"] == "VALIDATED"
+
+    result = run_executor_tick(ledger, allowlist, None, request_id=request.request_id)  # shadow again
+
+    assert result == {"processed": 0, "errors": 0, "skipped": 0}
+    assert ledger.get_request(request.request_id)["state"] == "VALIDATED"
+
+
+def test_canary_without_request_id_does_not_resume_a_validated_request(tmp_path):
+    # Resume is designated-only: mode="canary" with request_id=None must
+    # never auto-select a VALIDATED (shadow-verified) row either, matching
+    # the existing PLANNED behavior asserted by
+    # test_canary_without_designated_request_id_is_a_safe_noop.
+    repo = _fixture_repo(tmp_path)
+    ledger, request = _planned_ledger(tmp_path)
+    allowlist = _allowlist(_target(repo, tmp_path, command=_write_source_command()))
+
+    run_executor_tick(ledger, allowlist, None)  # shadow -> VALIDATED + shadow artifact
+    assert ledger.get_request(request.request_id)["state"] == "VALIDATED"
+
+    result = run_executor_tick(ledger, allowlist, None, pr_client=FakePrClient(), mode="canary")
+
+    assert result == {"processed": 0, "errors": 0, "skipped": 0}
+    assert ledger.get_request(request.request_id)["state"] == "VALIDATED"
+
+
+def test_canary_resume_still_refused_when_pr_budget_exhausted(tmp_path):
+    # The durable per-window PR budget precheck applies identically on the
+    # resume path: an exhausted budget must refuse with no transition.
+    repo = _fixture_repo(tmp_path)
+    ledger, request = _planned_ledger(tmp_path)
+    allowlist = _allowlist(_target(repo, tmp_path, command=_write_source_command()))
+
+    run_executor_tick(ledger, allowlist, None)  # shadow -> VALIDATED + shadow artifact
+    assert ledger.get_request(request.request_id)["state"] == "VALIDATED"
+    ledger.add_artifact(request.request_id, "pr", "https://example.test/pr/already")  # spend budget of 1
+
+    client = FakePrClient()
+    result = run_executor_tick(
+        ledger, allowlist, None, pr_client=client, mode="canary", request_id=request.request_id,
+    )
+
+    assert result == {"processed": 0, "errors": 0, "skipped": 0}
+    assert ledger.get_request(request.request_id)["state"] == "VALIDATED"
+    assert client.calls == []
+
+
+def test_canary_resume_still_refuses_the_live_checkout(tmp_path, monkeypatch):
+    # The live-Hermes-checkout refusal in _validate_target_boundary applies
+    # identically on the resume path, and the request must land at FAILED
+    # (not stranded at VALIDATED with no failure record) with the resume
+    # never having (illegally) touched BUILDING first.
+    from events import paths
+
+    repo = _fixture_repo(tmp_path)
+    ledger, request = _planned_ledger(tmp_path)
+    allowlist = _allowlist(_target(repo, tmp_path, command=_write_source_command()))
+
+    run_executor_tick(ledger, allowlist, None)  # shadow -> VALIDATED + shadow artifact
+    assert ledger.get_request(request.request_id)["state"] == "VALIDATED"
+
+    monkeypatch.setattr(paths, "get_default_hermes_root", lambda: repo)
+
+    result = run_executor_tick(
+        ledger, allowlist, None, pr_client=FakePrClient(), mode="canary", request_id=request.request_id,
+    )
+
+    assert result["errors"] == 1
+    assert ledger.get_request(request.request_id)["state"] == "FAILED"
+    last_transition = ledger.transitions_for(request.request_id)[-1]
+    assert last_transition["to_state"] == "FAILED"
+    assert last_transition["from_state"] == "VALIDATED"
+    assert "refuses the live Hermes checkout" in (last_transition["evidence_ref"] or "")
+
+
 def test_diff_line_count_reflects_a_fully_deleted_tracked_file(tmp_path):
     # H3 regression: `git add -N` (intent-to-add) stages a full DELETION of
     # an already-tracked file, so a subsequent UNSTAGED `git diff --numstat`
