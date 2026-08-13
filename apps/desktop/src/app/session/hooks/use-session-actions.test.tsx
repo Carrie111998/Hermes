@@ -1028,6 +1028,41 @@ describe('resumeSession failure recovery', () => {
     expect($messages.get().length).toBeGreaterThan(0)
   })
 
+  it('explicitly resumes an archived session by id without restoring it to the sidebar cache', async () => {
+    vi.mocked(getSession).mockResolvedValueOnce(
+      storedSession({ archived: true, id: 'stored-1', message_count: 1, profile: 'default' })
+    )
+    vi.mocked(getLatestSessionMessages).mockResolvedValueOnce({ messages: [], session_id: 'stored-1' } as never)
+
+    vi.mocked(requestGatewayForProfile).mockImplementation(async (_profile: string, method: string) => {
+      if (method === 'session.resume') {
+        return {
+          info: {},
+          message_count: 1,
+          messages: [],
+          resumed: 'stored-1',
+          session_id: 'runtime-1',
+          session_key: 'stored-1'
+        } as never
+      }
+
+      return {} as never
+    })
+    const requestGateway = vi.fn(async () => ({}) as never)
+
+    await runResume(requestGateway)
+
+    expect(requestGatewayForProfile).toHaveBeenCalledWith(
+      'default',
+      'session.resume',
+      expect.objectContaining({ session_id: 'stored-1', source: 'desktop' }),
+      undefined,
+      undefined
+    )
+    expect(requestGateway).not.toHaveBeenCalled()
+    expect($sessions.get()).toEqual([])
+  })
+
   it('preserves an optimistic user message during a same-session reconnect', async () => {
     setMessages([
       {
