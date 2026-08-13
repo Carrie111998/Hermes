@@ -7,26 +7,34 @@ mixin-first so ``DiscordAdapter.<method> is DiscordMediaSendMixin.<method>``.
 """
 
 import asyncio
-import io
 import logging
+import sys
 from typing import Any, Dict, Optional
 
 from gateway.platforms.base import SendResult
-from tools.url_safety import is_safe_url
-
-try:
-    import discord
-    from discord import Message as DiscordMessage, Intents
-    from discord.ext import commands
-except ImportError:
-    discord = None
-    DiscordMessage = Any
-    Intents = Any
-    commands = None
 
 # Bound to the adapter's logger name so log records keep their identity
 # (same trick as PR #75735's authz_mixin).
 logger = logging.getLogger("plugins.platforms.discord.adapter")
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve patchable Discord dependencies through adapter.py lazily.
+
+    The adapter remains the default runtime owner. Access through this module
+    is intentional: existing monkeypatch consumers can assign
+    ``media_send_mixin.discord`` or ``media_send_mixin.is_safe_url`` and the
+    methods below observe that exact patched namespace.
+    """
+    if name in {"discord", "is_safe_url"}:
+        from . import adapter
+
+        return getattr(adapter, name)
+    raise AttributeError(name)
+
+
+def _patchable_dependency(name: str) -> Any:
+    return getattr(sys.modules[__name__], name)
 
 
 class DiscordMediaSendMixin:
@@ -56,6 +64,9 @@ class DiscordMediaSendMixin:
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an image natively as a Discord file attachment."""
+        discord = _patchable_dependency("discord")
+        is_safe_url = _patchable_dependency("is_safe_url")
+
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
@@ -120,7 +131,7 @@ class DiscordMediaSendMixin:
                 self.name,
                 exc_info=True,
             )
-            return await super().send_image(chat_id, image_url, caption, reply_to)
+            return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error(
                 "[%s] Failed to send image attachment, falling back to URL: %s",
@@ -128,7 +139,7 @@ class DiscordMediaSendMixin:
                 e,
                 exc_info=True,
             )
-            return await super().send_image(chat_id, image_url, caption, reply_to)
+            return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
 
     async def send_animation(
         self,
@@ -139,6 +150,9 @@ class DiscordMediaSendMixin:
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an animated GIF natively as a Discord file attachment."""
+        discord = _patchable_dependency("discord")
+        is_safe_url = _patchable_dependency("is_safe_url")
+
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
@@ -251,6 +265,8 @@ class DiscordMediaSendMixin:
         default), and continues — it does NOT die on a single rate-limit
         hit.  Only CancelledError (from stop_typing) stops the loop.
         """
+        discord = _patchable_dependency("discord")
+
         if not self._client:
             return
         # Don't start a duplicate loop

@@ -8,8 +8,6 @@ generic fallback), and the mocked-discord import path.
 """
 
 import asyncio
-import subprocess
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -216,26 +214,16 @@ async def test_stop_typing_unknown_chat_is_noop():
 # --- mocked-discord import path ---------------------------------------------
 
 
-def test_mixin_imports_with_mocked_discord():
-    """sys.modules['discord'] mocked -> mixin must still import and bind it."""
-    root = Path(__file__).resolve().parents[3]
-    code = (
-        "import sys\n"
-        "from unittest.mock import MagicMock\n"
-        "discord_mod = MagicMock()\n"
-        "sys.modules['discord'] = discord_mod\n"
-        "sys.modules['discord.ext'] = MagicMock()\n"
-        "sys.modules['discord.ext.commands'] = MagicMock()\n"
-        "import plugins.platforms.discord.media_send_mixin as mix\n"
-        "assert mix.discord is discord_mod\n"
-        "assert mix.DiscordMediaSendMixin is not None\n"
-        "print('MOCKED-DISCORD-IMPORT-OK')\n"
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert "MOCKED-DISCORD-IMPORT-OK" in result.stdout, result.stderr
+def test_mixin_patch_surface_defaults_to_adapter_owned_dependencies():
+    """The original namespace stays patchable without copying authority."""
+    assert mixin_mod.discord is adapter_mod.discord
+    assert mixin_mod.is_safe_url is adapter_mod.is_safe_url
+
+
+def test_mixin_patch_surface_overrides_adapter_defaults(monkeypatch):
+    fake_discord = object()
+    fake_url_guard = object()
+    monkeypatch.setattr(mixin_mod, "discord", fake_discord)
+    monkeypatch.setattr(mixin_mod, "is_safe_url", fake_url_guard)
+    assert mixin_mod._patchable_dependency("discord") is fake_discord
+    assert mixin_mod._patchable_dependency("is_safe_url") is fake_url_guard
