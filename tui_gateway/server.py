@@ -258,7 +258,12 @@ _LONG_HANDLERS = frozenset(
         "profiles.describe",
         "profiles.get_asset",
         "profiles.list",
+        "profiles.peer_call",
+        "profiles.peer_fanout",
         "profiles.set_asset",
+        "profiles.team_delete",
+        "profiles.team_list",
+        "profiles.team_upsert",
         # image.generate is a multi-second remote API round-trip.
         "image.generate",
         "projects.discover_repos",

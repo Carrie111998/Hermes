@@ -1601,7 +1601,7 @@ print('fake reply')
         hermes.chmod(0o755)
         monkeypatch.setenv("PATH", str(fakebin) + os.pathsep + os.environ.get("PATH", ""))
         monkeypatch.setenv("FAKE_HERMES_CALLS", str(calls))
-        monkeypatch.setattr("plugins.platforms.a2a.adapter._profile_home", lambda profile: str(profile_home))
+        monkeypatch.setattr("hermes_cli.profile_peer._profile_home", lambda profile: str(profile_home))
 
         adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
             "agents": {"dev": {"profile": "dev", "tenant": "dev", "timeout": 5}}
@@ -1617,4 +1617,5 @@ print('fake reply')
         con = sqlite3.connect(db)
         title = con.execute("SELECT title FROM sessions WHERE id='sess-1'").fetchone()[0]
         con.close()
-        assert title == "a2a-dev-ctx-unsafe-value"
+        assert title.startswith("a2a-dev-ctx-unsafe-value-")
+        assert len(title.rsplit("-", 1)[-1]) == 12
