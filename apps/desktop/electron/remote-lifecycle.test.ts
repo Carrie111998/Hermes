@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFile as execFileCallback, spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { chmod, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -462,20 +462,15 @@ test.runIf(process.platform !== 'win32')('pidIsOurDashboard accepts a canonical 
   let child: ReturnType<typeof spawn> | null = null
 
   try {
-    try {
-      await execFile('uv', ['venv', venvPath, '--no-project'])
-    } catch (error: any) {
-      if (error?.code !== 'ENOENT') {
-        throw error
-      }
-
-      await execFile('python3', ['-m', 'venv', venvPath])
-
-      // Python's venv may copy on some systems; keep the regression shaped like
-      // uv's normal bin/python symlink in that fallback environment.
-      await rm(pythonPath, { force: true })
-      await symlink(process.execPath, pythonPath)
-    }
+    const { stdout: pythonExecutable } = await execFile('python3', [
+      '-c',
+      'import os,sys;print(os.path.realpath(sys.executable))'
+    ])
+    const ownedPython = join(directory, 'python')
+    await copyFile(pythonExecutable.trim(), ownedPython)
+    await chmod(ownedPython, 0o700)
+    await mkdir(join(venvPath, 'bin'), { recursive: true })
+    await symlink(ownedPython, pythonPath)
 
     await writeFile(entrypoint, 'import time\nprint("READY", flush=True)\ntime.sleep(30)\n')
     await chmod(entrypoint, 0o700)
