@@ -2032,43 +2032,23 @@ def _profile_runtime_scope(profile_home: "Path"):
     home_token = set_hermes_home_override(str(profile_home))
     hydrate_profile_secret_sources(Path(profile_home))
     secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+    try:
+        from hermes_cli.config import apply_terminal_config_to_env, load_config
 
-    # The terminal backend is environment-driven, while multiplexed profiles
-    # resolve config through the profile-home context above.  Bridge the active
-    # profile's terminal settings before constructing tools, and restore the
-    # process environment when the turn ends.  Without this, the first profile
-    # that initialized terminal_tool's one-shot bridge won globally; a routed
-    # profile could consequently execute on the host despite terminal.backend:
-    # docker in its own config.
-    _terminal_env_names = (
-        "TERMINAL_ENV", "TERMINAL_HOME_MODE", "TERMINAL_CWD",
-        "TERMINAL_TIMEOUT", "TERMINAL_DOCKER_FORWARD_ENV",
-        "TERMINAL_DOCKER_VOLUMES", "TERMINAL_DOCKER_ENV",
-        "TERMINAL_DOCKER_EXTRA_ARGS", "TERMINAL_DOCKER_IMAGE",
-        "TERMINAL_CONTAINER_CPU", "TERMINAL_CONTAINER_MEMORY",
-        "TERMINAL_CONTAINER_DISK", "TERMINAL_CONTAINER_PERSISTENT",
-        "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "TERMINAL_DOCKER_NETWORK",
-        "TERMINAL_DOCKER_RUN_AS_HOST_USER", "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
-        "TERMINAL_DOCKER_SHM_SIZE", "TERMINAL_DOCKER_ORPHAN_REAPER",
-        "TERMINAL_PERSISTENT_SHELL",
-    )
-    _terminal_env_snapshot = {
-        _name: os.environ.get(_name)
-        for _name in _terminal_env_names
-    }
-    try:
-        from hermes_cli.config import apply_terminal_config_to_env
-        apply_terminal_config_to_env(env=os.environ, override=True)
+        terminal_env = apply_terminal_config_to_env(
+            env={}, config=load_config(), override=True
+        )
+        terminal_env["__profile_key"] = str(profile_home)
     except Exception:
-        logger.debug("profile terminal config bridge failed", exc_info=True)
+        logger.exception("profile terminal config scope failed")
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+        raise
     try:
-        yield
+        from tools.terminal_tool import terminal_config_scope
+        with terminal_config_scope(terminal_env):
+            yield
     finally:
-        for _name, _value in _terminal_env_snapshot.items():
-            if _value is None:
-                os.environ.pop(_name, None)
-            else:
-                os.environ[_name] = _value
         reset_secret_scope(secret_token)
         reset_hermes_home_override(home_token)
 
