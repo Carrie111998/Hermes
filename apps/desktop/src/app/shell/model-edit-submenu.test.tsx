@@ -111,6 +111,23 @@ describe('ModelEditSubmenu reports edits without performing them', () => {
     expect(onSetOptions).toHaveBeenCalledWith({ effort: 'high' })
   })
 
+  it('thinking: toggling on replaces an unsupported default with a supported level', () => {
+    const onSetOptions = vi.fn()
+    renderSubmenu({
+      defaultEffort: 'medium',
+      effort: 'none',
+      fastControl: { kind: 'none' },
+      onSetOptions,
+      reasoning: true,
+      reasoningEfforts: ['low', 'high', 'max'],
+      reasoningToggle: true
+    })
+
+    fireEvent.click(screen.getByRole('switch'))
+
+    expect(onSetOptions).toHaveBeenCalledWith({ effort: 'low' })
+  })
+
   it('variant fast: swaps the model only when the row is active', () => {
     const onSelectModel = vi.fn()
     const onSetOptions = vi.fn()

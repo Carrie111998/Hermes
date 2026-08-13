@@ -117,6 +117,8 @@ function ModelEditSubmenuBody({
   const thinkingOn = isThinkingEnabled(effort, defaultEffort)
   const effortValues = supportedReasoningEfforts(reasoningEfforts)
   const canToggleReasoning = reasoning && reasoningToggle !== false
+  const preferredEnabledEffort = effortValue || resolveReasoningEffort(defaultEffort)
+  const enabledEffort = effortValues.find(value => value === preferredEnabledEffort) ?? effortValues[0]
 
   const setFast = (enabled: boolean) => {
     if (fastControl.kind === 'variant') {
@@ -151,7 +153,7 @@ function ModelEditSubmenuBody({
           <Switch
             checked={thinkingOn}
             className="ml-auto"
-            onCheckedChange={checked => onSetOptions({ effort: checked ? effortValue || defaultEffort : 'none' })}
+            onCheckedChange={checked => onSetOptions({ effort: checked ? enabledEffort : 'none' })}
             size="xs"
           />
         </DropdownMenuItem>
