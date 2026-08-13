@@ -10,7 +10,7 @@
  * thumbnail is downscaled.
  *
  * @param dataUrl  The full-resolution data URL (data:image/...;base64,...)
- * @param maxLongEdge  Maximum pixel dimension on the longest side (default 2048)
+ * @param maxLongEdge  Maximum pixel dimension on the longest side (default 512)
  * @returns  A downscaled data URL (PNG), the original if already small enough,
  *           or a 1×1 transparent PNG placeholder if downscaling fails.
  */
@@ -19,9 +19,16 @@
 const FALLBACK_PLACEHOLDER =
   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+GkZcAAAAASUVORK5CYII='
 
+// Composer pills render at 32 CSS pixels; a 512px source stays sharp on
+// high-density displays while keeping a square RGBA decode at ~1 MiB. A 2048px
+// thumbnail decodes to 16,777,216 bytes — 64 bytes above Chromium's PaintOp
+// serialization limit (16,777,152) — which reproduces the renderer crash seen
+// with multi-image attaches (see issue #41169 follow-up).
+const DEFAULT_MAX_LONG_EDGE = 512
+
 export async function downscaleDataUrlForPreview(
   dataUrl: string,
-  maxLongEdge = 2048
+  maxLongEdge = DEFAULT_MAX_LONG_EDGE
 ): Promise<string> {
   // Guard: createImageBitmap and OffscreenCanvas are not available in jsdom
   // (test environment) or very old Chromium builds. Return the original if missing.

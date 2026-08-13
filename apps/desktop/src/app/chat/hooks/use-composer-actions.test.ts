@@ -305,7 +305,7 @@ describe('attachImagePath thumbnail separation', () => {
     // original (which would re-introduce the main-thread decode freeze).
     expect(attachment?.thumbnailUrl).toBeDefined()
     expect(attachment?.thumbnailUrl).not.toBe(FULL_RES)
-    expect(drawImage).toHaveBeenCalledWith(expect.anything(), 0, 0, 2048, 1536)
+    expect(drawImage).toHaveBeenCalledWith(expect.anything(), 0, 0, 512, 384)
     expect(close).toHaveBeenCalled()
   })
 

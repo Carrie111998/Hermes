@@ -83,10 +83,10 @@ describe('downscaleDataUrlForPreview', () => {
       // so the function falls through to the fallback placeholder. But the
       // important thing is that drawImage was called with scaled dimensions
       // and the bitmap was closed.
-      const result = await downscaleDataUrlForPreview(TINY_PNG_DATA_URL, 2048)
+      const result = await downscaleDataUrlForPreview(TINY_PNG_DATA_URL)
 
-      // scale = 2048 / 4000 = 0.512 → width=2048, height=1536
-      expect(drawImage).toHaveBeenCalledWith(expect.anything(), 0, 0, 2048, 1536)
+      // scale = 512 / 4000 = 0.128 → width=512, height=384
+      expect(drawImage).toHaveBeenCalledWith(expect.anything(), 0, 0, 512, 384)
       expect(close).toHaveBeenCalled()
 
       // Result should be the downscaled data URL (from our mocked blob),

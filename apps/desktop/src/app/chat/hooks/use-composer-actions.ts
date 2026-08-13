@@ -5,7 +5,7 @@ import { droppedFileInlineRef } from '@/app/chat/composer/inline-refs'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { useI18n } from '@/i18n'
 import { attachmentId, contextPath, pathLabel } from '@/lib/chat-runtime'
-import { readDesktopFileDataUrl, selectDesktopPaths } from '@/lib/desktop-fs'
+import { readDesktopFileDataUrlLocalFirst, selectDesktopPaths } from '@/lib/desktop-fs'
 import { desktopGit } from '@/lib/desktop-git'
 import { downscaleDataUrlForPreview } from '@/lib/image-resize'
 import { normalize } from '@/lib/text'
@@ -53,22 +53,7 @@ export function isImagePath(filePath: string): boolean {
  * In local mode the facade IS the local bridge, so this stays a single read.
  */
 export async function attachmentPreviewDataUrl(filePath: string): Promise<string> {
-  let dataUrl: string
-
-  try {
-    const local = await window.hermesDesktop?.readFileDataUrl?.(filePath)
-
-    if (local) {
-      dataUrl = local
-    } else {
-      dataUrl = await readDesktopFileDataUrl(filePath)
-    }
-  } catch {
-    // Not on this machine (or unreadable locally) — try the gateway.
-    dataUrl = await readDesktopFileDataUrl(filePath)
-  }
-
-  return dataUrl
+  return readDesktopFileDataUrlLocalFirst(filePath)
 }
 
 export interface DroppedFile {
