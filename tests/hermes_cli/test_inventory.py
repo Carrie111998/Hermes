@@ -84,6 +84,36 @@ def _nous_row(model: str = "openai/gpt-5.5") -> dict:
     }
 
 
+def test_capabilities_include_exact_reasoning_controls_when_known():
+    ctx = _empty_ctx(provider="deepseek", model="deepseek-v4-flash")
+    row = {
+        "slug": "deepseek",
+        "name": "DeepSeek",
+        "models": ["deepseek-v4-flash", "future-model"],
+    }
+
+    class KnownCaps:
+        supports_reasoning = True
+        reasoning_efforts = ("low", "high", "max")
+        reasoning_toggle = True
+
+    with _list_auth_returning([row]), patch(
+        "agent.models_dev.get_model_capabilities",
+        side_effect=lambda _provider, model: KnownCaps() if model == "deepseek-v4-flash" else None,
+    ), patch("hermes_cli.models.model_supports_fast_mode", return_value=False):
+        payload = build_models_payload(ctx, capabilities=True)
+
+    provider = next(row for row in payload["providers"] if row["slug"] == "deepseek")
+    capabilities = provider["capabilities"]
+    assert capabilities["deepseek-v4-flash"] == {
+        "fast": False,
+        "reasoning": True,
+        "reasoning_efforts": ["low", "high", "max"],
+        "reasoning_toggle": True,
+    }
+    assert capabilities["future-model"] == {"fast": False, "reasoning": True}
+
+
 
 
 def test_cli_model_picker_forwards_force_refresh_to_probe_flags():

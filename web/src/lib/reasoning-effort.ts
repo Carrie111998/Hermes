@@ -29,6 +29,23 @@ export const VALID_EFFORTS: ReadonlySet<string> = new Set(
   EFFORT_OPTIONS.map((o) => o.value),
 );
 
+export function effortOptionsForModel(
+  efforts?: readonly string[],
+  toggle?: boolean,
+): ReadonlyArray<EffortOption> {
+  if (efforts === undefined) return EFFORT_OPTIONS;
+
+  const allowed = new Set(efforts.map((value) => value.trim().toLowerCase()));
+  const result = EFFORT_OPTIONS.filter(
+    (option) => option.value !== "none" && allowed.has(option.value),
+  );
+  if (result.length === 0) {
+    result.push(EFFORT_OPTIONS.find((option) => option.value === "medium")!);
+  }
+  if (toggle) result.unshift(EFFORT_OPTIONS[0]);
+  return result;
+}
+
 /** Normalize a raw `agent.reasoning_effort` config value to a selectable
  *  option. Empty/unknown → `medium` (Hermes' default when unset). */
 export function normalizeEffort(raw: unknown): string {

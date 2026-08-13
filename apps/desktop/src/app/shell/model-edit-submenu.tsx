@@ -10,7 +10,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Switch } from '@/components/ui/switch'
 import { useI18n } from '@/i18n'
-import { isThinkingEnabled, REASONING_EFFORTS, resolveReasoningEffort } from '@/lib/reasoning-effort'
+import { isThinkingEnabled, resolveReasoningEffort, supportedReasoningEfforts } from '@/lib/reasoning-effort'
 
 // Hermes' real reasoning levels live in lib/reasoning-effort; `none` is owned
 // by the Thinking toggle, not the radio.
@@ -82,6 +82,8 @@ interface ModelEditSubmenuProps {
   provider: string
   /** Whether this model supports reasoning effort. */
   reasoning: boolean
+  reasoningEfforts?: string[]
+  reasoningToggle?: boolean
 }
 
 export function ModelEditSubmenu(props: ModelEditSubmenuProps) {
@@ -104,13 +106,19 @@ function ModelEditSubmenuBody({
   isActive,
   onSelectModel,
   onSetOptions,
-  reasoning
+  reasoning,
+  reasoningEfforts,
+  reasoningToggle
 }: ModelEditSubmenuProps) {
   const { t } = useI18n()
   const copy = t.shell.modelOptions
 
   const effortValue = resolveReasoningEffort(effort, defaultEffort)
   const thinkingOn = isThinkingEnabled(effort, defaultEffort)
+  const effortValues = supportedReasoningEfforts(reasoningEfforts)
+  const canToggleReasoning = reasoning && reasoningToggle !== false
+  const preferredEnabledEffort = effortValue || resolveReasoningEffort(defaultEffort)
+  const enabledEffort = effortValues.find(value => value === preferredEnabledEffort) ?? effortValues[0]
 
   const setFast = (enabled: boolean) => {
     if (fastControl.kind === 'variant') {
@@ -139,13 +147,13 @@ function ModelEditSubmenuBody({
   ) : (
     <>
       <DropdownMenuLabel className={dropdownMenuSectionLabel}>{copy.options}</DropdownMenuLabel>
-      {reasoning ? (
+      {canToggleReasoning ? (
         <DropdownMenuItem className={dropdownMenuRow} onSelect={event => event.preventDefault()}>
           {copy.thinking}
           <Switch
             checked={thinkingOn}
             className="ml-auto"
-            onCheckedChange={checked => onSetOptions({ effort: checked ? effortValue || defaultEffort : 'none' })}
+            onCheckedChange={checked => onSetOptions({ effort: checked ? enabledEffort : 'none' })}
             size="xs"
           />
         </DropdownMenuItem>
@@ -160,8 +168,8 @@ function ModelEditSubmenuBody({
         <>
           <DropdownMenuSeparator className="mx-0" />
           <DropdownMenuLabel className={dropdownMenuSectionLabel}>{copy.effort}</DropdownMenuLabel>
-          <DropdownMenuRadioGroup onValueChange={value => onSetOptions({ effort: value })} value={effortValue}>
-            {REASONING_EFFORTS.map(value => (
+          <DropdownMenuRadioGroup onValueChange={value => onSetOptions({ effort: value })} value={enabledEffort}>
+            {effortValues.map(value => (
               <DropdownMenuRadioItem
                 className={dropdownMenuRow}
                 key={value}

@@ -423,6 +423,8 @@ export interface ModelOptionProvider {
 export interface ModelCapabilities {
   fast: boolean
   reasoning: boolean
+  reasoning_efforts?: string[]
+  reasoning_toggle?: boolean
 }
 
 export interface ModelOptionsResponse {

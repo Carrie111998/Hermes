@@ -31,6 +31,8 @@ function renderSubmenu(opts: {
   onSelectModel?: (model: string) => void
   onSetOptions: (patch: { effort?: string; fast?: boolean }) => void
   reasoning: boolean
+  reasoningEfforts?: string[]
+  reasoningToggle?: boolean
 }) {
   return render(
     <DropdownMenu open>
@@ -47,6 +49,8 @@ function renderSubmenu(opts: {
             onSetOptions={opts.onSetOptions}
             provider="p1"
             reasoning={opts.reasoning}
+            reasoningEfforts={opts.reasoningEfforts}
+            reasoningToggle={opts.reasoningToggle}
           />
         </DropdownMenuSub>
       </DropdownMenuContent>
@@ -79,6 +83,21 @@ describe('ModelEditSubmenu reports edits without performing them', () => {
     expect(onSetOptions).toHaveBeenCalledWith({ effort: 'none' })
   })
 
+  it('shows only supported effort rows and omits an unsupported Off toggle', () => {
+    renderSubmenu({
+      fastControl: { kind: 'none' },
+      onSetOptions: vi.fn(),
+      reasoning: true,
+      reasoningEfforts: ['low', 'high', 'max'],
+      reasoningToggle: false
+    })
+
+    expect(screen.queryByRole('switch')).toBeNull()
+    const rows = screen.getAllByRole('menuitemradio')
+    expect(rows.map(row => row.textContent)).toEqual(['Low', 'High', 'Max'])
+    expect(rows[0].getAttribute('aria-checked')).toBe('true')
+  })
+
   it('thinking: toggling back on restores the row level, not the hardcoded default', () => {
     const onSetOptions = vi.fn()
     renderSubmenu({
@@ -92,6 +111,23 @@ describe('ModelEditSubmenu reports edits without performing them', () => {
     fireEvent.click(screen.getByRole('switch'))
 
     expect(onSetOptions).toHaveBeenCalledWith({ effort: 'high' })
+  })
+
+  it('thinking: toggling on replaces an unsupported default with a supported level', () => {
+    const onSetOptions = vi.fn()
+    renderSubmenu({
+      defaultEffort: 'medium',
+      effort: 'none',
+      fastControl: { kind: 'none' },
+      onSetOptions,
+      reasoning: true,
+      reasoningEfforts: ['low', 'high', 'max'],
+      reasoningToggle: true
+    })
+
+    fireEvent.click(screen.getByRole('switch'))
+
+    expect(onSetOptions).toHaveBeenCalledWith({ effort: 'low' })
   })
 
   it('variant fast: swaps the model only when the row is active', () => {

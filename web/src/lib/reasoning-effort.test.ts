@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   EFFORT_OPTIONS,
   VALID_EFFORTS,
+  effortOptionsForModel,
   normalizeEffort,
 } from "./reasoning-effort";
 
@@ -43,5 +44,22 @@ describe("EFFORT_OPTIONS", () => {
     for (const level of ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]) {
       expect(values.has(level)).toBe(true);
     }
+  });
+});
+
+describe("effortOptionsForModel", () => {
+  it("filters to model-supported levels and includes Off only for toggles", () => {
+    expect(effortOptionsForModel(["low", "high", "max"], true).map((o) => o.value))
+      .toEqual(["none", "low", "high", "max"]);
+    expect(effortOptionsForModel(["low", "high"], false).map((o) => o.value))
+      .toEqual(["low", "high"]);
+  });
+
+  it("uses one canonical on level for binary reasoning", () => {
+    expect(effortOptionsForModel([], true).map((o) => o.value)).toEqual(["none", "medium"]);
+  });
+
+  it("keeps the conservative full-scale fallback when metadata is unknown", () => {
+    expect(effortOptionsForModel(undefined, undefined)).toBe(EFFORT_OPTIONS);
   });
 });
