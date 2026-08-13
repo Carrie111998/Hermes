@@ -1748,5 +1748,185 @@ class TestFallbackModelInheritance(unittest.TestCase):
         self.assertIsNone(kwargs["fallback_model"])
 
 
+class TestSubagentStopReasonContract(unittest.TestCase):
+    """Never-reject structured child results: {output, stop_reason}.
+
+    Mirrors the deepseek-harness SubagentResult contract
+    (packages/subagent/subagent/src/types.ts): a failed child settles into a
+    structured entry carrying stop_reason plus its preserved partial text,
+    instead of breaking the parent turn or silently dropping the child's
+    output.  The readable text stays in `summary`; `stop_reason` and
+    `partial_output` are additive fields.
+    """
+
+    def _run_child(self, run_conversation_return, child=None, parent=None):
+        from tools.delegate_tool import _run_single_child
+
+        child = child or MagicMock()
+        child.run_conversation.return_value = run_conversation_return
+        return _run_single_child(
+            task_index=0,
+            goal="stop-reason test",
+            child=child,
+            parent_agent=parent or _make_mock_parent(depth=0),
+        )
+
+    def test_success_maps_to_completed_and_keeps_existing_fields(self):
+        """Success keeps the previous contract (status/summary/exit_reason)
+        and gains stop_reason='completed'; no partial_output is emitted."""
+        entry = self._run_child(
+            {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+        )
+        self.assertEqual(entry["status"], "completed")
+        self.assertEqual(entry["exit_reason"], "completed")
+        self.assertEqual(entry["stop_reason"], "completed")
+        self.assertEqual(entry["summary"], "done")
+        self.assertNotIn("partial_output", entry)
+
+    def test_child_error_preserves_partial_text(self):
+        """A failing child (failed=True, empty final_response) maps to
+        stop_reason='error' and keeps its last real assistant text."""
+        entry = self._run_child(
+            {
+                "final_response": "",
+                "completed": False,
+                "interrupted": False,
+                "failed": True,
+                "error": "model exploded",
+                "api_calls": 2,
+                "messages": [
+                    {"role": "user", "content": "task"},
+                    {"role": "assistant", "content": "I started working on it and"},
+                ],
+            }
+        )
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["stop_reason"], "error")
+        self.assertEqual(entry["error"], "model exploded")
+        self.assertEqual(entry["partial_output"], "I started working on it and")
+
+    def test_interrupted_maps_to_aborted(self):
+        """User/parent cancellation maps to stop_reason='aborted'."""
+        entry = self._run_child(
+            {
+                "final_response": "partial answer before stop",
+                "completed": False,
+                "interrupted": True,
+                "api_calls": 1,
+                "messages": [],
+            }
+        )
+        self.assertEqual(entry["status"], "interrupted")
+        self.assertEqual(entry["exit_reason"], "interrupted")
+        self.assertEqual(entry["stop_reason"], "aborted")
+        # summary already carries the text — no duplicate partial_output.
+        self.assertNotIn("partial_output", entry)
+
+    def test_interrupted_with_dropped_text_sets_partial_output(self):
+        """Interrupted with an empty summary still surfaces the partial text."""
+        entry = self._run_child(
+            {
+                "final_response": "",
+                "completed": False,
+                "interrupted": True,
+                "api_calls": 1,
+                "messages": [{"role": "assistant", "content": "work in progress..."}],
+            }
+        )
+        self.assertEqual(entry["stop_reason"], "aborted")
+        self.assertEqual(entry["partial_output"], "work in progress...")
+
+    def test_max_tokens_sentinel_maps_to_max_tokens_with_partial_text(self):
+        """Output-length truncation maps to stop_reason='max-tokens'; the
+        sentinel summary is not real content, so the real partial text is
+        preserved in partial_output."""
+        entry = self._run_child(
+            {
+                "final_response": "Response truncated due to output length limit",
+                "completed": False,
+                "interrupted": False,
+                "partial": True,
+                "error": "Response truncated due to output length limit",
+                "api_calls": 1,
+                "messages": [{"role": "assistant", "content": "half of the answer"}],
+            }
+        )
+        self.assertEqual(entry["stop_reason"], "max-tokens")
+        self.assertEqual(
+            entry["summary"], "Response truncated due to output length limit"
+        )
+        self.assertEqual(entry["partial_output"], "half of the answer")
+
+    def test_max_iterations_with_real_text_maps_to_max_tokens(self):
+        """completed=False with real text means the run ended on its
+        iteration/token budget: stop_reason='max-tokens'."""
+        entry = self._run_child(
+            {
+                "final_response": "mostly done but ran out of iterations",
+                "completed": False,
+                "interrupted": False,
+                "api_calls": 10,
+                "messages": [],
+            }
+        )
+        self.assertEqual(entry["exit_reason"], "max_iterations")
+        self.assertEqual(entry["stop_reason"], "max-tokens")
+        # summary carries the text — no duplicate partial_output.
+        self.assertNotIn("partial_output", entry)
+
+    def test_empty_sentinel_maps_to_error(self):
+        """The run_agent.py '(empty)' sentinel (empty-LLM retries) is a
+        transport failure, not a token ceiling: stop_reason='error'."""
+        entry = self._run_child(
+            {
+                "final_response": "(empty)",
+                "completed": False,
+                "interrupted": False,
+                "error": "empty LLM responses",
+                "api_calls": 3,
+                "messages": [],
+            }
+        )
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["stop_reason"], "error")
+
+    def test_timeout_maps_to_error_and_preserves_partial_text(self):
+        """A timed-out child never breaks the turn: the entry carries
+        stop_reason='error' (closest available value; status='timeout'
+        retains the finer distinction) and the partial text captured from the
+        abandoned child's session."""
+        from tools import delegate_tool
+
+        child = MagicMock()
+        child._session_messages = [
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "partial before timeout"},
+        ]
+        child.run_conversation.side_effect = lambda **kw: time.sleep(10)
+        child.get_activity_summary.return_value = {
+            "api_call_count": 1,
+            "max_iterations": 30,
+            "current_tool": None,
+            "last_activity_ts": time.time(),
+        }
+        with patch("tools.delegate_tool._get_child_timeout", return_value=0.1):
+            entry = delegate_tool._run_single_child(
+                task_index=0,
+                goal="timeout test",
+                child=child,
+                parent_agent=_make_mock_parent(depth=0),
+            )
+        self.assertEqual(entry["status"], "timeout")
+        self.assertEqual(entry["stop_reason"], "error")
+        self.assertIsNone(entry["summary"])
+        self.assertEqual(entry["partial_output"], "partial before timeout")
+
+
 if __name__ == "__main__":
     unittest.main()

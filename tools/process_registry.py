@@ -2743,11 +2743,21 @@ def _format_async_delegation(evt: dict) -> str:
                 lines.append("Partial output:")
                 lines.append(r_summary)
             else:
-                lines.append(
-                    f"(no summary — status={r_status}"
-                    + (f": {r_error}" if r_error else "")
-                    + ")"
-                )
+                r_partial = r.get("partial_output")
+                if r_partial:
+                    lines.append(
+                        f"(status={r_status}"
+                        + (f": {r_error}" if r_error else "")
+                        + ")"
+                    )
+                    lines.append("Partial output (before the run ended):")
+                    lines.append(r_partial)
+                else:
+                    lines.append(
+                        f"(no summary — status={r_status}"
+                        + (f": {r_error}" if r_error else "")
+                        + ")"
+                    )
             r_live = r.get("live_transcript")
             if r_live:
                 lines.append(
@@ -2775,7 +2785,10 @@ def _format_async_delegation(evt: dict) -> str:
     if toolsets:
         lines.append(f"Toolsets: {', '.join(toolsets)}")
     lines.append(f"Role: {role}   Model: {model}")
-    lines.append(f"Status: {status}   API calls: {api_calls}   Duration: {duration}s")
+    status_line = f"Status: {status}   API calls: {api_calls}   Duration: {duration}s"
+    if evt.get("stop_reason"):
+        status_line += f"   Stop reason: {evt['stop_reason']}"
+    lines.append(status_line)
     lines.append("--- RESULT ---")
     if status in ("completed", "success") and summary:
         lines.append(summary)
@@ -2787,6 +2800,9 @@ def _format_async_delegation(evt: dict) -> str:
         if summary:
             lines.append("Partial output:")
             lines.append(summary)
+        elif evt.get("partial_output"):
+            lines.append("Partial output (before the run ended):")
+            lines.append(evt["partial_output"])
     else:
         # error / timeout / failed
         lines.append(
@@ -2796,6 +2812,9 @@ def _format_async_delegation(evt: dict) -> str:
         if summary:
             lines.append("Partial output:")
             lines.append(summary)
+        elif evt.get("partial_output"):
+            lines.append("Partial output (before the run ended):")
+            lines.append(evt["partial_output"])
     return "\n".join(lines)
 
 
