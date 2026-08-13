@@ -1470,7 +1470,17 @@ def estimate_usage_cost(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    billing_time: Optional[datetime] = None,
 ) -> CostResult:
+    """Estimate the USD cost of a usage record for a model+route.
+
+    ``billing_time`` prices a historical moment instead of the call time —
+    used by insights re-estimation of past sessions so DeepSeek's
+    peak/off-peak rate is selected by when the tokens were consumed. It
+    must be timezone-aware (naive datetimes raise ValueError) and is
+    normalized to UTC before hour selection. Default (None) prices at
+    call time via ``_UTC_NOW()``, which is correct for live callers.
+    """
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
     if route.billing_mode == "subscription_included":
         return CostResult(
@@ -1490,10 +1500,17 @@ def estimate_usage_cost(
     # Before the switchover the legacy flat card applies; after it, the
     # snapshot's off-peak rates bill at 2x during peak hours
     # (01:00-04:00 and 06:00-10:00 UTC). The rate is selected at call time
-    # (post-request), matching DeepSeek's per-request timestamp billing.
+    # (post-request), matching DeepSeek's per-request timestamp billing;
+    # pass billing_time to price a historical moment instead (insights
+    # re-estimation of past sessions).
     deepseek_peak_hour = False
     if route.provider == "deepseek":
-        now = _UTC_NOW()
+        if billing_time is not None:
+            if billing_time.tzinfo is None:
+                raise ValueError("billing_time must be timezone-aware (UTC)")
+            now = billing_time.astimezone(timezone.utc)
+        else:
+            now = _UTC_NOW()
         if now < _DEEPSEEK_PEAK_BILLING_EFFECTIVE_UTC:
             # Pre-switchover: use the legacy flat card. Every model in the
             # snapshot is mapped there; a future deepseek model must be
