@@ -89,7 +89,7 @@
           "description": ""
         },
         {
-          "id": "deepseek/deepseek-v4-pro",
+          "id": "deepseek/deepseek-v4-pro-0813",
           "description": ""
         },
         {
@@ -229,7 +229,7 @@
           "id": "x-ai/grok-4.6"
         },
         {
-          "id": "deepseek/deepseek-v4-pro"
+          "id": "deepseek/deepseek-v4-pro-0813"
         },
         {
           "id": "deepseek/deepseek-v4-flash"
