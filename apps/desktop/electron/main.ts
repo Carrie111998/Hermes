@@ -310,6 +310,13 @@ import {
   writeSandboxMarker
 } from './windows-sandbox-fallback'
 import { installWindowsSystemCaTrust } from './windows-system-ca'
+import {
+  buildWindowsRelaunchCommand,
+  configureWindowsTaskbarDetails,
+  resolveWindowsAppUserModelId,
+  resolveWindowsDevRelaunchAppPath
+} from './windows-taskbar-details'
+import { forceDrainWindowsUpdateBlockers } from './windows-update-force-drain'
 import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
@@ -757,6 +764,7 @@ const BOOT_FAKE_STEP_MS = (() => {
 })()
 
 const APP_NAME = process.env.HERMES_DESKTOP_APP_NAME || 'Hermes'
+const WINDOWS_RUNTIME_APP_USER_MODEL_ID = resolveWindowsAppUserModelId(process.defaultApp)
 const HUD_WINDOW_TITLE = `${APP_NAME} HUD`
 const TITLEBAR_HEIGHT = 34
 const MACOS_TRAFFIC_LIGHTS_HEIGHT = 14
@@ -1065,7 +1073,7 @@ app.setName(APP_NAME)
 // need this, so gate it on Windows. (Fixes: desktop approval/turn notifications
 // never firing on Windows.)
 if (IS_WINDOWS) {
-  app.setAppUserModelId('com.nousresearch.hermes')
+  app.setAppUserModelId(WINDOWS_RUNTIME_APP_USER_MODEL_ID)
 }
 
 // Seed the native About panel with the live Hermes version. This is refreshed
@@ -3392,17 +3400,24 @@ async function applyUpdates(opts = {}) {
       return { ok: false, error: message }
     }
 
-    // Preflight: after releasing our own backends, check for remaining
-    // Hermes processes running from this venv.  The updater normally refuses
-    // when it detects a holder, but because the updater is spawned detached
-    // with stdio:ignore, the user never sees that refusal and the update
-    // silently fails.  This preflight detects holders early and gives the
-    // user an actionable error.  Windows-only; the .pyd lock hazard is a
-    // Windows phenomenon.  ALL failures (blocked, missing python, timeout,
-    // malformed output, missing psutil) abort the handoff — never proceed
-    // to the detached updater when the venv state is unknown.
+    // Preflight: after releasing our own backends, scan for remaining Hermes
+    // processes running from this venv. The scanner proves each target belongs
+    // to this install; on a block we force-kill those trees, then rescan before
+    // the detached handoff. Windows-only: the .pyd lock hazard is a Windows
+    // phenomenon. Probe failures still abort — never hand off when the venv
+    // state is unknown.
     if (IS_WINDOWS) {
-      const scanOutcome = await scanVenvBlockers(updateRoot)
+      let scanOutcome = await scanVenvBlockers(updateRoot)
+
+      if (scanOutcome.kind === 'blocked') {
+        const blockerCount = scanOutcome.result.processes.length
+
+        rememberLog(`[updates] force-draining ${blockerCount} Hermes process(es) holding the install`)
+        scanOutcome = await forceDrainWindowsUpdateBlockers(scanOutcome, {
+          forceKillProcessTree,
+          scan: () => scanVenvBlockers(updateRoot)
+        })
+      }
 
       if (scanOutcome.kind === 'blocked') {
         const message = formatBlockerMessage(scanOutcome.result)
@@ -5720,6 +5735,20 @@ function getAppIconPath() {
   return APP_ICON_PATHS.find(fileExists)
 }
 
+function configureTaskbarDetails(win, icon = getAppIconPath()) {
+  configureWindowsTaskbarDetails(win, {
+    appId: WINDOWS_RUNTIME_APP_USER_MODEL_ID,
+    iconPath: icon,
+    isWindows: IS_WINDOWS,
+    relaunchCommand: buildWindowsRelaunchCommand({
+      executablePath: process.execPath,
+      appEntryPath: resolveWindowsDevRelaunchAppPath(process.defaultApp, process.argv),
+      isDefaultApp: process.defaultApp
+    }),
+    relaunchDisplayName: APP_NAME
+  })
+}
+
 function sendOpenUpdatesRequested() {
   if (!mainWindow || mainWindow.isDestroyed()) {
     return
@@ -6541,6 +6570,7 @@ function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
           webSecurity: true
         }
       })
+      configureTaskbarDetails(win)
     } catch (error) {
       finish(error instanceof Error ? error : new Error(String(error)))
 
@@ -7453,6 +7483,7 @@ function openPortalLoginWindow() {
           webSecurity: true
         }
       })
+      configureTaskbarDetails(win)
     } catch (error) {
       finish(error instanceof Error ? error : new Error(String(error)))
 
@@ -10146,6 +10177,8 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
 
+  configureTaskbarDetails(win, icon)
+
   if (IS_MAC) {
     win.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
   }
@@ -10239,6 +10272,8 @@ function createInstanceWindow() {
     backgroundColor: getWindowBackgroundColor(),
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
+
+  configureTaskbarDetails(win, icon)
 
   instanceWindows.add(win)
 
@@ -11110,6 +11145,8 @@ function createWindow() {
   })
 
   const createdMainWindow = mainWindow
+
+  configureTaskbarDetails(createdMainWindow, icon)
 
   if (IS_MAC) {
     mainWindow.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
