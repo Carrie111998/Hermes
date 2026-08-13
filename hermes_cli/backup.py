@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from hermes_constants import get_default_hermes_root, get_hermes_home, display_hermes_home
+from hermes_constants import get_hermes_home, display_hermes_home
 
 # Shared formatter; the private alias is kept because claw.py and the backup
 # tests import ``_format_size`` from this module.
@@ -580,7 +580,7 @@ def copy_db_and_verify(src: Path, dst: Path) -> bool:
 
 def run_backup(args) -> None:
     """Create a zip backup of the Hermes home directory."""
-    hermes_root = get_default_hermes_root()
+    hermes_root = get_hermes_home()
 
     if not hermes_root.is_dir():
         print(f"Error: Hermes home directory not found at {hermes_root}")
@@ -861,7 +861,7 @@ def run_import(args) -> None:
         print(f"Error: Not a valid zip file: {zip_path}")
         sys.exit(1)
 
-    hermes_root = get_default_hermes_root()
+    hermes_root = get_hermes_home()
 
     with zipfile.ZipFile(zip_path, "r") as zf:
         # Validate
