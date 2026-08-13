@@ -28,6 +28,9 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    profiles_root = home / "profiles"
+    for name in ("orchestrator", "alice", "bob", "reviewer", "specialist", "engineer"):
+        (profiles_root / name).mkdir(parents=True, exist_ok=True)
     kb.init_db()
     return home
 

@@ -8,6 +8,7 @@ and the assignee-fallback logic.
 from __future__ import annotations
 
 import json as jsonlib
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -388,6 +389,69 @@ def test_fanout_revalidates_assignees_inside_graph_commit(kanban_home):
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, tid).status == "triage"
         assert len(kb.list_tasks(conn, limit=100)) == 1
+
+
+def test_profile_rename_cannot_race_validated_graph_commit(kanban_home):
+    from hermes_cli import profiles
+
+    profiles_root = kanban_home / "profiles"
+    (profiles_root / "orchestrator").mkdir(parents=True)
+    engineer_dir = profiles_root / "engineer"
+    engineer_dir.mkdir()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="profile lifecycle race", triage=True)
+
+    validation_started = threading.Event()
+    allow_commit = threading.Event()
+    graph_result: list[object] = []
+    rename_error: list[BaseException] = []
+    original_require = kb._require_current_profiles
+
+    def pause_after_validation(*assignees):
+        original_require(*assignees)
+        validation_started.set()
+        assert allow_commit.wait(5)
+
+    def commit_graph():
+        with kb.connect_closing() as conn:
+            graph_result.append(kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orchestrator",
+                children=[{
+                    "title": "implementation",
+                    "assignee": "engineer",
+                    "parents": [],
+                    "workspace_policy": "scratch",
+                }],
+            ))
+
+    def rename_engineer():
+        try:
+            profiles.rename_profile("engineer", "engineer-new")
+        except BaseException as exc:
+            rename_error.append(exc)
+
+    with patch.object(kb, "_require_current_profiles", side_effect=pause_after_validation), patch(
+        "hermes_cli.profiles._check_gateway_running", return_value=False,
+    ):
+        graph_thread = threading.Thread(target=commit_graph)
+        rename_thread = threading.Thread(target=rename_engineer)
+        graph_thread.start()
+        assert validation_started.wait(5)
+        rename_thread.start()
+        rename_thread.join(0.2)
+        assert rename_thread.is_alive(), "rename bypassed profile lifecycle lock"
+        allow_commit.set()
+        graph_thread.join(5)
+        rename_thread.join(5)
+
+    assert len(graph_result) == 1
+    assert isinstance(graph_result[0], list)
+    assert len(rename_error) == 1
+    assert "open Kanban assignments" in str(rename_error[0])
+    assert engineer_dir.is_dir()
+    assert not (profiles_root / "engineer-new").exists()
 
 
 def test_single_spec_revalidates_assignee_inside_commit(kanban_home):

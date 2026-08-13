@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -37,6 +39,7 @@ def _evidence(tmp_path: Path, **overrides) -> Evidence:
         mount_state="verified",
         device_state="verified",
         observation_provenance="verified_adapter",
+        observed_at=int(time.time()),
     )
     values.update(overrides)
     return Evidence(**values)
@@ -382,6 +385,89 @@ def test_receipt_rejects_stale_or_foreign_workspace_evidence(tmp_path):
                 ],
             ),
         )
+
+
+def test_receipt_rejects_evidence_outside_freshness_window(tmp_path):
+    registry = Registry(tmp_path / "registry.sqlite3")
+    fresh = _evidence(tmp_path)
+    stale = _evidence(tmp_path, observed_at=int(time.time()) - 301)
+    registry.create_or_get(
+        workspace_id="one", idempotency_key="one", evidence=fresh,
+    )
+    conn = registry.open()
+    try:
+        Registry._append_observation(conn, "one", stale)
+        conn.execute(
+            "UPDATE workspaces SET evidence_hash=? WHERE id='one'",
+            (stale.observation_hash,),
+        )
+    finally:
+        conn.close()
+    with pytest.raises(RuntimeError, match="freshness window"):
+        registry.receipt("one", "closeout", _receipt_payload(stale))
+
+
+def test_receipt_validation_and_insert_hold_one_write_transaction(tmp_path, monkeypatch):
+    registry = Registry(tmp_path / "registry.sqlite3")
+    first = _evidence(tmp_path)
+    second = _evidence(tmp_path, head="b" * 40, observed_at=int(time.time()) + 1)
+    registry.create_or_get(
+        workspace_id="one", idempotency_key="one", evidence=first,
+    )
+
+    validation_started = threading.Event()
+    allow_validation = threading.Event()
+    update_done = threading.Event()
+    original = Registry._validate_receipt_payload
+
+    def pause_during_validation(payload):
+        validation_started.set()
+        assert allow_validation.wait(5)
+        original(payload)
+
+    monkeypatch.setattr(Registry, "_validate_receipt_payload", staticmethod(pause_during_validation))
+    receipt_result: list[str] = []
+    receipt_error: list[BaseException] = []
+    update_error: list[BaseException] = []
+
+    def create_receipt():
+        try:
+            receipt_result.append(
+                registry.receipt("one", "closeout", _receipt_payload(first))
+            )
+        except BaseException as exc:
+            receipt_error.append(exc)
+
+    def advance_evidence():
+        conn = registry.open()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            Registry._append_observation(conn, "one", second)
+            conn.execute(
+                "UPDATE workspaces SET evidence_hash=? WHERE id='one'",
+                (second.observation_hash,),
+            )
+            conn.execute("COMMIT")
+        except BaseException as exc:
+            update_error.append(exc)
+        finally:
+            conn.close()
+            update_done.set()
+
+    receipt_thread = threading.Thread(target=create_receipt)
+    update_thread = threading.Thread(target=advance_evidence)
+    receipt_thread.start()
+    assert validation_started.wait(5)
+    update_thread.start()
+    assert not update_done.wait(0.2), "evidence update bypassed receipt write transaction"
+    allow_validation.set()
+    receipt_thread.join(5)
+    update_thread.join(5)
+    assert not receipt_thread.is_alive()
+    assert not update_thread.is_alive()
+    assert not receipt_error
+    assert not update_error
+    assert len(receipt_result) == 1
 
 
 def test_two_process_reservation_returns_one_idempotent_record(tmp_path):
