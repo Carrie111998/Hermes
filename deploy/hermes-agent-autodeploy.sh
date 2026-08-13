@@ -63,10 +63,15 @@ if ! flock -n 9; then
   exit 0
 fi
 
-# Refuse to touch a dirty tree — a local edit means someone is mid-change, and
-# a fast-forward could silently discard or conflict with it.
-if [ -n "$(git status --porcelain)" ]; then
-  fail "working tree at $REPO_DIR is dirty; refusing to auto-pull (resolve by hand)"
+# Refuse to touch a tree with modified TRACKED files — a local edit means
+# someone is mid-change, and a fast-forward could silently discard or conflict
+# with it. Untracked files are deliberately ignored: a live gateway writes
+# runtime state inside the checkout (e.g. cron/executions.db), which would
+# otherwise trip this guard on every host, forever. Untracked files never
+# block a fast-forward unless an incoming commit would overwrite one, and git
+# errors on that case on its own.
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+  fail "tracked files at $REPO_DIR are modified; refusing to auto-pull (commit/stash by hand)"
 fi
 
 git fetch --quiet origin "$BRANCH" || fail "git fetch origin $BRANCH failed"

@@ -49,13 +49,18 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=hermes-agent-autodeploy
 
-# --- Hardening (mirrors hermes-gateway.service) ---
+# --- Hardening ---
+# This subset is safe in BOTH system and rootless `systemctl --user` scopes.
 NoNewPrivileges=yes
 PrivateTmp=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-RestrictSUIDSGID=yes
+# The capability/kernel/cgroup/SUID directives below are valid only for a
+# SYSTEM-level install (root manager). Under `systemctl --user` they fail the
+# unit at start with status=218/CAPABILITIES ("Failed to drop capabilities"),
+# so they are left commented. Uncomment them for a dedicated-host system unit:
+#   ProtectKernelTunables=yes
+#   ProtectKernelModules=yes
+#   ProtectControlGroups=yes
+#   RestrictSUIDSGID=yes
 
 [Install]
 WantedBy=multi-user.target
