@@ -37,6 +37,43 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
+# ── sqlite-connection tripwire (feeds pytest_runtest_teardown) ──────────────
+# ``sqlite3.connect`` is wrapped once, here, so the teardown hook below knows
+# whether a test could have left a cycle-held connection behind — see that
+# hook's docstring for why the collect exists and what it costs.
+#
+# Wrapping the module attribute is enough: no module in this repo does
+# ``from sqlite3 import connect`` (checked 2026-08-13), and the third-party
+# drivers that matter (aiosqlite, sqlalchemy) look the attribute up at call
+# time too. A caller that captured the original function *before* this
+# conftest was imported would go uncounted — conftest import happens before any
+# test module is imported, so that window is closed in practice. If a new
+# import style appears, the failure mode is the pre-2026-07 one (a %TEMP% dir
+# survives), not a wrong test result.
+_sqlite_opened_since_collect = 0
+_collect_armed = False
+
+
+def _install_sqlite_open_tripwire() -> None:
+    import sqlite3
+
+    if getattr(sqlite3.connect, "_hermes_counted", False):
+        return
+    _real_connect = sqlite3.connect
+
+    def _counting_connect(*args, **kwargs):
+        global _sqlite_opened_since_collect
+        _sqlite_opened_since_collect += 1
+        return _real_connect(*args, **kwargs)
+
+    _counting_connect._hermes_counted = True
+    sqlite3.connect = _counting_connect
+    sqlite3.dbapi2.connect = _counting_connect
+
+
+_install_sqlite_open_tripwire()
+
+
 # ── Per-file process isolation ──────────────────────────────────────────────
 # Tests run via ``scripts/run_tests_parallel.py``, which spawns a fresh
 # ``python -m pytest <file>`` subprocess per test file. Cross-file state
@@ -748,17 +785,39 @@ def _live_system_guard(request, monkeypatch):
     import subprocess as _subprocess
 
     test_pid = _os.getpid()
-    # Capture the test process's existing children at fixture start —
-    # any *new* children spawned by the test are also allowlisted via
-    # the live psutil walk below. Static set keeps the fast path cheap.
     try:
         import psutil as _psutil
-        _initial_children = {
-            c.pid for c in _psutil.Process(test_pid).children(recursive=True)
-        }
     except Exception:
         _psutil = None
-        _initial_children = set()
+
+    # Snapshot of the test process's children, allowlisted alongside the
+    # live psutil walk below. Taken LAZILY, on the first guarded kill:
+    # ``Process.children(recursive=True)`` builds a ppid map of every process
+    # on the box (~61ms per call on this Windows host, measured 2026-08-13)
+    # and the overwhelming majority of tests never signal anything — that was
+    # 6.0s of a 98-test file, charged to every test in the repo.
+    #
+    # Deferring only *widens* the snapshot to children the test itself spawned
+    # before the kill, and those are already allowlisted by the parents() walk
+    # in ``_is_own_subtree``, so the guard's answer is unchanged: a foreign PID
+    # is still refused. (Both spellings share the pre-existing stale-PID
+    # window — a dead child's PID recycled by a foreign process reads as ours.)
+    _initial_children: set[int] = set()
+    _snapshot_taken = False
+
+    def _own_children() -> set[int]:
+        nonlocal _snapshot_taken
+        if not _snapshot_taken:
+            _snapshot_taken = True
+            if _psutil is not None:
+                try:
+                    _initial_children.update(
+                        c.pid
+                        for c in _psutil.Process(test_pid).children(recursive=True)
+                    )
+                except Exception:
+                    pass
+        return _initial_children
 
     def _is_own_subtree(pid: int) -> bool:
         # PID 0 means "our own process group"; -1 means "every process we
@@ -769,7 +828,7 @@ def _live_system_guard(request, monkeypatch):
             return True
         if pid < 0:
             return False
-        if pid == test_pid or pid in _initial_children:
+        if pid == test_pid or pid in _own_children():
             return True
         if _psutil is None:
             return False
@@ -1418,5 +1477,24 @@ def pytest_runtest_teardown(item, nextitem):
 
     Purely a lifetime nudge — it never changes when anything commits, closes,
     or rolls back, so it cannot alter test semantics.
+
+    **Only tests that could have created such a connection pay for it.** A full
+    ``gc.collect()`` walks the whole tracked heap (61K objects at collection
+    time, 211K by the end of ``tests/hermes_cli/test_doctor.py``) and cost
+    0.163s per test — 16.0s of that 98-test file, charged to EVERY test in the
+    repo. Only 10 of those 98 tests ever opened a sqlite connection.
+    ``_sqlite_opened_since_collect`` (see ``sqlite3.connect`` wrapper above)
+    gates the call: 12 collects instead of 98, 2.1s instead of 16.0s, with no
+    change for any test that actually touches sqlite.
+
+    The gate deliberately stays armed for ONE more test after the last open.
+    Fixture finalizers run *after* this ``tryfirst`` hook, so a connection whose
+    last reference lives in a fixture becomes collectable only once this
+    teardown is over; the following test's collect is what frees it (the same
+    ordering the unconditional version relied on).
     """
-    gc.collect()
+    global _sqlite_opened_since_collect, _collect_armed
+    if _sqlite_opened_since_collect or _collect_armed:
+        _collect_armed = bool(_sqlite_opened_since_collect)
+        _sqlite_opened_since_collect = 0
+        gc.collect()
