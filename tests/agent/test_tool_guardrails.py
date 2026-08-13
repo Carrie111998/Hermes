@@ -8,6 +8,7 @@ from agent.tool_guardrails import (
     ToolCallSignature,
     canonical_tool_args,
     classify_tool_failure,
+    normalize_tool_args_for_guardrail,
 )
 
 
@@ -240,3 +241,65 @@ def test_no_progress_streak_survives_turn_boundary_until_real_work_lands():
         failed=False,
     )
     assert controller.before_call("todo", args).action == "allow"
+
+
+def test_guardrail_signature_normalizes_housekeeping_arg_jitter():
+    todo_a = ToolCallSignature.from_call(
+        "todo",
+        {
+            "merge": True,
+            "todos": [
+                {"id": "b", "content": "same", "status": "pending"},
+                {"id": "a", "content": "same", "status": "in_progress"},
+            ],
+        },
+    )
+    todo_b = ToolCallSignature.from_call(
+        "todo",
+        {
+            "merge": False,
+            "todos": [
+                {"id": "a", "content": "same", "status": "in_progress"},
+                {"id": "b", "content": "same", "status": "pending"},
+            ],
+        },
+    )
+    assert todo_a == todo_b
+
+    assert ToolCallSignature.from_call("skill_view", {"name": "hermes-agent"}) == ToolCallSignature.from_call(
+        "skill_view",
+        {"name": "hermes-agent", "file_path": None},
+    )
+    assert ToolCallSignature.from_call("read_file", {"path": "x"}) == ToolCallSignature.from_call(
+        "read_file",
+        {"path": "x", "offset": 1, "limit": 2000},
+    )
+
+    # Non-housekeeping tools keep raw args; shell-string differences may be semantic.
+    assert ToolCallSignature.from_call("terminal", {"command": "pwd"}) != ToolCallSignature.from_call(
+        "terminal",
+        {"command": "pwd "},
+    )
+
+
+def test_no_progress_blocks_todo_loop_despite_merge_and_order_jitter():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=3,
+        )
+    )
+    variants = [
+        {"merge": True, "todos": [{"id": "b", "content": "same", "status": "pending"}, {"id": "a", "content": "same", "status": "in_progress"}]},
+        {"merge": False, "todos": [{"id": "a", "content": "same", "status": "in_progress"}, {"id": "b", "content": "same", "status": "pending"}]},
+        {"todos": [{"id": "b", "content": "same", "status": "pending"}, {"id": "a", "content": "same", "status": "in_progress"}]},
+    ]
+
+    for args in variants:
+        assert controller.before_call("todo", args).action == "allow"
+        controller.after_call("todo", args, "same-list", failed=False)
+
+    blocked = controller.before_call("todo", variants[1])
+    assert blocked.action == "block"
+    assert blocked.count == 3

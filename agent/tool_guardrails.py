@@ -182,7 +182,7 @@ class ToolCallSignature:
 
     @classmethod
     def from_call(cls, tool_name: str, args: Mapping[str, Any] | None) -> "ToolCallSignature":
-        canonical = canonical_tool_args(args or {})
+        canonical = canonical_tool_args(normalize_tool_args_for_guardrail(tool_name, args or {}))
         return cls(tool_name=tool_name, args_hash=_sha256(canonical))
 
     def to_metadata(self) -> dict[str, str]:
@@ -220,6 +220,43 @@ class ToolGuardrailDecision:
         if self.signature is not None:
             data["signature"] = self.signature.to_metadata()
         return data
+
+
+def normalize_tool_args_for_guardrail(tool_name: str, args: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a loop-detection view of args with no-op jitter removed.
+
+    This is deliberately conservative. It only normalizes tool payloads where
+    the repeated-call semantics are declarative and stable. Shell commands,
+    browser input, and arbitrary mutating tools keep their raw canonical args.
+    """
+    normalized = dict(args)
+
+    if tool_name == "todo":
+        # ``merge`` changes how the todo tool applies an update, but repeated
+        # writes of the same final list with merge toggled are the same
+        # bookkeeping no-op from the guardrail's perspective.
+        normalized.pop("merge", None)
+        todos = normalized.get("todos")
+        if isinstance(todos, list):
+            normalized["todos"] = sorted(
+                todos,
+                key=lambda item: str(item.get("id", "")) if isinstance(item, Mapping) else str(item),
+            )
+        return normalized
+
+    if tool_name == "skill_view":
+        if normalized.get("file_path") is None:
+            normalized.pop("file_path", None)
+        return normalized
+
+    if tool_name == "read_file":
+        if normalized.get("offset") in (None, 1):
+            normalized.pop("offset", None)
+        if normalized.get("limit") in (None, 2000):
+            normalized.pop("limit", None)
+        return normalized
+
+    return normalized
 
 
 def canonical_tool_args(args: Mapping[str, Any]) -> str:
