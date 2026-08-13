@@ -12382,9 +12382,64 @@ function registerDeepLinkProtocol() {
 // Single-instance lock: deep links on a running app (Win/Linux) arrive as a
 // second-instance argv. Without the lock a second `hermes://` launch spawns a
 // whole new app instead of routing into the running one.
-const _gotSingleInstanceLock = app.requestSingleInstanceLock()
+//
+// Electron can leave these user-data symlinks behind after an abnormal exit on
+// Linux/X11. A dead or zombie PID cannot receive a second-instance event, so
+// clean up only that provably stale local lock and retry once.
+function clearStaleLinuxSingletonLock(): boolean {
+  if (process.platform !== 'linux') {
+    return false
+  }
+
+  const userData = app.getPath('userData')
+  const lockPath = path.join(userData, 'SingletonLock')
+  let target: string
+
+  try {
+    target = fs.readlinkSync(lockPath)
+  } catch {
+    return false
+  }
+
+  const hostPrefix = `${os.hostname()}-`
+  const pidText = target.startsWith(hostPrefix) ? target.slice(hostPrefix.length) : ''
+  if (!/^\d+$/.test(pidText)) {
+    return false
+  }
+
+  const pid = Number(pidText)
+  let stale = false
+  try {
+    process.kill(pid, 0)
+    // kill(pid, 0) succeeds for zombies. /proc state Z is equally stale.
+    const state = fs.readFileSync(`/proc/${pid}/stat`, 'utf8').match(/\)\s+([A-Z])/)
+    stale = state?.[1] === 'Z'
+  } catch {
+    stale = true
+  }
+  if (!stale) {
+    return false
+  }
+
+  try {
+    for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+      fs.rmSync(path.join(userData, name), { force: true })
+    }
+    rememberLog(`[startup] removed stale Electron SingletonLock for dead PID ${pid}`)
+    return true
+  } catch (err) {
+    rememberLog(`[startup] could not remove stale Electron SingletonLock: ${err.message}`)
+    return false
+  }
+}
+
+let _gotSingleInstanceLock = app.requestSingleInstanceLock()
+if (!_gotSingleInstanceLock && clearStaleLinuxSingletonLock()) {
+  _gotSingleInstanceLock = app.requestSingleInstanceLock()
+}
 
 if (!_gotSingleInstanceLock) {
+  rememberLog('[startup] Electron single-instance lock is held by a live process; exiting')
   app.quit()
 } else {
   app.on('second-instance', (_event, argv) => {
