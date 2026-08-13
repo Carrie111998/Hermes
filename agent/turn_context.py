@@ -46,6 +46,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
 )
+from agent.shared_media_tracker import build_recent_links_context_block
 
 logger = logging.getLogger(__name__)
 
@@ -54,12 +55,14 @@ def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
     plugin_user_context: str,
+    recent_links_block: str = "",
 ) -> Optional[str]:
     """Compose the API-bound content of the current turn's user message.
 
     Sources: memory-manager prefetch + ``pre_llm_call`` plugin context with
-    target="user_message" (the default). Both are appended to the *API copy*
-    of the user message only — the stored content stays clean.
+    target="user_message" (the default) + the recent-shared-links block
+    (``agent.shared_media_tracker``). All are appended to the *API copy* of
+    the user message only — the stored content stays clean.
 
     This is the single source of that composition. The prologue stamps the
     result onto the live message as ``api_content`` (persisted alongside the
@@ -80,6 +83,8 @@ def compose_user_api_content(
             injections.append(fenced)
     if plugin_user_context:
         injections.append(plugin_user_context)
+    if recent_links_block:
+        injections.append(recent_links_block)
     if not injections:
         return None
     return content + "\n\n" + "\n\n".join(injections)
@@ -423,6 +428,8 @@ class TurnContext:
     plugin_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
+    # Fenced recent-shared-links block (appended to the user message).
+    recent_links_block: str = ""
     # Turn-start preflight already proved an immediate retry ineffective.
     preflight_compression_blocked: bool = False
 
@@ -1266,6 +1273,23 @@ def build_turn_context(
         except Exception:
             pass
 
+    # Recent shared links: a bounded scan of what the user pasted earlier in
+    # THIS session, rendered as a short label list. Read from the persisted
+    # rows rather than ``messages`` so a link shared before an idle/preflight
+    # compaction boundary survives — the in-memory list has been rewritten
+    # into a summary by then, the durable transcript has not. One indexed
+    # SELECT of at most 50 user rows, and never fatal: a failed read costs
+    # the block, not the turn.
+    recent_links_block = ""
+    _links_db = getattr(agent, "_session_db", None)
+    if _links_db is not None and agent.session_id:
+        try:
+            recent_links_block = build_recent_links_context_block(
+                _links_db.get_recent_user_messages(agent.session_id, limit=50)
+            )
+        except Exception:
+            logger.debug("recent-shared-links scan skipped", exc_info=True)
+
     # ── api_content sidecar: persist what you send ──
     # The prefetch/plugin context above is injected into the API copy of this
     # turn's user message, never into the stored content — so on the next
@@ -1291,7 +1315,10 @@ def build_turn_context(
     ):
         _turn_user_msg = messages[current_turn_user_idx]
         _api_content = compose_user_api_content(
-            _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
+            _turn_user_msg.get("content", ""),
+            ext_prefetch_cache,
+            plugin_user_context,
+            recent_links_block,
         )
         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             _turn_user_msg["api_content"] = _api_content
@@ -1374,5 +1401,6 @@ def build_turn_context(
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
+        recent_links_block=recent_links_block,
         preflight_compression_blocked=_preflight_compression_blocked,
     )

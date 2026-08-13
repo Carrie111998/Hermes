@@ -8216,6 +8216,42 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             result.append(msg)
         return result
 
+    def get_recent_user_messages(
+        self, session_id: str, limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """Load the newest ``limit`` active user rows, oldest-first.
+
+        A narrow read for per-turn scans of what the user actually said
+        (see ``agent.shared_media_tracker``): it runs on EVERY turn, so it
+        selects only the three columns such a scan needs, filters ``role``
+        in SQL instead of dragging a tool-heavy transcript into Python, and
+        rides the ``idx_messages_session_id`` index — ``get_messages`` would
+        return the whole session (or a tail dominated by tool rows).
+
+        Ordered by AUTOINCREMENT id like :meth:`get_messages` (true insertion
+        order; see c03acca50 for the WSL2 clock-regression rationale), taken
+        from the newest end and reversed back into chronological order.
+        """
+        if limit <= 0:
+            return []
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT id, content, timestamp FROM messages "
+                "WHERE session_id = ? AND role = 'user' AND active = 1 "
+                "ORDER BY id DESC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+        rows.reverse()
+        return [
+            {
+                "id": row["id"],
+                "role": "user",
+                "content": self._decode_content(row["content"]),
+                "timestamp": row["timestamp"],
+            }
+            for row in rows
+        ]
+
     def find_pr_url_messages(self, session_ids: List[str]) -> List[Dict[str, Any]]:
         """Tool results in these sessions that mention a GitHub PR url.
 
