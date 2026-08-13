@@ -133,12 +133,30 @@ def _stub_doctor_externals(request, monkeypatch):
     ``exercises_real_gh_probe = True`` (see ``TestGitHubTokenCheck``).
 
     The ``shutil.which`` memo is deliberately NOT mirrored into
-    ``tests/hermes_cli/conftest_doctor_externals.py``, which otherwise carries
-    the same three stubs. It should help every sibling module that calls
-    ``run_doctor`` (they pay the same ~25 lookups per invocation), but that was
-    not measured here and this helper's own docstring records a sibling-wide
-    refactor that had to be reverted -- so it stays local until someone A/Bs
-    the siblings.
+    ``tests/hermes_cli/conftest_doctor_externals.py``, which carries the same
+    stubs for the sibling modules. That was tried and measured (2026-08-13) --
+    profiling both trees warmed, and comparing CALL COUNTS rather than
+    wall-clock so box load could not distort it:
+
+      * ``test_doctor_command_install``  19 -> 7 real ``which`` calls,
+                                         3544 -> 210 ``shutil._access_check``,
+                                         ~0.30s saved
+      * ``test_gmi_provider``            12 -> 12, 3353 -> 3353, nothing saved
+      * ``test_fireworks_provider``      11 -> 11, 3296 -> 3296, nothing saved
+
+    The memo only pays when one process invokes ``run_doctor`` repeatedly, so
+    the same command is looked up under the same ``$PATH`` more than once.
+    Those two sibling modules call it exactly once, so every key is distinct
+    and the hit rate is zero -- on any platform. Only this file (335
+    ``_safe_which`` calls / 6.29s) and, to a much smaller extent,
+    ``test_doctor_command_install`` have the repetition to exploit.
+
+    An interleaved wall-clock A/B of the siblings appeared to show a 12-19%
+    win; that was load, not the memo -- the count comparison above refutes it.
+    Note also that the ~19ms-per-``which`` that makes this worth doing at all
+    is a Windows artifact ($PATH x $PATHEXT with a stat per candidate), so the
+    9 ``Symlink check is Unix-only`` tests that would additionally run in
+    ``test_doctor_command_install`` on Linux do not change the conclusion.
 
     It also stubs ``model_tools`` in ``sys.modules``. ``run_doctor`` only wants
     ``check_tool_availability``/``TOOLSET_REQUIREMENTS`` from it, behind a
