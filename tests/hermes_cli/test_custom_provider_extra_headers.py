@@ -209,26 +209,16 @@ def test_apply_extra_headers_noop_without_match():
 def test_fetch_api_models_sends_extra_headers_to_models_probe(monkeypatch):
     captured = {}
 
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self):
-            return json.dumps({"data": [{"id": "proxy-model"}]}).encode()
-
-    def fake_urlopen(request, timeout=0):
+    def fake_read(request, timeout=0):
         captured["url"] = request.full_url
         captured["timeout"] = timeout
         captured["headers"] = {
             key.lower(): value
             for key, value in request.header_items()
         }
-        return FakeResponse()
+        return json.dumps({"data": [{"id": "proxy-model"}]}).encode()
 
-    monkeypatch.setattr(models_mod, "_urlopen_model_catalog_request", fake_urlopen)
+    monkeypatch.setattr(models_mod, "_read_model_catalog_request", fake_read)
 
     models = models_mod.fetch_api_models(
         "proxy-key",

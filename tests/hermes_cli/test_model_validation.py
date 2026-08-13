@@ -192,7 +192,14 @@ class TestFetchApiModels:
                 return _Resp()
             raise Exception("404")
 
-        with patch("hermes_cli.models._urlopen_model_catalog_request", side_effect=_fake_urlopen):
+        def _fake_read(req, timeout=5.0):
+            with _fake_urlopen(req, timeout=timeout) as response:
+                return response.read()
+
+        with patch(
+            "hermes_cli.models._read_model_catalog_request",
+            side_effect=_fake_read,
+        ):
             probe = probe_api_models("key", "http://localhost:8000")
 
         assert calls == ["http://localhost:8000/models", "http://localhost:8000/v1/models"]
@@ -476,27 +483,19 @@ class TestProbeApiModelsUserAgent:
     endpoint is reachable and the listing exists.
     """
 
-    def _make_mock_response(self, body: bytes):
-        from unittest.mock import MagicMock
-        mock_resp = MagicMock()
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
-        mock_resp.read = MagicMock(return_value=body)
-        return mock_resp
-
     def test_probe_sends_hermes_user_agent(self):
         from unittest.mock import patch
 
         body = b'{"data":[{"id":"claude-opus-4.7"}]}'
         with patch(
-            "hermes_cli.models._urlopen_model_catalog_request",
-            return_value=self._make_mock_response(body),
-        ) as mock_urlopen:
+            "hermes_cli.models._read_model_catalog_request",
+            return_value=body,
+        ) as mock_read:
             result = probe_api_models("sk-test", "https://example.com/v1")
 
         assert result["models"] == ["claude-opus-4.7"]
-        # The urlopen call receives a Request object as its first positional arg
-        req = mock_urlopen.call_args[0][0]
+        # The bounded reader receives a Request object as its first positional arg.
+        req = mock_read.call_args[0][0]
         ua = req.get_header("User-agent")  # urllib title-cases header names
         assert ua, "probe_api_models must send a User-Agent header"
         assert ua.startswith("hermes-cli/"), (
@@ -511,12 +510,12 @@ class TestProbeApiModelsUserAgent:
 
         body = b'{"data":[]}'
         with patch(
-            "hermes_cli.models._urlopen_model_catalog_request",
-            return_value=self._make_mock_response(body),
-        ) as mock_urlopen:
+            "hermes_cli.models._read_model_catalog_request",
+            return_value=body,
+        ) as mock_read:
             probe_api_models(None, "https://example.com/v1")
 
-        req = mock_urlopen.call_args[0][0]
+        req = mock_read.call_args[0][0]
         ua = req.get_header("User-agent")
         assert ua and ua.startswith("hermes-cli/")
         # No Authorization was set, but UA must still be present.
