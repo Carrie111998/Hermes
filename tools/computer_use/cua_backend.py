@@ -560,9 +560,12 @@ class _CuaDriverSession:
     session object, never the surrounding contexts.
     """
 
-    def __init__(self, bridge: _AsyncBridge) -> None:
+    def __init__(self, bridge: _AsyncBridge, backend: Optional["CuaDriverBackend"]) -> None:
         self._bridge = bridge
         self._session = None
+        # Back-reference to owning CuaDriverBackend for session ID renewal
+        # on reconnect (Surface 2 of NousResearch/hermes-agent#82479).
+        self._backend = backend
         self._lock = threading.Lock()
         self._started = False
         # Surface 4 of NousResearch/hermes-agent#47072: per-tool
@@ -864,9 +867,10 @@ class _CuaDriverSession:
             or "daemon proxy" in msg
         )
 
-    def _restart_session_locked(self) -> None:
+    def _restart_session_locked(self) -> Optional[str]:
         """Recreate the MCP session after the daemon/stdin transport was closed.
-        Caller must hold self._lock (the reconnect-once retry path holds it)."""
+        Caller must hold self._lock (the reconnect-once retry path holds it).
+        Returns the new session ID if renewed at the backend level, else None."""
         if self._started:
             try:
                 self._stop_lifecycle_locked()
@@ -878,6 +882,23 @@ class _CuaDriverSession:
         self._capability_version = ""
         self._start_lifecycle_locked()
         self._started = True
+        # If we have a backend reference, renew the session ID so that
+        # subsequent tool calls use the new identity with the new daemon.
+        # This is the correct place: CuaDriverBackend owns _session_id
+        # and passes it to every tool call, so renewing here ensures
+        # the new daemon session gets a matching identity.
+        if self._backend is not None:
+            new_id = f"hermes-{uuid.uuid4().hex[:12]}"
+            self._backend._session_id = new_id
+            try:
+                session = self._session
+                assert session is not None  # _start_lifecycle_locked guarantees this
+                self._bridge.run(session.call_tool("start_session", {"session": new_id}),
+                                 timeout=5.0)
+            except Exception as e:
+                logger.debug("cua-driver start_session (reconnect) failed (continuing anonymous): %s", e)
+            return new_id
+        return None
 
     def _call_tool_via_cli(self, name: str, args: Dict[str, Any], timeout: float) -> Dict[str, Any]:
         """Fallback transport: invoke ``cua-driver call <tool> <json>`` as a
@@ -1022,7 +1043,10 @@ class _CuaDriverSession:
             # genuinely dead daemon.
             logger.warning("cua-driver MCP session closed during %s; reconnecting once", name)
             with self._lock:
-                self._restart_session_locked()
+                new_id = self._restart_session_locked()
+            if new_id is not None:
+                args = dict(args)
+                args["session"] = new_id
             return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
 
 
@@ -1181,7 +1205,7 @@ class CuaDriverBackend(ComputerUseBackend):
 
     def __init__(self) -> None:
         self._bridge = _AsyncBridge()
-        self._session = _CuaDriverSession(self._bridge)
+        self._session = _CuaDriverSession(self._bridge, self)
         # Sticky context — updated by capture(), used by action tools.
         self._active_pid: Optional[int] = None
         self._active_window_id: Optional[int] = None
