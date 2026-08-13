@@ -10,6 +10,33 @@ import pytest
 from hermes_cli.main import cmd_update, PROJECT_ROOT
 
 
+@pytest.fixture(autouse=True)
+def _stub_update_side_effects(monkeypatch):
+    """Keep ``cmd_update`` off the real host.
+
+    Any test that drives the update flow far enough to be "behind" reaches two
+    steps that act on the developer's machine, and tests/conftest.py's
+    live-system guard rightly blocks both:
+
+    * ``_build_web_ui`` shells out to a REAL ``npm run build`` (network, a
+      rewritten node_modules). These tests patch ``shutil.which`` to None
+      expecting npm to look absent, but the build resolves npm by another route
+      on Windows (Program Files/nodejs/npm.cmd) and spawns it via
+      ``Popen``, so neither the ``which`` stub nor the ``subprocess.run`` patch
+      intercepts it.
+    * ``_kill_stale_dashboard_processes`` SIGTERMs PIDs it finds on the HOST.
+      Unguarded this would kill a real dashboard — the guard caught it doing
+      exactly that (``os.kill(<host pid>, 15)``).
+
+    No test in this file asserts on either seam, so stubbing them costs no
+    coverage and confines the flow to the git mock the tests already install.
+    """
+    import hermes_cli.main as _m
+
+    monkeypatch.setattr(_m, "_build_web_ui", lambda *a, **k: True)
+    monkeypatch.setattr(_m, "_kill_stale_dashboard_processes", lambda *a, **k: None)
+
+
 def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
     """Build a side_effect function for subprocess.run that simulates git commands."""
 
