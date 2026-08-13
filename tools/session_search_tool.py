@@ -33,6 +33,8 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Union
 
+from tools import query_expansion as qe
+
 # Sources that are excluded from session browsing/searching by default.
 # Third-party integrations tag their sessions with HERMES_SESSION_SOURCE=tool;
 # delegate subagent runs are tagged "subagent"; kanban dispatcher workers are
@@ -717,6 +719,41 @@ def _discover(
         logging.error("FTS5 search failed: %s", e, exc_info=True)
         return tool_error(f"Search failed: {e}", success=False)
 
+    # Bounded lexical expansion for conversational queries (port of
+    # openclaw/openclaw#121196). Multi-word FTS5 queries default to AND
+    # semantics, so a conversational recall prompt like "that thing we
+    # discussed about the API" matches almost nothing — every filler word
+    # must co-occur with the meaningful terms. When the strict query's
+    # candidate pool is thin (< limit distinct lineages), run ONE
+    # supplemental OR probe over the extracted keywords and append its
+    # hits BELOW every strict hit. Strict results always rank first;
+    # explicit FTS5 syntax (quotes, OR/NOT, wildcards) disables expansion
+    # entirely — the user is being precise.
+    expanded_terms: List[str] = []
+    strict_lineages = {r.get("session_id") for r in raw_results}
+    if len(strict_lineages) < limit and not qe.has_fts_operators(query):
+        keywords = qe.extract_keywords(query)
+        if keywords and not qe.expansion_is_noop(query, keywords):
+            try:
+                supplemental = db.search_messages(
+                    query=qe.build_expansion_query(keywords),
+                    role_filter=role_list,
+                    exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+                    limit=_DISCOVER_SCAN_LIMIT,
+                    offset=0,
+                    sort=sort,
+                    fields=_DISCOVER_SEARCH_FIELDS,
+                )
+            except Exception:
+                logging.debug("supplemental keyword probe failed", exc_info=True)
+                supplemental = []
+            if supplemental:
+                seen_ids = {r.get("id") for r in raw_results}
+                extras = [r for r in supplemental if r.get("id") not in seen_ids]
+                if extras:
+                    raw_results = list(raw_results) + extras
+                    expanded_terms = keywords
+
     # Demote automation (cron) rows below interactive ones before dedup, so a
     # high-volume cron corpus can't starve the user's own sessions out of the
     # top `limit` results (#19434). Stable — preserves BM25/recency order
@@ -841,6 +878,12 @@ def _discover(
         "count": len(results),
         "sessions_searched": len(seen_sessions),
     }
+    if expanded_terms:
+        _final_payload["expanded_terms"] = expanded_terms
+        _final_payload["expansion_note"] = (
+            "Strict query was thin; results were supplemented by a bounded "
+            "keyword OR probe over the terms above. Strict matches rank first."
+        )
     _annotate_rebuild_status(db, _final_payload)
     return json.dumps(_final_payload, ensure_ascii=False)
 
