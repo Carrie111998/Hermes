@@ -2294,9 +2294,11 @@ install_node_deps() {
         cd "$INSTALL_DIR"
         # Time-boxed: a stalled registry fetch would otherwise hang here with no
         # progress (same #39219 stall class as the desktop build below).
-        run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent || {
-            log_warn "npm install failed or timed out (browser tools may not work)"
-        }
+        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent; then
+            log_error "npm install failed or timed out; Node.js dependencies were not installed"
+            restore_dirty_lockfiles "$INSTALL_DIR"
+            return 1
+        fi
         log_success "Node.js dependencies installed"
 
         # Install Playwright browser + system dependencies.
@@ -2396,9 +2398,11 @@ install_node_deps() {
         log_info "Installing TUI dependencies..."
         cd "$INSTALL_DIR/ui-tui"
         # Time-boxed: a stalled registry fetch would otherwise hang here (#39219).
-        run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent || {
-            log_warn "TUI npm install failed or timed out (hermes --tui may not work)"
-        }
+        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent; then
+            log_error "TUI npm install failed or timed out; TUI dependencies were not installed"
+            restore_dirty_lockfiles "$INSTALL_DIR"
+            return 1
+        fi
         log_success "TUI dependencies installed"
     fi
 
@@ -3292,7 +3296,7 @@ run_stage_body() {
             resolve_install_layout
             require_install_dir
             check_node
-            install_node_deps
+            install_node_deps || return
             install_uv
             install_browser_use_cli
             install_computer_use_driver
@@ -3410,7 +3414,7 @@ main() {
     clone_repo
     setup_venv
     install_deps
-    install_node_deps
+    install_node_deps || return
     install_browser_use_cli
     install_computer_use_driver
     setup_path
