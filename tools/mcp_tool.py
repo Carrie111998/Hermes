@@ -6806,6 +6806,12 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 
     registered_names = _register_server_tools(name, server, config)
     server._registered_tool_names = list(registered_names)
+    shadowed = _discard_shadowed_empty_server_tasks(server)
+    if shadowed:
+        await asyncio.gather(
+            *(stale.shutdown() for stale in shadowed),
+            return_exceptions=True,
+        )
 
     transport_type = (
         "HTTP"
@@ -6824,6 +6830,37 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def _is_stale_empty_server_task(server: Any) -> bool:
+    return (
+        getattr(server, "session", None) is None
+        and not getattr(server, "_config", None)
+        and "has no 'command' in config" in str(getattr(server, "_error", ""))
+    )
+
+
+def _pop_stale_empty_server_task(state_key: _ServerStateKey) -> Optional[Any]:
+    """Remove a retained task that can only retry its original empty config."""
+    with _lock:
+        server = _servers.get(state_key)
+        if not _is_stale_empty_server_task(server):
+            return None
+        return _servers.pop(state_key)
+
+
+def _discard_shadowed_empty_server_tasks(server: Any) -> List[Any]:
+    """Drop failed empty-config tasks superseded by a scoped connection."""
+    discarded = []
+    with _lock:
+        for state_key, candidate in list(_servers.items()):
+            if (
+                state_key != server.state_key
+                and getattr(candidate, "name", None) == server.name
+                and _is_stale_empty_server_task(candidate)
+            ):
+                discarded.append(_servers.pop(state_key))
+    return discarded
+
 
 def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     """Connect to explicit MCP servers and register their tools.
@@ -6847,6 +6884,22 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         return []
 
     state_keys = {name: _server_state_key(name) for name in servers}
+    stale_failed = [
+        stale
+        for name, config in servers.items()
+        if config
+        if (stale := _pop_stale_empty_server_task(state_keys[name])) is not None
+    ]
+    if stale_failed:
+        _ensure_mcp_loop()
+
+        async def _shutdown_stale_failed() -> None:
+            await asyncio.gather(
+                *(server.shutdown() for server in stale_failed),
+                return_exceptions=True,
+            )
+
+        _run_on_mcp_loop(_shutdown_stale_failed, timeout=15)
 
     # Only attempt servers that aren't already connected (or currently
     # connecting) and are enabled.  Checking ``_server_connecting`` prevents

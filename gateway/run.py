@@ -1888,6 +1888,29 @@ def _profile_runtime_scope(profile_home: "Path"):
         reset_hermes_home_override(home_token)
 
 
+def _prepare_mcp_registry_for_gateway_agent() -> None:
+    """Complete profile-scoped MCP discovery before an agent snapshots tools."""
+    from agent.secret_scope import is_multiplex_active
+
+    if not is_multiplex_active():
+        return
+    try:
+        from tools.mcp_tool import discover_mcp_tools
+
+        discover_mcp_tools()
+    except Exception as exc:
+        logger.warning(
+            "Profile-scoped MCP discovery failed before agent build: %s", exc
+        )
+        raise
+
+
+def _create_gateway_agent(agent_factory, **kwargs):
+    """Build an agent only after scoped MCP discovery completes."""
+    _prepare_mcp_registry_for_gateway_agent()
+    return agent_factory(**kwargs)
+
+
 def load_gateway_config_for_runner() -> "GatewayConfig":
     """Load gateway config for the process-level GatewayRunner.
 
@@ -4709,7 +4732,8 @@ class TurnRunner:
 
         if agent is None:
             # Config changed or first message — create fresh agent
-            agent = ctx.AIAgent(
+            agent = _create_gateway_agent(
+                ctx.AIAgent,
                 model=turn_route["model"],
                 **turn_route["runtime"],
                 **_checkpoint_agent_kwargs(ctx.user_config),
