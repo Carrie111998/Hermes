@@ -15,6 +15,8 @@ import json
 import logging
 import os
 import platform
+import secrets
+import stat
 import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
@@ -75,16 +77,16 @@ ADAPTIVE_EFFORT_MAP = {
 # xhigh as a distinct level between high and max; older adaptive-thinking
 # models (4.6) reject it with a 400.  Keep this substring list in sync with
 # the Anthropic migration guide as new model families ship.
-_XHIGH_EFFORT_SUBSTRINGS = ("4-7", "4.7")
+_XHIGH_EFFORT_SUBSTRINGS = ("4-7", "4.7", "4-8", "4.8")
 
 # Models where extended thinking is deprecated/removed (4.6+ behavior: adaptive
 # is the only supported mode; 4.7 additionally forbids manual thinking entirely
 # and drops temperature/top_p/top_k).
-_ADAPTIVE_THINKING_SUBSTRINGS = ("4-6", "4.6", "4-7", "4.7")
+_ADAPTIVE_THINKING_SUBSTRINGS = ("4-6", "4.6", "4-7", "4.7", "4-8", "4.8")
 
 # Models where temperature/top_p/top_k return 400 if set to non-default values.
 # This is the Opus 4.7 contract; future 4.x+ models are expected to follow it.
-_NO_SAMPLING_PARAMS_SUBSTRINGS = ("4-7", "4.7")
+_NO_SAMPLING_PARAMS_SUBSTRINGS = ("4-7", "4.7", "4-8", "4.8")
 _FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-6", "opus-4.6")
 
 # ── Max output token limits per Anthropic model ───────────────────────
@@ -92,6 +94,8 @@ _FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-6", "opus-4.6")
 # max_tokens as a mandatory field.  Previously we hardcoded 16384, which
 # starves thinking-enabled models (thinking tokens count toward the limit).
 _ANTHROPIC_OUTPUT_LIMITS = {
+    # Claude 4.8
+    "claude-opus-4-8":   128_000,
     # Claude 4.7
     "claude-opus-4-7":   128_000,
     # Claude 4.6
@@ -817,6 +821,7 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
             capture_output=True,
             text=True,
             timeout=5,
+            stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.TimeoutExpired):
         logger.debug("Keychain: security command not available or timed out")
@@ -887,20 +892,6 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
         except (json.JSONDecodeError, OSError, IOError) as e:
             logger.debug("Failed to read ~/.claude/.credentials.json: %s", e)
 
-    return None
-
-
-def read_claude_managed_key() -> Optional[str]:
-    """Read Claude's native managed key from ~/.claude.json for diagnostics only."""
-    claude_json = Path.home() / ".claude.json"
-    if claude_json.exists():
-        try:
-            data = json.loads(claude_json.read_text(encoding="utf-8"))
-            primary_key = data.get("primaryApiKey", "")
-            if isinstance(primary_key, str) and primary_key.strip():
-                return primary_key.strip()
-        except (json.JSONDecodeError, OSError, IOError) as e:
-            logger.debug("Failed to read ~/.claude.json: %s", e)
     return None
 
 
@@ -1040,11 +1031,34 @@ def _write_claude_code_credentials(
         existing["claudeAiOauth"] = oauth_data
 
         cred_path.parent.mkdir(parents=True, exist_ok=True)
-        _tmp_cred = cred_path.with_suffix(".tmp")
-        _tmp_cred.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-        _tmp_cred.replace(cred_path)
-        # Restrict permissions (credentials file)
-        cred_path.chmod(0o600)
+        # Per-process random suffix avoids collisions between concurrent
+        # writers and stale leftovers from a prior crashed write.
+        _tmp_cred = cred_path.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
+        try:
+            # Create the temp file atomically at 0o600. The previous
+            # write_text + post-replace chmod opened a TOCTOU window where
+            # both the temp file and the destination briefly inherited the
+            # process umask (commonly 0o644 = world-readable), exposing
+            # Claude Code OAuth tokens to other local users between create
+            # and chmod. Mirrors agent/google_oauth.py (#19673) and
+            # tools/mcp_oauth.py (#21148). Parent dir (~/.claude/) is
+            # owned by Claude Code itself, so we leave its mode alone.
+            fd = os.open(
+                str(_tmp_cred),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                stat.S_IRUSR | stat.S_IWUSR,
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(existing, fh, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(_tmp_cred, cred_path)
+        except OSError:
+            try:
+                _tmp_cred.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
     except (OSError, IOError) as e:
         logger.debug("Failed to write refreshed credentials: %s", e)
 
@@ -1150,7 +1164,10 @@ def run_oauth_setup_token() -> Optional[str]:
             "Install it with: npm install -g @anthropic-ai/claude-code"
         )
 
-    # Run interactively — stdin/stdout/stderr inherited so user can interact
+    # Run interactively — stdin/stdout/stderr inherited so the user can
+    # complete the OAuth login prompt. Must keep inherited stdin; the TUI-EOF
+    # concern does not apply to an interactive login the user explicitly
+    # invokes.  noqa: subprocess-stdin
     try:
         subprocess.run([claude_path, "setup-token"])
     except (KeyboardInterrupt, EOFError):
@@ -1229,10 +1246,16 @@ def run_hermes_oauth_login_pure() -> Optional[Dict[str, Any]]:
     print()
 
     try:
-        webbrowser.open(auth_url)
-        print("  (Browser opened automatically)")
+        from hermes_cli.auth import _can_open_graphical_browser as _can_open_gui
     except Exception:
-        pass
+        _can_open_gui = lambda: True  # noqa: E731 — degrade to prior behavior
+
+    if _can_open_gui():
+        try:
+            webbrowser.open(auth_url)
+            print("  (Browser opened automatically)")
+        except Exception:
+            pass
 
     print()
     print("After authorizing, you'll see a code. Paste it below.")
@@ -1764,11 +1787,25 @@ def _strip_orphaned_tool_blocks(result: List[Dict[str, Any]]) -> None:
                     tool_result_ids.add(block.get("tool_use_id"))
     for m in result:
         if m["role"] == "assistant" and isinstance(m["content"], list):
-            m["content"] = [
+            kept = [
                 b
                 for b in m["content"]
                 if b.get("type") != "tool_use" or b.get("id") in tool_result_ids
             ]
+            # If stripping an orphaned tool_use mutated a turn that also carries a
+            # signed thinking block, that block's Anthropic signature was computed
+            # against the ORIGINAL (un-stripped) turn content and is now invalid.
+            # Anthropic rejects the replayed turn with HTTP 400 "thinking blocks in
+            # the latest assistant message cannot be modified".  Flag the turn so
+            # _manage_thinking_signatures can demote the dead signature instead of
+            # replaying it verbatim.  See hermes-agent: extended-thinking + parallel
+            # tool batch interrupted mid-flight → non-retryable 400 crash-loop.
+            if len(kept) != len(m["content"]) and any(
+                isinstance(b, dict) and b.get("type") in {"thinking", "redacted_thinking"}
+                for b in m["content"]
+            ):
+                m["_thinking_signature_invalidated"] = True
+            m["content"] = kept
             if not m["content"]:
                 m["content"] = [{"type": "text", "text": "(tool call removed)"}]
 
@@ -1813,6 +1850,10 @@ def _merge_consecutive_roles(result: List[Dict[str, Any]]) -> List[Dict[str, Any
                     fixed[-1]["content"] = prev_content + curr_content
             else:
                 # Consecutive assistant messages — merge text content.
+                # Propagate the orphan-strip signature-invalidation flag onto the
+                # surviving (prev) dict so _manage_thinking_signatures still sees it.
+                if m.get("_thinking_signature_invalidated"):
+                    fixed[-1]["_thinking_signature_invalidated"] = True
                 # Drop thinking blocks from the *second* message: their
                 # signature was computed against a different turn boundary
                 # and becomes invalid once merged.
@@ -1901,10 +1942,25 @@ def _manage_thinking_signatures(
         else:
             # Latest assistant on direct Anthropic: keep signed, downgrade unsigned
             # to text so the reasoning isn't lost.
+            #
+            # Exception: if orphan-stripping (or another structural mutation) removed
+            # a tool_use block from THIS turn, every thinking signature on it was
+            # computed against the original turn content and is now dead.  Anthropic
+            # rejects the turn either way — replaying the signed block 400s with
+            # "thinking blocks in the latest assistant message cannot be modified",
+            # and a bare signed block with no following tool_use is also invalid.
+            # Demote ALL thinking blocks on this turn to text so the turn replays
+            # cleanly and the model can re-plan from the surviving tool results.
+            signature_dead = bool(m.get("_thinking_signature_invalidated"))
             new_content = []
             for b in m["content"]:
                 if not isinstance(b, dict) or b.get("type") not in _THINKING_TYPES:
                     new_content.append(b)
+                    continue
+                if signature_dead:
+                    thinking_text = b.get("thinking", "")
+                    if thinking_text:
+                        new_content.append({"type": "text", "text": thinking_text})
                     continue
                 if b.get("type") == "redacted_thinking":
                     # Redacted blocks use 'data' for the signature payload —
@@ -1924,6 +1980,9 @@ def _manage_thinking_signatures(
         for b in m["content"]:
             if isinstance(b, dict) and b.get("type") in _THINKING_TYPES:
                 b.pop("cache_control", None)
+
+        # Drop the internal bookkeeping flag — it must never reach the API payload.
+        m.pop("_thinking_signature_invalidated", None)
 
 
 def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:
@@ -2122,9 +2181,13 @@ def build_anthropic_kwargs(
                 block["text"] = text
 
         # 3. Prefix tool names with mcp_ (Claude Code convention)
+        #    Skip names that already begin with the marker — native MCP server
+        #    tools (from mcp_servers: in config.yaml) are registered under their
+        #    full mcp_<server>_<tool> name and would double-prefix otherwise,
+        #    breaking round-trip registry lookup in normalize_response. GH-25255.
         if anthropic_tools:
             for tool in anthropic_tools:
-                if "name" in tool:
+                if "name" in tool and not tool["name"].startswith(_MCP_TOOL_PREFIX):
                     tool["name"] = _MCP_TOOL_PREFIX + tool["name"]
 
         # 4. Prefix tool names in message history (tool_use and tool_result blocks)
@@ -2242,3 +2305,43 @@ def build_anthropic_kwargs(
         kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
 
     return kwargs
+
+
+# Keys that belong exclusively to the OpenAI Responses / Codex API shape.
+# The Anthropic Messages SDK (``messages.create()`` / ``messages.stream()``)
+# raises ``TypeError: ... got an unexpected keyword argument`` on any of them.
+_RESPONSES_ONLY_KWARGS = frozenset(
+    {"instructions", "input", "store", "parallel_tool_calls"}
+)
+
+
+def sanitize_anthropic_kwargs(api_kwargs: Any, *, log_prefix: str = "") -> Any:
+    """Drop Responses-API-only keys before an Anthropic Messages SDK call.
+
+    Defensive boundary guard for #31673: under rare api_mode-flip races
+    (e.g. a concurrent auxiliary call mutating a shared agent between the
+    kwargs build and the stream dispatch), a Responses-shaped payload
+    carrying ``instructions=`` can reach ``messages.stream()`` /
+    ``messages.create()``. The Anthropic SDK rejects it with a
+    non-retryable ``TypeError`` that nukes the whole turn and propagates
+    the entire fallback chain.
+
+    Mutates ``api_kwargs`` in place and returns it. When a foreign key is
+    present we log a WARNING so the underlying race stays visible in the
+    wild instead of being silently papered over.
+    """
+    if not isinstance(api_kwargs, dict):
+        return api_kwargs
+    leaked = _RESPONSES_ONLY_KWARGS.intersection(api_kwargs)
+    if leaked:
+        for _key in leaked:
+            api_kwargs.pop(_key, None)
+        logger.warning(
+            "%sStripped Responses-only kwarg(s) %s from an Anthropic Messages "
+            "call (api_mode flip race — see #31673). The call will proceed; "
+            "this breadcrumb means a kwargs build ran under a Responses "
+            "api_mode while dispatch ran under anthropic_messages.",
+            log_prefix,
+            sorted(leaked),
+        )
+    return api_kwargs
