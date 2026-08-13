@@ -780,6 +780,7 @@ class AIAgent:
         self.session_reasoning_tokens = 0
         self.session_api_calls = 0
         self.session_estimated_cost_usd = 0.0
+        self.session_actual_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
         
@@ -2688,6 +2689,8 @@ class AIAgent:
         cu = normalize_usage(raw_usage, provider=self.provider, api_mode=self.api_mode)
         summary = asdict(cu)
         summary.pop("raw_usage", None)
+        if summary.get("actual_cost_usd") is not None:
+            summary["actual_cost_usd"] = float(summary["actual_cost_usd"])
         summary["prompt_tokens"] = cu.prompt_tokens
         summary["total_tokens"] = cu.total_tokens
         return summary

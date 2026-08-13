@@ -90,7 +90,7 @@ from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
 from agent.turn_finalizer import finalize_turn
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import estimate_usage_cost, normalize_usage, reported_usage_cost
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
@@ -3761,8 +3761,11 @@ def run_conversation(
                         base_url=_agg_cost_base_url,
                         api_key=getattr(agent, "api_key", ""),
                     )
+                    actual_cost_result = reported_usage_cost(aggregator_usage)
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
+                    if actual_cost_result is not None and actual_cost_result.amount_usd is not None:
+                        agent.session_actual_cost_usd += float(actual_cost_result.amount_usd)
                     # Add MoA advisor cost (already priced per-advisor at each
                     # advisor's own model rate) on top of the aggregator cost.
                     if _moa_ref_cost is not None:
@@ -3770,8 +3773,9 @@ def run_conversation(
                             agent.session_estimated_cost_usd += float(_moa_ref_cost)
                         except (TypeError, ValueError):  # pragma: no cover - defensive
                             pass
-                    agent.session_cost_status = cost_result.status
-                    agent.session_cost_source = cost_result.source
+                    effective_cost_result = actual_cost_result or cost_result
+                    agent.session_cost_status = effective_cost_result.status
+                    agent.session_cost_source = effective_cost_result.source
 
                     # Persist token counts to session DB for /insights.
                     # Do this for every platform with a session_id so non-CLI
@@ -3797,6 +3801,12 @@ def run_conversation(
                             _cost_delta = None
                             if cost_result.amount_usd is not None:
                                 _cost_delta = float(cost_result.amount_usd)
+                            _actual_cost_delta = (
+                                float(actual_cost_result.amount_usd)
+                                if actual_cost_result is not None
+                                and actual_cost_result.amount_usd is not None
+                                else None
+                            )
                             if _moa_ref_cost is not None:
                                 try:
                                     _cost_delta = (_cost_delta or 0.0) + float(_moa_ref_cost)
@@ -3815,8 +3825,9 @@ def run_conversation(
                                 cache_write_tokens=canonical_usage.cache_write_tokens,
                                 reasoning_tokens=canonical_usage.reasoning_tokens,
                                 estimated_cost_usd=_cost_delta,
-                                cost_status=cost_result.status,
-                                cost_source=cost_result.source,
+                                actual_cost_usd=_actual_cost_delta,
+                                cost_status=effective_cost_result.status,
+                                cost_source=effective_cost_result.source,
                                 billing_provider=agent.provider,
                                 billing_base_url=agent.base_url,
                                 billing_mode="subscription_included"

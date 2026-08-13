@@ -137,6 +137,7 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
 
         report = {
             "estimated_cost_usd": result.get("estimated_cost_usd"),
+            "actual_cost_usd": result.get("actual_cost_usd"),
             "cost_status": result.get("cost_status"),
             "cost_source": result.get("cost_source"),
             "input_tokens": result.get("input_tokens"),

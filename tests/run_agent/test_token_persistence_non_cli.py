@@ -25,6 +25,7 @@ def _make_agent(session_db, *, platform: str):
         agent = AIAgent(
             api_key="test-key",
             base_url="https://openrouter.ai/api/v1",
+            provider="openrouter",
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
@@ -54,6 +55,29 @@ def test_run_conversation_persists_tokens_for_telegram_sessions():
     # (queue_token_counts) rather than written inline on the turn thread.
     session_db.queue_token_counts.assert_called_once()
     assert session_db.queue_token_counts.call_args.args[0] == "telegram-session"
+
+
+def test_run_conversation_persists_openrouter_reported_cost_as_actual():
+    session_db = MagicMock()
+    agent = _make_agent(session_db, platform="telegram")
+    agent.client.chat.completions.create.return_value = _mock_response(
+        usage={
+            "prompt_tokens": 11,
+            "completion_tokens": 7,
+            "total_tokens": 18,
+            "cost": 0.012345,
+        }
+    )
+
+    result = agent.run_conversation("hello")
+
+    assert result["actual_cost_usd"] == 0.012345
+    assert result["cost_status"] == "actual"
+    assert result["cost_source"] == "provider_cost_api"
+    persisted = session_db.queue_token_counts.call_args.kwargs
+    assert persisted["actual_cost_usd"] == 0.012345
+    assert persisted["cost_status"] == "actual"
+    assert persisted["cost_source"] == "provider_cost_api"
 
 
 

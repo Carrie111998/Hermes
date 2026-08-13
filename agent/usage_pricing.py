@@ -78,6 +78,7 @@ class CanonicalUsage:
     cache_write_tokens: int = 0
     reasoning_tokens: int = 0
     request_count: int = 1
+    actual_cost_usd: Optional[Decimal] = None
     raw_usage: Optional[dict[str, Any]] = None
 
     @property
@@ -104,6 +105,12 @@ class CanonicalUsage:
             cache_write_tokens=self.cache_write_tokens + other.cache_write_tokens,
             reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
             request_count=self.request_count + other.request_count,
+            actual_cost_usd=(
+                self.actual_cost_usd + other.actual_cost_usd
+                if self.actual_cost_usd is not None
+                and other.actual_cost_usd is not None
+                else None
+            ),
             raw_usage=None,
         )
 
@@ -1349,12 +1356,41 @@ def normalize_usage(
             cache_read_tokens, cache_write_tokens,
         )
 
+    actual_cost_usd = None
+    if provider_name == "openrouter":
+        reported_cost = _to_decimal(getattr(response_usage, "cost", None))
+        if reported_cost is not None and reported_cost.is_finite() and reported_cost >= _ZERO:
+            actual_cost_usd = reported_cost
+
     return CanonicalUsage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
+        actual_cost_usd=actual_cost_usd,
+    )
+
+
+def reported_usage_cost(usage: CanonicalUsage) -> Optional[CostResult]:
+    """Return the provider-reported charge carried by a usage response.
+
+    ``normalize_usage`` only accepts this field from providers whose response
+    contract defines it as the account charge.  OpenRouter currently supplies
+    ``usage.cost`` on every completed response, including the final streaming
+    event.  Callers should persist this result as actual cost while retaining
+    ``estimate_usage_cost`` as an independent fallback/comparison value.
+    """
+    if usage.actual_cost_usd is None:
+        return None
+    label = format_cost_label(usage.actual_cost_usd)
+    if label.startswith("~"):
+        label = label[1:]
+    return CostResult(
+        amount_usd=usage.actual_cost_usd,
+        status="actual",
+        source="provider_cost_api",
+        label=label,
     )
 
 

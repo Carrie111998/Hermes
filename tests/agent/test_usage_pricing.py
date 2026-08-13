@@ -6,6 +6,7 @@ from agent.usage_pricing import (
     estimate_usage_cost,
     get_pricing_entry,
     normalize_usage,
+    reported_usage_cost,
     resolve_billing_route,
 )
 from decimal import Decimal
@@ -458,3 +459,38 @@ class TestSubscriptionIncludedNotes:
         assert result.amount_usd == Decimal("0")
         assert len(result.notes) > 0
         assert any("subscription" in note.lower() for note in result.notes)
+
+
+def test_openrouter_usage_cost_is_preserved_as_provider_reported_actual():
+    usage = SimpleNamespace(
+        prompt_tokens=100,
+        completion_tokens=20,
+        cost="0.012345",
+    )
+
+    normalized = normalize_usage(
+        usage,
+        provider="openrouter",
+        api_mode="chat_completions",
+    )
+    actual = reported_usage_cost(normalized)
+
+    assert normalized.actual_cost_usd == Decimal("0.012345")
+    assert actual is not None
+    assert actual.amount_usd == Decimal("0.012345")
+    assert actual.status == "actual"
+    assert actual.source == "provider_cost_api"
+    assert actual.label == "$0.01"
+
+
+def test_usage_cost_is_not_trusted_for_openai_compatible_providers_generically():
+    usage = SimpleNamespace(prompt_tokens=100, completion_tokens=20, cost="0.012345")
+
+    normalized = normalize_usage(
+        usage,
+        provider="custom",
+        api_mode="chat_completions",
+    )
+
+    assert normalized.actual_cost_usd is None
+    assert reported_usage_cost(normalized) is None

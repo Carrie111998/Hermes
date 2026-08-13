@@ -8,6 +8,7 @@ from hermes_cli.oneshot import _write_usage_file
 def _result(**overrides):
     base = {
         "estimated_cost_usd": 0.1234,
+        "actual_cost_usd": 0.12,
         "cost_status": "estimated",
         "cost_source": "pricing-table",
         "input_tokens": 1000,
@@ -33,6 +34,7 @@ class TestWriteUsageFile:
         _write_usage_file(str(path), _result())
         report = json.loads(path.read_text())
         assert report["estimated_cost_usd"] == 0.1234
+        assert report["actual_cost_usd"] == 0.12
         assert report["input_tokens"] == 1000
         assert report["output_tokens"] == 200
         assert report["model"] == "openai/gpt-5.5"
@@ -53,5 +55,4 @@ class TestWriteUsageFile:
         assert report["failure"] == "boom"
         # Missing result fields serialize as null, not KeyError.
         assert report["estimated_cost_usd"] is None
-
-
+        assert report["actual_cost_usd"] is None
