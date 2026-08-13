@@ -601,18 +601,23 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
     # user turn) separates them — an intervening ``tool`` message means
     # two distinct, valid tool-call rounds that must NOT be merged.
     #
-    # Codex Responses interim turns are exempt: the codex_responses
-    # api_mode legitimately keeps multiple consecutive incomplete
+    # Codex Responses interim turns are exempt only for the codex_responses
+    # api_mode: it legitimately keeps multiple consecutive incomplete
     # assistant turns in history, each carrying its own encrypted
     # continuation state (codex_reasoning_items / codex_message_items)
     # that must be replayed verbatim. Collapsing them corrupts the
     # Responses replay chain (the duplicate-detection logic at
     # conversation_loop.py already de-dups identical codex interims).
+    api_mode = getattr(agent, "api_mode", None)
+
     def _is_codex_interim(m: Dict) -> bool:
         return bool(
-            m.get("codex_reasoning_items")
-            or m.get("codex_message_items")
-            or m.get("finish_reason") == "incomplete"
+            api_mode == "codex_responses"
+            and (
+                m.get("codex_reasoning_items")
+                or m.get("codex_message_items")
+                or m.get("finish_reason") == "incomplete"
+            )
         )
 
     def _is_verification_candidate(m: Dict) -> bool:

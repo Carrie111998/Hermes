@@ -9,6 +9,8 @@ providers (violating role alternation), which retriggered the empty-retry
 recovery every turn.
 """
 
+import pytest
+
 from run_agent import AIAgent
 
 
@@ -157,6 +159,81 @@ def test_repair_keeps_tool_matching_only_call_id():
     assert any(m.get("role") == "tool" for m in messages)
 
 
+@pytest.mark.parametrize(
+    ("interim_field", "interim_value"),
+    [
+        ("codex_reasoning_items", [{"id": "rs-1"}]),
+        ("codex_message_items", [{"id": "msg-1"}]),
+        ("finish_reason", "incomplete"),
+    ],
+)
+def test_repair_keeps_codex_replay_turns_separate_for_codex_responses(
+    interim_field, interim_value
+):
+    agent = _bare_agent()
+    agent.api_mode = "codex_responses"
+    messages = [
+        {"role": "user", "content": "do it"},
+        {
+            "role": "assistant",
+            "content": "",
+            interim_field: interim_value,
+        },
+        {
+            "role": "assistant",
+            "content": "continued",
+            interim_field: interim_value,
+        },
+    ]
+
+    assert AIAgent._repair_message_sequence(agent, messages) == 0
+    assert len(messages) == 3
+
+
+@pytest.mark.parametrize(
+    ("with_agent", "api_mode"),
+    [
+        (True, "chat_completions"),
+        (True, ""),
+        (True, None),
+        (True, "unknown"),
+        (False, None),
+    ],
+)
+@pytest.mark.parametrize(
+    ("interim_field", "interim_value"),
+    [
+        ("codex_reasoning_items", [{"id": "rs-1"}]),
+        ("codex_message_items", [{"id": "msg-1"}]),
+        ("finish_reason", "incomplete"),
+    ],
+)
+def test_repair_merges_codex_interims_outside_codex_responses(
+    with_agent, api_mode, interim_field, interim_value
+):
+    agent = _bare_agent() if with_agent else None
+    if agent is not None:
+        agent.api_mode = api_mode
+    messages = [
+        {"role": "user", "content": "do it"},
+        {
+            "role": "assistant",
+            "content": "",
+            interim_field: interim_value,
+        },
+        {
+            "role": "assistant",
+            "content": "continued",
+            interim_field: interim_value,
+        },
+        {"role": "user", "content": "next"},
+    ]
+
+    assert repair_message_sequence(agent, messages) == 1
+    assert [message["role"] for message in messages] == ["user", "assistant", "user"]
+    assert messages[1]["content"] == "continued"
+
+
 
 
 
@@ -171,7 +248,7 @@ def test_repair_keeps_tool_matching_only_call_id():
 
 # ── repair_message_sequence_with_cursor (#44837) ───────────────────────────
 
-from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
+from agent.agent_runtime_helpers import repair_message_sequence, repair_message_sequence_with_cursor
 
 
 def test_cursor_clamped_when_compaction_shrinks_below_cursor():
@@ -368,7 +445,6 @@ def test_sanitize_drops_empty_tool_calls_array():
 # "all messages must have non-empty content except for the optional final
 # assistant message" (INVALID_REQUEST_BODY). sanitize_api_messages now heals
 # such turns on the per-call copy so the session recovers itself in memory.
-
 
 
 
