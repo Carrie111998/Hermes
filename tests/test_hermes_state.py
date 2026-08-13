@@ -3,6 +3,7 @@
 import sqlite3
 import time
 import json
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -115,7 +116,7 @@ class TestConnectionLifecycle:
 
         assert not any("wal_checkpoint" in sql.lower() for sql in executed)
 
-    def test_writable_close_retains_truncate_checkpoint(self, tmp_path):
+    def test_writable_close_uses_passive_checkpoint(self, tmp_path):
         db_path = tmp_path / "state.db"
         writable = SessionDB(db_path=db_path)
         executed = []
@@ -123,8 +124,15 @@ class TestConnectionLifecycle:
 
         writable.close()
 
-        assert any(
+        # close() must NOT TRUNCATE: transient per-cron-run connections firing
+        # full WAL resets race the gateway's live writer and corrupt B-tree
+        # pages (issue #45383). It uses PASSIVE instead.
+        assert not any(
             "pragma wal_checkpoint(truncate)" == " ".join(sql.lower().split())
+            for sql in executed
+        )
+        assert any(
+            "pragma wal_checkpoint(passive)" == " ".join(sql.lower().split())
             for sql in executed
         )
 
@@ -2281,6 +2289,45 @@ class TestVacuum:
         assert vacuum_calls == [True, True]
         assert db.get_meta("last_vacuum") is not None
 
+    def test_wal_size_limit_is_bounded(self, db):
+        """journal_size_limit must be a finite bound, not SQLite's -1 default.
+
+        Contract, not a snapshot: assert the limit is positive (so the WAL is
+        truncated back at checkpoints) rather than pinning the exact byte
+        count, which is a tunable.
+        """
+        mode = db._conn.execute("PRAGMA journal_mode").fetchone()[0]
+        if str(mode).lower() != "wal":
+            pytest.skip("WAL unavailable on this filesystem")
+        limit = db._conn.execute("PRAGMA journal_size_limit").fetchone()[0]
+        assert limit > 0, "unbounded WAL: state.db-wal never returns disk to the OS"
+
+    def test_vacuum_leaves_wal_truncated(self, db, tmp_path):
+        """VACUUM must not strand a giant WAL beside the database.
+
+        VACUUM rewrites every page through the write-ahead log. Without a
+        checkpoint *after* it, a 3 GB database leaves a 3 GB state.db-wal
+        behind — `sessions optimize` then consumes far more disk than it
+        frees, which is the opposite of its purpose.
+        """
+        mode = db._conn.execute("PRAGMA journal_mode").fetchone()[0]
+        if str(mode).lower() != "wal":
+            pytest.skip("WAL unavailable on this filesystem")
+
+        db.create_session(session_id="s1", source="cli")
+        for i in range(500):
+            db.append_message(
+                session_id="s1", role="user", content=f"padding message {i} " * 20
+            )
+        db.vacuum()
+
+        wal = Path(str(db.db_path) + "-wal")
+        if wal.exists():
+            limit = db._conn.execute("PRAGMA journal_size_limit").fetchone()[0]
+            assert wal.stat().st_size <= max(limit, 0) or wal.stat().st_size == 0, (
+                f"WAL left at {wal.stat().st_size} bytes after VACUUM"
+            )
+
 
 class TestOptimizeFts:
     def test_optimize_returns_index_count(self, db):
@@ -3496,6 +3543,41 @@ def test_gateway_session_peer_round_trip_and_recovery(db):
     assert recovered["id"] == "gw-session"
 
 
+@pytest.mark.parametrize(
+    "persisted_session_key",
+    ["agent:main:telegram:dm:chat-1", None],
+    ids=["exact-key", "peer-fallback"],
+)
+def test_gateway_session_recovery_does_not_cross_newer_reset_boundary(
+    db, persisted_session_key
+):
+    """A newer session_reset row fences recovery for the peer (#68539).
+
+    Recovery must never reach *behind* an intentional /new boundary and
+    resurrect an older still-open row — if the newest boundary row for the
+    peer is reset-ended, recovery returns nothing.
+    """
+    peer = {
+        "user_id": "user-1",
+        "session_key": persisted_session_key,
+        "chat_id": "chat-1",
+        "chat_type": "dm",
+    }
+    db.create_session("gw-before-reset", "telegram", **peer)
+    db.append_message("gw-before-reset", "user", "old context")
+    db.create_session("gw-reset", "telegram", **peer)
+    db.append_message("gw-reset", "user", "/new")
+    db.end_session("gw-reset", "session_reset")
+
+    assert db.find_latest_gateway_session_for_peer(
+        source="telegram",
+        user_id="user-1",
+        session_key="agent:main:telegram:dm:chat-1",
+        chat_id="chat-1",
+        chat_type="dm",
+    ) is None
+
+
 
 
 
@@ -4503,3 +4585,86 @@ class TestPerformancePragmasEndToEnd:
             assert self._read(ro._conn) == defaults
         finally:
             ro.close()
+
+
+class TestFts5SanitizerCharacterClass:
+    """Every character FTS5 rejects outside a quoted phrase must be stripped.
+
+    A survivor reaches MATCH raw and raises, which the execute site swallows
+    into zero results — so the search silently finds nothing rather than
+    erroring. Assertions run the sanitized text against a real FTS5 table.
+    """
+
+    @staticmethod
+    def _fts_table():
+        import sqlite3
+
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE VIRTUAL TABLE t USING fts5(content)")
+        conn.execute(
+            "INSERT INTO t (content) VALUES "
+            "('meet me at user host about gateway run py it s 50 a b')"
+        )
+        return conn
+
+    @staticmethod
+    def _sanitize(query):
+        from hermes_state_search import SessionSearchMixin
+
+        return SessionSearchMixin._sanitize_fts5_query(query)
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "it's",                 # apostrophe — ordinary prose
+            "gateway/run.py",       # path separator
+            "user@host",            # email / handle
+            "a,b",                  # comma
+            "why?",                 # question mark
+            "e=mc2",                # equals
+            "a;b", "a!b", "a&b", "a|b", "x~y",
+            "#tag", "$dollar", "[bracket]", "<tag>",
+            r"C:\path\file",        # backslash
+        ],
+    )
+    def test_query_stays_parsable(self, query):
+        conn = self._fts_table()
+        sanitized = self._sanitize(query)
+        if not sanitized.strip():
+            return
+        # Raises sqlite3.OperationalError if a special character survived.
+        conn.execute("SELECT count(*) FROM t WHERE t MATCH ?", (sanitized,)).fetchone()
+
+    def test_plain_terms_are_untouched(self):
+        assert self._sanitize("hello world").split() == ["hello", "world"]
+
+    def test_quoted_phrase_survives(self):
+        assert '"exact phrase"' in self._sanitize('"exact phrase"')
+
+    def test_hyphen_dotted_term_still_quoted(self):
+        # Step 5's behaviour must not regress: my-app.config.ts stays one term.
+        assert '"my-app.config.ts"' in self._sanitize("my-app.config.ts")
+
+    def test_prefix_star_still_works(self):
+        conn = self._fts_table()
+        sanitized = self._sanitize("gate*")
+        rows = conn.execute(
+            "SELECT count(*) FROM t WHERE t MATCH ?", (sanitized,)
+        ).fetchone()
+        assert rows[0] == 1
+
+    def test_percent_stripped_for_non_cjk_query(self):
+        # % is kept only for the CJK LIKE fallback; a non-CJK query never
+        # reaches that fallback, so % must be stripped before MATCH.
+        conn = self._fts_table()
+        sanitized = self._sanitize("50%")
+        assert "%" not in sanitized
+        conn.execute(
+            "SELECT count(*) FROM t WHERE t MATCH ?", (sanitized,)
+        ).fetchone()
+
+    def test_percent_preserved_for_cjk_query(self):
+        # The CJK LIKE fallback builds its own pattern from the sanitized
+        # text; keep % intact there (pre-existing contract).
+        sanitized = self._sanitize("完成50%")
+        assert "%" in sanitized
