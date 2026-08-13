@@ -402,6 +402,56 @@ class TestSignalReadReceipts:
 
         assert adapter._signal_transport_profile_name == "work"
 
+    @pytest.mark.parametrize(
+        ("primary_env", "primary_value"),
+        [
+            ("SIGNAL_ALLOWED_USERS", "+15551239999"),
+            ("SIGNAL_ALLOW_ALL_USERS", "true"),
+            ("GATEWAY_ALLOWED_USERS", "+15551239999"),
+            ("GATEWAY_ALLOW_ALL_USERS", "true"),
+        ],
+    )
+    def test_secondary_receipt_auth_does_not_borrow_primary_env(
+        self, monkeypatch, primary_env, primary_value
+    ):
+        """A scoped multiplex auth miss must not fall back to another profile."""
+        from agent.secret_scope import (
+            reset_secret_scope,
+            set_multiplex_active,
+            set_secret_scope,
+        )
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setenv(primary_env, primary_value)
+        adapter = _make_signal_adapter(monkeypatch, send_read_receipts=True)
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.adapters = {}
+        runner._profile_adapters = {"work": {Platform.SIGNAL: adapter}}
+        runner._active_profile_name = lambda: "default"
+        runner.pairing_store = MagicMock()
+        runner.pairing_store.is_approved.return_value = False
+        runner.pairing_stores = {"work": MagicMock()}
+        runner.pairing_stores["work"].is_approved.return_value = False
+        adapter.gateway_runner = runner
+        adapter._signal_transport_profile_name = "work"
+        adapter.set_authorization_check(
+            runner._make_adapter_auth_check(
+                Platform.SIGNAL,
+                profile_name="work",
+            )
+        )
+
+        event = _make_receipt_event(adapter)
+        set_multiplex_active(True)
+        scope_token = set_secret_scope({"UNRELATED": "secondary-only"})
+        try:
+            assert adapter._read_receipt_target(event) is None
+        finally:
+            reset_secret_scope(scope_token)
+            set_multiplex_active(False)
+
     @pytest.mark.asyncio
     async def test_note_to_self_is_not_acknowledged(self, monkeypatch):
         adapter = _make_signal_adapter(monkeypatch, send_read_receipts=True)
