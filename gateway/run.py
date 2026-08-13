@@ -7618,10 +7618,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _running_agent_count(self) -> int:
         return len(self._running_agents)
 
+    def _active_messaging_work_count(self) -> int:
+        """Messaging work still owned by the runner or a platform adapter.
+
+        A platform owner task wraps the runner's agent work and stays alive
+        through final response persistence and delivery.  Taking the larger
+        count avoids double-counting ordinary active turns while ensuring the
+        after-turn restart wait does not end in the delivery gap after the
+        runner releases ``_running_agents`` (#84285).
+        """
+        adapter_work = 0
+        for adapter in self._iter_gateway_adapters():
+            count_fn = getattr(adapter, "active_message_work_count", None)
+            if not callable(count_fn):
+                continue
+            try:
+                adapter_work += max(0, int(count_fn()))
+            except Exception:
+                logger.debug(
+                    "Failed to count active message work for %s",
+                    getattr(adapter, "name", type(adapter).__name__),
+                    exc_info=True,
+                )
+        return max(self._running_agent_count(), adapter_work)
+
     def _active_work_count(self) -> int:
         """All agent work the gateway must expose and drain as one total."""
         return (
-            self._running_agent_count()
+            self._active_messaging_work_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
         )

@@ -144,6 +144,69 @@ async def test_request_restart_defers_stop_until_active_turn_finishes():
 
 
 @pytest.mark.asyncio
+async def test_request_restart_waits_for_final_delivery_after_agent_finishes():
+    """After-turn restart must include the adapter's final-delivery task.
+
+    ``GatewayRunner._running_agents`` is cleared when the agent handler returns,
+    before ``BasePlatformAdapter._process_message_background`` records and sends
+    the final response.  Restarting in that gap cancels the adapter task before
+    it can create a durable delivery obligation.
+    """
+    runner, adapter = make_restart_runner()
+    runner.stop = AsyncMock()
+    runner._restart_after_turn_timeout = 5.0
+    session_key = "agent:main:telegram:dm:123"
+    runner._running_agents[session_key] = MagicMock()
+
+    delivery_released = asyncio.Event()
+    delivery_task = asyncio.create_task(delivery_released.wait())
+    adapter._session_tasks[session_key] = delivery_task
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    try:
+        assert runner.request_restart(detached=False, via_service=True) is True
+
+        # The agent has produced its response, but the adapter still owns the
+        # task that persists and sends it.
+        del runner._running_agents[session_key]
+        await asyncio.sleep(0.25)
+
+        runner.stop.assert_not_awaited()
+
+        delivery_released.set()
+        await delivery_task
+        await runner._restart_task
+
+        runner.stop.assert_awaited_once_with(
+            restart=True, detached_restart=False, service_restart=True
+        )
+    finally:
+        delivery_released.set()
+        await delivery_task
+
+
+def test_active_messaging_work_count_bridges_runner_and_adapter_lifetimes():
+    """One turn remains one work unit across runner/adapter ownership."""
+    runner, adapter = make_restart_runner()
+    session_key = "agent:main:telegram:dm:123"
+    runner._running_agents[session_key] = MagicMock()
+    owner_task = MagicMock()
+    owner_task.done.return_value = False
+    adapter._session_tasks[session_key] = owner_task
+
+    # During agent execution both registries describe the same turn.
+    assert runner._active_messaging_work_count() == 1
+
+    # After the handler returns, adapter-owned final delivery keeps it live.
+    del runner._running_agents[session_key]
+    assert runner._active_messaging_work_count() == 1
+
+    # A completed owner retained for stale-guard reconciliation is not work.
+    owner_task.done.return_value = True
+    assert runner._active_messaging_work_count() == 0
+
+
+@pytest.mark.asyncio
 async def test_request_restart_after_turn_timeout_zero_enters_stop_immediately():
     """restart_after_turn_timeout=0 preserves legacy immediate drain."""
     runner, _adapter = make_restart_runner()
@@ -373,5 +436,4 @@ async def test_drain_suppress_skips_home_channel_keeps_session_ping(tmp_path, mo
     assert "999" in sent_chat_ids
     assert "home-42" not in sent_chat_ids
     assert "shutting down" in adapter.sent[0]
-
 
