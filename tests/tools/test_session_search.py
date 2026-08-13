@@ -107,6 +107,82 @@ class TestBrowseShape:
         sids = [r["session_id"] for r in result["results"]]
         assert "s_newest" not in sids
 
+    def test_browse_ranks_and_dedupes_resumed_lineage_by_latest_segment(self, db):
+        base = time.time() - 1_000
+
+        db.create_session("resume_root", source="telegram", session_key="lane")
+        db.append_message(
+            "resume_root", role="user", content="old segment", timestamp=base + 100
+        )
+        db.end_session("resume_root", "session_reset")
+        db.create_session(
+            "resume_tip",
+            source="telegram",
+            session_key="lane",
+            parent_session_id="resume_root",
+        )
+        db.append_message(
+            "resume_tip", role="user", content="resumed latest segment", timestamp=base + 900
+        )
+
+        db.create_session("independent", source="cli")
+        db.append_message(
+            "independent", role="user", content="independent work", timestamp=base + 800
+        )
+        db.create_session("fresh", source="cli")
+        db.append_message(
+            "fresh", role="user", content="fresh work", timestamp=base + 700
+        )
+
+        result = json.loads(session_search(db=db, limit=10))
+        ids = [row["session_id"] for row in result["results"]]
+
+        assert ids[:3] == ["resume_tip", "independent", "fresh"]
+        assert "resume_root" not in ids
+        assert ids.count("resume_tip") == 1
+        resumed = result["results"][0]
+        assert resumed["last_active"] == pytest.approx(base + 900)
+        assert resumed["preview"] == "resumed latest segment"
+
+    def test_browse_keeps_branches_separate_and_delegate_children_hidden(self, db):
+        base = time.time() - 500
+        db.create_session("branch_root", source="cli")
+        db.append_message(
+            "branch_root", role="user", content="root conversation", timestamp=base + 10
+        )
+        db.end_session("branch_root", "branched")
+        db.create_session(
+            "branch_child",
+            source="cli",
+            parent_session_id="branch_root",
+            model_config={"_branched_from": "branch_root"},
+        )
+        db.append_message(
+            "branch_child", role="user", content="branch conversation", timestamp=base + 30
+        )
+
+        db.create_session("delegate_parent", source="cli")
+        db.append_message(
+            "delegate_parent", role="user", content="parent work", timestamp=base + 20
+        )
+        db.create_session(
+            "delegate_child",
+            source="cli",
+            parent_session_id="delegate_parent",
+            model_config={"_delegate_from": "delegate_parent"},
+        )
+        db.append_message(
+            "delegate_child", role="assistant", content="private delegate work", timestamp=base + 40
+        )
+
+        result = json.loads(session_search(db=db, limit=10))
+        ids = [row["session_id"] for row in result["results"]]
+
+        assert "branch_root" in ids
+        assert "branch_child" in ids
+        assert "delegate_parent" in ids
+        assert "delegate_child" not in ids
+
 
 # =========================================================================
 # Discovery shape (with query)
@@ -157,6 +233,69 @@ class TestDiscoveryShape:
         result = json.loads(session_search(query="modpack", db=db, current_session_id="s_newest"))
         sids = [r["session_id"] for r in result["results"]]
         assert "s_newest" not in sids
+
+    def test_discovery_role_filter_applies_to_window_and_bookends(self, db):
+        db.create_session("s_roles", source="cli")
+        db.append_message("s_roles", role="user", content="needle from the user")
+        db.append_message("s_roles", role="assistant", content="assistant context")
+        db.append_message("s_roles", role="tool", content="tool context")
+        db.append_message("s_roles", role="user", content="user tail")
+
+        result = json.loads(session_search(
+            query="needle", role_filter="user", db=db, limit=1
+        ))
+
+        hit = result["results"][0]
+        returned = hit["bookend_start"] + hit["messages"] + hit["bookend_end"]
+        assert returned
+        assert {message["role"] for message in returned} == {"user"}
+
+    def test_discovery_bounds_large_tool_calls_in_bookends(self, db):
+        db.create_session("s_bounded", source="cli")
+        db.append_message(
+            "s_bounded", role="user", content="large opening " + "o" * 50_000
+        )
+        db.append_message(
+            "s_bounded",
+            role="assistant",
+            content="preparing a tool call",
+            tool_calls=[{
+                "id": "call-large",
+                "type": "function",
+                "function": {
+                    "name": "terminal",
+                    "arguments": json.dumps({"command": "x" * 100_000}),
+                },
+            }],
+        )
+        db.append_message("s_bounded", role="tool", content="t" * 50_000)
+        for i in range(8):
+            db.append_message("s_bounded", role="user", content=f"setup {i}")
+            db.append_message("s_bounded", role="assistant", content=f"ready {i}")
+        db.append_message(
+            "s_bounded", role="user", content="bounded payload needle"
+        )
+        for i in range(8):
+            db.append_message("s_bounded", role="assistant", content=f"tail {i}")
+            db.append_message("s_bounded", role="user", content=f"followup {i}")
+
+        raw = session_search(
+            query="bounded payload needle",
+            role_filter="user,assistant,tool",
+            db=db,
+            limit=1,
+        )
+        result = json.loads(raw)
+        hit = result["results"][0]
+        shaped_tool_call = next(
+            message
+            for message in hit["bookend_start"]
+            if message.get("tool_calls_truncated")
+        )
+
+        assert shaped_tool_call["original_tool_calls_chars"] > 100_000
+        assert len(json.dumps(shaped_tool_call["tool_calls"])) < 5_000
+        assert len(raw) < 40_000
 
 
 class TestDiscoverySort:
@@ -209,6 +348,46 @@ class TestScrollShape:
             session_id=anchor_sid, around_message_id=anchor_mid, window=999, db=db
         ))
         assert result["window"] == 20
+
+    def test_scroll_role_filter_applies_to_returned_messages(self, db):
+        db.create_session("s_scroll_roles", source="cli")
+        db.append_message("s_scroll_roles", role="user", content="ask")
+        db.append_message("s_scroll_roles", role="assistant", content="calling tool")
+        tool_id = db.append_message(
+            "s_scroll_roles", role="tool", content="tool-only payload"
+        )
+        db.append_message("s_scroll_roles", role="assistant", content="answer")
+
+        result = json.loads(session_search(
+            session_id="s_scroll_roles",
+            around_message_id=tool_id,
+            window=3,
+            role_filter="tool",
+            db=db,
+        ))
+
+        assert [message["role"] for message in result["messages"]] == ["tool"]
+
+    def test_scroll_bounds_large_requested_tool_payload(self, db):
+        db.create_session("s_scroll_bounded", source="cli")
+        db.append_message("s_scroll_bounded", role="user", content="ask")
+        tool_id = db.append_message(
+            "s_scroll_bounded", role="tool", content="z" * 100_000
+        )
+
+        raw = session_search(
+            session_id="s_scroll_bounded",
+            around_message_id=tool_id,
+            role_filter="tool",
+            db=db,
+        )
+        result = json.loads(raw)
+        message = result["messages"][0]
+
+        assert message["content_truncated"] is True
+        assert message["original_content_chars"] == 100_000
+        assert len(message["content"]) <= 4_001
+        assert len(raw) < 10_000
 
 
     def test_scroll_rejects_active_delegation_child_in_current_lineage(self, db):

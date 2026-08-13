@@ -15,8 +15,8 @@ mode parameter):
      scroll forward / backward, re-anchor on the last / first message id of
      the returned window.
 
-  3. BROWSE — no args. Returns recent sessions chronologically (titles,
-     previews, timestamps).
+  3. BROWSE — no args. Returns recent logical conversations ranked by the
+     newest resumed/reset/compression segment (titles, previews, timestamps).
 
 All three modes operate on the SQLite session DB via the FTS5 index and
 the get_anchored_view / get_messages_around primitives in hermes_state.
@@ -55,6 +55,12 @@ _DEMOTED_SESSION_SOURCES = ("cron",)
 # the handful of distinct sessions a typical query returns.
 _DISCOVER_SCAN_LIMIT = 300
 
+# How many recent session segments browse scans before lineage deduplication.
+# Gateway resets create a fresh child segment linked to the prior session, so
+# fetching only ``limit + 5`` raw roots can hide the newest work or return fewer
+# than ``limit`` logical conversations when one lineage has many segments.
+_BROWSE_SCAN_LIMIT = 300
+
 # Raw FTS rows are only a discovery-plan input. The final response hydrates
 # its own anchored message window and bookends after lineage deduplication.
 _DISCOVER_SEARCH_FIELDS = (
@@ -76,6 +82,10 @@ _COMPACTION_PREFIXES = (
     "[CONTEXT COMPACTION",
     "[CONTEXT SUMMARY]:",
 )
+
+_BOOKEND_CONTENT_LIMIT = 1_200
+_MESSAGE_CONTENT_LIMIT = 4_000
+_TOOL_CALLS_LIMIT = 4_000
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
@@ -149,6 +159,69 @@ def _resolve_to_parent(db, session_id: str) -> tuple[str, bool]:
 def _resolve_lineage(db, session_id: str) -> str:
     """Convenience: return only the lineage root (ignores compression hop)."""
     return _resolve_to_parent(db, session_id)[0]
+
+
+def _session_model_config(session: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Decode the small lineage markers stored in ``sessions.model_config``."""
+    raw = (session or {}).get("model_config")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw:
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
+def _is_delegate_segment(session: Optional[Dict[str, Any]]) -> bool:
+    """Return True for a durable delegate child, even if its source is legacy."""
+    return bool(_session_model_config(session).get("_delegate_from"))
+
+
+def _resolve_browse_lineage(
+    db,
+    session_id: str,
+    session_cache: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> str:
+    """Resolve reset/compression continuation segments to one browse lineage.
+
+    ``parent_session_id`` also represents user-created branches and delegate
+    children. Those are boundaries, not resumed segments: branches remain
+    independently browseable and delegates stay hidden. Gateway reset children
+    carry neither marker, so they continue walking to the prior segment.
+    """
+    if not session_id:
+        return session_id
+    cache = session_cache if session_cache is not None else {}
+
+    def _get(sid: str) -> Dict[str, Any]:
+        if sid not in cache:
+            try:
+                cache[sid] = db.get_session(sid) or {}
+            except Exception:
+                cache[sid] = {}
+        return cache[sid]
+
+    current = session_id
+    visited: set[str] = set()
+    while current and current not in visited:
+        visited.add(current)
+        session = _get(current)
+        parent_id = session.get("parent_session_id")
+        if not parent_id:
+            break
+        config = _session_model_config(session)
+        if config.get("_branched_from") or config.get("_delegate_from"):
+            break
+        parent = _get(parent_id)
+        # Legacy branches predate the durable _branched_from marker. The
+        # parent's end reason is their remaining discriminator.
+        if parent.get("end_reason") == "branched":
+            break
+        current = parent_id
+    return current
 
 
 def _is_compression_ended(db, session_id: str) -> bool:
@@ -251,6 +324,7 @@ def _shape_message(
     m: Dict[str, Any],
     anchor_id: Optional[int] = None,
     max_content_len: Optional[int] = None,
+    max_tool_calls_len: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Slim a message row for the tool response. Keeps content even if empty.
 
@@ -273,6 +347,29 @@ def _shape_message(
         content = raw_content
         truncated = False
         original_chars = None
+    raw_tool_calls = m.get("tool_calls")
+    tool_calls = raw_tool_calls
+    tool_calls_truncated = False
+    original_tool_calls_chars = None
+    if max_tool_calls_len and raw_tool_calls:
+        try:
+            encoded_tool_calls = json.dumps(
+                raw_tool_calls, ensure_ascii=False, separators=(",", ":")
+            )
+        except (TypeError, ValueError):
+            encoded_tool_calls = str(raw_tool_calls)
+        if len(encoded_tool_calls) > max_tool_calls_len:
+            # Preserve the historical list shape while making the truncation
+            # explicit. A compact JSON preview is enough to identify the call;
+            # session_search scroll can retrieve adjacent prose without
+            # injecting a multi-megabyte argument block into the active turn.
+            tool_calls = [{
+                "truncated": True,
+                "preview": encoded_tool_calls[:max_tool_calls_len] + "…",
+            }]
+            tool_calls_truncated = True
+            original_tool_calls_chars = len(encoded_tool_calls)
+
     entry = {
         "id": m.get("id"),
         "role": m.get("role"),
@@ -281,8 +378,8 @@ def _shape_message(
     }
     if m.get("tool_name"):
         entry["tool_name"] = m.get("tool_name")
-    if m.get("tool_calls"):
-        entry["tool_calls"] = m.get("tool_calls")
+    if tool_calls:
+        entry["tool_calls"] = tool_calls
     if m.get("tool_call_id"):
         entry["tool_call_id"] = m.get("tool_call_id")
     if anchor_id is not None and m.get("id") == anchor_id:
@@ -290,6 +387,9 @@ def _shape_message(
     if truncated:
         entry["content_truncated"] = True
         entry["original_content_chars"] = original_chars
+    if tool_calls_truncated:
+        entry["tool_calls_truncated"] = True
+        entry["original_tool_calls_chars"] = original_tool_calls_chars
     # Strip None values to keep payload tight, but always keep content
     # (absent content is meaningful — tool-call-only assistant turns).
     return {k: v for k, v in entry.items() if v is not None or k in ("content",)}
@@ -435,30 +535,57 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
 
 
 def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_profile: str = None) -> str:
-    """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
+    """Return recent logical conversations, ranked by their freshest segment."""
     try:
+        # Reset and compression continuations are durable child rows. Read raw
+        # segments (rather than root-only projection) so a fresh continuation's
+        # activity can rank the lineage and provide the preview/link returned to
+        # the model. The rows already arrive newest-first.
         sessions = db.list_sessions_rich(
-            limit=limit + 5,
+            limit=max(_BROWSE_SCAN_LIMIT, limit + 5),
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            include_children=True,
+            project_compression_tips=False,
             order_by_last_active=True,
-        )  # fetch extra so we can skip current
+            compact_rows=True,
+        )
+        session_cache = {
+            str(s.get("id")): s for s in sessions if s.get("id")
+        }
+        current_root = (
+            _resolve_browse_lineage(db, current_session_id, session_cache)
+            if current_session_id
+            else None
+        )
 
-        current_root = _resolve_lineage(db, current_session_id) if current_session_id else None
-
-        results = []
+        # Insertion order is recall order: the first row for a lineage is its
+        # freshest segment because list_sessions_rich sorted raw segments by
+        # last_active. Later rows only back-fill stable root metadata such as a
+        # title and original started_at.
+        grouped: Dict[str, Dict[str, Any]] = {}
         for s in sessions:
             sid = s.get("id", "")
-            if current_root and (sid == current_root or sid == current_session_id):
+            if not sid or _is_delegate_segment(s):
                 continue
-            # Skip child / delegation sessions
-            if s.get("parent_session_id"):
+            lineage_root = _resolve_browse_lineage(db, sid, session_cache)
+            if current_root and lineage_root == current_root:
                 continue
+            existing = grouped.get(lineage_root)
+            if existing is None:
+                grouped[lineage_root] = dict(s)
+            elif not existing.get("title") and s.get("title"):
+                existing["title"] = s.get("title")
+
+        results = []
+        for lineage_root, s in grouped.items():
+            sid = s.get("id", "")
+            root_meta = session_cache.get(lineage_root) or {}
             results.append({
                 "session_id": sid,
                 "link": _session_link(sid, link_profile),
-                "title": s.get("title") or None,
+                "title": s.get("title") or root_meta.get("title") or None,
                 "source": s.get("source", ""),
-                "started_at": s.get("started_at", ""),
+                "started_at": root_meta.get("started_at", s.get("started_at", "")),
                 "last_active": s.get("last_active", ""),
                 "message_count": s.get("message_count", 0),
                 "preview": s.get("preview", ""),
@@ -484,6 +611,7 @@ def _scroll(
     around_message_id: int,
     window: int = 5,
     current_session_id: str = None,
+    role_filter: Optional[List[str]] = None,
 ) -> str:
     """Scroll shape: return a window of messages centered on an anchor.
 
@@ -594,6 +722,10 @@ def _scroll(
             success=False,
         )
 
+    if role_filter:
+        allowed_roles = set(role_filter)
+        messages = [m for m in messages if m.get("role") in allowed_roles]
+
     response = {
         "success": True,
         "mode": "scroll",
@@ -606,7 +738,15 @@ def _scroll(
             "title": session_meta.get("title"),
         },
         "window": window,
-        "messages": [_shape_message(m, anchor_id=around_message_id) for m in messages],
+        "messages": [
+            _shape_message(
+                m,
+                anchor_id=around_message_id,
+                max_content_len=_MESSAGE_CONTENT_LIMIT,
+                max_tool_calls_len=_TOOL_CALLS_LIMIT,
+            )
+            for m in messages
+        ],
         "messages_before": view.get("messages_before", 0),
         "messages_after": view.get("messages_after", 0),
     }
@@ -624,6 +764,7 @@ def _title_match_result(
     db,
     query: str,
     current_lineage_root: Optional[str],
+    role_filter: List[str],
 ) -> Optional[Dict[str, Any]]:
     """Return a discovery-shaped result when the query matches a session title."""
     title_query = _normalize_title_query(query)
@@ -656,10 +797,18 @@ def _title_match_result(
         logging.debug("get_messages failed for title match %s", session_id, exc_info=True)
         messages = []
 
-    anchor_id = messages[0].get("id") if messages else None
+    allowed_roles = set(role_filter)
+    eligible_messages = [m for m in messages if m.get("role") in allowed_roles]
+    anchor_id = eligible_messages[0].get("id") if eligible_messages else None
     if anchor_id is not None:
         try:
-            view = db.get_anchored_view(session_id, anchor_id, window=5, bookend=3)
+            view = db.get_anchored_view(
+                session_id,
+                anchor_id,
+                window=5,
+                bookend=3,
+                keep_roles=tuple(role_filter),
+            )
         except Exception:
             logging.debug("get_anchored_view failed for title match %s/%s", session_id, anchor_id, exc_info=True)
             view = {}
@@ -675,9 +824,34 @@ def _title_match_result(
         "matched_role": "session_title",
         "match_message_id": anchor_id,
         "snippet": f"Session title matched: {session_meta.get('title') or title_query}",
-        "bookend_start": [_shape_message(m) for m in (view.get("bookend_start") or messages[:3])],
-        "messages": [_shape_message(m, anchor_id=anchor_id) for m in (view.get("window") or messages[:5])],
-        "bookend_end": [_shape_message(m) for m in (view.get("bookend_end") or messages[-3:])],
+        "bookend_start": [
+            _shape_message(
+                m,
+                max_content_len=_BOOKEND_CONTENT_LIMIT,
+                max_tool_calls_len=_TOOL_CALLS_LIMIT,
+            )
+            for m in (view.get("bookend_start") or eligible_messages[:3])
+            if m.get("role") in allowed_roles
+        ],
+        "messages": [
+            _shape_message(
+                m,
+                anchor_id=anchor_id,
+                max_content_len=_MESSAGE_CONTENT_LIMIT,
+                max_tool_calls_len=_TOOL_CALLS_LIMIT,
+            )
+            for m in (view.get("window") or eligible_messages[:5])
+            if m.get("role") in allowed_roles
+        ],
+        "bookend_end": [
+            _shape_message(
+                m,
+                max_content_len=_BOOKEND_CONTENT_LIMIT,
+                max_tool_calls_len=_TOOL_CALLS_LIMIT,
+            )
+            for m in (view.get("bookend_end") or eligible_messages[-3:])
+            if m.get("role") in allowed_roles
+        ],
         "messages_before": view.get("messages_before", 0),
         "messages_after": view.get("messages_after", max(len(messages) - 5, 0)),
         "_lineage_root": lineage_root,
@@ -699,7 +873,7 @@ def _discover(
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
-    title_result = _title_match_result(db, query, current_lineage_root)
+    title_result = _title_match_result(db, query, current_lineage_root, role_list)
 
     try:
         raw_results = db.search_messages(
@@ -791,7 +965,13 @@ def _discover(
         hit_sid = match_info.get("session_id") or lineage_root
         msg_id = match_info.get("id")
         try:
-            view = db.get_anchored_view(hit_sid, msg_id, window=5, bookend=3)
+            view = db.get_anchored_view(
+                hit_sid,
+                msg_id,
+                window=5,
+                bookend=3,
+                keep_roles=tuple(role_list),
+            )
         except Exception as e:
             logging.warning("get_anchored_view failed for %s/%s: %s", hit_sid, msg_id, e, exc_info=True)
             continue
@@ -813,13 +993,29 @@ def _discover(
             "match_message_id": msg_id,
             "snippet": match_info.get("snippet") or "",
             "bookend_start": [
-                _shape_message(m, max_content_len=1200)
+                _shape_message(
+                    m,
+                    max_content_len=_BOOKEND_CONTENT_LIMIT,
+                    max_tool_calls_len=_TOOL_CALLS_LIMIT,
+                )
                 for m in (view.get("bookend_start") or [])
                 if not _is_compaction_summary(m.get("content", ""))
             ],
-            "messages": [_shape_message(m, anchor_id=msg_id, max_content_len=4000) for m in (view.get("window") or [])],
+            "messages": [
+                _shape_message(
+                    m,
+                    anchor_id=msg_id,
+                    max_content_len=_MESSAGE_CONTENT_LIMIT,
+                    max_tool_calls_len=_TOOL_CALLS_LIMIT,
+                )
+                for m in (view.get("window") or [])
+            ],
             "bookend_end": [
-                _shape_message(m, max_content_len=1200)
+                _shape_message(
+                    m,
+                    max_content_len=_BOOKEND_CONTENT_LIMIT,
+                    max_tool_calls_len=_TOOL_CALLS_LIMIT,
+                )
                 for m in (view.get("bookend_end") or [])
                 if not _is_compaction_summary(m.get("content", ""))
             ],
@@ -904,6 +1100,12 @@ def session_search(
             db = profile_db
             current_session_id = None
 
+    # Parse once before shape dispatch so scroll and discovery share the same
+    # semantics. Read/browse keep their historical unfiltered behavior.
+    role_list: Optional[List[str]] = None
+    if isinstance(role_filter, str) and role_filter.strip():
+        role_list = [r.strip() for r in role_filter.split(",") if r.strip()]
+
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
         return _scroll(
@@ -912,6 +1114,7 @@ def session_search(
             around_message_id=around_message_id,
             window=window,
             current_session_id=current_session_id,
+            role_filter=role_list,
         )
 
     # Read shape: a session_id with no anchor → dump the whole session.
@@ -946,11 +1149,6 @@ def session_search(
     # Browse shape: no query → recent sessions.
     if not query or not isinstance(query, str) or not query.strip():
         return _list_recent_sessions(db, limit, current_session_id, link_profile=profile)
-
-    # Parse role_filter
-    role_list: Optional[List[str]] = None
-    if isinstance(role_filter, str) and role_filter.strip():
-        role_list = [r.strip() for r in role_filter.split(",") if r.strip()]
 
     # Normalise sort
     sort_norm: Optional[str] = None
@@ -1108,16 +1306,18 @@ SESSION_SEARCH_SCHEMA = {
             "window": {
                 "type": "integer",
                 "description": (
-                    "Scroll shape only. Messages to return on each side of the anchor "
-                    "(anchor itself always included). Clamped to [1, 20]. Default 5."
+                    "Scroll shape only. Raw messages to inspect on each side of the anchor "
+                    "before role filtering. The anchor is included when its role matches "
+                    "role_filter (or no filter is set). Clamped to [1, 20]. Default 5."
                 ),
                 "default": 5,
             },
             "role_filter": {
                 "type": "string",
                 "description": (
-                    "Optional. Comma-separated roles to include. Discovery defaults to "
-                    "'user,assistant' (tool output is usually noise). Pass "
+                    "Optional. Comma-separated roles to include in discovery and scroll "
+                    "payloads. Discovery defaults to 'user,assistant' (tool output is "
+                    "usually noise); scroll remains unfiltered when omitted. Pass "
                     "'user,assistant,tool' to include tool output (debugging tool "
                     "behaviour) or 'tool' to search tool output only."
                 ),
