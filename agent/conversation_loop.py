@@ -3761,11 +3761,17 @@ def run_conversation(
                         base_url=_agg_cost_base_url,
                         api_key=getattr(agent, "api_key", ""),
                     )
-                    actual_cost_result = reported_usage_cost(aggregator_usage)
+                    # Use the fully folded usage here, not just the aggregator:
+                    # CanonicalUsage only preserves actual_cost_usd across an
+                    # addition when both sides reported it. A MoA turn therefore
+                    # becomes actual only when every advisor and the aggregator
+                    # supplied provider costs.
+                    actual_cost_result = reported_usage_cost(canonical_usage)
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
                     if actual_cost_result is not None and actual_cost_result.amount_usd is not None:
                         agent.session_actual_cost_usd += float(actual_cost_result.amount_usd)
+                        agent.session_actual_cost_api_calls += 1
                     # Add MoA advisor cost (already priced per-advisor at each
                     # advisor's own model rate) on top of the aggregator cost.
                     if _moa_ref_cost is not None:
@@ -3773,7 +3779,11 @@ def run_conversation(
                             agent.session_estimated_cost_usd += float(_moa_ref_cost)
                         except (TypeError, ValueError):  # pragma: no cover - defensive
                             pass
-                    effective_cost_result = actual_cost_result or cost_result
+                    actual_cost_complete = (
+                        actual_cost_result is not None
+                        and agent.session_actual_cost_api_calls == agent.session_api_calls
+                    )
+                    effective_cost_result = actual_cost_result if actual_cost_complete else cost_result
                     agent.session_cost_status = effective_cost_result.status
                     agent.session_cost_source = effective_cost_result.source
 

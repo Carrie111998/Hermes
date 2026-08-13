@@ -494,3 +494,19 @@ def test_usage_cost_is_not_trusted_for_openai_compatible_providers_generically()
 
     assert normalized.actual_cost_usd is None
     assert reported_usage_cost(normalized) is None
+
+
+def test_combined_usage_only_preserves_actual_cost_when_every_call_reports_it():
+    complete = CanonicalUsage(
+        input_tokens=10,
+        actual_cost_usd=Decimal("0.01"),
+    ) + CanonicalUsage(
+        output_tokens=5,
+        actual_cost_usd=Decimal("0.02"),
+    )
+    incomplete = complete + CanonicalUsage(output_tokens=1)
+
+    assert complete.actual_cost_usd == Decimal("0.03")
+    assert complete.request_count == 2
+    assert incomplete.actual_cost_usd is None
+    assert incomplete.request_count == 3

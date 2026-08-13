@@ -679,7 +679,13 @@ def finalize_turn(
         "total_tokens": agent.session_total_tokens,
         "last_prompt_tokens": getattr(agent.context_compressor, "last_prompt_tokens", 0) or 0,
         "estimated_cost_usd": agent.session_estimated_cost_usd,
-        "actual_cost_usd": getattr(agent, "session_actual_cost_usd", 0.0),
+        "actual_cost_usd": (
+            getattr(agent, "session_actual_cost_usd", 0.0)
+            if getattr(agent, "session_actual_cost_api_calls", 0)
+            == getattr(agent, "session_api_calls", 0)
+            and getattr(agent, "session_api_calls", 0) > 0
+            else None
+        ),
         "cost_status": agent.session_cost_status,
         "cost_source": agent.session_cost_source,
         # Requested service tier (from request_overrides.extra_body), for
