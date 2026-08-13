@@ -770,6 +770,44 @@ assert ad.mark_completion_delivered({delegation_id!r})
     assert probe.stdout.strip().splitlines()[-1] == "0"
 
 
+def test_abandoned_review_dispatch_restores_explicit_blocked_transition(
+    tmp_path, monkeypatch,
+):
+    """Process death before terminal recording preserves typed fail-closed state."""
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "delegations.sqlite3")
+    record = {
+        "delegation_id": "deleg_abandoned_review",
+        "session_key": "owner-session",
+        "origin_ui_session_id": "owner-ui",
+        "parent_session_id": "durable-parent",
+        "goal": "Inspect immutable candidate",
+        "role": "leaf",
+        "model": "reviewer",
+        "completion_contract": "review_verdict_v1",
+        "is_batch": False,
+        "status": "running",
+        "dispatched_at": time.time(),
+    }
+    ad._persist_dispatch(record)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+
+    restored_queue = queue.Queue()
+    assert ad.restore_undelivered_completions(restored_queue) == 1
+    evt = restored_queue.get_nowait()
+
+    assert evt["status"] == "unknown"
+    assert evt["completion_contract"] == "review_verdict_v1"
+    assert evt["terminal_transition"] == {
+        "kind": "review",
+        "verdict": "blocked",
+        "transition": "review_blocked",
+        "resume_parent": False,
+        "grants_authority": False,
+        "requires_existing_authority": True,
+        "stop_at_human_gate": True,
+    }
+
+
 def test_real_process_restart_restores_review_transition_and_acks_once(tmp_path):
     """Typed review completion survives process death and converges after ACK."""
     repo = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))

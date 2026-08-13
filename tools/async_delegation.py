@@ -449,6 +449,16 @@ def recover_abandoned_delegations() -> int:
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
                 "dispatched_at": dispatched_at, "completed_at": now,
             }
+            completion_contract = task.get("completion_contract")
+            if completion_contract is not None:
+                event["completion_contract"] = completion_contract
+            if _is_review_delegation(completion_contract):
+                event["terminal_transition"] = _build_terminal_transition(
+                    status="unknown",
+                    summary=None,
+                    error=event["error"],
+                    exit_reason="owner_exited",
+                )
             # Routing origin persisted at dispatch (see _capture_routing_origin):
             # restores scope_id/user_id for the reconstructed SessionSource so
             # relay egress priming works after a restart.
