@@ -1258,6 +1258,29 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 
+    def test_model_review_completion_contract_forwarded(self):
+        """The live model dispatch path must not drop the typed review contract."""
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {
+                    "goal": "Inspect immutable candidate",
+                    "completion_contract": "review_verdict_v1",
+                },
+            )
+
+        self.assertEqual(captured["completion_contract"], "review_verdict_v1")
+
+
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
 

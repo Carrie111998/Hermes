@@ -175,6 +175,221 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert evt["delegation_id"] == res["delegation_id"]
 
 
+@pytest.mark.parametrize(
+    ("status", "summary", "error", "exit_reason", "verdict", "transition"),
+    [
+        ("completed", "APPROVE — BLOCKER 0 · MAJOR 0 · MINOR 0", None,
+         "completed", "approve", "resume_parent"),
+        ("completed", "CHANGES_REQUIRED — one blocker", None,
+         "completed", "changes_required", "repair_required"),
+        ("completed", "NO VERDICT — evidence incomplete", None,
+         "completed", "no_verdict", "review_inconclusive"),
+        ("timeout", None, "review timed out", "timeout",
+         "timeout", "review_timeout"),
+        ("blocked", None, "credential unavailable", "blocked",
+         "blocked", "review_blocked"),
+        ("completed", "VERDICT: MAYBE", None, "completed",
+         "malformed", "review_malformed"),
+        ("completed", "review notes only", None, "completed",
+         "missing", "review_missing"),
+    ],
+)
+def test_terminal_reviewer_outcomes_have_explicit_safe_transitions(
+    status, summary, error, exit_reason, verdict, transition,
+):
+    """Reviewer text is advisory state, never an executable authority grant."""
+    event = ad._build_terminal_transition(
+        status=status,
+        summary=summary,
+        error=error,
+        exit_reason=exit_reason,
+    )
+
+    assert event == {
+        "kind": "review",
+        "verdict": verdict,
+        "transition": transition,
+        "resume_parent": transition == "resume_parent",
+        "grants_authority": False,
+        "requires_existing_authority": True,
+        "stop_at_human_gate": True,
+    }
+
+
+def test_batch_reviewer_approve_builds_one_safe_resume_transition():
+    record = {
+        "delegation_id": "deleg_review_batch",
+        "session_key": "owner-session",
+        "parent_session_id": "compressed-parent",
+        "goal": "Independent exact-SHA review and formal APPROVE or CHANGES_REQUIRED",
+        "goals": ["Independent exact-SHA review and formal APPROVE or CHANGES_REQUIRED"],
+        "role": "leaf",
+        "model": "reviewer",
+        "completion_contract": "review_verdict_v1",
+        "status": "running",
+        "dispatched_at": time.time(),
+    }
+    combined = {
+        "results": [{
+            "task_index": 0,
+            "status": "completed",
+            "summary": "APPROVE — BLOCKER 0 · MAJOR 0 · MINOR 0",
+            "exit_reason": "completed",
+        }],
+        "total_duration_seconds": 1.0,
+    }
+
+    ad._push_batch_completion_event(record, combined, "completed")
+    evt = process_registry.completion_queue.get_nowait()
+
+    assert evt["terminal_transition"] == {
+        "kind": "review",
+        "verdict": "approve",
+        "transition": "resume_parent",
+        "resume_parent": True,
+        "grants_authority": False,
+        "requires_existing_authority": True,
+        "stop_at_human_gate": True,
+    }
+    text = format_process_notification(evt)
+    assert text is not None
+    assert "does not grant authority" in text
+    assert "HUMAN_GATE" in text
+    assert "remote write, merge, or deploy" in text
+
+
+def test_non_review_child_does_not_get_review_transition():
+    record = {
+        "delegation_id": "deleg_research",
+        "goal": "Research approved Python packaging patterns",
+        "status": "running",
+        "dispatched_at": time.time(),
+    }
+    result = {
+        "status": "completed",
+        "summary": "APPROVE is mentioned in an upstream document",
+        "exit_reason": "completed",
+    }
+    ad._push_completion_event(record, result, "completed")
+    evt = process_registry.completion_queue.get_nowait()
+    assert "terminal_transition" not in evt
+
+
+def test_audit_goal_with_approve_text_requires_explicit_review_contract():
+    """Free-form goal prose cannot opt an ordinary child into review control-state."""
+    record = {
+        "delegation_id": "deleg_audit_logging",
+        "goal": "Audit logging performance and report findings",
+        "status": "running",
+        "dispatched_at": time.time(),
+    }
+    result = {
+        "status": "completed",
+        "summary": "APPROVE\nThe logging approach is sound.",
+        "exit_reason": "completed",
+    }
+
+    ad._push_completion_event(record, result, "completed")
+    evt = process_registry.completion_queue.get_nowait()
+
+    assert "terminal_transition" not in evt
+
+
+def test_explicit_review_contract_enables_transition_without_goal_heuristics():
+    """A persisted typed contract, not model prose, selects verdict semantics."""
+    record = {
+        "delegation_id": "deleg_typed_review",
+        "goal": "Inspect candidate f00ba4 and report findings",
+        "completion_contract": "review_verdict_v1",
+        "status": "running",
+        "dispatched_at": time.time(),
+    }
+    result = {
+        "status": "completed",
+        "summary": "APPROVE — BLOCKER 0 · MAJOR 0 · MINOR 0",
+        "exit_reason": "completed",
+    }
+
+    ad._push_completion_event(record, result, "completed")
+    evt = process_registry.completion_queue.get_nowait()
+
+    assert evt["completion_contract"] == "review_verdict_v1"
+    assert evt["terminal_transition"]["transition"] == "resume_parent"
+
+
+def test_unknown_completion_contract_fails_closed_as_ordinary_completion():
+    record = {
+        "delegation_id": "deleg_unknown_contract",
+        "goal": "Inspect candidate",
+        "completion_contract": "review_verdict_v2",
+        "status": "running",
+        "dispatched_at": time.time(),
+    }
+    result = {
+        "status": "completed",
+        "summary": "APPROVE",
+        "exit_reason": "completed",
+    }
+
+    ad._push_completion_event(record, result, "completed")
+    evt = process_registry.completion_queue.get_nowait()
+
+    assert evt["completion_contract"] == "review_verdict_v2"
+    assert "terminal_transition" not in evt
+
+
+def test_approve_transition_is_persisted_and_restored_without_action_authority(
+    tmp_path, monkeypatch,
+):
+    """A restart replays the same transition envelope; it cannot mint authority."""
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    record = {
+        "delegation_id": "deleg_review_restart",
+        "session_key": "owner-session",
+        "parent_session_id": "compressed-parent",
+        "goal": "Review immutable candidate",
+        "role": "leaf",
+        "model": "reviewer",
+        "completion_contract": "review_verdict_v1",
+        "status": "running",
+        "dispatched_at": time.time(),
+    }
+    ad._persist_dispatch(record)
+    result = {
+        "status": "completed",
+        "summary": "APPROVE — BLOCKER 0 · MAJOR 0 · MINOR 0",
+        "exit_reason": "completed",
+    }
+    ad._push_completion_event(record, result, "completed")
+    queued = process_registry.completion_queue.get_nowait()
+    assert queued["terminal_transition"]["transition"] == "resume_parent"
+
+    restored_queue = queue.Queue()
+    assert ad.restore_undelivered_completions(restored_queue) == 1
+    restored = restored_queue.get_nowait()
+    assert restored["restored"] is True
+    assert restored["terminal_transition"] == queued["terminal_transition"]
+    assert restored["terminal_transition"]["grants_authority"] is False
+
+    claim = ad.claim_event_delivery(restored, "test-parent")
+    assert claim
+    assert ad.complete_completion_delivery("deleg_review_restart", claim)
+    durable = ad.get_durable_delegation("deleg_review_restart")
+    assert durable is not None
+    assert durable["state"] == "completed"
+    assert durable["delivery_state"] == "delivered"
+    with ad._connect() as conn:
+        row = conn.execute(
+            "SELECT delivery_claim, delivery_claimed_at FROM async_delegations "
+            "WHERE delegation_id='deleg_review_restart'"
+        ).fetchone()
+    assert row == (None, None)
+
+    replay = queue.Queue()
+    assert ad.restore_undelivered_completions(replay) == 0
+    assert replay.empty()
+
+
 def test_rich_reinjection_block_is_self_contained():
     def runner():
         return {"status": "completed", "summary": "The answer is 42.",
@@ -555,6 +770,117 @@ assert ad.mark_completion_delivered({delegation_id!r})
     assert probe.stdout.strip().splitlines()[-1] == "0"
 
 
+def test_abandoned_review_dispatch_restores_explicit_blocked_transition(
+    tmp_path, monkeypatch,
+):
+    """Process death before terminal recording preserves typed fail-closed state."""
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "delegations.sqlite3")
+    record = {
+        "delegation_id": "deleg_abandoned_review",
+        "session_key": "owner-session",
+        "origin_ui_session_id": "owner-ui",
+        "parent_session_id": "durable-parent",
+        "goal": "Inspect immutable candidate",
+        "role": "leaf",
+        "model": "reviewer",
+        "completion_contract": "review_verdict_v1",
+        "is_batch": False,
+        "status": "running",
+        "dispatched_at": time.time(),
+    }
+    ad._persist_dispatch(record)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+
+    restored_queue = queue.Queue()
+    assert ad.restore_undelivered_completions(restored_queue) == 1
+    evt = restored_queue.get_nowait()
+
+    assert evt["status"] == "unknown"
+    assert evt["completion_contract"] == "review_verdict_v1"
+    assert evt["terminal_transition"] == {
+        "kind": "review",
+        "verdict": "blocked",
+        "transition": "review_blocked",
+        "resume_parent": False,
+        "grants_authority": False,
+        "requires_existing_authority": True,
+        "stop_at_human_gate": True,
+    }
+
+
+def test_real_process_restart_restores_review_transition_and_acks_once(tmp_path):
+    """Typed review completion survives process death and converges after ACK."""
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    env = {
+        **os.environ,
+        "HERMES_HOME": str(tmp_path),
+        "PYTHONPATH": repo,
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    producer = r'''
+import time
+from tools import async_delegation as ad
+r = ad.dispatch_async_delegation(
+    goal="Inspect immutable candidate", context=None, toolsets=None,
+    role="leaf", model="m", session_key="owner-session",
+    parent_session_id="durable-parent",
+    completion_contract="review_verdict_v1",
+    runner=lambda: {
+        "status": "completed",
+        "summary": "APPROVE — BLOCKER 0 · MAJOR 0 · MINOR 0",
+        "exit_reason": "completed",
+    },
+)
+deadline = time.time() + 5
+while ad.active_count() and time.time() < deadline:
+    time.sleep(.01)
+print(r["delegation_id"])
+'''
+    first = subprocess.run(
+        [sys.executable, "-c", producer], cwd=repo, env=env,
+        text=True, capture_output=True, timeout=15, check=True,
+    )
+    delegation_id = first.stdout.strip().splitlines()[-1]
+
+    consumer = r'''
+import json
+from tools import async_delegation as ad
+from tools.process_registry import process_registry
+evt = process_registry.completion_queue.get_nowait()
+claim = ad.claim_event_delivery(evt, "restarted-parent")
+assert claim
+assert ad.complete_completion_delivery(evt["delegation_id"], claim)
+print(json.dumps(evt, sort_keys=True))
+'''
+    second = subprocess.run(
+        [sys.executable, "-c", consumer], cwd=repo, env=env,
+        text=True, capture_output=True, timeout=15, check=True,
+    )
+    evt = json.loads(second.stdout.strip().splitlines()[-1])
+    assert evt["delegation_id"] == delegation_id
+    assert evt["completion_contract"] == "review_verdict_v1"
+    assert evt["terminal_transition"] == {
+        "kind": "review",
+        "verdict": "approve",
+        "transition": "resume_parent",
+        "resume_parent": True,
+        "grants_authority": False,
+        "requires_existing_authority": True,
+        "stop_at_human_gate": True,
+    }
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from tools.process_registry import process_registry; "
+            "print(process_registry.completion_queue.qsize())",
+        ],
+        cwd=repo, env=env, text=True, capture_output=True, timeout=15, check=True,
+    )
+    assert probe.stdout.strip().splitlines()[-1] == "0"
+
+
 # ---------------------------------------------------------------------------
 # Integration: delegate_task(background=True) routing
 # ---------------------------------------------------------------------------
@@ -750,6 +1076,28 @@ def test_gateway_formatter_renders_async_block():
     assert "ASYNC DELEGATION COMPLETE" in txt
     assert "Found the bug in test_foo" in txt
     assert "Investigate flaky test" in txt
+
+
+def test_review_transition_prompt_enforces_authority_and_human_gate():
+    evt = _make_async_evt(
+        summary="APPROVE — BLOCKER 0 · MAJOR 0 · MINOR 0",
+        terminal_transition={
+            "kind": "review",
+            "verdict": "approve",
+            "transition": "resume_parent",
+            "resume_parent": True,
+            "grants_authority": False,
+            "requires_existing_authority": True,
+            "stop_at_human_gate": True,
+        },
+    )
+    text = format_process_notification(evt)
+    assert text is not None
+    assert "does not grant authority" in text
+    assert "already-authorized next step" in text
+    assert "does not remain in_progress without live work" in text
+    assert "HUMAN_GATE" in text
+    assert "remote write, merge, or deploy" in text
 
 
 def test_gateway_cli_origin_event_left_unrouted():

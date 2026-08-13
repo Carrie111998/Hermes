@@ -3215,6 +3215,7 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    completion_contract: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -3834,6 +3835,7 @@ def delegate_task(
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
             progress_fn=_batch_progress,
+            completion_contract=completion_contract,
         )
 
         if dispatch.get("status") == "dispatched":
@@ -4365,6 +4367,18 @@ DELEGATE_TASK_SCHEMA = {
                     "backward compatibility."
                 ),
             },
+            "completion_contract": {
+                "type": "string",
+                "enum": ["review_verdict_v1"],
+                "description": (
+                    "Optional typed terminal-result contract. Use "
+                    "review_verdict_v1 only when this delegation is explicitly "
+                    "acting as a formal reviewer whose verdict is APPROVE, "
+                    "CHANGES_REQUIRED, or NO VERDICT. This selects advisory "
+                    "resume/repair state only and never grants tool, write, "
+                    "merge, deploy, or HUMAN_GATE-bypass authority."
+                ),
+            },
         },
         "required": [],
     },
@@ -4426,6 +4440,7 @@ registry.register(
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
+        completion_contract=args.get("completion_contract"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

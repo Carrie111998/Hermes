@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -89,6 +90,81 @@ _MAX_DELIVERY_ATTEMPTS = 8
 # deliverable while stopping weeks-old sessions from replaying after upgrades.
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 _DB_LOCK = threading.Lock()
+
+# Review outcomes are advisory control-state, never executable authority.
+# Free-form goal/context text is model-authored and therefore cannot select
+# review control semantics. The caller must persist this exact typed contract
+# at dispatch; unknown or absent contracts fail closed as ordinary completions.
+_REVIEW_COMPLETION_CONTRACT = "review_verdict_v1"
+_FORMAL_VERDICT_RE = re.compile(
+    r"(?im)^\s*(?:formal\s+)?(?:verdict\s*:\s*)?"
+    r"(APPROVE|CHANGES[_ ]REQUIRED|NO\s+VERDICT)\b",
+)
+_VERDICT_LABEL_RE = re.compile(r"(?im)^\s*(?:formal\s+)?verdict\s*:")
+_REVIEW_TRANSITIONS = {
+    "approve": "resume_parent",
+    "changes_required": "repair_required",
+    "no_verdict": "review_inconclusive",
+    "timeout": "review_timeout",
+    "blocked": "review_blocked",
+    "malformed": "review_malformed",
+    "missing": "review_missing",
+}
+
+
+def _is_review_delegation(completion_contract: Any) -> bool:
+    return completion_contract == _REVIEW_COMPLETION_CONTRACT
+
+
+def _build_terminal_transition(
+    *,
+    status: Any,
+    summary: Any,
+    error: Any = None,
+    exit_reason: Any = None,
+) -> Dict[str, Any]:
+    """Classify one terminal reviewer result into fail-closed control state.
+
+    The envelope is data only. In particular, ``approve`` may wake the parent
+    but can never authorize a tool call, remote write, merge, deploy, or bypass
+    a HUMAN_GATE. The parent must evaluate the already-existing authority for
+    its next workflow step after the completion re-enters as a fresh turn.
+    """
+    terminal_status = str(status or "").strip().lower()
+    terminal_reason = str(exit_reason or "").strip().lower()
+    if terminal_status == "timeout" or terminal_reason == "timeout":
+        verdict = "timeout"
+    elif terminal_status == "blocked" or terminal_reason == "blocked":
+        verdict = "blocked"
+    elif terminal_status not in {"completed", "success"}:
+        # Terminal failures without a dedicated review outcome are blocked:
+        # there is no valid verdict on which to continue.
+        verdict = "blocked"
+    else:
+        text = str(summary or "").strip()
+        match = _FORMAL_VERDICT_RE.search(text)
+        if match:
+            token = match.group(1).upper().replace(" ", "_")
+            verdict = {
+                "APPROVE": "approve",
+                "CHANGES_REQUIRED": "changes_required",
+                "NO_VERDICT": "no_verdict",
+            }[token]
+        elif _VERDICT_LABEL_RE.search(text):
+            verdict = "malformed"
+        else:
+            verdict = "missing"
+
+    transition = _REVIEW_TRANSITIONS[verdict]
+    return {
+        "kind": "review",
+        "verdict": verdict,
+        "transition": transition,
+        "resume_parent": transition == "resume_parent",
+        "grants_authority": False,
+        "requires_existing_authority": True,
+        "stop_at_human_gate": True,
+    }
 
 # ---------------------------------------------------------------------------
 # Stale-delegation detection (progress-based, on by default)
@@ -244,6 +320,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         key: record.get(key)
         for key in (
             "goal", "goals", "context", "toolsets", "role", "model", "is_batch",
+            "completion_contract",
             # Routing origin (scope_id/user_id/user_name): persisted so a
             # restart-recovered completion can reconstruct a full
             # SessionSource — see _capture_routing_origin.
@@ -372,6 +449,16 @@ def recover_abandoned_delegations() -> int:
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
                 "dispatched_at": dispatched_at, "completed_at": now,
             }
+            completion_contract = task.get("completion_contract")
+            if completion_contract is not None:
+                event["completion_contract"] = completion_contract
+            if _is_review_delegation(completion_contract):
+                event["terminal_transition"] = _build_terminal_transition(
+                    status="unknown",
+                    summary=None,
+                    error=event["error"],
+                    exit_reason="owner_exited",
+                )
             # Routing origin persisted at dispatch (see _capture_routing_origin):
             # restores scope_id/user_id for the reconstructed SessionSource so
             # relay egress priming works after a restart.
@@ -765,6 +852,7 @@ def dispatch_async_delegation(
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    completion_contract: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -817,6 +905,7 @@ def dispatch_async_delegation(
         "toolsets": list(toolsets) if toolsets else None,
         "role": role,
         "model": model,
+        "completion_contract": completion_contract,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
@@ -985,6 +1074,15 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
+    if record.get("completion_contract") is not None:
+        evt["completion_contract"] = record["completion_contract"]
+    if _is_review_delegation(record.get("completion_contract")):
+        evt["terminal_transition"] = _build_terminal_transition(
+            status=status,
+            summary=summary,
+            error=error,
+            exit_reason=result.get("exit_reason"),
+        )
     # Routing origin captured at dispatch (see _capture_routing_origin):
     # additive, lets the gateway reconstruct a full SessionSource (incl.
     # scope_id for relay tenant egress) when its own caches are cold.
@@ -1028,6 +1126,7 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    completion_contract: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -1064,6 +1163,7 @@ def dispatch_async_delegation_batch(
         "toolsets": list(toolsets) if toolsets else None,
         "role": role,
         "model": model,
+        "completion_contract": completion_contract,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
@@ -1201,6 +1301,23 @@ def _push_batch_completion_event(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
     }
+    # delegate_task uses this batch path even for one child. Classify a formal
+    # reviewer outcome only when the batch represents exactly one review task;
+    # multi-review fan-outs can disagree and must remain uncollapsed.
+    results = combined.get("results") or []
+    if event_record.get("completion_contract") is not None:
+        evt["completion_contract"] = event_record["completion_contract"]
+    if (
+        _is_review_delegation(event_record.get("completion_contract"))
+        and len(results) == 1
+    ):
+        child = results[0] if isinstance(results[0], dict) else {}
+        evt["terminal_transition"] = _build_terminal_transition(
+            status=child.get("status") or status,
+            summary=child.get("summary"),
+            error=child.get("error") or combined.get("error"),
+            exit_reason=child.get("exit_reason"),
+        )
     # Routing origin captured at dispatch (see _capture_routing_origin).
     for _k in ("scope_id", "user_id", "user_name"):
         if event_record.get(_k):
