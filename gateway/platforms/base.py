@@ -3969,7 +3969,13 @@ class BasePlatformAdapter(ABC):
                     continue
                 if expanded not in seen_paths:
                     seen_paths.add(expanded)
-                    media.append((expanded, has_voice_tag))
+                    # Telegram-native voice formats (Opus OGG, MP3/M4A from TTS)
+                    # delivered as a voice bubble automatically, even without the
+                    # explicit [[audio_as_voice]] marker, so TTS replies are never
+                    # raw files (native bubble + speed control work). The Telegram
+                    # adapter converts non-OGG audio to Opus before sending.
+                    _voice = has_voice_tag or expanded.lower().endswith((".ogg", ".oga", ".mp3", ".m4a"))
+                    media.append((expanded, _voice))
 
         for match in MEDIA_EXTENSIONLESS_TAG_RE.finditer(scan_content):
             path = _normalize_media_tag_path(match.group("path"))
@@ -5341,24 +5347,19 @@ class BasePlatformAdapter(ABC):
 
                 # Play TTS audio before text (voice-first experience)
                 _tts_caption_delivered = False
+                _voice_replied = False
                 if _tts_path and Path(_tts_path).exists():
                     try:
+                        # Voice-only: send the audio WITHOUT a text caption so a
+                        # voice message gets ONLY a voice reply (no visible text).
                         telegram_tts_caption = None
-                        if (
-                            self.platform == Platform.TELEGRAM
-                            and text_content
-                            and text_content[:1024] == text_content
-                        ):
-                            telegram_tts_caption = text_content
                         tts_result = await self.play_tts(
                             chat_id=event.source.chat_id,
                             audio_path=_tts_path,
                             caption=telegram_tts_caption,
                             metadata=_final_thread_metadata,
                         )
-                        _tts_caption_delivered = bool(
-                            telegram_tts_caption and getattr(tts_result, "success", False)
-                        )
+                        _voice_replied = bool(getattr(tts_result, "success", False))
                     finally:
                         try:
                             os.remove(_tts_path)
@@ -5369,7 +5370,7 @@ class BasePlatformAdapter(ABC):
                 # adapter while its in-flight handler was still producing a
                 # final response; that response is a new message, so resolve
                 # the current transport before sending it.
-                if text_content and not _tts_caption_delivered:
+                if text_content and not _tts_caption_delivered and not _voice_replied:
                     delivery_adapter = self._final_delivery_adapter(event.source)
                     logger.info(
                         "[%s] Sending response (%d chars) to %s",

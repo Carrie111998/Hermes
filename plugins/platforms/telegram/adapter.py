@@ -375,6 +375,45 @@ def _probe_voice_duration_seconds(path: str) -> Optional[int]:
     return None
 
 
+def _convert_audio_to_ogg(src_path: str) -> Optional[str]:
+    """Convert an audio file to native Opus/OGG for Telegram voice bubbles.
+
+    Telegram only renders a true *voice message* (round bubble with speed
+    control, no filename) for Ogg/Opus. TTS providers like Edge emit MP3/M4A,
+    which ``send_audio`` delivers as a plain audio file (filename, no speed
+    control). Converting to Opus/OGG here means every TTS reply becomes a real
+    native voice bubble. Blocking (ffmpeg subprocess) — call via asyncio.to_thread.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+    import uuid
+
+    if not shutil.which("ffmpeg"):
+        return None
+    ext = os.path.splitext(src_path)[1].lower()
+    if ext in {".ogg", ".oga", ".opus"}:
+        return src_path
+    dst = os.path.join(
+        tempfile.gettempdir(), "hermes_voice",
+        "voice_" + uuid.uuid4().hex[:12] + ".ogg",
+    )
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-i", src_path,
+             "-c:a", "libopus", "-b:a", "64k", "-ar", "48000", "-ac", "1",
+             dst],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=120,
+        )
+        if proc.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 0:
+            return dst
+    except Exception:
+        pass
+    return None
+
+
 def check_telegram_requirements() -> bool:
     """Check if Telegram dependencies are available.
 
@@ -6742,73 +6781,95 @@ class TelegramAdapter(BasePlatformAdapter):
                 _probe_voice_duration_seconds, audio_path
             )
 
-            with open(audio_path, "rb") as audio_file:
-                ext = os.path.splitext(audio_path)[1].lower()
-                # .ogg / .opus files -> send as voice (round playable bubble)
-                if ext in {".ogg", ".opus"}:
-                    _voice_thread = self._metadata_thread_id(metadata)
-                    reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
-                    voice_thread_kwargs = self._thread_kwargs_for_send(
-                        chat_id,
-                        _voice_thread,
-                        metadata,
-                        reply_to_message_id=reply_to_id,
-                        reply_to_mode=self._reply_to_mode
-                    )
-                    msg = await self._send_with_dm_topic_reply_anchor_retry(
-                        self._bot.send_voice,
-                        {
-                            "chat_id": normalize_telegram_chat_id(chat_id),
-                            "voice": audio_file,
-                            "caption": caption[:1024] if caption else None,
-                            "reply_to_message_id": reply_to_id,
-                            "duration": _duration_secs,
-                            **voice_thread_kwargs,
-                            **self._notification_kwargs(metadata),
-                        },
-                        metadata,
-                        reply_to_id,
-                        "voice",
-                        reset_media=lambda: audio_file.seek(0),
-                    )
-                elif ext in {".mp3", ".m4a"}:
-                    # Telegram's Bot API sendAudio only accepts MP3 / M4A.
-                    _audio_thread = self._metadata_thread_id(metadata)
-                    reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
-                    audio_thread_kwargs = self._thread_kwargs_for_send(
-                        chat_id,
-                        _audio_thread,
-                        metadata,
-                        reply_to_message_id=reply_to_id,
-                        reply_to_mode=self._reply_to_mode
-                    )
-                    msg = await self._send_with_dm_topic_reply_anchor_retry(
-                        self._bot.send_audio,
-                        {
-                            "chat_id": normalize_telegram_chat_id(chat_id),
-                            "audio": audio_file,
-                            "caption": caption[:1024] if caption else None,
-                            "reply_to_message_id": reply_to_id,
-                            "duration": _duration_secs,
-                            **audio_thread_kwargs,
-                            **self._notification_kwargs(metadata),
-                        },
-                        metadata,
-                        reply_to_id,
-                        "audio",
-                        reset_media=lambda: audio_file.seek(0),
-                    )
-                else:
-                    # Formats Telegram can't play natively (.wav, .flac, ...)
-                    # — fall back to document delivery instead of raising.
-                    return await self.send_document(
-                        chat_id=chat_id,
-                        file_path=audio_path,
-                        caption=caption,
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
-            return SendResult(success=True, message_id=str(msg.message_id))
+            # Convert TTS audio (MP3/M4A) to native Opus/OGG so Telegram sends a
+            # real voice bubble (play button + speed control), not an audio file.
+            _conv_src = audio_path
+            _converted_tmp: Optional[str] = None
+            _src_ext = os.path.splitext(audio_path)[1].lower()
+            if _src_ext in {".mp3", ".m4a"}:
+                _converted_tmp = await asyncio.to_thread(
+                    _convert_audio_to_ogg, audio_path
+                )
+                if _converted_tmp and _converted_tmp != audio_path and os.path.exists(_converted_tmp):
+                    audio_path = _converted_tmp
+            try:
+                with open(audio_path, "rb") as audio_file:
+                    ext = os.path.splitext(audio_path)[1].lower()
+                    # .ogg / .opus files -> send as voice (round playable bubble)
+                    if ext in {".ogg", ".opus"}:
+                        _voice_thread = self._metadata_thread_id(metadata)
+                        reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
+                        voice_thread_kwargs = self._thread_kwargs_for_send(
+                            chat_id,
+                            _voice_thread,
+                            metadata,
+                            reply_to_message_id=reply_to_id,
+                            reply_to_mode=self._reply_to_mode
+                        )
+                        msg = await self._send_with_dm_topic_reply_anchor_retry(
+                            self._bot.send_voice,
+                            {
+                                "chat_id": normalize_telegram_chat_id(chat_id),
+                                "voice": audio_file,
+                                "caption": caption[:1024] if caption else None,
+                                "reply_to_message_id": reply_to_id,
+                                "duration": _duration_secs,
+                                **voice_thread_kwargs,
+                                **self._notification_kwargs(metadata),
+                            },
+                            metadata,
+                            reply_to_id,
+                            "voice",
+                            reset_media=lambda: audio_file.seek(0),
+                        )
+                    elif ext in {".mp3", ".m4a"}:
+                        # Only reached when ffmpeg conversion was unavailable.
+                        _audio_thread = self._metadata_thread_id(metadata)
+                        reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
+                        audio_thread_kwargs = self._thread_kwargs_for_send(
+                            chat_id,
+                            _audio_thread,
+                            metadata,
+                            reply_to_message_id=reply_to_id,
+                            reply_to_mode=self._reply_to_mode
+                        )
+                        msg = await self._send_with_dm_topic_reply_anchor_retry(
+                            self._bot.send_audio,
+                            {
+                                "chat_id": normalize_telegram_chat_id(chat_id),
+                                "audio": audio_file,
+                                "caption": caption[:1024] if caption else None,
+                                "reply_to_message_id": reply_to_id,
+                                "duration": _duration_secs,
+                                **audio_thread_kwargs,
+                                **self._notification_kwargs(metadata),
+                            },
+                            metadata,
+                            reply_to_id,
+                            "audio",
+                            reset_media=lambda: audio_file.seek(0),
+                        )
+                    else:
+                        # Formats Telegram can't play natively (.wav, .flac, ...)
+                        # — fall back to document delivery instead of raising.
+                        return await self.send_document(
+                            chat_id=chat_id,
+                            file_path=audio_path,
+                            caption=caption,
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                return SendResult(success=True, message_id=str(msg.message_id))
+            finally:
+                if (
+                    _converted_tmp
+                    and _converted_tmp != _conv_src
+                    and os.path.exists(_converted_tmp)
+                ):
+                    try:
+                        os.unlink(_converted_tmp)
+                    except OSError:
+                        pass
         except Exception as e:
             logger.error(
                 "[%s] Failed to send Telegram voice/audio, falling back to base adapter: %s",
