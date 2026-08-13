@@ -1026,6 +1026,29 @@ class TestGroupMessageGating:
 
         assert event is not None
 
+    @pytest.mark.parametrize(
+        "configured",
+        ["15559998888", "+15559998888", "+1 555 999 8888", "(555) 999-8888"],
+    )
+    @pytest.mark.asyncio
+    async def test_business_number_is_matched_whatever_its_format(self, monkeypatch, configured):
+        """Meta may return the business number formatted; a mention in message
+        text is bare digits. Without normalizing, the substring check never
+        matches and the mention gate stays shut with no error at all.
+        """
+        monkeypatch.setenv("WHATSAPP_REQUIRE_MENTION", "true")
+        adapter = _make_adapter()
+        adapter._group_policy = "open"
+        adapter._mention_patterns = []
+
+        event = await adapter._build_message_event_from_cloud(
+            _group_raw(text={"body": "@15559998888 what is the status?"}),
+            {"15551234567": "Alice"},
+            {"display_phone_number": configured},
+        )
+
+        assert event is not None
+
     @pytest.mark.asyncio
     async def test_require_mention_still_drops_unaddressed_group_chatter(self, monkeypatch):
         """The anti-spam purpose of require_mention must survive the fix."""
@@ -1041,6 +1064,38 @@ class TestGroupMessageGating:
         )
 
         assert event is None
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "call the office on 15559998888 tomorrow",
+            "invoice 15559998888 is overdue",
+            "ref#15559998888",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_bare_business_number_in_text_is_not_a_mention(self, monkeypatch, body):
+        """A number in the text is not an address to the bot.
+
+        The shared gate falls back to a bare substring search of the body.
+        On Baileys that is a backstop behind structured mentionedIds, but
+        Cloud has no structured mentions -- so left unguarded that fallback
+        becomes the only mention path and any group message quoting the
+        business number (a pasted contact, an invoice or order reference)
+        silently bypasses require_mention.
+        """
+        monkeypatch.setenv("WHATSAPP_REQUIRE_MENTION", "true")
+        adapter = _make_adapter()
+        adapter._group_policy = "open"
+        adapter._mention_patterns = []
+
+        event = await adapter._build_message_event_from_cloud(
+            _group_raw(text={"body": body}),
+            {"15551234567": "Alice"},
+            {"display_phone_number": "15559998888"},
+        )
+
+        assert event is None, f"require_mention bypassed by: {body!r}"
 
     @pytest.mark.asyncio
     async def test_require_mention_admits_a_reply_to_the_bot(self, monkeypatch):

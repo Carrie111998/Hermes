@@ -2036,15 +2036,36 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # body-substring check find it, and context.from identifies the author
         # of a quoted message. Without these, a group message that mentions
         # the bot is dropped whenever require_mention is on.
-        our_number = str((metadata or {}).get("display_phone_number") or "").strip()
+        # Normalize to the bare wa_id: Meta may return the business number
+        # formatted ("+1 555 999 8888"), while a mention in message text is
+        # bare digits. Without this the substring check below never matches
+        # and the mention gate stays shut with no error -- reuse the same
+        # normalizer the allowlist path already applies.
+        _raw_our_number = str((metadata or {}).get("display_phone_number") or "").strip()
+        our_number = (
+            next(iter(self._normalize_allow_ids({_raw_our_number})), "")
+            if _raw_our_number
+            else ""
+        )
         quoted_from = str((raw_message.get("context") or {}).get("from") or "").strip()
+        _mentions_bot = bool(our_number) and f"@{our_number}" in (body or "")
+        _addresses_bot = _mentions_bot or bool(quoted_from)
         gating_data = {
             "chatId": chat_id,
             "senderId": sender_id,
             "isGroup": is_group,
             "body": body,
-            "botIds": [our_number] if our_number else [],
-            "mentionedIds": [],
+            # Only claim the bot is addressable when the message actually
+            # addresses it. The shared gate falls back to a bare substring
+            # search of the body, which on Baileys is a backstop behind
+            # structured mentionedIds -- but Cloud has no structured mention
+            # array, so that fallback would become the ONLY mention path and
+            # any group text merely containing the business number (a pasted
+            # contact, an invoice or order reference) would bypass
+            # require_mention. Cloud renders a real mention as "@<wa_id>", so
+            # gate on that form or on a quoted message.
+            "botIds": [our_number] if (our_number and _addresses_bot) else [],
+            "mentionedIds": [our_number] if (our_number and _mentions_bot) else [],
             "quotedParticipant": quoted_from,
         }
         if not self._should_process_message(gating_data):
