@@ -7728,6 +7728,190 @@ class DispatchResult:
     actively preventing two dispatchers from racing on ``kanban.db``."""
 
 
+@dataclass
+class _DispatchCapacityReservation:
+    """One provisional cross-board worker slot."""
+
+    capacity: "DispatchSweepCapacity"
+    key: tuple[str, str]
+    profile: str
+    lock_context: Any
+    active: bool = True
+
+    def release(self) -> None:
+        if self.active:
+            self.capacity._finish(self.key, self.lock_context)
+            self.active = False
+
+    def commit(self) -> None:
+        # Once spawn succeeds the running task in its board DB becomes the
+        # durable capacity record, so the provisional reservation can go.
+        self.release()
+
+
+_DISPATCH_CAPACITY_LOCK = threading.Lock()
+_DISPATCH_CAPACITY_RESERVATIONS: dict[tuple[str, str], str] = {}
+_DISPATCH_CAPACITY_SNAPSHOTS: dict[str, list[tuple[str, Optional[str]]]] = {}
+
+
+class DispatchSweepCapacity:
+    """Atomic machine-wide capacity shared by every board and dispatcher.
+
+    Board task state remains in the board databases.  This object only holds
+    short-lived reservations spanning capacity-check -> claim -> spawn, which
+    closes the gap where concurrent ticks on different DBs could both observe
+    the same last free slot.  A non-blocking install-wide file lock extends the
+    existing process-local reservation guard across gateway/orphan processes.
+    The lock is retained until the claim is either abandoned or its running DB
+    row is durable after spawn; process exit releases it automatically.  Live
+    counts are re-read while reserving so reclaim work earlier in a tick is
+    reflected immediately.
+    """
+
+    def __init__(
+        self,
+        boards: Iterable[str],
+        *,
+        max_in_progress: Optional[int] = None,
+        max_in_progress_per_profile: Optional[int] = None,
+    ) -> None:
+        self.max_in_progress = (
+            max_in_progress
+            if isinstance(max_in_progress, int) and max_in_progress > 0
+            else None
+        )
+        self.max_in_progress_per_profile = (
+            max_in_progress_per_profile
+            if isinstance(max_in_progress_per_profile, int)
+            and max_in_progress_per_profile > 0
+            else None
+        )
+        requested_boards = list(boards)
+        try:
+            discovered_boards = [
+                item.get("slug") or DEFAULT_BOARD
+                for item in list_boards(include_archived=True)
+            ]
+        except Exception:
+            discovered_boards = []
+        self._boards: list[tuple[str, str]] = []
+        seen_paths: set[str] = set()
+        for board in [*requested_boards, *discovered_boards]:
+            slug = board or DEFAULT_BOARD
+            path = str(kanban_db_path(board=slug).expanduser().resolve())
+            if path not in seen_paths:
+                seen_paths.add(path)
+                self._boards.append((slug, path))
+        self._board_paths = {path for _, path in self._boards}
+        self._preview_reservations: dict[tuple[str, str], str] = {}
+
+    def _live_counts(self) -> tuple[int, dict[str, int]]:
+        total = 0
+        by_profile: dict[str, int] = {}
+        reserved_running: set[tuple[str, str]] = set()
+        for slug, path in self._boards:
+            try:
+                with connect_closing(board=slug) as conn:
+                    db_rows = conn.execute(
+                        "SELECT id, assignee FROM tasks WHERE status = 'running'"
+                    ).fetchall()
+                rows = [(row["id"], row["assignee"]) for row in db_rows]
+                _DISPATCH_CAPACITY_SNAPSHOTS[path] = rows
+            except Exception as exc:
+                # Capacity accounting must not transfer a broken board's DB
+                # failure to the healthy board currently reserving a slot.
+                # Keep the last successful count rather than optimistically
+                # dropping workers that may still be live.
+                rows = _DISPATCH_CAPACITY_SNAPSHOTS.get(path, [])
+                _log.warning(
+                    "kanban capacity scan failed for board %s; using last known "
+                    "running count (%d): %s",
+                    slug,
+                    len(rows),
+                    exc,
+                )
+            for task_id, profile in rows:
+                key = (path, task_id)
+                total += 1
+                if profile:
+                    by_profile[profile] = by_profile.get(profile, 0) + 1
+                if key in _DISPATCH_CAPACITY_RESERVATIONS:
+                    reserved_running.add(key)
+
+        # A reservation may already have claimed its task. Count every
+        # reservation exactly once, whether or not that board write is visible.
+        reservations = {
+            **{
+                key: profile
+                for key, profile in _DISPATCH_CAPACITY_RESERVATIONS.items()
+                if key[0] in self._board_paths
+            },
+            **self._preview_reservations,
+        }
+        for key, profile in reservations.items():
+            if key in reserved_running:
+                continue
+            total += 1
+            if profile:
+                by_profile[profile] = by_profile.get(profile, 0) + 1
+        return total, by_profile
+
+    def reserve(
+        self, *, board: Optional[str], task_id: str, profile: str,
+        preview: bool = False,
+    ) -> tuple[Optional[_DispatchCapacityReservation], Optional[str], int]:
+        """Reserve one slot, returning ``(token, blocked_cap, count)``."""
+        if self.max_in_progress is None and self.max_in_progress_per_profile is None:
+            return None, None, 0
+        slug = board or get_current_board()
+        path = str(kanban_db_path(board=slug).expanduser().resolve())
+        key = (path, task_id)
+        with _DISPATCH_CAPACITY_LOCK:
+            # Reuse the board dispatch lock's cross-platform, non-blocking
+            # advisory-lock implementation.  A contender defers this tick
+            # instead of blocking the gateway worker thread.
+            lock_context = _dispatch_tick_lock(
+                kanban_home() / "kanban" / ".capacity"
+            )
+            held = lock_context.__enter__()
+            if not held:
+                lock_context.__exit__(None, None, None)
+                return None, "global", 0
+            retain_lock = False
+            try:
+                total, by_profile = self._live_counts()
+                if self.max_in_progress is not None and total >= self.max_in_progress:
+                    return None, "global", total
+                profile_count = by_profile.get(profile, 0)
+                if (
+                    self.max_in_progress_per_profile is not None
+                    and profile_count >= self.max_in_progress_per_profile
+                ):
+                    return None, "profile", profile_count
+                if preview:
+                    self._preview_reservations[key] = profile
+                    return None, None, 0
+                _DISPATCH_CAPACITY_RESERVATIONS[key] = profile
+                retain_lock = True
+                return (
+                    _DispatchCapacityReservation(
+                        self, key, profile, lock_context
+                    ),
+                    None,
+                    0,
+                )
+            finally:
+                if not retain_lock:
+                    lock_context.__exit__(None, None, None)
+
+    def _finish(self, key: tuple[str, str], lock_context: Any) -> None:
+        with _DISPATCH_CAPACITY_LOCK:
+            try:
+                _DISPATCH_CAPACITY_RESERVATIONS.pop(key, None)
+            finally:
+                lock_context.__exit__(None, None, None)
+
+
 # Bounded registry of recently-reaped worker child exits, populated by the
 # reap loop at the top of ``dispatch_once`` and consulted by
 # ``detect_crashed_workers`` to classify a dead-pid task.
@@ -9240,6 +9424,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    sweep_capacity: Optional[DispatchSweepCapacity] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -9275,6 +9460,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            sweep_capacity=sweep_capacity,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -9292,6 +9478,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            sweep_capacity=sweep_capacity,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -9313,6 +9500,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    sweep_capacity: Optional[DispatchSweepCapacity] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -9379,8 +9567,11 @@ def _dispatch_once_locked(
     # Both knobs are total in-flight caps. Collapse them before either lane
     # dispatches so ready and review workers consume the same budget without
     # subtracting the already-running count twice.
-    if max_in_progress is not None and (
+    if (
+        (sweep_capacity is None or sweep_capacity.max_in_progress is None)
+        and max_in_progress is not None and (
         max_spawn is None or max_in_progress < max_spawn
+        )
     ):
         max_spawn = max_in_progress
 
@@ -9414,6 +9605,8 @@ def _dispatch_once_locked(
     # skipped_unassigned — the operator-actionable signal is different:
     # "this profile is busy, try again later" not "this needs routing").
     _per_profile_cap = max_in_progress_per_profile if (
+        (sweep_capacity is None or sweep_capacity.max_in_progress_per_profile is None)
+        and
         isinstance(max_in_progress_per_profile, int)
         and max_in_progress_per_profile > 0
     ) else None
@@ -9545,79 +9738,99 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        reservation = None
+        if sweep_capacity is not None:
+            reservation, blocked_cap, capacity_count = sweep_capacity.reserve(
+                board=board,
+                task_id=row["id"],
+                profile=row_assignee,
+                preview=dry_run,
+            )
+            if blocked_cap == "global":
+                break
+            if blocked_cap == "profile":
+                result.skipped_per_profile_capped.append(
+                    (row["id"], row_assignee, capacity_count)
+                )
+                continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1
-            # Increment per-profile counter even in dry_run so the cap
-            # check sees the would-be spawn on subsequent iterations.
-            # Without this, dry_run reports every task as spawnable and
-            # under-reports the capped subset (#21582).
+            # Increment per-profile counter even in dry_run so the local cap
+            # check sees the would-be spawn on subsequent iterations. Sweep
+            # capacity keeps its own preview reservations for cross-board caps.
             if _per_profile_cap is not None and row_assignee:
                 _per_profile_running[row_assignee] = (
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
-        if claimed is None:
-            continue
         try:
-            resolved_branch_name = None
-            if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
-            else:
-                workspace = resolve_workspace(claimed, board=board)
-        except Exception as exc:
-            auto = _record_spawn_failure(
-                conn, claimed.id, f"workspace: {exc}",
-                failure_limit=failure_limit,
-            )
-            if auto:
-                result.auto_blocked.append(claimed.id)
-            continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
-        _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
-        try:
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
-            import inspect
+            claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+            if claimed is None:
+                continue
             try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
+                resolved_branch_name = None
+                if claimed.workspace_kind == "worktree":
+                    workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
                 else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
-            # NOTE: we intentionally do NOT reset consecutive_failures
-            # here. A successful spawn proves the worker can start but
-            # doesn't prove the run will succeed. Under unified
-            # failure counting, resetting on spawn would let a task
-            # that keeps timing out after spawn loop forever. The
-            # counter is cleared only on successful completion (see
-            # complete_task).
-            result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
-            spawned += 1
-            # Track the new in-flight count for this profile so later
-            # iterations in this same tick respect the per-profile cap
-            # (#21582). Subsequent ticks re-query from the DB.
-            if _per_profile_cap is not None and claimed.assignee:
-                _per_profile_running[claimed.assignee] = (
-                    _per_profile_running.get(claimed.assignee, 0) + 1
+                    workspace = resolve_workspace(claimed, board=board)
+            except Exception as exc:
+                auto = _record_spawn_failure(
+                    conn, claimed.id, f"workspace: {exc}",
+                    failure_limit=failure_limit,
                 )
-        except Exception as exc:
-            auto = _record_spawn_failure(
-                conn, claimed.id, str(exc),
-                failure_limit=failure_limit,
-            )
-            if auto:
-                result.auto_blocked.append(claimed.id)
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+                continue
+            # Persist the resolved workspace path so the worker can cd there.
+            set_workspace_path(conn, claimed.id, str(workspace))
+            if claimed.workspace_kind == "worktree":
+                set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+            _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+            try:
+                # Back-compat: older spawn_fn signatures accept only
+                # (task, workspace). Test stubs in the suite rely on that.
+                # Introspect the callable and pass `board` only when supported.
+                import inspect
+                try:
+                    sig = inspect.signature(_spawn)
+                    if "board" in sig.parameters:
+                        pid = _spawn(claimed, str(workspace), board=board)
+                    else:
+                        pid = _spawn(claimed, str(workspace))
+                except (TypeError, ValueError):
+                    pid = _spawn(claimed, str(workspace))
+                if pid:
+                    _set_worker_pid(conn, claimed.id, int(pid))
+                # NOTE: we intentionally do NOT reset consecutive_failures
+                # here. A successful spawn proves the worker can start but
+                # doesn't prove the run will succeed. Under unified
+                # failure counting, resetting on spawn would let a task
+                # that keeps timing out after spawn loop forever. The
+                # counter is cleared only on successful completion (see
+                # complete_task).
+                result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+                spawned += 1
+                if reservation is not None:
+                    reservation.commit()
+                # Track the new in-flight count for this profile so later
+                # iterations in this same tick respect the per-profile cap
+                # (#21582). Subsequent ticks re-query from the DB.
+                if _per_profile_cap is not None and claimed.assignee:
+                    _per_profile_running[claimed.assignee] = (
+                        _per_profile_running.get(claimed.assignee, 0) + 1
+                    )
+            except Exception as exc:
+                auto = _record_spawn_failure(
+                    conn, claimed.id, str(exc),
+                    failure_limit=failure_limit,
+                )
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+        finally:
+            if reservation is not None:
+                reservation.release()
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
@@ -9669,6 +9882,21 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        reservation = None
+        if sweep_capacity is not None:
+            reservation, blocked_cap, capacity_count = sweep_capacity.reserve(
+                board=board,
+                task_id=row["id"],
+                profile=row["assignee"],
+                preview=dry_run,
+            )
+            if blocked_cap == "global":
+                break
+            if blocked_cap == "profile":
+                result.skipped_per_profile_capped.append(
+                    (row["id"], row["assignee"], capacity_count)
+                )
+                continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             spawned += 1
@@ -9677,62 +9905,68 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
-        if claimed is None:
-            continue
         try:
-            resolved_branch_name = None
-            if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
-            else:
-                workspace = resolve_workspace(claimed, board=board)
-        except Exception as exc:
-            auto = _record_spawn_failure(
-                conn, claimed.id, f"workspace: {exc}",
-                failure_limit=failure_limit,
-            )
-            if auto:
-                result.auto_blocked.append(claimed.id)
-            continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
-        _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Force-load the sdlc-review skill for review agents — it carries
-        # the review logic (AC verification, merge, etc.). The mandatory
-        # kanban lifecycle is already injected into every worker's system
-        # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
-        claimed.skills = list(
-            dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
-        )
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
-        try:
-            import inspect
+            claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+            if claimed is None:
+                continue
             try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
+                resolved_branch_name = None
+                if claimed.workspace_kind == "worktree":
+                    workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
                 else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
-            result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
-            spawned += 1
-            if _per_profile_cap is not None and claimed.assignee:
-                _per_profile_running[claimed.assignee] = (
-                    _per_profile_running.get(claimed.assignee, 0) + 1
+                    workspace = resolve_workspace(claimed, board=board)
+            except Exception as exc:
+                auto = _record_spawn_failure(
+                    conn, claimed.id, f"workspace: {exc}",
+                    failure_limit=failure_limit,
                 )
-        except Exception as exc:
-            auto = _record_spawn_failure(
-                conn, claimed.id, str(exc),
-                failure_limit=failure_limit,
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+                continue
+            # Persist the resolved workspace path so the worker can cd there.
+            set_workspace_path(conn, claimed.id, str(workspace))
+            if claimed.workspace_kind == "worktree":
+                set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+            # Force-load the sdlc-review skill for review agents — it carries
+            # the review logic (AC verification, merge, etc.). The mandatory
+            # kanban lifecycle is already injected into every worker's system
+            # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
+            # review agent needs.
+            claimed.skills = list(
+                dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
             )
-            if auto:
-                result.auto_blocked.append(claimed.id)
+            _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+            try:
+                import inspect
+                try:
+                    sig = inspect.signature(_spawn)
+                    if "board" in sig.parameters:
+                        pid = _spawn(claimed, str(workspace), board=board)
+                    else:
+                        pid = _spawn(claimed, str(workspace))
+                except (TypeError, ValueError):
+                    pid = _spawn(claimed, str(workspace))
+                if pid:
+                    _set_worker_pid(conn, claimed.id, int(pid))
+                result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+                spawned += 1
+                if reservation is not None:
+                    reservation.commit()
+                if _per_profile_cap is not None and claimed.assignee:
+                    _per_profile_running[claimed.assignee] = (
+                        _per_profile_running.get(claimed.assignee, 0) + 1
+                    )
+            except Exception as exc:
+                auto = _record_spawn_failure(
+                    conn, claimed.id, str(exc),
+                    failure_limit=failure_limit,
+                )
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+        finally:
+            if reservation is not None:
+                reservation.release()
     return result
 
 
