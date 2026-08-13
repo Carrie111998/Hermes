@@ -52,6 +52,19 @@ class _FakeSession:
         self.calls = []
 
     def call_tool(self, name: str, args: Dict[str, Any], timeout: float = 30.0):
+        if name == "list_windows":
+            return {
+                "isError": False,
+                "data": {},
+                "structuredContent": {"windows": [{
+                    "app_name": "Test App",
+                    "pid": 4242,
+                    "window_id": 7,
+                    "is_on_screen": True,
+                    "title": "Test Window",
+                    "z_index": 1,
+                }]},
+            }
         self.last_args = args
         self.calls.append((name, dict(args)))
         return self._out
