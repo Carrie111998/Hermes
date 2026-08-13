@@ -1334,6 +1334,17 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
     payload = json.dumps(auth_store, indent=2) + "\n"
+    replace_target = auth_file
+    target_owner: Optional[Tuple[int, int]] = None
+    if hasattr(os, "fchown"):
+        replace_target = (
+            Path(os.path.realpath(auth_file)) if auth_file.is_symlink() else auth_file
+        )
+        try:
+            target_stat = replace_target.stat()
+        except FileNotFoundError:
+            target_stat = replace_target.parent.stat()
+        target_owner = (target_stat.st_uid, target_stat.st_gid)
     tmp_path = auth_file.with_name(f"{auth_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     try:
         # Create with 0o600 atomically via os.open(O_EXCL) + fdopen to close
@@ -1345,11 +1356,21 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
             stat.S_IRUSR | stat.S_IWUSR,
         )
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        atomic_replace(tmp_path, auth_file)
+        try:
+            # Atomic replacement swaps in a new inode. Set its ownership before
+            # it becomes visible so a privileged CLI cannot lock the
+            # HERMES_HOME owner out of a shared credential store.
+            if target_owner is not None:
+                os.fchown(fd, *target_owner)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                fd = -1
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        atomic_replace(tmp_path, replace_target)
         try:
             dir_fd = os.open(str(auth_file.parent), os.O_RDONLY)
         except OSError:

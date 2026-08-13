@@ -22,7 +22,7 @@ import json
 import os
 import stat
 import sys
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import pytest
 
@@ -67,6 +67,117 @@ def test_save_auth_store_writes_0o600_with_0o700_parent(tmp_path, monkeypatch):
     # Content survived the rewrite
     data = json.loads(auth_path.read_text())
     assert data["providers"]["openai-codex"]["tokens"]["access_token"] == "secret-x"
+
+
+def test_save_auth_store_preserves_existing_owner(tmp_path, monkeypatch):
+    """Atomic replacement must preserve UID/GID before exposing the new inode."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text('{"version": 1, "providers": {}}', encoding="utf-8")
+    existing_stat = auth_path.stat()
+    owner = os.stat_result(
+        (
+            existing_stat.st_mode,
+            existing_stat.st_ino,
+            existing_stat.st_dev,
+            existing_stat.st_nlink,
+            1234,
+            5678,
+            existing_stat.st_size,
+            existing_stat.st_atime,
+            existing_stat.st_mtime,
+            existing_stat.st_ctime,
+        )
+    )
+    events = []
+
+    from hermes_cli import auth as auth_mod
+
+    real_atomic_replace = auth_mod.atomic_replace
+
+    def ordered_fchown(fd, uid, gid):
+        events.append(("fchown", uid, gid))
+
+    def ordered_replace(source, target):
+        events.append(("replace", source, target))
+        return real_atomic_replace(source, target)
+
+    real_stat = type(auth_path).stat
+
+    def owner_stat(path, *args, **kwargs):
+        if path == auth_path:
+            return owner
+        return real_stat(path, *args, **kwargs)
+
+    with (
+        patch.object(type(auth_path), "stat", autospec=True, side_effect=owner_stat),
+        patch.object(os, "fchown", side_effect=ordered_fchown),
+        patch.object(auth_mod, "atomic_replace", side_effect=ordered_replace),
+    ):
+        auth_mod._save_auth_store(
+            {"version": auth_mod.AUTH_STORE_VERSION, "providers": {}}
+        )
+
+    assert events[0] == ("fchown", owner.st_uid, owner.st_gid)
+    assert events[1][0] == "replace"
+
+
+def test_save_new_auth_store_inherits_parent_owner(tmp_path, monkeypatch):
+    """A first privileged write must use the HERMES_HOME owner's UID/GID."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    parent_stat = tmp_path.stat()
+    owner = os.stat_result(
+        (
+            parent_stat.st_mode,
+            parent_stat.st_ino,
+            parent_stat.st_dev,
+            parent_stat.st_nlink,
+            1234,
+            5678,
+            parent_stat.st_size,
+            parent_stat.st_atime,
+            parent_stat.st_mtime,
+            parent_stat.st_ctime,
+        )
+    )
+
+    from hermes_cli import auth as auth_mod
+
+    real_stat = type(tmp_path).stat
+
+    def owner_stat(path, *args, **kwargs):
+        if path == tmp_path:
+            return owner
+        return real_stat(path, *args, **kwargs)
+
+    with (
+        patch.object(type(tmp_path), "stat", autospec=True, side_effect=owner_stat),
+        patch.object(os, "fchown") as fchown,
+    ):
+        auth_mod._save_auth_store(
+            {"version": auth_mod.AUTH_STORE_VERSION, "providers": {}}
+        )
+
+    fchown.assert_called_once_with(ANY, owner.st_uid, owner.st_gid)
+
+
+def test_save_auth_store_cleans_up_when_fchown_fails(tmp_path, monkeypatch):
+    """A failed ownership transfer must leave no replacement or temp file."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    auth_path = tmp_path / "auth.json"
+    original = '{"version": 1, "providers": {"original": {}}}'
+    auth_path.write_text(original, encoding="utf-8")
+
+    from hermes_cli import auth as auth_mod
+
+    with patch.object(os, "fchown", side_effect=PermissionError("denied")):
+        with pytest.raises(PermissionError, match="denied"):
+            auth_mod._save_auth_store(
+                {"version": auth_mod.AUTH_STORE_VERSION, "providers": {}}
+            )
+
+    assert auth_path.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob("auth.json.tmp.*")) == []
 
 
 # ---------------------------------------------------------------------------
