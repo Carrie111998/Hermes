@@ -24,6 +24,36 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
 
 
 
+    def test_stream_true_yields_acp_updates_before_prompt_completion(self) -> None:
+        events = iter(
+            [
+                ("reasoning", "Thinking"),
+                ("text", "Hello"),
+                ("text", " world"),
+                ("done", None),
+            ]
+        )
+        setattr(self.client, "_run_prompt_stream", lambda *_args, **_kwargs: events)
+
+        with patch.object(
+            self.client,
+            "_run_prompt",
+            side_effect=AssertionError("streaming must not wait for the one-shot prompt"),
+        ):
+            stream = self.client._create_chat_completion(
+                model="copilot-acp",
+                messages=[{"role": "user", "content": "say hello"}],
+                stream=True,
+            )
+            reasoning_chunk = next(stream)
+            text_chunk = next(stream)
+
+        self.assertEqual(
+            reasoning_chunk.choices[0].delta.reasoning_content,
+            "Thinking",
+        )
+        self.assertEqual(text_chunk.choices[0].delta.content, "Hello")
+
     def test_stream_true_preserves_tool_call_deltas(self) -> None:
         tool_response = (
             "<tool_call>"
@@ -32,17 +62,33 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
             "</tool_call>"
         )
 
-        with patch.object(self.client, "_run_prompt", return_value=(tool_response, "")):
+        with patch.object(
+            self.client,
+            "_run_prompt_stream",
+            return_value=iter([("text", tool_response)]),
+        ):
             stream = self.client._create_chat_completion(
                 model="copilot-acp",
                 messages=[{"role": "user", "content": "read README.md"}],
                 stream=True,
             )
+            chunks = list(stream)
+        streamed_text = "".join(
+            chunk.choices[0].delta.content or ""
+            for chunk in chunks
+            if chunk.choices
+        )
+        self.assertNotIn("<tool_call>", streamed_text)
+        self.assertNotIn("</tool_call>", streamed_text)
 
-        chunks = list(stream)
-        delta = chunks[0].choices[0].delta
+        tool_chunk = next(
+            chunk
+            for chunk in chunks
+            if chunk.choices and chunk.choices[0].delta.tool_calls
+        )
+        delta = tool_chunk.choices[0].delta
         self.assertIsNone(delta.content)
-        self.assertEqual(chunks[0].choices[0].finish_reason, "tool_calls")
+        self.assertEqual(tool_chunk.choices[0].finish_reason, "tool_calls")
         self.assertEqual(len(delta.tool_calls), 1)
         tool_delta = delta.tool_calls[0]
         self.assertEqual(tool_delta.index, 0)
@@ -52,7 +98,41 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
             json.loads(tool_delta.function.arguments),
             {"path": "README.md"},
         )
-        self.assertEqual(chunks[1].choices, [])
+        self.assertEqual(chunks[-1].choices, [])
+
+    def test_stream_tool_call_turn_emits_reasoning_exactly_once(self) -> None:
+        tool_response = (
+            "<tool_call>"
+            '{"id":"call_read","type":"function",'
+            '"function":{"name":"read_file","arguments":"{}"}}'
+            "</tool_call>"
+        )
+
+        with patch.object(
+            self.client,
+            "_run_prompt_stream",
+            return_value=iter(
+                [
+                    ("reasoning", "THINK-A"),
+                    ("reasoning", "THINK-B"),
+                    ("text", tool_response),
+                ]
+            ),
+        ):
+            chunks = list(
+                self.client._create_chat_completion(
+                    model="copilot-acp",
+                    messages=[{"role": "user", "content": "read README.md"}],
+                    stream=True,
+                )
+            )
+
+        accumulated_reasoning = "".join(
+            chunk.choices[0].delta.reasoning_content or ""
+            for chunk in chunks
+            if chunk.choices
+        )
+        self.assertEqual(accumulated_reasoning, "THINK-ATHINK-B")
 
 
     def _dispatch(self, message: dict, *, cwd: str) -> dict:
@@ -212,7 +292,7 @@ def test_run_prompt_preserves_real_home_when_profile_home_available(monkeypatch,
     client = _make_home_client(tmp_path)
 
     with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
-        with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+        with pytest.raises(RuntimeError, match="Could not start ACP provider"):
             client._run_prompt("hello", timeout_seconds=1)
 
     assert captured["kwargs"]["env"]["HOME"] == str(real_home)
@@ -227,7 +307,7 @@ def test_run_prompt_passes_home_when_parent_env_is_clean(monkeypatch, tmp_path):
     client = _make_home_client(tmp_path)
 
     with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
-        with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+        with pytest.raises(RuntimeError, match="Could not start ACP provider"):
             client._run_prompt("hello", timeout_seconds=1)
 
     assert "env" in captured["kwargs"]

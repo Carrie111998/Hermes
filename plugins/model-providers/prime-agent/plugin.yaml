@@ -1,0 +1,5 @@
+name: prime-agent-provider
+kind: model-provider
+version: 1.0.0
+description: Prime Agent via local ACP subprocess
+author: Nous Research
