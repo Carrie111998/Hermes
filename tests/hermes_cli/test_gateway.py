@@ -427,6 +427,63 @@ class TestStopProfileGateway:
         assert killed_pid in reap_extra_excludes[0]
 
 
+class TestReapUnsupervisedGatewayOrphans:
+    """The orphan reap must no-op under ANY service supervisor.
+
+    Before 2026-08-12 the gate checked ``supports_systemd_services()`` only
+    (Linux). On macOS the desktop serve layer calls this reap at every
+    startup and SIGTERMed the live launchd-managed gateway (PPID=1) as a
+    false orphan; launchd (KeepAlive) instantly respawned it, churning the
+    platform connection. The launchd gate mirrors the systemd one.
+    """
+
+    def test_reap_noop_when_launchd_service_running(self, monkeypatch):
+        """launchd supervising a live gateway => not an orphan, nothing to reap."""
+        kills = []
+
+        monkeypatch.setattr(gateway, "_probe_launchd_service_running", lambda: True)
+        monkeypatch.setattr(
+            gateway, "find_gateway_pids",
+            lambda exclude_pids=None, all_profiles=False: [12345],
+        )
+        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: kills.append(pid))
+
+        assert gateway._reap_unsupervised_gateway_orphans() is False
+        assert kills == []
+
+    def test_reap_runs_when_launchd_service_stopped(self, monkeypatch):
+        """No launchd supervisor => genuine orphans are reaped."""
+        kills = []
+
+        monkeypatch.setattr(gateway, "_probe_launchd_service_running", lambda: False)
+        monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(
+            gateway, "find_gateway_pids",
+            lambda exclude_pids=None, all_profiles=False: [12345],
+        )
+        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: kills.append(pid))
+        monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+        monkeypatch.setattr("time.sleep", lambda _: None)
+        monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: None)
+
+        assert gateway._reap_unsupervised_gateway_orphans() is True
+        assert 12345 in kills
+
+    def test_reap_noop_when_systemd_present(self, monkeypatch):
+        """Existing contract preserved: systemd supervisor => no-op."""
+        kills = []
+
+        monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
+        monkeypatch.setattr(
+            gateway, "find_gateway_pids",
+            lambda exclude_pids=None, all_profiles=False: [12345],
+        )
+        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: kills.append(pid))
+
+        assert gateway._reap_unsupervised_gateway_orphans() is False
+        assert kills == []
+
+
 def test_module_has_logger():
     """Verify module has a logger instance (regression guard for #27154)."""
     assert hasattr(gateway, "logger")

@@ -1535,8 +1535,13 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
     still holds the webhook port, so a follow-up restart stacks a duplicate on
     the same port (#51325). This is a no-op on hosts WITH a service supervisor,
     where a ``gateway restart`` argv is a transient management command, not the
-    running gateway — gating on ``supports_systemd_services()`` keeps the
-    orphan-aware scan from killing live management processes there.
+    running gateway — gating on ``supports_systemd_services()`` (Linux) and
+    ``_probe_launchd_service_running()`` (macOS) keeps the orphan-aware scan
+    from killing live management processes there. Before 2026-08-12 the gate
+    was systemd-only: on macOS the desktop serve layer called this reap at
+    every startup and SIGTERMed the live launchd-managed gateway (PPID=1) as a
+    false orphan; launchd (KeepAlive) instantly respawned it, churning the
+    platform connection. #77276 class.
 
     Args:
         extra_exclude: Additional PIDs to skip (e.g. a PID already killed by
@@ -1546,6 +1551,15 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
     """
     try:
         if supports_systemd_services():
+            return False
+    except Exception:
+        return False
+    # macOS: launchd is a service supervisor too. supports_systemd_services()
+    # is Linux-only, so without this the reap treats the live launchd-managed
+    # gateway as an orphan on every desktop serve startup. The probe requires
+    # a live PID, so a loaded-but-stopped service still lets the reap run.
+    try:
+        if _probe_launchd_service_running():
             return False
     except Exception:
         return False
