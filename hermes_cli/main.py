@@ -4888,6 +4888,14 @@ def cmd_wisdom(args):
         )
         if result.get("skipped_declined"):
             print(f"{len(result['skipped_declined'])} declined (not re-nominated).")
+        never_tracked = result.get("never_tracked", [])
+        if never_tracked:
+            print(
+                f"\n{len(never_tracked)} agent-authored skill(s) with no usage record "
+                f"(invisible to scoring):"
+            )
+            for name in never_tracked:
+                print(f"  {name}")
         print(
             "\nThis is a dry-run — nothing was shared. To share a skill:\n"
             "  hermes sync propose <skill>"

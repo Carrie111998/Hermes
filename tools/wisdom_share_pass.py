@@ -53,6 +53,14 @@ TOP_N = 3
 #: Minimum hours between passes (168 = 7 days).
 WISDOM_SHARE_INTERVAL_HOURS = 168
 
+#: Skills idle longer than this many days get their use_count contribution
+#: capped at IDLE_USE_CAP fraction. Prevents lifetime volume from burying
+#: currently relevant skills (probe finding, 2026-08-13).
+IDLE_DAYS_THRESHOLD = 30
+
+#: Fraction of use_count that counts for skills idle past IDLE_DAYS_THRESHOLD.
+IDLE_USE_CAP = 0.5
+
 
 # ---------------------------------------------------------------------------
 # State persistence
@@ -133,12 +141,31 @@ def _recency_weight(last_used_at: Optional[str], now: datetime) -> float:
 def score_skill(record: Dict[str, Any], now: datetime) -> float:
     """Score one usage record. Higher is more share-worthy.
 
-    uses * recency_weight + patches * PATCH_WEIGHT
+    uses * recency_weight * idle_cap + patches * PATCH_WEIGHT
+
+    The idle cap: skills idle past IDLE_DAYS_THRESHOLD get their use_count
+    contribution multiplied by IDLE_USE_CAP. Prevents a skill that was
+    heavily used months ago from outranking one used yesterday.
     """
     uses = record.get("use_count", 0) or 0
     patches = record.get("patch_count", 0) or 0
     recency = _recency_weight(record.get("last_used_at"), now)
-    return uses * recency + patches * PATCH_WEIGHT
+    idle_cap = _idle_cap(record.get("last_used_at"), now)
+    return uses * recency * idle_cap + patches * PATCH_WEIGHT
+
+
+def _idle_cap(last_used_at: Optional[str], now: datetime) -> float:
+    """Return IDLE_USE_CAP for skills idle past IDLE_DAYS_THRESHOLD, else 1.0."""
+    if not last_used_at:
+        return 1.0
+    try:
+        dt = datetime.fromisoformat(str(last_used_at).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return 1.0
+    days = (now - dt).days
+    if days > IDLE_DAYS_THRESHOLD:
+        return IDLE_USE_CAP
+    return 1.0
 
 
 def _evidence_line(name: str, record: Dict[str, Any], score: float, now: datetime) -> str:
@@ -188,11 +215,18 @@ def run_share_pass(*, dry_run: bool = True, now: Optional[datetime] = None) -> D
         if now is None:
             now = datetime.now(timezone.utc)
 
-        from tools.skill_usage import load_usage, provenance
+        from tools.skill_usage import load_usage, provenance, list_agent_created_skill_names
 
         data = load_usage()
         state = load_state()
         declined = set(state.get("declined", []))
+
+        # Never-tracked listing: agent-authored skills on disk with no usage
+        # record (mostly predating tracking). These are invisible to scoring
+        # but may be valuable. Surfaced separately so the owner can review.
+        all_agent = set(list_agent_created_skill_names())
+        tracked = set(data.keys())
+        never_tracked = sorted(all_agent - tracked - declined)
 
         scored: List[tuple] = []
         skipped_declined: List[str] = []
@@ -240,6 +274,7 @@ def run_share_pass(*, dry_run: bool = True, now: Optional[datetime] = None) -> D
             "ok": True,
             "dry_run": dry_run,
             "candidates": candidates,
+            "never_tracked": never_tracked,
             "skipped_declined": sorted(skipped_declined),
             "skipped_below_floor": skipped_below_floor,
             "run_at": now.isoformat(),

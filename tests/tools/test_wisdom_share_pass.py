@@ -269,3 +269,67 @@ class TestDecline:
         )
         decline_candidate("skill-x")
         assert len(saved_states) == 0  # no save when already declined
+
+
+# ---------------------------------------------------------------------------
+# M1 calibration: idle cap + never-tracked
+# ---------------------------------------------------------------------------
+
+
+class TestIdleCap:
+    def test_active_skill_no_cap(self):
+        rec = _rec(uses=100, last=_iso(10))
+        assert score_skill(rec, NOW) == pytest.approx(100.0)
+
+    def test_idle_skill_capped(self):
+        rec = _rec(uses=100, last=_iso(45))
+        # recency=0 at 45 days (past RECENCY_ZERO_DAYS=60? no, 45 < 60 so recency > 0)
+        # But idle cap applies (45 > IDLE_DAYS_THRESHOLD=30)
+        s = score_skill(rec, NOW)
+        assert s < 50.0  # capped
+
+    def test_idle_boundary(self):
+        rec = _rec(uses=100, last=_iso(30))
+        # Exactly at threshold — no cap
+        s = score_skill(rec, NOW)
+        assert s > 0
+
+    def test_patches_not_capped(self):
+        rec = _rec(uses=100, patches=20, last=_iso(45))
+        s = score_skill(rec, NOW)
+        # Patches contribute fully regardless of idle cap
+        assert s >= 20 * 0.5
+
+
+class TestNeverTracked:
+    def test_untracked_listed(self, tmp_path, monkeypatch):
+        data = {"skill-a": _rec(uses=10, last=_iso(1))}
+        _mock_usage(tmp_path, monkeypatch, data)
+        monkeypatch.setattr(
+            "tools.skill_usage.list_agent_created_skill_names",
+            lambda: ["skill-a", "skill-b", "skill-c"],
+        )
+        result = run_share_pass(now=NOW)
+        assert result["never_tracked"] == ["skill-b", "skill-c"]
+
+    def test_declined_untracked_excluded(self, tmp_path, monkeypatch):
+        data = {"skill-a": _rec(uses=10, last=_iso(1))}
+        state = _default_state()
+        state["declined"] = ["skill-b"]
+        _mock_usage(tmp_path, monkeypatch, data, state)
+        monkeypatch.setattr(
+            "tools.skill_usage.list_agent_created_skill_names",
+            lambda: ["skill-a", "skill-b", "skill-c"],
+        )
+        result = run_share_pass(now=NOW)
+        assert result["never_tracked"] == ["skill-c"]
+
+    def test_all_tracked_empty_list(self, tmp_path, monkeypatch):
+        data = {"skill-a": _rec(uses=10, last=_iso(1))}
+        _mock_usage(tmp_path, monkeypatch, data)
+        monkeypatch.setattr(
+            "tools.skill_usage.list_agent_created_skill_names",
+            lambda: ["skill-a"],
+        )
+        result = run_share_pass(now=NOW)
+        assert result["never_tracked"] == []
