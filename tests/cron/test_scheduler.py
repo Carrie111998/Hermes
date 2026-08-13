@@ -651,6 +651,24 @@ class TestRunJobSessionPersistence:
         advance.assert_not_called()
         run_one.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "result",
+        [
+            {"failed": True, "error": "provider retries exhausted"},
+            {"completed": False, "error": "incomplete turn"},
+        ],
+    )
+    def test_run_job_preserves_structured_failures(self, tmp_path, result):
+        with self._run_job_patches(tmp_path) as (_, mock_agent_cls):
+            mock_agent_cls.return_value.run_conversation.return_value = result
+            success, _, final_response, error = run_job(
+                {"id": "failed-job", "name": "test", "prompt": "hello"}
+            )
+
+        assert success is False
+        assert final_response == ""
+        assert result["error"] in error
+
 
 class TestRunJobConfigLogging:
     """Verify that config.yaml parse failures are logged, not silently swallowed."""
@@ -1047,8 +1065,8 @@ class TestSilentDelivery:
         deliver_mock.assert_called_once()
 
 
-    def test_whitespace_only_response_is_marked_failed_not_delivered(self):
-        """Whitespace-only final responses should behave like empty responses."""
+    def test_whitespace_only_response_is_successful_not_delivered(self):
+        """Whitespace-only successful responses are quiet completed runs."""
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "   \n\t  ", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
@@ -1060,8 +1078,8 @@ class TestSilentDelivery:
         deliver_mock.assert_not_called()
         mark_mock.assert_called_once_with(
             "monitor-job",
-            False,
-            "Agent completed but produced empty response (model error, timeout, or misconfiguration)",
+            True,
+            None,
             delivery_error=None,
         )
 

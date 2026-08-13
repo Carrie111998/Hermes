@@ -66,6 +66,15 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j2", True)
 
 
+def test_run_one_job_empty_response_is_silent_success(monkeypatch):
+    calls = _patch_pipeline(monkeypatch, final="   ")
+
+    s.run_one_job({"id": "j4", "name": "t"})
+
+    assert "deliver" not in [call[0] for call in calls]
+    assert ("mark", "j4", True) in calls
+
+
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
     """Regression: under profile isolation (multiplex active), run_one_job must
     execute run_job inside a profile secret scope so credential reads
