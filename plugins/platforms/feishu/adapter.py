@@ -3045,6 +3045,12 @@ class FeishuAdapter(BasePlatformAdapter):
             channel_prompt=self._resolve_channel_prompt(chat_id),
             timestamp=datetime.now(),
         )
+        # ``message_id`` above identifies the outbound bot message being
+        # reacted to, not this inbound reaction event. Feishu's typed reaction
+        # callback does not expose an authoritative unique event ID here, so
+        # fail closed rather than presenting the target ID as current inbound
+        # provenance to downstream hooks.
+        mark_source_identity_ambiguous(synthetic_event)
         logger.info("[Feishu] Routing reaction %s:%s on bot message %s as synthetic event", action, emoji_type, message_id)
         await self._handle_message_with_guards(synthetic_event)
 

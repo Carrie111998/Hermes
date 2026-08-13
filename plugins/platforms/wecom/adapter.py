@@ -563,6 +563,8 @@ class WeComAdapter(BasePlatformAdapter):
         media_urls, media_types = await self._extract_media(body)
         message_type = self._derive_message_type(body, text, media_types)
         has_reply_context = bool(reply_text and (text or media_urls))
+        quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
+        has_quote_context = bool(quote)
 
         if not text and reply_text and not media_urls:
             text = reply_text
@@ -586,10 +588,14 @@ class WeComAdapter(BasePlatformAdapter):
             message_id=msg_id,
             media_urls=media_urls,
             media_types=media_types,
-            reply_to_message_id=f"quote:{msg_id}" if has_reply_context else None,
+            reply_to_message_id=(
+                f"quote:{msg_id}" if has_quote_context else None
+            ),
             reply_to_text=reply_text if has_reply_context else None,
             timestamp=datetime.now(tz=timezone.utc),
         )
+        if has_quote_context:
+            mark_source_identity_ambiguous(event)
 
         # Only batch plain text messages — commands, media, etc. dispatch
         # immediately since they won't be split by the WeCom client.

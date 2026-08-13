@@ -546,6 +546,30 @@ class TestAdapterBehavior(unittest.TestCase):
         )
         adapter._handle_message_with_guards.assert_not_awaited()
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_reaction_on_own_bot_message_has_untrusted_source_identity(self):
+        from gateway.platforms.base import trusted_source_message_id
+
+        adapter = self._build_reaction_adapter(msg_sender_id="cli_self_app")
+        event = SimpleNamespace(
+            message_id="om_outbound_bot_msg",
+            user_id=SimpleNamespace(open_id="ou_human", user_id=None, union_id=None),
+            reaction_type=SimpleNamespace(emoji_type="THUMBSUP"),
+        )
+
+        asyncio.run(
+            adapter._handle_reaction_event(
+                "im.message.reaction.created_v1",
+                SimpleNamespace(event=event),
+            )
+        )
+
+        handler = adapter._handle_message_with_guards
+        getattr(handler, "assert_awaited_once")()
+        routed = getattr(handler, "await_args").args[0]
+        self.assertEqual(routed.message_id, "om_outbound_bot_msg")
+        self.assertIsNone(trusted_source_message_id(routed))
+
 
     def test_per_group_allowlist_policy_gates_by_sender(self):
         from gateway.config import PlatformConfig
