@@ -1,7 +1,7 @@
 ---
 name: local-tts-optimization
 category: productivity
-description: Deploy and tune a local TTS voice-clone engine on Apple Silicon (Qwen3-TTS via MLX) — latency, stability, and Chinese chunking best practices validated in production.
+description: Use when tuning local TTS latency/stability (MLX Qwen3-TTS).
 ---
 
 # Local TTS Optimization (Apple Silicon)
