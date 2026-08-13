@@ -1,151 +1,52 @@
 import { afterEach, describe, expect, it } from 'vitest'
 
-import {
-  $composerAttachments,
-  $voiceConversationStartRequest,
-  addComposerAttachment,
-  clearSessionDraft,
-  type ComposerAttachment,
-  migrateSessionDraft,
-  removeComposerAttachment,
-  requestVoiceConversationStart,
-  SESSION_DRAFTS_STORAGE_KEY,
-  stashSessionDraft,
-  takeSessionDraft,
-  takeVoiceConversationStart,
-  updateComposerAttachment
-} from './composer'
+import { addComposerTextAttachment, type ComposerAttachment, mainComposerScope } from '@/store/composer'
 
-describe('voice conversation start requests', () => {
-  it('latches each request until the main composer consumes it once', () => {
-    requestVoiceConversationStart()
-    const first = $voiceConversationStartRequest.get()
-
-    expect(takeVoiceConversationStart(first)).toBe(true)
-    expect(takeVoiceConversationStart(first)).toBe(false)
-
-    requestVoiceConversationStart()
-    expect(takeVoiceConversationStart($voiceConversationStartRequest.get())).toBe(true)
-  })
-})
-
-function attachment(overrides: Partial<ComposerAttachment> & Pick<ComposerAttachment, 'id'>): ComposerAttachment {
-  return { kind: 'file', label: 'doc.pdf', ...overrides }
-}
-
-describe('updateComposerAttachment', () => {
+describe('ComposerAttachment text kind', () => {
   afterEach(() => {
-    $composerAttachments.set([])
+    mainComposerScope.clear()
   })
 
-  it('replaces an existing attachment in place', () => {
-    addComposerAttachment(attachment({ id: 'file:a', uploadState: 'uploading' }))
+  it('addComposerTextAttachment stages a text chip with truncated preview', () => {
+    addComposerTextAttachment('hello world', 'msg-1')
+    const after = mainComposerScope.$attachments.get()
 
-    const updated = updateComposerAttachment(attachment({ id: 'file:a', attachedSessionId: 'sess-1' }))
-
-    expect(updated).toBe(true)
-    const current = $composerAttachments.get()
-    expect(current).toHaveLength(1)
-    expect(current[0]?.attachedSessionId).toBe('sess-1')
-    expect(current[0]?.uploadState).toBeUndefined()
+    expect(after.length).toBe(1)
+    const chip = after[0]!
+    expect(chip.kind).toBe('text')
+    expect(chip.textContent).toBe('hello world')
+    expect(chip.sourceMessageId).toBe('msg-1')
+    expect(chip.label).toBe('hello world')
   })
 
-  it('does NOT resurrect an attachment the user removed mid-upload', () => {
-    // Drop → eager upload starts → user removes the chip → upload resolves.
-    // The late success must not re-add the removed attachment.
-    addComposerAttachment(attachment({ id: 'file:a', uploadState: 'uploading' }))
-    removeComposerAttachment('file:a')
+  it('truncates preview label at 100 characters', () => {
+    const longText = 'a'.repeat(200)
+    addComposerTextAttachment(longText)
+    const chip = mainComposerScope.$attachments.get()[0]!
 
-    const updated = updateComposerAttachment(attachment({ id: 'file:a', attachedSessionId: 'sess-1' }))
-
-    expect(updated).toBe(false)
-    expect($composerAttachments.get()).toHaveLength(0)
+    expect(chip.label.length).toBeLessThanOrEqual(101) // 100 chars + ellipsis
+    expect(chip.label).toContain('\u2026')
+    expect(chip.textContent).toBe(longText) // full text preserved
   })
-})
 
-describe('session drafts', () => {
-  afterEach(() => {
-    for (const scope of ['session-a', 'session-b', null]) {
-      clearSessionDraft(scope)
+  it('generates a unique id for each text attachment', () => {
+    addComposerTextAttachment('first')
+    addComposerTextAttachment('second')
+    const after = mainComposerScope.$attachments.get()
+
+    expect(after.length).toBe(2)
+    expect(after[0]!.id).not.toBe(after[1]!.id)
+  })
+
+  it('accepts text kind in the ComposerAttachment type', () => {
+    const attachment: ComposerAttachment = {
+      id: 'text:test:1',
+      kind: 'text',
+      label: 'test',
+      textContent: 'some text',
+      sourceMessageId: 'msg-1',
     }
-
-    window.localStorage.clear()
-  })
-
-  it('keeps drafts isolated per session scope', () => {
-    stashSessionDraft('session-a', 'draft a', [])
-    stashSessionDraft('session-b', 'draft b', [attachment({ id: 'image:b', kind: 'image' })])
-
-    expect(takeSessionDraft('session-a')).toEqual({ attachments: [], text: 'draft a' })
-    expect(takeSessionDraft('session-b').text).toBe('draft b')
-    expect(takeSessionDraft('session-b').attachments.map(a => a.id)).toEqual(['image:b'])
-  })
-
-  it('scopes the unsaved new-session draft separately from real sessions', () => {
-    stashSessionDraft(null, 'new chat draft', [])
-    stashSessionDraft('session-a', 'session draft', [])
-
-    expect(takeSessionDraft(null).text).toBe('new chat draft')
-    expect(takeSessionDraft(undefined).text).toBe('new chat draft')
-    expect(takeSessionDraft('session-a').text).toBe('session draft')
-  })
-
-  it('persists draft text (not attachments) to localStorage', () => {
-    stashSessionDraft('session-a', 'survives reload', [attachment({ id: 'file:a' })])
-
-    const persisted = JSON.parse(window.localStorage.getItem(SESSION_DRAFTS_STORAGE_KEY) ?? '{}') as Record<
-      string,
-      string
-    >
-
-    expect(persisted['session-a']).toBe('survives reload')
-  })
-
-  it('evicts empty drafts instead of leaving stale entries behind', () => {
-    stashSessionDraft('session-a', 'saved', [])
-    stashSessionDraft('session-a', '   ', [])
-
-    expect(takeSessionDraft('session-a')).toEqual({ attachments: [], text: '' })
-  })
-
-  it('clears a stashed draft after an accepted submit', () => {
-    stashSessionDraft('session-a', 'sent prompt', [attachment({ id: 'file:a' })])
-    clearSessionDraft('session-a')
-
-    expect(takeSessionDraft('session-a')).toEqual({ attachments: [], text: '' })
-  })
-
-  it('returns clones so callers cannot mutate the stash', () => {
-    stashSessionDraft('session-a', 'draft', [attachment({ id: 'file:a' })])
-
-    const taken = takeSessionDraft('session-a')
-    taken.attachments[0]!.label = 'mutated'
-
-    expect(takeSessionDraft('session-a').attachments[0]?.label).toBe('doc.pdf')
-  })
-
-  it('migrates a tip-keyed draft onto the post-compression tip', () => {
-    const tipBefore = '20260720_062637_ad96b3'
-    const tipAfter = '20260720_071049_a28905'
-
-    stashSessionDraft(tipBefore, 'half typed while thinking', [])
-
-    expect(migrateSessionDraft(tipBefore, tipAfter)).toBe(true)
-    expect(takeSessionDraft(tipAfter).text).toBe('half typed while thinking')
-    expect(takeSessionDraft(tipBefore).text).toBe('')
-
-    clearSessionDraft(tipAfter)
-  })
-
-  it('does not overwrite a non-empty destination draft during migration', () => {
-    stashSessionDraft('from', 'old tip draft', [])
-    stashSessionDraft('to', 'already typed on new tip', [])
-
-    expect(migrateSessionDraft('from', 'to')).toBe(false)
-    expect(takeSessionDraft('to').text).toBe('already typed on new tip')
-    expect(takeSessionDraft('from').text).toBe('old tip draft')
-
-    clearSessionDraft('from')
-    clearSessionDraft('to')
+    expect(attachment.kind).toBe('text')
+    expect(attachment.textContent).toBe('some text')
   })
 })

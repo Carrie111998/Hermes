@@ -11,8 +11,10 @@ import {
 } from '@/components/ui/context-menu'
 import { translateNow, useI18n } from '@/i18n'
 import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
+import { attachmentId, pathLabel } from '@/lib/chat-runtime'
 import { IS_MAC } from '@/lib/keybinds/combo'
 import { cn } from '@/lib/utils'
+import { addComposerAttachment } from '@/store/composer'
 import {
   $fileActionDialog,
   beginInlineRename,
@@ -52,6 +54,16 @@ interface FileEntryContextMenuProps {
   relativeTo?: null | string
 }
 
+/** Stage a file or folder as a composer attachment chip. */
+export function attachFileAsContext(path: string, isDirectory: boolean): void {
+  addComposerAttachment({
+    id: attachmentId(isDirectory ? 'folder' : 'file', path),
+    kind: isDirectory ? 'folder' : 'file',
+    label: pathLabel(path),
+    path,
+  })
+}
+
 /** Right-click menu shared by both file trees (browser + review/git). */
 export function FileEntryContextMenu({ children, isDirectory, name, path, relativeTo }: FileEntryContextMenuProps) {
   const { t } = useI18n()
@@ -80,6 +92,10 @@ export function FileEntryContextMenu({ children, isDirectory, name, path, relati
             {m.copyRelativePath}
           </ContextMenuItem>
         )}
+        <ContextMenuSeparator />
+        <ContextMenuItem onSelect={() => attachFileAsContext(path, isDirectory)}>
+          Add as context
+        </ContextMenuItem>
         {localFs && (
           <>
             <ContextMenuSeparator />

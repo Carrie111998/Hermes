@@ -5,7 +5,7 @@ import { triggerHaptic } from '@/lib/haptics'
 
 export interface ComposerAttachment {
   id: string
-  kind: 'file' | 'folder' | 'image' | 'review' | 'terminal' | 'url'
+  kind: 'file' | 'folder' | 'image' | 'review' | 'terminal' | 'url' | 'text'
   label: string
   detail?: string
   refText?: string
@@ -16,6 +16,10 @@ export interface ComposerAttachment {
    * workspace (remote upload or local stage), and 'error' if that failed.
    * Drives the spinner / error state on the composer attachment card. */
   uploadState?: 'uploading' | 'error'
+  /** For 'text' kind: the selected message text. */
+  textContent?: string
+  /** For 'text' kind: which message it came from (for display). */
+  sourceMessageId?: string
 }
 
 export const $composerDraft = atom('')
@@ -388,6 +392,18 @@ export function clearComposerDraft() {
 export const addComposerAttachment = (attachment: ComposerAttachment) => mainComposerScope.add(attachment)
 export const removeComposerAttachment = (id: string) => mainComposerScope.remove(id)
 
+/** Stage a text snippet from a message as a composer attachment chip. */
+export function addComposerTextAttachment(text: string, sourceMessageId?: string): void {
+  const preview = text.length > 100 ? text.slice(0, 100) + '\u2026' : text
+  addComposerAttachment({
+    id: `text:${sourceMessageId ?? 'selection'}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+    kind: 'text',
+    label: preview,
+    textContent: text,
+    sourceMessageId,
+  })
+}
+
 /** Replace an existing attachment in place by id. No-op (returns false) when the
  * id is gone — e.g. the user removed the chip while an eager upload was still in
  * flight, so a late success must NOT resurrect it. Use this instead of
@@ -478,35 +494,3 @@ export function terminalContextBlocksFromDraft(draft: string) {
   }
 
   const selections = $composerTerminalSelections.get()
-
-  return labels.flatMap(label => {
-    const text = selections[label]?.trim()
-
-    if (!text) {
-      return []
-    }
-
-    return `\`\`\`terminal\n${text}\n\`\`\``
-  })
-}
-
-export function clearComposerTerminalSelections() {
-  if (Object.keys($composerTerminalSelections.get()).length === 0) {
-    return
-  }
-
-  $composerTerminalSelections.set({})
-}
-
-function upsertAttachment(attachments: ComposerAttachment[], attachment: ComposerAttachment) {
-  const index = attachments.findIndex(item => item.id === attachment.id)
-
-  if (index < 0) {
-    return [...attachments, attachment]
-  }
-
-  const next = [...attachments]
-  next[index] = attachment
-
-  return next
-}
