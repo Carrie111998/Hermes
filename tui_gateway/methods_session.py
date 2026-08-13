@@ -71,9 +71,11 @@ def _(rid, params: dict) -> dict:
         )
 
     boundary_old_session_id = str(params.get("old_session_id") or "")
+    boundary_cwd = ""
     if boundary_old_session_id:
         old_session = _sessions.get(boundary_old_session_id)
         if old_session is not None:
+            boundary_cwd = _persisted_session_cwd(old_session) or ""
             boundary_old_session_id = (
                 getattr(old_session.get("agent"), "session_id", None)
                 or old_session.get("session_key")
@@ -119,6 +121,7 @@ def _(rid, params: dict) -> dict:
             "transport": current_transport() or _stdio_transport,
             "boundary_old_session_id": boundary_old_session_id or None,
             "boundary_reason": str(params.get("reason") or "") or None,
+            "boundary_cwd": boundary_cwd,
         }
         _register_session_cwd(_sessions[sid])
 

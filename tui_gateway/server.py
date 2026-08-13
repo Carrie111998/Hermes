@@ -758,7 +758,11 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         reason=session.get("boundary_reason"),
         old_session_id=session.get("boundary_old_session_id"),
         new_session_id=session.get("boundary_new_session_id"),
-        cwd=str(session.get("cwd") or ""),
+        cwd=(
+            str(session.get("boundary_cwd") or "")
+            if "boundary_cwd" in session
+            else (_persisted_session_cwd(session) or "")
+        ),
     )
 
     # Mark session ended in DB so it doesn't linger as a ghost row in /resume.
@@ -2324,7 +2328,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 reason=current.get("boundary_reason"),
                 old_session_id=current.get("boundary_old_session_id"),
                 new_session_id=key if current.get("boundary_old_session_id") else None,
-                cwd=str(current.get("cwd") or ""),
+                cwd=(
+                    str(current.get("boundary_cwd") or "")
+                    if "boundary_cwd" in current
+                    else (_persisted_session_cwd(current) or "")
+                ),
             )
 
             info = _session_info(agent, current)
@@ -6846,7 +6854,11 @@ def _init_session(
         reason=_reset_session.get("boundary_reason"),
         old_session_id=_reset_session.get("boundary_old_session_id"),
         new_session_id=key if _reset_session.get("boundary_old_session_id") else None,
-        cwd=str(_reset_session.get("cwd") or ""),
+        cwd=(
+            str(_reset_session.get("boundary_cwd") or "")
+            if "boundary_cwd" in _reset_session
+            else (_persisted_session_cwd(_reset_session) or "")
+        ),
     )
     _emit("session.info", sid, _session_info(agent, _sessions.get(sid, {})))
     _schedule_mcp_late_refresh(sid, agent)

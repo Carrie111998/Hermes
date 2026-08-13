@@ -3734,6 +3734,7 @@ def test_explicit_session_rotation_emits_transition_and_cwd(monkeypatch, tmp_pat
         session_key="stored-old",
         source="tui",
         cwd=str(tmp_path),
+        explicit_cwd=True,
     )
     new_runtime = ""
     try:
@@ -3741,7 +3742,6 @@ def test_explicit_session_rotation_emits_transition_and_cwd(monkeypatch, tmp_pat
             "create",
             {
                 "cols": 80,
-                "cwd": str(tmp_path),
                 "old_session_id": "old-runtime",
                 "reason": "new_session",
             },
