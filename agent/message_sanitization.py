@@ -877,6 +877,11 @@ _TOOL_ROLE_STRICT_HOSTS = ("api.mistral.ai",)
 # caching).
 TOOL_TO_USER_BRIDGE_CONTENT = "[response interrupted]"
 
+# Marks a bridge this policy inserted, so a later destination can remove it
+# again. Underscore-prefixed like every other Hermes scaffolding marker, so
+# the transport's key sweeper drops it before the wire.
+TOOL_TO_USER_BRIDGE_KEY = "_tool_user_bridge"
+
 
 def requires_assistant_after_tool(provider: Any, model: Any, base_url: Any) -> bool:
     """True when the endpoint rejects a ``user`` turn straight after a ``tool``."""
@@ -892,14 +897,59 @@ def requires_assistant_after_tool(provider: Any, model: Any, base_url: Any) -> b
     )
 
 
-def bridge_tool_to_user_turns(api_messages: list) -> int:
-    """Insert a minimal assistant turn between a ``tool`` result and a ``user`` turn.
+def _bridges_tool_to_user(api_messages: list, idx: int) -> bool:
+    """True when the turn at ``idx`` sits between a ``tool`` and a ``user``."""
+    if idx == 0 or idx + 1 >= len(api_messages):
+        return False
+    prev = api_messages[idx - 1]
+    following = api_messages[idx + 1]
+    return (
+        isinstance(prev, dict)
+        and isinstance(following, dict)
+        and prev.get("role") == "tool"
+        and following.get("role") == "user"
+    )
+
+
+def apply_tool_role_policy(api_messages: list, strict: bool, *, mark: bool = True) -> int:
+    """Reconcile ``tool`` → ``user`` adjacency for the *current* destination.
+
+    Both directions, because ``api_messages`` is built once and reused across
+    retry attempts that can change provider:
+
+    * Destination rejects the adjacency (Mistral family): insert a minimal
+      assistant turn at every ``tool`` → ``user`` boundary.
+    * Destination accepts it: remove any bridge a previous strict destination
+      inserted, so a fallback onto a lenient provider is byte-for-byte free of
+      a turn it never needed. Only turns carrying
+      ``TOOL_TO_USER_BRIDGE_KEY`` are removed — a real assistant message is
+      never touched, whatever its content.
 
     Mutates ``api_messages`` (the per-call copy) in place and returns the
-    number of bridges inserted. Idempotent — a second pass finds no remaining
-    adjacency, so it is safe to call on every retry attempt.
+    number of turns inserted or removed. Idempotent for a fixed destination.
+
+    ``mark=False`` omits the marker, for callers that build a fresh
+    request-local copy per call and therefore never need to reverse it.
     """
-    inserted = 0
+    changed = 0
+
+    # Drop bridges that no longer serve the current destination: all of them
+    # when it accepts the adjacency, and any that a later pass (compaction,
+    # guidance peel) left stranded away from a tool -> user boundary. A bridge
+    # still doing its job is kept, so a repeat call for the same destination
+    # is a genuine no-op rather than a remove/re-insert churn.
+    for idx in range(len(api_messages) - 1, -1, -1):
+        msg = api_messages[idx]
+        if not (isinstance(msg, dict) and msg.get(TOOL_TO_USER_BRIDGE_KEY)):
+            continue
+        if strict and _bridges_tool_to_user(api_messages, idx):
+            continue
+        del api_messages[idx]
+        changed += 1
+
+    if not strict:
+        return changed
+
     idx = 1
     while idx < len(api_messages):
         prev = api_messages[idx - 1]
@@ -910,13 +960,14 @@ def bridge_tool_to_user_turns(api_messages: list) -> int:
             and prev.get("role") == "tool"
             and current.get("role") == "user"
         ):
-            api_messages.insert(
-                idx, {"role": "assistant", "content": TOOL_TO_USER_BRIDGE_CONTENT}
-            )
-            inserted += 1
+            bridge = {"role": "assistant", "content": TOOL_TO_USER_BRIDGE_CONTENT}
+            if mark:
+                bridge[TOOL_TO_USER_BRIDGE_KEY] = True
+            api_messages.insert(idx, bridge)
+            changed += 1
             idx += 1
         idx += 1
-    return inserted
+    return changed
 
 
 # ---------------------------------------------------------------------------

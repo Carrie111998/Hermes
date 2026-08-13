@@ -61,16 +61,15 @@ def test_mistral_wire_copy_gets_an_assistant_turn_between_tool_and_user():
     api_messages = _history_with_tool_then_user()
     assert _tool_then_user_indexes(api_messages) == [3]
 
-    bridged = agent._bridge_tool_to_user_for_provider(api_messages)
+    bridged = agent._reapply_tool_role_policy_for_provider(api_messages)
 
     assert bridged == 1
     assert _tool_then_user_indexes(api_messages) == []
     assert [m["role"] for m in api_messages] == [
         "system", "user", "assistant", "tool", "assistant", "user",
     ]
-    assert api_messages[4] == {
-        "role": "assistant", "content": TOOL_TO_USER_BRIDGE_CONTENT,
-    }
+    assert api_messages[4]["role"] == "assistant"
+    assert api_messages[4]["content"] == TOOL_TO_USER_BRIDGE_CONTENT
     # The user's redirect survives — bridging inserts, never rewinds.
     assert api_messages[5]["content"] == "actually, check the other dir"
 
@@ -82,7 +81,7 @@ def test_lenient_provider_wire_copy_is_untouched():
     api_messages = _history_with_tool_then_user()
     before = [dict(m) for m in api_messages]
 
-    assert agent._bridge_tool_to_user_for_provider(api_messages) == 0
+    assert agent._reapply_tool_role_policy_for_provider(api_messages) == 0
     assert api_messages == before
 
 
@@ -91,10 +90,10 @@ def test_bridging_is_idempotent_across_retry_attempts():
                         base_url="https://api.mistral.ai/v1")
     api_messages = _history_with_tool_then_user()
 
-    assert agent._bridge_tool_to_user_for_provider(api_messages) == 1
+    assert agent._reapply_tool_role_policy_for_provider(api_messages) == 1
     after_first = [dict(m) for m in api_messages]
 
-    assert agent._bridge_tool_to_user_for_provider(api_messages) == 0
+    assert agent._reapply_tool_role_policy_for_provider(api_messages) == 0
     assert api_messages == after_first
 
 
@@ -115,7 +114,7 @@ def test_every_adjacency_in_a_long_history_is_bridged():
         {"role": "user", "content": "q3"},
     ]
 
-    assert agent._bridge_tool_to_user_for_provider(api_messages) == 2
+    assert agent._reapply_tool_role_policy_for_provider(api_messages) == 2
     assert _tool_then_user_indexes(api_messages) == []
 
 
@@ -134,7 +133,7 @@ def test_tool_followed_by_assistant_is_left_alone():
     ]
     before = [dict(m) for m in api_messages]
 
-    assert agent._bridge_tool_to_user_for_provider(api_messages) == 0
+    assert agent._reapply_tool_role_policy_for_provider(api_messages) == 0
     assert api_messages == before
 
 
@@ -145,10 +144,91 @@ def test_stored_history_keeps_the_adjacency():
     history = _history_with_tool_then_user()
     api_messages = [dict(m) for m in history]
 
-    agent._bridge_tool_to_user_for_provider(api_messages)
+    agent._reapply_tool_role_policy_for_provider(api_messages)
 
     assert _tool_then_user_indexes(history) == [3]
     assert len(history) == 5
+
+
+def test_fallback_off_mistral_removes_the_bridge_again():
+    """Mistral -> lenient: the synthetic turn must not ride along.
+
+    ``api_messages`` is built once and reused across retry attempts, so a
+    fallback that switches destinations mid-conversation would otherwise send
+    a Mistral-shaped projection to a provider that never needed it.
+    """
+    agent = _make_agent(provider="mistral", model="mistral-large",
+                        base_url="https://api.mistral.ai/v1")
+    api_messages = _history_with_tool_then_user()
+    pristine = [dict(m) for m in api_messages]
+
+    assert agent._reapply_tool_role_policy_for_provider(api_messages) == 1
+
+    # _try_activate_fallback switches the live agent to a lenient provider and
+    # the retry loop reuses the same list.
+    agent.provider, agent.model = "openai", "gpt-5"
+    agent.base_url = "https://api.openai.com/v1"
+
+    assert agent._reapply_tool_role_policy_for_provider(api_messages) == 1
+    assert api_messages == pristine
+
+
+def test_fallback_back_onto_mistral_reinserts_the_bridge():
+    agent = _make_agent(provider="openai", model="gpt-5",
+                        base_url="https://api.openai.com/v1")
+    api_messages = _history_with_tool_then_user()
+
+    assert agent._reapply_tool_role_policy_for_provider(api_messages) == 0
+
+    agent.provider, agent.model = "mistral", "mistral-large"
+    agent.base_url = "https://api.mistral.ai/v1"
+    assert agent._reapply_tool_role_policy_for_provider(api_messages) == 1
+    assert _tool_then_user_indexes(api_messages) == []
+
+    agent.provider, agent.model = "openai", "gpt-5"
+    agent.base_url = "https://api.openai.com/v1"
+    assert agent._reapply_tool_role_policy_for_provider(api_messages) == 1
+    assert _tool_then_user_indexes(api_messages) == [3]
+
+
+def test_a_real_assistant_turn_is_never_removed_as_a_bridge():
+    """Only turns this policy inserted are reversible — content is not a key."""
+    agent = _make_agent(provider="openai", model="gpt-5",
+                        base_url="https://api.openai.com/v1")
+    api_messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "t1", "type": "function",
+                         "function": {"name": "f", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "t1", "content": "r"},
+        # A genuine model turn that happens to carry the bridge's wording.
+        {"role": "assistant", "content": TOOL_TO_USER_BRIDGE_CONTENT},
+        {"role": "user", "content": "q2"},
+    ]
+    before = [dict(m) for m in api_messages]
+
+    assert agent._reapply_tool_role_policy_for_provider(api_messages) == 0
+    assert api_messages == before
+
+
+def test_bridge_marker_never_reaches_the_wire():
+    """The marker is scaffolding — the transport's key sweeper drops it."""
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    agent = _make_agent(provider="mistral", model="mistral-large",
+                        base_url="https://api.mistral.ai/v1")
+    api_messages = _history_with_tool_then_user()
+    agent._reapply_tool_role_policy_for_provider(api_messages)
+
+    transport = object.__new__(ChatCompletionsTransport)
+    wire = transport.convert_messages(api_messages, model="mistral-large")
+
+    assert [m["role"] for m in wire] == [
+        "system", "user", "assistant", "tool", "assistant", "user",
+    ]
+    assert not any(
+        key.startswith("_") for msg in wire for key in msg if isinstance(key, str)
+    )
 
 
 def test_pre_send_pipeline_yields_a_mistral_legal_payload():
@@ -166,7 +246,7 @@ def test_pre_send_pipeline_yields_a_mistral_legal_payload():
     sanitized = sanitize_api_messages(_history_with_tool_then_user())
     assert _tool_then_user_indexes(sanitized) == [3]
 
-    agent._bridge_tool_to_user_for_provider(sanitized)
+    agent._reapply_tool_role_policy_for_provider(sanitized)
     assert _tool_then_user_indexes(sanitized) == []
 
 
@@ -181,7 +261,7 @@ def test_pre_send_pipeline_yields_a_mistral_legal_payload():
 ])
 def test_strict_endpoints_are_recognized(provider, model, base_url):
     agent = _make_agent(provider=provider, model=model, base_url=base_url)
-    assert agent._bridge_tool_to_user_for_provider(
+    assert agent._reapply_tool_role_policy_for_provider(
         _history_with_tool_then_user()) == 1
 
 
@@ -194,5 +274,5 @@ def test_strict_endpoints_are_recognized(provider, model, base_url):
 ])
 def test_lenient_endpoints_are_not_recognized(provider, model, base_url):
     agent = _make_agent(provider=provider, model=model, base_url=base_url)
-    assert agent._bridge_tool_to_user_for_provider(
+    assert agent._reapply_tool_role_policy_for_provider(
         _history_with_tool_then_user()) == 0

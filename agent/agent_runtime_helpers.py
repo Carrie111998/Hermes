@@ -3690,43 +3690,45 @@ def reapply_reasoning_echo_for_provider(agent, api_messages: list) -> int:
     )
 
 
-def bridge_tool_to_user_for_provider(agent, api_messages: list) -> int:
-    """Bridge ``tool`` → ``user`` adjacencies for providers that reject them.
+def reapply_tool_role_policy_for_provider(agent, api_messages: list) -> int:
+    """Reconcile ``tool`` → ``user`` adjacency against the *current* provider.
 
     Mistral answers HTTP 400 "Unexpected role 'user' after role 'tool'" when a
     user turn directly follows a tool result (#20154), which strands every
     subsequent request in the session once the shape is in history. The shape
     is legitimate — the user redirected before the model got its continuation
     turn — so ``repair_message_sequence`` keeps it in the stored transcript and
-    the repair happens here instead, on the per-call copy, and only when the
-    *current* provider is one that rejects it.
+    the repair happens here instead, on the per-call copy.
 
-    Called alongside ``reapply_reasoning_echo_for_provider`` so a
-    mid-conversation fallback onto Mistral is covered too.
+    Like ``reapply_reasoning_echo_for_provider``, this runs at the top of every
+    retry attempt and reconciles in BOTH directions: ``api_messages`` is built
+    once for the primary provider and a mid-conversation fallback can switch
+    destinations either way. Falling back Mistral → OpenAI must therefore
+    remove the bridge again, or the lenient provider receives a synthetic turn
+    it never needed (and a moved prompt prefix).
 
-    Returns the number of bridging assistant turns inserted.
+    Returns the number of bridging assistant turns inserted or removed.
     """
     from agent.message_sanitization import (
-        bridge_tool_to_user_turns,
+        apply_tool_role_policy,
         requires_assistant_after_tool,
     )
 
-    if not requires_assistant_after_tool(
+    strict = requires_assistant_after_tool(
         agent.provider,
         agent.model,
         getattr(agent, "_base_url_lower", agent.base_url),
-    ):
-        return 0
-
-    bridged = bridge_tool_to_user_turns(api_messages)
-    if bridged:
+    )
+    changed = apply_tool_role_policy(api_messages, strict)
+    if changed:
         logger.debug(
-            "Bridged %d tool->user adjacency/adjacencies with an assistant "
-            "turn for strict provider (model=%s)",
-            bridged,
+            "Reconciled %d tool->user bridge turn(s) for the active "
+            "destination (strict=%s, model=%s)",
+            changed,
+            strict,
             agent.model,
         )
-    return bridged
+    return changed
 
 
 def _iter_httpx_pool_objects(http_client: Any):

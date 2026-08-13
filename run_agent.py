@@ -7486,10 +7486,10 @@ class AIAgent:
         from agent.agent_runtime_helpers import reapply_reasoning_echo_for_provider
         return reapply_reasoning_echo_for_provider(self, api_messages)
 
-    def _bridge_tool_to_user_for_provider(self, api_messages: list) -> int:
-        """Forwarder — see ``agent.agent_runtime_helpers.bridge_tool_to_user_for_provider``."""
-        from agent.agent_runtime_helpers import bridge_tool_to_user_for_provider
-        return bridge_tool_to_user_for_provider(self, api_messages)
+    def _reapply_tool_role_policy_for_provider(self, api_messages: list) -> int:
+        """Forwarder — see ``agent.agent_runtime_helpers.reapply_tool_role_policy_for_provider``."""
+        from agent.agent_runtime_helpers import reapply_tool_role_policy_for_provider
+        return reapply_tool_role_policy_for_provider(self, api_messages)
 
     @staticmethod
     def _sanitize_tool_calls_for_strict_api(api_msg: dict, model: "str | None" = None) -> dict:
