@@ -5,8 +5,8 @@ and human maintainers working in `novkien/hermes-agent`.
 
 It explains where this application repository fits in Le Kien's wider Jarvis/Hermes
 system. It is intentionally shorter than a full architecture manual. Deep deployment,
-network, control-plane, and instruction-layer context lives in the installed
-`hermes-agent` skill and its focused references.
+network, control-plane, instruction-layer, plugin-source, and profile-SOUL context lives
+in the installed `hermes-agent` skill and its focused references.
 
 ## Authority and precedence
 
@@ -52,11 +52,13 @@ core surfaces:
 - prompt and context assembly;
 - CLI, TUI, web dashboard, desktop, and messaging gateway surfaces;
 - Telegram and other platform adapters;
-- tools, toolsets, plugins, skills integration, cron, memory, sessions, and profiles;
+- tools, toolsets, plugin framework/integration, skills integration, cron, memory,
+  sessions, and profiles;
 - tests, installer, documentation, and update mechanics.
 
 This repository is **one component** of the Jarvis/Hermes deployment. It is not the
-entire deployed system and is not the source of truth for live process state.
+entire deployed system and is not the source of truth for live process state, private
+shared skills, owner-managed external plugin packages, or profile `SOUL.md` definitions.
 
 ## Jarvis/Hermes system at a glance
 
@@ -65,19 +67,21 @@ flowchart LR
     U[Le Kien] <--> TG[Telegram]
     TG <--> GW[Hermes Gateway<br/>Jarvis host]
     GW <--> CORE[Hermes Agent Core]
-    CORE --> CTX[SOUL + AGENTS + skills<br/>memory + session context]
+    CORE --> CTX[Context<br/>SOUL + AGENTS + skills<br/>memory + session state]
     CORE --> R9[9router<br/>Pi]
     CORE --> LP[llama-proxy<br/>Pi]
 
     U <--> OS[AgentOS Dashboard<br/>Pi]
     OS --> HD[Hermes Dashboard API<br/>Jarvis host]
     OS --> GA[Hermes Gateway API<br/>Jarvis host]
-    OS --> AD[Temporary external data adapter<br/>Jarvis host]
+    OS --> AD[Temporary external AgentOS adapter<br/>Jarvis host]
     OS --> R9
     OS --> LP
 
-    GHS[(novkien/hermes-skills)] -->|Bridge fast-forward pull| CTX
-    GHA[(novkien/hermes-agent)] -->|repository update| CORE
+    GHS[(novkien/hermes-skills)] -->|shared skills + profile packs| CTX
+    GHA[(novkien/agents)] -->|profile SOUL.md| CTX
+    GHP[(novkien/hermes-plugins)] -->|gateway/runtime plugins| GW
+    GHAPP[(novkien/hermes-agent)] -->|application source| CORE
 
     LAN[LAN route] -. preferred .- OS
     TS[Tailnet route] -. fallback / distributed hosts .- OS
@@ -87,13 +91,15 @@ flowchart LR
 
 | Component | Current role | Current location or repository |
 |---|---|---|
-| Hermes application | Agent runtime, gateway, tools, profiles, sessions | This repository; deployed checkout normally `/home/jarvis/.hermes/hermes-agent` |
+| Hermes application | Agent runtime, gateway, tools, profiles, sessions, plugin framework and skills integration | This repository; deployed checkout normally `/home/jarvis/.hermes/hermes-agent` |
 | Telegram | Primary owner conversation surface | Hermes gateway platform adapter |
 | AgentOS | Browser control plane for the whole Jarvis/Hermes system | `novkien/agent-mission-control`; Pi LAN route currently `192.168.1.140` |
-| AgentOS data adapter | Temporary read-only bridge for dashboard data | Jarvis host; intended to be merged into `hermes-agent` only under a later explicit implementation plan |
+| AgentOS external adapter | Temporary external data/mutation bridge consumed by AgentOS through bounded supported routes | Jarvis host; remains separate until an owner-authorized merge plan changes that boundary |
 | 9router | General LLM/provider routing path | Pi; external project at `/home/pi/9router` |
 | llama-proxy | Local model routing, wake/switch/unload lifecycle, dashboard and ComfyUI passthrough | `novkien/llama-proxy`; Pi |
-| Skill registry | Canonical source for shared skills and profile packs | Private `novkien/hermes-skills` |
+| Skill registry | Canonical source for shared skills and profile-selectable skill packs | Private `novkien/hermes-skills` |
+| Plugin registry | Canonical source for owner-managed gateway/runtime plugin packages | Private `novkien/hermes-plugins`; live packages under `/home/jarvis/.hermes/plugins/` |
+| Agent SOUL registry | Canonical reviewed source for profile `SOUL.md` definitions | Private `novkien/agents`; deployed files under `/home/jarvis/.hermes/agents/<profile>/SOUL.md` |
 
 Addresses, ports, process identities, active models, bindings, branches, and commit SHAs
 are volatile facts. Before an operational action, reverify them from current evidence.
@@ -104,7 +110,7 @@ reverification contract.
 
 When running inside Hermes and the task concerns Jarvis/Hermes architecture,
 repositories, runtime topology, AgentOS, Telegram routing, LLM proxies, skills,
-context loading, profiles, or deployment, load:
+plugins, profile SOUL, context loading, profiles, or deployment, load:
 
 ```text
 skill_view("hermes-agent")
@@ -145,6 +151,7 @@ Focused skill references
   ├─ repositories and change control
   ├─ context loading and skill routing
   ├─ skills registry and profile packs
+  ├─ external gateway plugins and profile SOUL sources
   └─ freshness and source-of-truth rules
 
 Current source/runtime evidence
@@ -162,7 +169,9 @@ current live facts in evidence rather than treating a dated document as timeless
 | `novkien/hermes-agent` | Hermes application fork | Application source and root repository documentation |
 | `NousResearch/hermes-agent` | Upstream Hermes project | Read/fetch/update source; do not push owner changes here |
 | `novkien/hermes-skills` | Shared skills and profile-selectable skill packs | Instruction-layer skills, references, scripts, templates, tests and harnesses |
-| `novkien/agent-mission-control` | AgentOS dashboard | Separate dashboard code until an owner-authorized merge plan is executed |
+| `novkien/hermes-plugins` | Owner-managed Hermes gateway/runtime plugins | External plugin packages and their plugin-owned tests/configuration; not live runtime state |
+| `novkien/agents` | Reviewed profile `SOUL.md` definitions | Profile `SOUL.md` files only; profile import code/config remains outside this repository unless explicitly added |
+| `novkien/agent-mission-control` | AgentOS dashboard/BFF | Separate AgentOS code until an owner-authorized merge plan is executed |
 | `novkien/llama-proxy` | Sanitized llama-proxy source | Proxy application source |
 
 Do not infer a remote's purpose from its name. Read current Git configuration and
@@ -183,7 +192,7 @@ They are tracked by the private skills repository through a separate Git directo
 /home/jarvis/.hermes/repos/hermes-skills.git
 ```
 
-Bridge deploys an owner-authorized skills commit with a fast-forward-only pull:
+Bridge deploys an owner-authorized merged skills commit with a fast-forward-only pull:
 
 ```bash
 git \
@@ -196,6 +205,29 @@ For repository-tracked skill paths, this Git transport replaces apply-ZIP unless
 owner explicitly selects apply-ZIP for that operation. Cache refresh, session reset,
 service reload, and behavioral verification are separate actions and must be reported
 separately.
+
+### Plugin and SOUL source boundaries
+
+The owner-managed plugin source and profile SOUL source are separate from both this
+application repository and the skills registry:
+
+```text
+novkien/hermes-plugins
+  → reviewed gateway/runtime plugin packages
+  → deployed package root: /home/jarvis/.hermes/plugins/
+
+novkien/agents
+  → reviewed <profile>/SOUL.md files
+  → deployed file: /home/jarvis/.hermes/agents/<profile>/SOUL.md
+```
+
+A GitHub commit in either repository does not prove the corresponding live bytes were
+deployed, a service reloaded, a session reset, or behavior changed. Verify those steps
+separately when the task includes deployment or activation.
+
+The `plugins/` directory inside this application repository is the application plugin
+framework and bundled/built-in plugin surface. Do not confuse it with the owner's
+separately versioned external plugin packages in `novkien/hermes-plugins`.
 
 ## Network model
 
@@ -231,7 +263,7 @@ hermes-agent/
 ├── toolsets.py           # toolset definitions and core tool surface
 ├── tools/                # tool implementations and registry
 ├── gateway/              # messaging gateway and platform runtime
-├── plugins/              # plugin system and built-in plugins
+├── plugins/              # plugin framework and bundled/built-in plugin surface
 ├── hermes_cli/           # CLI commands, setup, profiles, web server and operations
 ├── cli.py                # classic interactive CLI orchestration
 ├── ui-tui/               # Ink/React terminal UI
@@ -255,16 +287,17 @@ Preserve these unless the owner explicitly requests a redesign:
 2. **Strict message alternation and session integrity.** Do not inject synthetic turns
    in ways that violate provider message ordering or corrupt persisted history.
 3. **Narrow core tool surface.** Prefer an existing tool, CLI command plus skill,
-   service-gated tool, plugin, or MCP integration before adding a permanent core model
-   tool.
+   service-gated tool, external plugin, or MCP integration before adding a permanent
+   core model tool.
 4. **Session-scoped capabilities.** UI/client capabilities are determined by the
    session and platform, not only by process environment.
 5. **Configuration separation.** Behavioral configuration belongs in `config.yaml`;
    `.env` is for credentials and secrets.
-6. **Profiles are explicit scopes.** Do not flatten profile packs or merge profile
-   state merely for convenience.
-7. **Evidence-backed behavior claims.** Code proves implementation; runtime evidence
-   proves deployment and current behavior. One does not substitute for the other.
+6. **Profiles are explicit scopes.** Do not flatten skill packs, profile SOUL, or
+   profile state merely for convenience.
+7. **Evidence-backed behavior claims.** Code proves implementation; reviewed Git source
+   proves repository content; runtime evidence proves deployment and current behavior.
+   One does not substitute for another.
 
 ## Change workflow
 
@@ -274,15 +307,18 @@ For every authorized change:
 2. Inspect the smallest set of current source/evidence required.
 3. Verify the premise against the current implementation before calling something a
    defect.
-4. Select the smallest correct target: documentation, skill, prompt, config, plugin,
-   service, or code.
+4. Select the smallest correct target and repository: application/documentation,
+   shared skill/profile pack, external plugin, profile SOUL, AgentOS, proxy, config,
+   service, or other code.
 5. Author complete final files. Do not use fragment patches as the normal Hermes
    handoff format.
 6. Preserve unrelated behavior and profile boundaries.
-7. Run the tests or checks requested by the owner or materially required by the
+7. Use a branch and pull request for owner repositories unless the owner explicitly
+   selects a different Git operation.
+8. Run the tests or checks requested by the owner or materially required by the
    changed surface.
-8. Report writes, commits, pulls, reloads, resets, and behavioral outcomes as separate
-   facts.
+9. Report writes, commits, PR/merge state, pulls, reloads, resets, and behavioral
+   outcomes as separate facts.
 
 Do not transform an execution request into review-only advice. Do not add an approval
 layer that the owner did not request.
@@ -290,7 +326,7 @@ layer that the owner did not request.
 ## Security
 
 - Never place credentials, passwords, private keys, bot tokens, API keys, cookies, or
-  authorization headers in repository documentation or skills.
+  authorization headers in repository documentation, skills, plugins, or SOUL files.
 - Store only the name/location class of a secret, never its value.
 - Do not publish live databases, WAL/SHM files, logs, session stores, model weights,
   runtime state, or unreviewed backups.
@@ -309,13 +345,14 @@ FILES_REPLACED:
 FILES_DELETED:
 COMMIT_CREATED:
 REMOTE_UPDATED:
+PULL_REQUEST:
 LOCAL_PULL_RESULT:
 CACHE_REFRESH_RESULT:
-SESSION_RESET_RESULTC:
-SERVICE_RELOAD_RESULTC:
+SESSION_RESET_RESULT:
+SERVICE_RELOAD_RESULT:
 BEHAVIORAL_TEST_RESULT:
 UNRESOLVED_FACTS:
 ```
 
-Never claim a commit, pull, reload, activation, or behavior change without the
-corresponding result.
+Never claim a commit, PR merge, pull, reload, activation, or behavior change without
+the corresponding result.
