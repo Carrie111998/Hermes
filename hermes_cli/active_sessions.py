@@ -35,6 +35,18 @@ def _get_terminal_surface_id() -> str:
             title_buf = ctypes.create_unicode_buffer(1024)
             length = ctypes.windll.kernel32.GetConsoleTitleW(title_buf, 1024)
             if length:
+                # Two PowerShell tabs with the same default title both resolve
+                # to the same "win32-console:Windows PowerShell" key, so the
+                # same-surface guard can't distinguish them. Augment with the
+                # console window handle so each tab gets a distinct key.
+                try:
+                    kernel32 = ctypes.windll.kernel32
+                    kernel32.GetConsoleWindow.restype = ctypes.c_void_p
+                    console_hwnd = kernel32.GetConsoleWindow()
+                    if console_hwnd:
+                        return f"win32-console:{title_buf.value}:hwnd:{console_hwnd}"
+                except Exception:
+                    pass
                 return f"win32-console:{title_buf.value}"
             return f"win32-pid:{os.getpid()}"
         fd = sys.stdout.fileno()
@@ -244,6 +256,25 @@ def _optional_float(value: Any) -> Optional[float]:
         return None
 
 
+def _resolve_pid_exists():
+    """Lazy import of the authoritative cross-platform PID-existence check.
+
+    active_sessions no longer does ``from gateway.status import _pid_exists``
+    per-call.  A per-call import inside ``_pid_alive``'s inner try/except meant
+    any import failure in ``gateway.status`` (circular import, syntax error,
+    missing transitive dep, scaffold race) was silently caught and returned
+    False for every PID — wiping the entire active-session registry through
+    ``_prune_dead`` exactly when it matters most (startup).
+
+    Importing once at first call and reusing the reference keeps the blast
+    radius bounded: if the import itself fails, ``_PID_EXISTS`` is never bound
+    and every ``_pid_alive`` call raises — surfacing the real problem instead
+    of silently making every PID look dead.
+    """
+    global _PID_EXISTS
+    from gateway.status import _pid_exists as _PID_EXISTS  # noqa: WPS436
+
+
 def _pid_alive(pid: Any, process_start_time: Any = None) -> bool:
     try:
         pid_int = int(pid)
@@ -252,9 +283,8 @@ def _pid_alive(pid: Any, process_start_time: Any = None) -> bool:
     if pid_int <= 0:
         return False
     try:
-        from gateway.status import _pid_exists
-
-        exists = bool(_pid_exists(pid_int))
+        _resolve_pid_exists()
+        exists = bool(_PID_EXISTS(pid_int))
     except Exception:
         return False
     if not exists:
