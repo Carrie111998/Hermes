@@ -534,6 +534,11 @@ def _get_cdp_override_raw() -> str:
     "do not execute ``agent-browser --version`` here" rule in
     ``check_browser_requirements``: no side effects during schema build.
     """
+    from agent.browser_interaction_policy import visible_browser_allowed
+
+    if not visible_browser_allowed():
+        return ""
+
     env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
     if env_override:
         return env_override
@@ -1045,6 +1050,10 @@ def _is_headed_mode() -> bool:
     var as fallback.  Result is cached after the first call.
     """
     global _cached_headed_mode, _headed_mode_resolved
+    from agent.browser_interaction_policy import visible_browser_allowed
+
+    if not visible_browser_allowed():
+        return False
     if _headed_mode_resolved:
         return _cached_headed_mode  # type: ignore[return-value]
 
@@ -1052,8 +1061,8 @@ def _is_headed_mode() -> bool:
     _cached_headed_mode = False
 
     try:
-        from hermes_cli.config import read_raw_config
-        cfg = read_raw_config()
+        from hermes_cli.config import load_config
+        cfg = load_config()
         val = cfg.get("browser", {}).get("headed")
         if val is not None:
             _cached_headed_mode = str(val).strip().lower() in ("true", "1", "yes")

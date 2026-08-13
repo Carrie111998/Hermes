@@ -2334,6 +2334,8 @@ class CLICommandsMixin:
                 print()
                 return
 
+            # /browser connect is the explicit, foreground opt-in boundary.
+            os.environ["HERMES_BROWSER_INTERACTION"] = "visible"
             os.environ["BROWSER_CDP_URL"] = cdp_url
             # Eagerly start the CDP supervisor so pending_dialogs + frame_tree
             # show up in the next browser_snapshot.  No-op if already started.
@@ -2365,6 +2367,7 @@ class CLICommandsMixin:
         elif sub == "disconnect":
             if current:
                 os.environ.pop("BROWSER_CDP_URL", None)
+                os.environ.pop("HERMES_BROWSER_INTERACTION", None)
                 try:
                     from tools.browser_tool import cleanup_all_browsers, _stop_cdp_supervisor
                     _stop_cdp_supervisor("default")

@@ -10335,6 +10335,11 @@ def _default_spawn(
     from gateway.session_context import _VAR_MAP
     for key in _VAR_MAP:
         env.pop(key, None)
+    # Board workers are unattended. Never inherit a foreground session's
+    # headed-browser or operator-CDP capability.
+    env["HERMES_BROWSER_INTERACTION"] = "isolated"
+    env.pop("AGENT_BROWSER_HEADED", None)
+    env.pop("BROWSER_CDP_URL", None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root

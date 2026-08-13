@@ -302,12 +302,19 @@ class TestLegacyCloudMigration:
         assert _is_provider_active(cli_row, dict(self._LEGACY)) is False
 
 
+@pytest.fixture(autouse=True)
+def _visible_browser_policy_for_legacy_contracts(monkeypatch):
+    """Existing Browser Use tests exercise the explicit foreground contract."""
+    monkeypatch.setenv("HERMES_BROWSER_INTERACTION", "visible")
+
+
 class TestBackendCdpResolution:
     """browser_exec routes through the configured browser backend by reusing
     the legacy stack's provider session machinery (_get_session_info)."""
 
     def _env(self):
         return {}
+
 
     def test_existing_bu_env_wins(self, monkeypatch):
         env = {"BU_CDP_WS": "ws://operator-override:9222"}
@@ -351,6 +358,23 @@ class TestBackendCdpResolution:
         env = self._env()
         assert bu_cli._resolve_backend_cdp(env, "t1") is None
         assert "BU_CDP_WS" not in env and "BU_CDP_URL" not in env
+
+    def test_isolated_policy_refuses_operator_cdp(self, monkeypatch):
+        import tools.browser_tool as bt
+
+        monkeypatch.delenv("HERMES_BROWSER_INTERACTION", raising=False)
+        monkeypatch.setattr(bt, "_get_cdp_override", lambda: "http://127.0.0.1:9222")
+        err = bu_cli._resolve_backend_cdp(self._env(), "t1")
+        assert err and "visible browser" in err.lower()
+
+    def test_isolated_policy_refuses_implicit_local_chrome(self, monkeypatch):
+        import tools.browser_tool as bt
+
+        monkeypatch.delenv("HERMES_BROWSER_INTERACTION", raising=False)
+        monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
+        monkeypatch.setattr(bt, "_get_cloud_provider", lambda: None)
+        err = bu_cli._resolve_backend_cdp(self._env(), "t1")
+        assert err and "web_search" in err
 
     def test_provider_failure_returns_error(self, monkeypatch):
         import tools.browser_tool as bt

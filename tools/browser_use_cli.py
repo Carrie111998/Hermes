@@ -385,7 +385,15 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str]) -> Optional[str]:
 
     Returns an error string on provider failure, None on success.
     """
+    from agent.browser_interaction_policy import visible_browser_allowed
+
+    allow_visible = visible_browser_allowed()
     if env.get("BU_CDP_WS") or env.get("BU_CDP_URL"):
+        if not allow_visible:
+            return (
+                "Visible browser/CDP overrides are disabled for isolated agent "
+                "research. Use web_search/web_extract or a configured cloud browser."
+            )
         return None
 
     try:
@@ -403,6 +411,11 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str]) -> Optional[str]:
     except Exception:
         override = ""
     if override:
+        if not allow_visible:
+            return (
+                "Visible browser/CDP overrides are disabled for isolated agent "
+                "research. Use web_search/web_extract or a configured cloud browser."
+            )
         env["BU_CDP_URL" if override.startswith(("http://", "https://")) else "BU_CDP_WS"] = override
         return None
 
@@ -412,6 +425,13 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str]) -> Optional[str]:
         logger.debug("Cloud provider lookup failed: %s", e)
         provider = None
     if provider is None:
+        if not allow_visible:
+            return (
+                "No isolated browser backend is configured; refusing Browser Use's "
+                "implicit local Chrome fallback. Use web_search/web_extract, set "
+                "browser.backend: off for Hermes' headless browser, or configure a "
+                "cloud browser provider."
+            )
         return None
 
     # Browser Use direct-API configs: the CLI talks to Browser Use cloud

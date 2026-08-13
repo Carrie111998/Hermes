@@ -13394,6 +13394,7 @@ def test_browser_manage_connect_sets_env_and_cleans_twice(monkeypatch):
         "Chromium-family browser is already listening at http://127.0.0.1:9222"
     ]
     assert os.environ.get("BROWSER_CDP_URL") == "http://127.0.0.1:9222"
+    assert os.environ.get("HERMES_BROWSER_INTERACTION") == "visible"
     # First cleanup runs against the OLD env (none here), second against the NEW.
     assert cleanup_calls == ["", "http://127.0.0.1:9222"]
 

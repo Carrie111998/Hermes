@@ -83,6 +83,9 @@ agent:
     assert pid == 4242
     assert captured["env"]["HERMES_HOME"] == str(profile)
     assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
+    assert captured["env"]["HERMES_BROWSER_INTERACTION"] == "isolated"
+    assert "AGENT_BROWSER_HEADED" not in captured["env"]
+    assert "BROWSER_CDP_URL" not in captured["env"]
     assert "--toolsets" in captured["cmd"]
     pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
     for required in ("terminal", "web", "file", "skills", "code_execution", "delegation"):

@@ -446,6 +446,15 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     action = (args.get("action") or "").strip().lower()
     if not action:
         return json.dumps({"error": "missing `action`"})
+    if action.startswith("cua_browser_"):
+        from agent.browser_interaction_policy import visible_browser_allowed
+
+        if not visible_browser_allowed():
+            return json.dumps({
+                "error": "Visible desktop browser control is disabled for isolated agent research.",
+                "code": "visible_browser_policy",
+                "hint": "Use web_search/web_extract or the isolated browser toolset.",
+            })
     # Per-run key for approval-state and daemon-mode isolation across
     # concurrent sessions.
     session_id = str(kwargs.get("session_id") or "")

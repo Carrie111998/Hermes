@@ -14425,6 +14425,9 @@ def _browser_connect(rid, params: dict) -> dict:
         # then again AFTER so the default task's cached supervisor
         # is drained against the new URL.
         cleanup_all_browsers()
+        # browser.manage(connect) is an explicit foreground opt-in. Detached
+        # agents cannot reach this UI boundary.
+        os.environ["HERMES_BROWSER_INTERACTION"] = "visible"
         os.environ["BROWSER_CDP_URL"] = normalized
         cleanup_all_browsers()
     except Exception as e:
@@ -14449,6 +14452,7 @@ def _browser_disconnect(rid) -> dict:
 
     reap()
     os.environ.pop("BROWSER_CDP_URL", None)
+    os.environ.pop("HERMES_BROWSER_INTERACTION", None)
     reap()
     return _ok(rid, {"connected": False})
 

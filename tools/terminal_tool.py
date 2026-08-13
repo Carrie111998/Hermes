@@ -2586,6 +2586,17 @@ def terminal_tool(
                 "status": "error",
             }, ensure_ascii=False)
 
+        from agent.browser_interaction_policy import blocked_visible_browser_command
+
+        browser_refusal = blocked_visible_browser_command(command)
+        if browser_refusal:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": browser_refusal,
+                "status": "blocked",
+            }, ensure_ascii=False)
+
         # Get configuration
         config = _get_env_config()
         env_type = config["env_type"]

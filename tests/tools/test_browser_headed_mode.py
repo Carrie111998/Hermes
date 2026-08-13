@@ -20,9 +20,15 @@ def _reset_headed_cache():
 
 @pytest.fixture(autouse=True)
 def _clean_headed_cache():
+    previous = os.environ.get("HERMES_BROWSER_INTERACTION")
+    os.environ["HERMES_BROWSER_INTERACTION"] = "visible"
     _reset_headed_cache()
     yield
     _reset_headed_cache()
+    if previous is None:
+        os.environ.pop("HERMES_BROWSER_INTERACTION", None)
+    else:
+        os.environ["HERMES_BROWSER_INTERACTION"] = previous
 
 
 # ---------------------------------------------------------------------------
@@ -40,14 +46,27 @@ class TestIsHeadedMode:
     def test_config_true(self):
         from tools.browser_tool import _is_headed_mode
         cfg = {"browser": {"headed": True}}
-        with patch("hermes_cli.config.read_raw_config", return_value=cfg):
+        with patch("hermes_cli.config.load_config", return_value=cfg):
             assert _is_headed_mode() is True
+
+    def test_managed_false_wins_over_raw_profile_true(self):
+        from tools.browser_tool import _is_headed_mode
+        resolved = {"browser": {"headed": False}}
+        with patch("hermes_cli.config.load_config", return_value=resolved):
+            assert _is_headed_mode() is False
+
+    def test_isolated_policy_forces_false(self, monkeypatch):
+        from tools.browser_tool import _is_headed_mode
+        monkeypatch.delenv("HERMES_BROWSER_INTERACTION", raising=False)
+        resolved = {"browser": {"headed": True}}
+        with patch("hermes_cli.config.load_config", return_value=resolved):
+            assert _is_headed_mode() is False
 
 
     def test_caching(self):
         from tools.browser_tool import _is_headed_mode
         cfg = {"browser": {"headed": True}}
-        with patch("hermes_cli.config.read_raw_config", return_value=cfg) as mock_read:
+        with patch("hermes_cli.config.load_config", return_value=cfg) as mock_read:
             assert _is_headed_mode() is True
             assert _is_headed_mode() is True
             assert mock_read.call_count == 1
