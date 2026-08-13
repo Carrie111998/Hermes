@@ -230,6 +230,32 @@ class TestRunOneJobHonoursInterruptedFlag:
         assert delivered_content == "This run was interrupted."
         assert "plausible final response" not in delivered_content
 
+    def test_interrupted_job_with_whitespace_response_delivers_failure_summary(self):
+        import cron.scheduler as sched
+
+        job = self._make_job()
+        sched._interrupted_job_ids.add(job["id"])
+
+        with patch("cron.scheduler.claim_dispatch", return_value=True), \
+             patch("agent.secret_scope.set_secret_scope", return_value=None), \
+             patch("agent.secret_scope.build_profile_secret_scope", return_value=None), \
+             patch("agent.secret_scope.reset_secret_scope"), \
+             patch(
+                 "cron.scheduler.run_job",
+                 return_value=(True, "full output", "  \n", None),
+             ), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch(
+                 "cron.scheduler._summarize_cron_failure_for_delivery",
+                 return_value="This run was interrupted.",
+             ), \
+             patch("cron.scheduler._deliver_result", return_value=None) as mock_deliver, \
+             patch("cron.scheduler.mark_job_run"):
+            result = sched.run_one_job(job)
+
+        assert result is True
+        mock_deliver.assert_called_once()
+        assert mock_deliver.call_args.args[1] == "This run was interrupted."
 
     def test_exception_path_also_honours_interrupted_flag(self):
         import cron.scheduler as sched

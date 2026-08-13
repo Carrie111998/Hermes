@@ -473,7 +473,25 @@ Check if nginx is running. If everything is healthy, respond with only [SILENT].
 Otherwise, report the issue.
 ```
 
-Failed jobs always deliver regardless of the `[SILENT]` marker — only successful runs can be silenced. For quiet monitoring jobs, prompt the agent to reply with only `[SILENT]` when there is nothing to report.
+By default, failed jobs deliver regardless of the `[SILENT]` marker — only successful runs can be silenced. For quiet monitoring jobs, prompt the agent to reply with only `[SILENT]` when there is nothing to report.
+
+### Model failure delivery
+
+LLM-driven jobs that fail normally send a compact scheduler-authored `⚠️ Cron ... failed` message to their delivery target. The full diagnostic is force-redacted and saved locally in `~/.hermes/cron/output/` and the job's `last_error`.
+
+To keep model failures local and prevent scheduler-authored failure notices from reaching Discord, Telegram, or another messaging target:
+
+```bash
+hermes config set cron.model_failure_delivery local
+```
+
+The accepted values are `notify` (default, backward-compatible) and `local`. Unknown values behave as `notify` so a typo cannot silently suppress alerts. Successful responses and `[SILENT]` suppression are unchanged, and `no_agent` watchdog failures still notify because a broken watchdog must not fail silently.
+
+No gateway restart is required. `run_one_job` calls `load_config()` before each failed-model delivery decision, and `load_config()` invalidates its cache when the config file changes. Roll back to failure notifications with:
+
+```bash
+hermes config set cron.model_failure_delivery notify
+```
 
 ## Script timeout
 

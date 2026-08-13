@@ -4687,25 +4687,40 @@ def run_one_job(
         delivery_error = None
         blocked_config = False
         try:
-            output_file = save_job_output(job["id"], output)
-            if verbose:
-                logger.info("Output saved to: %s", output_file)
-
-            # If the gateway shutdown killed this job's tool subprocess
-            # mid-flight (#60432), the agent may still have produced a
-            # plausible-looking final_response from the truncated output --
-            # force the failure path so the delivered message is an honest
-            # "this run was interrupted" summary instead of that response.
-            # Peek-only: the flag stays set for the authoritative check
-            # right before mark_job_run below.
+            # Resolve late failure conditions before persisting output or
+            # choosing delivery policy so every failed model run follows the
+            # same redaction and notification path.
+            empty_response = False
             if success and _is_interrupted(job["id"]):
                 success = False
                 error = (
                     "Interrupted by gateway shutdown before the run finished "
                     "(tool subprocess was killed mid-flight)."
                 )
+            elif success and not final_response.strip():
+                empty_response = True
+                success = False
+                error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-            # Deliver the final response to the origin/target chat.
+            # Failed model diagnostics are a durable security boundary: cron
+            # output and jobs.json must never retain raw secrets, even when the
+            # operator disabled general log redaction. Script-only watchdogs
+            # keep their existing failure semantics.
+            if not success and not job.get("no_agent"):
+                from agent.redact import redact_sensitive_text
+
+                output = redact_sensitive_text(output, force=True)
+                error = redact_sensitive_text(error, force=True)
+
+            output_file = save_job_output(job["id"], output)
+            if verbose:
+                logger.info("Output saved to: %s", output_file)
+
+            # Deliver the final response to the origin/target chat. LLM
+            # failures can be retained locally instead; only the exact known
+            # value opts into suppression, so invalid config fails safe to the
+            # backward-compatible notify behavior. no_agent watchdog failures
+            # always retain their existing alerting behavior.
             # If the agent responded with [SILENT], skip delivery (but
             # output is already saved above).  Failed jobs always deliver.
             #
@@ -4744,6 +4759,15 @@ def run_one_job(
             if blocked_config_silent:
                 should_deliver = False
             unresolved_origin = False
+            if empty_response:
+                should_deliver = False
+            if not success and not job.get("no_agent") and not blocked_config:
+                try:
+                    cron_config = (load_config() or {}).get("cron") or {}
+                except Exception:
+                    cron_config = {}
+                if cron_config.get("model_failure_delivery") == "local":
+                    should_deliver = False
             # Cron silence suppression — see _is_cron_silence_response.  Replaces the
             # old `SILENT_MARKER in ...upper()` substring check, which both leaked
             # bracketless near-markers ("SILENT" / "NO_REPLY") and wrongly swallowed
@@ -4770,13 +4794,6 @@ def run_one_job(
             # their subprocesses/clients (#10200).
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
-
-        # Treat empty final_response as a soft failure so last_status
-        # is not "ok" — the agent ran but produced nothing useful.
-        # (issue #8585)
-        if success and not final_response.strip():
-            success = False
-            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         if not _consume_interrupted_flag(job["id"]):
             if blocked_config:
