@@ -1578,6 +1578,7 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+    _recent_links_block = _ctx.recent_links_block
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -1883,10 +1884,10 @@ def run_conversation(
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks
-            # with target="user_message" (the default).  Both are
-            # API-call-time only — the original message in `messages` is
-            # never mutated beyond the api_content stamp, so nothing leaks
-            # into the clean transcript content.
+            # with target="user_message" (the default) + the recent
+            # shared-links block.  All are API-call-time only — the original
+            # message in `messages` is never mutated beyond the api_content
+            # stamp, so nothing leaks into the clean transcript content.
             if idx == current_turn_user_idx and msg.get("role") == "user":
                 if isinstance(_api_content, str) and _api_content:
                     # Stamped by the prologue from the same composition —
@@ -1901,6 +1902,7 @@ def run_conversation(
                         api_msg.get("content", ""),
                         _ext_prefetch_cache,
                         _plugin_user_context,
+                        _recent_links_block,
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed

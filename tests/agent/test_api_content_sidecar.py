@@ -30,6 +30,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.memory_manager import build_memory_context_block
+from agent.shared_media_tracker import build_recent_links_context_block
 from agent.turn_context import build_turn_context, compose_user_api_content
 from hermes_state import SessionDB
 
@@ -47,6 +48,29 @@ class TestComposeUserApiContent:
         out = compose_user_api_content("hello", "likes tea", "PLUGIN-CTX")
         fenced = build_memory_context_block("likes tea")
         assert out == "hello" + "\n\n" + fenced + "\n\n" + "PLUGIN-CTX"
+
+    def test_recent_links_block_is_the_third_injection(self):
+        links = build_recent_links_context_block(
+            [{"role": "user", "content": "https://example.com/a"}]
+        )
+        assert links  # test precondition
+        out = compose_user_api_content("hello", "likes tea", "PLUGIN-CTX", links)
+        fenced = build_memory_context_block("likes tea")
+        assert out == (
+            "hello" + "\n\n" + fenced + "\n\n" + "PLUGIN-CTX" + "\n\n" + links
+        )
+
+    def test_recent_links_block_alone(self):
+        out = compose_user_api_content("hello", "", "", "<recent-shared-links>\nx\n</recent-shared-links>")
+        assert out == "hello\n\n<recent-shared-links>\nx\n</recent-shared-links>"
+
+    def test_empty_recent_links_block_changes_nothing(self):
+        """Regression safety for the two pre-existing injection sources: an
+        empty third source must compose byte-identically to the 3-arg call."""
+        assert compose_user_api_content("hello", "", "", "") is None
+        assert compose_user_api_content(
+            "hello", "likes tea", "PLUGIN-CTX", ""
+        ) == compose_user_api_content("hello", "likes tea", "PLUGIN-CTX")
 
 
 
@@ -268,6 +292,64 @@ class TestPrologueStamping:
             ctx = _build(agent)
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
         assert agent.api_content_at_persist is None
+
+    def test_recent_shared_links_ride_the_sidecar(self, tmp_path):
+        """A URL pasted several turns ago is read back from the PERSISTED
+        rows and appended to the API copy only — the clean content and the
+        system prompt are untouched."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session("sess-1", source="cli")
+            db.append_message(
+                "sess-1", "user", content="watch https://youtube.com/watch?v=abc123"
+            )
+            db.append_message("sess-1", "assistant", content="ok")
+            for i in range(3):
+                db.append_message("sess-1", "user", content=f"follow-up {i}")
+
+            agent = _FakeAgent()
+            agent._session_db = db
+            with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+                ctx = _build(agent)
+
+            msg = ctx.messages[ctx.current_turn_user_idx]
+            assert msg["content"] == "hello"  # clean content untouched
+            assert msg["api_content"] == (
+                "hello\n\n<recent-shared-links>\n"
+                "- youtube.com/watch?v=abc123 (4 turns ago)\n"
+                "</recent-shared-links>"
+            )
+            assert ctx.recent_links_block in msg["api_content"]
+            # The system prompt is not an injection target.
+            assert ctx.active_system_prompt == "SYSTEM"
+        finally:
+            db.close()
+
+    def test_no_recent_links_block_without_urls(self):
+        """No URLs in the session ⇒ no third injection, no stamp at all."""
+        agent = _FakeAgent()
+        agent._session_db = MagicMock()
+        agent._session_db.get_recent_user_messages.return_value = [
+            {"role": "user", "content": "no links here"}
+        ]
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            ctx = _build(agent)
+        assert ctx.recent_links_block == ""
+        assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
+
+    def test_failed_link_read_never_breaks_the_turn(self):
+        agent = _FakeAgent()
+        agent._session_db = MagicMock()
+        agent._session_db.get_recent_user_messages.side_effect = RuntimeError("db down")
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            return_value=[{"context": "PLUGIN-CTX"}],
+        ):
+            ctx = _build(agent)
+        assert ctx.recent_links_block == ""
+        assert ctx.messages[ctx.current_turn_user_idx]["api_content"] == (
+            "hello\n\nPLUGIN-CTX"
+        )
 
     def test_no_stamp_for_codex_app_server(self):
         """codex_app_server turns bypass the api_messages build, so the
