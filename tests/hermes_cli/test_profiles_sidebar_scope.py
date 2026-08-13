@@ -130,6 +130,66 @@ class TestSidebarScope:
         assert {row["profile"] for row in payload["messaging"]["sessions"]} == {"default", "worker"}
 
 
+class TestProfileSessionReadPressure:
+
+    def test_sidebar_rejects_excess_concurrent_fanout_reads(
+        self, client, profiles_on_disk, monkeypatch
+    ):
+        """A stalled profile store must not create an unbounded request backlog."""
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+
+        from hermes_cli import web_server
+
+        _seed_session(profiles_on_disk["default"], "pressure", source="cli")
+
+        lock = threading.Lock()
+        two_reads_entered = threading.Event()
+        release_reads = threading.Event()
+        entered = 0
+
+        class BlockingDB:
+            def __init__(self):
+                self.first_read = True
+
+            def list_sessions_rich(self, **_kwargs):
+                nonlocal entered
+                if self.first_read:
+                    self.first_read = False
+                    with lock:
+                        entered += 1
+                        if entered == 2:
+                            two_reads_entered.set()
+                    assert release_reads.wait(5)
+                return []
+
+            def usage_totals(self):
+                return {"tokens": 0, "cost_usd": 0.0}
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(
+            web_server,
+            "_open_session_db_at_path",
+            lambda *_args, **_kwargs: BlockingDB(),
+        )
+
+        path = "/api/profiles/sessions/sidebar?recents_profile=default"
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            active = [pool.submit(client.get, path) for _ in range(2)]
+            assert two_reads_entered.wait(2)
+            overloaded = pool.submit(client.get, path)
+            try:
+                response = overloaded.result(timeout=1)
+            finally:
+                release_reads.set()
+
+            assert response.status_code == 429
+            assert response.headers["retry-after"] == "1"
+            assert [future.result().status_code for future in active] == [200, 200]
+
+
 class TestCrossProfileProjectTree:
 
     def test_one_folder_worked_in_by_two_profiles_is_one_project(self, client, profiles_on_disk, tmp_path):

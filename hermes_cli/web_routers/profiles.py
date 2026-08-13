@@ -13,11 +13,13 @@ late-binding seam in :mod:`hermes_cli.web_deps` so tests that
 """
 
 import asyncio  # noqa: F401 — used by handlers
+import functools
 import json
 import logging
 import re
 import subprocess  # noqa: F401
 import sys  # noqa: F401
+import threading
 import time  # noqa: F401
 from pathlib import Path  # noqa: F401
 from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
@@ -48,6 +50,35 @@ _log = logging.getLogger("hermes_cli.web_server")
 # (profile, message) per process so a persistent failure is loud in
 # errors.log without turning every sidebar poll into log spam.
 _profile_read_warned: set = set()
+
+# These two endpoints fan one request out across every profile state.db. Keep
+# their combined concurrency small so a slow SQLite read cannot consume the
+# server's whole worker pool and retain one DB/WAL handle per queued request.
+_PROFILE_SESSION_READ_CAPACITY = 2
+_PROFILE_SESSION_READ_ACQUIRE_TIMEOUT_S = 0.25
+_profile_session_read_slots = threading.BoundedSemaphore(
+    _PROFILE_SESSION_READ_CAPACITY
+)
+
+
+def _limit_profile_session_reads(handler):
+    @functools.wraps(handler)
+    def limited(*args, **kwargs):
+        acquired = _profile_session_read_slots.acquire(
+            timeout=_PROFILE_SESSION_READ_ACQUIRE_TIMEOUT_S
+        )
+        if not acquired:
+            raise HTTPException(
+                status_code=429,
+                detail="Profile session reads are busy; retry shortly",
+                headers={"Retry-After": "1"},
+            )
+        try:
+            return handler(*args, **kwargs)
+        finally:
+            _profile_session_read_slots.release()
+
+    return limited
 
 
 def _warn_profile_read_error(profile: str, exc: Exception) -> None:
@@ -80,6 +111,7 @@ _write_profile_model = late("_write_profile_model")
 
 
 @sessions_router.get("/api/profiles/sessions")
+@_limit_profile_session_reads
 def get_profiles_sessions(
     # ``le=500`` caps the per-request page size (idea from #39200) — this
     # endpoint fans the query out across EVERY profile's state.db, so an
@@ -230,6 +262,7 @@ def get_profiles_sessions(
 
 
 @sessions_router.get("/api/profiles/sessions/sidebar")
+@_limit_profile_session_reads
 def get_profiles_sessions_sidebar(
     recents_profile: str = "all",
     recents_limit: int = 20,
