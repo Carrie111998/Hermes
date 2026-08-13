@@ -1553,6 +1553,45 @@ def _windows_stop_drain_timeout() -> float:
     return max(1.0, min(configured, 30.0))
 
 
+def _drain_gateway_pids(pids: list[int], drain_timeout: float) -> bool:
+    """Drain each known gateway PID in turn under ONE shared deadline.
+
+    ``write_planned_stop_marker`` stores the target PID *inside* a single
+    global marker file, and the gateway only acts on a marker that names
+    itself. Writing markers for several PIDs up front would therefore make
+    each write clobber the previous one before its target had a chance to
+    consume it, so the drain has to be sequential: write the marker for one
+    PID, wait for that PID to exit, then move to the next.
+
+    Every PID shares one deadline so total stop latency stays bounded by the
+    configured drain timeout rather than growing to ``len(pids) *
+    drain_timeout`` -- ``_windows_stop_drain_timeout()`` exists precisely
+    because "Windows CLI stop must not wedge forever".
+
+    Returns True only when every live PID exited within the shared deadline,
+    so the caller can honestly report a clean drain rather than claiming one
+    while a sibling process is still being hard-killed.
+    """
+    own_pid = os.getpid()
+    deadline = time.monotonic() + max(drain_timeout, 1.0)
+    seen: set[int] = set()
+    attempted = False
+    all_drained = True
+    for pid in pids:
+        if pid <= 0 or pid == own_pid or pid in seen:
+            continue
+        seen.add(pid)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Out of budget: the caller still hard-kills this PID below.
+            all_drained = False
+            continue
+        attempted = True
+        if not _drain_gateway_pid(pid, remaining):
+            all_drained = False
+    return attempted and all_drained
+
+
 def _force_terminate_known_gateway_pids(pids: list[int]) -> int:
     """Force-kill known gateway PIDs without a broad process sweep."""
     try:
@@ -1616,7 +1655,7 @@ def stop() -> None:
     stop_pids = _collect_gateway_stop_pids(pid)
     drained = False
     if pid is not None:
-        drained = _drain_gateway_pid(pid, _windows_stop_drain_timeout())
+        drained = _drain_gateway_pids([pid], _windows_stop_drain_timeout())
 
     stopped_any = drained
     if is_task_registered():
