@@ -229,3 +229,73 @@ class TestGatewayHasActiveSupervisor:
         monkeypatch.setattr(gateway, "is_macos", lambda: False)
         monkeypatch.setattr(gateway, "is_windows", lambda: False)
         assert gateway._gateway_has_active_supervisor() is False
+
+
+class TestPlannedStopMarkerDiscipline:
+    """Regression for the planned-stop marker discipline (issue #83683).
+
+    A planned-stop marker is only legitimate when *this* process is about to
+    intentionally stop the gateway. The reap path must never write one for a
+    *supervised* gateway: doing so records a "clean exit", which under a launchd
+    job whose ``KeepAlive.SuccessfulExit`` is false defeats auto-recovery and
+    leaves the gateway down indefinitely (see @openclaw-claw's reproduction).
+    This class locks in that the reap is a pure no-op — no signal, no marker —
+    whenever any platform supervisor owns the gateway.
+    """
+
+    @pytest.mark.parametrize(
+        "supervisor_setup",
+        ["systemd", "launchd", "windows_task"],
+    )
+    def test_reap_never_writes_marker_under_active_supervisor(
+        self, monkeypatch, supervisor_setup
+    ):
+        if supervisor_setup == "systemd":
+            monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
+            monkeypatch.setattr(gateway, "is_macos", lambda: False)
+            monkeypatch.setattr(gateway, "is_windows", lambda: False)
+        elif supervisor_setup == "launchd":
+            monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+            monkeypatch.setattr(gateway, "is_macos", lambda: True)
+            monkeypatch.setattr(gateway, "is_windows", lambda: False)
+            monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: _FakePath(True))
+            monkeypatch.setattr(gateway, "_probe_launchd_service_running", lambda: True)
+        else:  # windows_task
+            monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+            monkeypatch.setattr(gateway, "is_macos", lambda: False)
+            monkeypatch.setattr(gateway, "is_windows", lambda: True)
+            import hermes_cli.gateway_windows as gw_win
+
+            monkeypatch.setattr(gw_win, "is_installed", lambda: True)
+            monkeypatch.setattr(gw_win, "is_task_registered", lambda: True)
+            monkeypatch.setattr(gw_win, "query_task_status", lambda: {"status": "running"})
+            monkeypatch.setattr(gw_win, "_gateway_pids", lambda: [])
+
+        # Active supervisor => _gateway_has_active_supervisor() is consulted
+        # first and short-circuits the reap as a no-op.
+        monkeypatch.setattr(gateway, "_gateway_has_active_supervisor", lambda: True)
+        monkeypatch.setattr(gateway_status, "get_running_pid", lambda: None)
+        monkeypatch.setattr(gateway, "find_gateway_pids", lambda **k: [1234])
+
+        killed = []
+        monkeypatch.setattr("os.kill", lambda pid, sig: killed.append((pid, sig)))
+        markers = []
+        monkeypatch.setattr(
+            gateway_status,
+            "write_planned_stop_marker",
+            lambda *a, **k: markers.append(a) or True,
+        )
+        monkeypatch.setattr(gateway_status, "_pid_exists", lambda pid: False)
+        monkeypatch.setattr("time.sleep", lambda *_a, **_k: None)
+
+        clock = [0.0]
+
+        def fake_monotonic():
+            clock[0] += 100.0
+            return clock[0]
+
+        monkeypatch.setattr("time.monotonic", fake_monotonic)
+
+        assert gateway._reap_unsupervised_gateway_orphans() is False
+        assert killed == []  # never signals a supervised gateway
+        assert markers == []  # never records a "clean stop" for it either
