@@ -7,7 +7,7 @@ Toolsets = explicit --toolsets when provided, otherwise whatever the user has
 configured for "cli" in `hermes tools`.
 Rules / memory / AGENTS.md / preloaded skills = same as a normal chat turn.
 Approvals = auto-bypassed (HERMES_YOLO_MODE=1 is set for the call).
-Working directory = the user's CWD (AGENTS.md etc. resolve from there as usual).
+Working directory = explicit --in DIR, otherwise the user's launch CWD.
 
 Model / provider selection mirrors `hermes chat`:
     - Both optional. If omitted, use the user's configured default.
@@ -173,6 +173,7 @@ def run_oneshot(
     provider: Optional[str] = None,
     toolsets: object = None,
     usage_file: Optional[str] = None,
+    in_dir: Optional[str] = None,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -187,6 +188,7 @@ def run_oneshot(
             cost, token counts, model, api_calls) is written there after the
             run — even when the run fails — so pipelines can account for
             spend per invocation.
+        in_dir: Validated explicit working directory from the CLI dispatcher.
 
     Returns the exit code.  The caller owns process termination.
     """
@@ -248,6 +250,7 @@ def run_oneshot(
                     provider=provider,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
+                    in_dir=in_dir,
                 )
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
@@ -325,6 +328,7 @@ def _run_agent(
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
+    in_dir: Optional[str] = None,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
@@ -417,6 +421,21 @@ def _run_agent(
         logger=logging.getLogger(__name__),
         single_query=True,
     )
+
+    if in_dir:
+        from tools.terminal_tool import (
+            _get_env_config,
+            record_session_cwd,
+        )
+
+        # --in is a host path. Finish backend resolution before changing the
+        # process cwd, then pin local tools without feeding that host path to
+        # SSH or sandbox backends as a remote cwd.
+        terminal_config = _get_env_config()
+        os.chdir(in_dir)
+        if terminal_config["env_type"] == "local":
+            os.environ["TERMINAL_CWD"] = in_dir
+            record_session_cwd("default", in_dir)
 
     session_db = _create_session_db_for_oneshot()
     # The try spans agent construction (not just ``chat``) so the SQLite store

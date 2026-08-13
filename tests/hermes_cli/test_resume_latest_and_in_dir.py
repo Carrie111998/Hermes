@@ -229,3 +229,97 @@ def test_in_dir_expands_user_home(main_mod, launched, monkeypatch, tmp_path):
         assert os.getcwd() == str((home / "proj").resolve())
     finally:
         os.chdir(start)
+
+
+@pytest.mark.parametrize(
+    ("backend", "configured_cwd"),
+    [
+        ("local", None),
+        ("ssh", "~/remote-project"),
+        ("docker", "/workspace"),
+    ],
+)
+def test_oneshot_in_dir_respects_terminal_backend(
+    main_mod, monkeypatch, tmp_path, backend, configured_cwd
+):
+    import os
+
+    from hermes_cli import oneshot
+    from tools import terminal_tool
+
+    target = tmp_path / "requested"
+    stale = tmp_path / "stale"
+    target.mkdir()
+    stale.mkdir()
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    configured_cwd = configured_cwd or str(stale)
+    (hermes_home / "config.yaml").write_text(
+        f"terminal:\n  backend: {backend}\n  cwd: {configured_cwd}\n",
+        encoding="utf-8",
+    )
+    start = os.getcwd()
+    seen = {}
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            seen["cwd"] = os.getcwd()
+            seen["terminal_cwd"] = os.environ.get("TERMINAL_CWD")
+            seen["tool_cwd"] = terminal_tool._get_env_config()["cwd"]
+            self.suppress_status_output = False
+            self.stream_delta_callback = object()
+            self.tool_gen_callback = object()
+
+        def run_conversation(self, _prompt):
+            return {"final_response": "ok", "failed": False, "partial": False}
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    import hermes_cli.mcp_startup as mcp_startup
+    import hermes_cli.runtime_provider as runtime_provider
+    import hermes_cli.tools_config as tools_config
+    import run_agent
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("TERMINAL_CWD", str(stale))
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", False)
+    monkeypatch.setattr(run_agent, "AIAgent", FakeAgent)
+    monkeypatch.setattr(oneshot, "_create_session_db_for_oneshot", lambda: None)
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda *_args: set())
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **_kwargs: {
+            "api_key": "key",
+            "base_url": "https://example.test/v1",
+            "provider": "test",
+            "requested_provider": "test",
+            "api_mode": "chat_completions",
+            "credential_pool": None,
+        },
+    )
+    monkeypatch.setattr(
+        mcp_startup,
+        "ensure_mcp_discovery_before_agent_build",
+        lambda **_kwargs: None,
+    )
+
+    try:
+        response, result = oneshot._run_agent("work here", in_dir=str(target))
+    finally:
+        terminal_tool.clear_session_cwd("default")
+        os.chdir(start)
+
+    assert response == "ok"
+    assert result["failed"] is False
+    assert seen["cwd"] == str(target.resolve())
+    if backend == "local":
+        assert seen["terminal_cwd"] == str(target.resolve())
+        assert seen["tool_cwd"] == str(target.resolve())
+    else:
+        assert seen["terminal_cwd"] == configured_cwd
+        assert seen["tool_cwd"] == configured_cwd
