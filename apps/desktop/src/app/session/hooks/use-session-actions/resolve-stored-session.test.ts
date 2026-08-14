@@ -17,6 +17,17 @@ const mockGetSession = vi.mocked(getSession)
 
 const session = (over: Partial<SessionInfo>): SessionInfo => over as SessionInfo
 
+/**
+ * Parsed JSON shaped like a `getSession` payload, not a Partial<SessionInfo>
+ * object literal. A single `as SessionInfo` would let the compiler treat
+ * `message_count: "0"` or `source: " Unknown "` as already matching the
+ * declared types. JSON round-trip preserves those runtime types; the
+ * `unknown` → `SessionInfo` assertion is the resolver boundary the tests
+ * are proving, not a fixture lie.
+ */
+const sessionFromRuntimeJson = (payload: Record<string, unknown>): SessionInfo =>
+  JSON.parse(JSON.stringify(payload)) as unknown as SessionInfo
+
 const profiles = (...names: string[]) => names.map(name => ({ name }) as never)
 
 describe('resolveStoredSession profile ownership', () => {
@@ -187,10 +198,49 @@ describe('resolveStoredSession profile ownership', () => {
     expect(mockGetSession).toHaveBeenNthCalledWith(3, 's1', 'default')
   })
 
-  it('falls back to the first known-source zero-message twin when no transcript candidate exists', async () => {
-    // Raw REST getSession returns the exact row and does not walk the
-    // compression chain — a legitimate compression root can be desktop/0.
-    // Prefer that known-source candidate over the deferred legacy shadow.
+  it('preserves the cached unknown/0 owner when a competing titled tui/0 draft has no transcript', async () => {
+    // Zero/zero collision: the active profile owns a titled unknown/0 shadow,
+    // and another profile has a legitimate titled tui/0 draft for the same id.
+    // Source alone is not ownership evidence — keep the original cached owner.
+    $profiles.set(profiles('meta', 'other', 'default'))
+    $activeGatewayProfile.set('meta')
+
+    const emptyShadow = session({
+      id: 's1',
+      message_count: 0,
+      profile: 'meta',
+      source: 'unknown',
+      title: 'Planned conversation'
+    })
+
+    const competingDraft = session({
+      id: 's1',
+      message_count: 0,
+      profile: 'other',
+      source: 'tui',
+      title: 'Planned conversation'
+    })
+
+    $sessions.set([emptyShadow])
+    mockGetSession.mockResolvedValueOnce(emptyShadow)
+    mockGetSession.mockResolvedValueOnce(competingDraft)
+    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved?.profile).toBe('meta')
+    expect(resolved?.message_count).toBe(0)
+    expect(resolved?.source).toBe('unknown')
+    expect(resolved?.title).toBe('Planned conversation')
+    expect($sessions.get().find(s => s.id === 's1')?.profile).toBe('meta')
+    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1')
+    expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'other')
+    expect(mockGetSession).toHaveBeenNthCalledWith(3, 's1', 'default')
+  })
+
+  it('preserves the cached unknown/0 owner when a competing titled desktop/0 draft has no transcript', async () => {
+    // Same zero/zero collision as the tui/0 case: a legitimate desktop/0 titled
+    // draft on another profile is not independent ownership evidence.
     $profiles.set(profiles('meta', 'other', 'default'))
     $activeGatewayProfile.set('meta')
 
@@ -217,11 +267,11 @@ describe('resolveStoredSession profile ownership', () => {
 
     const resolved = await resolveStoredSession('s1')
 
-    expect(resolved?.profile).toBe('other')
+    expect(resolved?.profile).toBe('meta')
     expect(resolved?.message_count).toBe(0)
-    expect(resolved?.source).toBe('desktop')
+    expect(resolved?.source).toBe('unknown')
     expect(resolved?.title).toBe('Untitled draft')
-    expect($sessions.get().find(s => s.id === 's1')?.profile).toBe('other')
+    expect($sessions.get().find(s => s.id === 's1')?.profile).toBe('meta')
     expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1')
     expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'other')
     expect(mockGetSession).toHaveBeenNthCalledWith(3, 's1', 'default')
@@ -341,5 +391,205 @@ describe('resolveStoredSession profile ownership', () => {
     expect(resolved).toBe(ambiguous)
     expect(resolved?.message_count).toBeUndefined()
     expect(mockGetSession).not.toHaveBeenCalled()
+  })
+
+  it('defers a titled unknown/0 shadow when source has surrounding whitespace and mixed case', async () => {
+    const emptyShadow = sessionFromRuntimeJson({
+      id: 's1',
+      message_count: 0,
+      profile: 'meta',
+      source: ' Unknown ',
+      title: 'Real conversation'
+    })
+
+    const materialized = session({
+      id: 's1',
+      message_count: 4,
+      profile: 'default',
+      source: 'desktop',
+      title: 'Real conversation'
+    })
+
+    $sessions.set([emptyShadow])
+    mockGetSession.mockResolvedValueOnce(emptyShadow)
+    mockGetSession.mockResolvedValueOnce(materialized)
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved?.profile).toBe('default')
+    expect(resolved?.message_count).toBe(4)
+    expect(resolved?.source).toBe('desktop')
+    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1')
+    expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'default')
+  })
+
+  it('defers a titled unknown/0 shadow when message_count is the numeric string "0"', async () => {
+    const emptyShadow = sessionFromRuntimeJson({
+      id: 's1',
+      message_count: '0',
+      profile: 'meta',
+      source: 'unknown',
+      title: 'Real conversation'
+    })
+
+    const materialized = session({
+      id: 's1',
+      message_count: 4,
+      profile: 'default',
+      source: 'desktop',
+      title: 'Real conversation'
+    })
+
+    $sessions.set([emptyShadow])
+    mockGetSession.mockResolvedValueOnce(emptyShadow)
+    mockGetSession.mockResolvedValueOnce(materialized)
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved?.profile).toBe('default')
+    expect(resolved?.message_count).toBe(4)
+    expect(resolved?.source).toBe('desktop')
+    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1')
+    expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'default')
+  })
+
+  it('trims surrounding whitespace on a cached row profile without changing case', async () => {
+    $profiles.set(profiles('MetaProd', 'default'))
+    $activeGatewayProfile.set('default')
+    $sessions.set([session({ id: 's1', profile: '  MetaProd  ' })])
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved?.profile).toBe('MetaProd')
+    expect($sessions.get().find(s => s.id === 's1')?.profile).toBe('  MetaProd  ')
+    expect(mockGetSession).not.toHaveBeenCalled()
+  })
+
+  it('stamps the active gateway profile on an unscoped hit whose profile is only whitespace', async () => {
+    mockGetSession.mockResolvedValueOnce(
+      sessionFromRuntimeJson({
+        id: 's1',
+        profile: '   '
+      })
+    )
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved?.profile).toBe('meta')
+    expect($sessions.get().find(s => s.id === 's1')?.profile).toBe('meta')
+    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1')
+  })
+
+  it('normalizes a malformed cache hit without reordering or dropping unrelated rows', async () => {
+    $profiles.set(profiles('MetaProd', 'default'))
+    $activeGatewayProfile.set('default')
+
+    const newer = session({ id: 'newer', profile: 'default', source: 'desktop' })
+
+    const target = sessionFromRuntimeJson({
+      id: 's1',
+      profile: '  MetaProd  ',
+      source: ' Desktop ',
+      title: 'Cached conversation'
+    })
+
+    const older = session({ id: 'older', profile: 'default', source: 'tui' })
+
+    $sessions.set([newer, target, older])
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved?.id).toBe('s1')
+    expect(resolved?.profile).toBe('MetaProd')
+    expect(resolved?.source).toBe('Desktop')
+    expect($sessions.get().map(row => row.id)).toEqual(['newer', 's1', 'older'])
+    expect($sessions.get()[0]).toBe(newer)
+    expect($sessions.get()[1]).toBe(target)
+    expect($sessions.get()[2]).toBe(older)
+    expect(mockGetSession).not.toHaveBeenCalled()
+  })
+
+  it('does not promote a normalized cache hit to the front of $sessions', async () => {
+    const newer = session({ id: 'newer', profile: 'meta' })
+
+    const target = sessionFromRuntimeJson({
+      id: 's1',
+      profile: '  meta  ',
+      source: 'cli'
+    })
+
+    const older = session({ id: 'older', profile: 'default' })
+
+    $sessions.set([newer, target, older])
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved?.profile).toBe('meta')
+    expect($sessions.get()[0]?.id).toBe('newer')
+    expect($sessions.get()[0]).toBe(newer)
+    expect(mockGetSession).not.toHaveBeenCalled()
+  })
+
+  it('returns the active gateway profile for a single-profile cached blank profile without rewriting cache', async () => {
+    $profiles.set(profiles('meta'))
+    $activeGatewayProfile.set('meta')
+
+    const newer = session({ id: 'newer', profile: 'meta' })
+
+    const target = sessionFromRuntimeJson({
+      id: 's1',
+      profile: '   '
+    })
+
+    const older = session({ id: 'older', profile: 'meta' })
+
+    $sessions.set([newer, target, older])
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved?.id).toBe('s1')
+    expect(resolved?.profile).toBe('meta')
+    expect($sessions.get().map(row => row.id)).toEqual(['newer', 's1', 'older'])
+    expect($sessions.get()[1]).toBe(target)
+    expect($sessions.get()[1]?.profile).toBe('   ')
+    expect(mockGetSession).not.toHaveBeenCalled()
+  })
+
+  it('does not treat message_count "00" or "0.0" as the legacy empty shadow', async () => {
+    for (const messageCount of ['00', '0.0'] as const) {
+      const row = sessionFromRuntimeJson({
+        id: 's1',
+        message_count: messageCount,
+        profile: 'meta',
+        source: 'unknown',
+        title: 'Maybe a draft'
+      })
+
+      $sessions.set([row])
+      mockGetSession.mockReset()
+
+      const resolved = await resolveStoredSession('s1')
+
+      expect(resolved).toBe(row)
+      expect(resolved?.message_count).toBe(messageCount)
+      expect(mockGetSession).not.toHaveBeenCalled()
+    }
+  })
+
+  it('keeps scoped probe ownership when the backend row profile is blank', async () => {
+    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+    mockGetSession.mockResolvedValueOnce(
+      sessionFromRuntimeJson({
+        id: 's1',
+        profile: '   '
+      })
+    )
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved?.profile).toBe('default')
+    expect($sessions.get().find(s => s.id === 's1')?.profile).toBe('default')
+    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1')
+    expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'default')
   })
 })

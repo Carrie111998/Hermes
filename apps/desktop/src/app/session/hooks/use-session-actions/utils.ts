@@ -842,6 +842,30 @@ function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
   ])
 }
 
+function normalizeResolverSource(source: SessionInfo['source']): SessionInfo['source'] {
+  if (typeof source !== 'string') {
+    return source
+  }
+
+  const trimmed = source.trim()
+
+  return trimmed.toLowerCase() === 'unknown' ? 'unknown' : trimmed
+}
+
+function withNormalizedResolverFields(session: SessionInfo): SessionInfo {
+  const source = normalizeResolverSource(session.source)
+  const rawCount = session.message_count as unknown
+  const messageCount = typeof rawCount === 'string' && rawCount.trim() === '0' ? 0 : session.message_count
+  const trimmedProfile = session.profile?.trim()
+  const profile = trimmedProfile ? trimmedProfile : session.profile
+
+  if (source === session.source && messageCount === session.message_count && profile === session.profile) {
+    return session
+  }
+
+  return { ...session, message_count: messageCount, profile, source }
+}
+
 /**
  * Legacy cross-profile damage can leave the same session id on the active
  * profile as `source=unknown` with `message_count=0` and a persisted title
@@ -853,44 +877,6 @@ function isLegacyEmptyUnknownShadow(session: SessionInfo): boolean {
   return session.source === 'unknown' && session.message_count === 0 && Boolean(session.title?.trim())
 }
 
-/**
- * A real session source (desktop/cli/tui/…) as opposed to the legacy
- * `unknown` shadow or an omitted stamp. Compression roots can legitimately
- * report `message_count=0` while a descendant owns the messages; raw REST
- * `getSession` returns that exact row and does not resolve the chain, so a
- * known-source zero-message hit is a safer resume target than the shadow.
- */
-function isKnownSourceCandidate(session: SessionInfo): boolean {
-  const source = session.source?.trim()
-
-  return Boolean(source) && source !== 'unknown'
-}
-
-/**
- * After a legacy empty-unknown shadow is deferred: transcript candidates win
- * immediately; the first known-source candidate is remembered while probing
- * continues; unknown/undefined rows must not displace the shadow.
- */
-function considerDeferredCandidate(
-  session: SessionInfo,
-  deferredEmptyUnknown: SessionInfo | undefined,
-  knownSourceFallback: SessionInfo | undefined
-): { done: true; session: SessionInfo } | { done: false; knownSourceFallback: SessionInfo | undefined } {
-  if (!deferredEmptyUnknown) {
-    return { done: true, session }
-  }
-
-  if (sessionShouldHaveTranscript(session)) {
-    return { done: true, session }
-  }
-
-  if (isKnownSourceCandidate(session)) {
-    return { done: false, knownSourceFallback: knownSourceFallback ?? session }
-  }
-
-  return { done: false, knownSourceFallback }
-}
-
 export async function resolveStoredSession(storedSessionId: string): Promise<SessionInfo | undefined> {
   const cached = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
 
@@ -900,15 +886,23 @@ export async function resolveStoredSession(storedSessionId: string): Promise<Ses
   // unresolved and fall through to the by-id lookups, which stamp ownership.
   const multiProfile = $profiles.get().length > 1
   let deferredEmptyUnknown: SessionInfo | undefined
-  let knownSourceFallback: SessionInfo | undefined
 
   if (cached && (cached.profile?.trim() || !multiProfile)) {
+    let owned = withNormalizedResolverFields(cached)
+
     // Defer only under multi-profile — that's the only case a twin on another
     // profile could exist. Single-profile empty unknowns return immediately.
-    if (multiProfile && isLegacyEmptyUnknownShadow(cached)) {
-      deferredEmptyUnknown = cached
+    if (multiProfile && isLegacyEmptyUnknownShadow(owned)) {
+      deferredEmptyUnknown = owned
     } else {
-      return cached
+      // Return a normalized copy to the caller. Do not write source/count/
+      // profile canonicalization back into `$sessions`: upsert prepends, which
+      // would promote an older cached row to most-recent.
+      if (!multiProfile && !owned.profile?.trim()) {
+        owned = { ...owned, profile: normalizeProfileKey($activeGatewayProfile.get()) }
+      }
+
+      return owned
     }
   }
 
@@ -916,26 +910,27 @@ export async function resolveStoredSession(storedSessionId: string): Promise<Ses
   // single-profile users and any id on the active profile (e.g. an old session
   // past the sidebar's recent window). 404 just means it's not on this profile.
   try {
-    const session = await getSession(storedSessionId)
+    const session = withNormalizedResolverFields(await getSession(storedSessionId))
 
     // Older backends omit `profile` on unscoped GETs; the serving backend is
     // the active gateway's, so back-fill that rather than caching an unowned
-    // row. A present stamp is preserved: in app-global remote mode a bare hit
-    // can legitimately carry another profile's row (see the branch tests).
-    session.profile ||= normalizeProfileKey($activeGatewayProfile.get())
+    // row. Whitespace-only is the same as omitted — do not let it fall through
+    // as `undefined` or canonicalize to "default" by accident. A present stamp
+    // is preserved: in app-global remote mode a bare hit can legitimately carry
+    // another profile's row (see the branch tests).
+    session.profile = session.profile?.trim() || normalizeProfileKey($activeGatewayProfile.get())
 
     if (multiProfile && isLegacyEmptyUnknownShadow(session)) {
       deferredEmptyUnknown ??= session
-    } else {
-      const considered = considerDeferredCandidate(session, deferredEmptyUnknown, knownSourceFallback)
+    } else if (!deferredEmptyUnknown || sessionShouldHaveTranscript(session)) {
+      // Transcript-bearing twins win immediately. A known-source zero-message
+      // draft (desktop/0, tui/0, compression root) is not distinguishable from
+      // a legitimate titled draft on another profile by source alone, so
+      // probing continues and the original cached owner is preserved when no
+      // transcript twin exists.
+      upsertResolvedSession(session, storedSessionId)
 
-      if (considered.done) {
-        upsertResolvedSession(considered.session, storedSessionId)
-
-        return considered.session
-      }
-
-      knownSourceFallback = considered.knownSourceFallback
+      return session
     }
   } catch {
     // Not on the active profile — fall through to the cross-profile probe.
@@ -953,7 +948,7 @@ export async function resolveStoredSession(storedSessionId: string): Promise<Ses
 
   for (const profile of otherProfiles) {
     try {
-      const session = await getSession(storedSessionId, profile)
+      const session = withNormalizedResolverFields(await getSession(storedSessionId, profile))
 
       // Same ownership contract: the DESKTOP profile we explicitly probed is
       // authoritative, whatever the scoped backend stamped (older backends
@@ -963,23 +958,17 @@ export async function resolveStoredSession(storedSessionId: string): Promise<Ses
 
       if (multiProfile && isLegacyEmptyUnknownShadow(session)) {
         deferredEmptyUnknown ??= session
-      } else {
-        const considered = considerDeferredCandidate(session, deferredEmptyUnknown, knownSourceFallback)
+      } else if (!deferredEmptyUnknown || sessionShouldHaveTranscript(session)) {
+        upsertResolvedSession(session, storedSessionId)
 
-        if (considered.done) {
-          upsertResolvedSession(considered.session, storedSessionId)
-
-          return considered.session
-        }
-
-        knownSourceFallback = considered.knownSourceFallback
+        return session
       }
     } catch {
       // Not on this profile; try the next.
     }
   }
 
-  const fallback = knownSourceFallback ?? deferredEmptyUnknown
+  const fallback = deferredEmptyUnknown
 
   if (fallback) {
     upsertResolvedSession(fallback, storedSessionId)
