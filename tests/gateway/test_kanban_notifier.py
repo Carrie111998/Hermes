@@ -575,6 +575,55 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
     assert tid_good in adapter.sent[0]["text"]
 
 
+def test_required_artifact_failure_is_durable_and_blocks_subscription_cursor(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "durable-artifact.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    artifact = tmp_path / "report.pdf"
+    artifact.write_bytes(b"report")
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="artifact", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(
+            conn, tid, summary="done", metadata={"artifacts": [str(artifact)]}
+        )
+    finally:
+        conn.close()
+
+    class ArtifactFailureAdapter(RecordingAdapter):
+        def extract_local_files(self, _text):
+            return [], _text
+
+        async def send_document(self, **_kwargs):
+            raise TimeoutError("upload unavailable")
+
+    from gateway.platforms.base import BasePlatformAdapter
+
+    monkeypatch.setattr(
+        BasePlatformAdapter,
+        "filter_local_delivery_paths",
+        classmethod(lambda _cls, paths: paths),
+    )
+    adapter = ArtifactFailureAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert _unseen_terminal_events(tid), "required artifact failure must rewind completion"
+    conn = kb.connect()
+    try:
+        rows = conn.execute(
+            "select kind,state,last_error_class from kanban_delivery_children order by ordinal"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert [(row["kind"], row["state"]) for row in rows] == [
+        ("primary_text", "sent"),
+        ("artifact_upload", "failed"),
+    ]
+
+
 def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch):
     """A `block_loop_detected` event must reach the subscriber as a triage ping.
 

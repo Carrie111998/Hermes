@@ -155,8 +155,8 @@ def test_wake_only_failure_rewinds_and_redelivers(tmp_path, monkeypatch):
     assert list(runner2._kanban_sub_fail_counts.values()) == [2]
 
 
-def test_notify_wake_failure_stays_best_effort(tmp_path, monkeypatch):
-    """notify+wake: text ping IS the delivery; failed wake must NOT rewind."""
+def test_notify_wake_failure_is_durable_and_rewinds(tmp_path, monkeypatch):
+    """Frozen wake children cannot be swallowed after text succeeds."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "notify-wake.db"))
     kb.init_db()
     tid = _make_completed_task("notify+wake")
@@ -167,12 +167,11 @@ def test_notify_wake_failure_stays_best_effort(tmp_path, monkeypatch):
 
     assert len(adapter.sent) == 1, "text ping delivered"
     assert len(adapter.handled) == 1, "wake attempted best-effort"
-    assert _unseen_terminal_events(tid) == [], (
-        "notify+wake: cursor advances on text delivery; a failed wake is "
-        "best-effort and must not rewind"
+    assert _unseen_terminal_events(tid), (
+        "the frozen wake child remains incomplete, so the completion cursor rewinds"
     )
-    assert runner._kanban_sub_fail_counts == {}, (
-        "best-effort wake failure must not bump the send-failure counter"
+    assert list(runner._kanban_sub_fail_counts.values()) == [1], (
+        "durable wake failure participates in the retry budget"
     )
     # (The sub itself unsubscribes because the task reached 'done' —
     # pre-existing task_terminal behavior, unrelated to the wake outcome.)

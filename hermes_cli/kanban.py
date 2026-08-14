@@ -2697,7 +2697,7 @@ def _cmd_dispatch_legacy_removed(args: argparse.Namespace) -> int:
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
-        res = kb.dispatch_once(
+        res = kb._dispatch_once_for_tests(
             conn,
             dry_run=args.dry_run,
             max_spawn=max_spawn,

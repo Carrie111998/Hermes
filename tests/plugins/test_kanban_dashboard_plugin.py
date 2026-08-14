@@ -503,16 +503,33 @@ def test_add_comment(client):
 # ---------------------------------------------------------------------------
 
 
-def test_dispatch_dry_run(client):
+def test_dispatch_is_status_only_and_never_runs_dry_run(client, monkeypatch):
+    from hermes_cli.dispatcher_authority import AuthorityStatus
+    from plugins.kanban.dashboard import plugin_api
+
     client.post(
         "/api/plugins/kanban/tasks",
         json={"title": "work", "assignee": "researcher"},
     )
+    monkeypatch.setattr(
+        plugin_api,
+        "_resolve_board",
+        lambda *_args, **_kwargs: pytest.fail("dashboard resolved a board"),
+    )
+    monkeypatch.setattr(
+        plugin_api,
+        "_conn",
+        lambda *_args, **_kwargs: pytest.fail("dashboard opened a board"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.dispatcher_authority.read_status_no_side_effects",
+        lambda: AuthorityStatus(True, "held", owner_hint="pid:123", freshness_seconds=1),
+    )
     r = client.post("/api/plugins/kanban/dispatch?dry_run=true&max=4")
-    assert r.status_code == 200
+    assert r.status_code == 409
     body = r.json()
-    # DispatchResult is serialized as a dataclass dict.
-    assert isinstance(body, dict)
+    assert body["detail"]["dispatch_nudge_accepted"] is False
+    assert body["detail"]["dispatch_performed"] is False
 
 
 # ---------------------------------------------------------------------------

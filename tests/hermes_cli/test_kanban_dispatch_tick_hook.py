@@ -51,7 +51,7 @@ def test_active_tick_fires_hook_with_outcome_ok(
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="t", assignee="alice")
-        kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242)
+        kb._dispatch_once_for_tests(conn, spawn_fn=lambda *a, **k: 4242)
     finally:
         conn.close()
     ok_events = [kw for kw in captured_ticks if kw["outcome"] == "ok"]
@@ -80,7 +80,7 @@ def test_tick_hook_fires_after_dispatch_lock_released(kanban_home):
     try:
         conn = kb.connect()
         try:
-            kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
+            kb._dispatch_once_for_tests(conn, spawn_fn=lambda *a, **k: 1)
         finally:
             conn.close()
     finally:
@@ -100,7 +100,7 @@ def test_misbehaving_subscriber_does_not_break_dispatcher(kanban_home):
     try:
         conn = kb.connect()
         try:
-            result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
+            result = kb._dispatch_once_for_tests(conn, spawn_fn=lambda *a, **k: 1)
             assert isinstance(result, kb.DispatchResult)
         finally:
             conn.close()
@@ -122,7 +122,7 @@ def test_no_subscriber_short_circuits_tick_hook(kanban_home, monkeypatch):
     monkeypatch.setattr(lifecycle, "invoke_hook", _spy)
     conn = kb.connect()
     try:
-        kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
+        kb._dispatch_once_for_tests(conn, spawn_fn=lambda *a, **k: 1)
     finally:
         conn.close()
     assert "on_kanban_dispatch_tick" not in invoked

@@ -9495,10 +9495,27 @@ def dispatch_once_authorized(
     from hermes_cli.dispatcher_authority import require_dispatcher_lease
 
     require_dispatcher_lease(lease, "dispatch_once")
-    return dispatch_once(conn, **kwargs)
+    return _dispatch_once(conn, **kwargs)
 
 
 def dispatch_once(
+    lease,
+    conn: sqlite3.Connection,
+    **kwargs,
+) -> DispatchResult:
+    """Guarded public dispatch helper; an opaque live lease is mandatory."""
+    return dispatch_once_authorized(lease, conn, **kwargs)
+
+
+def _dispatch_once_for_tests(
+    conn: sqlite3.Connection,
+    **kwargs,
+) -> DispatchResult:
+    """Non-installed test seam for mutation contract fixtures only."""
+    return _dispatch_once(conn, **kwargs)
+
+
+def _dispatch_once(
     conn: sqlite3.Connection,
     *,
     spawn_fn=None,
@@ -10595,7 +10612,7 @@ def run_daemon(
     while not stop_event.is_set():
         try:
             with contextlib.closing(connect()) as conn:
-                res = dispatch_once(
+                res = _dispatch_once_for_tests(
                     conn,
                     max_spawn=max_spawn,
                     failure_limit=failure_limit,

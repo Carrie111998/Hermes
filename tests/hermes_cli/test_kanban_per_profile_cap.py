@@ -8,7 +8,6 @@ model / API quota / browser pool from being overwhelmed by a fan-out.
 from __future__ import annotations
 
 import os
-import sys
 import tempfile
 
 import pytest
@@ -21,9 +20,6 @@ def isolated_kanban_home_with_profiles(monkeypatch):
     for prof in ("alpha", "beta", "default"):
         os.makedirs(os.path.join(test_home, "profiles", prof), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
     from hermes_cli import kanban_db
     yield kanban_db
 
@@ -45,7 +41,7 @@ def test_cap_2_balances_two_profiles(isolated_kanban_home_with_profiles):
         for i in range(3):
             kb.create_task(conn, title=f"b{i}", assignee="beta")
     with kb.connect_closing() as conn:
-        res = kb.dispatch_once(
+        res = kb._dispatch_once_for_tests(
             conn, spawn_fn=_fake_spawn, dry_run=True,
             max_in_progress_per_profile=2,
         )
@@ -70,7 +66,7 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
 
     # First tick: cap=1, only 1 alpha dispatched
     with kb.connect_closing() as conn:
-        res1 = kb.dispatch_once(
+        res1 = kb._dispatch_once_for_tests(
             conn, spawn_fn=_fake_spawn, dry_run=False,
             max_in_progress_per_profile=1,
         )
@@ -89,7 +85,7 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
 
     # Second tick: 1 more alpha should now dispatch
     with kb.connect_closing() as conn:
-        res2 = kb.dispatch_once(
+        res2 = kb._dispatch_once_for_tests(
             conn, spawn_fn=_fake_spawn, dry_run=False,
             max_in_progress_per_profile=1,
         )

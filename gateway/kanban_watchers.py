@@ -535,6 +535,7 @@ class GatewayKanbanWatchersMixin:
                     # "Task X completed" and re-decomposes work that already
                     # exists on the board.
                     wake_handoff = ""
+                    durable_completion_processed = False
                     for ev in d["events"]:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
@@ -679,48 +680,32 @@ class GatewayKanbanWatchersMixin:
                             # outcome there, not by skipping the send here.
                             continue
                         try:
-                            _send_res = await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
-                            )
-                            # A SendResult(success=False) without an exception
-                            # (returned by push-capable adapters on a genuine
-                            # transient failure) must count as a FAILED
-                            # delivery — otherwise the cursor advances and the
-                            # event is permanently lost. Adapters returning
-                            # None (or anything non-SendResult shaped) keep
-                            # the legacy "no exception == delivered" contract.
-                            if getattr(_send_res, "success", True) is False:
-                                raise RuntimeError(
-                                    "adapter send() reported failure: "
-                                    f"{getattr(_send_res, 'error', None) or 'unknown error'}"
+                            if kind == "completed":
+                                _complete = await self._deliver_kanban_completed_event(
+                                    adapter=adapter,
+                                    sub=sub,
+                                    event=ev,
+                                    task=task,
+                                    text=msg,
+                                    metadata=metadata,
+                                    board=board_slug,
                                 )
+                                if not _complete:
+                                    raise RuntimeError("durable delivery parent remains incomplete")
+                                durable_completion_processed = True
+                            else:
+                                _send_res = await adapter.send(
+                                    sub["chat_id"], msg, metadata=metadata,
+                                )
+                                if getattr(_send_res, "success", True) is False:
+                                    raise RuntimeError(
+                                        "adapter send() reported failure: "
+                                        f"{getattr(_send_res, 'error', None) or 'unknown error'}"
+                                    )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
                             )
-                            # After delivering the text notification, surface
-                            # any artifact paths the worker referenced in
-                            # ``kanban_complete(summary=..., artifacts=[...])``
-                            # (or the legacy ``result`` field) as native
-                            # uploads. ``extract_local_files`` finds bare
-                            # absolute paths in the summary;
-                            # ``send_document`` / ``send_image_file`` uploads
-                            # them. Only fires on the ``completed`` event so
-                            # we never spam attachments on retries.
-                            if kind == "completed":
-                                try:
-                                    await self._deliver_kanban_artifacts(
-                                        adapter=adapter,
-                                        chat_id=sub["chat_id"],
-                                        metadata=metadata,
-                                        event_payload=getattr(ev, "payload", None),
-                                        task=task,
-                                    )
-                                except Exception as art_exc:
-                                    logger.debug(
-                                        "kanban notifier: artifact delivery for %s failed: %s",
-                                        sub["task_id"], art_exc,
-                                    )
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
@@ -993,7 +978,12 @@ class GatewayKanbanWatchersMixin:
                         # work for review corrections and continuation. The
                         # retained cursor prevents replay while preserving the
                         # original delivery and wake ownership for that cycle.
-                        if _is_push_adapter and send_passive and _wake_kinds:
+                        if (
+                            _is_push_adapter
+                            and send_passive
+                            and _wake_kinds
+                            and not durable_completion_processed
+                        ):
                             # notify+wake: the text ping above was the
                             # delivery and the cursor has advanced; the wake
                             # injection stays best-effort.
@@ -1080,6 +1070,133 @@ class GatewayKanbanWatchersMixin:
             )
         finally:
             conn.close()
+
+    async def _deliver_kanban_completed_event(
+        self,
+        *,
+        adapter,
+        sub: dict,
+        event,
+        task,
+        text: str,
+        metadata: dict,
+        board: Optional[str],
+    ) -> bool:
+        """Materialize, send and acknowledge a completion's frozen child set."""
+        import hashlib
+        from gateway.wake import adapter_supports_push, deliver_wake
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli.kanban_delivery_outbox import materialize_parent, process_parent
+
+        conn = _kb.connect(board=board)
+        try:
+            payload = getattr(event, "payload", None) or {}
+            artifact_paths = [
+                str(path) for path in (payload.get("artifacts") or [])
+                if isinstance(path, str) and os.path.isfile(os.path.expanduser(path))
+            ]
+            artifacts = []
+            for ordinal, path in enumerate(artifact_paths):
+                expanded = os.path.expanduser(path)
+                digest = hashlib.sha256(Path(expanded).read_bytes()).hexdigest()
+                artifacts.append(
+                    {
+                        "manifest_id": f"event:{event.id}:artifact:{ordinal}",
+                        "sha256": digest,
+                        "ordinal": ordinal,
+                        "path": expanded,
+                    }
+                )
+            push = adapter_supports_push(adapter)
+            mode = sub.get("delivery_mode") or "notify"
+            wake = mode in ("notify+wake", "wake")
+            creator_session = (
+                sub.get("chat_id") if not push
+                else getattr(task, "session_id", None)
+            )
+            capability = {
+                "version": "route-capability-v1",
+                "adapter_type": (sub.get("platform") or "unknown").lower(),
+                "adapter_version": str(getattr(adapter, "delivery_capability_version", "1")),
+                "route_kind": "push" if push else "non_push",
+                "supports_async_delivery": push,
+                "creator_wake_applicable": bool(wake or not push),
+                "creator_session_id": creator_session,
+                "wake_required": bool(mode == "wake" or not push),
+                "artifact_transport": (sub.get("platform") or "unknown").lower(),
+                "artifact_policy_version": "artifact-policy-v1",
+            }
+            source = {
+                "board_uuid": board or _kb.DEFAULT_BOARD,
+                "event_id": str(event.id),
+                "subscription_id": ":".join(
+                    [sub["task_id"], sub["platform"], sub["chat_id"], sub.get("thread_id") or ""]
+                ),
+                "notifier_profile": sub.get("notifier_profile") or "",
+                "platform": sub["platform"],
+                "destination": f"{sub['chat_id']}:{sub.get('thread_id') or ''}",
+                "payload_schema_version": "terminal-completion-v1",
+            }
+            parent_id = materialize_parent(
+                conn,
+                source=source,
+                capability=capability,
+                text=text,
+                artifacts=artifacts,
+            )
+
+            async def _send(child: dict) -> str:
+                component = child["component"]
+                if child["kind"] == "primary_text":
+                    result = await adapter.send(sub["chat_id"], component["text"], metadata=metadata)
+                elif child["kind"] == "artifact_upload":
+                    result = await adapter.send_document(
+                        chat_id=sub["chat_id"],
+                        file_path=component["path"],
+                        metadata=metadata,
+                    )
+                else:
+                    if not component.get("creator_session_id"):
+                        raise RuntimeError("creator wake target unavailable")
+                    await deliver_wake(
+                        adapter,
+                        text=text,
+                        session_id=component["creator_session_id"],
+                        source=None if not push else self._kanban_wake_source(adapter, sub),
+                    )
+                    return f"wake:{child['child_id']}"
+                if getattr(result, "success", True) is False:
+                    raise RuntimeError(getattr(result, "error", None) or "adapter reported failure")
+                return str(
+                    getattr(result, "message_id", None)
+                    or getattr(result, "id", None)
+                    or f"at-least-once:{child['child_id']}"
+                )
+
+            return await process_parent(
+                conn,
+                parent_id,
+                owner=f"gateway:{os.getpid()}",
+                send_child=_send,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_wake_source(self, adapter, sub: dict):
+        """Rebuild the persisted creator route for a push wake child."""
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+
+        return SessionSource(
+            platform=Platform((sub.get("platform") or "").lower()),
+            chat_id=sub["chat_id"],
+            chat_type=sub.get("chat_type") or "group",
+            thread_id=sub.get("thread_id") or None,
+            user_id=sub.get("user_id"),
+            user_id_alt=sub.get("user_id_alt"),
+            profile=sub.get("notifier_profile") or None,
+            scope_id=_wake_scope_id(adapter, sub),
+        )
 
     async def _deliver_kanban_artifacts(
         self,

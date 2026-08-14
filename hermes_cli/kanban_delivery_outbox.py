@@ -132,8 +132,14 @@ def materialize_parent(
         if not text:
             raise CapabilityError("push route requires text")
         children.append(
-            {"kind": "primary_text", "ordinal": 0, "required": True, "component": {"payload_digest": _digest(text)}, "policy": "text-policy-v1"}
+            {"kind": "primary_text", "ordinal": 0, "required": True, "component": {"payload_digest": _digest(text), "text": text}, "policy": "text-policy-v1"}
         )
+        if cap.get("creator_wake_applicable"):
+            if not cap.get("creator_session_id"):
+                raise CapabilityError("applicable creator wake requires a stable target")
+            children.append(
+                {"kind": "creator_wake", "ordinal": 1, "required": bool(cap.get("wake_required", True)), "component": {"creator_session_id": cap["creator_session_id"], "wake_reason_version": "terminal-v1"}, "policy": cap.get("wake_policy_version") or "wake-policy-v1"}
+            )
     else:
         children.append(
             {"kind": "creator_wake", "ordinal": 0, "required": True, "component": {"creator_session_id": cap["creator_session_id"], "wake_reason_version": "terminal-v1"}, "policy": "wake-policy-v1"}
@@ -186,6 +192,65 @@ def lease_child(conn: sqlite3.Connection, child_id: str, owner: str, *, now: int
     return token
 
 
+def due_children(
+    conn: sqlite3.Connection,
+    *,
+    now: int,
+    parent_id: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Return immutable pending/retryable child work in delivery order."""
+    params: list[Any] = [now]
+    where = "state IN ('pending','failed') AND (next_attempt_at IS NULL OR next_attempt_at <= ?)"
+    if parent_id is not None:
+        where += " AND parent_id=?"
+        params.append(parent_id)
+    params.append(max(1, int(limit)))
+    rows = conn.execute(
+        f"SELECT * FROM kanban_delivery_children WHERE {where} "
+        "ORDER BY CASE kind WHEN 'primary_text' THEN 0 WHEN 'artifact_upload' THEN 1 ELSE 2 END, ordinal, child_id LIMIT ?",
+        params,
+    ).fetchall()
+    children: list[dict[str, Any]] = []
+    for row in rows:
+        child = dict(row)
+        child["component"] = json.loads(child.pop("component_json"))
+        children.append(child)
+    return children
+
+
+def recover_expired(conn: sqlite3.Connection, *, now: int) -> list[str]:
+    """Recover expired leases while preserving uncertain send evidence."""
+    recovered: list[str] = []
+    with conn:
+        rows = conn.execute(
+            "SELECT child_id,state,attempt_count,lease_token_hash,parent_id "
+            "FROM kanban_delivery_children WHERE state IN ('leased','sending') "
+            "AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?",
+            (now,),
+        ).fetchall()
+        for row in rows:
+            error_class = (
+                "uncertain_after_expired_sending"
+                if row[1] == "sending"
+                else "expired_before_send"
+            )
+            conn.execute(
+                "UPDATE kanban_delivery_children SET state='failed',last_error_class=?,"
+                "next_attempt_at=?,lease_owner=NULL,lease_token_hash=NULL,lease_expires_at=NULL,updated_at=? "
+                "WHERE child_id=? AND state=?",
+                (error_class, now, now, row[0], row[1]),
+            )
+            conn.execute(
+                "UPDATE kanban_delivery_attempts SET ended_at=?,transition='failed',error_class=? "
+                "WHERE child_id=? AND attempt_number=? AND lease_token_hash=?",
+                (now, error_class, row[0], row[2], row[3]),
+            )
+            _derive_parent(conn, row[4], now)
+            recovered.append(str(row[0]))
+    return recovered
+
+
 def _assert_token(row: sqlite3.Row | tuple, token: str, expected: str) -> str:
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     if not row or row[0] != expected or row[1] != token_hash:
@@ -220,6 +285,52 @@ def mark_failed(conn: sqlite3.Connection, child_id: str, token: str, *, error_cl
         _derive_parent(conn, row[2], now)
 
 
+def mark_dead(conn: sqlite3.Connection, child_id: str, *, error_class: str, now: int) -> None:
+    with conn:
+        row = conn.execute(
+            "SELECT state,parent_id FROM kanban_delivery_children WHERE child_id=?",
+            (child_id,),
+        ).fetchone()
+        if not row or row[0] != "failed":
+            raise TransitionError("only failed children can become dead")
+        conn.execute(
+            "UPDATE kanban_delivery_children SET state='dead',last_error_class=?,updated_at=? WHERE child_id=?",
+            (error_class, now, child_id),
+        )
+        _derive_parent(conn, row[1], now)
+
+
+def audit_dead_child(
+    conn: sqlite3.Connection,
+    child_id: str,
+    *,
+    actor: str,
+    reason_code: str,
+    evidence: str,
+    completion_permitted: bool,
+    now: int,
+) -> None:
+    if not actor or not reason_code or not evidence:
+        raise TransitionError("actor, reason and evidence are required")
+    with conn:
+        row = conn.execute(
+            "SELECT state,parent_id FROM kanban_delivery_children WHERE child_id=?",
+            (child_id,),
+        ).fetchone()
+        if not row or row[0] != "dead":
+            raise TransitionError("only dead children can be audited")
+        conn.execute(
+            "INSERT INTO kanban_delivery_audit(child_id,actor,reason_code,evidence_sha256,completion_permitted,created_at) VALUES(?,?,?,?,?,?)",
+            (child_id, actor, reason_code, hashlib.sha256(evidence.encode()).hexdigest(), int(completion_permitted), now),
+        )
+        if completion_permitted:
+            conn.execute(
+                "UPDATE kanban_delivery_children SET state='audited',updated_at=? WHERE child_id=?",
+                (now, child_id),
+            )
+        _derive_parent(conn, row[1], now)
+
+
 def _derive_parent(conn: sqlite3.Connection, parent_id: str, now: int) -> None:
     rows = conn.execute("SELECT state FROM kanban_delivery_children WHERE parent_id=?", (parent_id,)).fetchall()
     complete = bool(rows) and all(row[0] in ("sent", "audited") for row in rows)
@@ -230,3 +341,48 @@ def _derive_parent(conn: sqlite3.Connection, parent_id: str, now: int) -> None:
 def parent_complete(conn: sqlite3.Connection, parent_id: str) -> bool:
     row = conn.execute("SELECT state FROM kanban_delivery_parents WHERE parent_id=?", (parent_id,)).fetchone()
     return bool(row and row[0] in ("sent", "audited"))
+
+
+async def process_parent(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    *,
+    owner: str,
+    send_child,
+    now: int | None = None,
+    lease_seconds: int = 60,
+    retry_seconds: int = 5,
+) -> bool:
+    """Lease, send and durably acknowledge each incomplete child independently."""
+    import time
+
+    current = int(time.time()) if now is None else int(now)
+    recover_expired(conn, now=current)
+    for child in due_children(conn, parent_id=parent_id, now=current):
+        token = lease_child(
+            conn,
+            child["child_id"],
+            owner,
+            now=current,
+            lease_seconds=lease_seconds,
+        )
+        mark_sending(conn, child["child_id"], token, now=current)
+        try:
+            receipt = await send_child(child)
+            mark_sent(
+                conn,
+                child["child_id"],
+                token,
+                receipt=str(receipt or ""),
+                now=current,
+            )
+        except Exception as exc:
+            mark_failed(
+                conn,
+                child["child_id"],
+                token,
+                error_class=type(exc).__name__,
+                now=current,
+                retry_at=current + retry_seconds,
+            )
+    return parent_complete(conn, parent_id)

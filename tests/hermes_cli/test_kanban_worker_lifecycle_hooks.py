@@ -79,7 +79,7 @@ def test_dispatch_spawn_fires_worker_spawned(
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="t", assignee="alice")
-        result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242)
+        result = kb._dispatch_once_for_tests(conn, spawn_fn=lambda *a, **k: 4242)
         assert any(row[0] == tid for row in result.spawned)
     finally:
         conn.close()
@@ -165,7 +165,7 @@ def test_raising_callbacks_never_break_worker_lifecycle(
         conn = kb.connect()
         try:
             tid = kb.create_task(conn, title="t", assignee="alice")
-            result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 111)
+            result = kb._dispatch_once_for_tests(conn, spawn_fn=lambda *a, **k: 111)
             assert any(row[0] == tid for row in result.spawned)
 
             monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
@@ -202,7 +202,7 @@ def test_no_subscriber_short_circuits_worker_hooks(
     conn = kb.connect()
     try:
         kb.create_task(conn, title="t", assignee="alice")
-        kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 222)
+        kb._dispatch_once_for_tests(conn, spawn_fn=lambda *a, **k: 222)
     finally:
         conn.close()
     assert "on_kanban_worker_spawned" not in invoked

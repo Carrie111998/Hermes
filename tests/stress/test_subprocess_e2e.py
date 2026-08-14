@@ -86,7 +86,7 @@ exec {PY} -m hermes_cli.main "$@"
         tids.append(tid)
 
     spawn_fn = make_spawn_fn(home)
-    result = kb.dispatch_once(conn, spawn_fn=spawn_fn)
+    result = kb._dispatch_once_for_tests(conn, spawn_fn=spawn_fn)
     print(f"  dispatched: {len(result.spawned)} spawned")
     spawned_pids = []
     # The dispatcher sets worker_pid on each claimed task via _set_worker_pid.
@@ -179,7 +179,7 @@ exec {PY} -m hermes_cli.main "$@"
         os.close(r)
         return grandchild_pid
 
-    result = kb.dispatch_once(conn, spawn_fn=spawn_sleeper)
+    result = kb._dispatch_once_for_tests(conn, spawn_fn=spawn_sleeper)
     task = kb.get_task(conn, crash_tid)
     print(f"  spawned sleeper pid={task.worker_pid} for {crash_tid}")
     # Kill the sleeper forcibly

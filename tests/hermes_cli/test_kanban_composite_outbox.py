@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import asyncio
 
 import pytest
 
@@ -49,6 +50,30 @@ def test_push_and_non_push_freeze_different_required_shapes():
     wake_kinds = [r["kind"] for r in conn.execute("select * from kanban_delivery_children where parent_id=?", (wake,))]
     assert push_kinds == ["primary_text"]
     assert wake_kinds == ["creator_wake"]
+
+
+def test_push_with_required_creator_wake_freezes_text_and_wake_children():
+    from hermes_cli.kanban_delivery_outbox import init_schema, materialize_parent
+
+    conn = _conn()
+    init_schema(conn)
+    capability = _push()
+    capability.update(
+        creator_wake_applicable=True,
+        creator_session_id="session-1",
+        wake_required=True,
+    )
+    parent = materialize_parent(
+        conn, source=_source("e1"), capability=capability, text="done"
+    )
+    rows = conn.execute(
+        "select kind,required from kanban_delivery_children where parent_id=? order by ordinal",
+        (parent,),
+    ).fetchall()
+    assert [(row["kind"], row["required"]) for row in rows] == [
+        ("primary_text", 1),
+        ("creator_wake", 1),
+    ]
 
 
 def test_materialization_is_deterministic_and_capability_drift_cannot_reshape():
@@ -110,6 +135,113 @@ def test_seven_state_transitions_attempts_receipt_and_parent_gate():
     mark_sent(conn, artifact, token3, receipt="safe:2", now=15)
     assert parent_complete(conn, parent)
     assert conn.execute("select count(*) from kanban_delivery_attempts").fetchone()[0] == 3
+
+
+def test_due_children_preserve_payload_and_recover_expired_uncertain_send():
+    from hermes_cli.kanban_delivery_outbox import (
+        due_children,
+        init_schema,
+        lease_child,
+        mark_sending,
+        materialize_parent,
+        recover_expired,
+    )
+
+    conn = _conn()
+    init_schema(conn)
+    parent = materialize_parent(
+        conn,
+        source=_source("e1"),
+        capability=_push(),
+        text="durable body",
+    )
+    child = due_children(conn, parent_id=parent, now=10)[0]
+    assert child["kind"] == "primary_text"
+    assert child["component"]["text"] == "durable body"
+
+    token = lease_child(conn, child["child_id"], "notifier-a", now=10, lease_seconds=5)
+    mark_sending(conn, child["child_id"], token, now=11)
+    assert due_children(conn, parent_id=parent, now=12) == []
+    assert recover_expired(conn, now=16) == [child["child_id"]]
+    retried = due_children(conn, parent_id=parent, now=16)[0]
+    assert retried["state"] == "failed"
+    assert retried["last_error_class"] == "uncertain_after_expired_sending"
+
+
+def test_audit_requires_explicit_completion_permission_and_is_append_only():
+    from hermes_cli.kanban_delivery_outbox import (
+        audit_dead_child,
+        init_schema,
+        lease_child,
+        mark_dead,
+        mark_failed,
+        mark_sending,
+        materialize_parent,
+        parent_complete,
+    )
+
+    conn = _conn()
+    init_schema(conn)
+    parent = materialize_parent(conn, source=_source("e1"), capability=_push(), text="done")
+    child_id = conn.execute(
+        "select child_id from kanban_delivery_children where parent_id=?", (parent,)
+    ).fetchone()[0]
+    token = lease_child(conn, child_id, "notifier", now=7, lease_seconds=5)
+    mark_sending(conn, child_id, token, now=8)
+    mark_failed(conn, child_id, token, error_class="permanent", now=9, retry_at=99)
+    mark_dead(conn, child_id, error_class="permanent", now=10)
+    assert not parent_complete(conn, parent)
+    audit_dead_child(
+        conn,
+        child_id,
+        actor="operator",
+        reason_code="approved-terminal-disposition",
+        evidence="ticket:1",
+        completion_permitted=True,
+        now=11,
+    )
+    assert parent_complete(conn, parent)
+    assert conn.execute("select count(*) from kanban_delivery_audit").fetchone()[0] == 1
+
+
+def test_process_parent_acks_each_child_and_retries_only_failed_sibling():
+    from hermes_cli.kanban_delivery_outbox import (
+        init_schema,
+        materialize_parent,
+        parent_complete,
+        process_parent,
+    )
+
+    conn = _conn()
+    init_schema(conn)
+    parent = materialize_parent(
+        conn,
+        source=_source("e1"),
+        capability=_push(),
+        text="done",
+        artifacts=[{"manifest_id": "m1", "sha256": "a" * 64, "path": "/tmp/a"}],
+    )
+    calls = []
+
+    async def first(child):
+        calls.append(child["kind"])
+        if child["kind"] == "artifact_upload":
+            raise TimeoutError("upload timed out")
+        return f"safe:{child['child_id']}"
+
+    assert asyncio.run(process_parent(conn, parent, owner="n1", send_child=first, now=10)) is False
+    assert calls == ["primary_text", "artifact_upload"]
+    assert not parent_complete(conn, parent)
+
+    calls.clear()
+
+    async def second(child):
+        calls.append(child["kind"])
+        return f"safe:{child['child_id']}"
+
+    assert asyncio.run(process_parent(conn, parent, owner="n2", send_child=second, now=20)) is True
+    assert calls == ["artifact_upload"]
+    assert parent_complete(conn, parent)
 
 
 def _source(event: str):

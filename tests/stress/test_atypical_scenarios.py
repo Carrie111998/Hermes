@@ -461,7 +461,7 @@ def _(home, kb):
             workspace_path="/nonexistent/path/that/does/not/exist",
         )
         # Run dispatch_once with a dummy spawn_fn
-        result = kb.dispatch_once(conn, spawn_fn=lambda *_: 99999)
+        result = kb._dispatch_once_for_tests(conn, spawn_fn=lambda *_: 99999)
         # If the path was rejected, the task went through _record_spawn_failure
         task = kb.get_task(conn, tid)
         # Possible outcomes:
@@ -852,7 +852,7 @@ def _(home, kb):
     try:
         tid = kb.create_task(conn, title="orphan", assignee=None)
         assert kb.get_task(conn, tid).status == "ready"
-        result = kb.dispatch_once(conn, spawn_fn=lambda *_: 42)
+        result = kb._dispatch_once_for_tests(conn, spawn_fn=lambda *_: 42)
         assert tid in result.skipped_unassigned
         assert len(result.spawned) == 0
         # Task should still be ready, untouched

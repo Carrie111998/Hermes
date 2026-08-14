@@ -55,7 +55,7 @@ def test_held_lock_skips_the_tick_without_writes(conn):
     # Hold the lock, then attempt a contended tick.
     with kb._dispatch_tick_lock(db_path) as held:
         assert held is True  # we genuinely acquired it
-        result = kb.dispatch_once(conn, spawn_fn=spy_spawn)
+        result = kb._dispatch_once_for_tests(conn, spawn_fn=spy_spawn)
 
     assert result.skipped_locked is True
     assert result.spawned == []

@@ -74,3 +74,16 @@ def test_dashboard_dispatch_status_error_is_503_and_secret_free(monkeypatch):
     encoded = json.dumps(raised.value.detail)
     assert "permission_denied" in encoded
     assert "token" not in encoded.lower()
+
+
+def test_direct_dispatch_once_rejects_without_opaque_authority_before_tick(monkeypatch):
+    from hermes_cli import kanban_db
+    from hermes_cli.dispatcher_authority import DispatcherAuthorityError
+
+    monkeypatch.setattr(
+        kanban_db,
+        "_dispatch_once_locked",
+        lambda *_args, **_kwargs: pytest.fail("unguarded dispatch tick reached"),
+    )
+    with pytest.raises(DispatcherAuthorityError):
+        kanban_db.dispatch_once(None, object(), dry_run=True)
