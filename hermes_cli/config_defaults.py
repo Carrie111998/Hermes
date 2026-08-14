@@ -282,6 +282,12 @@ DEFAULT_CONFIG = {
         "image_input_mode": "auto",
         "disabled_toolsets": [],
 
+        # Global default reasoning effort level. Applies to all models unless
+        # overridden by reasoning_overrides for the active model.
+        # Values: "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra".
+        # Empty string = provider default.
+        "reasoning_effort": "",
+
         # Per-model reasoning effort overrides (spelling-tolerant).
         # Dict mapping model names (any reasonable spelling) to effort levels.
         # Takes precedence over agent.reasoning_effort when the current model
