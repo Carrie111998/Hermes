@@ -60,12 +60,56 @@ def _write_config(home: str, text: str) -> None:
         fp.write(text)
 
 
+@pytest.fixture(autouse=True)
+def _restore_purged_modules():
+    """Put ``sys.modules`` back the way ``_fresh_modules`` found it.
+
+    Without this the purge below leaks: every later test runs against
+    freshly-imported duplicates while test modules bound at collection time
+    still reference the originals, and two live copies of a module means two
+    distinct class objects with the same name, so ``except`` and ``isinstance``
+    quietly stop matching.
+
+    Restoring ``sys.modules`` alone is not enough — ``import a.b as x`` reads
+    ``sys.modules`` but ``from a.b import y`` reads the attribute ``b`` on the
+    parent package, so both have to be put back.
+    """
+    snapshot = dict(sys.modules)
+    yield
+    purged = {
+        name: module for name, module in snapshot.items()
+        if sys.modules.get(name) is not module
+    }
+    for name, module in purged.items():
+        sys.modules[name] = module
+    for name, module in purged.items():
+        parent_name, _, child = name.rpartition(".")
+        if not parent_name:
+            continue
+        parent = sys.modules.get(parent_name)
+        if parent is not None and getattr(parent, child, None) is not module:
+            setattr(parent, child, module)
+
+
 def _fresh_modules():
-    """Drop cached hermes modules so each test reloads against current env."""
+    """Drop cached hermes modules so each test reloads against current env.
+
+    The purge has to cover every ``agent.`` / ``tools.`` / ``hermes_`` module,
+    not just the five this file imports directly. ``agent.auxiliary_client``
+    re-reads configuration through modules it does not own, and any of those
+    left cached pins the PREVIOUS test's ``HERMES_HOME`` config, so the fresh
+    copy resolves against stale settings.
+
+    This file used to purge only those five and passed anyway, because
+    ``test_verification_stop_caching.py`` ran earlier and purged everything
+    without restoring — these tests were free-riding on another file's leak.
+    Fixing that leak exposed the under-purge here, which is the honest state:
+    the dependency existed all along and was invisible only because two bugs
+    lined up.
+    """
     for mod in list(sys.modules.keys()):
-        if mod.startswith(("agent.auxiliary_client", "agent.image_routing",
-                           "tools.vision_tools", "tools.browser_tool",
-                           "hermes_cli.config")):
+        if (mod == "run_agent"
+                or mod.startswith(("agent.", "tools.", "hermes_"))):
             del sys.modules[mod]
 
 

@@ -184,7 +184,13 @@ _POLICY: Dict[EventType, _Spec] = {
     _E.AGENT_ERROR: _Spec(Attention.WARN, ALERTS, wa=WA_URGENT),  # cluster-gated in escalator
     _E.AGENT_FAILURE_CLUSTER: _Spec(Attention.WARN, ALERTS, wa=WA_URGENT),
     _E.AGENT_LOOP_FAULT: _Spec(Attention.WARN, ALERTS),
-    _E.RESOURCE_PRESSURE: _Spec(Attention.WARN, ALERTS),
+    # Off the alerts topic (2026-08-14, operator pref): the disk_low WARN
+    # stage is an early warning that must stay legible, and alerts already
+    # carries ~112 delivered msgs/day (gateway_health 634, watchdog_burst 409
+    # per 30d) — the signal was indistinguishable from the noise. The disk
+    # axis pages via the disk_critical hook below, which forces
+    # action_required regardless of this line.
+    _E.RESOURCE_PRESSURE: _Spec(Attention.WARN, SECURITY),
     _E.CODE_DRIFT: _Spec(Attention.WARN, ALERTS),           # hook: resolved → INFO
     # Base case is the common one: the limit was hit and a fallback absorbed
     # it, which is degraded-but-working. The conditional hook below upgrades

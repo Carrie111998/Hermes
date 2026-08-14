@@ -16,6 +16,8 @@ import pytest
 from events.bus import EventBus
 from events.schema import EventType, Priority
 from events.producers.resource_monitor import (
+    DEFAULT_DISK_FREE_GB_DISARM,
+    DEFAULT_DISK_FREE_GB_THRESHOLD,
     ResourcePressureMonitor,
     ResourceSample,
     sample_resources,
@@ -101,9 +103,9 @@ class TestDiskThreshold:
         assert _pressure_events(bus) == []
 
     def test_disk_critical_is_a_separate_axis_from_disk_low(self, bus):
-        # 50 GB: below the 60 GB early-warning axis, above the 25 GB paging one.
+        # 35 GB: below the 45 GB early-warning axis, above the 25 GB paging one.
         monitor = ResourcePressureMonitor(bus)
-        monitor.evaluate(make_sample(disk_free_gb=50.0), now=0.0)
+        monitor.evaluate(make_sample(disk_free_gb=35.0), now=0.0)
         reasons = _pressure_events(bus)[0].payload["reasons"]
         assert "disk_low" in reasons
         assert "disk_critical" not in reasons
@@ -128,8 +130,26 @@ class TestDiskThreshold:
         # Regression 2026-08-14: the old 15 GB default fired only once the disk was
         # hours from zero, because Docker's VHDX can allocate 40-50 GB overnight.
         monitor = ResourcePressureMonitor(bus)
-        assert monitor.evaluate(make_sample(disk_free_gb=50.0), now=0.0)
+        assert monitor.evaluate(make_sample(disk_free_gb=35.0), now=0.0)
         assert "disk_low" in _pressure_events(bus)[0].payload["reasons"]
+
+    def test_default_disarm_is_reachable_on_this_hardware(self, bus):
+        # Regression 2026-08-14 (same day, second defect): the trigger was briefly
+        # set to 60 GB with a 75 GB disarm on a box whose post-reclaim CEILING is
+        # ~56.6 GB free. The axis breached on its first sample and could never
+        # unlatch, re-pinging every cooldown forever. Pin the invariant that makes
+        # that impossible: a fully-reclaimed disk must read as comfortably clear.
+        POST_RECLAIM_CEILING_GB = 56.6
+        assert DEFAULT_DISK_FREE_GB_THRESHOLD < POST_RECLAIM_CEILING_GB
+        assert DEFAULT_DISK_FREE_GB_DISARM < POST_RECLAIM_CEILING_GB
+        # ...and prove it end-to-end: breach, then recover to the real ceiling.
+        monitor = ResourcePressureMonitor(bus)
+        assert monitor.evaluate(make_sample(disk_free_gb=35.0), now=0.0)
+        assert monitor.evaluate(
+            make_sample(disk_free_gb=POST_RECLAIM_CEILING_GB), now=60.0) is None
+        # Cleared for real, so the next breach is a fresh rising edge.
+        assert monitor.evaluate(make_sample(disk_free_gb=35.0), now=120.0)
+        assert len(_pressure_events(bus)) == 2
 
 
 class TestPagefileGrowthTrigger:
@@ -256,6 +276,97 @@ class TestEdgeTriggerAndCooldown:
         assert len(_pressure_events(bus)) == 2
 
 
+class TestEscalationWithinAnEpisode:
+    """A NEW axis breaching mid-episode is new information, not a re-ping.
+
+    Regression 2026-08-14 (third defect of the day). ``rising_edge`` was
+    ``not was_in_episode`` — one global boolean over ALL axes — so once any
+    axis latched, an axis that breached later was folded into the running
+    episode and had to wait out ``re_alert_cooldown_seconds``.
+
+    That was harmless while every axis routed the same way. The two-stage disk
+    work made it a paging bug: disk_critical (25 GB) sits BELOW disk_low
+    (45 GB), so on the failure mode this axis exists for — a disk that fills
+    monotonically until a human frees space — disk_low ALWAYS latches first.
+    The critical page was therefore never prompt, and a dip that recovered
+    inside the cooldown was never sent at all. Only a gateway that restarted
+    while already below 25 GB could page immediately, which is exactly the
+    shape every pre-existing disk_critical test used.
+    """
+
+    def test_disk_critical_pages_immediately_during_a_disk_low_episode(self, bus):
+        monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
+        # 40 GB: the disk_low early warning opens the episode.
+        assert monitor.evaluate(make_sample(disk_free_gb=40.0), now=0.0)
+        # Still only disk_low — a re-ping inside the cooldown stays suppressed.
+        assert monitor.evaluate(make_sample(disk_free_gb=32.0), now=60.0) is None
+        # 20 GB crosses the 25 GB paging axis. That is a NEW axis, so it must
+        # emit now rather than 840s later when the cooldown happens to elapse.
+        assert monitor.evaluate(make_sample(disk_free_gb=20.0), now=120.0)
+        events = _pressure_events(bus)
+        assert len(events) == 2
+        assert "disk_critical" not in events[0].payload["reasons"]
+        assert "disk_critical" in events[1].payload["reasons"]
+
+    def test_disk_critical_dip_inside_the_cooldown_is_not_lost(self, bus):
+        # Worse than a delayed page: under the old rule a breach that recovered
+        # before the cooldown elapsed produced NO disk_critical event ever.
+        monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
+        assert monitor.evaluate(make_sample(disk_free_gb=40.0), now=0.0)
+        assert monitor.evaluate(make_sample(disk_free_gb=20.0), now=120.0)
+        # Recovered comfortably clear of both axes — episode over.
+        assert monitor.evaluate(make_sample(disk_free_gb=60.0), now=300.0) is None
+        reasons = [r for e in _pressure_events(bus) for r in e.payload["reasons"]]
+        assert "disk_critical" in reasons
+
+    def test_escalation_is_not_disk_specific(self, bus):
+        # The rule is per-axis, not a disk special case: phys breaching during
+        # a running commit episode is also new information.
+        monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
+        assert monitor.evaluate(make_sample(commit_pct=99.0), now=0.0)
+        assert monitor.evaluate(
+            make_sample(commit_pct=99.0, phys_pct=96.4), now=60.0)
+        assert len(_pressure_events(bus)) == 2
+
+    def test_already_latched_axis_re_breaching_is_not_an_edge(self, bus):
+        # The other half of the contract: only a NEWLY latched axis escalates.
+        # An axis that hovers in its band and re-breaches is the 2026-06-11
+        # storm shape and must stay cooldown-gated.
+        monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
+        assert monitor.evaluate(make_sample(commit_pct=88.2), now=0.0)
+        # 84% is below the 85% trigger but above the 80% disarm — still latched.
+        assert monitor.evaluate(make_sample(commit_pct=84.0), now=60.0) is None
+        # Re-crossing is the SAME axis, already latched: no fresh edge.
+        assert monitor.evaluate(make_sample(commit_pct=85.3), now=120.0) is None
+        assert len(_pressure_events(bus)) == 1
+
+    def test_escalated_event_routes_to_action_required_end_to_end(self, bus):
+        # Ties the producer to the deployed routing policy. Every other
+        # disk_critical routing test hand-builds an Event, so nothing proved a
+        # REAL emitted payload carries the shape classify()'s hook reads —
+        # nor that the hook still wins after 19a8dd9abd moved the base spec
+        # for resource_pressure from watchdog_alerts to security_and_system.
+        from events.routing_policy import Attention, classify
+
+        monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
+        monitor.evaluate(make_sample(disk_free_gb=40.0), now=0.0)
+        monitor.evaluate(make_sample(disk_free_gb=20.0), now=120.0)
+        low, critical = _pressure_events(bus)
+
+        # The WARN stage stays legible in security_and_system and never pages.
+        low_route = classify(low)
+        assert low_route.attention is Attention.WARN
+        assert low_route.topic_key == "security_and_system"
+        assert low_route.wa_tier is None
+
+        # The critical stage overrides that default topic and pages.
+        crit_route = classify(critical)
+        assert crit_route.attention is Attention.ACT
+        assert crit_route.topic_key == "action_required"
+        assert crit_route.wa_tier == "urgent"
+        assert crit_route.batch is False
+
+
 class TestHysteresis:
     """Disarm-level hysteresis (added 2026-06-12): a breached axis re-arms only
     once *comfortably* clear of its trigger, so hovering right at a threshold
@@ -300,14 +411,22 @@ class TestHysteresis:
         assert len(_pressure_events(bus)) == 2
 
     def test_disk_band_holds_episode(self, bus):
+        # Breaches at 35 GB, not 12: this test is about the disk_LOW band, and
+        # the fixture must stay inside the band of the axis it breaches. 12 GB
+        # also trips disk_critical (25/40), for which the 48 GB in-band sample
+        # below is *comfortably clear* — so a 12 -> 48 -> 12 walk is a genuine
+        # recovery and re-breach of the paging axis, which must re-emit. No
+        # single value is in-band for both axes; their bands do not overlap.
+        # Before the per-axis rising edge landed this file asserted the
+        # opposite, quietly pinning the escalation bug as correct behaviour.
         monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
-        assert monitor.evaluate(make_sample(disk_free_gb=12.0), now=0.0)
-        # 17 GB free is between the 15 GB trigger and the 20 GB disarm: holds.
-        assert monitor.evaluate(make_sample(disk_free_gb=65.0), now=60.0) is None
-        assert monitor.evaluate(make_sample(disk_free_gb=12.0), now=120.0) is None
+        assert monitor.evaluate(make_sample(disk_free_gb=35.0), now=0.0)
+        # 48 GB free is between the 45 GB trigger and the 52 GB disarm: holds.
+        assert monitor.evaluate(make_sample(disk_free_gb=48.0), now=60.0) is None
+        assert monitor.evaluate(make_sample(disk_free_gb=35.0), now=120.0) is None
         # Recovery above the disarm clears; the next breach fires immediately.
-        assert monitor.evaluate(make_sample(disk_free_gb=80.0), now=180.0) is None
-        assert monitor.evaluate(make_sample(disk_free_gb=12.0), now=240.0)
+        assert monitor.evaluate(make_sample(disk_free_gb=60.0), now=180.0) is None
+        assert monitor.evaluate(make_sample(disk_free_gb=35.0), now=240.0)
         assert len(_pressure_events(bus)) == 2
 
     def test_pagefile_growth_band_holds_episode(self, bus):
@@ -346,16 +465,19 @@ class TestHysteresis:
 
     def test_unbreached_axis_in_band_does_not_hold_episode(self, bus):
         # Guard for the latch design: only axes that actually BREACHED hold the
-        # episode open. Disk hovers in its band (17 GB) throughout but never
-        # crossed its 15 GB trigger, so commit clearing comfortably ends the
+        # episode open. Disk hovers in its band (48 GB) throughout but never
+        # crossed its 45 GB trigger, so commit clearing comfortably ends the
         # episode — disk must not suppress the next fresh commit emergency.
+        # NB: this fixture must stay IN THE BAND. It was scaled to 170.0 on
+        # 2026-08-14, which is comfortably clear rather than in-band, and the
+        # test passed while exercising none of the behaviour it documents.
         monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
         assert monitor.evaluate(
-            make_sample(commit_pct=88.0, disk_free_gb=170.0), now=0.0)
+            make_sample(commit_pct=88.0, disk_free_gb=48.0), now=0.0)
         assert monitor.evaluate(
-            make_sample(commit_pct=70.0, disk_free_gb=170.0), now=60.0) is None
+            make_sample(commit_pct=70.0, disk_free_gb=48.0), now=60.0) is None
         assert monitor.evaluate(
-            make_sample(commit_pct=88.0, disk_free_gb=170.0), now=120.0)
+            make_sample(commit_pct=88.0, disk_free_gb=48.0), now=120.0)
         assert len(_pressure_events(bus)) == 2
 
     def test_custom_disarm_levels_are_honored(self, bus):

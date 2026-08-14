@@ -24,9 +24,22 @@ import sys
 
 import pytest
 
-# A guaranteed-foreign PID: PID 1 (init).  Owned by root, not us, and
-# always exists. A sane guard refuses to signal it.
-FOREIGN_PID = 1
+# A guaranteed-foreign PID: one that is owned by the system, is never in
+# this test's subtree, and — crucially — ACTUALLY EXISTS on the platform
+# under test.
+#
+# PID 1 (init) satisfies that on POSIX only. On Windows there is no PID 1:
+# ``psutil.Process(1)`` raises NoSuchProcess, and ``_is_own_subtree`` then
+# deliberately allowlists it ("stale PID — kill would be a no-op anyway").
+# So on Windows a PID-1 assertion was vacuous: the guard never fired, the
+# real ``os.kill`` ran, and the test failed with OSError rather than the
+# RuntimeError it was written to demand — it could not fail for its own
+# reason. PID 4 is Windows "System": always present, parented by PID 0,
+# never in the test subtree. Same platform split — and the same reason —
+# as the ``_FOREIGN_LIVE_PID`` constant added by cd51467573 (branch
+# claude/zealous-mendeleev-5e8346) for the psutil-kill self-tests; if that
+# branch lands, the two should collapse into this one.
+FOREIGN_PID = 4 if sys.platform == "win32" else 1
 
 
 # ──────────────────── kill primitives ─────────────────────────
@@ -247,7 +260,16 @@ def test_os_popen_systemctl_blocked():
 
 
 def test_pty_spawn_systemctl_blocked():
-    import pty
+    """``pty.spawn`` is a genuine platform gap, not a weakened assertion.
+
+    The ``pty`` module does not exist on Windows, so there is no primitive
+    here for the guard to wrap — ``_live_system_guard`` registers this hook
+    inside its own ``try: import pty`` for exactly that reason. Skipping
+    where the module is absent keeps the two in step; it does not skip a
+    hook that Windows actually has (contrast the allow-cases below, which
+    are deliberately written to run everywhere).
+    """
+    pty = pytest.importorskip("pty", reason="pty is POSIX-only; the guard hook is too")
     with pytest.raises(RuntimeError, match="live-system guard"):
         pty.spawn(["systemctl", "--user", "restart", "hermes-gateway"])
 
@@ -396,62 +418,71 @@ def test_subprocess_systemctl_verb_after_trailing_backslash_blocked():
 # ──────────────────── pass-through cases (must NOT raise) ──────
 
 
+# The systemctl allow-cases below carry their tokens as ARGUMENTS to a
+# harmless ``sys.executable -c ""`` rather than invoking a real
+# ``systemctl``, for the same reason the gateway allow-cases do (see
+# ``_run_allowed``): ``systemctl`` does not exist on Windows, so spawning it
+# for real landed this file's Windows run red — the exact condition that hid
+# the rogue-gateway bug. ``_is_blocked_systemctl`` inspects the whole
+# command it is GIVEN (substring for ``systemctl``/hermes tokens, whole-word
+# for the mutating verb) with no dependence on which argv slot they occupy,
+# so this shape exercises the real matcher on every platform.
+# ``test_systemctl_wrapped_restart_is_still_blocked`` is the falsifier that
+# keeps these four honest.
+
+
 def test_systemctl_status_passes_through():
     """Read-only systemctl probes (status/show/list-units) are fine."""
-    # Run with check=False so we don't fail on the gateway's exit code.
-    r = subprocess.run(
-        ["systemctl", "--user", "status", "hermes-gateway", "--no-pager"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert r is not None  # Did not raise — the guard let it through.
+    r = _run_allowed("systemctl", "--user", "status", "hermes-gateway", "--no-pager")
+    assert r.returncode == 0  # Did not raise — the guard let it through.
 
 
 def test_systemctl_show_passes_through():
-    r = subprocess.run(
-        ["systemctl", "--user", "show", "hermes-gateway", "--no-pager"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert r is not None
+    r = _run_allowed("systemctl", "--user", "show", "hermes-gateway", "--no-pager")
+    assert r.returncode == 0
 
 
 def test_systemctl_list_units_passes_through():
-    r = subprocess.run(
-        ["systemctl", "--user", "list-units", "fake-not-real-unit*", "--no-pager"],
-        capture_output=True,
-        text=True,
-        check=False,
+    r = _run_allowed(
+        "systemctl", "--user", "list-units", "fake-not-real-unit*", "--no-pager"
     )
-    assert r is not None
+    assert r.returncode == 0
 
 
 def test_systemctl_unrelated_unit_passes_through():
     """systemctl restart of a non-hermes unit is allowed (we only protect hermes)."""
-    # Use --dry-run so we don't actually try to restart anything; just
-    # verify the guard doesn't block the call. systemctl supports
-    # --dry-run via the privileged API; on user scope it usually fails
-    # quickly without side effects.
-    r = subprocess.run(
-        ["systemctl", "--user", "show", "fake-not-real-unit"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert r is not None
+    r = _run_allowed("systemctl", "--user", "restart", "fake-not-real-unit")
+    assert r.returncode == 0
+
+
+def test_systemctl_wrapped_restart_is_still_blocked():
+    """Falsifier for the four allow-cases above.
+
+    They only mean something if the SAME argv shape still trips the guard
+    when the verb is a mutating one against a hermes unit. If this stops
+    raising, the four ``_passes_through`` tests above have gone vacuous.
+    """
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        _run_allowed("systemctl", "--user", "restart", "hermes-gateway")
 
 
 def test_kill_own_subtree_passes_through():
     """We CAN kill our own children — guard recognizes them via psutil."""
-    p = subprocess.Popen(["sleep", "30"])
+    # ``sys.executable`` rather than ``sleep``: coreutils are only on PATH
+    # on this box under git-bash, so a bare ``sleep`` made the result
+    # shell-dependent on Windows.
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         os.kill(p.pid, signal.SIGTERM)
     finally:
-        p.wait(timeout=2)
-    # SIGTERM = 15; subprocess returncode is -15 on POSIX.
-    assert p.returncode in {-signal.SIGTERM, 128 + int(signal.SIGTERM)}
+        p.wait(timeout=10)
+    if sys.platform == "win32":
+        # Windows has no signals: ``os.kill`` calls TerminateProcess(h, sig),
+        # so the child's exit code IS the signal number, not ``-sig``.
+        assert p.returncode == int(signal.SIGTERM)
+    else:
+        # SIGTERM = 15; subprocess returncode is -15 on POSIX.
+        assert p.returncode in {-signal.SIGTERM, 128 + int(signal.SIGTERM)}
 
 
 def test_subprocess_pkill_with_unrelated_pattern_passes_through():

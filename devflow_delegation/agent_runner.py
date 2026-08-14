@@ -365,11 +365,39 @@ def _load_dotenv_best_effort() -> None:
     afterwards, ``main`` catches that separately and fails fast with a
     specific message instead of silently falling through to ``call_llm``'s
     broken "auto" auto-detect.
+
+    A REAL executor-driven shadow tick showed ``HERMES_HOME`` unset in the
+    environment the executor spawns this runner with. With no explicit
+    ``hermes_home=``, ``load_hermes_dotenv`` falls back to its own
+    ``os.getenv("HERMES_HOME", Path.home() / ".hermes")`` -- the DEFAULT
+    profile root -- even when the sticky active profile (e.g. "main") is
+    different and the actual credential lives in that profile's
+    ``.env`` (e.g. ``~/.hermes/profiles/main/.env``). When ``HERMES_HOME``
+    is genuinely unset, resolve the active profile's directory explicitly
+    (``hermes_cli.profiles.get_active_profile`` /
+    ``resolve_profile_env``) and pass it as ``hermes_home=`` so the loader
+    reads the right file. When ``HERMES_HOME`` IS already set, leave it
+    alone -- do not override a caller's explicit choice. This profile
+    lookup is itself best-effort: any failure (import error, unknown
+    profile, ...) must not crash the run, it just falls through to the
+    loader's own default resolution. Note this never assigns
+    ``os.environ["HERMES_HOME"]`` -- ``HERMES_HOME`` is not on the scrub
+    allow-list (see ``scrubbed_env``), so setting it here would leak past
+    the scrub a few lines later in ``main``; it is only ever passed as a
+    plain argument to the loader.
     """
+    hermes_home = None
+    if "HERMES_HOME" not in os.environ:
+        try:
+            from hermes_cli.profiles import get_active_profile, resolve_profile_env
+
+            hermes_home = resolve_profile_env(get_active_profile())
+        except Exception:  # noqa: BLE001 -- best-effort only, never blocks the run
+            hermes_home = None
     try:
         from hermes_cli.env_loader import load_hermes_dotenv
 
-        load_hermes_dotenv()
+        load_hermes_dotenv(hermes_home=hermes_home)
     except Exception:  # noqa: BLE001 -- must never block the run
         print(
             "WARNING: failed to load the Hermes profile .env; continuing "

@@ -1146,6 +1146,236 @@ def _run_main_fails_fast_cleanly_when_the_loader_raises(monkeypatch, git_worktre
     assert "simulated corrupt" not in err
 
 
+# --- F6: a REAL executor-driven shadow tick showed HERMES_HOME unset when
+# the executor spawns this runner. load_hermes_dotenv() with no arguments
+# then falls back to its own `os.getenv("HERMES_HOME", Path.home()/".hermes")`
+# -- the DEFAULT profile root -- even when the active profile (e.g. "main")
+# is different and the actual credential lives in
+# ~/.hermes/profiles/main/.env. main() must resolve the active profile's
+# home explicitly and pass it to the loader ONLY when HERMES_HOME isn't
+# already set, must never crash if profile resolution itself fails, and must
+# never leave HERMES_HOME behind in os.environ (it is not on the scrub
+# allow-list).
+
+
+def test_main_resolves_active_profile_home_when_hermes_home_unset(monkeypatch, git_worktree, tmp_path):
+    saved_environ = dict(os.environ)
+    try:
+        _run_main_resolves_active_profile_home_when_unset(monkeypatch, git_worktree, tmp_path)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_environ)
+
+
+def _run_main_resolves_active_profile_home_when_unset(monkeypatch, git_worktree, tmp_path):
+    request_path, allowlist_path = _write_request_and_allowlist(tmp_path)
+
+    monkeypatch.setenv("DDP_REQUEST_PATH", str(request_path))
+    monkeypatch.setenv("PATH", "C:/fake/real/path")
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.chdir(git_worktree)
+
+    from devflow_delegation import agent_runner
+
+    monkeypatch.setattr("events.paths.devflow_allowlist_path", lambda: allowlist_path)
+
+    fake_profile_dir = str(tmp_path / "profiles" / "main")
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile", lambda: "main")
+
+    def fake_resolve_profile_env(name):
+        assert name == "main"
+        return fake_profile_dir
+
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", fake_resolve_profile_env)
+
+    seen = {}
+
+    def fake_load_hermes_dotenv(**kwargs):
+        seen["hermes_home"] = kwargs.get("hermes_home")
+        return []
+
+    monkeypatch.setattr("hermes_cli.env_loader.load_hermes_dotenv", fake_load_hermes_dotenv)
+    monkeypatch.setattr(agent_runner, "run_agent",
+                        lambda **k: {"iterations": 1, "tokens": 1, "stopped": "model-finished"})
+    monkeypatch.setattr(agent_runner, "self_check", lambda *a, **k: None)
+
+    assert agent_runner.main([]) == 0
+    # The loader must have been called with the ACTIVE PROFILE's directory,
+    # not left to its own HERMES_HOME/default-home fallback.
+    assert seen.get("hermes_home") == fake_profile_dir
+    # And HERMES_HOME itself must never have been set as a side effect.
+    assert "HERMES_HOME" not in os.environ
+
+
+def test_main_respects_hermes_home_when_already_set(monkeypatch, git_worktree, tmp_path):
+    saved_environ = dict(os.environ)
+    try:
+        _run_main_respects_hermes_home_when_already_set(monkeypatch, git_worktree, tmp_path)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_environ)
+
+
+def _run_main_respects_hermes_home_when_already_set(monkeypatch, git_worktree, tmp_path):
+    request_path, allowlist_path = _write_request_and_allowlist(tmp_path)
+
+    explicit_home = str(tmp_path / "explicit-home")
+    monkeypatch.setenv("DDP_REQUEST_PATH", str(request_path))
+    monkeypatch.setenv("PATH", "C:/fake/real/path")
+    monkeypatch.setenv("HERMES_HOME", explicit_home)
+    monkeypatch.chdir(git_worktree)
+
+    from devflow_delegation import agent_runner
+
+    monkeypatch.setattr("events.paths.devflow_allowlist_path", lambda: allowlist_path)
+
+    def fail_get_active_profile():
+        raise AssertionError("profile lookup must not run when HERMES_HOME is already set")
+
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile", fail_get_active_profile)
+
+    seen = {}
+
+    def fake_load_hermes_dotenv(**kwargs):
+        seen["hermes_home"] = kwargs.get("hermes_home")
+        return []
+
+    monkeypatch.setattr("hermes_cli.env_loader.load_hermes_dotenv", fake_load_hermes_dotenv)
+    monkeypatch.setattr(agent_runner, "run_agent",
+                        lambda **k: {"iterations": 1, "tokens": 1, "stopped": "model-finished"})
+    monkeypatch.setattr(agent_runner, "self_check", lambda *a, **k: None)
+
+    assert agent_runner.main([]) == 0
+    # Not overridden -- the loader is left to read HERMES_HOME itself, so no
+    # explicit hermes_home is passed on top of an already-set env var. (The
+    # scrub step later in main() removes HERMES_HOME from os.environ by the
+    # time main() returns -- it is not on the scrub allow-list -- so this
+    # asserts what the loader was CALLED with, not the final environment.)
+    assert seen.get("hermes_home") is None
+
+
+def test_main_proceeds_when_active_profile_resolution_raises(monkeypatch, git_worktree, tmp_path, capsys):
+    saved_environ = dict(os.environ)
+    try:
+        _run_main_proceeds_when_profile_resolution_raises(monkeypatch, git_worktree, tmp_path, capsys)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_environ)
+
+
+def _run_main_proceeds_when_profile_resolution_raises(monkeypatch, git_worktree, tmp_path, capsys):
+    request_path, allowlist_path = _write_request_and_allowlist(
+        tmp_path, agent_model="fakevendor/fake-model-1")
+
+    monkeypatch.setenv("DDP_REQUEST_PATH", str(request_path))
+    monkeypatch.setenv("PATH", "C:/fake/real/path")
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.delenv("FAKEVENDOR_API_KEY", raising=False)
+    monkeypatch.chdir(git_worktree)
+
+    from devflow_delegation import agent_runner
+
+    monkeypatch.setattr("events.paths.devflow_allowlist_path", lambda: allowlist_path)
+
+    fake_provider = SimpleNamespace(
+        id="fakevendor", api_key_env_vars=("FAKEVENDOR_API_KEY",), base_url_env_var="",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.providers.get_provider",
+        lambda name: fake_provider if name == "fakevendor" else None,
+    )
+
+    def raising_get_active_profile():
+        raise RuntimeError("simulated profile resolution failure")
+
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile", raising_get_active_profile)
+    # No credential anywhere -- the real loader would find nothing either;
+    # this stands in for it so the test stays hermetic.
+    monkeypatch.setattr("hermes_cli.env_loader.load_hermes_dotenv", lambda **k: [])
+
+    def fake_call_llm(**kwargs):
+        raise AssertionError("call_llm must never be called with no resolvable credential")
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+
+    def fake_run_agent(**kwargs):
+        raise AssertionError("run_agent must never start with no resolvable credential")
+
+    monkeypatch.setattr(agent_runner, "run_agent", fake_run_agent)
+
+    # Must not crash on the raising profile helper -- falls through to the
+    # existing clear fail-fast message.
+    exit_code = agent_runner.main([])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "no provider credential resolved" in err
+    assert "fakevendor/fake-model-1" in err
+
+
+def test_main_forwards_a_credential_from_the_active_profile_env(monkeypatch, git_worktree, tmp_path):
+    saved_environ = dict(os.environ)
+    try:
+        _run_main_forwards_a_credential_from_the_active_profile_env(monkeypatch, git_worktree, tmp_path)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_environ)
+
+
+def _run_main_forwards_a_credential_from_the_active_profile_env(monkeypatch, git_worktree, tmp_path):
+    request_path, allowlist_path = _write_request_and_allowlist(
+        tmp_path, agent_model="fakevendor/fake-model-1")
+
+    fake_key = "fk" + "-" + "profile" + "-" + "0123456789abcdef"
+    monkeypatch.setenv("DDP_REQUEST_PATH", str(request_path))
+    monkeypatch.setenv("PATH", "C:/fake/real/path")
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.delenv("FAKEVENDOR_API_KEY", raising=False)
+    monkeypatch.chdir(git_worktree)
+
+    from devflow_delegation import agent_runner
+
+    monkeypatch.setattr("events.paths.devflow_allowlist_path", lambda: allowlist_path)
+
+    fake_provider = SimpleNamespace(
+        id="fakevendor", api_key_env_vars=("FAKEVENDOR_API_KEY",), base_url_env_var="",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.providers.get_provider",
+        lambda name: fake_provider if name == "fakevendor" else None,
+    )
+
+    fake_profile_dir = str(tmp_path / "profiles" / "main")
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile", lambda: "main")
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda name: fake_profile_dir)
+
+    def fake_load_hermes_dotenv(**kwargs):
+        # Simulate the real loader: the credential is only found when the
+        # loader is pointed at the ACTIVE PROFILE's directory -- not the
+        # loader's own default-home fallback.
+        if kwargs.get("hermes_home") == fake_profile_dir:
+            os.environ["FAKEVENDOR_API_KEY"] = fake_key
+        return []
+
+    monkeypatch.setattr("hermes_cli.env_loader.load_hermes_dotenv", fake_load_hermes_dotenv)
+
+    captured = {}
+
+    def fake_call_llm(**kwargs):
+        captured.update(kwargs)
+        message = SimpleNamespace(content="done", tool_calls=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)],
+                               usage=SimpleNamespace(total_tokens=1))
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+    monkeypatch.setattr(agent_runner, "self_check", lambda *a, **k: None)
+
+    assert agent_runner.main([]) == 0
+    assert captured.get("provider") == "fakevendor"
+    assert captured.get("api_key") == fake_key
+    assert "FAKEVENDOR_API_KEY" not in os.environ
+
+
 # --- F5: the failure path printed unscanned exception text. The executor
 # captures stderr into its ExecutorError, which lands in the ledger and
 # notification surface -- a provider SDK error echoing a credential would put

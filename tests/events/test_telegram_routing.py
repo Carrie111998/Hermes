@@ -20,12 +20,13 @@ def test_r57_events_route_to_their_topics():
     assert _route(EventType.AGENT_LOOP_FAULT).topic_key == ALERTS
 
 
-def test_resource_pressure_routes_to_watchdog_alerts():
-    # Resource-pressure early-warning (2026-06-11 pagefile-burst remediation)
-    # is an operator system-health signal — same topic as gateway_health so a
-    # sudden commit/disk/pagefile alert lands in the stream the operator
-    # already watches for infrastructure trouble.
-    assert _route(EventType.RESOURCE_PRESSURE).topic_key == ALERTS
+def test_resource_pressure_routes_to_security_and_system():
+    # Moved off watchdog_alerts 2026-08-14 (operator pref). It had shared the
+    # topic with gateway_health since the 2026-06-11 pagefile-burst work, but
+    # alerts runs ~112 delivered msgs/day and the two-stage disk_low WARN has
+    # to stay readable to be worth receiving. security_and_system took 35
+    # msgs/30d, so the early warning is visible there.
+    assert _route(EventType.RESOURCE_PRESSURE).topic_key == SECURITY
 
 
 def test_tracker_partial_backlog_routes_to_action_required():
