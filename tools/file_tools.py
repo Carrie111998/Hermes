@@ -1807,8 +1807,15 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             return json.dumps({"error": block_error}, ensure_ascii=False)
 
         file_ops = _get_file_ops(task_id)
+        # Pass the RESOLVED path (the authoritative worktree base used by
+        # read_file/patch/write_file), not the raw argument. The raw "." would
+        # otherwise fall through to file_ops' live-cwd resolution, which can
+        # point at a different checkout than the one the agent is working in
+        # (the wrong-worktree search bug). resolved_path is absolute, or None
+        # if resolution raised — fall back to the raw path only in that case.
+        search_path = str(resolved_path) if resolved_path is not None else path
         result = file_ops.search(
-            pattern=pattern, path=path, target=target, file_glob=file_glob,
+            pattern=pattern, path=search_path, target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context
         )
         omitted = _filter_read_blocked_search_results(result, task_id)

@@ -388,6 +388,24 @@ class TestSearchHandler:
         mock_ops.search.assert_called_once()
 
     @patch("tools.file_tools._get_file_ops")
+    @patch("tools.file_tools._resolve_path_for_task", return_value="/worktree/repo")
+    def test_search_dispatches_resolved_path_not_raw(self, mock_resolve, mock_get):
+        """search_tool must pass the RESOLVED path to file_ops.search, not the
+        raw argument. A raw "." would otherwise resolve against file_ops' live
+        cwd (which can point at a different checkout) instead of the
+        authoritative workspace base — the wrong-worktree search bug."""
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"matches": []}
+        mock_ops.search.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import search_tool
+        search_tool(pattern="needle", target="content", path=".")
+        mock_ops.search.assert_called_once()
+        assert mock_ops.search.call_args.kwargs["path"] == "/worktree/repo"
+
+    @patch("tools.file_tools._get_file_ops")
     def test_search_passes_all_params(self, mock_get):
         mock_ops = MagicMock()
         result_obj = MagicMock()
