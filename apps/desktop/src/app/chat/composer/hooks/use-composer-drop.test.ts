@@ -163,4 +163,37 @@ describe('useComposerDrop — text drops', () => {
 
     expect(insertComposer).toHaveBeenCalledWith('> still works')
   })
+
+  it('does not throw when a mixed files+text drag arrives with no attach handler wired', () => {
+    const insertInlineRefs = vi.fn(() => false)
+    const requestMainFocus = vi.fn()
+
+    const { result } = renderHook(() =>
+      useComposerDrop({
+        cwd: '/repo',
+        insertInlineRefs,
+        onAttachDroppedItems: undefined,
+        requestMainFocus
+      })
+    )
+
+    // A drag carrying BOTH a file and text/plain: the text/plain guard lets it
+    // through the top-level check, the file branch runs, but there is no
+    // attach handler to hand osDrops to. Regression guard for the TypeError
+    // that used to fire on `onAttachDroppedItems!(osDrops)`.
+    const event = {
+      dataTransfer: {
+        dropEffect: 'none',
+        effectAllowed: 'none',
+        files: { length: 1, item: () => new File(['x'], 'notes.txt') },
+        getData: (format: string) => (format === 'text/plain' ? '> text' : ''),
+        items: [{ kind: 'file', getAsFile: () => new File(['x'], 'notes.txt'), webkitGetAsEntry: () => null }],
+        types: ['Files', 'text/plain']
+      },
+      preventDefault: vi.fn(),
+      stopPropagation: vi.fn()
+    }
+
+    expect(() => result.current.handleDrop(event as unknown as React.DragEvent<HTMLFormElement>)).not.toThrow()
+  })
 })
