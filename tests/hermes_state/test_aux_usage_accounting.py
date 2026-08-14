@@ -293,6 +293,65 @@ class TestAuxApiKeyForwarding:
         )
         assert sig.parameters["api_key"].default is None
 
+    def test_get_pricing_entry_falls_back_to_configured_endpoint_key(self, monkeypatch):
+        """Offline path (no api_key forwarded — e.g. ``hermes insights``):
+        get_pricing_entry must resolve the configured route's credential via
+        route identity and pass it to the /models probe.
+
+        Salvaged from #75510 (andyst-dev): the route-identity guard means the
+        configured key is only used when the profile's resolved endpoint IS
+        the probed route — a stale or attacker-chosen billing URL never
+        receives another provider's credential.
+        """
+        from unittest.mock import MagicMock
+
+        from agent import usage_pricing as up
+
+        captured = {}
+
+        def _fake_resolve(provider, *, user_providers=None, custom_providers=None):
+            return SimpleNamespace(
+                base_url="https://litellm.example/v1",
+                api_key_env_vars=("LITELLM_API_KEY",),
+            )
+
+        def _fake_env(name):
+            return "sk-configured-route-key" if name == "LITELLM_API_KEY" else None
+
+        def _fake_fetch(base_url, api_key=""):
+            captured["base_url"] = base_url
+            captured["api_key"] = api_key
+            return MagicMock()
+
+        monkeypatch.setattr(up, "fetch_endpoint_model_metadata", _fake_fetch)
+        monkeypatch.setattr(
+            "hermes_cli.providers.resolve_provider_full", _fake_resolve
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.get_env_value_prefer_dotenv", _fake_env
+        )
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"providers": {}})
+
+        # No api_key forwarded (offline path): the config route-identity
+        # fallback must supply the credential to the probe.
+        up.get_pricing_entry(
+            "litellm/gpt-4o",
+            provider="litellm-proxy",
+            base_url="https://litellm.example/v1",
+        )
+        assert captured.get("api_key") == "sk-configured-route-key"
+        assert captured.get("base_url") == "https://litellm.example/v1"
+
+        # A forwarded api_key (live path) wins over the config fallback.
+        captured.clear()
+        up.get_pricing_entry(
+            "litellm/gpt-4o",
+            provider="litellm-proxy",
+            base_url="https://litellm.example/v1",
+            api_key="sk-live-forwarded",
+        )
+        assert captured.get("api_key") == "sk-live-forwarded"
+
 
 class TestInsightsApiKeyForwarding:
     """Issue #75479 (sibling): agent/insights.py _estimate_cost must also
