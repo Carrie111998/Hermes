@@ -28,17 +28,20 @@ describe('I18nProvider', () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    window.localStorage.removeItem('hermes-desktop.ui-locale')
   })
 
-  it('defaults to English without a config client', () => {
+  it('defaults to the system locale without a config client', () => {
+    vi.stubGlobal('navigator', { language: 'zh-CN', languages: ['zh-CN'] })
+
     render(
       <I18nProvider configClient={null}>
         <LanguageProbe />
       </I18nProvider>
     )
 
-    expect(screen.getByTestId('locale').textContent).toBe('en')
-    expect(screen.getByTestId('label').textContent).toBe('Language')
+    expect(screen.getByTestId('locale').textContent).toBe('zh')
+    expect(screen.getByTestId('label').textContent).toBe('语言')
   })
 
   it('normalizes an initial locale alias and switches translations', async () => {
@@ -76,7 +79,7 @@ describe('I18nProvider', () => {
     expect(configClient.saveConfig).not.toHaveBeenCalled()
   })
 
-  it('keeps English usable when config loading fails', async () => {
+  it('keeps the current locale when config loading fails', async () => {
     const configClient: I18nConfigClient = {
       getConfig: vi.fn().mockRejectedValue(new Error('config unavailable')),
       saveConfig: vi.fn()
@@ -90,9 +93,50 @@ describe('I18nProvider', () => {
 
     await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'))
 
-    expect(screen.getByTestId('locale').textContent).toBe('en')
-    expect(screen.getByTestId('label').textContent).toBe('Language')
+    expect(screen.getByTestId('locale').textContent).toBe('zh')
+    expect(screen.getByTestId('label').textContent).toBe('语言')
     expect(configClient.saveConfig).not.toHaveBeenCalled()
+  })
+
+  it('uses the system locale when config has no display.language', async () => {
+    vi.stubGlobal('navigator', { language: 'ja-JP', languages: ['ja-JP'] })
+
+    const configClient: I18nConfigClient = {
+      getConfig: vi.fn().mockResolvedValue({}),
+      saveConfig: vi.fn()
+    }
+
+    render(
+      <I18nProvider configClient={configClient}>
+        <LanguageProbe />
+      </I18nProvider>
+    )
+
+    await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'))
+
+    expect(screen.getByTestId('locale').textContent).toBe('ja')
+    expect(screen.getByTestId('save').textContent).toBe('保存')
+    expect(configClient.saveConfig).not.toHaveBeenCalled()
+  })
+
+  it('keeps a first-run language switch when config cannot be saved yet', async () => {
+    const configClient: I18nConfigClient = {
+      getConfig: vi.fn().mockResolvedValue({}),
+      saveConfig: vi.fn().mockRejectedValue(new Error('backend not ready'))
+    }
+
+    render(
+      <I18nProvider configClient={configClient} initialLocale="en">
+        <LanguageProbe />
+      </I18nProvider>
+    )
+
+    await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'))
+    fireEvent.click(screen.getByRole('button', { name: 'switch' }))
+
+    await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('zh'))
+    expect(screen.getByTestId('label').textContent).toBe('语言')
+    expect(screen.getByTestId('save-error').textContent).toBe('')
   })
 
   it('loads zh-hant from display.language config', async () => {

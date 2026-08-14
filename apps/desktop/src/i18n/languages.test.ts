@@ -1,6 +1,15 @@
+// @vitest-environment jsdom
 import { describe, expect, it } from 'vitest'
 
-import { DEFAULT_LOCALE, isLocale, isSupportedLocaleValue, localeConfigValue, normalizeLocale } from './languages'
+import {
+  DEFAULT_LOCALE,
+  detectSystemLocale,
+  isLocale,
+  isSupportedLocaleValue,
+  localeConfigValue,
+  normalizeLocale,
+  resolvePreferredLocale
+} from './languages'
 
 describe('desktop i18n languages', () => {
   it('normalizes supported locale aliases', () => {
@@ -44,5 +53,31 @@ describe('desktop i18n languages', () => {
     expect(localeConfigValue('zh-hant')).toBe('zh-hant')
     expect(localeConfigValue('ja')).toBe('ja')
     expect(localeConfigValue('ar')).toBe('ar')
+  })
+
+  it('picks the first supported system language and skips unsupported ones', () => {
+    expect(detectSystemLocale(['zh-CN'])).toBe('zh')
+    expect(detectSystemLocale(['zh-TW'])).toBe('zh-hant')
+    expect(detectSystemLocale(['ja-JP', 'en-US'])).toBe('ja')
+    expect(detectSystemLocale(['de-DE', 'zh-Hans'])).toBe('zh')
+    expect(detectSystemLocale(['de-DE', 'fr-FR'])).toBe(DEFAULT_LOCALE)
+    expect(detectSystemLocale([])).toBe(DEFAULT_LOCALE)
+  })
+
+  it('prefers an explicit locale, then a stored one, then the system locale', () => {
+    const previous = window.localStorage.getItem('hermes-desktop.ui-locale')
+
+    window.localStorage.setItem('hermes-desktop.ui-locale', 'ja')
+
+    try {
+      expect(resolvePreferredLocale('zh-CN')).toBe('zh')
+      expect(resolvePreferredLocale(undefined)).toBe('ja')
+    } finally {
+      if (previous == null) {
+        window.localStorage.removeItem('hermes-desktop.ui-locale')
+      } else {
+        window.localStorage.setItem('hermes-desktop.ui-locale', previous)
+      }
+    }
   })
 })

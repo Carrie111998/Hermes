@@ -6,6 +6,15 @@ import type { DesktopBootstrapEvent, DesktopBootstrapState, DesktopConnectionPro
 
 import { DesktopInstallOverlay } from './desktop-install-overlay'
 
+class TestResizeObserver {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+
+vi.stubGlobal('ResizeObserver', TestResizeObserver)
+Element.prototype.scrollIntoView = function scrollIntoView() {}
+
 function bootstrapState(overrides: Partial<DesktopBootstrapState> = {}): DesktopBootstrapState {
   return {
     active: false,
@@ -102,6 +111,7 @@ describe('DesktopInstallOverlay first-run setup', () => {
     expect(await screen.findByText('Set up Hermes Desktop')).toBeTruthy()
     expect(screen.getByText('Connect to existing Hermes')).toBeTruthy()
     expect(screen.getByText('Install Hermes locally')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Switch language' })).toBeTruthy()
     expect(screen.queryByText(/steps complete/i)).toBeNull()
     expect(screen.queryByText(/Fetching installer manifest/i)).toBeNull()
   })

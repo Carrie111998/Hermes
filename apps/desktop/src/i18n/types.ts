@@ -112,6 +112,7 @@ export interface Translations {
 
   boot: {
     ready: string
+    connecting: string
     desktopBootFailedWithMessage: (message: string) => string
     steps: {
       connectingGateway: string
@@ -2088,6 +2089,8 @@ export interface Translations {
 
   install: {
     stageStates: Record<string, string>
+    stageNames: Record<string, string>
+    unknownError: string
     oneTimeTitle: string
     unsupportedDesc: (platform: string) => string
     installCommand: string

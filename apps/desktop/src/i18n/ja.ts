@@ -64,6 +64,7 @@ export const ja = defineLocale({
 
   boot: {
     ready: 'Hermes Desktop の準備ができました',
+    connecting: '接続中',
     desktopBootFailedWithMessage: message => `デスクトップの起動に失敗しました: ${message}`,
     steps: {
       connectingGateway: 'ライブデスクトップゲートウェイに接続中',
@@ -724,14 +725,47 @@ export const ja = defineLocale({
       envOverrideTitle: '環境変数がこのデスクトップセッションを制御しています。',
       envOverrideDesc:
         '保存された設定を使用するには HERMES_DESKTOP_REMOTE_URL と HERMES_DESKTOP_REMOTE_TOKEN の設定を解除してください。',
+      modeTitle: '接続モード',
       localTitle: 'ローカルゲートウェイ',
       localDesc:
         'ローカルホストでプライベートな Hermes バックエンドを起動します。これがデフォルトで、オフラインでも動作します。',
       inheritTitle: 'デフォルトゲートウェイを使用',
       inheritDesc: 'このプロファイルのオーバーライドを削除し、デフォルト接続を使用します。',
       remoteTitle: 'リモートゲートウェイ',
-      remoteDesc:
-        'このデスクトップシェルをリモートの Hermes バックエンドに接続します。ホスト型ゲートウェイは OAuth またはユーザー名とパスワードを使用します。自己ホスト型はセッショントークンを使用する場合があります。',
+      remoteDesc: 'このデスクトップシェルをリモートの Hermes バックエンドに接続します。',
+      remoteAuthHint:
+        'ホスト型ゲートウェイは OAuth またはユーザー名とパスワードを使用します。自己ホスト型はセッショントークンを使用する場合があります。',
+      cloudTitle: 'Hermes Cloud',
+      cloudDesc: 'Hermes Cloud に一度サインインすれば、アカウント上のエージェントから選べます。URL の貼り付けは不要です。',
+      cloudSignInTitle: 'Hermes Cloud',
+      cloudSignIn: 'Hermes Cloud にサインイン',
+      cloudSignedIn: 'Hermes Cloud にサインイン済み',
+      cloudNeedsSignIn: 'アカウント上のエージェントを検出するには Hermes Cloud にサインインしてください。',
+      cloudSignedInDesc: 'サインイン済みです。下からエージェントを選んでください。セッションは自動的に更新されます。',
+      cloudAgentsTitle: 'あなたのエージェント',
+      cloudOrgPickerTitle: '組織を選択',
+      cloudOrgSelect: '選択',
+      cloudOrgChange: '組織を変更',
+      cloudOrgRole: role => `ロール: ${role}`,
+      cloudLoadingAgents: 'エージェントを読み込み中…',
+      cloudNoAgents: {
+        before: 'このアカウントにエージェントが見つかりません。',
+        linkText: 'Nous ポータル',
+        after: 'で作成してから更新してください。'
+      },
+      cloudRefresh: '更新',
+      cloudConnect: '接続',
+      cloudConnecting: '接続中…',
+      cloudDiscoverFailed: 'Hermes Cloud のエージェントを読み込めませんでした',
+      cloudConnectFailed: 'そのエージェントに接続できませんでした',
+      cloudSignInFailed: 'Hermes Cloud へのサインインに失敗しました',
+      cloudSignedOutTitle: 'Hermes Cloud からサインアウトしました',
+      cloudSignedOutMessage: 'Hermes Cloud セッションをクリアしました。',
+      cloudConnectedTitle: '接続済み',
+      cloudConnectedPill: '接続済み',
+      cloudConnectedTo: name => `${name} に接続しました。`,
+      cloudAgentProvisioning: 'プロビジョニング中…',
+      cloudStatusLabel: status => `ステータス: ${status}`,
       remoteUrlTitle: 'リモート URL',
       remoteUrlDesc:
         'リモートダッシュボードバックエンドのベース URL。/hermes などのパスプレフィックスもサポートしています。',
@@ -2833,6 +2867,29 @@ export const ja = defineLocale({
       skipped: 'スキップ',
       failed: '失敗'
     },
+    stageNames: {
+      uv: 'uv をインストール',
+      python: 'Python を確認',
+      git: 'Git をインストール',
+      node: 'Node.js を検出',
+      'system-packages': 'システムパッケージをインストール',
+      prerequisites: 'システムの前提条件',
+      repository: 'Hermes Agent をダウンロード',
+      venv: 'Python 環境を作成',
+      dependencies: 'Python 依存関係をインストール',
+      'python-deps': 'Python 依存関係をインストール',
+      'node-deps': 'Node.js 依存関係をインストール',
+      desktop: 'デスクトップアプリをビルド',
+      path: 'hermes コマンドをインストール',
+      'config-templates': '設定テンプレートを書き込み',
+      config: '設定とスキルを準備',
+      'platform-sdks': 'メッセージングプラットフォーム SDK をインストール',
+      'bootstrap-marker': 'インストール完了を記録',
+      configure: 'API キーとモデルを設定',
+      setup: 'API キーと設定を構成',
+      gateway: 'ゲートウェイを設定'
+    },
+    unknownError: '不明なエラー',
     oneTimeTitle: 'Hermes には一度限りのインストールが必要です',
     unsupportedDesc: platform =>
       `${platform} では自動の初回インストールはまだ利用できません。ターミナルを開いて以下のコマンドを実行し、このアプリを再起動してください。以降の起動ではこの手順はスキップされます。`,

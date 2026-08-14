@@ -1,4 +1,5 @@
 import { configure } from '@testing-library/react'
+import { afterEach } from 'vitest'
 
 // Node 26 defines its own `localStorage` accessor on the global object, which
 // returns `undefined` unless the process was started with --localstorage-file
@@ -38,3 +39,11 @@ if (typeof (globalThis as any).localStorage === 'undefined') {
 // CPU contention in CI. Success still resolves the instant the node appears;
 // the wider deadline only absorbs a starved runner, killing timing flakes.
 configure({ asyncUtilTimeout: 5000 })
+
+afterEach(() => {
+  try {
+    window.localStorage?.removeItem('hermes-desktop.ui-locale')
+  } catch {
+    // jsdom / node workers without a window.
+  }
+})

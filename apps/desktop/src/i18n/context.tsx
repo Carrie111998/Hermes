@@ -3,7 +3,14 @@ import { createContext, type ReactNode, useCallback, useContext, useEffect, useM
 import { getHermesConfigRecord, type HermesConfigRecord, saveHermesConfig } from '@/hermes'
 
 import { TRANSLATIONS } from './catalog'
-import { DEFAULT_LOCALE, localeConfigValue, normalizeLocale } from './languages'
+import {
+  DEFAULT_LOCALE,
+  isSupportedLocaleValue,
+  localeConfigValue,
+  normalizeLocale,
+  resolvePreferredLocale,
+  writeStoredLocale
+} from './languages'
 import { setRuntimeI18nLocale } from './runtime'
 import type { Locale, Translations } from './types'
 
@@ -93,16 +100,18 @@ export interface I18nProviderProps {
 }
 
 export function I18nProvider({ children, configClient = defaultConfigClient, initialLocale }: I18nProviderProps) {
-  const [locale, setLocaleState] = useState<Locale>(() => normalizeLocale(initialLocale))
+  const [locale, setLocaleState] = useState<Locale>(() => resolvePreferredLocale(initialLocale))
   const [isLoadingConfig, setIsLoadingConfig] = useState(false)
   const [isSavingLocale, setIsSavingLocale] = useState(false)
   const [configLoadError, setConfigLoadError] = useState<Error | null>(null)
   const [saveError, setSaveError] = useState<Error | null>(null)
   const localeRef = useRef(locale)
+  const hasPersistedLanguageRef = useRef(false)
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     localeRef.current = locale
+    writeStoredLocale(locale)
     setRuntimeI18nLocale(locale)
     applyDocumentLocale(locale)
 
@@ -126,14 +135,31 @@ export function I18nProvider({ children, configClient = defaultConfigClient, ini
     configClient
       .getConfig()
       .then(config => {
-        if (!cancelled) {
-          setLocaleState(normalizeLocale(getConfigDisplayLanguage(config)))
+        if (cancelled) {
+          return
         }
+
+        const configured = getConfigDisplayLanguage(config)
+
+        if (isSupportedLocaleValue(configured)) {
+          hasPersistedLanguageRef.current = true
+          setLocaleState(normalizeLocale(configured))
+
+          return
+        }
+
+        hasPersistedLanguageRef.current = false
+
+        if (configured == null || configured === '') {
+          return
+        }
+
+        setLocaleState(DEFAULT_LOCALE)
       })
       .catch(error => {
         if (!cancelled) {
+          hasPersistedLanguageRef.current = false
           setConfigLoadError(toError(error))
-          setLocaleState(DEFAULT_LOCALE)
         }
       })
       .finally(() => {
@@ -167,13 +193,17 @@ export function I18nProvider({ children, configClient = defaultConfigClient, ini
         if (!result.ok) {
           throw new Error('Failed to save language')
         }
+
+        hasPersistedLanguageRef.current = true
       } catch (error) {
         const nextError = toError(error)
 
-        setLocaleState(previousLocale)
-        setSaveError(nextError)
+        if (hasPersistedLanguageRef.current) {
+          setLocaleState(previousLocale)
+          setSaveError(nextError)
 
-        throw nextError
+          throw nextError
+        }
       } finally {
         setIsSavingLocale(false)
       }

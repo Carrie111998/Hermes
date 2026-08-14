@@ -64,6 +64,7 @@ export const en: Translations = {
 
   boot: {
     ready: 'Hermes Desktop is ready',
+    connecting: 'CONNECTING',
     desktopBootFailedWithMessage: message => `Desktop boot failed: ${message}`,
     steps: {
       connectingGateway: 'Connecting live desktop gateway',
@@ -2464,6 +2465,29 @@ export const en: Translations = {
       skipped: 'Skipped',
       failed: 'Failed'
     },
+    stageNames: {
+      uv: 'Install uv',
+      python: 'Verify Python',
+      git: 'Install Git',
+      node: 'Detect Node.js',
+      'system-packages': 'Install system packages',
+      prerequisites: 'System prerequisites',
+      repository: 'Download Hermes Agent',
+      venv: 'Create Python environment',
+      dependencies: 'Install Python dependencies',
+      'python-deps': 'Install Python dependencies',
+      'node-deps': 'Install Node.js dependencies',
+      desktop: 'Build desktop app',
+      path: 'Install hermes command',
+      'config-templates': 'Write configuration templates',
+      config: 'Prepare config and skills',
+      'platform-sdks': 'Install messaging platform SDKs',
+      'bootstrap-marker': 'Mark install complete',
+      configure: 'Configure API keys and models',
+      setup: 'Configure API keys and settings',
+      gateway: 'Configure gateway'
+    },
+    unknownError: 'Unknown error',
     oneTimeTitle: 'Hermes needs a one-time install',
     unsupportedDesc: platform =>
       `Automated first-launch install isn’t available on ${platform} yet. Open Terminal and run the command below, then relaunch this app. Subsequent launches will skip this step.`,

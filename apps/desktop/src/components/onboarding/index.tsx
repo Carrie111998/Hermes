@@ -1,6 +1,7 @@
 import { useStore } from '@nanostores/react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 
+import { SetupLocaleControl } from '@/components/setup-locale-control'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { Input } from '@/components/ui/input'
@@ -309,6 +310,7 @@ export function DesktopOnboardingOverlay({
         leaving ? 'pointer-events-none opacity-0' : 'opacity-100'
       )}
     >
+      {!bare ? <SetupLocaleControl className={onboarding.manual ? 'end-14' : undefined} /> : null}
       <div
         className={cn(
           'relative w-full max-w-[45rem] transition-all duration-500 ease-out',
