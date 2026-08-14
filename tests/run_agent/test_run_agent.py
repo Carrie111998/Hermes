@@ -2325,6 +2325,7 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("read_terminal", {}),
         ("read_preview", {}),
         ("read_window_below", {}),
+        ("setup_mcp", {"server": "linear", "action": "install"}),
         ("delegate_task", {"goal": "Check the child path"}),
     )
 
