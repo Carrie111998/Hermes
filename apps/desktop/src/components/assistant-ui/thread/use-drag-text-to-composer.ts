@@ -2,7 +2,7 @@ import { useCallback, useRef } from 'react'
 
 import { createDragGhost, type DragGhost } from '@/lib/drag-ghost'
 
-import { hasTextSelection } from './user-message'
+import { hasTextSelection } from './selection'
 
 /**
  * Shared drag-text-to-composer behavior for message bubbles (user + assistant).

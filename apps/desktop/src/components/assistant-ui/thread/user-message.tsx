@@ -5,7 +5,10 @@ import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
 import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
 import { hasTextSelection } from '@/components/assistant-ui/thread/selection'
+<<<<<<< HEAD
 import { MessageTimelineTimestamp } from '@/components/assistant-ui/thread/timeline-timestamp'
+=======
+>>>>>>> 6a255a608 (refactor(desktop): move hasTextSelection to a leaf module)
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
 import { useDragTextToComposer } from '@/components/assistant-ui/thread/use-drag-text-to-composer'
 import { useMessageReactions } from '@/components/assistant-ui/thread/use-message-reactions'
