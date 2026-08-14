@@ -1,7 +1,7 @@
 ---
 name: mcp-apps-host-dev
 description: Use when developing or debugging the MCP Apps host layer in the Hermes desktop app — rendering sandboxed iframe cards, bridging postMessage ↔ gateway ↔ MCP server, or fixing security/architectural issues in the card pipeline. Covers both the TypeScript renderer and the Python bridge backend.
-version: 1.0.0
+version: 1.1.0
 author: Hermes Agent
 license: MIT
 platforms: [macos, linux, windows]
@@ -112,6 +112,26 @@ MCP Server 可以通过两种方式提供卡片 HTML：
 
 referenced form 的 HTML 是静态的（每个 `ui://` URI 只 fetch 一次，缓存在 `_mcp_ui_resource_html_cache`），卡片通过 `ui/initialize` 的 `lastToolResult` 拿到工具数据来渲染。
 
+### ui/initialize 握手
+
+卡片 iframe 加载后，向 host 发送 `ui/initialize` 请求。Host 响应中携带卡片初始化所需的全部上下文：
+
+```typescript
+// mcp-app-card.tsx — ui/initialize 响应
+reply({
+  result: {
+    protocolVersion: ...,
+    hostInfo: HOST_INFO,
+    hostCapabilities: { updateModelContext: { text: {} }, message: { text: {} } },
+    lastToolResult: buildLastToolResult(resultRef.current),  // 工具原始 structuredContent
+    sessionId: readSessionId(resultRef.current)               // 从 structuredContent.session_id 提取
+  }
+})
+```
+
+- **`lastToolResult`**：从原始工具结果的 `structuredContent` 构建（`buildLastToolResult`）。referenced-form 卡片（如 UTP 搜索）用它渲染初始视图（商品列表），而非空白搜索页。当 `structuredContent` 不存在或 `error` 时返回 `undefined`。
+- **`sessionId`**：从 `structuredContent.session_id` 提取（`readSessionId`）。某些 MCP Server（如 UTP）要求每次 `tools/call` 都带 `session_id`。卡片通过 `ui/initialize` 拿到后，理论上应在后续 `tools/call` 中带上——但旧版卡片 SDK 不一定会这样做（见踩坑 #11）。
+
 ## 关键文件地图
 
 ```
@@ -135,8 +155,11 @@ apps/desktop/src/
   │   ├── thread/message-parts.tsx    # ★ ChainToolFallback → hasMcpUi → McpAppCard
   │   ├── thread.tsx                  # ⚠️ 退役架构，不要往这加 MCP Apps 代码
   │   └── mcp-app-card.tsx            # ★ 卡片组件：iframe + postMessage 桥接
-  └── store/
-      └── mcp-app.ts                  # 卡片→模型通信通道（model-context + message）
+  ├── lib/chat-messages.ts            # ★ tool result 组装 + MCP UI 缓存持久化
+  │                                   #   cacheMcpUi / preserveMcpUiCards (localStorage)
+  ├── store/mcp-app.ts                # 卡片→模型通信通道（model-context + message）
+  └── app/contrib/wiring.tsx          # ★ 实际控制器（不是 DesktopController）
+                                      #   $mcpAppUserMessage 订阅 → ui/message 渲染
 ```
 
 ## 渲染管线
@@ -392,16 +415,79 @@ document.addEventListener('securitypolicyviolation', e => {
 })
 ```
 
+### 11. 卡片 tools/call 缺少 session_id → 数据不渲染
+
+**症状**：卡片渲染了但内容空白（如结账卡片"应付金额 -"，无商品信息），agent 文本回复里有完整数据。
+
+**根因**：卡片初始化后主动通过 `tools/call` 再次调用 MCP 工具刷新数据（如 `utp_checkout_get`、`utp_address_form`），但旧版卡片 SDK 不会把 `ui/initialize` 响应中的 `sessionId` 转发到 `tools/call` 的 `arguments` 里。UTP 等 MCP Server 要求每次调用必须带 `session_id`，缺少时返回 `isError: true`，卡片拿不到数据。
+
+**修复**：Host 在代理 `tools/call` 时自动注入 `session_id`（`mcp-app-card.tsx`）：
+
+```typescript
+if (method === 'tools/call') {
+    const params = (msg.params ?? {}) as Record<string, unknown>
+    const args = (params.arguments ?? {}) as Record<string, unknown>
+    if (args.session_id === undefined) {
+        const sid = readSessionId(resultRef.current)
+        if (sid) {
+            outgoingMsg = { ...msg, params: { ...params, arguments: { ...args, session_id: sid } } }
+        }
+    }
+}
+```
+
+**调试技巧**：在 `ui/initialize` handler 和 `tools/call` proxy 中加 `console.log` 输出 `hasLastToolResult`、`sessionId`、`tools/call` 的请求/响应 `isError` 和 `hasSC`，通过 CDP `evaluate` 在 iframe 重载后捕获。
+
+### 12. HMR 重载后卡片消失 → localStorage 持久化
+
+**症状**：开发模式下 Vite HMR 触发页面重载后，已渲染的 MCP App 卡片全部消失。
+
+**根因**：`_mcpUiBySession` 是进程内 `Map`，HMR 重载清空内存。`ui` payload 只在 `tool.complete` 事件中一次性传递（server 端 `pop_mcp_ui_payload` 是单次消费），不会被持久化到 session 数据库。
+
+**修复**（`chat-messages.ts`）：
+- `cacheMcpUi()` 同时写内存 Map 和 `localStorage`（key: `mcp-ui:<sessionId>`）
+- `preserveMcpUiCards()` 在内存 Map 未命中时回退读 `localStorage`
+- `clearCachedMcpUi()` 同时清内存和 `localStorage`
+- 跨 session ID 匹配：当 `preserveMcpUiCards` 收到的 runtime session ID 与存储时的 event session ID 不一致时，扫描所有 `mcp-ui:*` localStorage 条目按 tool-call ID 匹配
+
+**注意**：用 `localStorage` 而非 `sessionStorage`——`localStorage` 跨 HMR 重载和 app 重启都存活，匹配 MCP server 连接的生命周期（连接在 app 重启后也会重建）。
+
+### 13. Gateway 进程挂了但 Electron 活着 → 消息无回复
+
+**症状**：在桌面端发消息，完全没有回复，也不报错。
+
+**根因**：Electron 主进程和 Python gateway（`hermes_cli.main serve`）是两个独立进程。Gateway 可能因 API 端点超时（`stream_interrupt_abort` + `tcp_force_closed=1`）、内存耗尽或其他原因崩溃，但 Electron 壳不会自动重启它。用户看到的是"活着但没反应"的 app。
+
+**排查**：
+```bash
+# 1. 检查 gateway 进程是否存活
+ps aux | grep "hermes_cli.main serve" | grep -v grep
+
+# 2. 检查最新 agent 日志（是否有新 turn 记录）
+tail -10 ~/.hermes/logs/agent.log
+
+# 3. 如果日志停在几分钟前且没有新 turn → gateway 挂了
+
+# 4. 检查 API 端点是否可达
+curl -s --max-time 10 "<base_url>/chat/completions" -H "Authorization: Bearer <key>" -d '{"model":"<model>","messages":[{"role":"user","content":"hi"}],"max_tokens":5}'
+```
+
+**修复**：杀掉残留 Electron 进程后重启 `npm run dev`。如果 API 端点本身不稳定（如偶发超时），考虑在 `config.yaml` 中配置 `request_timeout` 或使用更稳定的 provider。
+
 ## 验证清单
 
 修改 MCP Apps Host 代码后，检查以下项目：
 
 - [ ] `message-parts.tsx` 的 `ChainToolFallback` 中有 `hasMcpUi` 检查，且位于 `react_to_message` 之后、`delegate_task` 之前
 - [ ] 没有在 `thread.tsx` 里添加 MCP Apps 代码
+- [ ] 实际控制器是 `contrib/wiring.tsx`（`ContribWiring`），不是 `DesktopController`——`$mcpAppUserMessage` 订阅必须在 `ContribWiring` 中
 - [ ] 如果改了桥接层，`toolCallId` 从 `mcp-app-card.tsx` → `tui_gateway/server.py` → `call_mcp_app_request` 完整传递
 - [ ] `call_mcp_app_request` 中对 `tools/call` 做了工具名白名单校验（`registered is None or name not in registered`，不依赖空列表的 falsy 短路）
 - [ ] `call_mcp_app_request` 中对 `resources/read` 做了 `ui://` 前缀校验
+- [ ] `tools/call` 代理路径在卡片参数缺少 `session_id` 时自动注入（`readSessionId(resultRef.current)`）
+- [ ] `cacheMcpUi` 同时写内存 Map 和 `localStorage`；`preserveMcpUiCards` 在内存未命中时回退读 `localStorage`
 - [ ] `requestMcpAppUserMessage` 有 per-card debounce（`debounceKey` 参数），不会在紧循环中无限触发模型回合，也不会跨卡片误伤
 - [ ] `vitest` 通过：`cd apps/desktop && npx vitest run src/components/assistant-ui/mcp-app-card.test.tsx src/store/mcp-app-security.test.ts`
 - [ ] Python 测试通过：`python -m pytest tests/test_mcp_apps_ui.py -x`
-- [ ] 在桌面端实际渲染一张 MCP Apps 卡片，确认 iframe 显示、点击按钮能触发工具调用
+- [ ] 在桌面端实际渲染一张 MCP Apps 卡片，确认 iframe 显示、点击按钮能触发工具调用、卡片内数据完整（非空白）
+- [ ] 开发模式下触发 HMR 重载后，已渲染的卡片仍然存活
