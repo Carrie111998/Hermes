@@ -170,6 +170,7 @@ import {
 import { runNativeLogin } from './native-oauth-login'
 import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
+import { canStopIdlePoolBackend } from './pool-backend-lifecycle'
 import { createKeepAwake } from './power-save'
 import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
@@ -1098,6 +1099,15 @@ let softRehomeInProgress = false
 // with no named profiles never populates this map, so their experience is
 // byte-for-byte the single-backend behavior.
 const backendPool = new Map() // profile -> { process, port, token, connectionPromise, lastActiveAt }
+// Renderers report authoritative in-flight turn state for the quit guard. Keep
+// it beside the backend pool too: renderer timer pings are advisory and may be
+// throttled while a backend is still executing a long tool call.
+const activeWorkByWebContents = new Map<number, ActiveWork>()
+
+function currentActiveWorkCount() {
+  return mergeActiveWork(activeWorkByWebContents.values()).count
+}
+
 // Keep the pool light: cap concurrent profile backends (LRU eviction) and reap
 // idle ones. A user idles at exactly the primary backend; pool backends only
 // exist while a non-primary profile is actively being chatted through.
@@ -8079,9 +8089,16 @@ function evictLruPoolBackends(keep) {
   }
 
   const now = Date.now()
+  const activeWorkCount = currentActiveWorkCount()
 
   const evictable = [...backendPool.entries()]
-    .filter(([, entry]) => now - (entry.lastActiveAt || 0) > POOL_KEEPALIVE_FRESH_MS)
+    .filter(([, entry]) =>
+      canStopIdlePoolBackend({
+        activeWorkCount,
+        idleForMs: now - (entry.lastActiveAt || 0),
+        idleThresholdMs: POOL_KEEPALIVE_FRESH_MS
+      })
+    )
     .sort((a, b) => (a[1].lastActiveAt || 0) - (b[1].lastActiveAt || 0))
 
   let removable = backendPool.size - Math.max(0, keep)
@@ -8104,9 +8121,16 @@ function startPoolIdleReaper() {
 
   poolIdleReaper = setInterval(() => {
     const now = Date.now()
+    const activeWorkCount = currentActiveWorkCount()
 
     for (const [profile, entry] of [...backendPool.entries()]) {
-      if (now - (entry.lastActiveAt || 0) > POOL_IDLE_MS) {
+      if (
+        canStopIdlePoolBackend({
+          activeWorkCount,
+          idleForMs: now - (entry.lastActiveAt || 0),
+          idleThresholdMs: POOL_IDLE_MS
+        })
+      ) {
         rememberLog(`Reaping idle profile backend "${profile}" (idle > ${Math.round(POOL_IDLE_MS / 1000)}s)`)
         stopPoolBackend(profile)
       }
@@ -11171,17 +11195,13 @@ ipcMain.handle('hermes:watchDirectory', (_event, dir) => watchDirectory(String(d
 
 ipcMain.handle('hermes:stopPreviewFileWatch', (_event, id) => stopPreviewFileWatch(String(id || '')))
 
-// Each renderer reports the turns it has in flight; the quit guard reads the
-// merged picture. Keyed by webContents id so a closed window stops counting.
-const activeWorkByWebContents = new Map<number, ActiveWork>()
-
 // The same merged picture drives background throttling: chat windows run
 // unthrottled while any turn is in flight (streaming must paint while hidden)
 // and fall back to Chromium's default throttling at idle. See stream-throttle.ts.
 const streamThrottle = createStreamThrottle()
 
 function updateStreamThrottleFromActiveWork() {
-  streamThrottle.update(mergeActiveWork(activeWorkByWebContents.values()).count > 0)
+  streamThrottle.update(currentActiveWorkCount() > 0)
 }
 
 ipcMain.on('hermes:active-work', (event, payload) => {
