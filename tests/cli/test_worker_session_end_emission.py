@@ -1,27 +1,40 @@
-"""Kanban worker session-end emission (HM1).
+"""Kanban worker hard-exit session-end emission (HM2).
 
 A kanban worker session must emit the memory-provider ``on_session_end``
-lifecycle event when it finishes — on BOTH the success and failure paths,
-exactly once per session — so memory providers (e.g. ``memori_byodb``, which
-writes only from that hook) ingest the worker's last turns.
+lifecycle event when it finishes, exactly once per session, so memory
+providers (e.g. ``memori_byodb``, which writes only from that hook) ingest the
+worker's last turns.
 
-The dispatcher spawns workers as ``hermes ... chat -q`` subprocesses:
-  - the non-goal worker takes the ``quiet=False`` single-query branch, which
-    already reaches ``_finalize_single_query`` → ``_run_cleanup`` →
-    ``shutdown_memory_provider`` from its ``finally`` block;
-  - the goal-mode worker takes the fully-quiet ``quiet=True`` branch, which
-    used to rely SOLELY on ``atexit`` firing ``_run_cleanup`` after
-    ``sys.exit``. This regression test locks in that the ``-Q`` path now calls
-    ``_finalize_single_query`` deterministically before exiting, so the
-    memory session-end fires even when atexit is bypassed (kanban
-    ``os._exit(0)`` signal handler, exit watchdog, hard kill) — exactly once,
-    and safely (a raising hook never fails the worker).
+The dispatcher spawns workers as ``hermes ... chat -q`` subprocesses. The
+single-query ``try:``/``finally:`` in ``main()`` ends with ``finally:
+_finalize_single_query`` → ``_run_cleanup`` → ``shutdown_memory_provider`` →
+providers' ``on_session_end``. ``sys.exit`` raises SystemExit so that
+``finally:`` ALWAYS runs on a normal exit — that is base behaviour.
 
-Interactive-session behaviour is unchanged: ``_run_cleanup`` already fired the
-memory session-end via the same ``shutdown_memory_provider`` path and is
-untouched here; only the goal-mode worker's exit branch changed.
+A prior revision added an explicit ``_finalize_single_query`` call just before
+``sys.exit`` on the ``-Q`` path. It was redundant (the ``finally:`` already
+covers it) AND missed the exits that actually skip the ``finally:`` — the
+kanban ``os._exit(0)`` signal handler and the exit watchdog. Both terminate
+the process directly, so no ``finally:``/``atexit`` ever runs.
+
+This suite locks in the fix: a single shared helper, ``_emit_session_end_for_exit``,
+is called immediately before each hard ``os._exit`` (signal handler + watchdog).
+It flushes the memory provider via the same ``shutdown_memory_provider`` path the
+``finally:`` reaches, guarded by ``_cleanup_done`` so it is exactly-once, and
+fully try/except-wrapped so a raising provider can never block the exit.
+
+Tests:
+  - the signal-handler path emits exactly once before ``os._exit`` (wiring test
+    through the real ``_signal_handler_q`` closure + helper unit test);
+  - the watchdog path emits exactly once (wiring test through the real
+    ``_watchdog`` closure + helper unit test);
+  - a raising provider does not prevent process exit (helper unit test);
+  - no double-emission when the normal ``finally:`` also runs (guard test).
 """
 
+import os
+import signal as _real_signal
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -62,11 +75,11 @@ class _RecordingProvider(MemoryProvider):
         return "{}"
 
 
-def _build_fake_cli(log, *, fail=False, raise_on_end=False):
-    """Build a FakeCLI that mimics the worker single-query surface.
+def _build_fake_agent(log, *, raise_on_end=False):
+    """A fake agent whose MemoryManager is wired to a _RecordingProvider.
 
-    The agent carries a real MemoryManager wired to a _RecordingProvider, so
-    a successful emission actually exercises the provider's on_session_end.
+    A successful emission actually exercises the provider's on_session_end,
+    so these tests verify real emission, not just that a stub was called.
     """
     mm = MemoryManager()
     mm._providers = [_RecordingProvider(log, raise_on_end=raise_on_end)]
@@ -84,16 +97,20 @@ def _build_fake_cli(log, *, fail=False, raise_on_end=False):
         mm.shutdown_all()
 
     agent.shutdown_memory_provider = shutdown
-    agent.run_conversation = (
-        lambda user_message=None, conversation_history=None: {
-            "final_response": "done",
-            "failed": fail,
-            "error": "boom" if fail else None,
-        }
-    )
+    return agent
+
+
+def _count_ends(log):
+    return sum(1 for c in log if c.startswith("on_session_end"))
+
+
+def _build_fake_cli(log, *, fail=False, raise_on_end=False):
+    """A full FakeCLI that lets ``main()`` run the single-query path to
+    completion (used by the signal-handler wiring test)."""
+    agent = _build_fake_agent(log, raise_on_end=raise_on_end)
 
     def _chat(query, images=None):
-        mm.initialize_all("worker-session")
+        log.append("chat")
         return "done"
 
     cli = SimpleNamespace(
@@ -125,84 +142,238 @@ def _patch_fake_cli(fake_cli):
     cli_mod._single_query_finalize_attempted_session_ids = set()
 
 
-def _run_quiet_worker(log, *, quiet, fail=False, raise_on_end=False):
-    """Drive ``cli.main(query=...)`` for the given quiet/fail combination.
-
-    Simulates ``sys.exit`` (catches SystemExit) but does NOT simulate atexit,
-    because the fix under test is precisely that the ``-Q`` path no longer
-    depends on atexit to deliver the memory session-end.
-    """
-    fake = _build_fake_cli(log, fail=fail, raise_on_end=raise_on_end)
-    _patch_fake_cli(fake)
-    try:
-        try:
-            cli_mod.main(query="work kanban task X", quiet=quiet, toolsets="terminal")
-        except SystemExit:
-            pass
-    finally:
-        cli_mod._active_agent_ref = None
-        cli_mod._cleanup_done = False
-        cli_mod._single_query_finalize_attempted_session_ids = set()
-        __import__("sys").modules["cli"].HermesCLI = cli_mod.HermesCLI
+def _unpatch_fake_cli():
+    cli_mod._active_agent_ref = None
+    cli_mod._cleanup_done = False
+    cli_mod._single_query_finalize_attempted_session_ids = set()
+    __import__("sys").modules["cli"].HermesCLI = cli_mod.HermesCLI
 
 
-def _count_ends(log):
-    return sum(1 for c in log if c.startswith("on_session_end"))
-
-
-def test_worker_quiet_path_emits_exactly_once():
-    """Non-goal (-q, quiet=False) worker success emits on_session_end once."""
-    log = []
-    _run_quiet_worker(log, quiet=False)
-    assert log.count("shutdown_memory_provider") == 1
-    assert _count_ends(log) == 1
-    assert "on_session_end:1" in log  # forwarded the real transcript
-
-
-def test_goal_quiet_worker_success_emits_exactly_once():
-    """Goal-mode (-Q, quiet=True) worker success emits on_session_end once,
-    deterministically via _finalize_single_query (not atexit)."""
-    log = []
-    _run_quiet_worker(log, quiet=True)
-    assert log.count("shutdown_memory_provider") == 1
-    assert _count_ends(log) == 1
-
-
-def test_goal_quiet_worker_failure_emits_exactly_once():
-    """Goal-mode (-Q) worker FAILURE also emits on_session_end exactly once."""
-    log = []
-    _run_quiet_worker(log, quiet=True, fail=True)
-    assert log.count("shutdown_memory_provider") == 1
-    assert _count_ends(log) == 1
-
-
-@patch("hermes_cli.plugins.invoke_hook")
-def test_raising_provider_hook_does_not_fail_worker(mock_invoke_hook):
-    """A memory provider on_session_end that raises is swallowed (logged by
-    MemoryManager) — it never fails the worker card or the dispatcher."""
-    log = []
-    _run_quiet_worker(log, quiet=True, raise_on_end=True)
-    assert _count_ends(log) == 1  # the provider was still called
-    # The worker survived the raise: cleanup ran and the session lease was
-    # released (had the exception escaped the MemoryManager guard, this
-    # would never be reached).
-    assert log.count("shutdown_memory_provider") == 1
-    assert log.count("release_active_session") >= 1
-
-
-def test_run_cleanup_still_dedupes_to_exactly_once():
-    """Interactive shutdown: _run_cleanup's memory session-end still fires
-    exactly once (the _cleanup_done guard), so my worker-path emission cannot
-    double-fire when atexit later runs the same cleanup."""
-    log = []
-    fake = _build_fake_cli(log)
-    cli_mod._active_agent_ref = fake.agent
+def _emit(log, *, cli=None, raise_on_end=False):
+    """Drive the shared hard-exit helper, wiring _active_agent_ref like the
+    real worker does (hermes_cli.cli_agent_setup_mixin sets it on init)."""
+    agent = _build_fake_agent(log, raise_on_end=raise_on_end)
+    if cli is None:
+        cli = SimpleNamespace(agent=agent)
+    cli_mod._active_agent_ref = agent
     cli_mod._cleanup_done = False
     try:
-        cli_mod._run_cleanup()
-        cli_mod._run_cleanup()  # second call must be a no-op
+        cli_mod._emit_session_end_for_exit(cli)
     finally:
         cli_mod._active_agent_ref = None
         cli_mod._cleanup_done = False
-    assert log.count("shutdown_memory_provider") == 1
+
+
+# ---------------------------------------------------------------------------
+# Shared helper unit tests
+# ---------------------------------------------------------------------------
+
+def test_signal_handler_shape_emits_exactly_once():
+    """_emit_session_end_for_exit(cli) — the shape the signal handler calls —
+    emits the provider on_session_end exactly once, with the real transcript."""
+    log = []
+    _emit(log, cli=SimpleNamespace(agent=_build_fake_agent(log)))
     assert _count_ends(log) == 1
+    assert "on_session_end:1" in log  # forwarded the real transcript
+    assert log.count("shutdown_memory_provider") == 1
+
+
+def test_watchdog_shape_emits_exactly_once():
+    """_emit_session_end_for_exit() with no cli — the shape the watchdog calls,
+    resolving the agent via _active_agent_ref — emits exactly once."""
+    log = []
+    _emit(log)  # cli defaults to None → uses _active_agent_ref
+    assert _count_ends(log) == 1
+    assert log.count("shutdown_memory_provider") == 1
+
+
+def test_no_double_emission_after_normal_finally():
+    """Once _run_cleanup (the normal finally: path) has run, _cleanup_done is
+    set and a later hard-exit emission is a no-op — no double-emission."""
+    log = []
+    agent = _build_fake_agent(log)
+    cli = SimpleNamespace(agent=agent)
+    cli_mod._active_agent_ref = agent
+    cli_mod._cleanup_done = False
+    try:
+        cli_mod._run_cleanup()            # normal finally: flushes the provider
+        cli_mod._emit_session_end_for_exit(cli)  # hard-exit emission → no-op
+    finally:
+        cli_mod._active_agent_ref = None
+        cli_mod._cleanup_done = False
+    assert _count_ends(log) == 1
+    assert log.count("shutdown_memory_provider") == 1
+
+
+def test_no_double_emission_on_repeated_hard_exit():
+    """The helper is exactly-once even when called repeatedly (two signals /
+    watchdog + signal both firing): the second call is a no-op."""
+    log = []
+    agent = _build_fake_agent(log)
+    cli = SimpleNamespace(agent=agent)
+    cli_mod._active_agent_ref = agent
+    cli_mod._cleanup_done = False
+    try:
+        cli_mod._emit_session_end_for_exit(cli)
+        cli_mod._emit_session_end_for_exit(cli)
+        cli_mod._emit_session_end_for_exit()  # also no-op via _active_agent_ref
+    finally:
+        cli_mod._active_agent_ref = None
+        cli_mod._cleanup_done = False
+    assert _count_ends(log) == 1
+    assert log.count("shutdown_memory_provider") == 1
+
+
+def test_raising_provider_does_not_prevent_exit():
+    """A memory provider on_session_end that raises is swallowed — the helper
+    returns normally (does not raise), so the following os._exit is never
+    prevented. Logs a warning and continues."""
+    log = []
+    # Must not raise out of _emit — if it does, the test fails here.
+    _emit(log, raise_on_end=True)
+    assert _count_ends(log) == 1  # the provider was still called
+    assert log.count("shutdown_memory_provider") == 1
+
+
+def test_no_agent_is_safe_noop():
+    """No active agent → the helper is a safe no-op (never raises)."""
+    cli_mod._cleanup_done = False
+    cli_mod._active_agent_ref = None
+    try:
+        cli_mod._emit_session_end_for_exit()  # must not raise
+        cli_mod._emit_session_end_for_exit(SimpleNamespace())  # clause w/o agent
+    finally:
+        cli_mod._cleanup_done = False
+
+
+# ---------------------------------------------------------------------------
+# Wiring tests through the real closures
+# ---------------------------------------------------------------------------
+
+def test_signal_handler_emits_before_os_exit():
+    """The real ``_signal_handler_q`` kanban branch calls the shared helper
+    before ``os._exit``. We capture the handler from ``main()``'s signal
+    registration (aborting ``main`` right after), then invoke the captured
+    closure — exactly as the OS would on SIGTERM — with ``os._exit`` and
+    ``signal.signal`` still patched, and assert the emission fired precisely
+    once and that ``os._exit(0)`` was reached."""
+    log = []
+    fake = _build_fake_cli(log)
+    _patch_fake_cli(fake)
+    captured = {"count": 0}
+
+    def _fake_signal_signal(signum, handler):
+        captured["count"] += 1
+        captured["handler"] = handler
+        if captured["count"] == 1:
+            # The FIRST registration is the real _signal_handler_q via
+            # main(); abort main now that it's installed — we only need the
+            # closure. Subsequent registrations (SIGTERM/SIGHUP/and the
+            # handler's own SIGALRM) just record and fall through.
+            raise SystemExit()
+
+    exit_calls = []
+
+    def _fake_os_exit(code):
+        exit_calls.append(code)
+        raise SystemExit(code)  # don't kill the test worker
+
+    os.environ["HERMES_KANBAN_TASK"] = "t_test"
+    os.environ["HERMES_SIGTERM_GRACE"] = "0"  # skip the in-handler sleep
+    try:
+        # Keep os._exit AND signal.signal patched across BOTH main() and the
+        # handler invocation so the handler's os._exit(0) and its managed
+        # SIGALRM deadman hit the fakes, never the real process.
+        with patch.object(cli_mod.os, "_exit", _fake_os_exit), \
+             patch.object(_real_signal, "signal", _fake_signal_signal):
+            try:
+                cli_mod.main(query="q", quiet=True, toolsets="terminal")
+            except SystemExit:
+                pass
+            handler = captured.get("handler")
+            assert handler is not None, "signal handler was not installed"
+            # Invoke the real closure exactly as the OS would on SIGTERM.
+            try:
+                handler(_real_signal.SIGTERM, None)
+            except SystemExit:
+                pass
+            # Cancel the 2s SIGALRM the handler armed, so it cannot fire after
+            # the test subprocess unwinds and kill the next test / worker.
+            try:
+                _real_signal.alarm(0)
+            except Exception:
+                pass
+            assert _count_ends(log) == 1
+            assert log.count("shutdown_memory_provider") == 1
+            # The kanban branch was reached: after emitting, the handler
+            # called os._exit(0), which our fake translated into SystemExit(0).
+            assert exit_calls == [0]
+    finally:
+        _unpatch_fake_cli()
+        del os.environ["HERMES_KANBAN_TASK"]
+        del os.environ["HERMES_SIGTERM_GRACE"]
+        # Restore the process's real signal handlers (main() replaced them).
+        _real_signal.signal(_real_signal.SIGINT, _real_signal.default_int_handler)
+        try:
+            _real_signal.signal(_real_signal.SIGTERM, _real_signal.SIG_DFL)
+        except Exception:
+            pass
+        try:
+            _real_signal.signal(_real_signal.SIGHUP, _real_signal.SIG_DFL)
+        except Exception:
+            pass
+
+
+def test_watchdog_emits_before_os_exit():
+    """The real exit-watchdog ``_watchdog`` closure calls the shared helper
+    before ``os._exit``. We capture the watchdog thread's target from a real
+    ``_arm_exit_watchdog`` call and run the inner closure — with patched
+    ``os._exit`` — asserting the emission fired exactly once before it."""
+    log = []
+    agent = _build_fake_agent(log)
+    captured = {}
+
+    def _fake_thread_start(self):
+        captured["target"] = self._target
+
+    exit_calls = []
+
+    def _fake_os_exit(code):
+        exit_calls.append(code)
+        raise SystemExit(code)  # don't kill the test worker
+
+    cli_mod._active_agent_ref = agent
+    cli_mod._cleanup_done = False
+    had_pytest_env = "PYTEST_CURRENT_TEST" in os.environ
+    pytest_val = os.environ.get("PYTEST_CURRENT_TEST")
+    # _arm_exit_watchdog early-returns under PYTEST_CURRENT_TEST (so the real
+    # os._exit backstop never kills a test worker). We want the watchdog thread
+    # itself, so clear it for the arming call; os._exit stays patched to the
+    # fake, so even if the thread were to actually run it could not kill us.
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    try:
+        # Keep os._exit patched across arming AND running the closure so the
+        # inner os._exit(0) hits the fake, never the real process. Also no-op
+        # time.sleep so running the closure directly doesn't sleep 9999s.
+        with patch.object(cli_mod.os, "_exit", _fake_os_exit), \
+             patch.object(cli_mod.time, "sleep", lambda *a, **k: None), \
+             patch.object(threading.Thread, "start", _fake_thread_start):
+            cli_mod._arm_exit_watchdog(timeout_s=9999)
+            target = captured.get("target")
+            assert target is not None, "watchdog thread was not started"
+            # Run the inner watchdog closure directly (skip the 9999s sleep).
+            try:
+                target()
+            except SystemExit:
+                pass
+            assert _count_ends(log) == 1
+            assert log.count("shutdown_memory_provider") == 1
+            assert exit_calls == [0]
+    finally:
+        cli_mod._active_agent_ref = None
+        cli_mod._cleanup_done = False
+        cli_mod._signal_watchdog_armed = False
+        if had_pytest_env and pytest_val is not None:
+            os.environ["PYTEST_CURRENT_TEST"] = pytest_val
+        else:
+            os.environ.pop("PYTEST_CURRENT_TEST", None)
