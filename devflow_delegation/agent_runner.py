@@ -7,16 +7,18 @@ change in the worktree and print something observable.
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Mapping
 
 from devflow_delegation.agent_policy import (
     Budget,
     CeilingExceeded,
+    redact_secrets,
     scan_for_secrets,
     scrubbed_env,
     secret_values,
@@ -98,15 +100,39 @@ def dispatch_tool(name: str, args: Dict[str, Any], *, worktree: Path, target: Ta
         return f"ERROR: {exc}"
 
 
+def _estimate_tokens(response: Any) -> int:
+    """Rough chars/4 estimate, used only when a provider reports no usage.
+
+    Not a token count in any real tokenizer's sense -- just enough signal
+    that Budget.tick keeps advancing so the ceiling stays live for providers
+    that omit ``usage`` entirely (see ``_tokens`` below).
+    """
+    try:
+        message = response.choices[0].message
+    except Exception:
+        return 0
+    text = str(getattr(message, "content", "") or "")
+    for call in getattr(message, "tool_calls", None) or []:
+        try:
+            text += str(call.function.name or "") + str(call.function.arguments or "")
+        except Exception:
+            continue
+    return len(text) // 4
+
+
 def _tokens(response: Any) -> int:
-    # If a provider never populates `usage` (missing attribute or None), this
-    # quietly returns 0 every tick. That's correct here, but it means
+    # If a provider never populates `usage` (missing attribute or None), a
+    # bare `usage.total_tokens` read quietly returns 0 every tick. That means
     # budget.tokens never advances for that provider, so the token ceiling in
     # Budget.tick can never trip for it -- only the iteration and wall-clock
-    # ceilings still bound the loop. Don't assume the token bound is live
-    # without checking the provider actually reports usage.
+    # ceilings still bound the loop. Fall back to a character-count estimate
+    # of the response so the ceiling stays live rather than silently going
+    # dark for providers that don't report usage.
     usage = getattr(response, "usage", None)
-    return int(getattr(usage, "total_tokens", 0) or 0)
+    total = int(getattr(usage, "total_tokens", 0) or 0)
+    if total > 0:
+        return total
+    return _estimate_tokens(response)
 
 
 def run_agent(
@@ -220,6 +246,60 @@ def self_check(worktree: Path, target: TargetConfig, *, known_values) -> None:
         raise RuntimeError(f"agent diff contains secret material: {', '.join(sorted(set(findings)))}")
 
 
+def _resolve_agent_credentials(agent_model: str, env: Mapping[str, str]) -> Dict[str, str]:
+    """Resolve explicit ``call_llm`` provider/api_key/base_url from the
+    PRE-SCRUB environment, so the live provider call does not depend on
+    ``call_llm``'s own "auto" auto-detection chain.
+
+    Why this exists: ``call_llm(model=target.agent_model, ...)`` with no
+    ``provider=`` resolves to ``agent/auxiliary_client.py``'s "auto" mode,
+    whose detection chain reads ``HERMES_HOME`` and ``*_API_KEY`` env vars --
+    exactly what the safety scrub (``scrubbed_env``) removes before the agent
+    loop runs. Explicitly resolving and forwarding the credential here keeps
+    the child/loop environment scrubbed while still making the call work.
+
+    ``target.agent_model`` follows Hermes's own "<provider>/<model>"
+    convention (e.g. "deepseek/deepseek-v4-pro", mirroring the platform's
+    ``model.provider``/``model.model`` config -- see TargetConfig's default).
+    If the prefix before the first "/" names a known provider (per
+    ``hermes_cli.providers``, the single source of truth for provider
+    identity -- NOT ``agent/auxiliary_client.py``, which this runner may not
+    modify), its credential env var(s) are read from ``env`` and returned so
+    the caller can forward them explicitly. The ``model=`` string itself is
+    left untouched here; only ``provider``/``api_key``/``base_url`` are added.
+
+    If the prefix doesn't resolve to a known provider (no "/", or an id
+    ``hermes_cli.providers`` doesn't recognize -- e.g. a test fixture's
+    "test/model"), this returns ``{}`` and the call falls through to
+    whatever "auto" would have done before this fix (unchanged, pre-existing
+    behavior for that case).
+    """
+    prefix = str(agent_model or "").split("/", 1)[0].strip()
+    if not prefix:
+        return {}
+    try:
+        from hermes_cli.providers import get_provider
+    except Exception:
+        return {}
+    try:
+        provider_def = get_provider(prefix)
+    except Exception:
+        return {}
+    if provider_def is None:
+        return {}
+    resolved: Dict[str, str] = {"provider": provider_def.id}
+    for name in provider_def.api_key_env_vars:
+        value = str(env.get(name, "") or "").strip()
+        if value:
+            resolved["api_key"] = value
+            break
+    if provider_def.base_url_env_var:
+        base_url = str(env.get(provider_def.base_url_env_var, "") or "").strip()
+        if base_url:
+            resolved["base_url"] = base_url
+    return resolved
+
+
 def main(argv=None) -> int:
     """Entrypoint used as a target's implementation_command."""
     del argv
@@ -228,6 +308,11 @@ def main(argv=None) -> int:
     if not request_path or not Path(request_path).is_file():
         print("ERROR: DDP_REQUEST_PATH is unset or missing", file=sys.stderr)
         return 1
+    # Populated inside the try block, before the scrub runs. Declared here so
+    # the except handlers below can always redact against it, even if the
+    # failure happened before it was captured (redact_secrets(..., ()) is a
+    # no-op, not an error).
+    known: tuple = ()
     try:
         request = json.loads(Path(request_path).read_text(encoding="utf-8"))
         envelope = request.get("request") or {}
@@ -255,6 +340,11 @@ def main(argv=None) -> int:
         # Fixed by scrubbing a full pre-clear snapshot instead of a
         # single-key dict assembled from an already-cleared environ.
         known = secret_values(dict(os.environ))
+        # Resolve the provider credential explicitly from the SAME pre-clear
+        # snapshot the scrub reads, before that snapshot is gone. See
+        # _resolve_agent_credentials for why: call_llm's own auto-detection
+        # depends on env vars the scrub is about to remove.
+        credentials = _resolve_agent_credentials(target.agent_model, os.environ)
         scrubbed = scrubbed_env(os.environ)
         os.environ.clear()
         os.environ.update(scrubbed)
@@ -262,14 +352,26 @@ def main(argv=None) -> int:
 
         from agent.auxiliary_client import call_llm
 
+        provider_call = (
+            functools.partial(call_llm, **credentials) if credentials else call_llm
+        )
+
         result = run_agent(worktree=worktree, target=target, request=request,
-                           provider_call=call_llm)
+                           provider_call=provider_call)
         self_check(worktree, target, known_values=known)
     except CeilingExceeded as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        # str(exc) here is our own ceiling message (safe), but route it
+        # through the same redaction as the generic handler below for
+        # defense in depth and one consistent failure-path contract.
+        print(f"ERROR: {redact_secrets(str(exc), known_values=known)}", file=sys.stderr)
         return 1
     except Exception as exc:  # fail closed on anything unexpected
-        print(f"ERROR: agent run failed: {exc}", file=sys.stderr)
+        # The executor captures stderr into its ExecutorError, which lands in
+        # the ledger and notification surface. A provider SDK auth error
+        # echoing a request header (or anything else that happened to quote
+        # a captured secret) must not reach that surface verbatim.
+        message = redact_secrets(str(exc), known_values=known)
+        print(f"ERROR: agent run failed: {message}", file=sys.stderr)
         return 1
     print(
         f"agent completed: iterations={result['iterations']} tokens={result['tokens']} "

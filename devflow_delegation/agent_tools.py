@@ -18,6 +18,13 @@ from devflow_delegation.allowlist import TargetConfig, path_allowed
 
 MAX_READ_CHARS = 100_000
 MAX_TEST_OUTPUT_CHARS = 20_000
+# pytest (and most test runners) put the failure summary at the END of the
+# output; collection/setup noise is at the start. A head-only truncation of a
+# large failing suite hands the agent collection noise and nothing about what
+# actually broke, so it burns iterations blind. Keep both ends instead.
+MAX_TEST_OUTPUT_HEAD_CHARS = 5_000
+MAX_TEST_OUTPUT_TAIL_CHARS = 15_000
+MAX_LIST_FILES_ENTRIES = 500
 
 
 class ToolError(Exception):
@@ -74,6 +81,12 @@ def list_files(worktree: Path, pattern: str = "**/*") -> List[str]:
         except ValueError:
             continue
         results.append(rel.as_posix())
+    if len(results) > MAX_LIST_FILES_ENTRIES:
+        total = len(results)
+        results = results[:MAX_LIST_FILES_ENTRIES]
+        results.append(
+            f"… [truncated: showing {MAX_LIST_FILES_ENTRIES} of {total} files; narrow the pattern]"
+        )
     return results
 
 
@@ -126,7 +139,10 @@ def run_tests(worktree: Path, target: TargetConfig, *, timeout_seconds: int = 60
         chunks.append(f"[{status}] {' '.join(argv)}\n{body}")
     output = "\n".join(chunks)
     if len(output) > MAX_TEST_OUTPUT_CHARS:
-        return output[:MAX_TEST_OUTPUT_CHARS] + "\n… [output truncated]"
+        head = output[:MAX_TEST_OUTPUT_HEAD_CHARS]
+        tail = output[-MAX_TEST_OUTPUT_TAIL_CHARS:]
+        omitted = len(output) - MAX_TEST_OUTPUT_HEAD_CHARS - MAX_TEST_OUTPUT_TAIL_CHARS
+        return f"{head}\n… [output truncated, {omitted} chars omitted] …\n{tail}"
     return output
 
 

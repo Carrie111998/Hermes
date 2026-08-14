@@ -101,6 +101,26 @@ def scan_for_secrets(text: str, *, known_values: Sequence[str] = ()) -> list[str
     return findings
 
 
+def redact_secrets(text: str, *, known_values: Sequence[str] = ()) -> str:
+    """Return ``text`` with any detected credential material replaced.
+
+    Mirrors ``scan_for_secrets``'s detectors (same ``known_values`` floor and
+    the same regex patterns) but returns redacted text instead of finding
+    labels. Exists for surfaces that must never carry raw secret material even
+    when something upstream (e.g. a provider SDK's exception message) leaked
+    it — the failure path that prints to stderr, which an executor captures
+    into its ledger and notification surface.
+    """
+    body = str(text or "")
+    for value in known_values:
+        candidate = str(value or "").strip()
+        if len(candidate) >= _MIN_SECRET_LEN and candidate in body:
+            body = body.replace(candidate, "[REDACTED]")
+    for _label, pattern in _SECRET_PATTERNS:
+        body = pattern.sub("[REDACTED]", body)
+    return body
+
+
 class CeilingExceeded(RuntimeError):
     """A run ceiling was reached. Always fatal to the run."""
 

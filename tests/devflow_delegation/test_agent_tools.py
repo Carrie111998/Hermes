@@ -171,3 +171,59 @@ def test_run_tests_rejects_shell_string_commands(worktree):
 def test_tool_schemas_cover_exactly_the_four_bounded_tools():
     names = {schema["function"]["name"] for schema in TOOL_SCHEMAS}
     assert names == {"read_file", "list_files", "write_file", "run_tests"}
+
+
+# --- F3: list_files had no output cap, unlike read_file (100k) and run_tests
+# (20k). On a large repo "**/*" returns thousands of paths, appended as a tool
+# message and re-sent every iteration -- unbounded prompt growth with no live
+# token bound (compounded by the fact that a provider omitting `usage` also
+# used to leave the token ceiling permanently inert -- see test_agent_runner).
+
+
+def test_list_files_caps_the_number_of_entries_returned(tmp_path):
+    from devflow_delegation.agent_tools import MAX_LIST_FILES_ENTRIES
+
+    many = MAX_LIST_FILES_ENTRIES + 50
+    for index in range(many):
+        (tmp_path / f"f{index:05d}.txt").write_text("x", encoding="utf-8")
+
+    result = list_files(tmp_path, "*.txt")
+
+    # One extra entry for the truncation marker; the count must not just grow
+    # with the number of files on disk.
+    assert len(result) == MAX_LIST_FILES_ENTRIES + 1
+    assert "truncated" in result[-1]
+    assert str(many) in result[-1]
+
+
+def test_list_files_does_not_truncate_when_under_the_cap(worktree):
+    result = list_files(worktree, "**/*.py")
+    assert result == ["src/app.py"]
+    assert not any("truncated" in entry for entry in result)
+
+
+# --- F6: run_tests truncated with output[:MAX_TEST_OUTPUT_CHARS], which keeps
+# only the HEAD. pytest puts the failure summary at the END, so a large
+# failing suite handed the agent collection noise and nothing about what
+# broke. Truncation must keep both ends.
+
+
+def test_run_tests_truncation_preserves_the_tail_not_just_the_head(worktree):
+    from devflow_delegation.agent_tools import MAX_TEST_OUTPUT_CHARS
+
+    # Emit enough head noise to blow past the cap, then a distinctive marker
+    # right at the end -- the exact spot pytest would put "FAILED test_x".
+    script = (
+        "import sys\n"
+        f"sys.stdout.write('n' * {MAX_TEST_OUTPUT_CHARS * 2})\n"
+        "print('FAILED test_the_actual_break - AssertionError: boom')\n"
+    )
+    target = _target(test_commands=(("python", "-c", script),))
+
+    result = run_tests(worktree, target)
+
+    assert len(result) <= MAX_TEST_OUTPUT_CHARS + 200  # head + marker + tail, bounded
+    assert "FAILED test_the_actual_break - AssertionError: boom" in result
+    assert "truncated" in result
+    # The head is still present too -- this isn't a tail-only truncation.
+    assert "n" * 100 in result

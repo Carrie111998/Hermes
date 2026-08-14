@@ -185,9 +185,23 @@ def test_dispatch_tool_run_tests_ignores_model_supplied_arguments(worktree):
 
 
 # --- I3: a provider response with missing/None usage must not crash ---
+#
+# F3 (final whole-branch review): the original assertion here was
+# `result["tokens"] == 0`, which pinned the very bug the review flagged --
+# a provider that never reports `usage` left `budget.tokens` permanently at
+# 0, so the token ceiling in Budget.tick could never trip for that provider
+# (only iteration/wall-clock still bounded the loop). The fix makes `_tokens`
+# fall back to a small chars/4 estimate of the response instead of a bare 0
+# when usage is missing/None, so the ceiling stays live. That estimate is
+# necessarily nonzero for non-empty content ("done" -> 1), so these two tests
+# are updated from `== 0` to `> 0` -- the invariant they protect ("must not
+# crash on missing usage") is unchanged and still asserted via
+# `stopped == "model-finished"` completing normally; only the stale exact
+# value is corrected. See test_run_agent_tokens_estimate_can_trip_the_ceiling
+# below for the new behavior's actual point: the ceiling is live again.
 
 
-def test_run_agent_tokens_default_to_zero_when_usage_is_none(worktree):
+def test_run_agent_tokens_estimate_a_nonzero_value_when_usage_is_none(worktree):
     message = SimpleNamespace(content="done", tool_calls=None)
     response = SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=None)
 
@@ -196,11 +210,11 @@ def test_run_agent_tokens_default_to_zero_when_usage_is_none(worktree):
 
     result = run_agent(worktree=worktree, target=_target(), request=_request(), provider_call=provider_call)
 
-    assert result["tokens"] == 0
+    assert result["tokens"] > 0
     assert result["stopped"] == "model-finished"
 
 
-def test_run_agent_tokens_default_to_zero_when_usage_is_absent(worktree):
+def test_run_agent_tokens_estimate_a_nonzero_value_when_usage_is_absent(worktree):
     message = SimpleNamespace(content="done", tool_calls=None)
     # No `usage` attribute at all -- getattr(response, "usage", None) path.
     response = SimpleNamespace(choices=[SimpleNamespace(message=message)])
@@ -210,8 +224,40 @@ def test_run_agent_tokens_default_to_zero_when_usage_is_absent(worktree):
 
     result = run_agent(worktree=worktree, target=_target(), request=_request(), provider_call=provider_call)
 
-    assert result["tokens"] == 0
+    assert result["tokens"] > 0
     assert result["stopped"] == "model-finished"
+
+
+def test_run_agent_tokens_estimate_can_trip_the_ceiling(worktree):
+    # The actual point of F3: a provider that NEVER reports usage must not be
+    # able to run forever just because the token ceiling silently reads 0
+    # every tick. A single large response from such a provider now trips the
+    # ceiling via the chars/4 estimate.
+    huge_content = "n" * 4000  # ~1000 estimated tokens
+    message = SimpleNamespace(content=huge_content, tool_calls=None)
+    response = SimpleNamespace(choices=[SimpleNamespace(message=message)])  # no usage attr
+
+    def provider_call(**kwargs):
+        return response
+
+    with pytest.raises(CeilingExceeded, match="tokens"):
+        run_agent(worktree=worktree, target=_target(agent_max_tokens=100),
+                  request=_request(), provider_call=provider_call)
+
+
+def test_run_agent_tokens_still_prefer_reported_usage_over_the_estimate(worktree):
+    # When a provider DOES report usage, the estimate must not override it --
+    # regardless of how long the response content is.
+    message = SimpleNamespace(content="n" * 4000, tool_calls=None)
+    response = SimpleNamespace(choices=[SimpleNamespace(message=message)],
+                               usage=SimpleNamespace(total_tokens=7))
+
+    def provider_call(**kwargs):
+        return response
+
+    result = run_agent(worktree=worktree, target=_target(), request=_request(), provider_call=provider_call)
+
+    assert result["tokens"] == 7
 
 
 # --- M1: the untrusted request must be wrapped in an explicit delimited block ---
@@ -370,6 +416,314 @@ def _run_main_preserves_path_when_scrubbing_the_environment(monkeypatch, git_wor
 
     assert agent_runner.main([]) == 0
     assert captured["path"] == "C:/fake/real/path"
+
+
+def _write_request_and_allowlist(tmp_path, *, agent_model="test/model"):
+    """Shared fixture-file setup for the main()-level tests below."""
+    request_path = tmp_path / "request.json"
+    request_path.write_text(
+        json.dumps({
+            "request_id": "dwr_test",
+            "request": {
+                "target": {"repo": "fixture"},
+                "title": "t", "problem_statement": "p", "acceptance_criteria": [],
+            },
+        }),
+        encoding="utf-8",
+    )
+    allowlist_path = tmp_path / "allowlist.json"
+    allowlist_path.write_text(
+        json.dumps({
+            "version": "1",
+            "targets": {
+                "fixture": {
+                    "repo": "fixture", "checkout_path": "/unused",
+                    "allowed_globs": ["src/**"],
+                    "executor_enabled": True,
+                    "implementation_command": ["python", "-m", "devflow_delegation.agent_runner"],
+                    "github_repo": "org/fixture",
+                    "max_autonomous_action": "create_pr",
+                    "synthetic_fixture": True,
+                    "agent_model": agent_model,
+                }
+            },
+        }),
+        encoding="utf-8",
+    )
+    return request_path, allowlist_path
+
+
+# --- F1: the env scrub had no test asserting a secret is actually GONE from
+# what run_agent observes. The only test driving main() to success checked
+# ONLY that PATH survived (see test_main_preserves_path_when_scrubbing_the_
+# environment above) -- delete the scrub lines in main() and every test still
+# passed. This seeds a secret-shaped var and asserts it is absent from the
+# environment run_agent (and therefore the eventual provider call) observes,
+# while PATH is still present.
+
+
+def test_main_scrubs_a_secret_shaped_env_var_before_running_the_agent(monkeypatch, git_worktree, tmp_path):
+    saved_environ = dict(os.environ)
+    try:
+        _run_main_scrubs_a_secret_shaped_env_var(monkeypatch, git_worktree, tmp_path)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_environ)
+
+
+def _run_main_scrubs_a_secret_shaped_env_var(monkeypatch, git_worktree, tmp_path):
+    request_path, allowlist_path = _write_request_and_allowlist(tmp_path)
+
+    # A secret-shaped value assembled at runtime -- never a literal secret in
+    # this file (the repo's own pre-commit gitleaks hook flags those).
+    fake_secret = "fk" + "-" + "test" + "-" + "0123456789abcdef"
+    monkeypatch.setenv("DDP_REQUEST_PATH", str(request_path))
+    monkeypatch.setenv("PATH", "C:/fake/real/path")
+    monkeypatch.setenv("FAKE_TEST_API_KEY", fake_secret)
+    monkeypatch.chdir(git_worktree)
+
+    from devflow_delegation import agent_runner
+
+    monkeypatch.setattr("events.paths.devflow_allowlist_path", lambda: allowlist_path)
+
+    observed = {}
+
+    def fake_run_agent(**kwargs):
+        observed.update(os.environ)
+        return {"iterations": 1, "tokens": 1, "stopped": "model-finished"}
+
+    monkeypatch.setattr(agent_runner, "run_agent", fake_run_agent)
+    monkeypatch.setattr(agent_runner, "self_check", lambda *a, **k: None)
+
+    assert agent_runner.main([]) == 0
+
+    # The whole point of the scrub: run_agent (and the real provider call it
+    # would make) must never see the raw credential value or its var name.
+    assert "FAKE_TEST_API_KEY" not in observed
+    assert fake_secret not in observed.values()
+    # But the scrub must not be a blunt full wipe -- PATH must survive.
+    assert observed.get("PATH") == "C:/fake/real/path"
+
+
+# --- F2: known_values capture ordering. `known = secret_values(dict(os.environ))`
+# must run BEFORE os.environ.clear(); if it ran after, `known` would always be
+# `()` and self_check's exact-match arm would go permanently dark (the regex
+# arm would still catch classic credential SHAPES like "sk-...", masking the
+# gap for anything that doesn't match one of those shapes). This drives
+# main() with self_check NOT stubbed, so the capture-before-scrub wire is
+# proven end to end rather than just at the unit level.
+
+
+def test_main_self_check_catches_a_leaked_env_secret_end_to_end(monkeypatch, git_worktree, tmp_path_factory):
+    saved_environ = dict(os.environ)
+    try:
+        _run_main_self_check_catches_a_leaked_env_secret(monkeypatch, git_worktree, tmp_path_factory, leak=True)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_environ)
+
+
+def test_main_self_check_passes_when_the_agents_diff_is_clean(monkeypatch, git_worktree, tmp_path_factory):
+    saved_environ = dict(os.environ)
+    try:
+        _run_main_self_check_catches_a_leaked_env_secret(monkeypatch, git_worktree, tmp_path_factory, leak=False)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_environ)
+
+
+def _run_main_self_check_catches_a_leaked_env_secret(monkeypatch, git_worktree, tmp_path_factory, *, leak):
+    # request.json/allowlist.json must live OUTSIDE git_worktree: git_worktree
+    # IS this test's `tmp_path` (the fixture returns it directly), and
+    # self_check runs for real here, so any file written under it becomes
+    # part of the scanned diff. A separate tmp_path_factory dir keeps the
+    # worktree clean of anything but what the "agent" itself wrote.
+    meta_dir = tmp_path_factory.mktemp("main_self_check_meta")
+    request_path, allowlist_path = _write_request_and_allowlist(meta_dir)
+
+    # A value that is both secret-shaped (its env var name has "KEY" in it,
+    # so secret_values() collects it) AND long enough to clear scan_for_secrets'
+    # exact-match floor. Assembled at runtime, not a literal.
+    fake_secret = "fk" + "-" + "leak" + "-" + "0123456789abcdef"
+    monkeypatch.setenv("DDP_REQUEST_PATH", str(request_path))
+    # PATH is deliberately left as the real, ambient value here (unlike the
+    # other main()-level tests in this file): self_check runs for real below
+    # and shells out to `git`, which needs a real PATH to resolve. Faking
+    # PATH would make git fail and raise RuntimeError for the WRONG reason,
+    # making the leak=True assertion pass even if the secret-scan never ran.
+    monkeypatch.setenv("FAKE_TEST_API_KEY", fake_secret)
+    monkeypatch.chdir(git_worktree)
+
+    from devflow_delegation import agent_runner
+
+    monkeypatch.setattr("events.paths.devflow_allowlist_path", lambda: allowlist_path)
+    # This target's agent_model ("test/model") never resolves to a real
+    # provider anyway (see _resolve_agent_credentials tests), but the real
+    # hermes_cli.providers.get_provider still does a full models.dev lookup
+    # (and persists a disk cache under HERMES_HOME) to determine that. The
+    # per-test HERMES_HOME tempdir (see tests/conftest.py's autouse
+    # _hermetic_environment) is itself nested under this test's tmp_path --
+    # the same directory git_worktree uses as its repo root -- so that cache
+    # write would land inside the worktree self_check is about to scan. Stub
+    # it out: credential resolution isn't what this test is about.
+    monkeypatch.setattr("hermes_cli.providers.get_provider", lambda name: None)
+
+    def fake_run_agent(**kwargs):
+        # Stand in for "the agent wrote a scoped file" -- with or without the
+        # leaked secret value inside it, depending on the scenario.
+        content = f"TOKEN = '{fake_secret}'\n" if leak else "x = 2\n"
+        (git_worktree / "src" / "app.py").write_text(content, encoding="utf-8")
+        return {"iterations": 1, "tokens": 1, "stopped": "model-finished"}
+
+    monkeypatch.setattr(agent_runner, "run_agent", fake_run_agent)
+    # self_check is deliberately NOT stubbed here -- that's the point.
+
+    exit_code = agent_runner.main([])
+    assert exit_code == (1 if leak else 0)
+
+
+# --- F4: the live provider call is likely broken by the scrub. call_llm(model=
+# target.agent_model, ...) with no provider= resolves to auxiliary_client's
+# "auto" chain, which reads HERMES_HOME + *_API_KEY env vars -- exactly what
+# the scrub removes. main() must resolve provider/api_key/base_url from the
+# PRE-SCRUB environment (via hermes_cli.providers, the provider-identity
+# source of truth) and forward them explicitly, so the call doesn't depend on
+# ambient auto-detection.
+
+
+def test_main_forwards_the_resolved_provider_credential_to_call_llm(monkeypatch, git_worktree, tmp_path):
+    saved_environ = dict(os.environ)
+    try:
+        _run_main_forwards_the_resolved_provider_credential(monkeypatch, git_worktree, tmp_path)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_environ)
+
+
+def _run_main_forwards_the_resolved_provider_credential(monkeypatch, git_worktree, tmp_path):
+    request_path, allowlist_path = _write_request_and_allowlist(
+        tmp_path, agent_model="fakevendor/fake-model-1")
+
+    fake_key = "fk" + "-" + "live" + "-" + "0123456789abcdef"
+    monkeypatch.setenv("DDP_REQUEST_PATH", str(request_path))
+    monkeypatch.setenv("PATH", "C:/fake/real/path")
+    monkeypatch.setenv("FAKEVENDOR_API_KEY", fake_key)
+    monkeypatch.setenv("FAKEVENDOR_BASE_URL", "https://fake.example.test/v1")
+    monkeypatch.chdir(git_worktree)
+
+    from devflow_delegation import agent_runner
+
+    monkeypatch.setattr("events.paths.devflow_allowlist_path", lambda: allowlist_path)
+
+    # A fake provider registry entry -- avoids depending on which real
+    # providers hermes_cli.providers happens to know about, and proves the
+    # wiring generically rather than pinning to today's real registry.
+    fake_provider = SimpleNamespace(
+        id="fakevendor",
+        api_key_env_vars=("FAKEVENDOR_API_KEY",),
+        base_url_env_var="FAKEVENDOR_BASE_URL",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.providers.get_provider",
+        lambda name: fake_provider if name == "fakevendor" else None,
+    )
+
+    captured = {}
+
+    def fake_call_llm(**kwargs):
+        captured.update(kwargs)
+        message = SimpleNamespace(content="done", tool_calls=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)],
+                               usage=SimpleNamespace(total_tokens=1))
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+    monkeypatch.setattr(agent_runner, "self_check", lambda *a, **k: None)
+
+    assert agent_runner.main([]) == 0
+
+    # Forwarded explicitly, not left to ambient auto-detection.
+    assert captured.get("provider") == "fakevendor"
+    assert captured.get("api_key") == fake_key
+    assert captured.get("base_url") == "https://fake.example.test/v1"
+    # The model string itself is untouched by this fix.
+    assert captured.get("model") == "fakevendor/fake-model-1"
+
+    # And captured BEFORE the scrub: by the time call_llm actually runs (which
+    # just happened, above), the raw var is already gone from the child
+    # environment -- the value only survived in the captured kwarg.
+    assert "FAKEVENDOR_API_KEY" not in os.environ
+
+
+def test_resolve_agent_credentials_returns_empty_for_an_unknown_provider_prefix():
+    from devflow_delegation.agent_runner import _resolve_agent_credentials
+
+    # "test/model" (the default fixture agent_model used throughout this
+    # file) has no matching entry in hermes_cli.providers -- this must not
+    # raise, and must not invent a provider.
+    assert _resolve_agent_credentials("test/model", {"TEST_API_KEY": "x"}) == {}
+
+
+def test_resolve_agent_credentials_forwards_only_whats_present(monkeypatch):
+    from devflow_delegation.agent_runner import _resolve_agent_credentials
+
+    fake_provider = SimpleNamespace(
+        id="fakevendor", api_key_env_vars=("FAKEVENDOR_API_KEY",), base_url_env_var="",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.providers.get_provider",
+        lambda name: fake_provider if name == "fakevendor" else None,
+    )
+
+    # No env vars set at all -- provider is still identified, but neither
+    # api_key nor base_url are invented out of thin air.
+    result = _resolve_agent_credentials("fakevendor/some-model", {})
+    assert result == {"provider": "fakevendor"}
+
+
+# --- F5: the failure path printed unscanned exception text. The executor
+# captures stderr into its ExecutorError, which lands in the ledger and
+# notification surface -- a provider SDK error echoing a credential would put
+# it in the control plane. main()'s except handlers must redact before
+# printing.
+
+
+def test_main_redacts_a_leaked_secret_from_an_exception_message(monkeypatch, git_worktree, tmp_path, capsys):
+    saved_environ = dict(os.environ)
+    try:
+        _run_main_redacts_a_leaked_secret_from_an_exception(monkeypatch, git_worktree, tmp_path, capsys)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_environ)
+
+
+def _run_main_redacts_a_leaked_secret_from_an_exception(monkeypatch, git_worktree, tmp_path, capsys):
+    request_path, allowlist_path = _write_request_and_allowlist(tmp_path)
+
+    fake_secret = "fk" + "-" + "boom" + "-" + "0123456789abcdef"
+    monkeypatch.setenv("DDP_REQUEST_PATH", str(request_path))
+    monkeypatch.setenv("PATH", "C:/fake/real/path")
+    monkeypatch.setenv("FAKE_TEST_API_KEY", fake_secret)
+    monkeypatch.chdir(git_worktree)
+
+    from devflow_delegation import agent_runner
+
+    monkeypatch.setattr("events.paths.devflow_allowlist_path", lambda: allowlist_path)
+
+    def fake_run_agent(**kwargs):
+        # Simulate a provider SDK exception that happens to echo the secret
+        # value back (e.g. an auth error quoting a request header).
+        raise RuntimeError(f"upstream 401: token {fake_secret} was rejected, retry later")
+
+    monkeypatch.setattr(agent_runner, "run_agent", fake_run_agent)
+
+    assert agent_runner.main([]) == 1
+
+    err = capsys.readouterr().err
+    assert fake_secret not in err
+    assert "[REDACTED]" in err
+    # Not a blanket suppression -- the surrounding, non-secret context survives.
+    assert "upstream 401" in err
+    assert "retry later" in err
 
 
 # --- Task 7: end-to-end -- the real executor drives a runner-shaped

@@ -3,6 +3,7 @@ import pytest
 from devflow_delegation.agent_policy import (
     Budget,
     CeilingExceeded,
+    redact_secrets,
     scan_for_secrets,
     scrubbed_env,
     secret_values,
@@ -90,6 +91,38 @@ def test_scan_for_secrets_ignores_short_and_clean_text():
 def test_scan_for_secrets_ignores_empty_known_values():
     # A blank/whitespace env value must never match every diff.
     assert scan_for_secrets("anything at all", known_values=("", "   ")) == []
+
+
+# --- F5: main()'s failure path must never print raw secret material.
+# redact_secrets is the piece that makes that possible.
+
+
+def test_redact_secrets_replaces_a_known_credential_value():
+    marker = "fk-" + "leak" + "-0123456789abcdef"
+    body = f"upstream 401: token {marker} was rejected"
+    redacted = redact_secrets(body, known_values=(marker,))
+    assert marker not in redacted
+    assert "[REDACTED]" in redacted
+    # Only the secret is touched -- surrounding context survives.
+    assert "upstream 401" in redacted and "was rejected" in redacted
+
+
+def test_redact_secrets_redacts_a_regex_matched_pattern_even_without_known_values():
+    marker = "sk-" + "aB1" * 8
+    redacted = redact_secrets(f"OPENAI_API_KEY={marker}\n")
+    assert marker not in redacted
+    assert "[REDACTED]" in redacted
+
+
+def test_redact_secrets_leaves_clean_text_untouched():
+    body = "def add(a, b):\n    return a + b\n"
+    assert redact_secrets(body, known_values=("fk-leak-0123456789abcdef",)) == body
+
+
+def test_redact_secrets_ignores_short_known_values():
+    # Mirrors scan_for_secrets' floor: a short "known" value would redact
+    # almost anything by coincidence.
+    assert redact_secrets("id: ab", known_values=("ab",)) == "id: ab"
 
 
 def test_budget_trips_on_iterations():
