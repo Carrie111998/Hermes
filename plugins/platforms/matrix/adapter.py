@@ -3115,16 +3115,16 @@ class MatrixAdapter(BasePlatformAdapter):
         client = self._client
         if not client or not hasattr(client, "handle_sync"):
             return
-        # Dedupe für m.room_key_request (fehlende Megolm-Sessions), damit wir
-        # pro (room, session) nur EINEN Request senden — auch wenn mehrere
-        # Events derselben Session im selben Sync auftauchen.
+        # Dedupe m.room_key_request (missing megolm sessions): send at most
+        # ONE request per (room, session), even when several events of the
+        # same session appear within one sync response.
         _requested_keys: set = set()
-        # --- Missing megolm session: aktiv Room-Keys anfordern ---
-        # Element X verschlüsselt In-Room-Verification (MSC 2241) als megolm
-        # Room-Events. Wenn der Bot die Session nicht hat (m.room_key kam nie an),
-        # kann er die Verifikation nicht lesen. Standard-Mechanismus: den Sender
-        # per m.room_key_request um die Keys bitten. mautrix ruft das nie selbst
-        # auf, deshalb machen wir es hier, dedupe pro (room, session).
+        # --- Missing megolm session: actively request room keys ---
+        # Element X encrypts in-room verification (MSC 2241) as megolm room
+        # events. If the bot lacks the session (m.room_key never arrived), it
+        # cannot read the verification. The standard mechanism is asking the
+        # sender for the keys via m.room_key_request. mautrix never does this
+        # on its own, so we do it here, deduped per (room, session).
         try:
             crypto = getattr(client, "crypto", None)
             if crypto is not None:
@@ -3150,7 +3150,7 @@ class MatrixAdapter(BasePlatformAdapter):
                             )
                             if _has:
                                 continue
-                            # Keys fehlen -> anfragen (fire-and-forget, timeout=0)
+                            # Keys missing -> request them (fire-and-forget, timeout=0)
                             _requested_keys.add(_dup_key)
                             _devs = await crypto.crypto_store.get_devices(_sender) or {}
                             try:
@@ -3169,12 +3169,12 @@ class MatrixAdapter(BasePlatformAdapter):
                                 )
         except Exception as _exc:
             logger.warning("Matrix: room key request scan failed: %s", _exc)
-        # --- Olm to_device: entschlüsseln & weiterleiten (SAS verification fix) ---
-        # Element X verschlüsselt SAS-Verification als Olm to_device events.
-        # Der mautrix OlmMachine (handle_to_device_event) entschlüsselt sie zwar,
-        # verarbeitet aber NUR Room-Keys und verwirft alles andere — Verification
-        # Events verschwinden dadurch. Hier entschlüsseln wir selbst und dispatchen
-        # die entschlüsselten Events an die Event-Handler (Class.TO_DEVICE).
+        # --- Olm to_device: decrypt & re-dispatch (SAS verification fix) ---
+        # Element X encrypts SAS verification as Olm to_device events. The
+        # mautrix OlmMachine (handle_to_device_event) decrypts them but only
+        # processes room keys and discards everything else — verification
+        # events would disappear. We decrypt them ourselves here and dispatch
+        # the decrypted events to the event handlers (Class.TO_DEVICE).
         _all_tasks = []
         try:
             crypto = getattr(client, "crypto", None)
@@ -3196,7 +3196,7 @@ class MatrixAdapter(BasePlatformAdapter):
                                 )
                                 _dec = await crypto._decrypt_olm_event(_olm_evt)
                             except Exception as _exc:
-                                # Nicht entschlüsselbar -> durchreichen, OlmMachine versucht es ohnehin.
+                                # Not decryptable -> pass through, the OlmMachine tries anyway.
                                 logger.debug(
                                     "Matrix: olm to_device decrypt failed for %s: %s",
                                     _raw.get("sender"), _exc,
@@ -3208,7 +3208,7 @@ class MatrixAdapter(BasePlatformAdapter):
                             elif _dec.type == _MtxEventType.FORWARDED_ROOM_KEY:
                                 await crypto._receive_forwarded_room_key(_dec)
                             else:
-                                # Entschlüsseltes Event (z.B. m.key.verification.*) dispatchen.
+                                # Dispatch the decrypted event (e.g. m.key.verification.*).
                                 logger.debug(
                                     "Matrix: decrypted to_device type=%s sender=%s",
                                     _dec.type, _dec.sender,
