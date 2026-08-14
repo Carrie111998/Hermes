@@ -76,6 +76,87 @@ def _run_ddgs_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
     return results
 
 
+# On Termux/Android, ``ddgs`` >= 7.x pulls ``primp`` (a Rust HTTP client) that
+# panics at runtime with 'android context was not initialized' (ndk-context),
+# SIGABRT-ing the search worker on the first network call. ``import ddgs`` and
+# ``is_available()`` pass, so it slips past the install check and only dies when
+# a real search runs. The HTML endpoint at html.duckduckgo.com works fine from
+# plain ``requests`` (already in the venv), so we fall back to scraping that
+# instead of pulling a Rust dependency. Tracked in NousResearch/hermes-agent#85972.
+def _run_ddgs_requests_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
+    """Termux/Android fallback: scrape DuckDuckGo HTML with ``requests``.
+
+    ``ddgs`` >= 7.x depends on ``primp`` (Rust) which panics on Android with
+    'android context was not initialized'. Plain ``requests`` against the HTML
+    endpoint avoids the native crash entirely. Sponsored ``result--ad`` blocks
+    are filtered out so ads never leak in as organic results.
+    """
+    import re
+
+    import requests  # type: ignore
+
+    results: list[dict[str, Any]] = []
+    resp = requests.post(
+        "https://html.duckduckgo.com/html/",
+        data={"q": query},
+        headers={"User-Agent": "Mozilla/5.0 (compatible; hermes-agent/1.0)"},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    html = resp.text
+
+    # Each organic result is a <div class="result results_links ..."> ... block;
+    # sponsored ones carry an extra "result--ad" marker. Walk the snippet blocks
+    # and skip any whose preceding sibling markup window contains that marker.
+    # We split on the result container opening tag to isolate per-result windows.
+    snippet_re = re.compile(
+        r'<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+        re.DOTALL,
+    )
+    title_re = re.compile(r"<[^>]+>", re.DOTALL)
+    body_re = re.compile(r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>', re.DOTALL)
+
+    for m in snippet_re.finditer(html):
+        href = m.group(1)
+        title_html = m.group(2)
+        # The markup window before this hit carries the "result--ad" class if
+        # this is a sponsored block; the window closes at the previous snippet.
+        start = html.rfind('class="result', 0, m.start())
+        window = html[start:m.end()]
+        if "result--ad" in window:
+            continue  # sponsored — drop it
+        # Decode DDG's redirect URLs (e.g. //duckduckgo.com/l/?uddg=...).
+        url = href
+        decoded = re.search(r"uddg=([^&]+)", href)
+        if decoded:
+            from urllib.parse import unquote
+
+            url = unquote(decoded.group(1))
+        title = title_re.sub("", title_html).strip()
+        body_match = body_re.search(window)
+        description = (
+            title_re.sub("", body_match.group(1)).strip() if body_match else ""
+        )
+        results.append(
+            {
+                "title": title,
+                "url": url,
+                "description": description,
+                "position": len(results) + 1,
+            }
+        )
+        if len(results) >= safe_limit:
+            break
+    return results
+
+
+def _is_termux() -> bool:
+    """Return True when running under Termux (where primp/ddgs can't run)."""
+    return bool(os.environ.get("TERMUX_VERSION")) or "com.termux/files/usr" in (
+        os.environ.get("PREFIX", "")
+    )
+
+
 # Optional test-only hook name forwarded to the child (see _search_worker.py).
 # Production search() never sets this.
 _test_hook: Optional[str] = None
@@ -281,12 +362,20 @@ class DDGSWebSearchProvider(WebSearchProvider):
         return "DuckDuckGo (ddgs)"
 
     def is_available(self) -> bool:
-        """Return True when the ``ddgs`` package is importable.
+        """Return True when search can run.
 
-        Probes the import once; cheap because Python caches the import. Must
-        NOT perform network I/O — runs at tool-registration time and on every
-        ``hermes tools`` paint.
+        On Termux/Android the ``ddgs`` package imports fine but crashes at
+        search time (primp Rust panic), so we treat the ``requests``-backed
+        HTML fallback as the available path there. On other platforms the
+        ``ddgs`` package must be importable.
         """
+        if _is_termux():
+            try:
+                import requests  # noqa: F401
+
+                return True
+            except ImportError:
+                return False
         try:
             import ddgs  # noqa: F401
 

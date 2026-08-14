@@ -41,6 +41,7 @@ A few features still need desktop/server-style dependencies that are not publish
 - automatic browser / Playwright bootstrap is skipped in the Termux installer
 - Docker-based terminal isolation is not available inside Termux
 - Android may still suspend Termux background jobs, so gateway persistence is best-effort rather than a normal managed service
+- **DuckDuckGo (`web-ddgs`)** uses a Rust-free `requests` fallback on Termux/Android. The `ddgs` PyPI package (>=7.x) pulls `primp`, which panics at runtime with `android context was not initialized`, so the installer ensures `libxslt` is present (for the `lxml` build) and the provider scrapes `html.duckduckgo.com` via `requests` instead. No action needed — it is automatic.
 
 That does not stop Hermes from working well as a phone-native CLI agent — it just means the recommended mobile install is intentionally narrower than the desktop/server install.
 

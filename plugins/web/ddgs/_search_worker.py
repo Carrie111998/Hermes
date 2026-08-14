@@ -98,10 +98,20 @@ def main() -> int:
     query = str(request.get("query") or "")
     safe_limit = max(1, int(request.get("safe_limit") or 1))
     try:
-        # Import inside main so script startup stays light / patchable.
-        from plugins.web.ddgs.provider import _run_ddgs_search
+        # On Termux/Android, ddgs>=7.x pulls primp (Rust) which panics at
+        # runtime with 'android context was not initialized'. Plain requests
+        # against the HTML endpoint works, so prefer that fallback there
+        # (NousResearch/hermes-agent#85972).
+        if os.environ.get("TERMUX_VERSION") or "com.termux/files/usr" in (
+            os.environ.get("PREFIX", "")
+        ):
+            from plugins.web.ddgs.provider import _run_ddgs_requests_search
 
-        results = _run_ddgs_search(query, safe_limit)
+            results = _run_ddgs_requests_search(query, safe_limit)
+        else:
+            from plugins.web.ddgs.provider import _run_ddgs_search
+
+            results = _run_ddgs_search(query, safe_limit)
         _write_envelope({"ok": True, "results": results})
         return 0
     except Exception as exc:  # noqa: BLE001
