@@ -51,6 +51,16 @@ _approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_tool_call_id",
     default="",
 )
+# Hermes session id (observability identity, distinct from the gateway
+# routing session_key above). Approval hooks forward it so observer
+# plugins can attach approval marks to the REAL session scope — without
+# it they fall back to a synthetic "default" session whose scope never
+# closes, and close-time exporters never ship the marks (staging defect
+# 2026-08-10: approvals invisible on the audit board).
+_approval_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_session_id",
+    default="",
+)
 
 # Interactive-CLI flag. Concurrent ACP sessions run on a shared
 # ThreadPoolExecutor (acp_adapter/server.py), so mutating the process-global
@@ -113,6 +123,12 @@ def _fire_approval_hook(hook_name: str, **kwargs) -> None:
     try:
         kwargs.setdefault("turn_id", _approval_turn_id.get())
         kwargs.setdefault("tool_call_id", _approval_tool_call_id.get())
+        # Forward the Hermes session id so observer plugins parent approval
+        # marks to the real session scope instead of a synthetic "default"
+        # session (whose scope never closes → marks never export).
+        _session_id = _approval_session_id.get()
+        if _session_id:
+            kwargs.setdefault("session_id", _session_id)
         invoke_hook(hook_name, **kwargs)
     except Exception as exc:
         # invoke_hook() already swallows per-callback errors, so reaching here
@@ -183,19 +199,26 @@ def set_current_observability_context(
     *,
     turn_id: str = "",
     tool_call_id: str = "",
-) -> tuple[contextvars.Token[str], contextvars.Token[str]]:
+    session_id: str = "",
+) -> tuple[
+    contextvars.Token[str], contextvars.Token[str], contextvars.Token[str]
+]:
     """Bind active tool correlation IDs to approval hooks."""
     return (
         _approval_turn_id.set(turn_id or ""),
         _approval_tool_call_id.set(tool_call_id or ""),
+        _approval_session_id.set(session_id or ""),
     )
 
 
 def reset_current_observability_context(
-    tokens: tuple[contextvars.Token[str], contextvars.Token[str]],
+    tokens: tuple[
+        contextvars.Token[str], contextvars.Token[str], contextvars.Token[str]
+    ],
 ) -> None:
     """Restore prior approval hook correlation IDs."""
-    turn_token, tool_token = tokens
+    turn_token, tool_token, session_token = tokens
+    _approval_session_id.reset(session_token)
     _approval_tool_call_id.reset(tool_token)
     _approval_turn_id.reset(turn_token)
 
@@ -260,6 +283,38 @@ def _is_gateway_approval_context() -> bool:
     if env_var_enabled("HERMES_GATEWAY_SESSION"):
         return True
     return bool(_get_session_platform())
+
+
+def _resolve_cli_approval_callback(approval_callback=None):
+    """Return an interactive CLI approval callback when one is available.
+
+    Prefers an explicitly passed callback, then the per-thread CLI callback
+    registered via ``tools.terminal_tool.set_approval_callback``.
+    """
+    if approval_callback is not None:
+        return approval_callback
+    try:
+        from tools.terminal_tool import _get_approval_callback
+        return _get_approval_callback()
+    except Exception:
+        return None
+
+
+def _should_fall_through_to_cli_approval(
+    *,
+    is_cli: bool,
+    approval_callback,
+    notify_cb,
+) -> bool:
+    """Prefer the classic CLI Dangerous Command panel over silent pending.
+
+    ``HERMES_EXEC_ASK`` (and sometimes a session platform marker) can leak into
+    an interactive CLI process — most commonly via ``import gateway.run``, which
+    historically set ask-mode as a module-level side effect. Without a gateway
+    notify listener, the ask/gateway branch used to return ``pending_approval``
+    immediately and skip the CLI panel the user can actually answer.
+    """
+    return bool(is_cli and approval_callback is not None and notify_cb is None)
 
 # Sensitive write targets that should trigger approval even when referenced
 # via shell expansions like $HOME or $HERMES_HOME, or by the resolved absolute
@@ -3270,12 +3325,7 @@ def _run_approval_gate(
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
-    if approval_callback is None:
-        try:
-            from tools.terminal_tool import _get_approval_callback
-            approval_callback = _get_approval_callback()
-        except Exception:
-            approval_callback = None
+    approval_callback = _resolve_cli_approval_callback(approval_callback)
 
     is_cli = _is_interactive_cli()
     is_gateway = _is_gateway_approval_context()
@@ -3384,24 +3434,32 @@ def _run_approval_gate(
                 save_permanent_allowlist(_permanent_approved)
             return {"approved": True, "message": None}
 
-        # No notify callback (e.g. API server without an attached chat):
-        # queue for /approve /deny review, agent sees approval_required.
-        submit_pending(session_key, {
-            "command": display_target,
-            "pattern_key": pattern_key,
-            "description": description,
-        })
-        return {
-            "approved": False,
-            "pattern_key": pattern_key,
-            "status": "approval_required",
-            "command": display_target,
-            "description": description,
-            "message": (
-                f"⚠️ This action is potentially dangerous ({description}). "
-                f"Asking the user for approval.\n\n**Target:**\n```\n{display_target}\n```"
-            ),
-        }
+        # No notify callback: interactive CLI with a panel callback should
+        # still prompt locally instead of queuing a pending approval nobody
+        # can see (HERMES_EXEC_ASK / platform-marker leaks into CLI).
+        if not _should_fall_through_to_cli_approval(
+            is_cli=is_cli,
+            approval_callback=approval_callback,
+            notify_cb=notify_cb,
+        ):
+            # No notify callback (e.g. API server without an attached chat):
+            # queue for /approve /deny review, agent sees approval_required.
+            submit_pending(session_key, {
+                "command": display_target,
+                "pattern_key": pattern_key,
+                "description": description,
+            })
+            return {
+                "approved": False,
+                "pattern_key": pattern_key,
+                "status": "approval_required",
+                "command": display_target,
+                "description": description,
+                "message": (
+                    f"⚠️ This action is potentially dangerous ({description}). "
+                    f"Asking the user for approval.\n\n**Target:**\n```\n{display_target}\n```"
+                ),
+            }
 
     _fire_approval_hook(
         "pre_approval_request",
@@ -4013,6 +4071,7 @@ def check_all_command_guards(command: str, env_type: str,
     if _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
+    approval_callback = _resolve_cli_approval_callback(approval_callback)
     is_cli = _is_interactive_cli()
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
@@ -4396,35 +4455,44 @@ def check_all_command_guards(command: str, env_type: str,
                     "user_approved": True, "description": combined_desc}
 
         # Fallback: no gateway callback registered (e.g. cron, batch).
-        # Return approval_required for backward compat. Redact secrets in the
-        # user-facing copy — the raw `command` is preserved for execution and
-        # the allowlist keys off pattern_key, so redaction is display-only.
-        from agent.redact import redact_sensitive_text
-        _disp_command = redact_sensitive_text(command)
-        _disp_combined_desc = redact_sensitive_text(combined_desc)
-        pending_data = {
-            "command": _disp_command,
-            "pattern_key": primary_key,
-            "pattern_keys": all_keys,
-            "description": _disp_combined_desc,
-        }
-        if smart_denied_for_owner:
-            pending_data.update(smart_denied=True, allow_permanent=False)
-        submit_pending(session_key, pending_data)
-        result = {
-            "approved": False,
-            "pattern_key": primary_key,
-            "status": "pending_approval",
-            "approval_pending": True,
-            "command": _disp_command,
-            "description": _disp_combined_desc,
-            "message": (
-                f"⚠️ {_disp_combined_desc}. Asking the user for approval.\n\n**Command:**\n```\n{_disp_command}\n```"
-            ),
-        }
-        if smart_denied_for_owner:
-            result.update(smart_denied=True, allow_permanent=False)
-        return result
+        # Interactive CLI with a Dangerous Command callback should still
+        # paint the local panel — ask-mode often leaks into CLI via
+        # importing gateway.run, and returning pending_approval here makes
+        # the agent look "auto-blocked" with no Approve/Deny UI.
+        if not _should_fall_through_to_cli_approval(
+            is_cli=is_cli,
+            approval_callback=approval_callback,
+            notify_cb=notify_cb,
+        ):
+            # Return approval_required for backward compat. Redact secrets in the
+            # user-facing copy — the raw `command` is preserved for execution and
+            # the allowlist keys off pattern_key, so redaction is display-only.
+            from agent.redact import redact_sensitive_text
+            _disp_command = redact_sensitive_text(command)
+            _disp_combined_desc = redact_sensitive_text(combined_desc)
+            pending_data = {
+                "command": _disp_command,
+                "pattern_key": primary_key,
+                "pattern_keys": all_keys,
+                "description": _disp_combined_desc,
+            }
+            if smart_denied_for_owner:
+                pending_data.update(smart_denied=True, allow_permanent=False)
+            submit_pending(session_key, pending_data)
+            result = {
+                "approved": False,
+                "pattern_key": primary_key,
+                "status": "pending_approval",
+                "approval_pending": True,
+                "command": _disp_command,
+                "description": _disp_combined_desc,
+                "message": (
+                    f"⚠️ {_disp_combined_desc}. Asking the user for approval.\n\n**Command:**\n```\n{_disp_command}\n```"
+                ),
+            }
+            if smart_denied_for_owner:
+                result.update(smart_denied=True, allow_permanent=False)
+            return result
 
     # CLI interactive: single combined prompt
     # Hide [a]lways when no persistable (non-tirith) warning is present
@@ -4579,6 +4647,10 @@ def check_execute_code_guard(code: str, env_type: str,
     #     (context now propagates into the RPC thread, #33057); a whole-script
     #     prompt would fire on every execute_code call.
     #   * Local non-interactive non-gateway: documented limitation above.
+    # Ask-mode (HERMES_EXEC_ASK) still takes this path even when INTERACTIVE
+    # is also set — that combination is how gateway/smart tests and messaging
+    # ask-mode drive whole-script approval. Terminal-command CLI leaks are
+    # handled in check_all_command_guards via the CLI callback fall-through.
     if not is_gateway and not is_ask:
         return {"approved": True, "message": None}
 
