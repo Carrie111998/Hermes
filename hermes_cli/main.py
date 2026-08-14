@@ -8154,7 +8154,7 @@ def _recover_core_update_marker_locked() -> None:
         _repair_venv_via_import_probes(install_prefix, env=install_env)
 
     try:
-        from hermes_cli.managed_uv import ensure_uv
+        from hermes_cli.managed_uv import _default_live_venv, ensure_uv
 
         # Always bootstrap pip first: a killed install can leave the venv with
         # no pip module at all, and uv may also be gone. ensurepip restores a
@@ -8170,7 +8170,10 @@ def _recover_core_update_marker_locked() -> None:
 
         uv_bin = ensure_uv()
         if uv_bin:
-            uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+            uv_env = {
+                **os.environ,
+                "VIRTUAL_ENV": str(_default_live_venv(PROJECT_ROOT)),
+            }
             if _is_termux_env(uv_env):
                 uv_env.pop("PYTHONPATH", None)
                 uv_env.pop("PYTHONHOME", None)
@@ -8247,13 +8250,15 @@ def _windows_running_hermes_launcher_locked() -> bool:
 def _default_venv_install_target() -> tuple[list[str], dict[str, str] | None]:
     """Return ``(install_cmd_prefix, env)`` for the project venv when possible."""
     try:
-        from hermes_cli.managed_uv import ensure_uv
+        from hermes_cli.managed_uv import _default_live_venv, ensure_uv
 
         uv_bin = ensure_uv()
+        venv_dir = _default_live_venv(PROJECT_ROOT)
     except Exception:
         uv_bin = None
-    if uv_bin:
-        env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+        venv_dir = None
+    if uv_bin and venv_dir is not None:
+        env = {**os.environ, "VIRTUAL_ENV": str(venv_dir)}
         if _is_termux_env(env):
             env.pop("PYTHONPATH", None)
             env.pop("PYTHONHOME", None)
@@ -8306,11 +8311,12 @@ def _is_windows() -> bool:
 
 def _venv_scripts_dir() -> Path | None:
     """Return the venv Scripts directory if we're running inside the project venv."""
-    venv_dir = PROJECT_ROOT / "venv"
-    if not venv_dir.is_dir():
-        return None
+    from hermes_cli.managed_uv import _default_live_venv
     from hermes_constants import venv_bin_dir
 
+    venv_dir = _default_live_venv(PROJECT_ROOT)
+    if not venv_dir.is_dir():
+        return None
     scripts = venv_bin_dir(venv_dir, windows=_is_windows())
     return scripts if scripts.is_dir() else None
 

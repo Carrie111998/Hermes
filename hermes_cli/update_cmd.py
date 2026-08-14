@@ -274,8 +274,10 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
     try:
         interpreter = sys.executable
         try:
+            from hermes_cli.managed_uv import _default_live_venv
+
             venv_python = venv_python_path(
-                Path(root) / "venv", windows=_m()._is_windows()
+                _default_live_venv(Path(root)), windows=_m()._is_windows()
             )
             if venv_python.exists():
                 interpreter = str(venv_python)
@@ -958,7 +960,12 @@ def _update_via_zip(args):
     if not uv_bin:
         uv_bin = _ensure_uv_for_termux(pip_cmd)
     if uv_bin:
-        uv_env = {**os.environ, "VIRTUAL_ENV": str(_m().PROJECT_ROOT / "venv")}
+        from hermes_cli.managed_uv import _default_live_venv
+
+        uv_env = {
+            **os.environ,
+            "VIRTUAL_ENV": str(_default_live_venv(_m().PROJECT_ROOT)),
+        }
         if _m()._is_termux_env(uv_env):
             uv_env.pop("PYTHONPATH", None)
             uv_env.pop("PYTHONHOME", None)
@@ -2883,7 +2890,9 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
     Returns ``(healthy, detail)``. Never raises; unknown states report
     healthy so a probe failure can't force needless reinstalls.
     """
-    venv_dir = _m().PROJECT_ROOT / "venv"
+    from hermes_cli.managed_uv import _default_live_venv
+
+    venv_dir = _default_live_venv(_m().PROJECT_ROOT)
     venv_python = venv_python_path(venv_dir, windows=_m()._is_windows())
     if not venv_python.exists():
         # No venv interpreter at all. In a dev checkout that's normal (the
@@ -2961,7 +2970,9 @@ def _detect_venv_python_processes(
     except Exception:
         return []
 
-    venv_dir = _m().PROJECT_ROOT / "venv"
+    from hermes_cli.managed_uv import _default_live_venv
+
+    venv_dir = _default_live_venv(_m().PROJECT_ROOT)
     try:
         venv_prefix = str(venv_dir.resolve()).lower().rstrip(os.sep) + os.sep
     except OSError:
@@ -3086,7 +3097,9 @@ def _venv_launcher_ancestors(pids: list[int]) -> list[int]:
     except Exception:
         return []
 
-    venv_dir = _m().PROJECT_ROOT / "venv"
+    from hermes_cli.managed_uv import _default_live_venv
+
+    venv_dir = _default_live_venv(_m().PROJECT_ROOT)
     try:
         venv_prefix = str(venv_dir.resolve()).lower().rstrip(os.sep) + os.sep
     except OSError:
