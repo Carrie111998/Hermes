@@ -25,10 +25,19 @@ _ENV_ALLOW = frozenset({
 _MIN_SECRET_LEN = 8
 
 _SECRET_PATTERNS = (
-    ("private-key-block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    # Case-insensitive: PEM headers and "Bearer" prefixes are sometimes re-cased
+    # by tooling (e.g. uppercased in logs) without ceasing to be the same credential.
+    ("private-key-block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", re.IGNORECASE)),
+    # Case-sensitive: AWS mandates an uppercase "AKIA" prefix by spec, so lowering
+    # this would only add false positives, never catch a real key it currently misses.
     ("aws-access-key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
-    ("bearer-token", re.compile(r"\bBearer\s+[A-Za-z0-9._\-]{20,}")),
-    ("openai-key", re.compile(r"\bsk-[A-Za-z0-9]{20,}\b")),
+    ("bearer-token", re.compile(r"\bBearer\s+[A-Za-z0-9._\-]{20,}", re.IGNORECASE)),
+    # Case-sensitive: OpenAI always issues "sk-" lowercase with a mixed-case body;
+    # case-insensitive matching would not catch a real format this misses, only
+    # add false positives against unrelated all-caps identifiers containing "SK-".
+    # Body widened to allow "-"/"_" so scoped formats like sk-proj-... / sk-ant-...
+    # match, not just the older 20+ contiguous-alphanumeric shape.
+    ("openai-key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")),
 )
 
 
@@ -69,7 +78,16 @@ def secret_values(base: Optional[Mapping[str, str]] = None) -> tuple[str, ...]:
 
 
 def scan_for_secrets(text: str, *, known_values: Sequence[str] = ()) -> list[str]:
-    """Return finding labels for credential material in ``text``. Empty means clean."""
+    """Return finding labels for credential material in ``text``. Empty means clean.
+
+    Note: ``known_values`` entries shorter than ``_MIN_SECRET_LEN`` are deliberately
+    never matched here, even though ``secret_values()`` collects them with no length
+    floor. A short value (e.g. 3 characters) would match almost any diff by sheer
+    coincidence, so the floor is false-positive control, not a coverage gap to close.
+    A real secret shorter than ``_MIN_SECRET_LEN`` is collected as sensitive but can
+    never be flagged by this exact-match path; the regex patterns below are the only
+    backstop for such cases.
+    """
     body = str(text or "")
     findings: list[str] = []
     for value in known_values:

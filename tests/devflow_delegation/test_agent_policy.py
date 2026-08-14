@@ -47,6 +47,42 @@ def test_scan_for_secrets_flags_a_private_key_block():
     assert scan_for_secrets(f"{marker}\nabc\n")
 
 
+def test_scan_for_secrets_flags_an_aws_access_key():
+    # The canonical AWS documentation example key (AKIA + 16 chars), not a real
+    # credential — used throughout AWS's own docs and gitleaks' default allowlist.
+    marker = "AKIA" + "IOSFODNN7EXAMPLE"
+    findings = scan_for_secrets(f"aws_access_key_id = {marker}\n")
+    assert "aws-access-key" in findings
+
+
+def test_scan_for_secrets_flags_a_bearer_token():
+    marker = "Bearer " + "x" * 12 + "Y" * 12 + "0123456789"
+    findings = scan_for_secrets(f"Authorization: {marker}\n")
+    assert "bearer-token" in findings
+
+
+def test_scan_for_secrets_flags_a_plain_openai_key():
+    marker = "sk-" + "aB1" * 8  # 24 chars after "sk-", well past the 20-char floor
+    findings = scan_for_secrets(f"OPENAI_API_KEY={marker}\n")
+    assert "openai-key" in findings
+
+
+def test_scan_for_secrets_flags_a_scoped_openai_key():
+    # Current project/vendor-scoped formats insert a hyphen after "sk-" (e.g.
+    # sk-proj-..., sk-ant-...); the old pattern required 20+ contiguous
+    # alphanumerics right after "sk-" and missed these entirely (F1).
+    marker = "sk-proj-" + "aB1" * 8
+    findings = scan_for_secrets(f"OPENAI_API_KEY={marker}\n")
+    assert "openai-key" in findings
+
+
+def test_scan_for_secrets_does_not_flag_ordinary_code_containing_sk_dash():
+    # "sk-" appears as a substring of ordinary words/identifiers; that alone
+    # must never trip the openai-key pattern.
+    body = "def task-runner(): return risk-free_score\n"
+    assert scan_for_secrets(body) == []
+
+
 def test_scan_for_secrets_ignores_short_and_clean_text():
     assert scan_for_secrets("def add(a, b):\n    return a + b\n", known_values=("sk-live-abc",)) == []
 
