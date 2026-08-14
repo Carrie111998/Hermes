@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 // The global-remote share (backend routing case 3): every profile is served
-// by the PRIMARY backend over one host, and getConnection() tags the shared
-// descriptor with `profile`. Dialing a second WebSocket at that descriptor
-// used to fail over SSH (per-backend tunnel/ticket) and poison the active
-// gateway with a closed socket — "Hermes gateway is not connected" for every
-// profile except the primary. These tests pin the fix: a profile routed to
-// the shared primary activates the primary socket instead of dialing.
+// by the PRIMARY backend over one host, and ensureBackend tags that
+// descriptor with `sharedPrimary: true`. Dialing a second WebSocket at that
+// descriptor used to fail over SSH (per-backend tunnel/ticket) and poison the
+// active gateway with a closed socket — "Hermes gateway is not connected" for
+// every profile except the primary. Pooled backends (local `--profile serve`
+// or per-profile remote overrides) also carry a `profile` name but must dial
+// their own socket — checking `.profile` alone misclassified them (#85745).
 
 vi.mock('@/hermes', () => ({
   HermesGateway: class {
@@ -47,12 +48,16 @@ afterEach(() => {
 })
 
 describe('ensureGatewayForProfile under a shared global remote', () => {
-  it('activates the primary socket for a profile tagged onto the shared descriptor', async () => {
+  it('activates the primary socket for a shared-primary descriptor', async () => {
     const primary = makePrimary()
     setPrimaryGateway(primary as never, 'default')
     installDesktop({
-      // Shared descriptor: primary connection tagged with the profile.
-      getConnection: vi.fn(async () => ({ port: 4242, profile: 'venture', token: 't' }))
+      getConnection: vi.fn(async () => ({
+        port: 4242,
+        profile: 'venture',
+        sharedPrimary: true,
+        token: 't'
+      }))
     })
 
     await ensureGatewayForProfile('venture')
@@ -60,19 +65,32 @@ describe('ensureGatewayForProfile under a shared global remote', () => {
     expect($gateway.get()).toBe(primary)
   })
 
-  it('still pools a socket for profiles with their own descriptor (untagged)', async () => {
+  it('pools a socket for a local profile descriptor tagged with profile but not sharedPrimary', async () => {
     const primary = makePrimary()
     setPrimaryGateway(primary as never, 'default')
     installDesktop({
-      // Own descriptor: no profile tag → normal pooled path (dial attempted).
+      getConnection: vi.fn(async () => ({
+        port: 5151,
+        profile: 'bubu',
+        token: 't2',
+        wsUrl: 'ws://127.0.0.1:5151/api/ws?token=t2'
+      }))
+    })
+
+    await ensureGatewayForProfile('bubu')
+
+    expect($gateway.get()).not.toBe(primary)
+  })
+
+  it('still pools a socket for profiles with their own untagged descriptor', async () => {
+    const primary = makePrimary()
+    setPrimaryGateway(primary as never, 'default')
+    installDesktop({
       getConnection: vi.fn(async () => ({ port: 5151, token: 't2' }))
     })
 
     await ensureGatewayForProfile('worker')
 
-    // The pooled path dialed (our stub throws, so the socket stays closed and
-    // reconnect is scheduled) — the important part is it did NOT silently
-    // reuse the primary.
     expect($gateway.get()).not.toBe(primary)
   })
 })
