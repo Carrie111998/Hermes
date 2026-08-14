@@ -2508,6 +2508,18 @@ DEFAULT_CONFIG = {
             # estimate), regardless of context size. Range 200..60000.
             "listing_max_tokens": 4000,
         },
+        # Spill of oversized tool results to session-scoped files
+        # (tools/tool_spill.py). When enabled and a tool result's UTF-8 size
+        # exceeds max_inline_bytes, the FULL text is written once to
+        # HERMES_HOME/sessions/spill/<session>/ and the inline message becomes
+        # a bounded head/tail preview plus a locator notice the model can
+        # follow with read_file. Default OFF (conservative): the legacy
+        # char-based persistence (tools.tool_result_storage) remains the
+        # always-on safety net.
+        "spill": {
+            "enabled": False,
+            "max_inline_bytes": 100_000,
+        },
     },
 
     # Logging — controls file logging to ~/.hermes/logs/.

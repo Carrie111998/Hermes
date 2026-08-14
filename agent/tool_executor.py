@@ -48,6 +48,10 @@ from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
 )
+from tools.tool_spill import (
+    load_config as _load_spill_config,
+    maybe_spill_tool_result,
+)
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
@@ -772,6 +776,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # Resolve the context-scaled tool-output budget once per turn (cheap, but
     # avoids rebuilding it per result inside the loop below).
     _tool_budget = _budget_for_agent(agent)
+    # Config-gated spill settings (opt-in, default off) — resolved once per
+    # turn so the hot path does not re-read the config file per tool result.
+    _spill_cfg = _load_spill_config()
 
     # ── Pre-flight: interrupt check ──────────────────────────────────
     if agent._interrupt_requested:
@@ -1476,6 +1483,20 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             config=_tool_budget,
         ) if not _is_multimodal_tool_result(function_result) else function_result
 
+        # Config-gated spill (opt-in, default off): a result over
+        # tools.spill.max_inline_bytes is written ONCE to a session-scoped
+        # file and replaced inline by a head/tail preview + locator notice.
+        # Applied here, at write time — the stored message is the final form,
+        # so the transcript between steps stays byte-identical.
+        if not _is_multimodal_tool_result(function_result):
+            function_result = maybe_spill_tool_result(
+                content=function_result,
+                tool_name=name,
+                tool_use_id=tc.id,
+                session_id=getattr(agent, "session_id", "") or "",
+                config=_spill_cfg,
+            )
+
         subdir_hints = agent._subdirectory_hints.check_tool_call(name, args)
         if subdir_hints:
             if _is_multimodal_tool_result(function_result):
@@ -1610,6 +1631,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     """
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
+    # Config-gated spill settings (opt-in, default off) — resolved once per
+    # turn so the hot path does not re-read the config file per tool result.
+    _spill_cfg = _load_spill_config()
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
@@ -2277,6 +2301,20 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             env=get_active_env(effective_task_id),
             config=_tool_budget,
         ) if not _is_multimodal_tool_result(function_result) else function_result
+
+        # Config-gated spill (opt-in, default off): a result over
+        # tools.spill.max_inline_bytes is written ONCE to a session-scoped
+        # file and replaced inline by a head/tail preview + locator notice.
+        # Applied here, at write time — the stored message is the final form,
+        # so the transcript between steps stays byte-identical.
+        if not _is_multimodal_tool_result(function_result):
+            function_result = maybe_spill_tool_result(
+                content=function_result,
+                tool_name=function_name,
+                tool_use_id=tool_call.id,
+                session_id=getattr(agent, "session_id", "") or "",
+                config=_spill_cfg,
+            )
 
         # Discover subdirectory context files from tool arguments
         subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
