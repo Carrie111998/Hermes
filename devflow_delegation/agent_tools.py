@@ -7,13 +7,17 @@ is handed back to the model as a tool result so it can correct course.
 """
 from __future__ import annotations
 
+import os
+import subprocess
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import List
 
+from devflow_delegation.agent_policy import scrubbed_env
 from devflow_delegation.allowlist import TargetConfig, path_allowed
 
 MAX_READ_CHARS = 100_000
+MAX_TEST_OUTPUT_CHARS = 20_000
 
 
 class ToolError(Exception):
@@ -91,3 +95,87 @@ def write_file(worktree: Path, target: TargetConfig, path: str, content: str) ->
     except OSError as exc:
         raise ToolError(f"failed to write {rel}: {exc}") from exc
     return f"wrote {rel} ({len(str(content))} chars)"
+
+
+def run_tests(worktree: Path, target: TargetConfig, *, timeout_seconds: int = 600) -> str:
+    """Run ONLY the target's allowlisted ``test_commands``.
+
+    Takes no arguments from the model: this is what makes "fix it and make the
+    tests pass" possible without ever handing the agent a shell.
+    """
+    commands = [cmd for cmd in target.test_commands if cmd]
+    if not commands:
+        raise ToolError("this target has no configured test commands")
+    env = scrubbed_env(dict(os.environ))
+    chunks: List[str] = []
+    for command in commands:
+        if isinstance(command, str):
+            raise ToolError("test commands must be argv lists, not shell strings")
+        argv = [str(part) for part in command]
+        try:
+            completed = subprocess.run(
+                argv, cwd=str(worktree), env=env, shell=False, capture_output=True,
+                text=True, encoding="utf-8", errors="replace", timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            raise ToolError(f"test command timed out after {timeout_seconds}s: {' '.join(argv)}")
+        except OSError as exc:
+            raise ToolError(f"test command could not start: {exc}") from exc
+        status = "PASSED" if completed.returncode == 0 else "FAILED"
+        body = (completed.stdout or "") + (completed.stderr or "")
+        chunks.append(f"[{status}] {' '.join(argv)}\n{body}")
+    output = "\n".join(chunks)
+    if len(output) > MAX_TEST_OUTPUT_CHARS:
+        return output[:MAX_TEST_OUTPUT_CHARS] + "\n… [output truncated]"
+    return output
+
+
+TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a UTF-8 text file inside the working tree.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Repo-relative path."}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "List files in the working tree matching a glob pattern.",
+            "parameters": {
+                "type": "object",
+                "properties": {"pattern": {"type": "string", "description": "Glob, e.g. src/**/*.py"}},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write a file. Only paths inside the target's allowed scope are permitted.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Repo-relative path."},
+                    "content": {"type": "string", "description": "Full new file content."},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_tests",
+            "description": "Run this repository's configured test suite. Takes no arguments.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+]

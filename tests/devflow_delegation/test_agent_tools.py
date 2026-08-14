@@ -140,3 +140,34 @@ def test_write_file_refuses_a_symlink_that_escapes_the_worktree(worktree, tmp_pa
     with pytest.raises(ToolError):
         write_file(worktree, _target(), "src/escape_write.txt", "pwned\n")
     assert victim.read_text(encoding="utf-8") == "original\n"
+
+
+from devflow_delegation.agent_tools import TOOL_SCHEMAS, run_tests
+
+
+def test_run_tests_executes_the_targets_configured_commands(worktree):
+    target = _target(test_commands=(("python", "-c", "print('tests passed')"),))
+    assert "tests passed" in run_tests(worktree, target)
+
+
+def test_run_tests_reports_failure_without_raising(worktree):
+    # A failing suite is information the agent must act on, not a crash.
+    target = _target(test_commands=(("python", "-c", "import sys; print('boom'); sys.exit(1)"),))
+    result = run_tests(worktree, target)
+    assert "FAILED" in result and "boom" in result
+
+
+def test_run_tests_refuses_a_target_with_no_test_commands(worktree):
+    with pytest.raises(ToolError):
+        run_tests(worktree, _target(test_commands=()))
+
+
+def test_run_tests_rejects_shell_string_commands(worktree):
+    # Stage-2 validator semantics: string commands are invalid, never shelled out.
+    with pytest.raises(ToolError):
+        run_tests(worktree, _target(test_commands=("python -c \"print(1)\"",)))
+
+
+def test_tool_schemas_cover_exactly_the_four_bounded_tools():
+    names = {schema["function"]["name"] for schema in TOOL_SCHEMAS}
+    assert names == {"read_file", "list_files", "write_file", "run_tests"}
