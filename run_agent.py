@@ -202,6 +202,7 @@ from agent.tool_guardrails import (
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
     file_mutation_result_landed,
+    path_change_fingerprint,
 )
 from agent.trajectory import (
     convert_scratchpad_to_think,
@@ -3493,6 +3494,12 @@ class AIAgent:
                     state[path] = {
                         "tool": tool_name,
                         "error_preview": preview,
+                        # On-disk state at the moment the write failed.  The
+                        # footer re-checks this before accusing the model of
+                        # over-claiming, so a path that a NON-watched tool
+                        # (terminal, execute_code, an MCP server, a plugin)
+                        # went on to write is not reported as unmodified.
+                        "fingerprint": path_change_fingerprint(path),
                     }
         else:
             for path in targets:
@@ -3554,6 +3561,31 @@ class AIAgent:
             return text
         return cls._FOOTER_PATH_RE.sub(lambda m: f"`{m.group(0)}`", text)
 
+    @staticmethod
+    def _file_mutation_still_unwritten(path: str, info: Dict[str, Any]) -> bool:
+        """Return True when *path* still looks genuinely unmodified.
+
+        Compares the fingerprint taken when the write failed against the
+        path's state right now.  Any difference means something landed a
+        write through a tool the verifier does not watch, so the failure
+        should not be reported.
+
+        Fails SAFE in both unknown cases — a missing recorded fingerprint
+        (older state, or a test constructing the dict by hand) and an
+        unreadable path both return True and keep the warning.  A verifier
+        that suppresses when it cannot tell is worse than no verifier.
+        """
+        recorded = info.get("fingerprint")
+        if recorded is None:
+            return True
+        try:
+            current = path_change_fingerprint(path)
+        except Exception:
+            return True
+        if current is None:
+            return True
+        return tuple(current) == tuple(recorded)
+
     @classmethod
     def _format_file_mutation_failure_footer(cls, failed: Dict[str, Dict[str, Any]]) -> str:
         """Render the per-turn failed-mutation dict as a user-facing footer.
@@ -3568,6 +3600,20 @@ class AIAgent:
         bare-path media extractor can never auto-attach a protected file
         (e.g. ``~/.hermes/config.yaml``) to a messaging channel (#35584).
         """
+        if not failed:
+            return ""
+        # Drop any path that changed on disk since the write failed.  The
+        # tracked tools (``write_file`` / ``patch``) are not the only writers
+        # in the system: a model that gets a ``patch`` denied and then lands
+        # the same edit through ``terminal`` has NOT over-claimed, and saying
+        # it did trains the user to ignore this footer.  Entries recorded
+        # without a fingerprint, or whose path can no longer be stat'd, are
+        # kept — unknown must never mean silent.
+        failed = {
+            path: info
+            for path, info in failed.items()
+            if cls._file_mutation_still_unwritten(path, info)
+        }
         if not failed:
             return ""
         lines = [
