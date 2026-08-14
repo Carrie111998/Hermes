@@ -2419,6 +2419,35 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Wake a needs-input worker when a human adds a comment. This fixes
+        # comments sitting unread until some unrelated dispatcher activity.
+        "human_comment_wake": True,
+        # Normally a muted subscriber stays muted. Set true when human replies
+        # must wake the task's worker even if ordinary notifications are muted.
+        "human_comment_wake_overrides_mute": False,
+        # Checkpoint protocol policy. Disabled by default so existing worker
+        # lifecycle and tool schemas are unchanged until deliberately enabled.
+        "safe_checkpoint": {
+            "enabled": False,
+            # Empty selects the built-in generic checkpoint guidance. Supply
+            # only local workflow context, not a hard-coded budget policy.
+            "prompt_hint": "",
+        },
+        # How dispatch handles a resolved workspace already used by a running
+        # task: allow (historical behaviour), warn, or serialize.
+        "workspace_conflict": "allow",
+        # Notify targets applied to every task creation path. Entries use the
+        # same target format as ``kanban_notify-subscribe``.
+        "default_subscriptions": [],
+        # Task-creation validation policy: off, warn, or strict. Warn is
+        # behavior-compatible because violations only produce log lines.
+        "validate_on_create": "warn",
+        # When validation is active, require callers to explicitly choose a
+        # workspace instead of accepting the implicit scratch default.
+        "require_explicit_workspace": False,
+        # 0 disables deadline nudges. Positive values nudge a worker to
+        # checkpoint after this fraction of its runtime cap has elapsed.
+        "deadline_warning_fraction": 0.0,
         # Auto-subscribe the originating gateway/TUI session to task
         # completion + block events when ``kanban_create`` is called from
         # inside a session that has a persistent delivery channel. The

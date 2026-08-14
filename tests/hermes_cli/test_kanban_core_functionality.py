@@ -963,6 +963,61 @@ def test_config_default_dispatch_in_gateway_is_true():
     )
 
 
+def test_workflow_policy_config_defaults_preserve_current_behavior():
+    """The workflow-policy schema must keep existing Kanban behavior by default.
+
+    Human-comment wake is deliberately default-on: a reply to a blocked task
+    otherwise remains unread.  The remaining policies are inert or preserve
+    their upstream behavior until a user opts into a stricter mode.
+    """
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    policy = DEFAULT_CONFIG["kanban"]
+    assert policy["human_comment_wake"] is True
+    assert policy["human_comment_wake_overrides_mute"] is False
+    assert policy["safe_checkpoint"] == {"enabled": False, "prompt_hint": ""}
+    assert policy["workspace_conflict"] == "allow"
+    assert policy["default_subscriptions"] == []
+    assert policy["validate_on_create"] == "warn"
+    assert policy["require_explicit_workspace"] is False
+    assert policy["deadline_warning_fraction"] == 0.0
+
+
+def test_workflow_policy_config_accepts_enabled_values(tmp_path, monkeypatch):
+    """Nested and scalar policy overrides survive the normal config merge."""
+    from hermes_cli.config import load_config
+
+    (tmp_path / "config.yaml").write_text(
+        "kanban:\n"
+        "  human_comment_wake: false\n"
+        "  human_comment_wake_overrides_mute: true\n"
+        "  safe_checkpoint:\n"
+        "    enabled: true\n"
+        "    prompt_hint: checkpoint before changing deployment state\n"
+        "  workspace_conflict: serialize\n"
+        "  default_subscriptions:\n"
+        "    - gateway:ops\n"
+        "  validate_on_create: strict\n"
+        "  require_explicit_workspace: true\n"
+        "  deadline_warning_fraction: 0.75\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    policy = load_config()["kanban"]
+    assert policy["human_comment_wake"] is False
+    assert policy["human_comment_wake_overrides_mute"] is True
+    assert policy["safe_checkpoint"] == {
+        "enabled": True,
+        "prompt_hint": "checkpoint before changing deployment state",
+    }
+    assert policy["workspace_conflict"] == "serialize"
+    assert policy["default_subscriptions"] == ["gateway:ops"]
+    assert policy["validate_on_create"] == "strict"
+    assert policy["require_explicit_workspace"] is True
+    assert policy["deadline_warning_fraction"] == 0.75
+
+
 
 
 
@@ -1406,5 +1461,4 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
 

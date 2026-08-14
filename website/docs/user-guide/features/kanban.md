@@ -616,6 +616,20 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `auto_subscribe_on_create` | `true` | When `kanban_create` runs inside a persistent gateway/TUI session, terminal events resume that originating agent with a synthetic status turn. Set to `false` for passive completion or to require explicit `kanban_notify-subscribe` calls. Independent of `auto_decompose`. |
 | `done_sub_retention_days` | `30` | Notify subscriptions survive `done` (reopen-safe) and are removed on `archived`. The notifier GC purges subscriptions whose task has been `done` with no new events for this many days, bounding sub-table growth on boards that never archive. `0` disables the sweep. |
 
+Workflow policy keys:
+
+| Key | Default | Purpose |
+|---|---|---|
+| `human_comment_wake` | `true` | Wake a worker blocked on `needs_input` when a human comments. This fixes human replies remaining unread. |
+| `human_comment_wake_overrides_mute` | `false` | Also wake the worker when the subscriber has muted ordinary notifications. |
+| `safe_checkpoint.enabled` | `false` | Enable fenced safe checkpoints, including the worker tool, prompt guidance, and persistent-dispatcher capability advertisement. |
+| `safe_checkpoint.prompt_hint` | `""` | Optional extra guidance on when workers should checkpoint. Empty uses the built-in generic context-pressure guidance. |
+| `workspace_conflict` | `"allow"` | Workspace collision policy: `allow` preserves current behavior; `warn` dispatches and logs; `serialize` skips candidates sharing a running task's workspace. |
+| `default_subscriptions` | `[]` | Notify-subscribe targets added on every task creation path. Entries use the same format as `kanban_notify-subscribe`. |
+| `validate_on_create` | `"warn"` | Creation validation policy: `off`, `warn` (log violations but create), or `strict` (reject). Checks skills, profiles, and explicit-workspace policy. |
+| `require_explicit_workspace` | `false` | When validation is active, treat an implicit `scratch` workspace as a violation. |
+| `deadline_warning_fraction` | `0.0` | Fraction of a task's runtime cap at which to nudge the worker to checkpoint. `0` disables the nudge. |
+
 And the two auxiliary LLM slots:
 
 | Key | Purpose |

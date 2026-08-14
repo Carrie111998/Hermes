@@ -1196,6 +1196,11 @@ Isolation model:
 - After `kanban.failure_limit` consecutive non-success attempts on the
   same task (default: 2), the dispatcher auto-blocks it to prevent spin
   loops.
+- **Workflow policy:** `kanban.human_comment_wake` defaults on to wake a
+  `needs_input` worker after a human reply. Safe checkpoints, workspace
+  collision handling, creation validation/default subscriptions, and runtime
+  deadline nudges are separately configured under `kanban.*`; their defaults
+  preserve existing dispatch behavior.
 
 Full user-facing docs: `website/docs/user-guide/features/kanban.md`.
 
