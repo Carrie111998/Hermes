@@ -216,6 +216,20 @@ class TestReasoningOnlyAssistantTurnsSurviveReload:
         assert len(assistant) == 1
         assert "timestamp" not in assistant[0]
 
+    def test_empty_list_content_keeps_its_type(self):
+        """Only ``None``/absent normalizes to ``""``.
+
+        An empty multimodal block list is falsy but is not a missing value,
+        so it must survive as a list rather than being rewritten to a string
+        -- downstream consumers branch on `isinstance(content, list)`.
+        """
+        assistant = _assistant_rows([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [], "reasoning_content": "thinking"},
+        ])
+        assert len(assistant) == 1
+        assert assistant[0]["content"] == []
+
     def test_truthy_content_turn_is_unaffected(self):
         """Control: the pre-existing hot path is unchanged."""
         assistant = _assistant_rows([

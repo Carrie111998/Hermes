@@ -1478,7 +1478,15 @@ def _build_gateway_agent_history(
             # with HTTP 400.  Truly empty assistant shells still fall through
             # and are dropped.  Assistant timestamps stay dropped, per the
             # comment above.
-            agent_history.append(_build_replay_entry(role, content or "", msg))
+            #
+            # Only the None/absent case is normalized to "" — the shape the
+            # entry dict expects for a missing value.  Any other falsy content
+            # (notably an empty multimodal block list) is forwarded verbatim so
+            # the replay entry keeps the stored content TYPE rather than being
+            # silently rewritten to a string.
+            agent_history.append(
+                _build_replay_entry(role, "" if content is None else content, msg)
+            )
 
     # Strip interrupted tool-call tails so the LLM doesn't re-execute
     # tools that were killed mid-flight.
