@@ -1143,10 +1143,6 @@ def test_claim_seals_sources_and_rejects_cursor_tampering(kanban_home):
         assert receipt["source_ids"] == ["src_abcdefgh"]
         assert receipt["claim_lock"] == kb.get_task(conn, task_id).claim_lock
         assert receipt["claim_expires"] == kb.get_task(conn, task_id).claim_expires
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setenv("HERMES_KANBAN_RUNTIME_BACKEND", "remote")
-            with pytest.raises(ValueError, match="not available for this run"):
-                kb.read_task_source(conn, task_id, "src_abcdefgh", run_id=claimed.current_run_id, limit=1)
         first = kb.read_task_source(conn, task_id, "src_abcdefgh", run_id=claimed.current_run_id, limit=6)
         assert first["bytes"] == payload[:6]
         assert first["next_cursor"]
@@ -1241,6 +1237,73 @@ def test_spec_pm_reader_only_contract_preserves_least_privilege(kanban_home, mon
         assert receipt["shadowed_toolsets"] == ["file", "terminal"]
         assert "file" not in receipt["effective_toolsets"]
         assert "terminal" not in receipt["effective_toolsets"]
+
+
+@pytest.mark.parametrize(
+    ("runtime_contract", "is_valid"),
+    [
+        ({"toolsets": ["file", "kanban"], "requested_toolsets": ["kanban", "file", "terminal"], "backend": "local"}, False),
+        ({"toolsets": ["kanban"], "requested_toolsets": ["kanban", "file", "terminal"], "backend": "docker"}, False),
+        (None, False),
+        ({"toolsets": ["kanban"], "requested_toolsets": ["kanban", "file", "terminal"], "backend": "local"}, True),
+    ],
+    ids=["effective-toolset-drift", "backend-drift", "unresolvable-profile", "unchanged-contract"],
+)
+def test_runtime_receipt_revalidates_pinned_profile_contract(kanban_home, monkeypatch, runtime_contract, is_valid):
+    """Source reads fail closed unless the current profile contract matches the sealed receipt."""
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda _profile: "/isolated/spec-pm")
+    initial_contract = {
+        "toolsets": ["kanban"],
+        "requested_toolsets": ["kanban", "file", "terminal"],
+        "backend": "local",
+    }
+    monkeypatch.setattr(kb, "_resolve_worker_runtime_contract", lambda _home: initial_contract)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="runtime contract",
+            assignee="spec-pm",
+            required_capabilities=["kanban_source_reader"],
+        )
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        monkeypatch.setattr(kb, "_resolve_worker_runtime_contract", lambda _home: runtime_contract)
+        receipt = kb._run_preclaim_receipt(conn, claimed, claimed.current_run_id)
+        assert (receipt is not None) is is_valid
+
+
+def test_spawn_pins_backend_and_toolsets_from_preclaim_receipt(kanban_home, monkeypatch, tmp_path):
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda _profile: "/isolated/spec-pm")
+    monkeypatch.setattr(
+        kb,
+        "_resolve_worker_runtime_contract",
+        lambda _home: {"toolsets": ["kanban"], "requested_toolsets": ["kanban", "file"], "backend": "local"},
+    )
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    captured = {}
+
+    class FakeProc:
+        pid = 4242
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs["env"])
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="pinned launch", assignee="spec-pm", required_capabilities=["kanban_source_reader"]
+        )
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+    assert kb._default_spawn(claimed, str(workspace)) == 4242
+    assert captured["env"]["TERMINAL_ENV"] == "local"
+    toolsets = captured["cmd"][captured["cmd"].index("--toolsets") + 1]
+    assert toolsets == "kanban"
 
 
 def test_source_manifest_rejects_unsupported_media_at_creation(kanban_home):

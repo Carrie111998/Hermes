@@ -4756,6 +4756,56 @@ def _run_source_snapshot(conn: sqlite3.Connection, task_id: str, run_id: int) ->
     return snapshot if isinstance(snapshot, dict) else None
 
 
+def _normalize_runtime_contract(contract: Any) -> Optional[dict[str, Any]]:
+    """Canonicalize the launch-equivalent worker contract for exact comparison."""
+    if not isinstance(contract, Mapping):
+        return None
+    toolsets = contract.get("toolsets")
+    if not isinstance(toolsets, list):
+        return None
+    requested = contract.get("requested_toolsets", [])
+    if not isinstance(requested, list):
+        return None
+    backend = str(contract.get("backend") or "").strip().lower()
+    if not backend:
+        return None
+    effective = sorted({str(item) for item in toolsets if isinstance(item, str) and item})
+    requested_toolsets = sorted({str(item) for item in requested if isinstance(item, str) and item})
+    return {
+        "requested_toolsets": requested_toolsets,
+        "effective_toolsets": effective,
+        "shadowed_toolsets": sorted(set(requested_toolsets) - set(effective)),
+        "backend": backend,
+    }
+
+
+def _resolve_task_runtime_contract(task: Task) -> Optional[dict[str, Any]]:
+    """Resolve the task assignee's CLI contract through the preclaim resolver."""
+    if not task.assignee:
+        return _normalize_runtime_contract({"toolsets": [], "requested_toolsets": [], "backend": "local"})
+    try:
+        from hermes_cli.profiles import resolve_profile_env
+
+        return _normalize_runtime_contract(_resolve_worker_runtime_contract(resolve_profile_env(task.assignee)))
+    except Exception:
+        return None
+
+
+def _receipt_runtime_contract(receipt: Any) -> Optional[dict[str, Any]]:
+    """Return the sealed worker contract only when all persisted fields agree."""
+    if not isinstance(receipt, Mapping):
+        return None
+    effective = receipt.get("effective_toolsets")
+    contract = _normalize_runtime_contract({
+        "toolsets": effective,
+        "requested_toolsets": receipt.get("requested_toolsets"),
+        "backend": receipt.get("backend"),
+    })
+    if contract is None:
+        return None
+    return contract if all(receipt.get(field) == contract[field] for field in contract) else None
+
+
 def _run_preclaim_receipt(conn: sqlite3.Connection, task: Task, run_id: int) -> Optional[dict[str, Any]]:
     """Return a receipt only when it still authorizes this exact source run."""
     row = conn.execute(
@@ -4767,6 +4817,9 @@ def _run_preclaim_receipt(conn: sqlite3.Connection, task: Task, run_id: int) -> 
     except (TypeError, ValueError):
         return None
     if not isinstance(receipt, dict) or receipt.get("version") != 1:
+        return None
+    sealed_contract = _receipt_runtime_contract(receipt)
+    if sealed_contract is None:
         return None
     if receipt.get("task_id") != task.id or receipt.get("run_id") != run_id:
         return None
@@ -4783,8 +4836,10 @@ def _run_preclaim_receipt(conn: sqlite3.Connection, task: Task, run_id: int) -> 
         return None
     if int(receipt.get("checked_at") or 0) <= 0 or int(task.claim_expires or 0) < int(time.time()):
         return None
-    backend = str(os.environ.get("HERMES_KANBAN_RUNTIME_BACKEND") or os.environ.get("TERMINAL_ENV") or "local").strip().lower() or "local"
-    if receipt.get("backend") != backend:
+    runtime_contract = _resolve_task_runtime_contract(task)
+    if runtime_contract is None:
+        return None
+    if sealed_contract != runtime_contract:
         return None
     required_sha = receipt.get("required_repo_sha")
     binding = receipt.get("repo_binding")
@@ -4876,26 +4931,19 @@ def _preclaim_source_diagnostics(conn: sqlite3.Connection, task_id: str) -> tupl
     # Resolve once and carry the exact launch-time contract into the receipt.
     # A remote executor cannot safely access host attachment paths or validate
     # host git state until a version-pinned materializer exists; fail closed.
-    contract: Optional[dict[str, Any]] = None
     needs_runtime_contract = bool(task.required_capabilities or task.source_manifest or task.required_repo_sha)
-    if task.assignee and needs_runtime_contract:
-        try:
-            from hermes_cli.profiles import resolve_profile_env
-            contract = _resolve_worker_runtime_contract(resolve_profile_env(task.assignee))
-        except Exception as exc:
-            diagnostics.append({"code": "capability_unproven", "detail": f"profile_resolution:{exc}"})
-    elif not task.required_capabilities:
-        # Unassigned local claims are supported for direct/operator workflows.
-        # They have no capability assertion to prove, but source sealing still
-        # uses the local dispatcher filesystem.
-        contract = {"toolsets": [], "backend": "local"}
+    contract = _resolve_task_runtime_contract(task) if needs_runtime_contract else None
+    if contract is None and not needs_runtime_contract:
+        # Legacy tasks without preclaim requirements still receive an explicit
+        # local receipt so their ordinary lifecycle behavior remains unchanged.
+        contract = _normalize_runtime_contract({"toolsets": [], "requested_toolsets": [], "backend": "local"})
     if contract is None:
         diagnostics.append({"code": "capability_unproven", "detail": "runtime_contract"})
         enabled: set[str] = set()
         backend = "unknown"
     else:
-        enabled = set(contract["toolsets"])
-        backend = str(contract["backend"])
+        enabled = set(contract["effective_toolsets"])
+        backend = contract["backend"]
     if backend != "local" and (task.source_manifest or task.required_repo_sha):
         diagnostics.append({
             "code": "remote_materialization_unsupported",
@@ -10807,6 +10855,22 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
     return list(contract["toolsets"]) if contract and contract["toolsets"] else None
 
 
+def _pinned_spawn_runtime_contract(task: Task, board: Optional[str]) -> Optional[dict[str, Any]]:
+    """Load a claimed run's persisted contract for launch without ambient guessing."""
+    if task.current_run_id is None:
+        return None
+    try:
+        with connect(board=board) as conn:
+            row = conn.execute(
+                "SELECT preclaim_receipt FROM task_runs WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+                (task.current_run_id, task.id),
+            ).fetchone()
+        receipt = json.loads(row["preclaim_receipt"]) if row and row["preclaim_receipt"] else None
+    except (sqlite3.Error, TypeError, ValueError):
+        return None
+    return _receipt_runtime_contract(receipt)
+
+
 _retagged_workspace_roots: set[str] = set()
 
 
@@ -10959,6 +11023,15 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
+    # A preclaimed run launches from the same persisted capability/backend
+    # contract that its source reader revalidates at runtime. This overwrites
+    # inherited TERMINAL_ENV rather than treating the dispatcher environment as
+    # authority. Legacy/manual spawn callers without a persisted run retain the
+    # existing profile-resolution fallback.
+    pinned_contract = _pinned_spawn_runtime_contract(task, board)
+    if pinned_contract is not None:
+        env["TERMINAL_ENV"] = pinned_contract["backend"]
+
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
     # quiet chat run into the Ink TUI, whose no-TTY bail-out exits 0 without
@@ -10999,7 +11072,11 @@ def _default_spawn(
     # branch, not a nested one.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    worker_toolsets = (
+        pinned_contract["effective_toolsets"]
+        if pinned_contract is not None
+        else _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    )
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
