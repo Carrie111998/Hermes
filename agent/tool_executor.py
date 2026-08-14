@@ -48,7 +48,13 @@ from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
 )
-from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
+from tools.budget_config import (
+    BudgetConfig,
+    DEFAULT_BUDGET,
+    budget_for_context_window,
+    budget_with_persist_threshold,
+    normalize_persist_threshold,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,12 +89,30 @@ def _budget_for_agent(agent) -> BudgetConfig:
     proportional to their window so a single large tool result can't push the
     request past the model's limit (#23767). Falls back to the default budget
     when the context length isn't resolvable.
+
+    An explicit ``tools.tool_result_persist_threshold_chars`` config value
+    (exposed on the agent as ``_tool_result_persist_threshold_chars`` by
+    agent_init) overrides ONLY the per-result cap; the turn budget and preview
+    size still come from context scaling, so a small model keeps its
+    small-window turn-budget protection (#23767) instead of being reset to the
+    200K default. The value is normalized through
+    ``normalize_persist_threshold`` -- booleans, non-positive numbers and
+    garbage set programmatically (plugins/tests) all fall back to context
+    scaling rather than crashing the tool loop or silently persisting
+    everything (``int(True) == 1``).
     """
+    ctx = None
     try:
-        ctx = getattr(getattr(agent, "context_compressor", None), "context_length", None)
-        return budget_for_context_window(int(ctx)) if ctx else DEFAULT_BUDGET
+        _ctx = getattr(getattr(agent, "context_compressor", None), "context_length", None)
+        ctx = int(_ctx) if _ctx else None
     except Exception:
-        return DEFAULT_BUDGET
+        ctx = None
+    explicit = normalize_persist_threshold(
+        getattr(agent, "_tool_result_persist_threshold_chars", None)
+    )
+    if explicit is not None:
+        return budget_with_persist_threshold(explicit, ctx)
+    return budget_for_context_window(ctx) if ctx else DEFAULT_BUDGET
 
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.

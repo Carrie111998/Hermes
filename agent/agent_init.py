@@ -1940,6 +1940,34 @@ def init_agent(
     if not isinstance(_compression_cfg, dict):
         _compression_cfg = {}
     compression_threshold = float(_compression_cfg.get("threshold", 0.50))
+
+    # Explicit tool-result persistence threshold override
+    # (tools.tool_result_persist_threshold_chars). When set to a positive
+    # int, tool results larger than that many chars are persisted to the
+    # sandbox and replaced in-context by a preview + path, overriding the
+    # context-scaled default (100K chars for large models). Invalid values
+    # (booleans, non-positive numbers, garbage) are ignored with a warning
+    # rather than failing the session. Validation funnels through
+    # normalize_persist_threshold -- the same single source of truth the
+    # factory and executor use -- so reject rules cannot drift between
+    # layers (notably: bool is an int subclass, so int(True) == 1 would
+    # silently persist almost every tool result if accepted here).
+    _persist_threshold_chars = None
+    _tools_cfg = _agent_cfg.get("tools", {})
+    if isinstance(_tools_cfg, dict):
+        _raw_persist_thr = _tools_cfg.get("tool_result_persist_threshold_chars")
+        if _raw_persist_thr is not None:
+            from tools.budget_config import normalize_persist_threshold
+
+            _persist_threshold_chars = normalize_persist_threshold(_raw_persist_thr)
+            if _persist_threshold_chars is None:
+                _ra().logger.warning(
+                    "tools.tool_result_persist_threshold_chars must be a "
+                    "positive int, got %r; ignoring (keeping context-scaled default)",
+                    _raw_persist_thr,
+                )
+    agent._tool_result_persist_threshold_chars = _persist_threshold_chars
+
     # Per-model/route compaction-threshold override. Codex gpt-5.4 / gpt-5.5
     # raise to 85% (the Codex backend caps both families at 272K, so the
     # default 50% would compact at ~136K — half the usable context). Gated by
