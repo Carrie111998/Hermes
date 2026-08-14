@@ -24,13 +24,15 @@ from agent.agent_runtime_helpers import (
 def _agent(
     mode: Union[str, bool, list] = "auto",
     api_mode="chat_completions",
-    model="anthropic/claude-sonnet-4",
+    model="gpt-5.6-sol",
+    provider="openrouter",
 ):
     # _strip_think_blocks is a no-op for these plain-text fixtures.
     return SimpleNamespace(
         _intent_ack_continuation=mode,
         api_mode=api_mode,
         model=model,
+        provider=provider,
         _strip_think_blocks=lambda c: c,
     )
 
@@ -79,6 +81,19 @@ def test_enabled_is_mode_not_off():
     assert intent_ack_continuation_enabled(_agent(False, "codex_responses")) is False
 
 
+def test_auto_enables_copilot_acp_for_action_acknowledgements():
+    agent = _agent(provider="copilot-acp")
+
+    assert intent_ack_continuation_mode(agent) == "all"
+    assert intent_ack_continuation_enabled(agent) is True
+
+
+def test_explicit_off_overrides_copilot_acp_default():
+    agent = _agent(mode=False, provider="copilot-acp")
+
+    assert intent_ack_continuation_mode(agent) == "off"
+
+
 # ── detector: workspace requirement ─────────────────────────────────────────
 
 
@@ -117,7 +132,6 @@ def test_all_path_drops_workspace_requirement():
 
 
 # ── detector: guardrails that hold regardless of workspace ───────────────────
-
 
 
 
