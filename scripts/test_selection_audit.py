@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,9 +13,38 @@ _ALLOWED_LANES = {
     "optional_acp", "optional_anthropic", "optional_wecom", "optional_hindsight",
     "optional_fal", "optional_daytona", "optional_modal", "optional_parallel_web",
     "optional_wake_macos", "optional_computer_use_linux", "linux_systemd_s6",
-    "gnu_cli_host", "wsl_and_audio_host",
+    "gnu_cli_host", "wsl_and_audio_host", "nondeterministic_timing",
 }
 _NODE_RE = re.compile(r"^tests/[^:]+(?:::.*)+$")
+
+
+def _baseline_test_paths() -> set[str]:
+    result = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", "f3d5080c68f034d9bb42f93c39d393633580b5da", "--", "tests"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return {line for line in result.stdout.splitlines() if re.match(r"tests/test_.*\.py$|tests/.+/test_.*\.py$", line)}
+
+
+def _collected_node_ids(path: str) -> set[str]:
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", path],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode not in {0, 5}:
+        raise ValueError(f"cannot collect selectors for {path}: {result.stderr.strip() or result.stdout.strip()}")
+    prefix = f"{path}::"
+    return {
+        line.strip().split(" ", 1)[0]
+        for line in result.stdout.splitlines()
+        if line.strip().startswith(prefix)
+    }
 
 
 def load_manifest() -> dict:
@@ -63,6 +94,8 @@ def load_manifest() -> dict:
                 raise ValueError(f"file selection must use its direct file selector: {selector}")
             if level == "node" and not _NODE_RE.match(selector):
                 raise ValueError(f"malformed node selector: {selector}")
+            if level == "node" and selector not in _collected_node_ids(path):
+                raise ValueError(f"manifest selector does not exist: {selector}")
     data["_entries_by_path"] = {entry["path"]: entry for entry in entries}
     return data
 
@@ -81,11 +114,19 @@ def _relative(path: Path) -> str:
 def audit_file_ownership(files: list[Path]) -> dict:
     manifest = load_manifest()
     known = manifest["_entries_by_path"]
+    core_paths = set(manifest.get("core_paths", []))
+    baseline = _baseline_test_paths()
     rows = []
     for path in sorted(files):
         relative = _relative(path)
         entry = known.get(relative)
-        rows.append({"path": relative, "owner": entry["lane"] if entry else "core+dev"})
+        if entry:
+            owner = entry["lane"]
+        elif relative in core_paths or relative in baseline:
+            owner = "core+dev"
+        else:
+            raise ValueError(f"unowned discovered test path: {relative}")
+        rows.append({"path": relative, "owner": owner})
     declared = set(known)
     discovered = {row["path"] for row in rows}
     missing = sorted(declared - discovered)

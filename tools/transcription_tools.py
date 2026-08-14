@@ -1479,16 +1479,15 @@ def _load_local_whisper_model(model_name: str, device: str = "auto", compute_typ
             "Apple Silicon/Rosetta detected — loading faster-whisper on CPU "
             "(int8) to avoid native device autodetection crashes"
         )
-        # Explicit configuration is authoritative even on Apple Silicon. The
-        # hardening default remains CPU/int8, but silently discarding a user's
-        # compute_type makes the setting impossible to test or operate.
-        if device != "auto" or compute_type != "auto":
-            return WhisperModel(
-                model_name,
-                device="cpu" if device == "auto" else device,
-                compute_type="int8" if compute_type == "auto" else compute_type,
-            )
-        return WhisperModel(model_name, device="cpu", compute_type="int8")
+        # Preserve explicit compute_type while keeping device forced to CPU;
+        # the safety gate must not be bypassed by an explicit device request.
+        return WhisperModel(
+            model_name,
+            # The safety gate is unconditional: explicit CUDA/device requests
+            # must not bypass the Apple Silicon/Rosetta CPU hardening.
+            device="cpu",
+            compute_type="int8" if compute_type == "auto" else compute_type,
+        )
 
     try:
         return WhisperModel(model_name, device=device, compute_type=compute_type)

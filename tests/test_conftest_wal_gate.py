@@ -75,3 +75,22 @@ def test_conftest_does_not_import_hermes_state_at_collection():
         if saved is not None:
             sys.modules["hermes_state"] = saved
     assert not blocked
+
+
+def test_conftest_home_detection_has_no_posix_pwd_import_dependency(monkeypatch):
+    import tests.conftest as conftest
+
+    monkeypatch.setattr(conftest.os, "name", "nt", raising=False)
+    monkeypatch.setenv("USERPROFILE", "C:\\Users\\isolated")
+    monkeypatch.setattr(conftest.Path, "home", staticmethod(lambda: conftest.Path("C:\\Users\\isolated")))
+    assert conftest._hermes_home_points_at_production("") is True
+
+
+def test_conftest_preserves_custom_posix_home(monkeypatch):
+    import pwd
+    import tests.conftest as conftest
+
+    monkeypatch.setattr(conftest.os, "name", "posix", raising=False)
+    monkeypatch.setattr(pwd, "getpwuid", lambda _uid: type("Entry", (), {"pw_dir": "/Users/operator"})())
+    monkeypatch.setattr(conftest.Path, "home", staticmethod(lambda: conftest.Path("/tmp/isolated-home")))
+    assert conftest._hermes_home_points_at_production("") is False

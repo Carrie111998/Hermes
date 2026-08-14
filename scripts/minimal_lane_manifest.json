@@ -4,6 +4,9 @@
   "base_head": "f3d5080c68f034d9bb42f93c39d393633580b5da",
   "base_tree": "2f2da9514bef80c75646d7944ad26dc5778a4dea",
   "source_inventory": "/Users/jarvis/harvis-command-release-evidence/hermes-test-baseline-phase1/phase1_inventory.json",
+  "core_paths": [
+    "tests/test_selection_audit.py"
+  ],
   "entries": [
     {
       "path": "tests/acp/test_entry.py",
@@ -419,6 +422,17 @@
         "tests/tools/test_voice_mode.py::TestWSL2PowerShellFallback::test_wsl2_unique_temp_filename"
       ],
       "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/tools/test_transcription_tools.py",
+      "lane": "nondeterministic_timing",
+      "rationale": "This node uses a 0.1-second wall-clock idle window around real child-process startup and pipe-reader scheduling. It is directly runnable and usually passes, but races scheduler load in the parallel canonical lane. The test remains unchanged and visible pending a deterministic process/clock synchronization rewrite; production STT behavior is not excluded.",
+      "direct_rerun": "tests/tools/test_transcription_tools.py",
+      "selectors": [
+        "tests/tools/test_transcription_tools.py::TestRunCommandSttIdleTimeout::test_stderr_progress_extends_beyond_timeout"
+      ],
+      "phase1_status": "POST_PHASE2_NONDETERMINISTIC",
       "selection_level": "node"
     },
     {

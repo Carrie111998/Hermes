@@ -22,7 +22,7 @@ test runner at ``scripts/run_tests.sh``.
 import asyncio
 import atexit
 import os
-import pwd
+
 import shutil
 import sqlite3
 import sys
@@ -83,7 +83,11 @@ def _hermes_home_points_at_production(value: str) -> bool:
         # supplying an isolated HOME/.hermes route; collection must not hide
         # that route behind a random HERMES_HOME sandbox.
         try:
-            operator_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+            if os.name == "nt":
+                operator_home = Path(os.environ.get("USERPROFILE", str(Path.home()))).resolve()
+            else:
+                import pwd
+                operator_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
             if Path.home().resolve() != operator_home:
                 return False
         except Exception:

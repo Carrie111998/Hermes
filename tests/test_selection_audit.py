@@ -12,8 +12,22 @@ from scripts import test_selection_audit as audit
 def test_manifest_preserves_rationale_and_direct_rerun_selectors() -> None:
     data = audit.load_manifest()
     assert data["manifest_version"] == "2.0"
-    assert len(data["entries"]) == 37
+    assert len(data["entries"]) == 38
     assert all(entry["rationale"] and entry["direct_rerun"] == entry["path"] for entry in data["entries"])
+
+
+def test_stt_timing_exclusion_is_single_node_and_directly_runnable() -> None:
+    data = audit.load_manifest()
+    entry = next(
+        item for item in data["entries"]
+        if item["path"] == "tests/tools/test_transcription_tools.py"
+    )
+    assert entry["lane"] == "nondeterministic_timing"
+    assert entry["selection_level"] == "node"
+    assert entry["direct_rerun"] == entry["path"]
+    assert entry["selectors"] == [
+        "tests/tools/test_transcription_tools.py::TestRunCommandSttIdleTimeout::test_stderr_progress_extends_beyond_timeout"
+    ]
 
 
 def test_mixed_file_keeps_core_nodes_and_deselects_only_declared_nodes() -> None:
@@ -52,3 +66,26 @@ def test_outside_root_is_not_manifest_audited() -> None:
     # that the audit itself never silently claims an external file as core.
     with pytest.raises(ValueError, match="outside-root"):
         audit.audit_file_ownership([outside])
+
+
+def test_newly_added_undeclared_file_fails_closed() -> None:
+    new_test = audit.ROOT / "tests/test_selection_audit_probe.py"
+    new_test.write_text("def test_new(): pass\n", encoding="utf-8")
+    try:
+        # A path not in the frozen base inventory and not explicitly owned by
+        # the manifest must never silently become core+dev.
+        with pytest.raises(ValueError, match="unowned"):
+            audit.audit_file_ownership([new_test])
+    finally:
+        new_test.unlink(missing_ok=True)
+
+
+def test_nonexistent_node_selector_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    data = json.loads(audit.MANIFEST.read_text(encoding="utf-8"))
+    entry = next(item for item in data["entries"] if item["selection_level"] == "node")
+    entry["selectors"] = [f'{entry["path"]}::missing_test']
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.setattr(audit, "MANIFEST", manifest)
+    with pytest.raises(ValueError, match="does not exist"):
+        audit.load_manifest()

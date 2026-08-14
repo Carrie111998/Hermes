@@ -404,6 +404,18 @@ class TestTranscribeLocalExtended:
         assert result["success"] is True
         mock_whisper_cls.assert_called_once_with("base", device="cpu", compute_type="float32")
 
+    def test_apple_silicon_forces_cpu_even_for_explicit_device(self):
+        from tools import transcription_tools as tt
+
+        mock_whisper_cls = MagicMock()
+        with patch.object(tt, "_should_force_faster_whisper_cpu", return_value=True), \
+             patch("faster_whisper.WhisperModel", mock_whisper_cls):
+            tt._load_local_whisper_model("base", device="cuda", compute_type="float16")
+
+        mock_whisper_cls.assert_called_once_with(
+            "base", device="cpu", compute_type="float16"
+        )
+
 
     def test_cuda_out_of_memory_does_not_trigger_cpu_fallback(self, tmp_path):
         """'CUDA out of memory' is a real error, not a missing lib — surface it."""
