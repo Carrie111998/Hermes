@@ -2576,6 +2576,12 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
             if summary_extra_body:
                 summary_kwargs["extra_body"] = summary_extra_body
+            if agent.request_overrides:
+                for key, value in agent.request_overrides.items():
+                    if key == "extra_body" and isinstance(value, dict):
+                        summary_kwargs.setdefault("extra_body", {}).update(value)
+                    else:
+                        summary_kwargs[key] = value
 
             if agent.api_mode == "anthropic_messages":
                 _tsum = agent._get_transport()
@@ -2653,12 +2659,20 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 }
                 if _summary_temperature is not None:
                     summary_kwargs["temperature"] = _summary_temperature
+                if _summary_top_p is not None:
+                    summary_kwargs["top_p"] = _summary_top_p
                 if agent.max_tokens is not None:
                     summary_kwargs.update(agent._max_tokens_param(agent.max_tokens))
                 if _lm_reasoning_effort is not None:
                     summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
+                if agent.request_overrides:
+                    for key, value in agent.request_overrides.items():
+                        if key == "extra_body" and isinstance(value, dict):
+                            summary_kwargs.setdefault("extra_body", {}).update(value)
+                        else:
+                            summary_kwargs[key] = value
 
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary_retry"

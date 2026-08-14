@@ -645,14 +645,6 @@ class ChatCompletionsTransport(ProviderTransport):
             if temp is not None:
                 api_kwargs["temperature"] = temp
 
-        # top_p: per-model contract override (Ollama-cloud Kimi requires
-        # exactly 0.95 — omitting the param 400s on the server-side default).
-        # request_overrides applied below can still replace it — an
-        # intentional caller override always wins.
-        _fixed_top_p = params.get("fixed_top_p")
-        if _fixed_top_p is not None and "top_p" not in api_kwargs:
-            api_kwargs["top_p"] = _fixed_top_p
-
         # Timeout
         timeout = params.get("timeout")
         if timeout is not None:
@@ -697,6 +689,13 @@ class ChatCompletionsTransport(ProviderTransport):
             )
         )
         api_kwargs.update(top_level_from_profile)
+
+        # Apply the model contract after provider extras so a profile cannot
+        # accidentally replace the endpoint-required value. Explicit request
+        # overrides are applied below and still win.
+        _fixed_top_p = params.get("fixed_top_p")
+        if _fixed_top_p is not None and "top_p" not in api_kwargs:
+            api_kwargs["top_p"] = _fixed_top_p
 
         # extra_body assembly
         extra_body: dict[str, Any] = {}

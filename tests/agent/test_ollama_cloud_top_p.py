@@ -49,6 +49,7 @@ def test_fixed_top_p_for_ollama_cloud_kimi(model: str) -> None:
         "qwen3:8b",  # local Ollama tag, not :cloud
         "nemotron-3-nano:30b",  # ollama-cloud provider but no :cloud tag
         "gpt-oss:120b-cloud",  # dash suffix, not the :cloud tag
+        "moonshot-v1:cloud",  # Moonshot is not the verified Kimi contract
         "claude-sonnet-4.6",
         "trinity-large-thinking",
     ],
