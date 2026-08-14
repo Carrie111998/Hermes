@@ -2049,7 +2049,7 @@ def _iter_shell_command_starts(command: str):
             yield start
 
 
-def _mark_command_starts(command: str) -> str:
+def _mark_command_starts(command: str, marker: str = "\n") -> str:
     """Insert a newline before each real (quote-aware) command start.
 
     ``\\n`` is already a ``_CMDPOS`` separator, so this rewrites subshell
@@ -2071,7 +2071,7 @@ def _mark_command_starts(command: str) -> str:
     parts: list[str] = []
     previous = 0
     for offset in offsets:
-        parts.extend((command[previous:offset], "\n"))
+        parts.extend((command[previous:offset], marker))
         previous = offset
     parts.append(command[previous:])
     return "".join(parts)
@@ -2241,6 +2241,16 @@ def _command_detection_variants(command: str):
             continue
         seen.add(variant)
         yield variant
+    # Locate command starts before escape normalization can corrupt shell quote
+    # state. The leading space keeps the inserted newline from being consumed
+    # as a backslash-newline continuation when the preceding text ends in `\`.
+    faithful_marked = _mark_command_starts(
+        _mask_quoted_newlines(command), marker=" \n"
+    )
+    faithful_marked = _normalize_command_for_detection(faithful_marked)
+    if faithful_marked not in seen:
+        seen.add(faithful_marked)
+        yield faithful_marked
 
 
 def _is_verification_artifact_cleanup(command: str) -> bool:

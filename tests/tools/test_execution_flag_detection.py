@@ -259,6 +259,52 @@ def test_escaped_quotes_in_grep_pattern_do_not_hide_following_hardline_command()
     assert detect_hardline_command(command) == (True, "system shutdown/reboot")
 
 
+@pytest.mark.parametrize(
+    ("command", "description"),
+    [
+        (r'echo "a\"b"; reboot', "system shutdown/reboot"),
+        (
+            r'echo "a\"b" && rm -rf --no-preserve-root /',
+            "recursive delete of root filesystem",
+        ),
+        (r'printf "x\"y"; shutdown -h now', "system shutdown/reboot"),
+        (r'cat "file\"name.txt"; rm -rf ~/', "recursive delete of home directory"),
+    ],
+)
+def test_faithful_quote_state_marks_following_hardline_command(command, description):
+    assert detect_hardline_command(command) == (True, description)
+
+
+def test_faithful_quote_state_marker_survives_backslash_line_normalization():
+    # Two backslashes leave a literal backslash before the real newline command
+    # boundary; normalization must not consume the inserted start marker too.
+    command = r"printf \\" + "\nreboot"
+    assert detect_hardline_command(command) == (True, "system shutdown/reboot")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'grep -n "; reboot" f.txt',
+        'echo "; reboot"',
+    ],
+)
+def test_quoted_hardline_text_remains_data(command):
+    assert detect_hardline_command(command) == (False, None)
+
+
+@pytest.mark.parametrize(
+    ("command", "description"),
+    [
+        ('echo "ab"; reboot', "system shutdown/reboot"),
+        ("reboot", "system shutdown/reboot"),
+        ("rm -rf --no-preserve-root /", "recursive delete of root filesystem"),
+    ],
+)
+def test_plain_hardline_commands_remain_blocked(command, description):
+    assert detect_hardline_command(command) == (True, description)
+
+
 def test_interpreter_heredoc_keeps_legacy_approval_key_compatibility():
     from tools.approval import _approval_key_aliases
 
