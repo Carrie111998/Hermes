@@ -82,6 +82,36 @@ def test_non_rate_limit_failover_does_not_record(captured):
     assert captured == []
 
 
+def test_reason_is_threaded_at_known_sites():
+    """The two sites that know their reason must pass it.
+
+    Without this, the eager empty-response fallback (documented in its own
+    comment as 'a common rate-limit symptom') and the non-retryable branch
+    both fail over invisibly.
+    """
+    import inspect
+    from agent import conversation_loop
+
+    src = inspect.getsource(conversation_loop)
+
+    # The eager empty/malformed-response fallback.
+    assert "_try_activate_fallback(reason=FailoverReason.upstream_rate_limit)" in src, \
+        "conversation_loop.py:1605 must pass a reason"
+
+    # Verified counts before this task: 8 bare, 2 carrying a reason.
+    # This task converts exactly 2, leaving 6 deliberately bare (the sites
+    # that genuinely do not know why they are failing over). An exact match
+    # makes a regression in EITHER direction fail: a reason-carrying site
+    # falling back to bare, or someone "helpfully" inventing a reason at a
+    # site that does not know one.
+    bare = src.count("_try_activate_fallback()")
+    assert bare == 6, (
+        f"expected exactly 6 deliberately-bare call sites, found {bare} — "
+        "either a reason-carrying site regressed, or a reason was invented "
+        "at a site that cannot know it (which manufactures false alerts)"
+    )
+
+
 def _fake_client():
     client = MagicMock()
     client.base_url = "https://api.openai.com/v1"
