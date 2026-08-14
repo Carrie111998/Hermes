@@ -887,24 +887,48 @@ class HindsightMemoryProvider(MemoryProvider):
             return False
 
     def unavailable_reason(self) -> str:
-        """Explain an unavailable local_embedded provider (missing runtime).
+        """Explain an unavailable provider (missing config or runtime).
 
         ``is_available()`` returns False for local modes when the embedded
         runtime can't be imported, so ``initialize()`` — and the hint it would
         log — is never reached (#7718). Surface the install guidance here, where
         agent_init warns about an unavailable provider.
+
+        Cloud mode gets the same treatment: when credentials are missing
+        (the systemd/gateway case where ``~/.hermes/.env`` is not inherited,
+        #2765) the caller's warning is otherwise bare — the user has
+        ``memory.provider`` set but no idea which variables to configure.
         """
         try:
             cfg = _load_config()
             mode = cfg.get("mode", "cloud")
         except Exception:
             return ""
-        if mode not in {"local", "local_embedded"}:
+        if self.is_available():
             return ""
-        available, reason = _check_local_runtime()
-        if available:
+        if mode in {"local", "local_embedded"}:
+            available, reason = _check_local_runtime()
+            if available:
+                return ""
+            return _local_runtime_hint(reason).strip()
+        if mode == "local_external":
             return ""
-        return _local_runtime_hint(reason).strip()
+        # Cloud mode: report exactly which credential is missing.
+        has_key = bool(
+            cfg.get("apiKey")
+            or cfg.get("api_key")
+            or get_secret("HINDSIGHT_API_KEY", "")
+        )
+        has_url = bool(cfg.get("api_url") or os.environ.get("HINDSIGHT_API_URL", ""))
+        missing = [name for name, present in
+                   (("HINDSIGHT_API_URL", has_url), ("HINDSIGHT_API_KEY", has_key))
+                   if not present]
+        if not missing:
+            return ""
+        return ("Cloud mode is configured but missing "
+                + " and ".join(f"`{name}`" for name in missing)
+                + " — set them in config (api_url/apiKey) or in the gateway "
+                  "service environment (see #2765).")
 
     def save_config(self, values, hermes_home):
         """Write config to $HERMES_HOME/hindsight/config.json."""
