@@ -95,6 +95,11 @@ class RelayAdapter(BasePlatformAdapter):
         # feedback off SendResult — see send()). Consumed by the gateway's
         # semantic thread-rename lane; bounded like the sibling caches.
         self._auto_thread_by_chat: Dict[str, Tuple[str, str]] = {}
+        # chat_id -> draft_id of the currently OPEN native draft stream
+        # (NS-658 live cards). Armed by send_draft on a successful frame;
+        # consumed by send() to convert the turn-final delivery into the
+        # sealing draft(final=true) frame instead of a duplicate post.
+        self._open_draft_by_chat: Dict[str, int] = {}
         # chat_id -> event fired when the entry above lands, so a consumer that
         # arrives before the send can wait for it instead of polling. See
         # wait_for_auto_thread_info.
@@ -247,7 +252,165 @@ class RelayAdapter(BasePlatformAdapter):
         chat_type: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        return self.descriptor.supports_draft_streaming
+        # Native draft streaming needs BOTH the descriptor flag and the
+        # "draft" op. supported_ops is fail-open for legacy connectors
+        # (empty tuple = pre-contract ops only), but "draft" did not exist
+        # pre-contract, so it must NOT fail open: an explicit advertisement
+        # is required. Without it the stream consumer stays on the
+        # edit-based path exactly as today.
+        return (
+            self.descriptor.supports_draft_streaming
+            and "draft" in (self.descriptor.supported_ops or ())
+        )
+
+    # ── Live cards: native draft streaming + task cards (NS-658) ─────────
+    #
+    # Additive relay ops within contract v1. The gateway side is dumb: it
+    # emits ops when the negotiated descriptor advertises them; the
+    # connector owns the platform API mechanics (chat.startStream et al.),
+    # per-workspace feature-gate caching, and the send+edit fallback.
+    #
+    # Semantic bridge: the base send_draft contract is Telegram-shaped —
+    # the draft clears and the final answer arrives as a separate send().
+    # Slack native streaming makes the stream THE message, sealed once.
+    # The adapter tracks the open draft per chat; the turn-final send()
+    # for that chat converts to draft(final=true) so the connector seals
+    # the stream instead of posting a duplicate message.
+
+    def supports_native_task_cards(self) -> bool:
+        """Descriptor probe for the TurnRunner's task-card lane.
+
+        Explicit advertisement required — same no-fail-open rule as
+        "draft" (the op did not exist pre-contract).
+        """
+        return "task_card" in (self.descriptor.supported_ops or ())
+
+    async def send_draft(
+        self,
+        chat_id: str,
+        draft_id: int,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        if not self.supports_draft_streaming():
+            raise NotImplementedError(
+                "connector does not advertise the 'draft' relay op"
+            )
+        if self._transport is None:
+            return SendResult(success=False, error="no transport")
+        result = await self._transport.send_outbound(
+            {
+                "op": "draft",
+                "chat_id": chat_id,
+                "draft_id": draft_id,
+                "content": content,
+                "final": False,
+                "metadata": self._with_scope(chat_id, dict(metadata or {})),
+            },
+            platform=self._platform_by_chat.get(str(chat_id)),
+        )
+        if result.get("success"):
+            self._open_draft_by_chat[str(chat_id)] = draft_id
+            return SendResult(success=True)
+        # A failed frame must NOT leave seal-interception armed: the stream
+        # consumer disables the draft transport for the run and the final
+        # answer must go out as a REAL send.
+        self._open_draft_by_chat.pop(str(chat_id), None)
+        return SendResult(
+            success=False, error=str(result.get("error") or "draft failed")
+        )
+
+    async def _seal_open_draft(
+        self,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        """Convert the turn-final send into the sealing draft frame."""
+        draft_id = self._open_draft_by_chat.pop(str(chat_id))
+        if self._transport is None:
+            return SendResult(success=False, error="no transport")
+        result = await self._transport.send_outbound(
+            {
+                "op": "draft",
+                "chat_id": chat_id,
+                "draft_id": draft_id,
+                "content": content,
+                "final": True,
+                "metadata": self._with_scope(chat_id, dict(metadata or {})),
+            },
+            platform=self._platform_by_chat.get(str(chat_id)),
+        )
+        if result.get("success"):
+            # The connector returns the stream's ts as the message identity.
+            return SendResult(
+                success=True,
+                message_id=str(result.get("message_id") or "") or None,
+            )
+        return SendResult(
+            success=False, error=str(result.get("error") or "draft seal failed")
+        )
+
+    async def send_native_task_card_progress(
+        self,
+        chat_id: str,
+        card_id: str,
+        tasks: list,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Relay leg of the #85476 task-card lane: emit one card frame.
+
+        ``tasks`` are the TurnRunner's normalized task dicts (id/title/
+        status/details/output); the connector maps them onto its
+        workspace-scoped card stream (task_update chunks, 256-char field
+        limits enforced connector-side where the API lives).
+        """
+        if not self.supports_native_task_cards():
+            return SendResult(
+                success=False, error="connector does not advertise task_card"
+            )
+        if self._transport is None:
+            return SendResult(success=False, error="no transport")
+        result = await self._transport.send_outbound(
+            {
+                "op": "task_card",
+                "chat_id": chat_id,
+                "card_id": card_id,
+                "chunks": [dict(t) for t in tasks],
+                "metadata": self._with_scope(chat_id, dict(metadata or {})),
+            },
+            platform=self._platform_by_chat.get(str(chat_id)),
+        )
+        if result.get("success"):
+            return SendResult(success=True)
+        return SendResult(
+            success=False, error=str(result.get("error") or "task_card failed")
+        )
+
+    async def stop_native_task_card_progress(
+        self,
+        chat_id: str,
+        card_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Seal the card stream at turn end (idempotent connector-side)."""
+        if not self.supports_native_task_cards():
+            return SendResult(
+                success=False, error="connector does not advertise task_card"
+            )
+        if self._transport is None:
+            return SendResult(success=False, error="no transport")
+        result = await self._transport.send_outbound(
+            {
+                "op": "task_card_stop",
+                "chat_id": chat_id,
+                "card_id": card_id,
+                "metadata": self._with_scope(chat_id, dict(metadata or {})),
+            },
+            platform=self._platform_by_chat.get(str(chat_id)),
+        )
+        return SendResult(success=bool(result.get("success")))
+
 
     # ── abstract methods (delegated to the transport) ────────────────────
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -1059,6 +1222,11 @@ class RelayAdapter(BasePlatformAdapter):
             )
         if self._transport is None:
             return SendResult(success=False, error="no transport")
+        # NS-658: an open native draft stream absorbs the turn-final send —
+        # the stream IS the message; sealing it posts the final content and
+        # returns the stream ts as the message identity.
+        if str(chat_id) in self._open_draft_by_chat:
+            return await self._seal_open_draft(chat_id, content, send_metadata)
         # Native _resolve_thread_ts parity: a Slack DM reply must post flat at
         # the DM root, not threaded under the triggering message. One shared
         # helper resolves the anchor for EVERY egress lane (see
