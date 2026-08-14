@@ -5,6 +5,7 @@ import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
 import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
+import { useDragTextToComposer } from '@/components/assistant-ui/thread/use-drag-text-to-composer'
 import { useMessageReactions } from '@/components/assistant-ui/thread/use-message-reactions'
 import { UserMessageText } from '@/components/assistant-ui/thread/user-message-text'
 import { Codicon } from '@/components/ui/codicon'
@@ -308,6 +309,7 @@ export const UserMessage: FC<{
 
   const [pickerOpen, setPickerOpen] = useState(false)
   const { enabled: reactionsEnabled, react, reactions: shownReactions } = useMessageReactions(messageId, 'user')
+  const { onDragEnd, onDragStart } = useDragTextToComposer()
 
   const pickEmoji = useCallback(
     (emoji: null | string) => {
@@ -483,6 +485,8 @@ export const UserMessage: FC<{
                       triggerHaptic('selection')
                       setExpanded(value => !value)
                     }}
+                    onDragEnd={onDragEnd}
+                    onDragStart={onDragStart}
                     title={bodyClamped ? (expanded ? t.common.collapse : copy.expandMessage) : undefined}
                     type="button"
                   >
@@ -507,6 +511,8 @@ export const UserMessage: FC<{
 
                         triggerHaptic('selection')
                       }}
+                      onDragEnd={onDragEnd}
+                      onDragStart={onDragStart}
                       onPointerDown={() => {
                         if (hasTextSelection()) {
                           return
