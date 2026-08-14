@@ -632,9 +632,11 @@ class TestPluginHooks:
         assert "subagent_lifecycle" in VALID_HOOKS
         assert "delegation_wrapper_lifecycle" in VALID_HOOKS
         assert "managed_process_lifecycle" in VALID_HOOKS
+        assert "session_turn_lifecycle" in VALID_HOOKS
         assert HOOK_CONTRACT_VERSIONS["subagent_lifecycle"] == 2
         assert HOOK_CONTRACT_VERSIONS["delegation_wrapper_lifecycle"] == 1
         assert HOOK_CONTRACT_VERSIONS["managed_process_lifecycle"] == 2
+        assert HOOK_CONTRACT_VERSIONS["session_turn_lifecycle"] == 1
         assert "transform_terminal_output" in VALID_HOOKS
         assert "transform_tool_result" in VALID_HOOKS
         assert "transform_llm_output" in VALID_HOOKS

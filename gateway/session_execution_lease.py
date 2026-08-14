@@ -23,6 +23,7 @@ class SessionExecutionLease:
     session_id: str
     owner_id: str
     _heartbeat_task: Optional[asyncio.Task[Any]] = None
+    _release_task: Optional[asyncio.Task[bool]] = None
     _released: bool = False
     _lost: bool = False
     _on_lost: Optional[Callable[[], None]] = None
@@ -90,16 +91,28 @@ class SessionExecutionLease:
         return owned
 
     async def release(self) -> bool:
-        if self._released:
-            return False
-        self._released = True
+        """Release exactly once; cancellation never abandons the operation.
+
+        ``_released`` means either the release completed or ``_release_task``
+        is the shielded in-flight operation that every caller can re-await.
+        """
+        if self._release_task is None:
+            self._release_task = asyncio.create_task(self._release())
+            self._released = True
+        return await asyncio.shield(self._release_task)
+
+    async def _release(self) -> bool:
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._heartbeat_task
-        return bool(await asyncio.to_thread(
-            self.db.release_session_execution_lease, self.session_id, self.owner_id
-        ))
+        return bool(
+            await asyncio.to_thread(
+                self.db.release_session_execution_lease,
+                self.session_id,
+                self.owner_id,
+            )
+        )
 
     async def __aenter__(self) -> "SessionExecutionLease":
         return self

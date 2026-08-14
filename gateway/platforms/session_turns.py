@@ -11,19 +11,549 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import concurrent.futures
 import hashlib
 import io
 import json
+import logging
+import queue
 import re
+import threading
 import time
 import uuid
 import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from enum import Enum
+from typing import Any, Callable, Dict, Optional, TypeVar
 
 from aiohttp import web
 
 from gateway.session_execution_lease import SessionExecutionConflict
+
+
+logger = logging.getLogger(__name__)
+_StoreResult = TypeVar("_StoreResult")
+
+SESSION_TURN_HEARTBEAT_INTERVAL_SECONDS = 15.0
+SESSION_TURN_LIFECYCLE_QUEUE_SIZE = 32
+SESSION_TURN_LIFECYCLE_WORKERS = 4
+SESSION_TURN_LIFECYCLE_PENDING_DISPATCHERS = 32
+SESSION_TURN_LIFECYCLE_SLOW_SECONDS = 0.1
+SESSION_TURN_LIFECYCLE_FLUSH_SECONDS = 0.05
+SESSION_TURN_CALLBACK_QUEUE_SIZE = 32
+SESSION_TURN_CALLBACK_ENQUEUE_TIMEOUT_SECONDS = 1.0
+
+
+class _CallbackEventClass(Enum):
+    """Persistence guarantees for events emitted by synchronous agent callbacks."""
+
+    STRUCTURAL = "structural"
+    VOLATILE = "volatile"
+
+
+@dataclass(frozen=True)
+class _CallbackPersistenceEvent:
+    event_class: _CallbackEventClass
+    event_type: str
+    data: Dict[str, Any]
+    structural_sequence: Optional[int] = None
+
+
+@dataclass
+class _StructuralSubmission:
+    """Handshake that makes timeout cancellation and enqueue mutually exclusive."""
+
+    event: _CallbackPersistenceEvent
+    lock: threading.Lock
+    cancelled: bool = False
+    enqueued: bool = False
+
+
+class _CallbackPersistenceOverloaded(RuntimeError):
+    """Stop a producer after retaining an exact structural resync range."""
+
+
+class _InterruptDeliveryFailed(RuntimeError):
+    """Privacy-safe internal signal that an agent rejected an interrupt call."""
+
+
+class _CallbackPersistenceIngress:
+    """Bounded sync-callback ingress to one loop-owned persistence pump.
+
+    Structural callbacks apply bounded backpressure. If a callback cannot be
+    retained, one out-of-band resync range records every rejected structural
+    ordinal; the pump persists that marker after all retained events and before
+    terminal truth. Volatile deltas use one coalescing loop notification.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, maxsize: int):
+        self.loop = loop
+        self.queue: asyncio.Queue[_CallbackPersistenceEvent] = asyncio.Queue(
+            maxsize=max(1, maxsize)
+        )
+        self.done = asyncio.Event()
+        self.pump_task: Optional[asyncio.Task[Any]] = None
+        self.max_observed = 0
+        self.resync_required = False
+        self._loop_thread_id = threading.get_ident()
+        self._volatile_lock = threading.Lock()
+        self._pending_volatile: Optional[_CallbackPersistenceEvent] = None
+        self._volatile_notification_pending = False
+        self._accepting = True
+        self._structural_lock = threading.Lock()
+        self._next_structural_sequence = 1
+        self._structural_resync_range: Optional[tuple[int, int]] = None
+        self._producer_stopped = False
+
+    def bind_pump(self, pump_task: asyncio.Task[Any]) -> None:
+        self.pump_task = pump_task
+
+    def append_structural(self, event_type: str, data: Dict[str, Any]) -> None:
+        # Serialize producers so the first rejected ordinal closes ingress and
+        # every later rejected fact extends one exact contiguous range.
+        with self._structural_lock:
+            sequence = self._next_structural_sequence
+            self._next_structural_sequence += 1
+            event = _CallbackPersistenceEvent(
+                _CallbackEventClass.STRUCTURAL,
+                event_type,
+                dict(data),
+                structural_sequence=sequence,
+            )
+            if self._producer_stopped or not self._accepting:
+                self._mark_structural_resync(sequence)
+                raise _CallbackPersistenceOverloaded("callback persistence closed")
+            if threading.get_ident() == self._loop_thread_id:
+                try:
+                    self.queue.put_nowait(event)
+                except asyncio.QueueFull as exc:
+                    self._mark_structural_resync(sequence)
+                    raise _CallbackPersistenceOverloaded(
+                        "structural callback persistence saturated"
+                    ) from exc
+                self._observe_size()
+                return
+            self._append_structural_from_callback_thread(event, sequence)
+
+    def _append_structural_from_callback_thread(
+        self, event: _CallbackPersistenceEvent, sequence: int
+    ) -> None:
+        if self.loop.is_closed() or not self.loop.is_running():
+            self._mark_structural_resync(sequence)
+            raise _CallbackPersistenceOverloaded("callback persistence loop unavailable")
+        submission = _StructuralSubmission(event=event, lock=threading.Lock())
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._put_structural(submission), self.loop
+            )
+        except RuntimeError as exc:
+            self._mark_structural_resync(sequence)
+            raise _CallbackPersistenceOverloaded(
+                "callback persistence loop unavailable"
+            ) from exc
+        deadline = time.monotonic() + SESSION_TURN_CALLBACK_ENQUEUE_TIMEOUT_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or self.loop.is_closed() or not self.loop.is_running():
+                with submission.lock:
+                    if submission.enqueued:
+                        return
+                    submission.cancelled = True
+                future.cancel()
+                self._mark_structural_resync(sequence)
+                raise _CallbackPersistenceOverloaded(
+                    "structural callback persistence unavailable"
+                )
+            try:
+                future.result(timeout=min(0.05, remaining))
+                return
+            except concurrent.futures.TimeoutError:
+                continue
+            except Exception as exc:
+                with submission.lock:
+                    enqueued = submission.enqueued
+                if enqueued:
+                    return
+                self._mark_structural_resync(sequence)
+                raise _CallbackPersistenceOverloaded(
+                    "callback persistence unavailable"
+                ) from exc
+
+    async def _put_structural(self, submission: _StructuralSubmission) -> None:
+        while self._accepting:
+            if self.pump_task is not None and self.pump_task.done():
+                raise _CallbackPersistenceOverloaded("callback persistence unavailable")
+            with submission.lock:
+                if submission.cancelled:
+                    raise _CallbackPersistenceOverloaded(
+                        "callback persistence enqueue cancelled"
+                    )
+                try:
+                    self.queue.put_nowait(submission.event)
+                except asyncio.QueueFull:
+                    pass
+                else:
+                    submission.enqueued = True
+                    self._observe_size()
+                    return
+            await asyncio.sleep(0.01)
+        raise _CallbackPersistenceOverloaded("callback persistence closed")
+
+    def _mark_structural_resync(self, sequence: int) -> None:
+        self._producer_stopped = True
+        if self._structural_resync_range is None:
+            self._structural_resync_range = (sequence, sequence)
+        else:
+            first, last = self._structural_resync_range
+            self._structural_resync_range = (min(first, sequence), max(last, sequence))
+
+    @property
+    def structural_resync_range(self) -> Optional[tuple[int, int]]:
+        with self._structural_lock:
+            return self._structural_resync_range
+
+    def append_volatile(self, event_type: str, data: Dict[str, Any]) -> None:
+        event = _CallbackPersistenceEvent(
+            _CallbackEventClass.VOLATILE, event_type, dict(data)
+        )
+        if threading.get_ident() == self._loop_thread_id:
+            if not self._accepting:
+                return
+            try:
+                self.queue.put_nowait(event)
+                self._observe_size()
+            except asyncio.QueueFull:
+                self.resync_required = True
+            return
+        with self._volatile_lock:
+            if not self._accepting:
+                return
+            if self._pending_volatile is not None:
+                # Do not concatenate bodies: retained callback memory stays fixed.
+                self.resync_required = True
+                return
+            self._pending_volatile = event
+            if self._volatile_notification_pending:
+                return
+            self._volatile_notification_pending = True
+        self.loop.call_soon_threadsafe(self._flush_volatile)
+
+    def _flush_volatile(self) -> None:
+        with self._volatile_lock:
+            event = self._pending_volatile
+            self._pending_volatile = None
+            self._volatile_notification_pending = False
+        if event is None:
+            return
+        if not self._accepting:
+            self.resync_required = True
+            return
+        try:
+            self.queue.put_nowait(event)
+            self._observe_size()
+        except asyncio.QueueFull:
+            self.resync_required = True
+
+    def close(self) -> None:
+        """Run on the loop after the agent exits; retain or mark the last delta."""
+        with self._volatile_lock:
+            self._accepting = False
+            pending = self._pending_volatile
+            self._pending_volatile = None
+        if pending is not None:
+            try:
+                self.queue.put_nowait(pending)
+                self._observe_size()
+            except asyncio.QueueFull:
+                self.resync_required = True
+        self.done.set()
+
+    def _observe_size(self) -> None:
+        self.max_observed = max(self.max_observed, self.queue.qsize())
+
+
+@dataclass
+class _TurnExecutionState:
+    """Authoritative phase reached only after the corresponding durable write."""
+
+    entered: bool = False
+    started: bool = False
+    execution_done: bool = False
+
+    @property
+    def cancellation_code(self) -> str:
+        if not self.started:
+            return "cancelled_before_execution"
+        if self.execution_done:
+            return "cancelled_after_execution"
+        return "cancelled_during_execution"
+
+
+def _emit_turn_lifecycle(event: str, session_id: str, turn_id: str, **extra: Any) -> bool:
+    """Invoke the provider boundary. Call only from an observer worker thread."""
+    try:
+        from agent.lifecycle_hooks import emit_session_turn_lifecycle
+
+        return emit_session_turn_lifecycle(
+            event,
+            session_id=session_id,
+            turn_id=turn_id,
+            **extra,
+        )
+    except Exception:
+        logger.warning(
+            "session_turn_lifecycle_failed event=%s reason=invalid_or_callback_error",
+            event,
+        )
+        return False
+
+
+_lifecycle_metric_lock = threading.Lock()
+_lifecycle_metrics = {
+    "heartbeat_dropped": 0,
+    "observer_failed": 0,
+    "observer_slow": 0,
+    "observer_capacity_exhausted": 0,
+    "terminal_enqueue_failed": 0,
+}
+
+
+def _note_lifecycle_degradation(metric: str, event: str, reason: str) -> None:
+    """Record a privacy-safe provider degradation without touching execution."""
+    with _lifecycle_metric_lock:
+        _lifecycle_metrics[metric] = _lifecycle_metrics.get(metric, 0) + 1
+    logger.warning(
+        "session_turn_lifecycle_degraded event=%s reason=%s metric=%s",
+        event,
+        reason,
+        metric,
+    )
+
+
+def session_turn_lifecycle_metrics() -> Dict[str, int]:
+    """Return process-local safe counters for monitoring/tests."""
+    with _lifecycle_metric_lock:
+        return dict(_lifecycle_metrics)
+
+
+class _SessionTurnLifecycleExecutor:
+    """Process-wide fixed observer capacity with a bounded pending queue.
+
+    Python cannot forcibly stop a plugin callback. A hung callback therefore
+    occupies one of a fixed number of daemon workers, while the bounded queue
+    prevents completed turns from accumulating behind it forever. Once both
+    bounds are exhausted, new lifecycle streams explicitly degrade fail-open.
+    """
+
+    def __init__(self, workers: int, pending: int):
+        self.worker_count = max(1, workers)
+        self.pending_capacity = max(1, pending)
+        self._queue: queue.Queue[SessionTurnLifecycleDispatcher] = queue.Queue(
+            maxsize=self.pending_capacity
+        )
+        self._start_lock = threading.Lock()
+        self._stats_lock = threading.Lock()
+        self._started = False
+        self._active = 0
+        self._next_observation = 0
+        self._observations: Dict[int, tuple[str, float, bool]] = {}
+        # Pay the fixed worker startup cost at module initialization, never on
+        # a latency-sensitive turn-admission path.
+        self._start_workers()
+        threading.Thread(
+            target=self._watch_slow_callbacks,
+            name="session-lifecycle-watchdog",
+            daemon=True,
+        ).start()
+
+    def submit(self, dispatcher: "SessionTurnLifecycleDispatcher") -> bool:
+        try:
+            self._queue.put_nowait(dispatcher)
+            return True
+        except queue.Full:
+            return False
+
+    def stats(self) -> Dict[str, int]:
+        with self._stats_lock:
+            active = self._active
+        return {
+            "workers": self.worker_count,
+            "active": active,
+            "pending": self._queue.qsize(),
+            "pending_capacity": self.pending_capacity,
+        }
+
+    def observe_callback_started(self, event: str) -> int:
+        with self._stats_lock:
+            self._next_observation += 1
+            token = self._next_observation
+            self._observations[token] = (event, time.monotonic(), False)
+            return token
+
+    def observe_callback_finished(self, token: int) -> None:
+        with self._stats_lock:
+            self._observations.pop(token, None)
+
+    def _start_workers(self) -> None:
+        if self._started:
+            return
+        with self._start_lock:
+            if self._started:
+                return
+            for index in range(self.worker_count):
+                threading.Thread(
+                    target=self._worker,
+                    name=f"session-turn-lifecycle-{index}",
+                    daemon=True,
+                ).start()
+            self._started = True
+
+    def _worker(self) -> None:
+        while True:
+            dispatcher = self._queue.get()
+            with self._stats_lock:
+                self._active += 1
+            try:
+                dispatcher._run()
+            finally:
+                with self._stats_lock:
+                    self._active -= 1
+                self._queue.task_done()
+
+    def _watch_slow_callbacks(self) -> None:
+        """Report hung callbacks from one fixed watchdog, never per-turn timers."""
+        while True:
+            time.sleep(max(0.01, SESSION_TURN_LIFECYCLE_SLOW_SECONDS / 2))
+            now = time.monotonic()
+            slow_events = []
+            with self._stats_lock:
+                for token, (event, started_at, reported) in list(
+                    self._observations.items()
+                ):
+                    if not reported and now - started_at >= SESSION_TURN_LIFECYCLE_SLOW_SECONDS:
+                        self._observations[token] = (event, started_at, True)
+                        slow_events.append(event)
+            for event in slow_events:
+                _note_lifecycle_degradation(
+                    "observer_slow", event, "callback_slow"
+                )
+
+
+_lifecycle_executor = _SessionTurnLifecycleExecutor(
+    SESSION_TURN_LIFECYCLE_WORKERS,
+    SESSION_TURN_LIFECYCLE_PENDING_DISPATCHERS,
+)
+
+
+def session_turn_lifecycle_executor_stats() -> Dict[str, int]:
+    """Return privacy-safe fixed-capacity observer executor diagnostics."""
+    return _lifecycle_executor.stats()
+
+
+class SessionTurnLifecycleDispatcher:
+    """Ordered, bounded, non-blocking observer delivery for one durable turn.
+
+    Plugin code runs only on the process-wide fixed daemon pool. Heartbeats are
+    lossy under backpressure, while the structural registered/started/terminal
+    facts are retained. A slow or permanently hung plugin therefore cannot
+    hold aiohttp, the coordinator, or the persistent execution lease.
+    """
+
+    def __init__(self, session_id: str, turn_id: str):
+        self.session_id = session_id
+        self.turn_id = turn_id
+        self._queue: queue.Queue[tuple[str, Dict[str, Any]]] = queue.Queue(
+            maxsize=max(4, SESSION_TURN_LIFECYCLE_QUEUE_SIZE)
+        )
+        self._closed = False
+        self._drained = threading.Event()
+        # Registered is admitted before the worker can observe later events.
+        self._queue.put_nowait(("registered", {}))
+        self._admitted = _lifecycle_executor.submit(self)
+        if not self._admitted:
+            self._closed = True
+            self._drained.set()
+            _note_lifecycle_degradation(
+                "observer_capacity_exhausted", "registered", "executor_saturated"
+            )
+
+    def emit(self, event: str, **extra: Any) -> bool:
+        """Queue an event without waiting; return whether it was retained."""
+        if self._closed:
+            _note_lifecycle_degradation("observer_failed", event, "dispatcher_closed")
+            return False
+        try:
+            self._queue.put_nowait((event, dict(extra)))
+            return True
+        except queue.Full:
+            if event == "heartbeat":
+                _note_lifecycle_degradation("heartbeat_dropped", event, "queue_full")
+                return False
+            # Structural events must not be displaced by observer latency.
+            # At capacity after registered/started, at least one queued item is
+            # a heartbeat; evict the oldest heartbeat without blocking.
+            with self._queue.mutex:
+                for index, item in enumerate(self._queue.queue):
+                    if item[0] == "heartbeat":
+                        del self._queue.queue[index]
+                        self._queue.not_full.notify()
+                        break
+                else:
+                    _note_lifecycle_degradation(
+                        "terminal_enqueue_failed" if event == "terminal" else "observer_failed",
+                        event,
+                        "structural_queue_full",
+                    )
+                    return False
+            self._queue.put_nowait((event, dict(extra)))
+            return True
+
+    def close(self, terminal_outcome: str) -> bool:
+        """Queue exactly one terminal and reject all later events."""
+        if self._closed:
+            return False
+        accepted = self.emit("terminal", terminal_outcome=terminal_outcome)
+        self._closed = True
+        return accepted
+
+    def abort(self) -> bool:
+        """Stop delivery without inventing a non-durable terminal fact."""
+        if self._closed:
+            return False
+        accepted = self.emit("_close")
+        self._closed = True
+        return accepted
+
+    def flush(self, timeout: Optional[float] = None) -> bool:
+        """Wait for terminal delivery. Never call directly on the event loop."""
+        return self._drained.wait(timeout)
+
+    def _run(self) -> None:
+        while True:
+            event, extra = self._queue.get()
+            if event == "_close":
+                self._drained.set()
+                return
+            observation = _lifecycle_executor.observe_callback_started(event)
+            try:
+                delivered = _emit_turn_lifecycle(
+                    event,
+                    self.session_id,
+                    self.turn_id,
+                    **extra,
+                )
+                if not delivered:
+                    _note_lifecycle_degradation(
+                        "observer_failed", event, "callback_error"
+                    )
+            except Exception:
+                # Defensive: _emit_turn_lifecycle is already fail-open.
+                _note_lifecycle_degradation("observer_failed", event, "callback_error")
+            finally:
+                _lifecycle_executor.observe_callback_finished(observation)
+            if event == "terminal":
+                self._drained.set()
+                return
 
 
 DELIVERY_MODES = frozenset({"occ_only", "slack_only", "both"})
@@ -487,7 +1017,10 @@ class SessionTurnStore:
         content = self.db._decode_content(row["content"])
         return content if isinstance(content, str) else None
 
-    def request_stop(self, turn_id: str) -> Optional[Dict[str, Any]]:
+    def request_stop(
+        self, turn_id: str
+    ) -> Optional[tuple[Dict[str, Any], bool]]:
+        """Atomically request stop, record its edge once, and report ownership."""
         now = time.time()
 
         def stop(conn):
@@ -496,15 +1029,26 @@ class SessionTurnStore:
             ).fetchone()
             if row is None:
                 return None
-            if row["status"] not in TERMINAL_STATUSES:
+            transitioned = row["status"] in {"queued", "running"}
+            if transitioned:
                 conn.execute(
                     "UPDATE api_session_turns SET stop_requested = 1, status = 'stopping', "
                     "updated_at = ? WHERE turn_id = ?", (now, turn_id)
                 )
+                seq_row = conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 AS seq "
+                    "FROM api_session_turn_events WHERE turn_id = ?", (turn_id,)
+                ).fetchone()
+                conn.execute(
+                    "INSERT INTO api_session_turn_events "
+                    "(turn_id, seq, event_type, data_json, created_at) "
+                    "VALUES (?, ?, 'turn.stopping', ?, ?)",
+                    (turn_id, int(seq_row["seq"]), '{\"status\": \"stopping\"}', now),
+                )
             result = conn.execute(
                 "SELECT * FROM api_session_turns WHERE turn_id = ?", (turn_id,)
             ).fetchone()
-            return dict(result)
+            return dict(result), transitioned
         return self.db._execute_write(stop)
 
     def stop_requested(self, turn_id: str) -> bool:
@@ -824,8 +1368,25 @@ class SessionTurnService:
         self.adapter = adapter
         self._stores: Dict[int, SessionTurnStore] = {}
         self._store_lock = asyncio.Lock()
+        # SessionDB serializes SQLite with its own lock. This lock additionally
+        # preserves submission order for all loop-originated store operations;
+        # the operation itself always runs off the aiohttp loop.
+        self._store_operation_lock = asyncio.Lock()
         self._tasks: Dict[str, asyncio.Task[Any]] = {}
         self._agent_refs: Dict[str, list[Any]] = {}
+        # Stop requests have two distinct pieces of process-local ownership.
+        # The handoff survives its HTTP waiter, while an interruption owner
+        # prevents concurrent/recovery handoffs from spawning duplicate
+        # interrupts for the same durable stopping edge.  The interruption
+        # owner is a per-turn lifetime marker: completing the synchronous
+        # interrupt call (or its watcher) does not mean the worker has exited.
+        self._stop_handoffs: Dict[
+            tuple[str, str], asyncio.Task[tuple[Optional[Dict[str, Any]], bool]]
+        ] = {}
+        self._interruption_owners: Dict[str, asyncio.Task[Any]] = {}
+        self._interruption_watcher_owners: Dict[str, asyncio.Task[Any]] = {}
+        self._lifecycle_dispatchers: Dict[str, SessionTurnLifecycleDispatcher] = {}
+        self._lifecycle_cleanup_owners: set[str] = set()
         # Assistant text deltas are intentionally process-local. Canonical
         # SessionDB messages are the only durable transcript authority.
         self._volatile_events: Dict[str, Dict[int, Dict[str, Any]]] = {}
@@ -839,14 +1400,84 @@ class SessionTurnService:
             return self._stores[key]
         async with self._store_lock:
             if key not in self._stores:
-                store = await asyncio.to_thread(SessionTurnStore, db)
-                await asyncio.to_thread(store.reconcile_uncertain)
+                def initialize_store() -> SessionTurnStore:
+                    store = SessionTurnStore(db)
+                    store.reconcile_uncertain()
+                    return store
+
+                store = await self._store_operation(initialize_store)
                 self._stores[key] = store
         return self._stores[key]
 
     async def reconcile_startup(self) -> None:
         """Initialize the ledger and interrupt crash-uncertain prior work."""
         await self._store()
+
+    async def _store_operation(
+        self,
+        operation: Callable[[], _StoreResult],
+        *,
+        propagate_cancellation: bool = True,
+    ) -> _StoreResult:
+        """Run one ordered store operation off-loop and never abandon its thread."""
+
+        async def run_ordered() -> _StoreResult:
+            async with self._store_operation_lock:
+                return await asyncio.to_thread(operation)
+
+        operation_task = asyncio.create_task(run_ordered())
+        cancelled = False
+        while True:
+            try:
+                result = await asyncio.shield(operation_task)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                continue
+        if cancelled and propagate_cancellation:
+            raise asyncio.CancelledError
+        return result
+
+    async def _finish_turn(
+        self,
+        store: SessionTurnStore,
+        turn_id: str,
+        status: str,
+        event_type: str,
+        error_code: Optional[str] = None,
+        effective_session_id: Optional[str] = None,
+    ) -> bool:
+        """Persist terminal row and matching ledger event as one ordered unit."""
+
+        def finish_and_append() -> bool:
+            changed = store.finish(
+                turn_id,
+                status,
+                safe_error_code=error_code,
+                effective_session_id=effective_session_id,
+            )
+            if changed:
+                data = {"status": status}
+                if error_code is not None:
+                    data["error_code"] = error_code
+                store.append_event(turn_id, event_type, data)
+            return changed
+
+        # Terminal ownership must survive cancellation through both writes.
+        return await self._store_operation(
+            finish_and_append, propagate_cancellation=False
+        )
+
+    async def _finish_after_callback_store_failure(
+        self, store: SessionTurnStore, turn_id: str
+    ) -> None:
+        """Terminate without appending behind structural events the pump lost."""
+        await self._store_operation(
+            lambda: store.finish(
+                turn_id, "failed", safe_error_code="event_store_failed"
+            ),
+            propagate_cancellation=False,
+        )
 
     @staticmethod
     def _turn_id(request: web.Request, body: Dict[str, Any]) -> str:
@@ -882,11 +1513,11 @@ class SessionTurnService:
 
         # An accepted idempotency key is durable truth. Browser retries must
         # reuse it even if the Slack adapter's current connectivity changed.
-        existing = await asyncio.to_thread(store.get, turn_id)
+        existing = await self._store_operation(lambda: store.get(turn_id))
         if existing is not None:
             try:
-                _turn, _created = await asyncio.to_thread(
-                    store.reserve, session_id, turn_id, payload
+                _turn, _created = await self._store_operation(
+                    lambda: store.reserve(session_id, turn_id, payload)
                 )
             except ConflictingTurn:
                 return _error(
@@ -899,7 +1530,9 @@ class SessionTurnService:
             return web.json_response(
                 {
                     "object": "hermes.session.turn.reused",
-                    "turn": store.public_turn(turn_id),
+                    "turn": await self._store_operation(
+                        lambda: store.public_turn(turn_id)
+                    ),
                 },
                 status=200,
             )
@@ -908,8 +1541,8 @@ class SessionTurnService:
         slack_adapter = None
         if payload["delivery_mode"] in {"slack_only", "both"}:
             try:
-                binding = await asyncio.to_thread(
-                    resolve_slack_binding, store.db, session_id
+                binding = await self._store_operation(
+                    lambda: resolve_slack_binding(store.db, session_id)
                 )
             except SlackBindingError as exc:
                 return _error("Session has no unique Slack binding", exc.code, 409)
@@ -918,7 +1551,9 @@ class SessionTurnService:
                 return _error("Slack adapter is not connected", "slack_unavailable", 503)
 
         try:
-            turn, created = await asyncio.to_thread(store.reserve, session_id, turn_id, payload)
+            turn, created = await self._store_operation(
+                lambda: store.reserve(session_id, turn_id, payload)
+            )
         except ConflictingTurn:
             return _error("turn_id was already used for a different request", "idempotency_conflict", 409)
         except TurnConflict:
@@ -927,26 +1562,117 @@ class SessionTurnService:
             return _error(str(exc), "invalid_turn", 400)
 
         if created:
-            task = asyncio.create_task(
-                self._execute(store, turn_id, session_id, payload, binding, slack_adapter)
+            # reserve() committed the runnable identity before this observation.
+            self._admit_execution(
+                store, turn_id, session_id, payload, binding, slack_adapter
             )
-            self._tasks[turn_id] = task
-            try:
-                self.adapter._background_tasks.add(task)
-                task.add_done_callback(self.adapter._background_tasks.discard)
-            except (AttributeError, TypeError):
-                pass
-            task.add_done_callback(lambda _task, tid=turn_id: self._tasks.pop(tid, None))
-        public = store.public_turn(turn_id)
+        public = await self._store_operation(lambda: store.public_turn(turn_id))
         return web.json_response(
             {"object": "hermes.session.turn.accepted" if created else "hermes.session.turn.reused", "turn": public},
             status=202 if created else 200,
         )
 
+    @staticmethod
+    def _consume_background_task_exception(task: asyncio.Task[Any]) -> None:
+        """Retrieve failures and log only a stable, privacy-safe classification."""
+        if task.cancelled():
+            return
+        try:
+            failure = task.exception()
+        except asyncio.CancelledError:
+            return
+        if failure is not None:
+            logger.error(
+                "session_turn_background_task_failed reason=internal_task_error"
+            )
+
+    def _track_background_task(self, task: asyncio.Task[Any]) -> None:
+        # Exception retrieval is unconditional even when an adapter does not
+        # expose the optional ownership set.
+        task.add_done_callback(self._consume_background_task_exception)
+        try:
+            self.adapter._background_tasks.add(task)
+            task.add_done_callback(self.adapter._background_tasks.discard)
+        except (AttributeError, TypeError):
+            pass
+
+    def _admit_execution(
+        self,
+        store: SessionTurnStore,
+        turn_id: str,
+        session_id: str,
+        payload: Dict[str, Any],
+        binding: Optional[SlackBinding],
+        slack_adapter: Any,
+    ) -> asyncio.Task[Any]:
+        """Own task admission and its never-entered cancellation seam."""
+        # Construct before scheduling: registered is already first in its FIFO.
+        dispatcher = SessionTurnLifecycleDispatcher(session_id, turn_id)
+        self._lifecycle_dispatchers[turn_id] = dispatcher
+        phase = _TurnExecutionState()
+        task = asyncio.create_task(
+            self._execute(
+                store,
+                turn_id,
+                session_id,
+                payload,
+                binding,
+                slack_adapter,
+                phase,
+            )
+        )
+        self._tasks[turn_id] = task
+        self._track_background_task(task)
+
+        def execution_done(done: asyncio.Task[Any]) -> None:
+            # Explicitly consume the execution exception here as well as in the
+            # generic tracker. Reading it does not alter cleanup ownership.
+            self._consume_background_task_exception(done)
+            if done.cancelled() and not phase.entered:
+                # A coroutine cancelled before its first instruction cannot run
+                # _execute's try/finally. Transfer all ownership to the same
+                # cleanup seam used by the normal execution epilogue.
+                cleanup = asyncio.create_task(
+                    self._finalize_execution(
+                        store,
+                        turn_id,
+                        cancelled_before_entry=True,
+                    )
+                )
+                self._tasks[turn_id] = cleanup
+                self._track_background_task(cleanup)
+                cleanup.add_done_callback(
+                    lambda finished, tid=turn_id: (
+                        self._consume_background_task_exception(finished),
+                        self._remove_task_if_current(tid, finished),
+                    )
+                )
+            else:
+                self._remove_task_if_current(turn_id, done)
+
+        task.add_done_callback(execution_done)
+        return task
+
+    def _remove_task_if_current(
+        self, turn_id: str, task: asyncio.Task[Any]
+    ) -> None:
+        if self._tasks.get(turn_id) is task:
+            self._tasks.pop(turn_id, None)
+
     async def _execute(self, store: SessionTurnStore, turn_id: str, session_id: str,
-                       payload: Dict[str, Any], binding: Optional[SlackBinding], slack_adapter: Any) -> None:
+                       payload: Dict[str, Any], binding: Optional[SlackBinding], slack_adapter: Any,
+                       phase: Optional[_TurnExecutionState] = None) -> None:
+        phase = phase or _TurnExecutionState()
+        phase.entered = True
         agent_ref: list[Any] = [None]
         execution_lease = None
+        heartbeat_task: Optional[asyncio.Task[Any]] = None
+        agent_task: Optional[asyncio.Task[Any]] = None
+        callback_event_task: Optional[asyncio.Task[Any]] = None
+        callback_ingress: Optional[_CallbackPersistenceIngress] = None
+        callback_events_drained = False
+        drain_callback_events: Optional[Callable[[], Any]] = None
+        dispatcher = self._lifecycle_dispatchers.get(turn_id)
         self._agent_refs[turn_id] = agent_ref
         try:
             def interrupt_on_lease_loss() -> None:
@@ -961,39 +1687,135 @@ class SessionTurnService:
                     on_lost=interrupt_on_lease_loss,
                 )
             except SessionExecutionConflict:
-                store.finish(turn_id, "failed", safe_error_code="active_session_execution")
-                store.append_event(turn_id, "turn.failed", {"status": "failed", "error_code": "active_session_execution"})
+                await self._finish_turn(
+                    store, turn_id, "failed", "turn.failed", "active_session_execution"
+                )
                 return
-            if store.stop_requested(turn_id):
-                store.finish(turn_id, "interrupted", safe_error_code="stopped_before_start")
-                store.append_event(turn_id, "turn.interrupted", {"status": "interrupted", "error_code": "stopped_before_start"})
+            if await self._store_operation(lambda: store.stop_requested(turn_id)):
+                await self._finish_turn(
+                    store, turn_id, "interrupted", "turn.interrupted", "stopped_before_start"
+                )
                 return
-            if not store.set_running(turn_id):
+            def start_turn() -> bool:
+                if not store.set_running(turn_id):
+                    return False
+                store.append_event(turn_id, "turn.started", {"status": "running"})
+                # Set in the same off-loop ownership unit as the durable write.
+                # If the coordinator is cancelled while awaiting this worker,
+                # _store_operation waits for it and the catch below sees truth.
+                phase.started = True
+                return True
+
+            if not await self._store_operation(start_turn):
                 return
-            store.append_event(turn_id, "turn.started", {"status": "running"})
+            if dispatcher is not None:
+                dispatcher.emit("started")
+
+            async def emit_heartbeats() -> None:
+                while True:
+                    await asyncio.sleep(SESSION_TURN_HEARTBEAT_INTERVAL_SECONDS)
+                    if dispatcher is not None:
+                        dispatcher.emit("heartbeat")
+
+            heartbeat_task = asyncio.create_task(emit_heartbeats())
             try:
                 history = await self.adapter._conversation_history_for_session(session_id)
             except Exception:
-                store.finish(turn_id, "failed", safe_error_code="history_read_failed")
-                store.append_event(turn_id, "turn.failed", {"status": "failed", "error_code": "history_read_failed"})
-                return
-            if store.stop_requested(turn_id):
-                store.finish(turn_id, "interrupted", safe_error_code="stopped_before_execution")
-                store.append_event(
-                    turn_id,
-                    "turn.interrupted",
-                    {"status": "interrupted", "error_code": "stopped_before_execution"},
+                await self._finish_turn(
+                    store, turn_id, "failed", "turn.failed", "history_read_failed"
                 )
                 return
-            message_high_water = await asyncio.to_thread(store.message_high_water)
+            if await self._store_operation(lambda: store.stop_requested(turn_id)):
+                await self._finish_turn(
+                    store, turn_id, "interrupted", "turn.interrupted",
+                    "stopped_before_execution",
+                )
+                return
+            message_high_water = await self._store_operation(store.message_high_water)
 
-            def append(event_type: str, data: Dict[str, Any]) -> None:
-                durable = store.append_event(turn_id, event_type, data)
-                if event_type == "assistant.delta" and payload["delivery_mode"] != "slack_only":
-                    self._volatile_events.setdefault(turn_id, {})[durable["seq"]] = {
-                        **durable,
-                        "data": dict(data),
-                    }
+            callback_ingress = _CallbackPersistenceIngress(
+                asyncio.get_running_loop(), SESSION_TURN_CALLBACK_QUEUE_SIZE
+            )
+
+            async def persist_callback_events() -> None:
+                assert callback_ingress is not None
+                while True:
+                    if callback_ingress.done.is_set() and callback_ingress.queue.empty():
+                        break
+                    try:
+                        event = await asyncio.wait_for(
+                            callback_ingress.queue.get(), timeout=0.05
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+                    durable = await self._store_operation(
+                        lambda event=event: store.append_event(
+                            turn_id, event.event_type, event.data
+                        )
+                    )
+                    if (
+                        event.event_class is _CallbackEventClass.VOLATILE
+                        and payload["delivery_mode"] != "slack_only"
+                    ):
+                        self._volatile_events.setdefault(turn_id, {})[
+                            durable["seq"]
+                        ] = {**durable, "data": dict(event.data)}
+                if callback_ingress.resync_required:
+                    # A durable body-free delta marker drives all replay paths
+                    # through the canonical-transcript resync contract.
+                    await self._store_operation(
+                        lambda: store.append_event(
+                            turn_id, "assistant.delta", {"volatile": True}
+                        )
+                    )
+                structural_range = callback_ingress.structural_resync_range
+                if structural_range is not None:
+                    missing_from, missing_through = structural_range
+                    await self._store_operation(
+                        lambda: store.append_event(
+                            turn_id,
+                            "session.resync_required",
+                            {
+                                "reason": "structural_events_lost",
+                                "missing_from": missing_from,
+                                "missing_through": missing_through,
+                            },
+                        )
+                    )
+
+            callback_event_task = asyncio.create_task(persist_callback_events())
+            callback_ingress.bind_pump(callback_event_task)
+
+            async def _drain_callback_events() -> bool:
+                nonlocal callback_events_drained
+                if not callback_events_drained:
+                    assert callback_ingress is not None
+                    callback_ingress.close()
+                    callback_events_drained = True
+                assert callback_event_task is not None
+                # Shield the single owned pump and re-await through repeated
+                # cancellation. No retained structural event may be overtaken by
+                # terminal persistence, and the pump exception is consumed here.
+                while not callback_event_task.done():
+                    try:
+                        await asyncio.shield(callback_event_task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if callback_event_task.cancelled():
+                    error: Optional[BaseException] = asyncio.CancelledError()
+                else:
+                    error = callback_event_task.exception()
+                if error is not None:
+                    logger.error(
+                        "session_turn_background_task_failed "
+                        "reason=callback_event_store_error"
+                    )
+                    return False
+                return True
+
+            drain_callback_events = _drain_callback_events
 
             def on_delta(delta: Any) -> None:
                 if (
@@ -1001,13 +1823,19 @@ class SessionTurnService:
                     and isinstance(delta, str)
                     and delta
                 ):
-                    append("assistant.delta", {"delta": delta})
+                    assert callback_ingress is not None
+                    callback_ingress.append_volatile(
+                        "assistant.delta", {"delta": delta}
+                    )
 
             def on_tool_start(tool_call_id: Any, function_name: Any, function_args: Any) -> None:
                 projected = project_safe_tool_event(
                     "tool.started", tool_call_id=tool_call_id, tool_name=function_name, args=function_args
                 )
-                append(projected["event"], projected["data"])
+                assert callback_ingress is not None
+                callback_ingress.append_structural(
+                    projected["event"], projected["data"]
+                )
 
             def on_tool_complete(tool_call_id: Any, function_name: Any, function_args: Any, function_result: Any) -> None:
                 try:
@@ -1023,48 +1851,100 @@ class SessionTurnService:
                     event_type, tool_call_id=tool_call_id, tool_name=function_name,
                     args=function_args, output=function_result,
                 )
-                append(projected["event"], projected["data"])
+                assert callback_ingress is not None
+                callback_ingress.append_structural(
+                    projected["event"], projected["data"]
+                )
 
-            result, _usage = await self.adapter._run_agent(
-                user_message=_agent_input(payload),
-                conversation_history=history,
-                session_id=session_id,
-                stream_delta_callback=on_delta,
-                tool_start_callback=on_tool_start,
-                tool_complete_callback=on_tool_complete,
-                agent_ref=agent_ref,
+            agent_task = asyncio.create_task(
+                self.adapter._run_agent(
+                    user_message=_agent_input(payload),
+                    conversation_history=history,
+                    session_id=session_id,
+                    stream_delta_callback=on_delta,
+                    tool_start_callback=on_tool_start,
+                    tool_complete_callback=on_tool_complete,
+                    agent_ref=agent_ref,
+                    authoritative_turn_id=turn_id,
+                )
             )
+            while True:
+                try:
+                    # Cancelling a Task waiting directly on run_in_executor
+                    # abandons the still-live thread. Shield the child and keep
+                    # this coordinator as monitoring owner until real exit.
+                    result, _usage = await asyncio.shield(agent_task)
+                    phase.execution_done = True
+                    break
+                except asyncio.CancelledError:
+                    if agent_task.done():
+                        # A child cancellation is a real execution outcome, not
+                        # a request to abandon coordinator ownership.
+                        await agent_task
+                    await self._store_operation(
+                        lambda: store.request_stop(turn_id),
+                        propagate_cancellation=False,
+                    )
+                    if self._interruption_owners.get(turn_id) is None:
+                        agent = agent_ref[0]
+                        if agent is not None:
+                            current = asyncio.current_task()
+                            assert current is not None
+                            self._interruption_owners[turn_id] = current
+                            try:
+                                self._deliver_interrupt(
+                                    agent,
+                                    "Session turn coordinator cancellation requested"
+                                )
+                            except _InterruptDeliveryFailed:
+                                self._release_direct_interruption_owner(
+                                    turn_id, current
+                                )
+                        else:
+                            watcher = asyncio.create_task(
+                                self._interrupt_when_available(turn_id)
+                            )
+                            self._interruption_owners[turn_id] = watcher
+                            self._interruption_watcher_owners[turn_id] = watcher
+                            self._track_background_task(watcher)
+                            watcher.add_done_callback(
+                                lambda done: self._interruption_watcher_done(
+                                    turn_id, done
+                                )
+                            )
+                    # Continue heartbeat and lease ownership until the executor
+                    # future itself resolves. Repeated cancellation is handled
+                    # by the same bounded, non-abandoning loop.
+            assert drain_callback_events is not None
+            if not await drain_callback_events():
+                await self._finish_after_callback_store_failure(store, turn_id)
+                return
             effective_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
             if execution_lease is None or not await execution_lease.still_owned():
-                store.finish(
-                    turn_id,
-                    "interrupted",
-                    safe_error_code="execution_lease_lost",
-                    effective_session_id=effective_id,
-                )
-                store.append_event(
-                    turn_id,
-                    "turn.interrupted",
-                    {"status": "interrupted", "error_code": "execution_lease_lost"},
+                await self._finish_turn(
+                    store, turn_id, "interrupted", "turn.interrupted",
+                    "execution_lease_lost", effective_id,
                 )
                 return
-            if store.stop_requested(turn_id):
-                store.finish(turn_id, "interrupted", safe_error_code="stop_requested", effective_session_id=effective_id)
-                store.append_event(turn_id, "turn.interrupted", {"status": "interrupted", "error_code": "stop_requested"})
+            if await self._store_operation(lambda: store.stop_requested(turn_id)):
+                await self._finish_turn(
+                    store, turn_id, "interrupted", "turn.interrupted",
+                    "stop_requested", effective_id,
+                )
                 return
             if not isinstance(result, dict) or result.get("failed"):
-                store.finish(turn_id, "failed", safe_error_code="run_failed", effective_session_id=effective_id)
-                store.append_event(turn_id, "turn.failed", {"status": "failed", "error_code": "run_failed"})
+                await self._finish_turn(
+                    store, turn_id, "failed", "turn.failed", "run_failed", effective_id
+                )
                 return
 
-            assistant_message_id = await asyncio.to_thread(
-                store.anchor_completed_assistant,
-                turn_id,
-                effective_id,
-                after_message_id=message_high_water,
+            assistant_message_id = await self._store_operation(
+                lambda: store.anchor_completed_assistant(
+                    turn_id, effective_id, after_message_id=message_high_water
+                )
             )
-            anchored_content = await asyncio.to_thread(
-                store.anchored_assistant_content, turn_id
+            anchored_content = await self._store_operation(
+                lambda: store.anchored_assistant_content(turn_id)
             )
             final_response = result.get("final_response")
             if (
@@ -1073,53 +1953,225 @@ class SessionTurnService:
                 or not isinstance(final_response, str)
                 or anchored_content != final_response
             ):
-                store.finish(
-                    turn_id,
-                    "failed",
-                    safe_error_code="assistant_anchor_mismatch",
-                    effective_session_id=effective_id,
-                )
-                store.append_event(
-                    turn_id,
-                    "turn.failed",
-                    {"status": "failed", "error_code": "assistant_anchor_mismatch"},
+                await self._finish_turn(
+                    store, turn_id, "failed", "turn.failed",
+                    "assistant_anchor_mismatch", effective_id,
                 )
                 return
-            store.append_event(
-                turn_id,
-                "assistant.completed",
-                {"completed": True, "assistant_message_id": assistant_message_id},
+            await self._store_operation(
+                lambda: store.append_event(
+                    turn_id,
+                    "assistant.completed",
+                    {"completed": True, "assistant_message_id": assistant_message_id},
+                )
             )
             if payload["delivery_mode"] in {"slack_only", "both"}:
                 assert binding is not None and slack_adapter is not None
                 await self._deliver_slack(
                     store, turn_id, binding, slack_adapter, anchored_content
                 )
-            store.finish(turn_id, "completed", effective_session_id=effective_id)
-            store.append_event(turn_id, "turn.completed", {"status": "completed"})
+            await self._finish_turn(
+                store, turn_id, "completed", "turn.completed",
+                effective_session_id=effective_id,
+            )
         except asyncio.CancelledError:
-            # An asyncio cancellation does not kill run_in_executor work.  Only
-            # mark interrupted here when no agent was ever created; otherwise a
-            # still-running worker must remain truthfully stopping.
-            if agent_ref[0] is None:
-                store.finish(turn_id, "interrupted", safe_error_code="cancelled_before_execution")
-            raise
+            # Phase changes only after its corresponding durable truth exists,
+            # so cancellation can never contradict a persisted turn.started.
+            if agent_task is not None and agent_task.done():
+                phase.execution_done = True
+            if callback_event_task is not None:
+                assert drain_callback_events is not None
+                if not await drain_callback_events():
+                    await self._finish_after_callback_store_failure(store, turn_id)
+                    return
+            await self._finish_turn(
+                store, turn_id, "interrupted", "turn.interrupted",
+                phase.cancellation_code,
+            )
         except Exception:
-            store.finish(turn_id, "failed", safe_error_code="run_failed")
-            store.append_event(turn_id, "turn.failed", {"status": "failed", "error_code": "run_failed"})
+            if callback_event_task is not None:
+                assert drain_callback_events is not None
+                if not await drain_callback_events():
+                    await self._finish_after_callback_store_failure(store, turn_id)
+                    return
+            await self._finish_turn(
+                store, turn_id, "failed", "turn.failed", "run_failed"
+            )
         finally:
+            await self._finalize_execution(
+                store,
+                turn_id,
+                execution_lease=execution_lease,
+                heartbeat_task=heartbeat_task,
+            )
+
+    async def _finalize_execution(
+        self,
+        store: SessionTurnStore,
+        turn_id: str,
+        *,
+        cancelled_before_entry: bool = False,
+        execution_lease: Any = None,
+        heartbeat_task: Optional[asyncio.Task[Any]] = None,
+    ) -> None:
+        """Idempotently clean up either admission or normal execution exit."""
+        if turn_id in self._lifecycle_cleanup_owners:
+            return
+        self._lifecycle_cleanup_owners.add(turn_id)
+        dispatcher = self._lifecycle_dispatchers.get(turn_id)
+        try:
+            if cancelled_before_entry:
+                await self._finish_turn(
+                    store,
+                    turn_id,
+                    "interrupted",
+                    "turn.interrupted",
+                    "cancelled_before_execution",
+                )
+
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    # Awaiting retrieves the exception; never expose its text.
+                    logger.error(
+                        "session_turn_background_task_failed reason=heartbeat_error"
+                    )
+
+            # The durable ledger alone authorizes public terminal truth. If it
+            # cannot supply a terminal row, stop the private dispatcher without
+            # synthesizing a lifecycle terminal.
+            row = await self._store_operation(
+                lambda: store.get(turn_id), propagate_cancellation=False
+            )
+            status = row.get("status") if row else None
+            outcome = (
+                {
+                    "completed": "succeeded",
+                    "failed": "failed",
+                    "interrupted": "cancelled",
+                }.get(status)
+                if isinstance(status, str)
+                else None
+            )
+            if dispatcher is not None:
+                if outcome is None:
+                    dispatcher.abort()
+                else:
+                    dispatcher.close(outcome)
+
             if execution_lease is not None:
-                await execution_lease.release()
+                # Re-await the lease's single shielded release operation through
+                # repeated coordinator cancellation.
+                while True:
+                    try:
+                        await execution_lease.release()
+                        break
+                    except asyncio.CancelledError:
+                        continue
+
+            if dispatcher is not None:
+                flush_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        dispatcher.flush, SESSION_TURN_LIFECYCLE_FLUSH_SECONDS
+                    )
+                )
+                while True:
+                    try:
+                        await asyncio.shield(flush_task)
+                        break
+                    except asyncio.CancelledError:
+                        continue
+        finally:
+            # A successful interrupt call is only a request.  Retain its owner
+            # until this authoritative execution/worker cleanup seam so a
+            # repeated stop while the turn is still ``stopping`` cannot issue
+            # another interrupt.  This also covers never-entered coordinators,
+            # and ``finally`` prevents a cleanup failure from leaking ownership.
+            self._interruption_owners.pop(turn_id, None)
+            self._interruption_watcher_owners.pop(turn_id, None)
             self._agent_refs.pop(turn_id, None)
+            self._lifecycle_dispatchers.pop(turn_id, None)
+            self._lifecycle_cleanup_owners.discard(turn_id)
 
     async def _deliver_slack(self, store: SessionTurnStore, turn_id: str, binding: SlackBinding,
                              slack_adapter: Any, content: str) -> None:
-        if not store.begin_delivery(turn_id, "slack"):
+        def begin_and_read_delivery() -> Optional[Dict[str, Any]]:
+            if not store.begin_delivery(turn_id, "slack"):
+                return None
+            return store.get_delivery(turn_id, "slack") or {}
+
+        async def record_outcome(
+            state: str,
+            event_type: str,
+            error_code: Optional[str] = None,
+            *,
+            provider_message_id: Optional[str] = None,
+            cancellation_resistant: bool = False,
+        ) -> None:
+            def finish_and_append() -> None:
+                store.finish_delivery(
+                    turn_id,
+                    "slack",
+                    state,
+                    error_code,
+                    provider_message_id=provider_message_id,
+                )
+                data = {"destination": "slack", "status": state}
+                if error_code is not None:
+                    data["error_code"] = error_code
+                store.append_event(turn_id, event_type, data)
+
+            await self._store_operation(
+                finish_and_append,
+                propagate_cancellation=not cancellation_resistant,
+            )
+
+        async def record_cancelled_sending() -> None:
+            # Own exactly one ordered transition task and retrieve every error.
+            transition = asyncio.create_task(
+                record_outcome(
+                    "needs_manual_retry",
+                    "delivery.failed",
+                    "delivery_outcome_unknown",
+                    cancellation_resistant=True,
+                )
+            )
+            while not transition.done():
+                try:
+                    await asyncio.shield(transition)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not transition.cancelled() and transition.exception() is not None:
+                logger.error(
+                    "session_turn_delivery_transition_failed "
+                    "destination=slack reason=store_error"
+                )
+
+        try:
+            delivery = await self._store_operation(begin_and_read_delivery)
+        except asyncio.CancelledError:
+            # _store_operation finishes its worker before propagating, so inspect
+            # the resulting durable state rather than guessing whether begin ran.
+            current = await self._store_operation(
+                lambda: store.get_delivery(turn_id, "slack"),
+                propagate_cancellation=False,
+            )
+            if current is not None and current.get("state") == "sending":
+                await record_cancelled_sending()
+            raise
+        if delivery is None:
             return
-        delivery = store.get_delivery(turn_id, "slack") or {}
+
         if len(content) > MAX_SLACK_ROUTED_CHARS:
-            store.finish_delivery(turn_id, "slack", "rejected", "delivery_too_large")
-            store.append_event(turn_id, "delivery.failed", {"destination": "slack", "status": "rejected", "error_code": "delivery_too_large"})
+            await record_outcome(
+                "rejected", "delivery.failed", "delivery_too_large"
+            )
             return
         metadata = dict(binding.metadata)
         # The durable delivery id is also Slack's idempotency key. The bounded
@@ -1129,41 +2181,41 @@ class SessionTurnService:
             result = await slack_adapter.send(
                 binding.chat_id, content, reply_to=binding.thread_id, metadata=metadata
             )
+        except asyncio.CancelledError:
+            # chat.postMessage may already have reached Slack. Own one shielded,
+            # ordered write through repeated cancellation before propagating;
+            # neither provider text nor message content enters the ledger/log.
+            await record_cancelled_sending()
+            raise
         except Exception:
-            store.finish_delivery(turn_id, "slack", "needs_manual_retry", "delivery_outcome_unknown")
-            store.append_event(turn_id, "delivery.failed", {"destination": "slack", "status": "needs_manual_retry", "error_code": "delivery_outcome_unknown"})
+            await record_outcome(
+                "needs_manual_retry",
+                "delivery.failed",
+                "delivery_outcome_unknown",
+            )
             return
         if getattr(result, "success", False):
             provider_message_id = getattr(result, "message_id", None)
             if not isinstance(provider_message_id, str) or not provider_message_id:
-                store.finish_delivery(
-                    turn_id,
-                    "slack",
+                await record_outcome(
                     "needs_manual_retry",
+                    "delivery.failed",
                     "provider_receipt_missing",
                 )
-                store.append_event(
-                    turn_id,
-                    "delivery.failed",
-                    {
-                        "destination": "slack",
-                        "status": "needs_manual_retry",
-                        "error_code": "provider_receipt_missing",
-                    },
-                )
                 return
-            store.finish_delivery(
-                turn_id,
-                "slack",
+            await record_outcome(
                 "delivered",
+                "delivery.completed",
                 provider_message_id=provider_message_id,
             )
-            store.append_event(turn_id, "delivery.completed", {"destination": "slack", "status": "delivered"})
         else:
             # Once chat.postMessage was attempted, a timeout/error can be
             # ambiguous.  Never retry automatically.
-            store.finish_delivery(turn_id, "slack", "needs_manual_retry", "delivery_outcome_unknown")
-            store.append_event(turn_id, "delivery.failed", {"destination": "slack", "status": "needs_manual_retry", "error_code": "delivery_outcome_unknown"})
+            await record_outcome(
+                "needs_manual_retry",
+                "delivery.failed",
+                "delivery_outcome_unknown",
+            )
 
     async def status(self, request: web.Request) -> web.Response:
         auth_err = self.adapter._check_auth(request)
@@ -1172,7 +2224,9 @@ class SessionTurnService:
         store = await self._store()
         if store is None:
             return _error("Session database unavailable", "session_db_unavailable", 503)
-        turn = await asyncio.to_thread(store.public_turn, request.match_info["turn_id"])
+        turn = await self._store_operation(
+            lambda: store.public_turn(request.match_info["turn_id"])
+        )
         if not turn or turn["session_id"] != request.match_info["session_id"]:
             return _error("Turn not found", "turn_not_found", 404)
         return web.json_response({"object": "hermes.session.turn.status", "turn": turn})
@@ -1185,7 +2239,7 @@ class SessionTurnService:
         if store is None:
             return _error("Session database unavailable", "session_db_unavailable", 503)
         turn_id = request.match_info["turn_id"]
-        turn = await asyncio.to_thread(store.get, turn_id)
+        turn = await self._store_operation(lambda: store.get(turn_id))
         if not turn or turn["session_id"] != request.match_info["session_id"]:
             return _error("Turn not found", "turn_not_found", 404)
         raw_sequence = request.headers.get("Last-Event-ID") or request.query.get("after") or "0"
@@ -1195,7 +2249,9 @@ class SessionTurnService:
                 raise ValueError
         except (TypeError, ValueError):
             return _error("Last-Event-ID must be a non-negative integer", "invalid_last_event_id", 400)
-        low_water, high_water, event_count = await asyncio.to_thread(store.event_bounds, turn_id)
+        low_water, high_water, event_count = await self._store_operation(
+            lambda: store.event_bounds(turn_id)
+        )
         if sequence > high_water:
             return _resync_error(
                 "Last-Event-ID is ahead of the durable event high-water mark",
@@ -1208,7 +2264,9 @@ class SessionTurnService:
                 "event_gap",
                 high_water=high_water,
             )
-        initial_rows = await asyncio.to_thread(store.events_after, turn_id, sequence)
+        initial_rows = await self._store_operation(
+            lambda: store.events_after(turn_id, sequence)
+        )
         volatile = self._volatile_events.get(turn_id, {})
         missing_volatile = any(
             row["event"] == "assistant.delta" and row["seq"] not in volatile
@@ -1228,8 +2286,12 @@ class SessionTurnService:
         await response.prepare(request)
         try:
             while True:
-                rows = await asyncio.to_thread(store.events_after, turn_id, sequence)
-                current = await asyncio.to_thread(store.get, turn_id)
+                def read_stream_state() -> tuple[
+                    list[Dict[str, Any]], Optional[Dict[str, Any]]
+                ]:
+                    return store.events_after(turn_id, sequence), store.get(turn_id)
+
+                rows, current = await self._store_operation(read_stream_state)
                 missing_volatile = any(
                     row["event"] == "assistant.delta"
                     and row["seq"] not in self._volatile_events.get(turn_id, {})
@@ -1282,12 +2344,14 @@ class SessionTurnService:
             return _error("Session database unavailable", "session_db_unavailable", 503)
         session_id = request.match_info["session_id"]
         turn_id = request.match_info["turn_id"]
-        turn = await asyncio.to_thread(store.get, turn_id)
+        turn = await self._store_operation(lambda: store.get(turn_id))
         if not turn or turn["session_id"] != session_id:
             return _error("Turn not found", "turn_not_found", 404)
         if turn["status"] != "completed":
             return _error("Turn is not completed", "turn_not_completed", 409)
-        existing = await asyncio.to_thread(store.get_delivery, turn_id, "slack")
+        existing = await self._store_operation(
+            lambda: store.get_delivery(turn_id, "slack")
+        )
         if existing:
             if existing["state"] == "delivered":
                 return web.json_response({"object": "hermes.session.turn.delivery", "delivery": existing})
@@ -1297,14 +2361,18 @@ class SessionTurnService:
                 409,
             )
         try:
-            binding = await asyncio.to_thread(resolve_slack_binding, store.db, session_id)
+            binding = await self._store_operation(
+                lambda: resolve_slack_binding(store.db, session_id)
+            )
         except SlackBindingError as exc:
             return _error("Session has no unique Slack binding", exc.code, 409)
         slack_adapter = self.adapter._get_platform_callback_adapter(request, "slack")
         if slack_adapter is None:
             return _error("Slack adapter is not connected", "slack_unavailable", 503)
         try:
-            content = await asyncio.to_thread(store.anchored_assistant_content, turn_id)
+            content = await self._store_operation(
+                lambda: store.anchored_assistant_content(turn_id)
+            )
         except Exception:
             return _error("Session history unavailable", "session_history_unavailable", 503)
         if not isinstance(content, str):
@@ -1316,7 +2384,9 @@ class SessionTurnService:
         await self._deliver_slack(
             store, turn_id, binding, slack_adapter, content
         )
-        delivery = await asyncio.to_thread(store.get_delivery, turn_id, "slack")
+        delivery = await self._store_operation(
+            lambda: store.get_delivery(turn_id, "slack")
+        )
         status = 200 if delivery and delivery["state"] == "delivered" else 409
         return web.json_response(
             {"object": "hermes.session.turn.delivery", "delivery": delivery}, status=status
@@ -1330,11 +2400,56 @@ class SessionTurnService:
         if store is None:
             return _error("Session database unavailable", "session_db_unavailable", 503)
         turn_id = request.match_info["turn_id"]
-        turn = await asyncio.to_thread(store.get, turn_id)
-        if not turn or turn["session_id"] != request.match_info["session_id"]:
+        session_id = request.match_info["session_id"]
+        public, _transitioned = await self._join_stop_handoff(
+            store, session_id, turn_id
+        )
+        if public is None:
             return _error("Turn not found", "turn_not_found", 404)
-        if turn["status"] in TERMINAL_STATUSES:
-            return web.json_response({"object": "hermes.session.turn.stop", "turn": store.public_turn(turn_id)})
+        if public["status"] in TERMINAL_STATUSES:
+            return web.json_response(
+                {"object": "hermes.session.turn.stop", "turn": public}
+            )
+        return web.json_response(
+            {"object": "hermes.session.turn.stop", "turn": public}, status=202
+        )
+
+    async def _join_stop_handoff(
+        self, store: SessionTurnStore, session_id: str, turn_id: str
+    ) -> tuple[Optional[Dict[str, Any]], bool]:
+        """Join one cancellation-resistant durable-stop/interruption handoff."""
+
+        key = (session_id, turn_id)
+        handoff = self._stop_handoffs.get(key)
+        if handoff is not None and handoff.done():
+            # A retry may arrive before the completed handoff's done callback.
+            # Retire that exact generation synchronously so one caller creates
+            # the recovery handoff below and concurrent callers join it.
+            if self._stop_handoffs.get(key) is handoff:
+                self._stop_handoffs.pop(key, None)
+            handoff = None
+        if handoff is None:
+            handoff = asyncio.create_task(
+                self._perform_stop_handoff(store, session_id, turn_id)
+            )
+            self._stop_handoffs[key] = handoff
+            self._track_background_task(handoff)
+
+            def handoff_done(done: asyncio.Task[Any]) -> None:
+                if self._stop_handoffs.get(key) is done:
+                    self._stop_handoffs.pop(key, None)
+
+            handoff.add_done_callback(handoff_done)
+
+        # Client disconnect/request cancellation only abandons this waiter. The
+        # tracked handoff keeps ownership through durable commit and interrupt.
+        return await asyncio.shield(handoff)
+
+    async def _perform_stop_handoff(
+        self, store: SessionTurnStore, session_id: str, turn_id: str
+    ) -> tuple[Optional[Dict[str, Any]], bool]:
+        """Commit/read stop truth, then recover or claim interruption ownership."""
+
         # Let a just-admitted task finish durable lease/history admission so a
         # stop does not race it into a false "stopped before start" result.
         # Bounded and event-loop friendly; genuinely queued work still stops.
@@ -1343,25 +2458,128 @@ class SessionTurnService:
             if (ref and ref[0] is not None) or turn_id not in self._tasks:
                 break
             await asyncio.sleep(0.01)
-        stopped = await asyncio.to_thread(store.request_stop, turn_id)
-        ref = self._agent_refs.get(turn_id)
-        agent = ref[0] if ref else None
-        if agent is not None:
-            try:
-                agent.interrupt("Stop requested via session turn API")
-            except Exception:
-                pass
-        else:
-            watcher = asyncio.create_task(self._interrupt_when_available(turn_id))
-            try:
-                self.adapter._background_tasks.add(watcher)
-                watcher.add_done_callback(self.adapter._background_tasks.discard)
-            except (AttributeError, TypeError):
-                pass
-        store.append_event(turn_id, "turn.stopping", {"status": "stopping"})
-        return web.json_response(
-            {"object": "hermes.session.turn.stop", "turn": store.public_turn(turn_id)}, status=202
+        def stop_and_read() -> tuple[Optional[Dict[str, Any]], bool]:
+            existing = store.get(turn_id)
+            if existing is None or existing["session_id"] != session_id:
+                return None, False
+            if existing["status"] in TERMINAL_STATUSES:
+                return store.public_turn(turn_id), False
+            result = store.request_stop(turn_id)
+            if result is None:
+                return None, False
+            _row, transitioned = result
+            return store.public_turn(turn_id), transitioned
+
+        # This task, rather than an HTTP request task, owns the ordered store
+        # operation. shield() in the caller ensures a disconnected request can
+        # neither cancel the commit nor strand its interruption handoff.
+        public, transitioned = await self._store_operation(
+            stop_and_read, propagate_cancellation=False
         )
+        if public is not None and (
+            transitioned or public["status"] == "stopping"
+        ):
+            owner = self._interruption_owners.get(turn_id)
+            if owner is not None:
+                # A retry can enter after the watcher task has completed but
+                # before its call_soon() done callback has run.  Inspect and
+                # conditionally release the exact failed generation here, with
+                # no await before a replacement owner is installed below.
+                self._release_failed_interruption_watcher(turn_id, owner)
+            if self._interruption_owners.get(turn_id) is not None:
+                return public, transitioned
+
+            ref = self._agent_refs.get(turn_id)
+            agent = ref[0] if ref else None
+            if agent is not None:
+                current = asyncio.current_task()
+                assert current is not None
+                self._interruption_owners[turn_id] = current
+                try:
+                    self._deliver_interrupt(
+                        agent, "Stop requested via session turn API"
+                    )
+                except _InterruptDeliveryFailed:
+                    # The durable row remains truthfully stopping.  This exact
+                    # handoff did not deliver the request, so relinquish only
+                    # its generation and let a later stop retry safely.
+                    self._release_direct_interruption_owner(turn_id, current)
+            else:
+                watcher = asyncio.create_task(self._interrupt_when_available(turn_id))
+                self._interruption_owners[turn_id] = watcher
+                self._interruption_watcher_owners[turn_id] = watcher
+                self._track_background_task(watcher)
+                watcher.add_done_callback(
+                    lambda done: self._interruption_watcher_done(turn_id, done)
+                )
+        return public, transitioned
+
+    def _interruption_watcher_done(
+        self, turn_id: str, watcher: asyncio.Task[Any]
+    ) -> None:
+        """Preserve successful ownership; release failed watcher generations."""
+        # A successful interrupt request remains owned until the worker
+        # finalizer. Failure/cancellation did not deliver that request, so
+        # release the exact generation even while a local execution exists.
+        if self._release_failed_interruption_watcher(turn_id, watcher):
+            return
+        # A durable queued row can be stopped without ever being admitted in
+        # this process; no execution finalizer exists in that case.
+        if (
+            turn_id not in self._tasks
+            and self._interruption_owners.get(turn_id) is watcher
+        ):
+            self._interruption_owners.pop(turn_id, None)
+            self._interruption_watcher_owners.pop(turn_id, None)
+
+    def _release_failed_interruption_watcher(
+        self, turn_id: str, watcher: asyncio.Task[Any]
+    ) -> bool:
+        """Release only the current failed watcher generation, if completed."""
+        if self._interruption_watcher_owners.get(turn_id) is not watcher:
+            return False
+        if not watcher.done():
+            return False
+        if watcher.cancelled():
+            reason = "cancelled"
+        else:
+            try:
+                failure = watcher.exception()
+            except asyncio.CancelledError:
+                reason = "cancelled"
+            else:
+                if failure is None:
+                    return False
+                reason = "internal_error"
+        if self._interruption_owners.get(turn_id) is not watcher:
+            return False
+        self._interruption_owners.pop(turn_id, None)
+        self._interruption_watcher_owners.pop(turn_id, None)
+        # Never log turn identity or exception text: either can contain
+        # tenant/provider data.  The stable classification is operationally
+        # sufficient and safe for shared logs.
+        logger.error("session_turn_interrupt_watcher_failed reason=%s", reason)
+        return True
+
+    def _release_direct_interruption_owner(
+        self, turn_id: str, owner: asyncio.Task[Any]
+    ) -> bool:
+        """Conditionally release one failed synchronous interruption handoff."""
+        if self._interruption_owners.get(turn_id) is not owner:
+            return False
+        self._interruption_owners.pop(turn_id, None)
+        logger.error(
+            "session_turn_interrupt_delivery_failed reason=internal_error"
+        )
+        return True
+
+    @staticmethod
+    def _deliver_interrupt(agent: Any, reason: str) -> None:
+        """Deliver an interrupt or raise a typed signal with no provider detail."""
+        try:
+            agent.interrupt(reason)
+        except Exception:
+            raise _InterruptDeliveryFailed from None
 
     async def _interrupt_when_available(self, turn_id: str) -> None:
         """Close the small race between stop admission and agent construction."""
@@ -1372,10 +2590,7 @@ class SessionTurnService:
             ref = self._agent_refs.get(turn_id)
             agent = ref[0] if ref else None
             if agent is not None:
-                try:
-                    agent.interrupt("Stop requested via session turn API")
-                except Exception:
-                    pass
+                self._deliver_interrupt(agent, "Stop requested via session turn API")
                 return
             await asyncio.sleep(0.01)
 

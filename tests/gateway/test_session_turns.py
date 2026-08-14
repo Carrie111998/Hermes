@@ -21,12 +21,14 @@ from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.base import SendResult
 from gateway.platforms.session_turns import (
     ConflictingTurn,
+    SlackBinding,
     SessionTurnStore,
     TurnConflict,
     TurnInputError,
     project_safe_tool_event,
     resolve_slack_binding,
 )
+from gateway.session_execution_lease import SessionExecutionLease
 from hermes_state import SessionDB
 
 
@@ -51,6 +53,406 @@ def _png(width: int = 1, height: int = 1) -> str:
     raw += chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00\x00"))
     raw += chunk(b"IEND", b"")
     return "data:image/png;base64," + base64.b64encode(raw).decode()
+
+
+@pytest.mark.asyncio
+async def test_callback_drain_survives_cancellation_without_terminal_overtake(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    store = SessionTurnStore(session_db)
+    turn_id = "cancel-during-callback-drain"
+    store.reserve("s1", turn_id, _payload())
+    persistence_entered = threading.Event()
+    persistence_release = threading.Event()
+    original_append = store.append_event
+
+    def blocked_append(tid, event_type, data):
+        if event_type == "tool.started":
+            persistence_entered.set()
+            persistence_release.wait(timeout=2)
+        return original_append(tid, event_type, data)
+
+    monkeypatch.setattr(store, "append_event", blocked_append)
+
+    async def run_agent(**kwargs):
+        kwargs["tool_start_callback"]("call-1", "terminal", {})
+        session_db.append_message("s1", "user", kwargs["user_message"])
+        session_db.append_message("s1", "assistant", "done")
+        return {"final_response": "done"}, {}
+
+    adapter._run_agent = run_agent
+    execution = service._admit_execution(
+        store, turn_id, "s1", _payload(), None, None
+    )
+    assert await asyncio.to_thread(persistence_entered.wait, 1)
+    execution.cancel()
+    await asyncio.sleep(0)
+    assert not execution.done()
+    persistence_release.set()
+    await service.wait_for_turn(turn_id)
+
+    events = store.events_after(turn_id, 0)
+    names = [event["event"] for event in events]
+    assert store.get(turn_id)["status"] == "completed"
+    assert names.index("tool.started") < names.index("assistant.completed")
+    assert names.index("tool.started") < names.index("turn.completed")
+
+
+@pytest.mark.asyncio
+async def test_slack_send_cancellation_durably_marks_manual_retry_privacy_safe(
+    session_db,
+):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    service = adapter._session_turn_service
+    store = SessionTurnStore(session_db)
+    turn_id = "cancel-slack-send"
+    store.reserve("s1", turn_id, _payload(mode="both"))
+    send_entered = asyncio.Event()
+
+    async def cancelled_send(*_args, **_kwargs):
+        send_entered.set()
+        await asyncio.Future()
+
+    slack = MagicMock()
+    slack.send = cancelled_send
+    task = asyncio.create_task(
+        service._deliver_slack(
+            store,
+            turn_id,
+            SlackBinding(chat_id="safe", thread_id=None, metadata={}),
+            slack,
+            "private assistant body",
+        )
+    )
+    await asyncio.wait_for(send_entered.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    delivery = store.get_delivery(turn_id, "slack")
+    events = store.events_after(turn_id, 0)
+    assert delivery is not None
+    assert delivery["state"] == "needs_manual_retry"
+    assert delivery["safe_error_code"] == "delivery_outcome_unknown"
+    assert [event["event"] for event in events] == ["delivery.failed"]
+    assert "private assistant body" not in repr(events)
+
+
+@pytest.mark.asyncio
+async def test_slow_callback_store_applies_bounded_worker_backpressure_and_recovers(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    import gateway.platforms.session_turns as session_turns
+
+    monkeypatch.setattr(session_turns, "SESSION_TURN_CALLBACK_QUEUE_SIZE", 2)
+    created_ingress = []
+    ingress_type = session_turns._CallbackPersistenceIngress
+
+    def capture_ingress(loop, maxsize):
+        ingress = ingress_type(loop, maxsize)
+        created_ingress.append(ingress)
+        return ingress
+
+    monkeypatch.setattr(session_turns, "_CallbackPersistenceIngress", capture_ingress)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    store = SessionTurnStore(session_db)
+    turn_id = "bounded-callback-backpressure"
+    store.reserve("s1", turn_id, _payload())
+    first_write_entered = threading.Event()
+    release_store = threading.Event()
+    producer_done = threading.Event()
+    original_append = store.append_event
+
+    def slow_append(tid, event_type, data):
+        if event_type == "tool.started" and not first_write_entered.is_set():
+            first_write_entered.set()
+            release_store.wait(timeout=2)
+        return original_append(tid, event_type, data)
+
+    monkeypatch.setattr(store, "append_event", slow_append)
+
+    async def run_agent(**kwargs):
+        def worker():
+            for index in range(8):
+                call_id = f"call-{index}"
+                kwargs["tool_start_callback"](call_id, "terminal", {})
+                kwargs["tool_complete_callback"](
+                    call_id, "terminal", {}, "success"
+                )
+            producer_done.set()
+
+        await asyncio.to_thread(worker)
+        session_db.append_message("s1", "user", kwargs["user_message"])
+        session_db.append_message("s1", "assistant", "done")
+        return {"final_response": "done"}, {}
+
+    adapter._run_agent = run_agent
+    execution = service._admit_execution(
+        store, turn_id, "s1", _payload(), None, None
+    )
+    assert await asyncio.to_thread(first_write_entered.wait, 1)
+    await asyncio.sleep(0.03)
+    assert not producer_done.is_set()
+    ticked = asyncio.Event()
+    asyncio.get_running_loop().call_soon(ticked.set)
+    await asyncio.wait_for(ticked.wait(), 0.1)
+    assert created_ingress[0].queue.qsize() <= 2
+    assert created_ingress[0].max_observed <= 2
+
+    release_store.set()
+    await service.wait_for_turn(turn_id)
+    assert execution.done()
+    structural = [
+        event["event"]
+        for event in store.events_after(turn_id, 0)
+        if event["event"].startswith("tool.")
+    ]
+    assert structural == ["tool.started", "tool.completed"] * 8
+    assert store.get(turn_id)["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_loop_thread_full_persists_exact_resync_before_terminal(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    import gateway.platforms.session_turns as session_turns
+
+    monkeypatch.setattr(session_turns, "SESSION_TURN_CALLBACK_QUEUE_SIZE", 1)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    store = SessionTurnStore(session_db)
+    turn_id = "loop-thread-structural-full"
+    store.reserve("s1", turn_id, _payload())
+    first_write_entered = threading.Event()
+    release_store = threading.Event()
+    original_append = store.append_event
+
+    def blocked_append(tid, event_type, data):
+        if event_type == "tool.started" and data.get("tool_call_id") == "call-1":
+            first_write_entered.set()
+            release_store.wait(timeout=2)
+        return original_append(tid, event_type, data)
+
+    monkeypatch.setattr(store, "append_event", blocked_append)
+
+    async def run_agent(**kwargs):
+        # These callbacks deliberately run on the owner loop. The pump consumes
+        # the first event and blocks in its store thread; the second fills the
+        # sole queue slot, so the third must become the durable missing range.
+        kwargs["tool_start_callback"]("call-1", "terminal", {})
+        assert await asyncio.to_thread(first_write_entered.wait, 1)
+        kwargs["tool_complete_callback"]("call-1", "terminal", {}, "ok")
+        try:
+            kwargs["tool_start_callback"]("call-2", "terminal", {})
+        finally:
+            release_store.set()
+
+    adapter._run_agent = run_agent
+    service._admit_execution(store, turn_id, "s1", _payload(), None, None)
+    await service.wait_for_turn(turn_id)
+
+    events = store.events_after(turn_id, 0)
+    names = [event["event"] for event in events]
+    marker = next(event for event in events if event["event"] == "session.resync_required")
+    assert marker["data"] == {
+        "reason": "structural_events_lost",
+        "missing_from": 3,
+        "missing_through": 3,
+    }
+    assert names.index("tool.completed") < names.index("session.resync_required")
+    assert names.index("session.resync_required") < names.index("turn.failed")
+    assert store.get(turn_id)["status"] == "failed"
+
+
+def test_callback_thread_on_stopped_loop_fails_bounded_and_marks_resync():
+    import gateway.platforms.session_turns as session_turns
+
+    loop = asyncio.new_event_loop()
+    ingress_holder = []
+    started = threading.Event()
+
+    def own_loop():
+        asyncio.set_event_loop(loop)
+        ingress_holder.append(session_turns._CallbackPersistenceIngress(loop, 1))
+        started.set()
+        loop.run_forever()
+
+    owner = threading.Thread(target=own_loop)
+    owner.start()
+    assert started.wait(timeout=1)
+    ingress = ingress_holder[0]
+    loop.call_soon_threadsafe(loop.stop)
+    owner.join(timeout=1)
+    assert not owner.is_alive()
+
+    before = time.monotonic()
+    with pytest.raises(session_turns._CallbackPersistenceOverloaded):
+        ingress.append_structural("tool.started", {"tool_call_id": "call-1"})
+    assert time.monotonic() - before < 0.5
+    assert ingress.structural_resync_range == (1, 1)
+    assert ingress.queue.empty()
+    loop.close()
+
+
+def test_callback_thread_timeout_cancels_pending_enqueue_without_late_insert(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import gateway.platforms.session_turns as session_turns
+
+    monkeypatch.setattr(
+        session_turns, "SESSION_TURN_CALLBACK_ENQUEUE_TIMEOUT_SECONDS", 0.05
+    )
+    loop = asyncio.new_event_loop()
+    ingress_holder = []
+    blocked = threading.Event()
+    release = threading.Event()
+    processed = threading.Event()
+
+    def own_loop():
+        asyncio.set_event_loop(loop)
+        ingress = session_turns._CallbackPersistenceIngress(loop, 1)
+        ingress.append_structural("tool.started", {"tool_call_id": "retained"})
+        ingress_holder.append(ingress)
+        loop.call_soon(lambda: (blocked.set(), release.wait(timeout=1)))
+        loop.run_forever()
+
+    owner = threading.Thread(target=own_loop)
+    owner.start()
+    assert blocked.wait(timeout=1)
+    ingress = ingress_holder[0]
+
+    with pytest.raises(session_turns._CallbackPersistenceOverloaded):
+        ingress.append_structural("tool.completed", {"tool_call_id": "rejected"})
+    assert ingress.structural_resync_range == (2, 2)
+    release.set()
+    loop.call_soon_threadsafe(processed.set)
+    assert processed.wait(timeout=1)
+    assert ingress.queue.qsize() == 1
+    assert ingress.queue.get_nowait().data["tool_call_id"] == "retained"
+    loop.call_soon_threadsafe(loop.stop)
+    owner.join(timeout=1)
+    assert not owner.is_alive()
+    loop.close()
+
+
+@pytest.mark.asyncio
+async def test_failing_callback_store_never_overtakes_retained_structure_and_recovers(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    store = SessionTurnStore(session_db)
+    producer_queued_following_event = threading.Event()
+    original_append = store.append_event
+    fail_callbacks = True
+
+    def failing_append(tid, event_type, data):
+        if fail_callbacks and event_type == "tool.started":
+            # Ensure tool.completed is retained behind the failing current event.
+            producer_queued_following_event.wait(timeout=1)
+            raise sqlite3.OperationalError("private callback store failure")
+        return original_append(tid, event_type, data)
+
+    monkeypatch.setattr(store, "append_event", failing_append)
+
+    async def run_agent(**kwargs):
+        def worker():
+            kwargs["tool_start_callback"]("call-1", "terminal", {})
+            kwargs["tool_complete_callback"](
+                "call-1", "terminal", {}, "success"
+            )
+            producer_queued_following_event.set()
+
+        await asyncio.to_thread(worker)
+        session_db.append_message("s1", "user", kwargs["user_message"])
+        session_db.append_message(
+            "s1", "assistant", kwargs["authoritative_turn_id"]
+        )
+        return {"final_response": kwargs["authoritative_turn_id"]}, {}
+
+    adapter._run_agent = run_agent
+    failed_turn = "callback-store-failure"
+    store.reserve("s1", failed_turn, _payload())
+    service._admit_execution(
+        store, failed_turn, "s1", _payload(), None, None
+    )
+    await service.wait_for_turn(failed_turn)
+
+    assert store.get(failed_turn)["status"] == "failed"
+    assert store.get(failed_turn)["safe_error_code"] == "event_store_failed"
+    # A terminal event must not jump ahead of the retained tool.completed event.
+    assert [event["event"] for event in store.events_after(failed_turn, 0)] == [
+        "turn.started"
+    ]
+
+    fail_callbacks = False
+    recovered_turn = "callback-store-recovered"
+    store.reserve("s1", recovered_turn, _payload())
+    service._admit_execution(
+        store, recovered_turn, "s1", _payload(), None, None
+    )
+    await service.wait_for_turn(recovered_turn)
+
+    recovered_events = [
+        event["event"] for event in store.events_after(recovered_turn, 0)
+    ]
+    assert store.get(recovered_turn)["status"] == "completed"
+    assert recovered_events == [
+        "turn.started",
+        "tool.started",
+        "tool.completed",
+        "assistant.completed",
+        "turn.completed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_execution_lease_release_survives_repeated_cancellation(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    entered = threading.Event()
+    unblock = threading.Event()
+    original_release = session_db.release_session_execution_lease
+    release_calls = 0
+
+    def blocked_release(session_id, owner_id):
+        nonlocal release_calls
+        release_calls += 1
+        entered.set()
+        unblock.wait(timeout=2)
+        return original_release(session_id, owner_id)
+
+    monkeypatch.setattr(session_db, "release_session_execution_lease", blocked_release)
+    lease = await SessionExecutionLease.acquire(
+        session_db, "s1", owner_prefix="repeated-cancel"
+    )
+
+    try:
+        for _ in range(3):
+            waiter = asyncio.create_task(lease.release())
+            assert await asyncio.to_thread(entered.wait, 1)
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+            assert lease._released is True
+            assert lease._release_task is not None
+            assert not lease._release_task.cancelled()
+            assert session_db.get_session_execution_lease("s1") is not None
+    finally:
+        unblock.set()
+
+    assert await lease.release() is True
+    assert release_calls == 1
+    assert lease._release_task is not None and lease._release_task.done()
+    assert lease._heartbeat_task is not None and lease._heartbeat_task.done()
+    assert session_db.get_session_execution_lease("s1") is None
 
 
 def test_duplicate_submit_reuses_same_turn_without_second_reservation(session_db):
@@ -737,6 +1139,504 @@ async def test_stop_reports_stopping_until_worker_actually_exits(session_db):
         assert (await final.json())["turn"]["status"] == "interrupted"
 
 
+@pytest.mark.asyncio
+async def test_sequential_repeated_stop_interrupts_once_through_worker_exit(session_db):
+    worker_ready = asyncio.Event()
+    worker_release = asyncio.Event()
+
+    class Agent:
+        interrupts = 0
+
+        def interrupt(self, _reason):
+            self.interrupts += 1
+
+    agent = Agent()
+
+    async def run_agent(**kwargs):
+        kwargs["agent_ref"][0] = agent
+        worker_ready.set()
+        await worker_release.wait()
+        return {"final_response": "discarded", "messages": []}, {}
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    adapter._run_agent = run_agent
+    service = adapter._session_turn_service
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        submitted = await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": "turn-stop-sequential"},
+            json=_payload(),
+        )
+        assert submitted.status == 202
+        await asyncio.wait_for(worker_ready.wait(), 1)
+
+        first = await client.post(
+            "/api/sessions/s1/turns/turn-stop-sequential/stop"
+        )
+        second = await client.post(
+            "/api/sessions/s1/turns/turn-stop-sequential/stop"
+        )
+        assert first.status == second.status == 202
+        assert (await first.json())["turn"]["status"] == "stopping"
+        assert (await second.json())["turn"]["status"] == "stopping"
+        assert agent.interrupts == 1
+        assert "turn-stop-sequential" in service._interruption_owners
+
+        worker_release.set()
+        await service.wait_for_turn("turn-stop-sequential")
+        assert "turn-stop-sequential" not in service._interruption_owners
+
+        later = await client.post(
+            "/api/sessions/s1/turns/turn-stop-sequential/stop"
+        )
+        assert later.status == 200
+        assert (await later.json())["turn"]["status"] == "interrupted"
+        assert agent.interrupts == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_repeated_stop_joins_watcher_through_worker_exit(session_db):
+    runner_entered = asyncio.Event()
+    publish_agent = asyncio.Event()
+    worker_release = asyncio.Event()
+    interrupted = asyncio.Event()
+
+    class Agent:
+        interrupts = 0
+
+        def interrupt(self, _reason):
+            self.interrupts += 1
+            interrupted.set()
+
+    agent = Agent()
+
+    async def run_agent(**kwargs):
+        runner_entered.set()
+        await publish_agent.wait()
+        kwargs["agent_ref"][0] = agent
+        await worker_release.wait()
+        return {"final_response": "discarded", "messages": []}, {}
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    adapter._run_agent = run_agent
+    service = adapter._session_turn_service
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        submitted = await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": "turn-stop-watcher-lifetime"},
+            json=_payload(),
+        )
+        assert submitted.status == 202
+        await asyncio.wait_for(runner_entered.wait(), 1)
+
+        first = await client.post(
+            "/api/sessions/s1/turns/turn-stop-watcher-lifetime/stop"
+        )
+        assert first.status == 202
+        publish_agent.set()
+        await asyncio.wait_for(interrupted.wait(), 1)
+
+        # The watcher has synchronously returned, but its per-turn owner must
+        # remain until the still-live worker and central finalizer both exit.
+        repeated = await asyncio.gather(
+            *[
+                client.post(
+                    "/api/sessions/s1/turns/turn-stop-watcher-lifetime/stop"
+                )
+                for _ in range(8)
+            ]
+        )
+        assert all(response.status == 202 for response in repeated)
+        assert agent.interrupts == 1
+        assert "turn-stop-watcher-lifetime" in service._interruption_owners
+
+        worker_release.set()
+        await service.wait_for_turn("turn-stop-watcher-lifetime")
+        assert "turn-stop-watcher-lifetime" not in service._interruption_owners
+
+        later = await asyncio.gather(
+            *[
+                client.post(
+                    "/api/sessions/s1/turns/turn-stop-watcher-lifetime/stop"
+                )
+                for _ in range(3)
+            ]
+        )
+        assert all(response.status == 200 for response in later)
+        later_payloads = await asyncio.gather(
+            *[response.json() for response in later]
+        )
+        assert all(
+            payload["turn"]["status"] == "interrupted"
+            for payload in later_payloads
+        )
+        assert agent.interrupts == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_reason"),
+    [("exception", "internal_error"), ("cancelled", "cancelled")],
+)
+async def test_failed_stop_watcher_releases_owner_and_concurrent_retry_runs_once(
+    session_db,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure_kind: str,
+    expected_reason: str,
+):
+    runner_entered = asyncio.Event()
+    publish_agent = asyncio.Event()
+    worker_release = asyncio.Event()
+    interrupted = asyncio.Event()
+    first_watcher_finished = asyncio.Event()
+    retry_watcher_started = asyncio.Event()
+
+    class Agent:
+        interrupts = 0
+
+        def interrupt(self, _reason):
+            self.interrupts += 1
+            interrupted.set()
+
+    agent = Agent()
+
+    async def run_agent(**kwargs):
+        runner_entered.set()
+        await publish_agent.wait()
+        kwargs["agent_ref"][0] = agent
+        await worker_release.wait()
+        return {"final_response": "discarded", "messages": []}, {}
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    adapter._run_agent = run_agent
+    service = adapter._session_turn_service
+    original_watcher = service._interrupt_when_available
+    watcher_calls = 0
+
+    async def fail_once_then_interrupt(turn_id):
+        nonlocal watcher_calls
+        watcher_calls += 1
+        if watcher_calls == 1:
+            first_watcher_finished.set()
+            if failure_kind == "exception":
+                raise RuntimeError("private watcher retry secret")
+            raise asyncio.CancelledError
+        retry_watcher_started.set()
+        await original_watcher(turn_id)
+
+    monkeypatch.setattr(service, "_interrupt_when_available", fail_once_then_interrupt)
+    turn_id = f"turn-stop-watcher-{failure_kind}-retry"
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        submitted = await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": turn_id},
+            json=_payload(),
+        )
+        assert submitted.status == 202
+        await asyncio.wait_for(runner_entered.wait(), 1)
+
+        first = await client.post(f"/api/sessions/s1/turns/{turn_id}/stop")
+        assert first.status == 202
+        await asyncio.wait_for(first_watcher_finished.wait(), 1)
+        for _ in range(10):
+            if turn_id not in service._interruption_owners:
+                break
+            await asyncio.sleep(0)
+        assert turn_id not in service._interruption_owners
+        assert turn_id not in service._interruption_watcher_owners
+
+        retries = await asyncio.gather(
+            *[
+                client.post(f"/api/sessions/s1/turns/{turn_id}/stop")
+                for _ in range(8)
+            ]
+        )
+        assert all(response.status == 202 for response in retries)
+        await asyncio.wait_for(retry_watcher_started.wait(), 1)
+        assert watcher_calls == 2
+
+        publish_agent.set()
+        await asyncio.wait_for(interrupted.wait(), 1)
+        assert agent.interrupts == 1
+        assert turn_id in service._interruption_owners
+
+        worker_release.set()
+        await service.wait_for_turn(turn_id)
+        terminal = await client.get(f"/api/sessions/s1/turns/{turn_id}")
+        assert terminal.status == 200
+        assert (await terminal.json())["turn"]["status"] == "interrupted"
+
+    assert watcher_calls == 2
+    assert agent.interrupts == 1
+    assert turn_id not in service._interruption_owners
+    assert turn_id not in service._interruption_watcher_owners
+    assert "session_turn_interrupt_watcher_failed" in caplog.text
+    assert f"reason={expected_reason}" in caplog.text
+    assert "private watcher retry secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery_path", ["direct", "watcher"])
+async def test_interrupt_exception_releases_owner_and_concurrent_retry_terminalizes_once(
+    session_db,
+    caplog: pytest.LogCaptureFixture,
+    delivery_path: str,
+):
+    """A real Agent.interrupt exception is retryable on both delivery paths."""
+    runner_entered = asyncio.Event()
+    publish_agent = asyncio.Event()
+    agent_ready = asyncio.Event()
+    interrupt_delivered = asyncio.Event()
+    worker_release = asyncio.Event()
+
+    class Agent:
+        attempts = 0
+        delivered = 0
+
+        def interrupt(self, _reason):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("private direct provider interrupt secret")
+            self.delivered += 1
+            interrupt_delivered.set()
+
+    agent = Agent()
+
+    async def run_agent(**kwargs):
+        runner_entered.set()
+        if delivery_path == "watcher":
+            await publish_agent.wait()
+        kwargs["agent_ref"][0] = agent
+        agent_ready.set()
+        await worker_release.wait()
+        return {"final_response": "discarded", "messages": []}, {}
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    adapter._run_agent = run_agent
+    service = adapter._session_turn_service
+    turn_id = f"interrupt-exception-{delivery_path}"
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        submitted = await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": turn_id},
+            json=_payload(),
+        )
+        assert submitted.status == 202
+        await asyncio.wait_for(runner_entered.wait(), 1)
+        if delivery_path == "direct":
+            await asyncio.wait_for(agent_ready.wait(), 1)
+
+        first = await client.post(f"/api/sessions/s1/turns/{turn_id}/stop")
+        assert first.status == 202
+        first_body = await first.json()
+        assert first_body["turn"]["status"] == "stopping"
+        assert "private direct provider interrupt secret" not in await first.text()
+
+        if delivery_path == "watcher":
+            publish_agent.set()
+            await asyncio.wait_for(agent_ready.wait(), 1)
+
+        deadline = time.monotonic() + 1
+        while turn_id in service._interruption_owners and time.monotonic() < deadline:
+            await asyncio.sleep(0)
+        assert agent.attempts == 1
+        assert agent.delivered == 0
+        assert turn_id not in service._interruption_owners
+
+        # All retries race for one handoff generation.  One interrupt is
+        # delivered; its owner then survives through authoritative worker exit.
+        retries = await asyncio.gather(
+            *[
+                client.post(f"/api/sessions/s1/turns/{turn_id}/stop")
+                for _ in range(12)
+            ]
+        )
+        assert all(response.status == 202 for response in retries)
+        await asyncio.wait_for(interrupt_delivered.wait(), 1)
+        assert agent.attempts == 2
+        assert agent.delivered == 1
+        assert turn_id in service._interruption_owners
+
+        worker_release.set()
+        await service.wait_for_turn(turn_id)
+        terminal = await client.get(f"/api/sessions/s1/turns/{turn_id}")
+        assert terminal.status == 200
+        assert (await terminal.json())["turn"]["status"] == "interrupted"
+
+        later = await asyncio.gather(
+            *[
+                client.post(f"/api/sessions/s1/turns/{turn_id}/stop")
+                for _ in range(3)
+            ]
+        )
+        assert all(response.status == 200 for response in later)
+
+    assert agent.attempts == 2
+    assert agent.delivered == 1
+    assert turn_id not in service._interruption_owners
+    assert turn_id not in service._interruption_watcher_owners
+    assert "private direct provider interrupt secret" not in caplog.text
+    if delivery_path == "watcher":
+        assert "session_turn_interrupt_watcher_failed reason=internal_error" in caplog.text
+    else:
+        assert "session_turn_interrupt_delivery_failed reason=internal_error" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_concurrent_repeated_stop_records_and_watches_once(session_db, monkeypatch):
+    gate = asyncio.Event()
+
+    async def run_agent(**_kwargs):
+        await gate.wait()
+        return {"failed": True}, {}
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    adapter._run_agent = run_agent
+    service = adapter._session_turn_service
+    watcher_started = 0
+
+    async def counted_watcher(_turn_id):
+        nonlocal watcher_started
+        watcher_started += 1
+        await gate.wait()
+
+    monkeypatch.setattr(service, "_interrupt_when_available", counted_watcher)
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        submitted = await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": "turn-stop-concurrent"},
+            json=_payload(),
+        )
+        assert submitted.status == 202
+        await asyncio.sleep(0)
+        responses = await asyncio.gather(*[
+            client.post("/api/sessions/s1/turns/turn-stop-concurrent/stop")
+            for _ in range(8)
+        ])
+        assert all(response.status == 202 for response in responses)
+        public = [(await response.json())["turn"] for response in responses]
+        assert all(turn["status"] == "stopping" for turn in public)
+        assert watcher_started == 1
+        events = SessionTurnStore(session_db).events_after("turn-stop-concurrent", 0)
+        assert [event["event"] for event in events].count("turn.stopping") == 1
+        gate.set()
+        await service.wait_for_turn("turn-stop-concurrent")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_http_stops_finish_commit_handoff_and_interrupt_once(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    """Cancellation after the stopping commit cannot orphan interruption."""
+
+    worker_released = asyncio.Event()
+    agent_ready = asyncio.Event()
+
+    class Agent:
+        interrupts = 0
+
+        def interrupt(self, _reason):
+            self.interrupts += 1
+            worker_released.set()
+
+    agent = Agent()
+
+    async def run_agent(**kwargs):
+        kwargs["agent_ref"][0] = agent
+        agent_ready.set()
+        await worker_released.wait()
+        return {"final_response": "must be discarded", "messages": []}, {}
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    adapter._run_agent = run_agent
+    service = adapter._session_turn_service
+    await service.reconcile_startup()
+    store = await service._store()
+    assert store is not None
+    turn_id = "cancel-stop-after-commit"
+    store.reserve("s1", turn_id, _payload())
+    service._admit_execution(store, turn_id, "s1", _payload(), None, None)
+    await asyncio.wait_for(agent_ready.wait(), 1)
+
+    commit_finished = threading.Event()
+    return_from_store = threading.Event()
+    original_stop = store.request_stop
+
+    def commit_then_block(*args, **kwargs):
+        result = original_stop(*args, **kwargs)
+        commit_finished.set()
+        return_from_store.wait(timeout=2)
+        return result
+
+    monkeypatch.setattr(store, "request_stop", commit_then_block)
+    watcher_calls = 0
+    original_watcher = service._interrupt_when_available
+
+    async def counted_watcher(requested_turn_id):
+        nonlocal watcher_calls
+        watcher_calls += 1
+        await original_watcher(requested_turn_id)
+
+    monkeypatch.setattr(service, "_interrupt_when_available", counted_watcher)
+
+    def stop_request():
+        request = MagicMock()
+        request.match_info = {"session_id": "s1", "turn_id": turn_id}
+        return request
+
+    # Every HTTP handler joins the same tracked handoff. Cancel all waiters at
+    # the exact seam where SQLite has committed stopping but the worker thread
+    # has not returned the transition result to the event loop.
+    requests = [asyncio.create_task(service.stop(stop_request())) for _ in range(12)]
+    assert await asyncio.to_thread(commit_finished.wait, 1)
+    assert store.get(turn_id)["status"] == "stopping"
+    for request in requests:
+        request.cancel()
+    cancelled = await asyncio.gather(*requests, return_exceptions=True)
+    assert all(isinstance(result, asyncio.CancelledError) for result in cancelled)
+
+    return_from_store.set()
+    await asyncio.wait_for(worker_released.wait(), 1)
+    await service.wait_for_turn(turn_id)
+    for _ in range(20):
+        if not service._stop_handoffs and not service._interruption_owners:
+            break
+        await asyncio.sleep(0)
+
+    events = store.events_after(turn_id, 0)
+    assert store.get(turn_id)["status"] == "interrupted"
+    assert agent.interrupts == 1
+    assert watcher_calls == 0
+    assert [event["event"] for event in events].count("turn.stopping") == 1
+    assert service._stop_handoffs == {}
+    assert service._interruption_owners == {}
+
+    # A later idempotent stop observes terminal truth and cannot create a
+    # second edge, interruption, watcher, or leaked owner.
+    later = await service.stop(stop_request())
+    assert later.status == 200
+    assert json.loads(later.text)["turn"]["status"] == "interrupted"
+    assert agent.interrupts == 1
+    assert watcher_calls == 0
+    assert [
+        event["event"] for event in store.events_after(turn_id, 0)
+    ].count("turn.stopping") == 1
+    assert service._stop_handoffs == {}
+    assert service._interruption_owners == {}
+
+
 def test_no_transcript_duplication_store_has_no_content_columns(session_db):
     store = SessionTurnStore(session_db)
     store.reserve("s1", "turn-1", _payload("body must not be here"))
@@ -955,3 +1855,1017 @@ async def test_slack_only_turn_never_exposes_assistant_deltas_to_occ(session_db)
 
     assert "assistant.delta" not in wire
     assert "must not reach OCC" not in wire
+
+
+@pytest.mark.asyncio
+async def test_native_lifecycle_orders_heartbeats_and_distinguishes_sequential_turns(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    import gateway.platforms.session_turns as session_turns
+
+    lifecycle = []
+
+    def capture(hook, **kwargs):
+        if hook == "session_turn_lifecycle":
+            lifecycle.append(dict(kwargs["dto"]))
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
+    monkeypatch.setattr(session_turns, "SESSION_TURN_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+
+    async def run_agent(**kwargs):
+        native_id = kwargs["authoritative_turn_id"]
+        await asyncio.sleep(0.035)
+        session_db.append_message("s1", "user", kwargs["user_message"])
+        session_db.append_message("s1", "assistant", native_id)
+        return {
+            "final_response": native_id,
+            "messages": session_db.get_messages_as_conversation("s1"),
+        }, {}
+
+    adapter._run_agent = run_agent
+    async with TestClient(TestServer(_app(adapter))) as client:
+        for turn_id in ("native-turn-a", "native-turn-b"):
+            response = await client.post(
+                "/api/sessions/s1/turns",
+                headers={"Idempotency-Key": turn_id},
+                json=_payload(turn_id),
+            )
+            assert response.status == 202
+            await adapter._session_turn_service.wait_for_turn(turn_id)
+
+    assert {dto["turn_id"] for dto in lifecycle} == {
+        "native-turn-a",
+        "native-turn-b",
+    }
+    for turn_id in ("native-turn-a", "native-turn-b"):
+        events = [dto for dto in lifecycle if dto["turn_id"] == turn_id]
+        assert events[0]["event"] == "registered"
+        assert events[1]["event"] == "started"
+        assert "heartbeat" in [dto["event"] for dto in events[2:-1]]
+        assert events[-1]["event"] == "terminal"
+        assert events[-1]["terminal_outcome"] == "succeeded"
+        assert sum(dto["event"] == "terminal" for dto in events) == 1
+        assert [dto["sequence"] for dto in events] == sorted(
+            dto["sequence"] for dto in events
+        )
+        assert len({dto["sequence"] for dto in events}) == len(events)
+        assert {dto["session_id"] for dto in events} == {"s1"}
+
+
+@pytest.mark.asyncio
+async def test_native_lifecycle_observer_failure_is_fail_open(session_db, monkeypatch):
+    def broken_observer(hook, **kwargs):
+        if hook == "session_turn_lifecycle":
+            raise RuntimeError("observer secret must not affect the turn")
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", broken_observer)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+
+    async def run_agent(**kwargs):
+        session_db.append_message("s1", "user", kwargs["user_message"])
+        session_db.append_message("s1", "assistant", "done")
+        return {
+            "final_response": "done",
+            "messages": session_db.get_messages_as_conversation("s1"),
+        }, {}
+
+    adapter._run_agent = run_agent
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": "observer-fail-open"},
+            json=_payload(),
+        )
+        await adapter._session_turn_service.wait_for_turn("observer-fail-open")
+        status = await client.get("/api/sessions/s1/turns/observer-fail-open")
+        turn = (await status.json())["turn"]
+
+    assert response.status == 202
+    assert turn["status"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stop", "expected_outcome"),
+    [(False, "failed"), (True, "cancelled")],
+)
+async def test_native_lifecycle_maps_terminal_outcome_without_error_text(
+    session_db, monkeypatch: pytest.MonkeyPatch, stop, expected_outcome
+):
+    lifecycle = []
+
+    def capture(hook, **kwargs):
+        if hook == "session_turn_lifecycle":
+            lifecycle.append(dict(kwargs["dto"]))
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    lease_gate = asyncio.Event()
+    if stop:
+        adapter._run_agent = AsyncMock()
+        acquire_lease = adapter._acquire_session_execution_lease
+
+        async def delayed_acquire(*args, **kwargs):
+            await lease_gate.wait()
+            return await acquire_lease(*args, **kwargs)
+
+        monkeypatch.setattr(adapter, "_acquire_session_execution_lease", delayed_acquire)
+    else:
+        adapter._run_agent = AsyncMock(side_effect=RuntimeError("raw provider secret"))
+
+    turn_id = f"terminal-{expected_outcome}"
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": turn_id},
+            json=_payload(),
+        )
+        assert response.status == 202
+        if stop:
+            # request_stop before the scheduled worker starts is an authoritative
+            # cancelled-before-start result.
+            await client.post(f"/api/sessions/s1/turns/{turn_id}/stop")
+            lease_gate.set()
+        await adapter._session_turn_service.wait_for_turn(turn_id)
+
+    terminal = [dto for dto in lifecycle if dto["event"] == "terminal"]
+    assert len(terminal) == 1
+    assert terminal[0]["terminal_outcome"] == expected_outcome
+    assert set(terminal[0]) == {
+        "contract_version",
+        "event",
+        "occurred_at",
+        "sequence",
+        "session_id",
+        "turn_id",
+        "terminal_outcome",
+    }
+    assert "secret" not in repr(terminal)
+
+
+@pytest.mark.asyncio
+async def test_coordinator_cancellation_retains_worker_heartbeat_lease_and_terminal_truth(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    """Cancelling asyncio ownership must not abandon a live executor worker."""
+    import gateway.platforms.session_turns as session_turns
+
+    lifecycle = []
+    worker_started = threading.Event()
+    worker_release = threading.Event()
+    worker_exited = threading.Event()
+    agent = MagicMock()
+
+    def capture(hook, **kwargs):
+        if hook == "session_turn_lifecycle":
+            lifecycle.append(dict(kwargs["dto"]))
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
+    monkeypatch.setattr(session_turns, "SESSION_TURN_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+
+    async def run_agent(**kwargs):
+        def worker():
+            kwargs["agent_ref"][0] = agent
+            worker_started.set()
+            worker_release.wait(timeout=2)
+            session_db.append_message("s1", "user", kwargs["user_message"])
+            session_db.append_message("s1", "assistant", "late result")
+            worker_exited.set()
+            return {
+                "final_response": "late result",
+                "messages": session_db.get_messages_as_conversation("s1"),
+            }, {}
+
+        return await asyncio.to_thread(worker)
+
+    adapter._run_agent = run_agent
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": "cancel-live-worker"},
+            json=_payload(),
+        )
+        assert response.status == 202
+        assert await asyncio.to_thread(worker_started.wait, 1)
+        coordinator = adapter._session_turn_service._tasks["cancel-live-worker"]
+        coordinator.cancel()
+        await asyncio.sleep(0.04)
+
+        row = SessionTurnStore(session_db).get("cancel-live-worker")
+        assert row["status"] == "stopping"
+        assert not worker_exited.is_set()
+        assert session_db.get_session_execution_lease("s1") is not None
+        before = sum(item["event"] == "heartbeat" for item in lifecycle)
+        await asyncio.sleep(0.03)
+        after = sum(item["event"] == "heartbeat" for item in lifecycle)
+        assert after > before
+        assert not [item for item in lifecycle if item["event"] == "terminal"]
+
+        worker_release.set()
+        await adapter._session_turn_service.wait_for_turn("cancel-live-worker")
+
+    assert worker_exited.is_set()
+    assert session_db.get_session_execution_lease("s1") is None
+    row = SessionTurnStore(session_db).get("cancel-live-worker")
+    assert row["status"] == "interrupted"
+    terminal = [item for item in lifecycle if item["event"] == "terminal"]
+    assert len(terminal) == 1
+    assert terminal[0]["terminal_outcome"] == "cancelled"
+    assert agent.interrupt.call_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_post_agent_cancellation_preserves_started_ledger_truth(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    """Cancellation after agent exit must not claim execution never started."""
+    still_owned_entered = asyncio.Event()
+    fake_lease = MagicMock()
+
+    async def blocked_still_owned():
+        still_owned_entered.set()
+        await asyncio.Event().wait()
+
+    fake_lease.still_owned = AsyncMock(side_effect=blocked_still_owned)
+    fake_lease.release = AsyncMock(return_value=True)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    adapter._acquire_session_execution_lease = AsyncMock(return_value=fake_lease)
+
+    async def run_agent(**_kwargs):
+        session_db.append_message("s1", "user", "hello")
+        session_db.append_message("s1", "assistant", "finished agent result")
+        return {"final_response": "finished agent result"}, {}
+
+    adapter._run_agent = run_agent
+    store = SessionTurnStore(session_db)
+    turn_id = "cancel-after-agent"
+    store.reserve("s1", turn_id, _payload())
+    coordinator = adapter._session_turn_service._admit_execution(
+        store, turn_id, "s1", _payload(), None, None
+    )
+    await asyncio.wait_for(still_owned_entered.wait(), 1)
+    coordinator.cancel()
+    await adapter._session_turn_service.wait_for_turn(turn_id)
+
+    row = store.get(turn_id)
+    events = store.events_after(turn_id, 0)
+    assert row["status"] == "interrupted"
+    assert row["started_at"] is not None
+    assert row["safe_error_code"] == "cancelled_after_execution"
+    assert [event["event"] for event in events] == [
+        "turn.started", "turn.interrupted"
+    ]
+    assert events[-1]["data"]["error_code"] == "cancelled_after_execution"
+    fake_lease.release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_forced_cleanup_failure_is_retrieved_and_privacy_safe(
+    session_db, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """Cleanup ownership reports failure without asyncio's unretrieved warning."""
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    store = SessionTurnStore(session_db)
+    turn_id = "forced-cleanup-failure"
+    store.reserve("s1", turn_id, _payload())
+    monkeypatch.setattr(
+        service,
+        "_finalize_execution",
+        AsyncMock(side_effect=RuntimeError("private cleanup secret")),
+    )
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
+    loop_contexts = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_contexts.append(context))
+    try:
+        execution = service._admit_execution(
+            store, turn_id, "s1", _payload(), None, None
+        )
+        execution.cancel()
+        await asyncio.gather(execution, return_exceptions=True)
+        deadline = time.monotonic() + 1
+        while turn_id in service._tasks and time.monotonic() < deadline:
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert turn_id not in service._tasks
+    assert not [
+        context for context in loop_contexts
+        if context.get("message") == "Task exception was never retrieved"
+    ]
+    assert "session_turn_background_task_failed" in caplog.text
+    assert "private cleanup secret" not in caplog.text
+    # The forced replacement intentionally prevented the real cleanup body;
+    # explicitly drain its test-only observer after proving task ownership.
+    dispatcher = service._lifecycle_dispatchers.pop(turn_id)
+    dispatcher.abort()
+    assert await asyncio.to_thread(dispatcher.flush, 1)
+
+
+@pytest.mark.asyncio
+async def test_central_finalizer_releases_interrupt_owner_on_cleanup_failure(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    store = SessionTurnStore(session_db)
+    turn_id = "interrupt-owner-cleanup-failure"
+    owner = asyncio.current_task()
+    assert owner is not None
+    service._interruption_owners[turn_id] = owner
+    service._agent_refs[turn_id] = [MagicMock()]
+
+    async def fail_cleanup_store(*_args, **_kwargs):
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(service, "_store_operation", fail_cleanup_store)
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        await service._finalize_execution(store, turn_id)
+
+    assert turn_id not in service._interruption_owners
+    assert turn_id not in service._agent_refs
+    assert turn_id not in service._lifecycle_cleanup_owners
+
+
+@pytest.mark.asyncio
+async def test_blocking_finalize_store_does_not_block_event_loop(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    """Synchronous SQLite finalization remains ordered but runs off-loop."""
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    store = SessionTurnStore(session_db)
+    turn_id = "blocking-finalize-store"
+    store.reserve("s1", turn_id, _payload())
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
+    finish_entered = threading.Event()
+    finish_release = threading.Event()
+    original_finish = store.finish
+
+    def blocking_finish(*args, **kwargs):
+        finish_entered.set()
+        finish_release.wait(timeout=2)
+        return original_finish(*args, **kwargs)
+
+    monkeypatch.setattr(store, "finish", blocking_finish)
+    execution = service._admit_execution(
+        store, turn_id, "s1", _payload(), None, None
+    )
+    execution.cancel()
+    await asyncio.gather(execution, return_exceptions=True)
+    assert await asyncio.to_thread(finish_entered.wait, 1)
+
+    # This timer must fire while finish() is blocked in the store worker.
+    ticked = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.02, ticked.set)
+    await asyncio.wait_for(ticked.wait(), 0.1)
+    finish_release.set()
+    await service.wait_for_turn(turn_id)
+
+    assert store.get(turn_id)["status"] == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_blocking_delivery_store_does_not_block_loop_and_keeps_state_event_order(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    store = SessionTurnStore(session_db)
+    store.reserve("s1", "blocking-delivery", _payload(mode="both"))
+    entered = threading.Event()
+    release = threading.Event()
+    original_begin = store.begin_delivery
+
+    def blocking_begin(*args, **kwargs):
+        entered.set()
+        release.wait(timeout=2)
+        return original_begin(*args, **kwargs)
+
+    monkeypatch.setattr(store, "begin_delivery", blocking_begin)
+    binding = SlackBinding(chat_id="safe", thread_id=None, metadata={})
+    delivery = asyncio.create_task(
+        service._deliver_slack(
+            store,
+            "blocking-delivery",
+            binding,
+            AsyncMock(),
+            "x" * 3_001,
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 1)
+
+    ticked = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.02, ticked.set)
+    await asyncio.wait_for(ticked.wait(), 0.1)
+    release.set()
+    await delivery
+
+    persisted = store.get_delivery("blocking-delivery", "slack")
+    events = store.events_after("blocking-delivery", 0)
+    assert persisted is not None and persisted["state"] == "rejected"
+    assert [event["event"] for event in events] == ["delivery.failed"]
+    assert events[0]["data"]["status"] == persisted["state"]
+
+
+@pytest.mark.asyncio
+async def test_blocking_stop_store_does_not_block_aiohttp_loop(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    await service.reconcile_startup()
+    store = await service._store()
+    assert store is not None
+    store.reserve("s1", "blocking-stop", _payload())
+    entered = threading.Event()
+    release = threading.Event()
+    original_stop = store.request_stop
+
+    def blocking_stop(*args, **kwargs):
+        entered.set()
+        release.wait(timeout=2)
+        return original_stop(*args, **kwargs)
+
+    monkeypatch.setattr(store, "request_stop", blocking_stop)
+    async with TestClient(TestServer(_app(adapter))) as client:
+        stop_task = asyncio.create_task(
+            client.post("/api/sessions/s1/turns/blocking-stop/stop")
+        )
+        assert await asyncio.to_thread(entered.wait, 1)
+        capability = await asyncio.wait_for(client.get("/v1/capabilities"), 0.2)
+        assert capability.status == 200
+        release.set()
+        response = await stop_task
+        body = await response.json()
+
+    assert response.status == 202
+    assert body["turn"]["status"] == "stopping"
+    assert [event["event"] for event in store.events_after("blocking-stop", 0)] == [
+        "turn.stopping"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_store_operations_preserve_submission_order(session_db):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    service = adapter._session_turn_service
+    first_entered = threading.Event()
+    first_release = threading.Event()
+    observed = []
+
+    def first():
+        observed.append("first-start")
+        first_entered.set()
+        first_release.wait(timeout=2)
+        observed.append("first-end")
+
+    def second():
+        observed.append("second")
+
+    first_task = asyncio.create_task(service._store_operation(first))
+    assert await asyncio.to_thread(first_entered.wait, 1)
+    second_task = asyncio.create_task(service._store_operation(second))
+    await asyncio.sleep(0.02)
+    assert observed == ["first-start"]
+    first_release.set()
+    await asyncio.gather(first_task, second_task)
+
+    assert observed == ["first-start", "first-end", "second"]
+
+
+@pytest.mark.asyncio
+async def test_stop_watcher_failure_is_retrieved_and_privacy_safe(
+    session_db,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    await service.reconcile_startup()
+    store = await service._store()
+    assert store is not None
+    store.reserve("s1", "broken-stop-watcher", _payload())
+    monkeypatch.setattr(
+        service,
+        "_interrupt_when_available",
+        AsyncMock(side_effect=RuntimeError("private watcher secret")),
+    )
+    loop_contexts = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_contexts.append(context))
+    try:
+        async with TestClient(TestServer(_app(adapter))) as client:
+            response = await client.post(
+                "/api/sessions/s1/turns/broken-stop-watcher/stop"
+            )
+            assert response.status == 202
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert not [
+        context
+        for context in loop_contexts
+        if context.get("message") == "Task exception was never retrieved"
+    ]
+    assert "session_turn_background_task_failed" in caplog.text
+    assert "private watcher secret" not in caplog.text
+    assert service._interruption_owners == {}
+
+
+@pytest.mark.asyncio
+async def test_immediate_prestart_cancellation_reclaims_all_lifecycle_capacity(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    """Never-entered coordinators still durably terminate and drain observers."""
+    import gateway.platforms.session_turns as session_turns
+
+    lifecycle = []
+
+    def capture(hook, **kwargs):
+        if hook == "session_turn_lifecycle":
+            lifecycle.append(dict(kwargs["dto"]))
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    store = SessionTurnStore(session_db)
+    admitted: dict[str, bool] = {}
+    tasks = []
+
+    # No await occurs between create_task and cancel: all 80 coordinators are
+    # deterministically cancelled before their coroutine's first instruction.
+    for index in range(80):
+        session_id = "s1" if index == 0 else f"prestart-session-{index}"
+        if index:
+            session_db.create_session(session_id, "api_server")
+        turn_id = f"prestart-turn-{index}"
+        store.reserve(session_id, turn_id, _payload(turn_id))
+        task = service._admit_execution(
+            store, turn_id, session_id, _payload(turn_id), None, None
+        )
+        admitted[turn_id] = service._lifecycle_dispatchers[turn_id]._admitted
+        task.cancel()
+        tasks.append(task)
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        stats = session_turns.session_turn_lifecycle_executor_stats()
+        if (
+            not service._tasks
+            and not service._lifecycle_dispatchers
+            and stats["active"] == 0
+            and stats["pending"] == 0
+        ):
+            break
+        await asyncio.sleep(0.01)
+
+    assert service._tasks == {}
+    assert service._lifecycle_dispatchers == {}
+    stats = session_turns.session_turn_lifecycle_executor_stats()
+    assert stats["active"] == stats["pending"] == 0
+
+    by_turn = {
+        turn_id: [item for item in lifecycle if item["turn_id"] == turn_id]
+        for turn_id in admitted
+    }
+    for turn_id, was_admitted in admitted.items():
+        row = store.get(turn_id)
+        assert row["status"] == "interrupted"
+        assert row["safe_error_code"] == "cancelled_before_execution"
+        events = by_turn[turn_id]
+        if was_admitted:
+            assert [item["event"] for item in events] == ["registered", "terminal"]
+            assert events[-1]["terminal_outcome"] == "cancelled"
+        else:
+            # Executor saturation is the contract's explicit observer fail-open.
+            assert events == []
+
+    # Recovered observer/executor capacity must support a complete later turn.
+    async def run_agent(**kwargs):
+        session_db.append_message("s1", "user", kwargs["user_message"])
+        session_db.append_message("s1", "assistant", "recovered")
+        return {"final_response": "recovered"}, {}
+
+    adapter._run_agent = run_agent
+    normal_id = "post-prestart-normal"
+    store.reserve("s1", normal_id, _payload("normal"))
+    service._admit_execution(store, normal_id, "s1", _payload("normal"), None, None)
+    await service.wait_for_turn(normal_id)
+    normal = [item for item in lifecycle if item["turn_id"] == normal_id]
+    assert store.get(normal_id)["status"] == "completed"
+    assert [item["event"] for item in normal] == ["registered", "started", "terminal"]
+    assert normal[-1]["terminal_outcome"] == "succeeded"
+    assert service._tasks == {}
+    assert service._lifecycle_dispatchers == {}
+
+
+@pytest.mark.asyncio
+async def test_slow_observer_never_blocks_post_worker_or_lease_release(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_observer(hook, **_kwargs):
+        if hook == "session_turn_lifecycle" and not entered.is_set():
+            entered.set()
+            release.wait(timeout=2)
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", slow_observer)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+
+    async def run_agent(**kwargs):
+        session_db.append_message("s1", "user", kwargs["user_message"])
+        session_db.append_message("s1", "assistant", "done")
+        return {"final_response": "done"}, {}
+
+    adapter._run_agent = run_agent
+    # Exclude one-time ledger/SQLite initialization from the observer latency
+    # assertion; this test measures only turn admission with a hung callback.
+    await adapter._session_turn_service.reconcile_startup()
+    async with TestClient(TestServer(_app(adapter))) as client:
+        started_at = time.perf_counter()
+        response = await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": "slow-observer"},
+            json=_payload(),
+        )
+        elapsed = time.perf_counter() - started_at
+        assert response.status == 202
+        assert elapsed < 0.5  # Far below the callback's two-second block.
+        assert await asyncio.to_thread(entered.wait, 1)
+        await adapter._session_turn_service.wait_for_turn("slow-observer")
+
+    assert SessionTurnStore(session_db).get("slow-observer")["status"] == "completed"
+    assert session_db.get_session_execution_lease("s1") is None
+    assert "slow-observer" not in adapter._session_turn_service._lifecycle_dispatchers
+    release.set()
+
+
+@pytest.mark.asyncio
+async def test_hung_observer_many_turns_has_fixed_capacity_and_no_dispatcher_leaks(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    import gateway.platforms.session_turns as session_turns
+
+    release = threading.Event()
+    entered = 0
+    entered_lock = threading.Lock()
+    baseline = session_turns.session_turn_lifecycle_metrics()
+    stats = session_turns.session_turn_lifecycle_executor_stats()
+    turn_count = stats["workers"] + stats["pending_capacity"] + 12
+
+    def hung_observer(hook, **_kwargs):
+        nonlocal entered
+        if hook == "session_turn_lifecycle":
+            with entered_lock:
+                entered += 1
+            release.wait(timeout=5)
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", hung_observer)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+
+    for index in range(1, turn_count):
+        session_db.create_session(f"bounded-{index}", "api_server")
+
+    async def run_agent(**kwargs):
+        session_id = kwargs["session_id"]
+        session_db.append_message(session_id, "user", kwargs["user_message"])
+        session_db.append_message(session_id, "assistant", "done")
+        return {"final_response": "done"}, {}
+
+    adapter._run_agent = run_agent
+    try:
+        async with TestClient(TestServer(_app(adapter))) as client:
+            responses = await asyncio.gather(
+                *[
+                    client.post(
+                        f"/api/sessions/{'s1' if index == 0 else f'bounded-{index}'}/turns",
+                        headers={"Idempotency-Key": f"bounded-turn-{index}"},
+                        json=_payload(),
+                    )
+                    for index in range(turn_count)
+                ]
+            )
+            assert {response.status for response in responses} == {202}
+            await asyncio.gather(
+                *[
+                    adapter._session_turn_service.wait_for_turn(f"bounded-turn-{index}")
+                    for index in range(turn_count)
+                ]
+            )
+
+        executor = session_turns.session_turn_lifecycle_executor_stats()
+        assert executor["active"] <= executor["workers"]
+        assert executor["pending"] <= executor["pending_capacity"]
+        assert len(
+            [
+                thread
+                for thread in threading.enumerate()
+                if thread.name.startswith("session-turn-lifecycle-")
+            ]
+        ) == executor["workers"]
+        assert entered <= executor["workers"]
+        assert (
+            session_turns.session_turn_lifecycle_metrics()[
+                "observer_capacity_exhausted"
+            ]
+            > baseline["observer_capacity_exhausted"]
+        )
+        assert adapter._session_turn_service._lifecycle_dispatchers == {}
+    finally:
+        release.set()
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        executor = session_turns.session_turn_lifecycle_executor_stats()
+        if executor["active"] == 0 and executor["pending"] == 0:
+            break
+        await asyncio.sleep(0.01)
+    assert session_turns.session_turn_lifecycle_executor_stats()["active"] == 0
+    assert session_turns.session_turn_lifecycle_executor_stats()["pending"] == 0
+
+
+def test_lifecycle_dispatcher_backpressure_drops_only_heartbeats_and_logs_metric(
+    monkeypatch: pytest.MonkeyPatch
+):
+    import gateway.platforms.session_turns as session_turns
+
+    entered = threading.Event()
+    release = threading.Event()
+    lifecycle = []
+    baseline = session_turns.session_turn_lifecycle_metrics()
+
+    def blocked(hook, **kwargs):
+        if hook == "session_turn_lifecycle":
+            lifecycle.append(dict(kwargs["dto"]))
+            if kwargs["dto"]["event"] == "registered":
+                entered.set()
+                release.wait(timeout=2)
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", blocked)
+    monkeypatch.setattr(session_turns, "SESSION_TURN_LIFECYCLE_QUEUE_SIZE", 4)
+    dispatcher = session_turns.SessionTurnLifecycleDispatcher("safe-session", "safe-turn")
+    assert entered.wait(timeout=1)
+    assert dispatcher.emit("started")
+    for _ in range(20):
+        dispatcher.emit("heartbeat")
+    assert dispatcher.close("succeeded")
+
+    metrics = session_turns.session_turn_lifecycle_metrics()
+    assert metrics["heartbeat_dropped"] > baseline["heartbeat_dropped"]
+    release.set()
+    assert dispatcher.flush(timeout=1)
+    names = [item["event"] for item in lifecycle]
+    assert names[0:2] == ["registered", "started"]
+    assert names[-1] == "terminal"
+    assert names.count("terminal") == 1
+
+
+@pytest.mark.asyncio
+async def test_lease_loss_emits_one_cancelled_terminal_after_worker_exit(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    lifecycle = []
+    fake_lease = MagicMock()
+    fake_lease.still_owned = AsyncMock(return_value=False)
+    fake_lease.release = AsyncMock(return_value=False)
+
+    def capture(hook, **kwargs):
+        if hook == "session_turn_lifecycle":
+            lifecycle.append(dict(kwargs["dto"]))
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    adapter._acquire_session_execution_lease = AsyncMock(return_value=fake_lease)
+
+    async def run_agent(**kwargs):
+        session_db.append_message("s1", "user", kwargs["user_message"])
+        session_db.append_message("s1", "assistant", "untrusted after lease loss")
+        return {"final_response": "untrusted after lease loss"}, {}
+
+    adapter._run_agent = run_agent
+    async with TestClient(TestServer(_app(adapter))) as client:
+        await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": "lease-loss-once"},
+            json=_payload(),
+        )
+        await adapter._session_turn_service.wait_for_turn("lease-loss-once")
+
+    row = SessionTurnStore(session_db).get("lease-loss-once")
+    assert row["status"] == "interrupted"
+    assert row["safe_error_code"] == "execution_lease_lost"
+    terminal = [item for item in lifecycle if item["event"] == "terminal"]
+    assert len(terminal) == 1
+    assert terminal[0]["terminal_outcome"] == "cancelled"
+    fake_lease.release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_history_read_failure_lifecycle_is_registered_started_terminal(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    lifecycle = []
+
+    def capture(hook, **kwargs):
+        if hook == "session_turn_lifecycle":
+            lifecycle.append(dict(kwargs["dto"]))
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    adapter._conversation_history_for_session = AsyncMock(
+        side_effect=RuntimeError("private history failure")
+    )
+    async with TestClient(TestServer(_app(adapter))) as client:
+        await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": "history-lifecycle"},
+            json=_payload(),
+        )
+        await adapter._session_turn_service.wait_for_turn("history-lifecycle")
+
+    assert [item["event"] for item in lifecycle] == ["registered", "started", "terminal"]
+    assert lifecycle[-1]["terminal_outcome"] == "failed"
+    assert "private" not in repr(lifecycle)
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_duplicate_posts_register_and_execute_once(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    lifecycle = []
+    calls = 0
+    release = asyncio.Event()
+
+    def capture(hook, **kwargs):
+        if hook == "session_turn_lifecycle":
+            lifecycle.append(dict(kwargs["dto"]))
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+
+    async def run_agent(**kwargs):
+        nonlocal calls
+        calls += 1
+        await release.wait()
+        session_db.append_message("s1", "user", kwargs["user_message"])
+        session_db.append_message("s1", "assistant", "once")
+        return {"final_response": "once"}, {}
+
+    adapter._run_agent = run_agent
+    async with TestClient(TestServer(_app(adapter))) as client:
+        responses = await asyncio.gather(*[
+            client.post(
+                "/api/sessions/s1/turns",
+                headers={"Idempotency-Key": "duplicate-race"},
+                json=_payload(),
+            )
+            for _ in range(2)
+        ])
+        release.set()
+        await adapter._session_turn_service.wait_for_turn("duplicate-race")
+
+    assert sorted(response.status for response in responses) == [200, 202]
+    assert calls == 1
+    assert sum(item["event"] == "registered" for item in lifecycle) == 1
+    assert sum(item["event"] == "terminal" for item in lifecycle) == 1
+
+
+@pytest.mark.asyncio
+async def test_startup_preserves_live_owner_without_adoption_or_lifecycle(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    store = SessionTurnStore(session_db)
+    store.reserve("s1", "foreign-live", _payload())
+    store.set_running("foreign-live")
+    assert session_db.acquire_session_execution_lease("s1", "foreign-owner", ttl_seconds=30)
+    lifecycle = []
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda hook, **kwargs: lifecycle.append((hook, kwargs)),
+    )
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+
+    await adapter._session_turn_service.reconcile_startup()
+
+    assert store.get("foreign-live")["status"] == "running"
+    assert adapter._session_turn_service._tasks == {}
+    assert lifecycle == []
+
+
+@pytest.mark.asyncio
+async def test_api_root_turn_identity_reaches_child_parent_turn_id_end_to_end(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    """The admitted API identity, not a synthesized task id, parents children."""
+    from tools import delegate_tool
+
+    lifecycle = []
+    parent = MagicMock()
+    parent.session_id = "s1"
+    parent._delegate_depth = 0
+    parent.base_url = "https://example.invalid/v1"
+    parent.api_key = "key"
+    parent.model = "model"
+    parent.provider = "openai"
+    parent.api_mode = "chat_completions"
+    parent.reasoning_config = {"enabled": False}
+    parent.enabled_toolsets = []
+    parent.disabled_toolsets = []
+    parent.prefill_messages = None
+    parent._fallback_chain = []
+    parent.request_overrides = {}
+    parent.openrouter_min_coding_score = None
+    child = MagicMock()
+    child.session_id = "child-session"
+
+    def capture(hook, **kwargs):
+        if hook in {"session_turn_lifecycle", "subagent_lifecycle"}:
+            lifecycle.append((hook, dict(kwargs["dto"])))
+        return []
+
+    def run_conversation(*, user_message, **_kwargs):
+        # This assignment is the real turn-prologue contract in
+        # build_turn_context; its focused test covers consumption/reset.
+        parent._current_turn_id = parent._authoritative_turn_id
+        delegate_tool._build_child_agent(
+            task_index=0,
+            goal="private child goal",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=2,
+            parent_agent=parent,
+            task_count=1,
+        )
+        session_db.append_message("s1", "user", user_message)
+        session_db.append_message("s1", "assistant", "done")
+        return {"final_response": "done"}
+
+    parent.run_conversation.side_effect = run_conversation
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
+    monkeypatch.setattr("run_agent.AIAgent", MagicMock(return_value=child))
+    monkeypatch.setattr(delegate_tool, "_resolve_child_credential_pool", lambda *_args: None)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    monkeypatch.setattr(adapter, "_create_agent", MagicMock(return_value=parent))
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": "root-authoritative-turn"},
+            json=_payload(),
+        )
+        assert response.status == 202
+        await adapter._session_turn_service.wait_for_turn("root-authoritative-turn")
+
+    registered_children = [
+        dto for hook, dto in lifecycle
+        if hook == "subagent_lifecycle" and dto["event"] == "registered"
+    ]
+    assert len(registered_children) == 1
+    assert registered_children[0]["parent_turn_id"] == "root-authoritative-turn"
+    assert "private child goal" not in repr(registered_children)

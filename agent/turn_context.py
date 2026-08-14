@@ -428,7 +428,15 @@ def build_turn_context(
     # Generate unique task_id if not provided to isolate VMs between tasks.
     effective_task_id = task_id or str(uuid.uuid4())
     agent._current_task_id = effective_task_id
-    turn_id = f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+    authoritative_turn_id = getattr(agent, "_authoritative_turn_id", None)
+    turn_id = (
+        authoritative_turn_id
+        if isinstance(authoritative_turn_id, str) and authoritative_turn_id
+        else f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+    )
+    # The API edge injects this once for a durable session turn. Do not let a
+    # reused agent accidentally apply the same provider identity to a later turn.
+    agent._authoritative_turn_id = None
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
     # Tripwire: warn (with both turn ids) when this turn starts before the
