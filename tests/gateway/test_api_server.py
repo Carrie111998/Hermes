@@ -2375,13 +2375,13 @@ class TestSessionIdHeader:
         monkeypatch.setattr(
             async_delegation,
             "consume_deferred_completions",
-            lambda session_id: [{
+            lambda session_id, *, prepare: [prepare({
                 "type": "async_delegation",
                 "delegation_id": "deleg_chat_context",
                 "status": "completed",
                 "summary": f"result for {session_id}",
                 "goal": "research",
-            }],
+            })],
         )
         mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
         app = _create_app(auth_adapter)

@@ -201,13 +201,13 @@ class TestStartRun:
         monkeypatch.setattr(
             async_delegation,
             "consume_deferred_completions",
-            lambda session_id: [{
+            lambda session_id, *, prepare: [prepare({
                 "type": "async_delegation",
                 "delegation_id": "deleg_run_context",
                 "status": "completed",
                 "summary": f"result for {session_id}",
                 "goal": "research",
-            }],
+            })],
         )
         app = _create_runs_app(adapter)
         captured = {}

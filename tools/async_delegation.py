@@ -574,8 +574,17 @@ def defer_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def consume_deferred_completions(origin_session_id: str) -> List[Dict[str, Any]]:
-    """Atomically take deferred completions for one real API client turn."""
+def consume_deferred_completions(
+    origin_session_id: str,
+    *,
+    prepare: Optional[Callable[[Dict[str, Any]], Any]] = None,
+) -> List[Any]:
+    """Atomically prepare and take deferred completions for one client turn.
+
+    ``prepare`` runs before the durable row is acknowledged. If preparation
+    fails, the transaction rolls back so a formatting failure cannot lose a
+    completion that never reached the model.
+    """
     if not origin_session_id:
         return []
     now = time.time()
@@ -603,6 +612,7 @@ def consume_deferred_completions(origin_session_id: str) -> List[Dict[str, Any]]
                     (now, delegation_id),
                 )
                 continue
+            prepared = prepare(event) if prepare is not None else event
             cur = conn.execute(
                 """UPDATE async_delegations SET delivery_state='delivered',
                           delivered_at=?, updated_at=?
@@ -610,7 +620,7 @@ def consume_deferred_completions(origin_session_id: str) -> List[Dict[str, Any]]
                 (now, now, delegation_id),
             )
             if cur.rowcount == 1:
-                events.append(event)
+                events.append(prepared)
     return events
 
 

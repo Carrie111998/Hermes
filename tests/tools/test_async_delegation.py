@@ -119,6 +119,28 @@ def test_deferred_completion_is_consumed_once_by_its_origin_session():
     assert row["delivery_state"] == "delivered"
 
 
+def test_deferred_completion_stays_parked_when_preparation_fails():
+    _persist_completed_event(
+        delegation_id="deleg_api_prepare_failure",
+        origin_session_id="raw-api-session",
+    )
+    claim_id = "gateway:test-claim"
+    assert ad.claim_completion_delivery("deleg_api_prepare_failure", claim_id)
+    assert ad.defer_completion_delivery("deleg_api_prepare_failure", claim_id)
+
+    def fail_to_prepare(_event):
+        raise ValueError("cannot format event")
+
+    with pytest.raises(ValueError, match="cannot format event"):
+        ad.consume_deferred_completions(
+            "raw-api-session", prepare=fail_to_prepare,
+        )
+
+    row = ad.get_durable_delegation("deleg_api_prepare_failure")
+    assert row is not None
+    assert row["delivery_state"] == "deferred"
+
+
 def test_active_for_session_counts_every_live_delegation_state():
     with ad._records_lock:
         ad._records.update(

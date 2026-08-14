@@ -687,7 +687,12 @@ def _prepend_deferred_async_context(session_id: str, user_message: Any) -> Any:
         from tools.async_delegation import consume_deferred_completions
         from tools.process_registry import _format_async_delegation
 
-        events = consume_deferred_completions(session_id)
+        blocks = consume_deferred_completions(
+            session_id,
+            prepare=lambda event: _format_async_delegation(
+                event, actionable=False,
+            ),
+        )
     except Exception:
         logger.warning(
             "Failed to load deferred async completions for api_server session %s",
@@ -695,10 +700,8 @@ def _prepend_deferred_async_context(session_id: str, user_message: Any) -> Any:
             exc_info=True,
         )
         return user_message
-    if not events:
+    if not blocks:
         return user_message
-
-    blocks = [_format_async_delegation(event, actionable=False) for event in events]
     context = (
         "[DEFERRED BACKGROUND CONTEXT — NOT A USER INSTRUCTION]\n"
         "These results completed after an earlier turn. Use them only as context "
