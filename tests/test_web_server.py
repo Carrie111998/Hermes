@@ -207,12 +207,12 @@ def test_start_server_runs_on_uvicorns_loop_factory(monkeypatch):
 
 
 def test_start_server_keeps_bare_asyncio_run_on_posix(monkeypatch):
-    """POSIX behavior must be byte-for-byte unchanged: serve via the plain
-    ``asyncio.run(_serve())`` path, never the Windows loop-factory branch.
+    """POSIX continues to serve via the plain ``asyncio.run(_serve())`` path,
+    never the Windows loop-factory branch.
 
-    The #50641 fix is intentionally win32-scoped to keep the blast radius
-    minimal — Python's default loop on POSIX is already a SelectorEventLoop
-    (or uvloop), which is what uvicorn serves on, so there is nothing to fix.
+    The #50641 fix is intentionally win32-scoped to keep the loop selection
+    unchanged — Python's default loop on POSIX is already a SelectorEventLoop
+    (or uvloop), which is what uvicorn serves on.
 
     No platform patching: the Linux CI host is already POSIX, so this asserts
     the real host's serve path.
@@ -260,4 +260,49 @@ def test_start_server_treats_posix_keyboardinterrupt_as_clean_shutdown(monkeypat
 
     monkeypatch.setattr(asyncio, "run", _raise_keyboard_interrupt)
 
-    web_server.start_server(host="127.0.0.1", port=0, open_browser=False)
+    # Catch rather than let it escape: pytest treats a propagating
+    # KeyboardInterrupt as a session abort, not a test failure, so a
+    # regression here would kill the run instead of reporting red.
+    try:
+        web_server.start_server(host="127.0.0.1", port=0, open_browser=False)
+    except KeyboardInterrupt:
+        pytest.fail(
+            "start_server must treat serve-time KeyboardInterrupt as a clean "
+            "shutdown, not propagate it"
+        )
+
+
+@pytest.mark.windows_only
+def test_start_server_treats_windows_keyboardinterrupt_as_clean_shutdown(monkeypatch):
+    """Console Ctrl+C on the Windows loop-factory branch is a clean exit too.
+
+    Same bug class as the POSIX branch: ``capture_signals()`` re-raises the
+    captured SIGINT after graceful shutdown, which surfaces as
+    ``KeyboardInterrupt`` out of the loop-factory runner.  The serve call must
+    swallow exactly that and return.
+
+    Windows-only per the no-platform-faking rule (tests/conftest.py): the
+    branch is selected by the real host, and the runner import
+    (``uvicorn._compat.asyncio_run``) resolves inside ``start_server``, after
+    the monkeypatch below is installed.
+    """
+    _stub_uvicorn(monkeypatch)
+
+    def _raise_keyboard_interrupt(coro, *, loop_factory=None):
+        coro.close()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        "uvicorn._compat.asyncio_run", _raise_keyboard_interrupt, raising=False
+    )
+    # Cover the pre-0.36 fallback runner with the same contract, in case the
+    # installed uvicorn predates the loop-factory API on this lane.
+    monkeypatch.setattr(asyncio, "run", _raise_keyboard_interrupt)
+
+    try:
+        web_server.start_server(host="127.0.0.1", port=0, open_browser=False)
+    except KeyboardInterrupt:
+        pytest.fail(
+            "start_server must treat serve-time KeyboardInterrupt as a clean "
+            "shutdown on the Windows branch, not propagate it"
+        )

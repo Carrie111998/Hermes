@@ -18253,9 +18253,9 @@ def start_server(
 
     # Windows-only path. Resolve the runner + loop factory FIRST (and fall back
     # to a hand-installed Windows selector policy only when uvicorn predates the
-    # loop-factory API, < 0.36). The actual serve call is then OUTSIDE the
-    # try/except so genuine serve-time errors (port in use, KeyboardInterrupt)
-    # propagate normally instead of being swallowed and double-run.
+    # loop-factory API, < 0.36). The actual serve call is then OUTSIDE this
+    # import try/except so genuine serve-time errors (port in use) propagate
+    # normally instead of being swallowed and double-run.
     try:
         from uvicorn._compat import asyncio_run as _runner
 
@@ -18270,7 +18270,16 @@ def start_server(
         except Exception:
             pass
 
-    if _runner is not None:
-        _runner(_serve(), loop_factory=_loop_factory)
-    else:
-        asyncio.run(_serve())
+    # Same clean Ctrl+C contract as the POSIX branch above: ``capture_signals()``
+    # re-raises the captured signal after the graceful shutdown has already
+    # completed. For console Ctrl+C the re-raised SIGINT lands as
+    # ``KeyboardInterrupt`` — a clean user-requested exit here too. (Re-raised
+    # SIGTERM/SIGBREAK keep their default terminate disposition and never reach
+    # this except.)
+    try:
+        if _runner is not None:
+            _runner(_serve(), loop_factory=_loop_factory)
+        else:
+            asyncio.run(_serve())
+    except KeyboardInterrupt:
+        return
