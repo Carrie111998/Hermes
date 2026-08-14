@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
 
 _ZERO = Decimal("0")
+_ONE = Decimal("1")
 _ONE_MILLION = Decimal("1000000")
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 
@@ -1194,16 +1195,65 @@ def _openrouter_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
     )
 
 
+def _custom_provider_pricing_override(base_url: str) -> Dict[str, Any]:
+    """Return explicit pricing semantics for the custom provider at *base_url*."""
+    if not base_url:
+        return {}
+    try:
+        from hermes_cli.config import (
+            get_compatible_custom_providers,
+            load_config_readonly,
+            normalize_route_base_url,
+        )
+
+        target = normalize_route_base_url(base_url)
+        for entry in get_compatible_custom_providers(load_config_readonly()):
+            candidate = normalize_route_base_url(entry.get("base_url"))
+            pricing = entry.get("pricing")
+            if candidate == target and isinstance(pricing, dict):
+                return pricing
+    except Exception:
+        logger.debug("custom-provider pricing override resolution failed", exc_info=True)
+    return {}
+
+
 def _pricing_entry_from_metadata(
     metadata: Dict[str, Dict[str, Any]],
     model_id: str,
     *,
     source_url: str,
     pricing_version: str,
+    pricing_override: Optional[Dict[str, Any]] = None,
 ) -> Optional[PricingEntry]:
     if model_id not in metadata:
         return None
-    pricing = metadata[model_id].get("pricing") or {}
+    model_metadata = metadata[model_id]
+    pricing = model_metadata.get("pricing") or {}
+    if not isinstance(pricing, dict):
+        return None
+    pricing = dict(pricing)
+    # Some compatible catalogs place these beside ``pricing`` rather than
+    # inside it. Accept both shapes, with the nested value taking precedence.
+    for key in ("currency", "rate"):
+        if key not in pricing and key in model_metadata:
+            pricing[key] = model_metadata[key]
+    # A local provider config is an explicit user contract and therefore wins
+    # over incomplete or incorrect endpoint metadata.
+    if pricing_override:
+        for key in ("currency", "rate"):
+            if key in pricing_override:
+                pricing[key] = pricing_override[key]
+
+    currency = str(pricing.get("currency") or "USD").strip().upper()
+    usd_rate = _ONE
+    if currency != "USD":
+        usd_rate = _to_decimal(pricing.get("rate"))
+        if usd_rate is None or usd_rate <= _ZERO:
+            # The endpoint has told us the values are not USD, but has not
+            # supplied a safe conversion contract. Unknown is more honest than
+            # silently relabelling foreign currency as dollars.
+            return None
+
     prompt = _to_decimal(pricing.get("prompt"))
     completion = _to_decimal(pricing.get("completion"))
     request = _to_decimal(pricing.get("request"))
@@ -1223,14 +1273,14 @@ def _pricing_entry_from_metadata(
     def _per_token_to_per_million(value: Optional[Decimal]) -> Optional[Decimal]:
         if value is None:
             return None
-        return value * _ONE_MILLION
+        return value * usd_rate * _ONE_MILLION
 
     return PricingEntry(
         input_cost_per_million=_per_token_to_per_million(prompt),
         output_cost_per_million=_per_token_to_per_million(completion),
         cache_read_cost_per_million=_per_token_to_per_million(cache_read),
         cache_write_cost_per_million=_per_token_to_per_million(cache_write),
-        request_cost=request,
+        request_cost=request * usd_rate if request is not None else None,
         source="provider_models_api",
         source_url=source_url,
         pricing_version=pricing_version,
@@ -1262,6 +1312,7 @@ def get_pricing_entry(
             route.model,
             source_url=f"{route.base_url.rstrip('/')}/models",
             pricing_version="openai-compatible-models-api",
+            pricing_override=_custom_provider_pricing_override(route.base_url),
         )
         if entry:
             return entry

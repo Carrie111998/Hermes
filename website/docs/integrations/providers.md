@@ -1271,7 +1271,26 @@ providers:
     transport: anthropic_messages  # for Anthropic-compatible proxies
 ```
 
-Each entry accepts: `api` (the endpoint base URL — `base_url`/`url` are accepted aliases), `name` (optional display name; defaults to the dict key), `key_env` or inline `api_key`, `transport` (`chat_completions` / `anthropic_messages` / `codex_responses`), `default_model`, `models`, `context_length`, `discover_models`, `extra_body`, `extra_headers`, `ssl_ca_cert` / `ssl_verify`, and `enabled: false` to hide an entry without deleting it.
+Each entry accepts: `api` (the endpoint base URL — `base_url`/`url` are accepted aliases), `name` (optional display name; defaults to the dict key), `key_env` or inline `api_key`, `transport` (`chat_completions` / `anthropic_messages` / `codex_responses`), `default_model`, `models`, `context_length`, `discover_models`, `pricing`, `extra_body`, `extra_headers`, `ssl_ca_cert` / `ssl_verify`, and `enabled: false` to hide an entry without deleting it.
+
+If an endpoint's `/models` prices are denominated in a currency other than USD,
+declare the currency and the number of USD per one unit of that currency. Hermes
+applies the rate to prompt, completion, cache, and request prices before recording
+USD costs:
+
+```yaml
+providers:
+  router-ai:
+    api: https://router.example/v1
+    pricing:
+      currency: RUB
+      rate: 0.011  # USD per RUB; update when your billing conversion changes
+```
+
+An endpoint may publish the same `currency` and `rate` fields in each model's
+`pricing` object. Provider config takes precedence. If a catalog declares a
+non-USD currency without a positive rate, Hermes reports its pricing as unknown
+instead of incorrectly labelling the foreign-currency amount as USD.
 
 :::note Legacy format
 Older configs used a top-level `custom_providers:` list instead. It still works — Hermes reads both — and `hermes update` auto-migrates it to the `providers:` dict (config v12). Field names differ slightly in the dict format: legacy `model` is `default_model`, and legacy `api_mode` is `transport`.

@@ -1328,6 +1328,7 @@ def _normalize_custom_provider_entry(
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
         "discover_models", "extra_body", "extra_headers",
+        "pricing",
         "ssl_ca_cert", "ssl_verify",
     }
     for camel, snake in _CAMEL_ALIASES.items():
@@ -1456,6 +1457,10 @@ def _normalize_custom_provider_entry(
     if isinstance(extra_body, dict):
         normalized["extra_body"] = dict(extra_body)
 
+    pricing = entry.get("pricing")
+    if isinstance(pricing, dict):
+        normalized["pricing"] = dict(pricing)
+
     # Per-provider extra HTTP headers (proxies, gateways, custom auth).
     # Values may carry credentials (e.g. CF-Access-Client-Secret) — never
     # log them anywhere downstream.
@@ -1501,6 +1506,7 @@ def _custom_provider_entry_to_provider_config(
         "discover_models",
         "extra_body",
         "extra_headers",
+        "pricing",
         "ssl_ca_cert",
         "ssl_verify",
     ):
