@@ -95,7 +95,7 @@ def _cgroup_output_matches_scope(stdout: str, unit: str) -> bool:
         lowered = [component.lower() for component in components]
         if any("gateway" in component or "dispatcher" in component for component in lowered):
             return False
-        if expected_component not in components:
+        if components.count(expected_component) != 1:
             return False
     return bool(hierarchy_ids)
 

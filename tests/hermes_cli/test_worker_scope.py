@@ -203,6 +203,40 @@ def test_cgroup_parser_rejects_spoofed_duplicate_or_conflicting_records(output_f
     assert not _cgroup_output_matches_scope(output_factory(unit), unit)
 
 
+def test_cgroup_parser_rejects_duplicate_exact_component_in_one_path():
+    from hermes_cli.worker_scope import _cgroup_output_matches_scope
+
+    unit = "hermes-kanban-isolation-probe-123-1"
+    assert not _cgroup_output_matches_scope(
+        f"0::/user.slice/{unit}.scope/child/{unit}.scope\n",
+        unit,
+    )
+
+
+def test_scope_health_rejects_duplicate_exact_component_in_one_path(monkeypatch):
+    from hermes_cli import worker_scope
+    from hermes_cli.worker_scope import WorkerIsolationError, build_scoped_worker_command
+
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"systemd-run", "systemctl"} else None,
+    )
+
+    def fake_run(argv, **_kwargs):
+        if argv[0].endswith("systemctl"):
+            return SimpleNamespace(returncode=1, stdout="degraded\n")
+        unit = next(part.split("=", 1)[1] for part in argv if part.startswith("--unit="))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=f"0::/user.slice/{unit}.scope/child/{unit}.scope\n",
+        )
+
+    monkeypatch.setattr(worker_scope.subprocess, "run", fake_run)
+    with pytest.raises(WorkerIsolationError):
+        build_scoped_worker_command(["hermes"], env={}, require_isolation=True)
+
+
 @pytest.mark.parametrize(
     "output_factory",
     [
