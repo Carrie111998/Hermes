@@ -111,6 +111,17 @@ class TestConfigYamlRouting:
         assert "not a recognized config key" not in capsys.readouterr().out
         assert "script_timeout_seconds: 600" in _read_config(_isolated_hermes_home)
 
+    def test_image_gen_output_size_flag_is_recognized(
+        self, _isolated_hermes_home, capsys
+    ):
+        set_config_value("image_gen.enforce_output_size", "true")
+
+        import yaml
+
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert saved["image_gen"]["enforce_output_size"] is True
+        assert "not a recognized config key" not in capsys.readouterr().out
+
     def test_terminal_docker_cwd_mount_flag_goes_to_config_and_env(self, _isolated_hermes_home):
         set_config_value("terminal.docker_mount_cwd_to_workspace", "true")
         config = _read_config(_isolated_hermes_home)
