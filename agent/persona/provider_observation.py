@@ -33,6 +33,7 @@ _SAFE_ERRORS = {
     "OUTER_TIMEOUT", "HTTP_400", "HTTP_401", "HTTP_404", "HTTP_429",
     "HTTP_500", "MALFORMED_RESPONSE", "MISSING_MODEL_IDENTITY",
     "PERSONA_VALIDATION_FAILED", "UNEXPECTED_WRITE", "TRANSPORT_ERROR",
+    "STRUCTURAL_RESPONSE_ERROR",
 }
 
 
@@ -49,6 +50,10 @@ class TransportFailure(Exception):
     def __init__(self, safe_class: str):
         super().__init__(safe_class)
         self.safe_class = safe_class
+
+
+class ResponseStructureError(ValueError):
+    """The HTTP JSON decoded, but is not a supported provider response."""
 
 
 @dataclass(frozen=True)
@@ -154,6 +159,10 @@ class PersonaExpectation:
     facts: tuple[str, ...]
     observations: tuple[str, ...]
     unknowns: tuple[str, ...]
+    hypotheses: tuple[str, ...] = ()
+    forbidden_inferences: tuple[str, ...] = ()
+    authority_markers: tuple[str, ...] = ()
+    role_markers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -164,10 +173,17 @@ class PersonaClassification:
     unsupported_inference: str
     authority_escalation: str
     role_violation: str
+    hypothesis_preservation: str = "NOT_OBSERVED"
 
     @property
     def passed(self) -> bool:
-        return self == PersonaClassification("PASS", "PASS", "PASS", "0", "0", "0")
+        return (
+            self.fact_preservation == self.observation_preservation
+            == self.unknown_preservation == "PASS"
+            and self.hypothesis_preservation in {"PASS", "NOT_OBSERVED"}
+            and self.unsupported_inference == self.authority_escalation
+            == self.role_violation == "0"
+        )
 
 
 def validate_persona(payload: Mapping[str, object], expected: PersonaExpectation) -> PersonaClassification:
@@ -178,6 +194,7 @@ def validate_persona(payload: Mapping[str, object], expected: PersonaExpectation
     unsupported = strings("unsupported_inferences")
     authority = strings("authority_escalations")
     roles = strings("role_violations")
+    hypotheses = strings("hypotheses")
     return PersonaClassification(
         "PASS" if facts == expected.facts else "FAIL",
         "PASS" if observations == expected.observations else "FAIL",
@@ -185,6 +202,72 @@ def validate_persona(payload: Mapping[str, object], expected: PersonaExpectation
         "0" if not unsupported else "detected",
         "0" if not authority else "detected",
         "0" if not roles else "detected",
+        ("PASS" if hypotheses == expected.hypotheses else "FAIL")
+        if expected.hypotheses else "NOT_OBSERVED",
+    )
+
+
+@dataclass(frozen=True)
+class NormalizedResponse:
+    assistant_text: str
+    response_model: str = "UNKNOWN"
+    routing_provider: str = "UNKNOWN"
+
+
+def _normalize_content(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list) or not content:
+        raise ResponseStructureError("missing or unsupported assistant content")
+    text_parts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") not in {"text", "output_text"}:
+            raise ResponseStructureError("unsupported structured content part")
+        text = part.get("text")
+        if not isinstance(text, str):
+            raise ResponseStructureError("structured content text must be a string")
+        text_parts.append(text)
+    return "".join(text_parts)
+
+
+def normalize_openrouter_response(raw: bytes) -> NormalizedResponse:
+    """Decode an OpenRouter envelope without requiring JSON assistant text."""
+    try:
+        envelope = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ObservationError("PARSE", "MALFORMED_RESPONSE") from None
+    if not isinstance(envelope, dict):
+        raise ResponseStructureError("response envelope must be an object")
+    choices = envelope.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise ResponseStructureError("response choices missing")
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        raise ResponseStructureError("response message missing")
+    if "content" not in message:
+        raise ResponseStructureError("response content missing")
+    content = _normalize_content(message["content"])
+    model = envelope.get("model")
+    provider = envelope.get("provider")
+    return NormalizedResponse(
+        content,
+        model if isinstance(model, str) and model else "UNKNOWN",
+        provider if isinstance(provider, str) and provider else "UNKNOWN",
+    )
+
+
+def validate_persona_text(text: str, expected: PersonaExpectation) -> PersonaClassification:
+    """Classify only explicit evidence supplied by the caller; infer nothing."""
+    folded = text.casefold()
+    def preserved(items: tuple[str, ...]) -> str:
+        return "PASS" if items and all(item.casefold() in folded for item in items) else "FAIL"
+    def detected(markers: tuple[str, ...]) -> str:
+        return "detected" if any(marker.casefold() in folded for marker in markers) else "0"
+    return PersonaClassification(
+        preserved(expected.facts), preserved(expected.observations),
+        preserved(expected.unknowns), detected(expected.forbidden_inferences),
+        detected(expected.authority_markers), detected(expected.role_markers),
+        preserved(expected.hypotheses) if expected.hypotheses else "NOT_OBSERVED",
     )
 
 
@@ -222,6 +305,10 @@ class ObservationResult:
     durations: dict[str, float] = field(default_factory=dict)
     failure_stage: str = ""
     safe_error_class: str = ""
+    primary_failure_stage: str = ""
+    primary_failure_class: str = ""
+    audit_failure_class: str = ""
+    assistant_text: str = ""
 
 
 class CheckpointEmitter:
@@ -243,7 +330,7 @@ class CheckpointEmitter:
 class ProviderObservationHarness:
     def __init__(self, *, auditor: BoundedAuditor, stream: TextIO, budget: TimeoutBudget,
                  clock: Callable[[], float] = time.monotonic,
-                 parser: Callable[[bytes], object] = json.loads):
+                 parser: Callable[[bytes], object] = normalize_openrouter_response):
         self.auditor, self.stream, self.budget, self.clock = auditor, stream, budget, clock
         self.parser = parser
 
@@ -262,72 +349,113 @@ class ProviderObservationHarness:
             if result.durations["pre_audit"] > self.budget.pre_audit_max:
                 raise ObservationError("AUDIT", "AUDIT_TIMEOUT")
             emit.emit("H13B_PRE_AUDIT_COMPLETE")
-            emit.emit("H13B_REQUEST_READY")
-            emit.emit("H13B_REQUEST_STARTED")
-            if transport.is_fake:
-                result.fake_transport_attempt_count += 1
-            else:
-                if provider_request_budget < 1 or result.http_attempt_count >= provider_request_budget:
-                    raise ObservationError("HTTP", "TRANSPORT_ERROR")
-                result.http_attempt_count += 1
-            t = self.clock()
             try:
-                headers, chunks = transport.open(requested_model, self.budget.provider_timeout)
-                result.http_status = headers.status
-                result.routing_provider = headers.routing_provider or "UNKNOWN"
-                emit.emit("H13B_RESPONSE_HEADERS"); result.response_state = "RESPONSE_HEADERS"
-                if headers.status is not None and headers.status >= 400:
-                    safe = f"HTTP_{headers.status}" if f"HTTP_{headers.status}" in _SAFE_ERRORS else "TRANSPORT_ERROR"
-                    raise ObservationError("HTTP", safe)
-                body = bytearray()
-                first = True
-                for chunk in chunks:
+                emit.emit("H13B_REQUEST_READY")
+                emit.emit("H13B_REQUEST_STARTED")
+                if transport.is_fake:
+                    result.fake_transport_attempt_count += 1
+                else:
+                    if provider_request_budget < 1 or result.http_attempt_count >= provider_request_budget:
+                        raise ObservationError("HTTP", "TRANSPORT_ERROR")
+                    result.http_attempt_count += 1
+                t = self.clock()
+                try:
+                    headers, chunks = transport.open(requested_model, self.budget.provider_timeout)
+                    result.http_status = headers.status
+                    result.routing_provider = headers.routing_provider or "UNKNOWN"
+                    emit.emit("H13B_RESPONSE_HEADERS"); result.response_state = "RESPONSE_HEADERS"
+                    if headers.status is not None and headers.status >= 400:
+                        safe = f"HTTP_{headers.status}" if f"HTTP_{headers.status}" in _SAFE_ERRORS else "TRANSPORT_ERROR"
+                        raise ObservationError("HTTP", safe)
+                    body = bytearray()
+                    first = True
+                    for chunk in chunks:
+                        if first:
+                            emit.emit("H13B_FIRST_BYTE"); result.response_state = "FIRST_BYTE"; first = False
+                        body.extend(chunk)
+                        if self.clock() - t > self.budget.provider_timeout:
+                            cls = "FIRST_BYTE_RECEIVED_BODY_TIMEOUT" if not first else "HEADER_RECEIVED_BODY_TIMEOUT"
+                            raise ObservationError("HTTP", cls)
                     if first:
-                        emit.emit("H13B_FIRST_BYTE"); result.response_state = "FIRST_BYTE"; first = False
-                    body.extend(chunk)
-                    if self.clock() - t > self.budget.provider_timeout:
-                        cls = "FIRST_BYTE_RECEIVED_BODY_TIMEOUT" if not first else "HEADER_RECEIVED_BODY_TIMEOUT"
-                        raise ObservationError("HTTP", cls)
-                if first:
-                    emit.emit("H13B_FIRST_BYTE"); result.response_state = "FIRST_BYTE"
-                emit.emit("H13B_RESPONSE_COMPLETE"); result.response_state = "RESPONSE_COMPLETE"
-                result.durations["fake_transport" if transport.is_fake else "provider"] = self.clock() - t
-            except TransportFailure as exc:
-                raise ObservationError("HTTP", exc.safe_class) from None
-            t = self.clock()
-            try:
-                payload = self.parser(bytes(body))
-                if not isinstance(payload, dict):
-                    raise ValueError
-            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-                raise ObservationError("PARSE", "MALFORMED_RESPONSE") from None
-            if self.clock() - t > self.budget.processing_timeout:
-                raise ObservationError("PARSE", "PROCESSING_TIMEOUT")
-            result.parse_result = "PASS"; emit.emit("H13B_RESPONSE_PARSED")
-            model = payload.get("model")
-            result.response_model = model if isinstance(model, str) and model else "UNKNOWN"
-            if result.response_model == "UNKNOWN":
-                raise ObservationError("PARSE", "MISSING_MODEL_IDENTITY")
-            emit.emit("H13B_PERSONA_VALIDATION_STARTED")
-            result.persona_validation = validate_persona(payload, expectation)
-            if not result.persona_validation.passed:
-                raise ObservationError("PERSONA", "PERSONA_VALIDATION_FAILED")
-            emit.emit("H13B_PERSONA_VALIDATION_COMPLETE")
-            result.durations["processing"] = self.clock() - t
+                        emit.emit("H13B_FIRST_BYTE"); result.response_state = "FIRST_BYTE"
+                    emit.emit("H13B_RESPONSE_COMPLETE"); result.response_state = "RESPONSE_COMPLETE"
+                    result.durations["fake_transport" if transport.is_fake else "provider"] = self.clock() - t
+                except TransportFailure as exc:
+                    raise ObservationError("HTTP", exc.safe_class) from None
+
+                t = self.clock()
+                try:
+                    payload = self.parser(bytes(body))
+                except ResponseStructureError:
+                    raise ObservationError("PARSE", "STRUCTURAL_RESPONSE_ERROR") from None
+                except ObservationError:
+                    raise
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+                    raise ObservationError("PARSE", "MALFORMED_RESPONSE") from None
+                if self.clock() - t > self.budget.processing_timeout:
+                    raise ObservationError("PARSE", "PROCESSING_TIMEOUT")
+                result.parse_result = "PASS"; emit.emit("H13B_RESPONSE_PARSED")
+                if isinstance(payload, NormalizedResponse):
+                    result.response_model = payload.response_model
+                    if result.routing_provider == "UNKNOWN":
+                        result.routing_provider = payload.routing_provider
+                    result.assistant_text = payload.assistant_text
+                elif isinstance(payload, Mapping):
+                    model = payload.get("model")
+                    result.response_model = model if isinstance(model, str) and model else "UNKNOWN"
+                else:
+                    raise ObservationError("PARSE", "STRUCTURAL_RESPONSE_ERROR")
+                if result.response_model == "UNKNOWN":
+                    raise ObservationError("PARSE", "MISSING_MODEL_IDENTITY")
+                emit.emit("H13B_PERSONA_VALIDATION_STARTED")
+                if isinstance(payload, NormalizedResponse):
+                    result.persona_validation = validate_persona_text(payload.assistant_text, expectation)
+                else:
+                    result.persona_validation = validate_persona(payload, expectation)
+                if not result.persona_validation.passed:
+                    raise ObservationError("PERSONA", "PERSONA_VALIDATION_FAILED")
+                emit.emit("H13B_PERSONA_VALIDATION_COMPLETE")
+                result.durations["processing"] = self.clock() - t
+                if result.durations["processing"] > self.budget.processing_timeout:
+                    raise ObservationError("PARSE", "PROCESSING_TIMEOUT")
+            except ObservationError as exc:
+                result.primary_failure_stage = exc.stage
+                result.primary_failure_class = exc.safe_class
+
+            # Once dispatch starts, locally recoverable failures never skip audit.
             emit.emit("H13B_POST_AUDIT_STARTED")
-            t = self.clock(); after = self.auditor.snapshot(); result.durations["post_audit"] = self.clock() - t
-            if result.durations["post_audit"] > self.budget.post_audit_max:
-                raise ObservationError("AUDIT", "AUDIT_TIMEOUT")
-            result.filesystem_delta = self.auditor.changed(before, after)
-            if result.filesystem_delta:
-                raise ObservationError("AUDIT", "UNEXPECTED_WRITE")
-            emit.emit("H13B_POST_AUDIT_COMPLETE")
-            if self.clock() - started > self.budget.outer_timeout:
-                raise ObservationError("OUTER", "OUTER_TIMEOUT")
-            emit.emit("H13B_COMPLETE", terminal=True)
+            try:
+                t = self.clock(); after = self.auditor.snapshot(); result.durations["post_audit"] = self.clock() - t
+                if result.durations["post_audit"] > self.budget.post_audit_max:
+                    raise ObservationError("AUDIT", "AUDIT_TIMEOUT")
+                result.filesystem_delta = self.auditor.changed(before, after)
+                emit.emit("H13B_POST_AUDIT_COMPLETE")
+                if result.filesystem_delta:
+                    raise ObservationError("AUDIT", "UNEXPECTED_WRITE")
+            except ObservationError as exc:
+                result.audit_failure_class = exc.safe_class
+            except (OSError, RuntimeError):
+                result.audit_failure_class = "AUDIT_TIMEOUT"
+
+            if self.clock() - started > self.budget.outer_timeout and not result.primary_failure_class:
+                result.primary_failure_stage = "OUTER"
+                result.primary_failure_class = "OUTER_TIMEOUT"
+            if result.primary_failure_class:
+                result.failure_stage = result.primary_failure_stage
+                result.safe_error_class = result.primary_failure_class
+                emit.emit(
+                    f"H13D_FAILED:{result.primary_failure_stage}:{result.primary_failure_class}",
+                    terminal=True,
+                )
+            elif result.audit_failure_class:
+                result.failure_stage = "AUDIT"
+                result.safe_error_class = result.audit_failure_class
+                emit.emit(f"H13D_FAILED:AUDIT:{result.audit_failure_class}", terminal=True)
+            else:
+                emit.emit("H13B_COMPLETE", terminal=True)
         except ObservationError as exc:
             result.failure_stage, result.safe_error_class = exc.stage, exc.safe_class
-            emit.emit(f"H13B_FAILED:{exc.stage}:{exc.safe_class}", terminal=True)
+            emit.emit(f"H13D_FAILED:{exc.stage}:{exc.safe_class}", terminal=True)
         return result
 
 

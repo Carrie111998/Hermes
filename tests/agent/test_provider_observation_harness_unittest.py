@@ -91,18 +91,18 @@ class HarnessTests(unittest.TestCase):
             "B":(FakeTransport(before_open=.001),"H13B_COMPLETE"),
             "C":(FakeTransport(before_first=.001),"H13B_COMPLETE"),
             "D":(FakeTransport(before_end=.001),"H13B_COMPLETE"),
-            "E":(FakeTransport(status=400),"H13B_FAILED:HTTP:HTTP_400"),
-            "F":(FakeTransport(status=401),"H13B_FAILED:HTTP:HTTP_401"),
-            "G":(FakeTransport(status=404),"H13B_FAILED:HTTP:HTTP_404"),
-            "H":(FakeTransport(status=429),"H13B_FAILED:HTTP:HTTP_429"),
-            "I":(FakeTransport(status=500),"H13B_FAILED:HTTP:HTTP_500"),
-            "J":(FakeTransport(failure=("open","CONNECT_OR_PRE_HEADER_TIMEOUT")),"H13B_FAILED:HTTP:CONNECT_OR_PRE_HEADER_TIMEOUT"),
-            "K":(FakeTransport(failure=("headers","HEADER_RECEIVED_BODY_TIMEOUT")),"H13B_FAILED:HTTP:HEADER_RECEIVED_BODY_TIMEOUT"),
-            "L":(FakeTransport(failure=("first","FIRST_BYTE_RECEIVED_BODY_TIMEOUT")),"H13B_FAILED:HTTP:FIRST_BYTE_RECEIVED_BODY_TIMEOUT"),
-            "M":(FakeTransport(body=malformed),"H13B_FAILED:PARSE:MALFORMED_RESPONSE"),
-            "N":(FakeTransport(body=missing),"H13B_FAILED:PARSE:MISSING_MODEL_IDENTITY"),
-            "O":(FakeTransport(body=bad),"H13B_FAILED:PERSONA:PERSONA_VALIDATION_FAILED"),
-            "P":(FakeTransport(),"H13B_FAILED:AUDIT:UNEXPECTED_WRITE"),
+            "E":(FakeTransport(status=400),"H13D_FAILED:HTTP:HTTP_400"),
+            "F":(FakeTransport(status=401),"H13D_FAILED:HTTP:HTTP_401"),
+            "G":(FakeTransport(status=404),"H13D_FAILED:HTTP:HTTP_404"),
+            "H":(FakeTransport(status=429),"H13D_FAILED:HTTP:HTTP_429"),
+            "I":(FakeTransport(status=500),"H13D_FAILED:HTTP:HTTP_500"),
+            "J":(FakeTransport(failure=("open","CONNECT_OR_PRE_HEADER_TIMEOUT")),"H13D_FAILED:HTTP:CONNECT_OR_PRE_HEADER_TIMEOUT"),
+            "K":(FakeTransport(failure=("headers","HEADER_RECEIVED_BODY_TIMEOUT")),"H13D_FAILED:HTTP:HEADER_RECEIVED_BODY_TIMEOUT"),
+            "L":(FakeTransport(failure=("first","FIRST_BYTE_RECEIVED_BODY_TIMEOUT")),"H13D_FAILED:HTTP:FIRST_BYTE_RECEIVED_BODY_TIMEOUT"),
+            "M":(FakeTransport(body=malformed),"H13D_FAILED:PARSE:MALFORMED_RESPONSE"),
+            "N":(FakeTransport(body=missing),"H13D_FAILED:PARSE:MISSING_MODEL_IDENTITY"),
+            "O":(FakeTransport(body=bad),"H13D_FAILED:PERSONA:PERSONA_VALIDATION_FAILED"),
+            "P":(FakeTransport(),"H13D_FAILED:AUDIT:UNEXPECTED_WRITE"),
         }
         for name,(transport,terminal) in cases.items():
             with self.subTest(name=name):
@@ -112,7 +112,10 @@ class HarnessTests(unittest.TestCase):
                 self.assertEqual(sum(x==terminal for x in result.checkpoints),1)
                 self.assertNotRegex(out.lower(),r"authorization:|bearer |api[_ -]?key")
                 self.assertEqual(result.http_attempt_count,0)
+                self.assertEqual(result.fake_transport_attempt_count,1)
                 self.assertEqual((result.retry_count,result.fallback_count),(0,0))
+                self.assertIn("H13B_POST_AUDIT_COMPLETE",result.checkpoints)
+                if name!="P": self.assertEqual(result.filesystem_delta,())
                 if name=="P": self.assertEqual(result.response_state,"RESPONSE_COMPLETE")
 
     def test_exact_persona_classification(self):
@@ -124,13 +127,13 @@ class HarnessTests(unittest.TestCase):
     def test_timeout_budget_invariant_and_processing_class(self):
         invalid=TimeoutBudget(outer_timeout=5.0)
         result,_,_=self.run_case(FakeTransport(),budget=invalid)
-        self.assertEqual(result.checkpoints[-1],"H13B_FAILED:OUTER:OUTER_TIMEOUT")
+        self.assertEqual(result.checkpoints[-1],"H13D_FAILED:OUTER:OUTER_TIMEOUT")
         self.assertTrue(TimeoutBudget().valid())
         def slow_parser(body):
             time.sleep(.05)
             return json.loads(body)
         result,_,_=self.run_case(FakeTransport(),budget=replace(TimeoutBudget(),processing_timeout=.001),parser=slow_parser)
-        self.assertEqual(result.checkpoints[-1],"H13B_FAILED:PARSE:PROCESSING_TIMEOUT")
+        self.assertEqual(result.checkpoints[-1],"H13D_FAILED:PARSE:PROCESSING_TIMEOUT")
 
     def test_bounded_directory_delta_detected_without_recursion(self):
         with tempfile.TemporaryDirectory() as td:
