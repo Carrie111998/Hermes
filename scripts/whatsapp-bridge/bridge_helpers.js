@@ -95,6 +95,46 @@ export function acknowledgeDeliveryReceipts(queue, acknowledgements) {
   return removed;
 }
 
+export function createDeliveryReceiptQueue({ capacity = 1000, pageSize = 100 } = {}) {
+  if (!Number.isInteger(capacity) || capacity < 1) throw new RangeError('capacity must be positive');
+  if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > capacity) {
+    throw new RangeError('pageSize must be within capacity');
+  }
+  const queue = [];
+  const seen = new Set();
+  return {
+    add(receipt) {
+      const messageId = receipt?.messageId;
+      const status = receipt?.status;
+      if (typeof messageId !== 'string' || !/^[A-Za-z0-9_-]{1,191}$/.test(messageId)) return false;
+      if (!['sent', 'delivered', 'read'].includes(status)) return false;
+      if (typeof receipt.occurredAt !== 'string' || !receipt.occurredAt) return false;
+      const key = `${messageId}:${status}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      queue.push(receipt);
+      if (queue.length > capacity) {
+        const evicted = queue.shift();
+        seen.delete(`${evicted.messageId}:${evicted.status}`);
+      }
+      return true;
+    },
+    snapshot() {
+      return queue.slice(0, pageSize);
+    },
+    acknowledge(acknowledgements) {
+      const removed = acknowledgeDeliveryReceipts(queue, acknowledgements);
+      for (const acknowledgement of acknowledgements || []) {
+        seen.delete(`${acknowledgement?.messageId}:${acknowledgement?.status}`);
+      }
+      return removed;
+    },
+    size() {
+      return queue.length;
+    },
+  };
+}
+
 export function getMessageContent(msg) {
   const content = msg?.message || {};
   if (content.ephemeralMessage?.message) return content.ephemeralMessage.message;

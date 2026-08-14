@@ -36,7 +36,7 @@ import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
   buildPollPayload,
-  acknowledgeDeliveryReceipts,
+  createDeliveryReceiptQueue,
   createReconnectScheduler,
   createVersionResolver,
   buildLocationPayload,
@@ -273,9 +273,12 @@ const logger = pino({ level: 'warn' });
 
 // Message queue for polling
 const messageQueue = [];
-const receiptQueue = [];
 const MAX_QUEUE_SIZE = 100;
 const MAX_RECEIPT_QUEUE_SIZE = 1000;
+const receiptQueue = createDeliveryReceiptQueue({
+  capacity: MAX_RECEIPT_QUEUE_SIZE,
+  pageSize: MAX_QUEUE_SIZE,
+});
 
 // Track recently sent message IDs.  Two purposes:
 //   1. Prevent echo-back loops with media in self-chat mode.
@@ -286,16 +289,10 @@ const MAX_RECEIPT_QUEUE_SIZE = 1000;
 // sustained sending.
 const recentlySentIds = createOutboundIdTracker(512);
 const recentlyProcessedPollUpdates = createOutboundIdTracker(512);
-const recentlyProcessedReceipts = createOutboundIdTracker(2048);
 const messageStore = createBoundedMessageStore(512);
 
 function enqueueDeliveryReceipt(receipt) {
-  if (!receipt) return;
-  const dedupeId = `${receipt.messageId}:${receipt.status}`;
-  if (recentlyProcessedReceipts.has(dedupeId)) return;
-  recentlyProcessedReceipts.remember(dedupeId);
-  receiptQueue.push(receipt);
-  if (receiptQueue.length > MAX_RECEIPT_QUEUE_SIZE) receiptQueue.shift();
+  if (receipt) receiptQueue.add(receipt);
 }
 
 function normalizePollUpdateOptions(aggregation, pollUpdateMessage, meId) {
@@ -844,7 +841,7 @@ app.get('/messages', (req, res) => {
 
 // Poll outbound delivery/read receipts independently from inbound messages.
 app.get('/receipts', (req, res) => {
-  res.json(receiptQueue.slice(0, MAX_QUEUE_SIZE));
+  res.json(receiptQueue.snapshot());
 });
 
 app.post('/receipts/ack', (req, res) => {
@@ -864,7 +861,7 @@ app.post('/receipts/ack', (req, res) => {
       return res.status(400).json({ error: 'invalid receipt acknowledgement' });
     }
   }
-  const acknowledged = acknowledgeDeliveryReceipts(receiptQueue, acknowledgements);
+  const acknowledged = receiptQueue.acknowledge(acknowledgements);
   return res.json({ success: true, acknowledged });
 });
 

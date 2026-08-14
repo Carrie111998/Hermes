@@ -16,6 +16,7 @@ import {
   buildPollPayload,
   buildTextSendPayload,
   acknowledgeDeliveryReceipts,
+  createDeliveryReceiptQueue,
   createBoundedMessageStore,
   deliveryReceiptFromMessageUpdate,
   deliveryReceiptFromUserReceiptUpdate,
@@ -115,6 +116,30 @@ import {
     { messageId: 'outbound-1', status: 'read', occurredAt: '2026-08-14T12:01:00Z' },
   ]);
   console.log('  ✓ receipts remain queued until their exact status is acknowledged');
+}
+
+{
+  const receipts = createDeliveryReceiptQueue({ capacity: 2, pageSize: 1 });
+  const delivered = {
+    messageId: 'outbound-queue-1', status: 'delivered', occurredAt: '2026-08-14T12:00:00Z',
+  };
+  const read = {
+    messageId: 'outbound-queue-1', status: 'read', occurredAt: '2026-08-14T12:01:00Z',
+  };
+  const other = {
+    messageId: 'outbound-queue-2', status: 'sent', occurredAt: '2026-08-14T12:02:00Z',
+  };
+  assert.equal(receipts.add(delivered), true);
+  assert.equal(receipts.add(delivered), false);
+  assert.equal(receipts.add(read), true);
+  assert.equal(receipts.add(other), true);
+  assert.equal(receipts.size(), 2);
+  assert.deepEqual(receipts.snapshot(), [read]);
+  assert.equal(receipts.acknowledge([{ messageId: read.messageId, status: read.status }]), 1);
+  assert.deepEqual(receipts.snapshot(), [other]);
+  assert.equal(receipts.add(delivered), true);
+  assert.equal(receipts.size(), 2);
+  console.log('  ✓ receipt queue bounds, deduplicates, paginates, and acknowledges exact states');
 }
 
 // -- inbound read receipts ------------------------------------------------
