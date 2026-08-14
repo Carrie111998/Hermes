@@ -1156,9 +1156,6 @@ def kanban_command(args: argparse.Namespace) -> int:
     if action == "boards":
         return _dispatch_boards(args)
 
-    if action == "intake":
-        return _dispatch_intake(args)
-
     # `--board <slug>` applies to every subcommand below by way of an
     # env-var pin for the duration of this call. Using HERMES_KANBAN_BOARD
     # (rather than threading `board=` through 50+ kb.connect() sites)
@@ -1194,6 +1191,9 @@ def kanban_command(args: argparse.Namespace) -> int:
     # schema creation; `create` / `list` / every other command would
     # error out on a fresh install.
     with board_scope:
+        if action == "intake":
+            return _dispatch_intake(args)
+
         # `repair` must dispatch BEFORE the auto-init below: on a corrupt DB
         # init_db() itself raises KanbanDbCorruptError, which would turn
         # every `hermes kanban repair` into "could not initialize database"

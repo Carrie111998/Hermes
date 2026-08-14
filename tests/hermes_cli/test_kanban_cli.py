@@ -252,6 +252,64 @@ def test_run_slash_intake_retry_reports_refusal_and_success(kanban_home):
     assert "attention_required" in refusal
 
 
+def test_run_slash_intake_show_honors_board_override(kanban_home):
+    current_board = "intake-current"
+    selected_board = "intake-selected"
+    kb.ensure_product_board_defaults(current_board, switch=True)
+    kb.ensure_product_board_defaults(selected_board)
+
+    with kb.connect(board=selected_board) as conn:
+        intake_id = kb.create_qualification_intake(
+            conn, raw_request="request", source="cli"
+        )
+        kb.append_qualification_intake_event(
+            conn,
+            intake_id=intake_id,
+            kind="work_contract_verification_failed",
+            payload={"failure_path": "io_error"},
+        )
+        conn.execute(
+            "UPDATE qualification_intake SET status = 'attention_required' WHERE id = ?",
+            (intake_id,),
+        )
+
+    output = kc.run_slash(
+        f"--board {selected_board} intake show {intake_id}"
+    )
+
+    assert f"Intake {intake_id}: attention_required" in output
+    assert "Failure path: io_error" in output
+    assert "unknown qualification intake" not in output
+    assert kb.get_current_board() == current_board
+
+
+def test_run_slash_intake_retry_honors_board_override(kanban_home):
+    current_board = "intake-current"
+    selected_board = "intake-selected"
+    kb.ensure_product_board_defaults(current_board, switch=True)
+    kb.ensure_product_board_defaults(selected_board)
+
+    with kb.connect(board=selected_board) as conn:
+        intake_id = kb.create_qualification_intake(
+            conn, raw_request="request", source="cli"
+        )
+        conn.execute(
+            "UPDATE qualification_intake SET status = 'attention_required' WHERE id = ?",
+            (intake_id,),
+        )
+
+    output = kc.run_slash(
+        f"--board {selected_board} intake retry {intake_id}"
+    )
+
+    assert f"{intake_id}: pending" in output
+    with kb.connect(board=selected_board) as conn:
+        record = kb.get_qualification_intake(conn, intake_id)
+        assert record is not None
+        assert record["status"] == "pending"
+    assert kb.get_current_board() == current_board
+
+
 def test_run_slash_dispatch_dry_run_counts(kanban_home):
     kc.run_slash("create 'a' --assignee alice")
     kc.run_slash("create 'b' --assignee bob")
