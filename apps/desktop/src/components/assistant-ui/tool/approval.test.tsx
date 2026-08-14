@@ -165,7 +165,7 @@ describe('PendingToolApproval', () => {
     expect(within(fallback as HTMLElement).getByRole('button', { name: /Reject/ })).toBeTruthy()
   })
 
-  it('hides the floating fallback once the inline approval bar is mounted', async () => {
+  it('keeps the floating card visible even when the inline strip is mounted', async () => {
     setRequest('rm /tmp/hermes_approval_test.txt')
 
     const { container } = render(
@@ -177,7 +177,8 @@ describe('PendingToolApproval', () => {
 
     await waitFor(() => {
       expect(container.querySelector('[data-slot="tool-approval-inline"]')).not.toBeNull()
-      expect(container.querySelector('[data-slot="tool-approval-fallback"]')).toBeNull()
+      expect(container.querySelector('[data-slot="tool-approval-fallback"]')).not.toBeNull()
     })
+    expect(within(container.querySelector('[data-slot="tool-approval-fallback"]') as HTMLElement).getByText('rm /tmp/hermes_approval_test.txt')).toBeTruthy()
   })
 })
