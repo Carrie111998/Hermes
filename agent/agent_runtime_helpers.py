@@ -3850,8 +3850,12 @@ def _connection_candidates(conn: Any):
             stack.append(inner)
 
 
-def _iter_pool_sockets(client: Any):
+def _iter_pool_sockets(client: Any, *, active_only: bool = False):
     """Yield raw sockets reachable from an OpenAI/httpx client pool.
+
+    When ``active_only`` is true, skip connections that explicitly report
+    themselves idle. Connections without a reliable ``is_idle`` signal remain
+    eligible so older/private httpcore layouts keep working.
 
     httpcore 1.x stores the concrete HTTP11/HTTP2 connection under
     ``conn._connection``; older versions exposed stream attributes directly
@@ -3883,6 +3887,14 @@ def _iter_pool_sockets(client: Any):
             or []
         )
         for conn in list(connections):
+            if active_only:
+                is_idle = getattr(conn, "is_idle", None)
+                if callable(is_idle):
+                    try:
+                        if is_idle():
+                            continue
+                    except Exception:
+                        pass
             for candidate in _connection_candidates(conn):
                 stream = (
                     getattr(candidate, "_network_stream", None)
@@ -4115,7 +4127,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
 
 
 
-def force_close_tcp_sockets(client: Any) -> int:
+def force_close_tcp_sockets(client: Any, *, active_only: bool = False) -> int:
     """Abort in-flight TCP I/O by shutting down sockets WITHOUT closing FDs.
 
     When a provider drops a connection mid-stream — or the user issues an
@@ -4155,12 +4167,12 @@ def force_close_tcp_sockets(client: Any) -> int:
 
     shutdown_count = 0
     try:
-        for sock in _iter_pool_sockets(client):
+        for sock in _iter_pool_sockets(client, active_only=active_only):
             try:
                 sock.shutdown(_socket.SHUT_RDWR)
             except OSError:
                 # Already shut down / not connected / FD invalid — all benign.
-                pass
+                continue
             # IMPORTANT (#29507): do NOT call sock.close() here. See docstring.
             shutdown_count += 1
     except Exception as exc:

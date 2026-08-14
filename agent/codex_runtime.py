@@ -1302,6 +1302,16 @@ def _consume_codex_event_stream(
     return final
 
 
+def _publish_codex_stream_event(agent) -> None:
+    """Publish SSE activity under the watchdog's first-event decision lock."""
+    event_lock = getattr(agent, "_codex_stream_event_lock", None)
+    if event_lock is None:
+        agent._codex_stream_last_event_ts = time.time()
+    else:
+        with event_lock:
+            agent._codex_stream_last_event_ts = time.time()
+
+
 def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):
     """Execute one streaming Responses API request and return the final response.
 
@@ -1333,7 +1343,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.
-        agent._codex_stream_last_event_ts = time.time()
+        _publish_codex_stream_event(agent)
         agent._touch_activity("receiving stream response")
 
     for attempt in range(max_stream_retries + 1):

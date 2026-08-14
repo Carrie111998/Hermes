@@ -246,10 +246,16 @@ def test_e2e_cron_turn_is_bounded_through_the_real_agent_routing(monkeypatch):
     agent = _build_cron_agent(monkeypatch)
     agent.client = wire
     monkeypatch.setattr(run_agent, "OpenAI", lambda **_kwargs: wire)
+
+    def force_close_active_socket(self, client, *, active_only=False):
+        assert active_only is True
+        client.sockets_shut_down.set()
+        return 1
+
     monkeypatch.setattr(
         run_agent.AIAgent,
         "_force_close_tcp_sockets",
-        lambda self, client: (client.sockets_shut_down.set(), 1)[1],
+        force_close_active_socket,
     )
 
     started = time.time()
