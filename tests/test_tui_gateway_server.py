@@ -7703,7 +7703,10 @@ def test_config_set_model_switches_agent_without_touching_env(monkeypatch):
         assert session["history"][-1]["role"] == "user"
         assert "changed to anthropic/claude-sonnet-4.6" in session["history"][-1]["content"]
         assert db.messages[-1] == {
-            "session_id": "session-key",
+            # The marker targets the agent's LIVE session id ('sid'), not the
+            # gateway routing key — session_key goes stale after compression
+            # rotation (#20001, #82001) and writes to it raise/silently drop.
+            "session_id": "sid",
             "role": "user",
             "content": session["history"][-1]["content"],
         }
