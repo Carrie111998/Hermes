@@ -186,16 +186,6 @@ function IdleView({
     )
   }
 
-  if (!status.supported) {
-    return (
-      <CenteredStatus
-        body={status.message ?? u.unsupportedMessage}
-        icon={<AlertCircle className="size-6 text-muted-foreground" />}
-        title={u.notAvailableTitle}
-      />
-    )
-  }
-
   if (status.error) {
     return (
       <CenteredStatus
@@ -207,6 +197,16 @@ function IdleView({
         body={u.connectionRetry}
         icon={<ErrorIcon />}
         title={u.checkFailedTitle}
+      />
+    )
+  }
+
+  if (!status.supported) {
+    return (
+      <CenteredStatus
+        body={status.message ?? u.unsupportedMessage}
+        icon={<AlertCircle className="size-6 text-muted-foreground" />}
+        title={u.notAvailableTitle}
       />
     )
   }

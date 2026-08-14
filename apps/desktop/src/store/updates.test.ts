@@ -240,13 +240,53 @@ describe('checkBackendUpdates', () => {
       update_available: false,
       can_apply: false,
       update_command: 'docker pull ...',
-      message: 'Docker images are immutable.'
+      message: 'Docker images are immutable.',
+      error_code: 'update-check-not-applicable'
     })
 
     const result = await checkBackendUpdates()
 
     expect(result?.supported).toBe(false)
     expect(result?.message).toBe('Docker images are immutable.')
+    expect(result?.error).toBeUndefined()
+  })
+
+  it('marks behind=null from an older backend as a failed check without error_code', async () => {
+    setRemote(true)
+    checkHermesUpdateSpy.mockResolvedValue({
+      install_method: 'docker',
+      current_version: '0.16.0',
+      behind: null,
+      update_available: false,
+      can_apply: false,
+      update_command: 'docker pull ...',
+      message: 'Unable to check for updates.'
+    })
+
+    const result = await checkBackendUpdates()
+
+    expect(result?.error).toBe('check-failed')
+    expect(result?.behind).toBeUndefined()
+  })
+
+  it('preserves a backend update-check failure instead of mapping it to current', async () => {
+    setRemote(true)
+    checkHermesUpdateSpy.mockResolvedValue({
+      install_method: 'managed-runtime',
+      current_version: '0.20.0',
+      behind: null,
+      update_available: false,
+      can_apply: false,
+      update_command: 'managed outside dashboard',
+      message: "Couldn't reach the update source — try again later.",
+      error_code: 'update-check-failed'
+    })
+
+    const result = await checkBackendUpdates()
+
+    expect(result?.error).toBe('update-check-failed')
+    expect(result?.behind).toBeUndefined()
+    expect(result?.updateAvailable).toBe(false)
   })
 
   it('is a no-op in local mode (backend check only runs when remote)', async () => {
@@ -348,6 +388,52 @@ describe('requestActiveUpdate', () => {
     requestActiveUpdate()
     await vi.waitFor(() => expect(updateHermesSpy).toHaveBeenCalled())
   })
+
+  it('opens managed non-applyable backend updates without calling apply', async () => {
+    setRemote(true)
+    $backendUpdateStatus.set(status({ behind: 0, updateAvailable: true, supported: false }))
+
+    requestActiveUpdate()
+    await vi.waitFor(() => expect(checkHermesUpdateSpy).toHaveBeenCalled())
+
+    expect($updateOverlayOpen.get()).toBe(true)
+    expect($updateOverlayTarget.get()).toBe('backend')
+    expect(updateHermesSpy).not.toHaveBeenCalled()
+  })
+
+  it('rejects a direct managed backend apply before transport', async () => {
+    setRemote(true)
+    $backendUpdateStatus.set(status({ behind: 3, updateAvailable: true, supported: false }))
+
+    const result = await applyBackendUpdate()
+
+    expect(result).toMatchObject({ ok: false, error: 'update-not-applyable' })
+    expect($updateOverlayOpen.get()).toBe(true)
+    expect($updateOverlayTarget.get()).toBe('backend')
+    expect(updateHermesSpy).not.toHaveBeenCalled()
+  })
+
+  it('rejects a direct backend apply before status is known', async () => {
+    setRemote(true)
+    $backendUpdateStatus.set(null)
+
+    const result = await applyBackendUpdate()
+
+    expect(result).toMatchObject({ ok: false, error: 'update-not-applyable' })
+    expect(updateHermesSpy).not.toHaveBeenCalled()
+  })
+
+  it('opens an errored client update status without calling apply', async () => {
+    setRemote(false)
+    $updateStatus.set(status({ behind: 3, error: 'check-failed' }))
+
+    requestActiveUpdate()
+    await vi.waitFor(() => expect(checkClientMock).toHaveBeenCalled())
+
+    expect($updateOverlayOpen.get()).toBe(true)
+    expect($updateOverlayTarget.get()).toBe('client')
+    expect(applyClientMock).not.toHaveBeenCalled()
+  })
 })
 
 describe('applyUpdates terminal state', () => {
@@ -359,6 +445,7 @@ describe('applyUpdates terminal state', () => {
     dismissSpy.mockClear()
     applyMock.mockReset()
     resetUpdateApplyState()
+    $updateStatus.set(status())
     $updateOverlayOpen.set(true)
     ;(globalThis as unknown as { window: unknown }).window = {
       hermesDesktop: { updates: { apply: applyMock } }
@@ -368,6 +455,20 @@ describe('applyUpdates terminal state', () => {
 
   afterEach(() => {
     delete (globalThis as unknown as { window?: unknown }).window
+  })
+
+  it.each([
+    ['missing', null],
+    ['current', status({ behind: 0, updateAvailable: false })],
+    ['unsupported', status({ supported: false })],
+    ['failed', status({ error: 'check-failed' })]
+  ])('rejects %s client status at the shared apply boundary', async (_label, invalidStatus) => {
+    $updateStatus.set(invalidStatus)
+
+    const result = await applyUpdates()
+
+    expect(result).toMatchObject({ ok: false, error: 'update-not-applyable' })
+    expect(applyMock).not.toHaveBeenCalled()
   })
 
   it('holds the restart view when a relauncher hands off (no close, no toast)', async () => {
@@ -469,7 +570,7 @@ describe('applyBackendUpdate recovery', () => {
     checkHermesUpdateSpy.mockReset()
     updateHermesSpy.mockReset()
     getActionStatusSpy.mockReset()
-    $backendUpdateStatus.set(null)
+    $backendUpdateStatus.set(status())
     $backendUpdateApply.set({
       applying: false,
       stage: 'idle',
@@ -484,6 +585,15 @@ describe('applyBackendUpdate recovery', () => {
 
   afterEach(() => {
     vi.useRealTimers()
+  })
+
+  it('refuses to apply when the backend is already current', async () => {
+    $backendUpdateStatus.set(status({ behind: 0, updateAvailable: false }))
+
+    const result = await applyBackendUpdate()
+
+    expect(result).toMatchObject({ ok: false, error: 'update-not-applyable' })
+    expect(updateHermesSpy).not.toHaveBeenCalled()
   })
 
   it('waits for the backend to return after the restart drops the connection, then clears the overlay', async () => {

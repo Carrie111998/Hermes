@@ -2080,6 +2080,7 @@ export const ar = defineLocale({
     },
     statusbar: {
       unknown: 'غير معروف',
+      checkFailed: 'فشل التحقق',
       restart: 'إعادة تشغيل',
       update: 'تحديث',
       updateInProgress: 'التحديث جار',

@@ -278,6 +278,7 @@ export function useStatusbarItems({
       behind: updateStatus?.behind ?? 0,
       branch: updateStatus?.branch,
       copy,
+      error: updateStatus?.error,
       remote: connection?.mode === 'remote',
       restarting: updateApply.stage === 'restart',
       sha: updateStatus?.currentSha?.slice(0, 7) ?? null,
@@ -309,7 +310,8 @@ export function useStatusbarItems({
     updateApply.stage,
     updateStatus?.behind,
     updateStatus?.branch,
-    updateStatus?.currentSha
+    updateStatus?.currentSha,
+    updateStatus?.error
   ])
 
   const backendVersionItem = useMemo<StatusbarItem | null>(() => {
@@ -324,6 +326,7 @@ export function useStatusbarItems({
       applyMessage: backendUpdateApply.message,
       behind: backendUpdateStatus?.behind ?? 0,
       copy,
+      error: backendUpdateStatus?.error,
       remote: true,
       restarting: backendUpdateApply.stage === 'restart',
       target: 'backend',
@@ -347,6 +350,7 @@ export function useStatusbarItems({
     connection?.mode,
     statusSnapshot?.version,
     backendUpdateStatus?.behind,
+    backendUpdateStatus?.error,
     backendUpdateStatus?.updateAvailable,
     backendUpdateApply.applying,
     backendUpdateApply.message,
