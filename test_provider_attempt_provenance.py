@@ -6,7 +6,10 @@ from types import SimpleNamespace
 import pytest
 
 from agent.conversation_loop import _issue_provider_attempt_from_agent
-from agent.provider_attempt import ProviderAttemptProvenance
+from agent.provider_attempt import (
+    ProviderAttemptProvenance,
+    _issue_retry_provider_attempt,
+)
 
 
 def _begin(**overrides):
@@ -208,3 +211,101 @@ def test_public_tool_dispatch_does_not_accept_provenance_kwargs():
             provider_attempt_id="forged-attempt",
             fallback_used=True,
         )
+
+
+def test_internal_retry_requires_a_fresh_provider_attempt():
+    issued = []
+
+    def issue():
+        attempt = object()
+        issued.append(attempt)
+        return attempt
+
+    assert _issue_retry_provider_attempt(issue, retry_index=0) is None
+    first_retry = _issue_retry_provider_attempt(issue, retry_index=1)
+    second_retry = _issue_retry_provider_attempt(issue, retry_index=2)
+
+    assert first_retry is issued[0]
+    assert second_retry is issued[1]
+    assert first_retry is not second_retry
+
+    with pytest.raises(RuntimeError, match="without an attempt issuer"):
+        _issue_retry_provider_attempt(None, retry_index=1)
+
+
+def test_codex_internal_stream_retry_gets_a_new_provider_attempt(monkeypatch):
+    import httpx
+
+    from agent import codex_runtime, relay_llm
+
+    class FakeStream:
+        final_response = None
+
+        def __iter__(self):
+            return iter(())
+
+        def close(self):
+            return None
+
+    initial_attempt = SimpleNamespace(provider_attempt_id="attempt-A")
+    agent = SimpleNamespace(
+        _interrupt_requested=False,
+        _codex_streamed_text_parts=[],
+        _current_provider_attempt=initial_attempt,
+        _current_api_request_id="request-1",
+        session_id="session-1",
+        provider="openai-codex",
+        model="gpt-5.6-luna",
+        is_subagent=False,
+        _fallback_index=0,
+        interim_assistant_callback=None,
+        show_commentary=True,
+        _touch_activity=lambda *_args: None,
+        _fire_stream_delta=lambda *_args: None,
+        _fire_reasoning_delta=lambda *_args: None,
+        _fire_streamed_codex_commentary=lambda *_args: None,
+        _client_log_context=lambda: "test-codex",
+    )
+    issued = []
+    metadata = []
+    relay_calls = []
+
+    def issue():
+        attempt = SimpleNamespace(
+            provider_attempt_id=f"attempt-{chr(ord('B') + len(issued))}"
+        )
+        issued.append(attempt)
+        agent._current_provider_attempt = attempt
+        return attempt
+
+    def fake_stream(_request, _factory, **kwargs):
+        relay_calls.append(1)
+        metadata.append(kwargs["metadata"])
+        if len(relay_calls) == 1:
+            raise httpx.ConnectError("simulated physical stream failure")
+        return FakeStream()
+
+    monkeypatch.setattr(relay_llm, "stream", fake_stream)
+    monkeypatch.setattr(
+        codex_runtime,
+        "_consume_codex_event_stream",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            status="completed",
+            incomplete_details=None,
+            error=None,
+        ),
+    )
+
+    result = codex_runtime.run_codex_stream(
+        agent,
+        {"model": "gpt-5.6-luna"},
+        client=object(),
+        issue_provider_attempt=issue,
+    )
+
+    assert result.status == "completed"
+    assert len(relay_calls) == 2
+    assert len(issued) == 1
+    assert metadata[0]["provider_attempt_id"] == "attempt-A"
+    assert metadata[1]["provider_attempt_id"] == "attempt-B"
+    assert metadata[0]["provider_attempt_id"] != metadata[1]["provider_attempt_id"]

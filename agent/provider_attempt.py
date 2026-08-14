@@ -248,6 +248,25 @@ class ToolCallProvenance:
         return result
 
 
+def _issue_retry_provider_attempt(
+    issue_provider_attempt,
+    *,
+    retry_index: int,
+):
+    """Issue a fresh core attempt before an internal physical retry.
+
+    The outer conversation loop issues the first attempt.  A lower transport
+    retry must either obtain a new producer-issued record here or fail closed;
+    silently reusing the outer record would collapse two physical requests into
+    one identity.
+    """
+    if retry_index <= 0:
+        return None
+    if not callable(issue_provider_attempt):
+        raise RuntimeError("physical provider retry occurred without an attempt issuer")
+    return issue_provider_attempt()
+
+
 def _begin_provider_attempt(
     *,
     session_id: str,

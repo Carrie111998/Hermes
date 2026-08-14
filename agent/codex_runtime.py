@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.provider_attempt import _issue_retry_provider_attempt
 
 logger = logging.getLogger(__name__)
 
@@ -1302,7 +1303,14 @@ def _consume_codex_event_stream(
     return final
 
 
-def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):
+def run_codex_stream(
+    agent,
+    api_kwargs: dict,
+    client: Any = None,
+    on_first_delta=None,
+    *,
+    issue_provider_attempt=None,
+):
     """Execute one streaming Responses API request and return the final response.
 
     Uses ``responses.create(stream=True)`` (low-level raw event iteration)
@@ -1339,6 +1347,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
+        _issue_retry_provider_attempt(
+            issue_provider_attempt,
+            retry_index=attempt,
+        )
 
         intercepted_events = []
         writer_token = {"value": None}
@@ -1389,6 +1401,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 metadata={
                     "api_mode": "codex_responses",
                     "api_request_id": getattr(agent, "_current_api_request_id", None),
+                    "provider_attempt_id": getattr(
+                        getattr(agent, "_current_provider_attempt", None),
+                        "provider_attempt_id",
+                        None,
+                    ),
                     "call_role": (
                         "delegated"
                         if getattr(agent, "is_subagent", False)

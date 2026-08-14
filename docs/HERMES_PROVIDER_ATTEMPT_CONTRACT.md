@@ -6,8 +6,8 @@ can lead to a discretionary `decision-submit` tool call.
 ## Producer boundary
 
 The Hermes conversation/provider retry loop issues one immutable
-`ProviderAttemptProvenance` record before each outer-loop provider dispatch.
-The record contains:
+`ProviderAttemptProvenance` record before the first provider dispatch of a
+logical request. The record contains:
 
 - Hermes-owned `runtime_instance_id`, `session_id`, `task_id`, and `turn_id`
 - logical `api_request_id`
@@ -25,6 +25,51 @@ The successful assistant response retains the immutable record internally.
 Tool dispatch receives that exact record through the core dispatch context, and
 the `tool_call_id` is bound to it before the observer event is emitted. An
 unrelated later attempt cannot replace the response-bound record.
+
+## Physical-call boundary
+
+The first outer-loop record is reused only while the same physical provider
+execution is in flight. Lower-layer retry/reconnect paths must call the
+Hermes-owned retry issuer before opening another provider connection. If such a
+path has no issuer, `_issue_retry_provider_attempt()` raises instead of
+silently reusing the old ID. A pre-dispatch `outcome="started"` record is not a
+completed physical execution; only a successful provider response completes a
+record.
+
+The current configured runtime path is `openai-codex` / `codex_responses`.
+Within this fork:
+
+- Codex stream retries (initial connect and mid-stream transport failure) issue
+  a new attempt before the next `relay_llm.stream` call.
+- The OpenAI-compatible and Anthropic stream retry loops use the same common
+  issuer. Their request clients set SDK `max_retries=0`.
+- Bedrock runtime clients use botocore
+  `Config(retries={"mode": "standard", "total_max_attempts": 1})`, so the
+  SDK does not retry inside one provider call. The explicit
+  `converse_stream`-denied → `converse` recovery issues a new attempt before
+  the second outbound call.
+- Codex's request client also uses `max_retries=0`; Hermes owns the outer and
+  stream retry policy.
+
+Focused tests simulate a failed Codex physical stream followed by recovery and
+assert two Relay/provider dispatches carry different attempt IDs.
+
+## Relay boundary
+
+The inspected Python Relay adapter calls the provider callback once per
+`llm.execute` invocation and once per `stream_factory` invocation. The installed
+`nemo-relay` package is version `0.7.1`; a no-network harness observed one
+callback for a normal call and one callback when the callback raised a simulated
+stream transport error. The native `stream_execute` implementation is a
+compiled boundary, so this evidence is limited to the inspected installed
+snapshot and harness behavior. A separately deployed Relay implementation may
+differ; any Relay-level retry must issue a native attempt per physical call and
+cannot reuse this ID.
+
+Optional virtual MoA execution and auxiliary-client fan-out are not the current
+configured `openai-codex` path. Their reference-provider calls are separate
+physical executions and are not covered by this main-response attempt contract;
+they remain UNKNOWN until a dedicated producer seam is specified.
 
 ## Observer boundary
 
@@ -45,9 +90,3 @@ the consumer is outside Hermes or is controlled by Violet, Hermes still needs
 a lifecycle-bound authenticated handoff (or a signing key inaccessible to the
 consumer). Until that boundary exists, Violet must reject these observer
 projections and fail closed.
-
-The local Relay callback is one dispatch callback in the inspected source.
-Whether a separately deployed Relay implementation can perform additional
-provider retries outside this Hermes loop is not established by this patch;
-such retries must receive their own native attempt identity rather than reuse
-this record.

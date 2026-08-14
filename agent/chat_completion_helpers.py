@@ -41,6 +41,7 @@ from agent.message_sanitization import (
 )
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.provider_attempt import _issue_retry_provider_attempt
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
@@ -494,7 +495,13 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
     return None
 
 
-def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
+def _dispatch_nonstreaming_api_request(
+    agent,
+    api_kwargs: dict,
+    *,
+    make_client,
+    issue_provider_attempt=None,
+):
     """Run one non-streaming LLM request for the active api_mode and return it.
 
     Shared by the interrupt-worker path (``interruptible_api_call``) and the
@@ -516,6 +523,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
             api_kwargs,
             client=request_client,
             on_first_delta=getattr(agent, "_codex_on_first_delta", None),
+            issue_provider_attempt=issue_provider_attempt,
         )
     if agent.api_mode == "anthropic_messages":
         # #67142: use a request-local Anthropic client so the stale/interrupt
@@ -851,7 +859,12 @@ def direct_api_call(agent, api_kwargs: dict):
             )
 
 
-def interruptible_api_call(agent, api_kwargs: dict):
+def interruptible_api_call(
+    agent,
+    api_kwargs: dict,
+    *,
+    issue_provider_attempt=None,
+):
     """
     Run the API call in a background thread so the main conversation loop
     can detect interrupts without waiting for the full HTTP round-trip.
@@ -969,6 +982,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     ),
                     kind=kind,
                 ),
+                issue_provider_attempt=issue_provider_attempt,
             )
         except Exception as e:
             # If the request was cancelled by the main thread's interrupt
@@ -2767,7 +2781,13 @@ def _build_partial_stream_stub(
     )
 
 
-def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):
+def interruptible_streaming_api_call(
+    agent,
+    api_kwargs: dict,
+    *,
+    on_first_delta=None,
+    issue_provider_attempt=None,
+):
     """Streaming variant of _interruptible_api_call for real-time token delivery.
 
     Handles all three api_modes:
@@ -2828,7 +2848,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # branch below — routing through the _interruptible_api_call method keeps the
     # outer loop's per-request retry/refresh seam intact.
     if should_use_direct_api_call(agent):
-        return agent._interruptible_api_call(api_kwargs)
+        return agent._interruptible_api_call(
+            api_kwargs,
+            issue_provider_attempt=issue_provider_attempt,
+        )
 
     if agent.api_mode == "codex_responses":
         # Codex streams internally via _run_codex_stream. The main dispatch
@@ -2838,7 +2861,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         agent._codex_on_first_delta = on_first_delta
         _emit_stream_start()
         try:
-            response = agent._interruptible_api_call(api_kwargs)
+            response = agent._interruptible_api_call(
+                api_kwargs,
+                issue_provider_attempt=issue_provider_attempt,
+            )
             _emit_stream_end(final_text=_stream_final_text(response), finished=True, error=None)
             return response
         except Exception as exc:
@@ -2918,6 +2944,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 "bedrock: converse_stream denied by IAM (%s) — "
                                 "using non-streaming converse() for this session.",
                                 type(_bedrock_exc).__name__,
+                            )
+                            _issue_retry_provider_attempt(
+                                issue_provider_attempt,
+                                retry_index=1,
                             )
                             return normalize_converse_response(
                                 client.converse(**final_kwargs)
@@ -3475,6 +3505,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 metadata={
                     "api_mode": "chat_completions",
                     "api_request_id": getattr(agent, "_current_api_request_id", None),
+                    "provider_attempt_id": getattr(
+                        getattr(agent, "_current_provider_attempt", None),
+                        "provider_attempt_id",
+                        None,
+                    ),
                     "call_role": (
                         "delegated"
                         if getattr(agent, "is_subagent", False)
@@ -3952,6 +3987,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 metadata={
                     "api_mode": "anthropic_messages",
                     "api_request_id": getattr(agent, "_current_api_request_id", None),
+                    "provider_attempt_id": getattr(
+                        getattr(agent, "_current_provider_attempt", None),
+                        "provider_attempt_id",
+                        None,
+                    ),
                     "call_role": (
                         "delegated"
                         if getattr(agent, "is_subagent", False)
@@ -4103,6 +4143,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 if agent._interrupt_requested:
                     _cancel_current_stream_attempt("interrupt_before_stream_retry")
                     raise InterruptedError("Agent interrupted before stream retry")
+                _issue_retry_provider_attempt(
+                    issue_provider_attempt,
+                    retry_index=_stream_attempt,
+                )
                 _emit_stream_start()
                 try:
                     if agent.api_mode == "anthropic_messages":

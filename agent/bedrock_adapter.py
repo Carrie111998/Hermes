@@ -95,8 +95,15 @@ def _get_bedrock_runtime_client(region: str):
     """
     if region not in _bedrock_runtime_client_cache:
         boto3 = _require_boto3()
+        from botocore.config import Config
+
         _bedrock_runtime_client_cache[region] = boto3.client(
-            "bedrock-runtime", region_name=region,
+            "bedrock-runtime",
+            region_name=region,
+            # Hermes owns retry/fallback and provider-attempt identity.
+            # Botocore's default legacy policy retries inside one client call,
+            # which would make one provider_attempt_id cover multiple requests.
+            config=Config(retries={"mode": "standard", "total_max_attempts": 1}),
         )
     return _bedrock_runtime_client_cache[region]
 
