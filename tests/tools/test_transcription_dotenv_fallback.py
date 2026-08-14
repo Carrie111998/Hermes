@@ -24,6 +24,9 @@ def isolate_env(monkeypatch):
     """
     for key in (
         "GROQ_API_KEY",
+        "VOICE_TOOLS_OPENAI_KEY",
+        "OPENAI_API_KEY",
+        "STT_OPENAI_BASE_URL",
         "MISTRAL_API_KEY",
         "XAI_API_KEY",
         "XAI_STT_BASE_URL",
@@ -112,6 +115,27 @@ class TestTranscribeCallSitesReadDotenv:
     """The actual transcribe functions must forward the dotenv-resolved
     key into the provider SDK / HTTP call. We mock ``get_env_value`` and
     capture what gets passed through."""
+
+    def test_openai_endpoint_and_key_follow_post_import_dotenv_update(self):
+        """A running process must not pair a live key with a stale endpoint."""
+        import importlib
+        from tools import transcription_tools as tt
+
+        tt = importlib.reload(tt)
+        try:
+            with patch.object(tt, "_load_stt_config", return_value={}), patch(
+                "hermes_cli.config.load_env",
+                return_value={
+                    "VOICE_TOOLS_OPENAI_KEY": "updated-key",
+                    "STT_OPENAI_BASE_URL": "https://stt.example/v1",
+                },
+            ):
+                assert tt._resolve_openai_audio_client_config() == (
+                    "updated-key",
+                    "https://stt.example/v1",
+                )
+        finally:
+            importlib.reload(tt)
 
     def test_transcribe_groq_forwards_dotenv_key(self):
         from tools import transcription_tools as tt
