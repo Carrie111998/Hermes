@@ -61,9 +61,15 @@ def list_files(worktree: Path, pattern: str = "**/*") -> List[str]:
         if not item.is_file():
             continue
         try:
-            results.append(item.relative_to(root).as_posix())
+            # item.relative_to(root) alone is lexical: a pattern such as
+            # "../*.py" yields glob results with a literal ".." component,
+            # which is still a lexical prefix-match against root and would
+            # NOT raise here. Resolve first so escapes are caught the same
+            # way _relative() catches them.
+            rel = item.resolve().relative_to(root)
         except ValueError:
             continue
+        results.append(rel.as_posix())
     return results
 
 
@@ -77,6 +83,11 @@ def write_file(worktree: Path, target: TargetConfig, path: str, content: str) ->
             + ", ".join(target.allowed_globs)
         )
     destination = Path(worktree).resolve() / rel
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(str(content), encoding="utf-8")
+    if destination.exists() and not destination.is_file():
+        raise ToolError(f"cannot write {rel}: an existing directory occupies that path")
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(str(content), encoding="utf-8")
+    except OSError as exc:
+        raise ToolError(f"failed to write {rel}: {exc}") from exc
     return f"wrote {rel} ({len(str(content))} chars)"
