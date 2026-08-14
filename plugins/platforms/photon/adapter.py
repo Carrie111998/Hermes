@@ -586,12 +586,12 @@ def _env_enablement() -> Optional[dict]:
 def _markdown_enabled() -> bool:
     """Send agent replies as markdown (spectrum-ts ``markdown()`` builder).
 
-    iMessage renders it natively; other Spectrum platforms degrade to
-    readable plain text. On-device rendering can't be unit-tested, so
-    ``PHOTON_MARKDOWN=false`` is the kill-switch back to stripped plain
-    text without a release.
+    Native rich-text rendering varies by message shape and cannot be proven
+    end to end in unit tests, so clean conversational plain text is the safe
+    default. ``PHOTON_MARKDOWN=true`` explicitly opts into the spectrum-ts
+    markdown builder.
     """
-    return os.getenv("PHOTON_MARKDOWN", "true").strip().lower() not in {
+    return os.getenv("PHOTON_MARKDOWN", "false").strip().lower() not in {
         "false", "0", "no",
     }
 
@@ -2848,9 +2848,12 @@ async def _standalone_send(
                     else:
                         rich_url = None
                 if not rich_url:
+                    outbound_text = (
+                        message if _markdown_enabled() else strip_markdown(message)
+                    )
                     send_body: Dict[str, Any] = {
                         "spaceId": chat_id,
-                        "text": message[:_MAX_MESSAGE_LENGTH],
+                        "text": outbound_text[:_MAX_MESSAGE_LENGTH],
                     }
                     if _markdown_enabled() and not _richlink_candidate(message):
                         send_body["format"] = "markdown"

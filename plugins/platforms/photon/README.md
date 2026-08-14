@@ -124,7 +124,7 @@ All env vars are documented in `plugin.yaml`. The most important:
 | `PHOTON_REQUIRE_MENTION`  | false                      | Gate group chats on a wake word      |
 | `PHOTON_MAX_INLINE_ATTACHMENT_BYTES` | 20 MB           | Max inbound attachment size the sidecar reads & inlines |
 | `PHOTON_TELEMETRY`        | false                      | Spectrum SDK telemetry — toggle with `hermes photon telemetry on\|off` (restart the gateway to apply) |
-| `PHOTON_MARKDOWN`         | true                       | Send agent replies as markdown (iMessage renders natively). `false` strips formatting to plain text |
+| `PHOTON_MARKDOWN`         | false                      | Strip formatting to clean plain text. Set `true` only after verifying native rendering end to end for the message shapes you use |
 | `PHOTON_REACTIONS`        | false                      | Tapback 👀/👍/👎 as processing status; tapbacks on bot messages reach the agent as `reaction:added:<emoji>` |
 
 ## Attachments & limitations
@@ -150,12 +150,11 @@ All env vars are documented in `plugin.yaml`. The most important:
   documents are sent via `space.send(attachment(...))` /
   `space.send(voice(...))` through the sidecar's `/send-attachment`
   endpoint; a caption is delivered as a separate text bubble after the media.
-- **Markdown is rendered.** Replies go out via spectrum-ts' `markdown()`
-  builder; iMessage renders bold/italics/lists/code natively and other
-  Spectrum platforms degrade to readable plain text. URL-only replies go out
-  via spectrum-ts' `richlink()` builder so iMessage can render a native link
-  preview card. `PHOTON_MARKDOWN=false` reverts to stripped plain text and
-  disables rich-link routing.
+- **Plain text is the default.** Replies have Markdown syntax stripped before
+  they reach spectrum-ts, including messages that contain raw URLs. Set
+  `PHOTON_MARKDOWN=true` only after verifying native rendering end to end for
+  the message shapes you use. Markdown mode also enables URL-only rich-link
+  routing.
 - **Reactions (tapbacks) are supported** behind `PHOTON_REACTIONS` (default
   off): the adapter tapbacks 👀 while processing and swaps it for 👍/👎 on
   completion, and a user tapback on a bot-sent message is routed to the agent

@@ -23,6 +23,8 @@ _URL = "https://example.com/article"
 def _make_adapter(monkeypatch: pytest.MonkeyPatch) -> PhotonAdapter:
     monkeypatch.setenv("PHOTON_PROJECT_ID", "test-project-id")
     monkeypatch.setenv("PHOTON_PROJECT_SECRET", "test-project-secret")
+    # Rich-link routing is part of the explicitly opted-in Markdown mode.
+    monkeypatch.setenv("PHOTON_MARKDOWN", "true")
     cfg = PlatformConfig(enabled=True, token="", extra={})
     return PhotonAdapter(cfg)
 
@@ -152,7 +154,7 @@ async def test_direct_url_only_send_falls_back_to_plain_send(
 async def test_standalone_url_only_send_routes_to_richlink_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("PHOTON_MARKDOWN", raising=False)
+    monkeypatch.setenv("PHOTON_MARKDOWN", "true")
     monkeypatch.setenv("PHOTON_SIDECAR_TOKEN", "tok")
     posted: List[Tuple[str, Dict[str, Any]]] = []
 
@@ -235,5 +237,4 @@ def _preview_attachment_by_id(
     payload["id"] = attachment_id
     payload["name"] = None
     return payload
-
 

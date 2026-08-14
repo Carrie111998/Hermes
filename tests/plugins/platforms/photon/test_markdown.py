@@ -1,8 +1,7 @@
 """Markdown handling tests for PhotonAdapter.
 
-Markdown is on by default (the sidecar sends it via spectrum-ts'
-``markdown()`` builder and iMessage renders it); ``PHOTON_MARKDOWN=false``
-reverts to the stripped-plain-text path.
+Plain text is the safe default. ``PHOTON_MARKDOWN=true`` explicitly opts into
+the spectrum-ts ``markdown()`` builder.
 """
 from __future__ import annotations
 
@@ -35,23 +34,23 @@ def _capture_sidecar(adapter: PhotonAdapter) -> List[Tuple[str, Dict[str, Any]]]
     return calls
 
 
-def test_format_message_passthrough_by_default(
+def test_format_message_strips_markdown_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("PHOTON_MARKDOWN", raising=False)
     adapter = _make_adapter(monkeypatch)
-    assert adapter.format_message(_MD) == _MD
+    assert adapter.format_message(_MD) == "bold and code"
 
 
 def test_supports_code_blocks_mirrors_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("PHOTON_MARKDOWN", raising=False)
-    assert _make_adapter(monkeypatch).supports_code_blocks is True
-    monkeypatch.setenv("PHOTON_MARKDOWN", "false")
     assert _make_adapter(monkeypatch).supports_code_blocks is False
+    monkeypatch.setenv("PHOTON_MARKDOWN", "true")
+    assert _make_adapter(monkeypatch).supports_code_blocks is True
 
 
 @pytest.mark.asyncio
-async def test_sidecar_send_includes_markdown_format(
+async def test_sidecar_send_defaults_to_stripped_plain_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("PHOTON_MARKDOWN", raising=False)
@@ -62,12 +61,28 @@ async def test_sidecar_send_includes_markdown_format(
 
     path, body = calls[0]
     assert path == "/send"
-    assert body["format"] == "markdown"
-    assert body["text"] == _MD  # passed through unstripped
+    assert "format" not in body
+    assert body["text"] == "bold and code"
 
 
 @pytest.mark.asyncio
-async def test_standalone_send_includes_markdown_format(
+async def test_sidecar_send_can_explicitly_opt_in_to_markdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PHOTON_MARKDOWN", "true")
+    adapter = _make_adapter(monkeypatch)
+    calls = _capture_sidecar(adapter)
+
+    await adapter.send("+15551234567", _MD)
+
+    path, body = calls[0]
+    assert path == "/send"
+    assert body["format"] == "markdown"
+    assert body["text"] == _MD
+
+
+@pytest.mark.asyncio
+async def test_standalone_send_defaults_to_stripped_plain_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("PHOTON_MARKDOWN", raising=False)
@@ -102,4 +117,28 @@ async def test_standalone_send_includes_markdown_format(
     result = await photon_adapter._standalone_send(cfg, "+15551234567", _MD)
 
     assert result.get("success") is True
-    assert posted[0][1]["format"] == "markdown"
+    assert "format" not in posted[0][1]
+    assert posted[0][1]["text"] == "bold and code"
+
+
+@pytest.mark.asyncio
+async def test_markdown_plus_raw_url_delivers_plain_builder_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PHOTON_MARKDOWN", raising=False)
+    adapter = _make_adapter(monkeypatch)
+    calls = _capture_sidecar(adapter)
+
+    await adapter.send(
+        "+15551234567",
+        "## Update\n\n- **Read the docs:** https://example.com/docs",
+    )
+
+    path, body = calls[0]
+    assert path == "/send"
+    assert body == {
+        "spaceId": "+15551234567",
+        "text": "Update\n\n- Read the docs: https://example.com/docs",
+    }
+    for marker in ("##", "- **", "**", "[the docs]("):
+        assert marker not in body["text"]

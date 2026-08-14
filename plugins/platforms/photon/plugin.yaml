@@ -79,7 +79,7 @@ optional_env:
     prompt: "Enable Spectrum telemetry? (true/false)"
     password: false
   - name: PHOTON_MARKDOWN
-    description: "Send agent replies as markdown — iMessage renders it natively, other Spectrum platforms degrade to plain text (true/false, default true)"
+    description: "Send agent replies as markdown (true/false, default false; opt in only after verifying native rendering end to end)"
     prompt: "Render replies as markdown? (true/false)"
     password: false
   - name: PHOTON_REACTIONS
