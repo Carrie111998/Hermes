@@ -126,6 +126,7 @@ def test_notify_sub_crud(kanban_home):
         # Duplicate add is a no-op.
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="123",
+            notifier_profile="default",
             delivery_metadata={
                 "chat_type": "dm",
                 "telegram_reply_to_message_id": "43",
@@ -138,12 +139,14 @@ def test_notify_sub_crud(kanban_home):
         # Distinct thread is a new row.
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="123",
+            notifier_profile="default",
             thread_id="5",
         )
         assert len(kb.list_notify_subs(conn, tid)) == 2
         # Remove one.
         ok = kb.remove_notify_sub(
-            conn, task_id=tid, platform="telegram", chat_id="123",
+            conn, task_id=tid, notifier_profile="default",
+            platform="telegram", chat_id="123",
         )
         assert ok is True
         assert len(kb.list_notify_subs(conn, tid)) == 1

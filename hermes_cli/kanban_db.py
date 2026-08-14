@@ -1500,18 +1500,40 @@ CREATE TABLE IF NOT EXISTS task_attachments (
 -- the original requester so human-in-the-loop workflows close the loop.
 CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     task_id       TEXT NOT NULL,
+    notifier_profile TEXT NOT NULL DEFAULT '',
     platform      TEXT NOT NULL,
     chat_id       TEXT NOT NULL,
     thread_id     TEXT NOT NULL DEFAULT '',
     user_id       TEXT,
     user_id_alt   TEXT,
     chat_type     TEXT,
-    notifier_profile TEXT,
     delivery_mode TEXT NOT NULL DEFAULT 'notify',
     delivery_metadata TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (task_id, platform, chat_id, thread_id)
+    PRIMARY KEY (task_id, notifier_profile, platform, chat_id, thread_id)
+);
+
+CREATE TABLE IF NOT EXISTS kanban_notify_sources (
+    task_id       TEXT NOT NULL,
+    notifier_profile TEXT NOT NULL DEFAULT '',
+    platform      TEXT NOT NULL,
+    chat_id       TEXT NOT NULL,
+    thread_id     TEXT NOT NULL DEFAULT '',
+    source_kind TEXT NOT NULL
+        CHECK (source_kind IN ('origin','home','manual','legacy')),
+    source_key TEXT NOT NULL,
+    delivery_mode TEXT NOT NULL DEFAULT 'notify'
+        CHECK (delivery_mode IN ('notify','notify+wake','wake')),
+    user_id       TEXT,
+    user_id_alt   TEXT,
+    chat_type     TEXT,
+    delivery_metadata TEXT,
+    created_at    INTEGER NOT NULL,
+    PRIMARY KEY (
+        task_id, notifier_profile, platform, chat_id, thread_id,
+        source_kind, source_key
+    )
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
@@ -1524,6 +1546,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_notify_sources_task   ON kanban_notify_sources(task_id);
 """
 
 
@@ -2798,6 +2821,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+    _ensure_notify_sources(conn)
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -2847,13 +2871,14 @@ _REBUILD_SPECS = {
     ),
     "kanban_notify_subs": (
         "CREATE TABLE kanban_notify_subs ("
-        " task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
+        " task_id TEXT NOT NULL, notifier_profile TEXT NOT NULL DEFAULT '',"
+        " platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
         " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT, user_id_alt TEXT,"
         " chat_type TEXT,"
-        " notifier_profile TEXT, delivery_mode TEXT NOT NULL DEFAULT 'notify',"
+        " delivery_mode TEXT NOT NULL DEFAULT 'notify',"
         " delivery_metadata TEXT, created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
-        " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
+        " PRIMARY KEY (task_id, notifier_profile, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
 }
@@ -2866,7 +2891,19 @@ def _table_has_drifted(conn: sqlite3.Connection, table: str) -> bool:
         return False  # table absent — nothing to rebuild
     if table == "kanban_notify_subs":
         lei = next((c for c in info if c["name"] == "last_event_id"), None)
-        return lei is not None and (lei["type"] or "").upper() != "INTEGER"
+        profile = next((c for c in info if c["name"] == "notifier_profile"), None)
+        pk = [c["name"] for c in sorted(info, key=lambda c: c["pk"] or 99) if c["pk"]]
+        return (
+            lei is not None
+            and (
+                (lei["type"] or "").upper() != "INTEGER"
+                or profile is None
+                or not profile["notnull"]
+                or pk != [
+                    "task_id", "notifier_profile", "platform", "chat_id", "thread_id"
+                ]
+            )
+        )
     # task_events / task_comments / task_runs: id must be INTEGER and a PK.
     id_col = next((c for c in info if c["name"] == "id"), None)
     if id_col is None:
@@ -2906,12 +2943,22 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
             conn.execute(create_sql)
             new_cols = {c["name"] for c in conn.execute(f"PRAGMA table_info({table})")}
             if table == "kanban_notify_subs":
-                # Cast the legacy TEXT cursor to INTEGER; NULL / non-numeric → 0.
-                shared = [c for c in old_cols if c in new_cols and c != "last_event_id"]
-                cols_csv = ", ".join(shared)
+                shared = [
+                    c for c in old_cols
+                    if c in new_cols and c not in {"last_event_id", "notifier_profile"}
+                ]
+                insert_cols = ["notifier_profile", *shared, "last_event_id"]
+                cols_csv = ", ".join(insert_cols)
+                selected = ", ".join(shared)
+                profile_expr = (
+                    "COALESCE(notifier_profile, '')"
+                    if "notifier_profile" in old_cols
+                    else "''"
+                )
                 conn.execute(
-                    f"INSERT INTO {table} ({cols_csv}, last_event_id) "
-                    f"SELECT {cols_csv}, COALESCE(CAST(last_event_id AS INTEGER), 0) "
+                    f"INSERT INTO {table} ({cols_csv}) "
+                    f"SELECT {profile_expr}, {selected}, "
+                    "COALESCE(CAST(last_event_id AS INTEGER), 0) "
                     f"FROM {table}_legacy"
                 )
             else:
@@ -2932,6 +2979,63 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError:
             pass
         raise
+
+
+def _ensure_notify_sources(conn: sqlite3.Connection) -> None:
+    """Create source ownership and classify pre-source routes as legacy."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kanban_notify_sources (
+            task_id TEXT NOT NULL,
+            notifier_profile TEXT NOT NULL DEFAULT '',
+            platform TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL DEFAULT '',
+            source_kind TEXT NOT NULL CHECK (source_kind IN ('origin','home','manual','legacy')),
+            source_key TEXT NOT NULL,
+            delivery_mode TEXT NOT NULL DEFAULT 'notify'
+                CHECK (delivery_mode IN ('notify','notify+wake','wake')),
+            user_id TEXT,
+            user_id_alt TEXT,
+            chat_type TEXT,
+            delivery_metadata TEXT,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (
+                task_id, notifier_profile, platform, chat_id, thread_id,
+                source_kind, source_key
+            )
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_notify_sources_task "
+        "ON kanban_notify_sources(task_id)"
+    )
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'kanban_notify_subs'"
+    ).fetchone() is None:
+        return
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO kanban_notify_sources
+            (task_id, notifier_profile, platform, chat_id, thread_id,
+             source_kind, source_key, delivery_mode, user_id, user_id_alt,
+             chat_type, delivery_metadata, created_at)
+        SELECT task_id, notifier_profile, platform, chat_id, thread_id,
+               'legacy', 'route', delivery_mode, user_id, user_id_alt,
+               chat_type, delivery_metadata, created_at
+          FROM kanban_notify_subs r
+         WHERE NOT EXISTS (
+               SELECT 1 FROM kanban_notify_sources s
+                WHERE s.task_id = r.task_id
+                  AND s.notifier_profile = r.notifier_profile
+                  AND s.platform = r.platform
+                  AND s.chat_id = r.chat_id
+                  AND s.thread_id = r.thread_id
+         )
+        """
+    )
 
 
 def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
@@ -3589,6 +3693,41 @@ def _inherit_notify_subs(
             *parent_ids,
         ),
     )
+    conn.execute(
+        f"""
+        INSERT OR IGNORE INTO kanban_notify_sources
+            (task_id, notifier_profile, platform, chat_id, thread_id,
+             source_kind, source_key, delivery_mode, user_id, user_id_alt,
+             chat_type, delivery_metadata, created_at)
+        SELECT ?, notifier_profile, platform, chat_id, thread_id,
+               source_kind, source_key, delivery_mode, user_id, user_id_alt,
+               chat_type, delivery_metadata, ?
+          FROM kanban_notify_sources
+         WHERE task_id IN ({placeholders})
+        """,
+        (
+            child_id,
+            int(created_at if created_at is not None else time.time()),
+            *parent_ids,
+        ),
+    )
+    inherited_routes = conn.execute(
+        """
+        SELECT DISTINCT notifier_profile, platform, chat_id, thread_id
+          FROM kanban_notify_sources
+         WHERE task_id = ?
+        """,
+        (child_id,),
+    ).fetchall()
+    for route in inherited_routes:
+        _recompute_notify_route(
+            conn,
+            task_id=child_id,
+            notifier_profile=str(route["notifier_profile"]),
+            platform=str(route["platform"]),
+            chat_id=str(route["chat_id"]),
+            thread_id=str(route["thread_id"]),
+        )
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
@@ -7439,6 +7578,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_notify_sources WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
@@ -7462,6 +7602,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_notify_sources WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
@@ -10960,6 +11101,143 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
     }
 
 
+_NOTIFY_SOURCE_KINDS = {"origin", "home", "manual", "legacy"}
+_NOTIFY_SOURCE_PRIORITY = {"origin": 0, "manual": 1, "home": 2, "legacy": 3}
+
+
+def _notify_profile(value: Optional[str]) -> str:
+    return str(value or "").strip()
+
+
+def _notify_route_key(
+    *, task_id: str, notifier_profile: Optional[str], platform: str,
+    chat_id: str, thread_id: Optional[str],
+) -> tuple[str, str, str, str, str]:
+    return (
+        task_id, _notify_profile(notifier_profile), platform, chat_id, thread_id or ""
+    )
+
+
+def _effective_notify_mode(modes: Iterable[str]) -> str:
+    values = set(modes)
+    wants_notify = bool(values & {"notify", "notify+wake"})
+    wants_wake = bool(values & {"wake", "notify+wake"})
+    if wants_notify and wants_wake:
+        return "notify+wake"
+    if wants_wake:
+        return "wake"
+    return "notify"
+
+
+def _recompute_notify_route(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    notifier_profile: Optional[str],
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> bool:
+    key = _notify_route_key(
+        task_id=task_id,
+        notifier_profile=notifier_profile,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+    )
+    rows = conn.execute(
+        """
+        SELECT * FROM kanban_notify_sources
+         WHERE task_id = ? AND notifier_profile = ? AND platform = ?
+           AND chat_id = ? AND thread_id = ?
+        """,
+        key,
+    ).fetchall()
+    if not rows:
+        conn.execute(
+            "DELETE FROM kanban_notify_subs WHERE task_id = ? AND notifier_profile = ? "
+            "AND platform = ? AND chat_id = ? AND thread_id = ?",
+            key,
+        )
+        return False
+
+    sources = sorted(
+        (dict(row) for row in rows),
+        key=lambda row: (
+            _NOTIFY_SOURCE_PRIORITY.get(str(row.get("source_kind")), 99),
+            str(row.get("source_key") or ""),
+        ),
+    )
+    metadata: dict[str, Any] = {}
+    for source in sources:
+        for field, value in _decode_notify_delivery_metadata(
+            source.get("delivery_metadata")
+        ).items():
+            metadata.setdefault(field, value)
+
+    def first(field: str) -> Optional[str]:
+        for source in sources:
+            value = source.get(field)
+            if value not in (None, ""):
+                return str(value)
+        return None
+
+    conn.execute(
+        """
+        UPDATE kanban_notify_subs
+           SET user_id = ?, user_id_alt = ?, chat_type = ?, delivery_mode = ?,
+               delivery_metadata = ?
+         WHERE task_id = ? AND notifier_profile = ? AND platform = ?
+           AND chat_id = ? AND thread_id = ?
+        """,
+        (
+            first("user_id"),
+            first("user_id_alt"),
+            first("chat_type") or "dm",
+            _effective_notify_mode(str(source.get("delivery_mode") or "notify") for source in sources),
+            _encode_notify_delivery_metadata(metadata),
+            *key,
+        ),
+    )
+    return True
+
+
+def list_notify_sources(
+    conn: sqlite3.Connection,
+    task_id: Optional[str] = None,
+    *,
+    notifier_profile: Optional[str] = None,
+    platform: Optional[str] = None,
+    source_kind: Optional[str] = None,
+) -> list[dict]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    for column, value in (
+        ("task_id", task_id),
+        ("notifier_profile", _notify_profile(notifier_profile) if notifier_profile is not None else None),
+        ("platform", platform),
+        ("source_kind", source_kind),
+    ):
+        if value is not None:
+            clauses.append(f"{column} = ?")
+            params.append(value)
+    sql = "SELECT * FROM kanban_notify_sources"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += (
+        " ORDER BY task_id, notifier_profile, platform, chat_id, thread_id, "
+        "source_kind, source_key"
+    )
+    result = []
+    for row in conn.execute(sql, params).fetchall():
+        item = dict(row)
+        item["delivery_metadata"] = _decode_notify_delivery_metadata(
+            item.get("delivery_metadata")
+        )
+        result.append(item)
+    return result
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -10973,9 +11251,12 @@ def add_notify_sub(
     notifier_profile: Optional[str] = None,
     delivery_mode: Optional[str] = None,
     delivery_metadata: Optional[Mapping[str, Any]] = None,
+    source_kind: str = "manual",
+    source_key: str = "route",
+    _allow_nested: bool = False,
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
-    for ``task_id``. Idempotent on (task, platform, chat, thread).
+    for ``task_id``. Idempotent on the profile-scoped route plus source.
 
     ``user_id_alt`` records the originating source's platform-specific stable
     alt ID (Signal UUID, Feishu union_id, ...) alongside ``user_id``. Active-wake
@@ -11015,7 +11296,12 @@ def add_notify_sub(
     insert_chat_type = chat_type or "dm"
     now = int(time.time())
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
-    with write_txn(conn):
+    profile = _notify_profile(notifier_profile)
+    if source_kind not in _NOTIFY_SOURCE_KINDS:
+        raise ValueError(f"invalid notification source kind: {source_kind!r}")
+    kind = source_kind
+    source_key = str(source_key or "route")
+    with write_txn(conn, allow_nested=_allow_nested):
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
@@ -11033,7 +11319,7 @@ def add_notify_sub(
                 user_id,
                 user_id_alt,
                 insert_chat_type,
-                notifier_profile,
+                profile,
                 insert_mode,
                 metadata_json,
                 now,
@@ -11046,9 +11332,10 @@ def add_notify_sub(
                 """
                 UPDATE kanban_notify_subs
                    SET chat_type = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                 WHERE task_id = ? AND notifier_profile = ? AND platform = ?
+                   AND chat_id = ? AND thread_id = ?
                 """,
-                (chat_type, task_id, platform, chat_id, thread_id or ""),
+                (chat_type, task_id, profile, platform, chat_id, thread_id or ""),
             )
         if user_id_alt:
             # Self-heal legacy rows created before alternate IDs were tracked.
@@ -11056,21 +11343,11 @@ def add_notify_sub(
                 """
                 UPDATE kanban_notify_subs
                    SET user_id_alt = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                 WHERE task_id = ? AND notifier_profile = ? AND platform = ?
+                   AND chat_id = ? AND thread_id = ?
                    AND (user_id_alt IS NULL OR user_id_alt = '')
                 """,
-                (user_id_alt, task_id, platform, chat_id, thread_id or ""),
-            )
-        if notifier_profile:
-            # Self-heal legacy rows that predate notifier ownership.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET notifier_profile = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                   AND (notifier_profile IS NULL OR notifier_profile = '')
-                """,
-                (notifier_profile, task_id, platform, chat_id, thread_id or ""),
+                (user_id_alt, task_id, profile, platform, chat_id, thread_id or ""),
             )
         if delivery_mode in _NOTIFY_DELIVERY_MODES:
             # Explicit delivery_mode is last-write-wins on re-subscribe.
@@ -11078,9 +11355,10 @@ def add_notify_sub(
                 """
                 UPDATE kanban_notify_subs
                    SET delivery_mode = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                 WHERE task_id = ? AND notifier_profile = ? AND platform = ?
+                   AND chat_id = ? AND thread_id = ?
                 """,
-                (delivery_mode, task_id, platform, chat_id, thread_id or ""),
+                (delivery_mode, task_id, profile, platform, chat_id, thread_id or ""),
             )
         if metadata_json:
             # Refresh the routing anchor for duplicate subscriptions.
@@ -11088,10 +11366,228 @@ def add_notify_sub(
                 """
                 UPDATE kanban_notify_subs
                    SET delivery_metadata = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                 WHERE task_id = ? AND notifier_profile = ? AND platform = ?
+                   AND chat_id = ? AND thread_id = ?
                 """,
-                (metadata_json, task_id, platform, chat_id, thread_id or ""),
+                (metadata_json, task_id, profile, platform, chat_id, thread_id or ""),
             )
+        conn.execute(
+            """
+            INSERT INTO kanban_notify_sources
+                (task_id, notifier_profile, platform, chat_id, thread_id,
+                 source_kind, source_key, delivery_mode, user_id, user_id_alt,
+                 chat_type, delivery_metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (
+                task_id, notifier_profile, platform, chat_id, thread_id,
+                source_kind, source_key
+            ) DO UPDATE SET
+                delivery_mode = CASE WHEN ? = 1
+                    THEN excluded.delivery_mode ELSE delivery_mode END,
+                user_id = COALESCE(excluded.user_id, user_id),
+                user_id_alt = COALESCE(excluded.user_id_alt, user_id_alt),
+                chat_type = COALESCE(excluded.chat_type, chat_type),
+                delivery_metadata = COALESCE(
+                    excluded.delivery_metadata, delivery_metadata
+                )
+            """,
+            (
+                task_id, profile, platform, chat_id, thread_id or "",
+                kind, source_key, insert_mode, user_id, user_id_alt,
+                chat_type, metadata_json, now,
+                int(delivery_mode in _NOTIFY_DELIVERY_MODES),
+            ),
+        )
+        _recompute_notify_route(
+            conn,
+            task_id=task_id,
+            notifier_profile=profile,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
+
+
+def replace_home_notify_source(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    notifier_profile: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    user_id_alt: Optional[str] = None,
+    chat_type: Optional[str] = None,
+    delivery_metadata: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    """Atomically move this profile/platform's home intent to ``chat_id``."""
+    profile = _notify_profile(notifier_profile)
+    current_key = (task_id, profile, platform, chat_id, thread_id or "")
+    with write_txn(conn):
+        previous = conn.execute(
+            """
+            SELECT task_id, notifier_profile, platform, chat_id, thread_id
+              FROM kanban_notify_sources
+             WHERE task_id = ? AND notifier_profile = ? AND platform = ?
+               AND source_kind = 'home' AND source_key = ?
+            """,
+            (task_id, profile, platform, profile),
+        ).fetchall()
+        for row in previous:
+            old_key = tuple(row)
+            if old_key == current_key:
+                continue
+            conn.execute(
+                """
+                DELETE FROM kanban_notify_sources
+                 WHERE task_id = ? AND notifier_profile = ? AND platform = ?
+                   AND chat_id = ? AND thread_id = ?
+                   AND source_kind = 'home' AND source_key = ?
+                """,
+                (*old_key, profile),
+            )
+            _recompute_notify_route(
+                conn,
+                task_id=str(row["task_id"]),
+                notifier_profile=str(row["notifier_profile"]),
+                platform=str(row["platform"]),
+                chat_id=str(row["chat_id"]),
+                thread_id=str(row["thread_id"]),
+            )
+        add_notify_sub(
+            conn,
+            task_id=task_id,
+            notifier_profile=profile,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            user_id_alt=user_id_alt,
+            chat_type=chat_type,
+            delivery_mode="notify",
+            delivery_metadata=delivery_metadata,
+            source_kind="home",
+            source_key=profile,
+            _allow_nested=True,
+        )
+    return {"replaced": sum(tuple(row) != current_key for row in previous)}
+
+
+def remove_home_notify_sources(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    notifier_profile: str,
+    platform: str,
+) -> dict[str, Any]:
+    """Remove current and stale home intents without touching other sources."""
+    profile = _notify_profile(notifier_profile)
+    with write_txn(conn):
+        rows = conn.execute(
+            """
+            SELECT task_id, notifier_profile, platform, chat_id, thread_id
+              FROM kanban_notify_sources
+             WHERE task_id = ? AND notifier_profile = ? AND platform = ?
+               AND source_kind = 'home' AND source_key = ?
+            """,
+            (task_id, profile, platform, profile),
+        ).fetchall()
+        conn.execute(
+            """
+            DELETE FROM kanban_notify_sources
+             WHERE task_id = ? AND notifier_profile = ? AND platform = ?
+               AND source_kind = 'home' AND source_key = ?
+            """,
+            (task_id, profile, platform, profile),
+        )
+        delivery_active = False
+        for row in rows:
+            delivery_active = _recompute_notify_route(
+                conn,
+                task_id=str(row["task_id"]),
+                notifier_profile=str(row["notifier_profile"]),
+                platform=str(row["platform"]),
+                chat_id=str(row["chat_id"]),
+                thread_id=str(row["thread_id"]),
+            ) or delivery_active
+    return {"removed": len(rows), "delivery_active": delivery_active}
+
+
+def adopt_passive_legacy_home_source(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    notifier_profile: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> bool:
+    """Narrowly adopt an exact profile-owned passive legacy route as home."""
+    profile = _notify_profile(notifier_profile)
+    key = (task_id, profile, platform, chat_id, thread_id or "")
+    with write_txn(conn):
+        route = conn.execute(
+            """
+            SELECT delivery_mode FROM kanban_notify_subs
+             WHERE task_id = ? AND notifier_profile = ? AND platform = ?
+               AND chat_id = ? AND thread_id = ?
+            """,
+            key,
+        ).fetchone()
+        if route is None or route["delivery_mode"] != "notify":
+            return False
+        sources = conn.execute(
+            """
+            SELECT * FROM kanban_notify_sources
+             WHERE task_id = ? AND notifier_profile = ? AND platform = ?
+               AND chat_id = ? AND thread_id = ?
+             ORDER BY source_kind, source_key
+            """,
+            key,
+        ).fetchall()
+        if not sources or any(
+            source["source_kind"] != "legacy"
+            or source["delivery_mode"] != "notify"
+            for source in sources
+        ):
+            return False
+        source = sources[0]
+        conn.execute(
+            """
+            DELETE FROM kanban_notify_sources
+             WHERE task_id = ? AND notifier_profile = ? AND platform = ?
+               AND chat_id = ? AND thread_id = ? AND source_kind = 'legacy'
+            """,
+            key,
+        )
+        conn.execute(
+            """
+            INSERT INTO kanban_notify_sources
+                (task_id, notifier_profile, platform, chat_id, thread_id,
+                 source_kind, source_key, delivery_mode, user_id, user_id_alt,
+                 chat_type, delivery_metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, 'home', ?, 'notify', ?, ?, ?, ?, ?)
+            """,
+            (
+                *key,
+                profile,
+                source["user_id"],
+                source["user_id_alt"],
+                source["chat_type"],
+                source["delivery_metadata"],
+                source["created_at"],
+            ),
+        )
+        _recompute_notify_route(
+            conn,
+            task_id=task_id,
+            notifier_profile=profile,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
+    return True
 
 
 def _notify_profile_filter(
@@ -11118,7 +11614,7 @@ def _notify_profile_filter(
         )
         params.extend(profiles)
     if include_unowned:
-        clauses.append("notifier_profile IS NULL OR notifier_profile = ''")
+        clauses.append("notifier_profile = ''")
     if not clauses:
         return "0", []
     return "(" + ") OR (".join(clauses) + ")", params
@@ -11234,15 +11730,24 @@ def remove_notify_sub(
     conn: sqlite3.Connection,
     *,
     task_id: str,
+    notifier_profile: Optional[str] = None,
     platform: str,
     chat_id: str,
     thread_id: Optional[str] = None,
 ) -> bool:
     with write_txn(conn):
+        profile = _notify_profile(notifier_profile)
+        conn.execute(
+            "DELETE FROM kanban_notify_sources WHERE task_id = ? "
+            "AND notifier_profile = ? AND platform = ? AND chat_id = ? "
+            "AND thread_id = ?",
+            (task_id, profile, platform, chat_id, thread_id or ""),
+        )
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs WHERE task_id = ? "
-            "AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (task_id, platform, chat_id, thread_id or ""),
+            "AND notifier_profile = ? AND platform = ? AND chat_id = ? "
+            "AND thread_id = ?",
+            (task_id, profile, platform, chat_id, thread_id or ""),
         )
     return cur.rowcount > 0
 
@@ -11278,6 +11783,17 @@ def purge_stale_done_notify_subs(
         return 0
     cutoff = int(time.time()) - days * 86400
     with write_txn(conn):
+        conn.execute(
+            "DELETE FROM kanban_notify_sources WHERE task_id IN ("
+            " SELECT t.id FROM tasks t"
+            " WHERE t.status = 'done'"
+            " AND COALESCE("
+            "  (SELECT MAX(e.created_at) FROM task_events e"
+            "   WHERE e.task_id = t.id),"
+            "  t.completed_at, t.created_at, 0"
+            " ) < ?)",
+            (cutoff,),
+        )
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs WHERE task_id IN ("
             " SELECT t.id FROM tasks t"
@@ -11296,6 +11812,7 @@ def unseen_events_for_sub(
     conn: sqlite3.Connection,
     *,
     task_id: str,
+    notifier_profile: Optional[str] = None,
     platform: str,
     chat_id: str,
     thread_id: Optional[str] = None,
@@ -11309,8 +11826,9 @@ def unseen_events_for_sub(
     """
     row = conn.execute(
         "SELECT last_event_id FROM kanban_notify_subs "
-        "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-        (task_id, platform, chat_id, thread_id or ""),
+        "WHERE task_id = ? AND notifier_profile = ? AND platform = ? "
+        "AND chat_id = ? AND thread_id = ?",
+        (task_id, _notify_profile(notifier_profile), platform, chat_id, thread_id or ""),
     ).fetchone()
     if row is None:
         return 0, []
@@ -11345,6 +11863,7 @@ def claim_unseen_events_for_sub(
     conn: sqlite3.Connection,
     *,
     task_id: str,
+    notifier_profile: Optional[str] = None,
     platform: str,
     chat_id: str,
     thread_id: Optional[str] = None,
@@ -11367,8 +11886,9 @@ def claim_unseen_events_for_sub(
     with write_txn(conn):
         row = conn.execute(
             "SELECT last_event_id FROM kanban_notify_subs "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (task_id, platform, chat_id, thread_id or ""),
+            "WHERE task_id = ? AND notifier_profile = ? AND platform = ? "
+            "AND chat_id = ? AND thread_id = ?",
+            (task_id, _notify_profile(notifier_profile), platform, chat_id, thread_id or ""),
         ).fetchone()
         if row is None:
             return 0, 0, []
@@ -11376,6 +11896,7 @@ def claim_unseen_events_for_sub(
         new_cursor, events = unseen_events_for_sub(
             conn,
             task_id=task_id,
+            notifier_profile=notifier_profile,
             platform=platform,
             chat_id=chat_id,
             thread_id=thread_id,
@@ -11385,9 +11906,13 @@ def claim_unseen_events_for_sub(
             return old_cursor, old_cursor, []
         conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "WHERE task_id = ? AND notifier_profile = ? AND platform = ? "
+            "AND chat_id = ? AND thread_id = ? "
             "AND last_event_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or "", int(old_cursor)),
+            (
+                int(new_cursor), task_id, _notify_profile(notifier_profile), platform,
+                chat_id, thread_id or "", int(old_cursor),
+            ),
         )
         return old_cursor, new_cursor, events
 
@@ -11396,6 +11921,7 @@ def advance_notify_cursor(
     conn: sqlite3.Connection,
     *,
     task_id: str,
+    notifier_profile: Optional[str] = None,
     platform: str,
     chat_id: str,
     thread_id: Optional[str] = None,
@@ -11404,8 +11930,12 @@ def advance_notify_cursor(
     with write_txn(conn):
         conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or ""),
+            "WHERE task_id = ? AND notifier_profile = ? AND platform = ? "
+            "AND chat_id = ? AND thread_id = ?",
+            (
+                int(new_cursor), task_id, _notify_profile(notifier_profile), platform,
+                chat_id, thread_id or "",
+            ),
         )
 
 
@@ -11413,6 +11943,7 @@ def rewind_notify_cursor(
     conn: sqlite3.Connection,
     *,
     task_id: str,
+    notifier_profile: Optional[str] = None,
     platform: str,
     chat_id: str,
     thread_id: Optional[str] = None,
@@ -11428,10 +11959,12 @@ def rewind_notify_cursor(
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "WHERE task_id = ? AND notifier_profile = ? AND platform = ? "
+            "AND chat_id = ? AND thread_id = ? "
             "AND last_event_id = ?",
             (
-                int(old_cursor), task_id, platform, chat_id, thread_id or "",
+                int(old_cursor), task_id, _notify_profile(notifier_profile), platform,
+                chat_id, thread_id or "",
                 int(claimed_cursor),
             ),
         )

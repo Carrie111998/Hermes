@@ -2079,6 +2079,9 @@ def _configured_home_channels() -> list[dict]:
             "chat_id": hc.chat_id,
             "thread_id": hc.thread_id or "",
             "name": hc.name or "Home",
+            "user_id": hc.user_id,
+            "scope_id": hc.scope_id,
+            "chat_type": getattr(hc, "chat_type", None),
         })
     # Stable order for deterministic UI — platform name alphabetical.
     result.sort(key=lambda r: r["platform"])
@@ -2115,26 +2118,92 @@ def get_home_channels(
     — useful for the "no task selected" state of the UI.
     """
     homes = _configured_home_channels()
-    subscribed_homes: set[tuple[str, str, str]] = set()
+    subscriptions: list[dict] = []
+    sources: list[dict] = []
+    profile = _active_profile_name()
     if task_id:
         board = _resolve_board(board)
         conn = _conn(board=board)
         try:
-            subs = kanban_db.list_notify_subs(conn, task_id)
+            for home in homes:
+                kanban_db.adopt_passive_legacy_home_source(
+                    conn,
+                    task_id=task_id,
+                    notifier_profile=profile,
+                    platform=home["platform"],
+                    chat_id=home["chat_id"],
+                    thread_id=home["thread_id"] or None,
+                )
+            subscriptions = kanban_db.list_notify_subs(
+                conn, task_id, notifier_profiles={profile}
+            )
+            sources = kanban_db.list_notify_sources(
+                conn, task_id, notifier_profile=profile
+            )
         finally:
             conn.close()
-        for sub in subs:
-            key = (
-                str(sub.get("platform") or ""),
-                str(sub.get("chat_id") or ""),
-                str(sub.get("thread_id") or ""),
-            )
-            subscribed_homes.add(key)
+    route_keys = {
+        (
+            str(sub.get("platform") or ""),
+            str(sub.get("chat_id") or ""),
+            str(sub.get("thread_id") or ""),
+        )
+        for sub in subscriptions
+    }
+    source_keys: dict[tuple[str, str, str], set[str]] = {}
+    for source in sources:
+        key = (
+            str(source.get("platform") or ""),
+            str(source.get("chat_id") or ""),
+            str(source.get("thread_id") or ""),
+        )
+        source_keys.setdefault(key, set()).add(str(source.get("source_kind") or ""))
     result = []
     for home in homes:
         key = (home["platform"], home["chat_id"], home["thread_id"])
-        result.append({**home, "subscribed": key in subscribed_homes})
-    return {"home_channels": result}
+        kinds = source_keys.get(key, set())
+        has_home = "home" in kinds
+        has_other = bool(kinds - {"home"})
+        if has_home and has_other:
+            state = "home_and_other"
+        elif has_home:
+            state = "home"
+        elif has_other:
+            state = "other"
+        else:
+            state = "none"
+        result.append({
+            **{k: v for k, v in home.items() if k not in {"user_id", "scope_id", "chat_type"}},
+            "subscribed": key in route_keys,
+            "subscription_state": state,
+            "mutable": not (has_home and has_other),
+        })
+    current_keys = {
+        (home["platform"], home["chat_id"], home["thread_id"])
+        for home in homes
+    }
+    stale = [
+        {
+            "platform": str(source["platform"]),
+            "chat_id": str(source["chat_id"]),
+            "thread_id": str(source.get("thread_id") or ""),
+            "name": " / ".join(
+                part for part in (
+                    str(source["chat_id"]), str(source.get("thread_id") or "")
+                ) if part
+            ),
+            "notifier_profile": str(source["notifier_profile"]),
+        }
+        for source in sources
+        if source.get("source_kind") == "home"
+        and (
+            str(source["platform"]),
+            str(source["chat_id"]),
+            str(source.get("thread_id") or ""),
+        ) not in current_keys
+    ]
+    stale.sort(key=lambda item: (item["platform"], item["chat_id"], item["thread_id"]))
+    return {"home_channels": result, "stale_home_subscriptions": stale}
 
 
 @router.post("/tasks/{task_id}/home-subscribe/{platform}")
@@ -2159,40 +2228,44 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-        kanban_db.add_notify_sub(
+        metadata = {
+            key: home[key]
+            for key in ("user_id", "scope_id")
+            if home.get(key)
+        }
+        kanban_db.replace_home_notify_source(
             conn,
             task_id=task_id,
             platform=platform,
             chat_id=home["chat_id"],
             thread_id=home["thread_id"] or None,
             notifier_profile=_active_profile_name(),
+            user_id=home.get("user_id"),
+            chat_type=home.get("chat_type"),
+            delivery_metadata=metadata,
         )
-        return {"ok": True, "task_id": task_id, "home_channel": home}
+        public_home = {
+            key: home[key]
+            for key in ("platform", "chat_id", "thread_id", "name")
+        }
+        return {"ok": True, "task_id": task_id, "home_channel": public_home}
     finally:
         conn.close()
 
 
 @router.delete("/tasks/{task_id}/home-subscribe/{platform}")
 def unsubscribe_home(task_id: str, platform: str, board: Optional[str] = Query(None)):
-    """Remove any notify subscription on *task_id* that matches *platform*'s home."""
-    homes = _configured_home_channels()
-    home = next((h for h in homes if h["platform"] == platform), None)
-    if not home:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No home channel configured for platform {platform!r}.",
-        )
+    """Remove this profile's current or stale home intent idempotently."""
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        kanban_db.remove_notify_sub(
+        result = kanban_db.remove_home_notify_sources(
             conn,
             task_id=task_id,
             platform=platform,
-            chat_id=home["chat_id"],
-            thread_id=home["thread_id"] or None,
+            notifier_profile=_active_profile_name(),
         )
-        return {"ok": True, "task_id": task_id, "home_channel": home}
+        return {"ok": True, "task_id": task_id, **result}
     finally:
         conn.close()
 

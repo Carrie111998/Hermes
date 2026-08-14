@@ -553,6 +553,10 @@ class GatewaySlashCommandsMixin:
                                     # message and wake the destination agent.
                                     delivery_mode="notify+wake",
                                     delivery_metadata=delivery_metadata,
+                                    source_kind="origin",
+                                    source_key=(
+                                        f"{platform_str}:{chat_id}:{thread_id or ''}"
+                                    ),
                                 )
                             finally:
                                 conn.close()

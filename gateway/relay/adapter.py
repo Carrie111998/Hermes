@@ -1534,7 +1534,26 @@ class RelayAdapter(BasePlatformAdapter):
         pre-media behaviour — media delivery is progressive enhancement,
         never a regression when the connector predates the op.
         """
-        if self._transport is None or not self.descriptor.supports_op("send_media"):
+        media_metadata: Dict[str, Any] = dict(metadata or {})
+        explicit_platform = media_metadata.pop("_relay_logical_platform", None)
+        if explicit_platform and not self.fronts_platform(explicit_platform):
+            return SendResult(
+                success=False,
+                error=f"relay does not front platform {explicit_platform}",
+            )
+        descriptor = self.descriptor
+        if explicit_platform and self._transport is not None:
+            resolve = getattr(self._transport, "descriptor_for_platform", None)
+            if callable(resolve):
+                try:
+                    resolved = cast(
+                        Optional[CapabilityDescriptor],
+                        resolve(str(explicit_platform)),
+                    )
+                except Exception:  # noqa: BLE001 - capability lookup is best-effort
+                    resolved = None
+                descriptor = resolved or descriptor
+        if self._transport is None or not descriptor.supports_op("send_media"):
             return None
         source_url = source
         if source_is_path:
@@ -1550,7 +1569,6 @@ class RelayAdapter(BasePlatformAdapter):
         # unresolved anchor threads an image under the user's DM message in
         # flat mode, and loses the per-message thread entirely in thread mode
         # (threadTs() reads metadata only). Route through the shared helper.
-        media_metadata: Dict[str, Any] = dict(metadata or {})
         effective_reply_to = self._apply_slack_thread_anchor(
             chat_id, reply_to, media_metadata
         )
@@ -1568,7 +1586,11 @@ class RelayAdapter(BasePlatformAdapter):
         try:
             result = await self._transport.send_outbound(
                 action,
-                platform=self._platform_by_chat.get(str(chat_id)),
+                platform=(
+                    str(explicit_platform)
+                    if explicit_platform
+                    else self._platform_by_chat.get(str(chat_id))
+                ),
             )
         except Exception:  # noqa: BLE001 - transport failure degrades to the caller's fallback
             logger.debug("relay send_media transport failure", exc_info=True)

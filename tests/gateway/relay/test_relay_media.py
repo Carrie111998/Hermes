@@ -102,6 +102,25 @@ async def test_send_image_url_passes_through_without_upload():
 
 
 @pytest.mark.asyncio
+async def test_send_media_uses_explicit_platform_without_warm_chat_cache():
+    adapter, stub, _fake = _adapter()
+    assert adapter._platform_by_chat == {}
+
+    result = await adapter.send_image(
+        "cold-chat",
+        "https://fal.media/x.png",
+        metadata={
+            "_relay_logical_platform": "telegram",
+            "scope_id": "scope-1",
+        },
+    )
+
+    assert result.success is True
+    assert stub.sent_platforms[-1] == "telegram"
+    assert stub.sent[-1]["metadata"] == {"scope_id": "scope-1"}
+
+
+@pytest.mark.asyncio
 async def test_local_path_lanes_upload_first(tmp_path: Path):
     adapter, stub, fake = _adapter()
     f = tmp_path / "clip.ogg"

@@ -857,6 +857,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_nrm.add_argument("--platform", required=True)
     p_nrm.add_argument("--chat-id", required=True)
     p_nrm.add_argument("--thread-id", default=None)
+    p_nrm.add_argument(
+        "--notifier-profile", default=None,
+        help="Profile-owned route to remove (default: active profile)",
+    )
 
     # --- log ---
     p_log = sub.add_parser(
@@ -2979,6 +2983,7 @@ def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         ok = kb.remove_notify_sub(
             conn, task_id=args.task_id,
+            notifier_profile=args.notifier_profile or _profile_author(),
             platform=args.platform, chat_id=args.chat_id,
             thread_id=args.thread_id,
         )

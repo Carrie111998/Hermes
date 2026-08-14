@@ -38,7 +38,7 @@ def _assert_inherited_notify_sub(subs: list[dict]) -> None:
 def test_notify_sub_delivery_mode_persists_and_last_write_wins(kanban_home):
     """delivery_mode persists; an explicit re-subscribe is last-write-wins, a
     ``None`` re-subscribe leaves the existing mode untouched, an unknown value
-    is ignored, and none of this clobbers the notifier_profile owner."""
+    is ignored, within one profile-scoped route identity."""
     import hermes_cli.kanban_db as kb
 
     conn = kb.connect()
@@ -54,11 +54,10 @@ def test_notify_sub_delivery_mode_persists_and_last_write_wins(kanban_home):
         assert subs[0]["delivery_mode"] == "notify"
         assert subs[0]["notifier_profile"] == "owner-a"
 
-        # Explicit re-subscribe changes the mode (last-write-wins) and must NOT
-        # overwrite the existing owner (owner self-heals only when unset).
+        # Explicit re-subscribe changes the mode for this profile's route.
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat1",
-            notifier_profile="owner-b", delivery_mode="wake",
+            notifier_profile="owner-a", delivery_mode="wake",
         )
         subs = kb.list_notify_subs(conn, tid)
         assert len(subs) == 1
@@ -66,17 +65,170 @@ def test_notify_sub_delivery_mode_persists_and_last_write_wins(kanban_home):
         assert subs[0]["notifier_profile"] == "owner-a"
 
         # A None re-subscribe leaves the existing mode untouched.
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1",
+            notifier_profile="owner-a",
+        )
         subs = kb.list_notify_subs(conn, tid)
         assert subs[0]["delivery_mode"] == "wake"
 
         # An unknown mode is ignored (treated like None: no clobber).
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat1",
+            notifier_profile="owner-a",
             delivery_mode="bogus",
         )
         subs = kb.list_notify_subs(conn, tid)
         assert subs[0]["delivery_mode"] == "wake"
+    finally:
+        conn.close()
+
+
+def test_notify_routes_are_profile_scoped_and_cursor_updates_are_isolated(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="shared destination")
+        for profile in ("default", "writer"):
+            kb.add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform="telegram",
+                chat_id="same-chat",
+                notifier_profile=profile,
+                source_kind="manual",
+                source_key="route",
+            )
+
+        subs = kb.list_notify_subs(conn, task_id)
+        assert {sub["notifier_profile"] for sub in subs} == {"default", "writer"}
+
+        kb._append_event(conn, task_id, kind="blocked", payload={"reason": "wait"})
+        baseline = {sub["notifier_profile"]: sub["last_event_id"] for sub in subs}
+        old_cursor, new_cursor, events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=task_id,
+            notifier_profile="default",
+            platform="telegram",
+            chat_id="same-chat",
+        )
+        assert events and new_cursor > old_cursor
+        assert kb.rewind_notify_cursor(
+            conn,
+            task_id=task_id,
+            notifier_profile="default",
+            platform="telegram",
+            chat_id="same-chat",
+            claimed_cursor=new_cursor,
+            old_cursor=old_cursor,
+        )
+        refreshed = {
+            sub["notifier_profile"]: sub for sub in kb.list_notify_subs(conn, task_id)
+        }
+        assert refreshed["default"]["last_event_id"] == old_cursor
+        assert refreshed["writer"]["last_event_id"] == baseline["writer"]
+    finally:
+        conn.close()
+
+
+def test_home_source_coexists_with_origin_without_downgrading_or_deleting(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="co-owned route")
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="chat1",
+            notifier_profile="default",
+            delivery_mode="notify+wake",
+            delivery_metadata={"session_id": "origin-session", "scope_id": "origin-scope"},
+            source_kind="origin",
+            source_key="origin-session",
+        )
+
+        kb.replace_home_notify_source(
+            conn,
+            task_id=task_id,
+            notifier_profile="default",
+            platform="telegram",
+            chat_id="chat1",
+            delivery_metadata={"scope_id": "home-scope", "user_id": "home-user"},
+        )
+
+        route = kb.list_notify_subs(conn, task_id)[0]
+        assert route["delivery_mode"] == "notify+wake"
+        assert route["delivery_metadata"] == {
+            "scope_id": "origin-scope",
+            "session_id": "origin-session",
+            "user_id": "home-user",
+        }
+        assert {s["source_kind"] for s in kb.list_notify_sources(conn, task_id)} == {
+            "origin",
+            "home",
+        }
+
+        result = kb.remove_home_notify_sources(
+            conn,
+            task_id=task_id,
+            notifier_profile="default",
+            platform="telegram",
+        )
+        assert result["removed"] == 1
+        assert result["delivery_active"] is True
+        remaining = kb.list_notify_subs(conn, task_id)
+        assert len(remaining) == 1
+        assert remaining[0]["delivery_mode"] == "notify+wake"
+        assert remaining[0]["delivery_metadata"]["scope_id"] == "origin-scope"
+    finally:
+        conn.close()
+
+
+def test_replacing_stale_home_moves_only_home_source_without_replay(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="moving home")
+        kb.replace_home_notify_source(
+            conn,
+            task_id=task_id,
+            notifier_profile="default",
+            platform="telegram",
+            chat_id="old-chat",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            notifier_profile="default",
+            platform="telegram",
+            chat_id="old-chat",
+            delivery_mode="notify+wake",
+            source_kind="origin",
+            source_key="origin-session",
+        )
+        kb._append_event(conn, task_id, kind="blocked", payload={"reason": "before move"})
+
+        kb.replace_home_notify_source(
+            conn,
+            task_id=task_id,
+            notifier_profile="default",
+            platform="telegram",
+            chat_id="new-chat",
+        )
+
+        routes = {sub["chat_id"]: sub for sub in kb.list_notify_subs(conn, task_id)}
+        assert set(routes) == {"old-chat", "new-chat"}
+        assert routes["old-chat"]["delivery_mode"] == "notify+wake"
+        assert kb.unseen_events_for_sub(
+            conn,
+            task_id=task_id,
+            notifier_profile="default",
+            platform="telegram",
+            chat_id="new-chat",
+        )[1] == []
+        sources = kb.list_notify_sources(conn, task_id)
+        assert {(s["source_kind"], s["chat_id"]) for s in sources} == {
+            ("origin", "old-chat"),
+            ("home", "new-chat"),
+        }
     finally:
         conn.close()
 
@@ -108,6 +260,57 @@ def test_child_task_inherits_parent_delivery_mode(kanban_home):
     assert subs[0]["user_id_alt"] == "alt-u1"
     assert subs[0]["notifier_profile"] == "default"
     assert subs[0]["delivery_mode"] == "notify+wake"
+
+
+def test_multi_parent_inheritance_recomputes_source_union(kanban_home):
+    conn = kb.connect()
+    try:
+        origin_parent = kb.create_task(conn, title="origin parent")
+        home_parent = kb.create_task(conn, title="home parent")
+        kb.add_notify_sub(
+            conn,
+            task_id=origin_parent,
+            notifier_profile="default",
+            platform="telegram",
+            chat_id="shared-chat",
+            delivery_mode="wake",
+            user_id="origin-user",
+            delivery_metadata={"origin_key": "origin-value"},
+            source_kind="origin",
+            source_key="session-1",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=home_parent,
+            notifier_profile="default",
+            platform="telegram",
+            chat_id="shared-chat",
+            delivery_mode="notify",
+            delivery_metadata={"scope_id": "scope-1"},
+            source_kind="home",
+            source_key="default",
+        )
+
+        child = kb.create_task(
+            conn,
+            title="merged child",
+            parents=[home_parent, origin_parent],
+        )
+        route = kb.list_notify_subs(conn, child)[0]
+        sources = kb.list_notify_sources(conn, child)
+    finally:
+        conn.close()
+
+    assert route["delivery_mode"] == "notify+wake"
+    assert route["user_id"] == "origin-user"
+    assert route["delivery_metadata"] == {
+        "origin_key": "origin-value",
+        "scope_id": "scope-1",
+    }
+    assert {(source["source_kind"], source["source_key"]) for source in sources} == {
+        ("origin", "session-1"),
+        ("home", "default"),
+    }
 
 
 def test_notify_sub_chat_type_persists_and_last_write_wins(kanban_home):
@@ -1123,7 +1326,8 @@ def test_gc_archived_rows_already_removed_by_unsub(kanban_home):
         # The notifier removes the sub at archive time; the GC targets only
         # ``done`` tasks, so an archived task contributes nothing to purge.
         kb.remove_notify_sub(
-            conn, task_id=tid, platform="telegram", chat_id="c-arch",
+            conn, task_id=tid, notifier_profile="default",
+            platform="telegram", chat_id="c-arch",
         )
         _backdate_task(kb, conn, tid, days=365)
         assert kb.purge_stale_done_notify_subs(conn, max_age_days=30) == 0

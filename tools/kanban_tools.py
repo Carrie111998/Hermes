@@ -1599,6 +1599,12 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             notifier_profile=notifier_profile,
             delivery_mode=delivery_mode,
             delivery_metadata=delivery_metadata or None,
+            source_kind="origin",
+            source_key=(
+                get_session_env("HERMES_SESSION_ID", "")
+                or get_session_env("HERMES_SESSION_KEY", "")
+                or f"{platform}:{chat_id}:{thread_id or ''}"
+            ),
         )
         return True
     except Exception as _exc:

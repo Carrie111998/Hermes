@@ -86,6 +86,18 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
         lei = {r["name"]: r for r in conn.execute("PRAGMA table_info(kanban_notify_subs)")}
         assert lei["last_event_id"]["type"].upper() == "INTEGER"
         assert "delivery_metadata" in lei
+        assert lei["notifier_profile"]["notnull"] == 1
+        pk = [
+            row["name"]
+            for row in sorted(
+                conn.execute("PRAGMA table_info(kanban_notify_subs)"),
+                key=lambda row: row["pk"] or 99,
+            )
+            if row["pk"]
+        ]
+        assert pk == [
+            "task_id", "notifier_profile", "platform", "chat_id", "thread_id"
+        ]
 
         # Data preserved across the rebuild.
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
@@ -93,6 +105,9 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
         assert len(conn.execute("SELECT * FROM task_runs").fetchall()) == 1
         # Non-numeric legacy cursor ("e-1") casts to 0.
         assert conn.execute("SELECT last_event_id FROM kanban_notify_subs").fetchone()["last_event_id"] == 0
+        legacy_source = conn.execute("SELECT * FROM kanban_notify_sources").fetchone()
+        assert legacy_source["source_kind"] == "legacy"
+        assert legacy_source["notifier_profile"] == ""
 
         # Indexes restored, including idx_events_run (added by the additive pass).
         indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
