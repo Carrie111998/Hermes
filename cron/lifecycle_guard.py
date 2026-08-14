@@ -100,11 +100,38 @@ _SHELL_LINE_CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
 
 
 def contains_gateway_lifecycle_command(text: str) -> bool:
-    """Return True if *text* contains a gateway lifecycle command pattern."""
+    """Return True if *text* contains a gateway lifecycle command pattern.
+
+    Matches in two passes. The first is the raw-text regex above — cheap,
+    and the only pass that can fire on non-shell inputs shlex can't
+    tokenize (e.g. a Python source string). The second re-runs the same
+    pattern against each command segment after shell tokenization, where
+    quotes and backslash escapes have already been resolved.
+
+    That second pass exists because a real shell resolves quote-splicing
+    (``kick"start"``) and backslash-escaping (``kick\\start``) into one
+    literal word — ``kickstart`` — before the command ever runs. The raw
+    text still has the quote or backslash sitting between the verb's two
+    halves, so the first pass alone lets a spliced verb reach
+    ``launchctl``/``systemctl`` untouched while still executing as the
+    blocked lifecycle command (#80269, reported against #80260's bootout
+    parity fix). Tokenizing closes that gap while keeping the same
+    gateway-label anchoring (``_GATEWAY_LIFECYCLE_PATTERN`` still requires
+    a ``hermes``/``gateway`` token) — this function is the single choke
+    point ``_contains_unsafe_gateway_action`` calls at every recursion
+    level, so referenced-script and ``sh -c`` payload scanning inherit the
+    fix automatically.
+    """
     if not text:
         return False
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
-    return bool(_GATEWAY_LIFECYCLE_PATTERN.search(normalized))
+    if _GATEWAY_LIFECYCLE_PATTERN.search(normalized):
+        return True
+    for segment in _iter_command_segments(normalized):
+        joined = " ".join(segment)
+        if joined and _GATEWAY_LIFECYCLE_PATTERN.search(joined):
+            return True
+    return False
 
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
