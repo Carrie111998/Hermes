@@ -4,6 +4,7 @@ import { type FC, type ReactNode, useCallback, useEffect, useRef, useState } fro
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
 import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
+import { hasTextSelection } from '@/components/assistant-ui/thread/selection'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
 import { useDragTextToComposer } from '@/components/assistant-ui/thread/use-drag-text-to-composer'
 import { useMessageReactions } from '@/components/assistant-ui/thread/use-message-reactions'
@@ -18,12 +19,8 @@ import { $gateway } from '@/store/gateway'
 import { notifyThreadEditOpen } from '@/store/thread-scroll'
 import { isWatchWindow } from '@/store/windows'
 
-/** True when the user has a live text highlight (drag-select / triple-click). */
-export function hasTextSelection(): boolean {
-  const selection = window.getSelection()
-
-  return Boolean(selection && !selection.isCollapsed && selection.toString().length > 0)
-}
+// Re-export for consumers that historically imported it from this module.
+export { hasTextSelection } from '@/components/assistant-ui/thread/selection'
 
 export function StickyHumanMessageContainer({
   attachments,
