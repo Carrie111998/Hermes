@@ -57,6 +57,13 @@ class TestHandleFunctionCall:
         assert "disabled toolset" in result["error"]
         dispatch.assert_not_called()
 
+    def test_kanban_dispatch_requires_positive_authority_when_all_grants_absent(self):
+        with patch("model_tools.registry.dispatch") as dispatch:
+            result = json.loads(handle_function_call("kanban_list", {}))
+
+        assert "toolset 'kanban' is not enabled" in result["error"]
+        dispatch.assert_not_called()
+
     def test_kanban_dispatch_requires_enabled_toolset_when_grant_list_is_absent(self):
         with patch("model_tools.registry.dispatch") as dispatch:
             result = json.loads(
@@ -70,6 +77,79 @@ class TestHandleFunctionCall:
         assert "toolset 'kanban' is not enabled" in result["error"]
         dispatch.assert_not_called()
 
+    def test_worker_lifecycle_grant_overrides_normal_chat_toolsets(self):
+        with patch(
+            "model_tools.registry.dispatch", return_value='{"ok":true}'
+        ) as dispatch:
+            result = json.loads(
+                handle_function_call(
+                    "kanban_complete",
+                    {},
+                    enabled_tools=["kanban_complete"],
+                    enabled_toolsets=["web"],
+                )
+            )
+
+        assert result == {"ok": True}
+        dispatch.assert_called_once_with(
+            "kanban_complete",
+            {},
+            task_id=None,
+            session_id=None,
+            user_task=None,
+        )
+
+
+    def test_tool_call_bridge_cannot_expand_an_exact_grant(self):
+        deferred_def = {
+            "type": "function",
+            "function": {"name": "kanban_complete", "parameters": {}},
+        }
+        with (
+            patch(
+                "tools.tool_search.is_bridge_tool",
+                side_effect=lambda name: name == "tool_call",
+            ),
+            patch(
+                "tools.tool_search.resolve_underlying_call",
+                return_value=("kanban_complete", {}, None),
+            ),
+            patch(
+                "tools.tool_search.scoped_deferrable_names",
+                return_value={"kanban_complete"},
+            ),
+            patch("tools.tool_search.validate_deferred_call_args", return_value=None),
+            patch("model_tools.get_tool_definitions", return_value=[deferred_def]),
+            patch(
+                "model_tools.registry.dispatch", return_value='{"ok":true}'
+            ) as dispatch,
+        ):
+            denied = json.loads(
+                handle_function_call(
+                    "tool_call",
+                    {"name": "kanban_complete", "arguments": {}},
+                    enabled_tools=["tool_call"],
+                    enabled_toolsets=["kanban"],
+                )
+            )
+            allowed = json.loads(
+                handle_function_call(
+                    "tool_call",
+                    {"name": "kanban_complete", "arguments": {}},
+                    enabled_tools=["tool_call", "kanban_complete"],
+                    enabled_toolsets=["web"],
+                )
+            )
+
+        assert "not available in this session" in denied["error"]
+        assert allowed == {"ok": True}
+        dispatch.assert_called_once_with(
+            "kanban_complete",
+            {},
+            task_id=None,
+            session_id=None,
+            user_task=None,
+        )
 
     def test_post_tool_call_receives_non_negative_integer_duration_ms(self):
         """Regression: post_tool_call and transform_tool_result hooks must

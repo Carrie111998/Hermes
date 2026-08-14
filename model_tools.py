@@ -1317,6 +1317,22 @@ def handle_function_call(
                         "Use tool_search to find tools you can call."
                     )
                 )
+            # Kanban grants are exact runtime authority, not merely schema
+            # visibility. The bridge's legacy deferred-tool recursion may add
+            # an underlying name to keep ordinary deferred tools callable, but
+            # it must never manufacture Kanban authority that the dispatcher
+            # did not place in the session grant.
+            if (
+                underlying_name.startswith("kanban_")
+                and enabled_tools is not None
+                and underlying_name not in set(enabled_tools)
+            ):
+                return _return_bridge_result(
+                    tool_error(
+                        f"'{underlying_name}' is not available in this session. "
+                        "Use tool_search to find tools you can call."
+                    )
+                )
             # Probe-validate against the deferred tool's schema (ironclaw#5149):
             # a blind call missing required arguments returns the parameter
             # schema instead of dispatching into an opaque downstream failure.
@@ -1361,9 +1377,15 @@ def handle_function_call(
                     f"toolset '{toolset}' applies to this session."
                 )
             )
-        if enabled_toolsets is not None and toolset not in {
-            str(name).strip() for name in enabled_toolsets
-        }:
+        # An explicit tool-name grant is the authoritative post-schema runtime
+        # capability. Dispatcher workers may have Kanban lifecycle names
+        # injected into that exact grant even when their normal chat toolsets
+        # intentionally omit Kanban. Without an explicit grant, require a
+        # positive platform/toolset decision rather than treating None as open.
+        if enabled_tools is None and (
+            enabled_toolsets is None
+            or toolset not in {str(name).strip() for name in enabled_toolsets}
+        ):
             return _return_bridge_result(
                 tool_error(
                     f"Tool '{function_name}' is unavailable because toolset "
