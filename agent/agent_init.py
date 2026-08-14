@@ -517,6 +517,8 @@ def init_agent(
     provider_sort: str = None,
     provider_require_parameters: bool = False,
     provider_data_collection: str = None,
+    provider_preferred_min_throughput: Any = None,
+    provider_preferred_max_latency: Any = None,
     openrouter_min_coding_score: Optional[float] = None,
     session_id: str = None,
     tool_progress_callback: callable = None,
@@ -883,6 +885,8 @@ def init_agent(
     agent.provider_sort = provider_sort
     agent.provider_require_parameters = provider_require_parameters
     agent.provider_data_collection = provider_data_collection
+    agent.provider_preferred_min_throughput = provider_preferred_min_throughput
+    agent.provider_preferred_max_latency = provider_preferred_max_latency
     agent.openrouter_min_coding_score = openrouter_min_coding_score
 
     # Store toolset filtering options
@@ -1751,6 +1755,7 @@ def init_agent(
     # So the built-in store is created unless memory is globally disabled, while
     # the external-provider block below stays gated on skip_memory.
     _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
+    mem_config = {}
     if not skip_memory or _memory_toolset_requested:
         try:
             mem_config = _agent_cfg.get("memory", {})
@@ -1779,7 +1784,12 @@ def init_agent(
             if _mem_provider_name and _mem_provider_name.strip():
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
+                _external_prefetch_timeout = (
+                    mem_config.get("external_prefetch_timeout") if mem_config else None
+                )
+                agent._memory_manager = _MemoryManager(
+                    external_prefetch_timeout=_external_prefetch_timeout
+                )
                 _mp = _load_mem(_mem_provider_name)
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)

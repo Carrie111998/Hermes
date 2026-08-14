@@ -46,6 +46,7 @@ from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
+_OPENROUTER_PERFORMANCE_PERCENTILES = {"p50", "p75", "p90", "p99"}
 
 # When the fallback chain is fully exhausted on a non-rate-limit failure
 # (e.g. every provider returns a non-retryable client error like HTTP 400),
@@ -177,6 +178,59 @@ def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
     return None
 
 
+def _validated_openrouter_performance_preference(
+    raw_value: Any,
+    field_name: str,
+) -> Optional[Any]:
+    """Normalize an OpenRouter soft performance threshold.
+
+    OpenRouter accepts either one positive number or a mapping of percentile
+    cutoffs (p50/p75/p90/p99). Invalid entries are ignored with a warning so a
+    typo cannot turn a soft routing preference into an upstream 400.
+    """
+    if isinstance(raw_value, bool):
+        logger.warning("Ignoring invalid OpenRouter provider.%s value %r", field_name, raw_value)
+        return None
+    if isinstance(raw_value, (int, float)):
+        value = float(raw_value)
+        if math.isfinite(value) and value > 0:
+            return value
+        logger.warning("Ignoring invalid OpenRouter provider.%s value %r", field_name, raw_value)
+        return None
+    if isinstance(raw_value, dict):
+        normalized: Dict[str, float] = {}
+        for percentile, raw_cutoff in raw_value.items():
+            if percentile not in _OPENROUTER_PERFORMANCE_PERCENTILES:
+                logger.warning(
+                    "Ignoring unsupported OpenRouter provider.%s percentile %r",
+                    field_name,
+                    percentile,
+                )
+                continue
+            if isinstance(raw_cutoff, bool) or not isinstance(raw_cutoff, (int, float)):
+                logger.warning(
+                    "Ignoring invalid OpenRouter provider.%s.%s value %r",
+                    field_name,
+                    percentile,
+                    raw_cutoff,
+                )
+                continue
+            cutoff = float(raw_cutoff)
+            if math.isfinite(cutoff) and cutoff > 0:
+                normalized[percentile] = cutoff
+            else:
+                logger.warning(
+                    "Ignoring invalid OpenRouter provider.%s.%s value %r",
+                    field_name,
+                    percentile,
+                    raw_cutoff,
+                )
+        return normalized or None
+    if raw_value is not None:
+        logger.warning("Ignoring invalid OpenRouter provider.%s value %r", field_name, raw_value)
+    return None
+
+
 def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
     """Build the validated provider-routing object shared by request paths."""
     preferences: Dict[str, Any] = {}
@@ -193,6 +247,16 @@ def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
         preferences["require_parameters"] = True
     if agent.provider_data_collection:
         preferences["data_collection"] = agent.provider_data_collection
+    for attribute, field_name in (
+        ("provider_preferred_min_throughput", "preferred_min_throughput"),
+        ("provider_preferred_max_latency", "preferred_max_latency"),
+    ):
+        value = _validated_openrouter_performance_preference(
+            getattr(agent, attribute, None),
+            field_name,
+        )
+        if value is not None:
+            preferences[field_name] = value
     return preferences
 
 
@@ -1552,7 +1616,10 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             provider_profile=_profile,
             ollama_num_ctx=agent._ollama_num_ctx,
             # Context forwarded to profile hooks:
-            provider_preferences=_prefs or None,
+            # Provider-performance routing is valid only for aggregator endpoints.
+            # A provider label can coexist with an explicit custom base_url; do not
+            # leak OpenRouter/Nous-only request fields to that upstream.
+            provider_preferences=_prefs if (_is_or or _is_nous) else None,
             openrouter_min_coding_score=agent.openrouter_min_coding_score,
             anthropic_max_output=_ant_max,
             supports_reasoning=agent._supports_reasoning_extra_body(),

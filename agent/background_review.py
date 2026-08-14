@@ -805,6 +805,8 @@ def _run_review_in_thread(
                     "provider_sort",
                     "provider_require_parameters",
                     "provider_data_collection",
+                    "provider_preferred_min_throughput",
+                    "provider_preferred_max_latency",
                 ):
                     _pref_val = getattr(agent, _pref_attr, None)
                     if _pref_val:

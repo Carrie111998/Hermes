@@ -23,7 +23,14 @@ Or set manually in `~/.hermes/config.yaml`:
 ```yaml
 memory:
   provider: openviking   # or honcho, mem0, hindsight, holographic, retaindb, byterover, supermemory
+  external_prefetch_timeout: 0.8  # seconds to wait for prefetched context
 ```
+
+`external_prefetch_timeout` bounds how long Hermes waits for the external
+provider's prefetched context on each turn. The provider keeps running in the
+background after the deadline, so a slow or unavailable memory service cannot
+block the agent indefinitely. Choose a value above the provider's measured p95
+recall latency; the default is 8 seconds.
 
 ## How It Works
 

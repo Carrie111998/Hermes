@@ -46,6 +46,7 @@ from tools.code_execution_tool import (
     EXECUTE_CODE_SCHEMA,
     _TOOL_DOC_LINES,
     _execute_remote,
+    _send_uds_response,
 )
 from tools.registry import registry
 
@@ -248,6 +249,83 @@ print(result.get("output", ""))
         result = self._run(code)
         self.assertEqual(result["status"], "success")
         self.assertIn("mock output for: echo hello", result["output"])
+        self.assertEqual(result["tool_calls_made"], 1)
+
+    def test_tool_result_with_trailing_hint_is_parseable(self):
+        """Truncated tool payloads may append a UI hint after valid JSON."""
+        code = """
+from hermes_tools import search_files
+first = search_files("needle", path=".")
+second = search_files("needle", path=".")
+print(first["total_count"], second["total_count"])
+print(first["_hermes_hint"], second["_hermes_hint"])
+"""
+
+        def hinted_mock(function_name, function_args, task_id=None, user_task=None):
+            if function_name == "search_files":
+                return (
+                    json.dumps({"total_count": 12, "matches": [], "truncated": True})
+                    + "\n\n[Hint: Results truncated. Use offset=5 to see more.]"
+                )
+            return _mock_handle_function_call(
+                function_name, function_args, task_id=task_id, user_task=user_task
+            )
+
+        with patch("model_tools.handle_function_call", side_effect=hinted_mock):
+            raw = execute_code(
+                code=code,
+                task_id="test-trailing-hint",
+                enabled_tools=list(SANDBOX_ALLOWED_TOOLS),
+            )
+
+        result = json.loads(raw)
+        self.assertEqual(result["status"], "success", msg=result)
+        self.assertIn("12", result["output"])
+        self.assertIn("[Hint: Results truncated.", result["output"])
+        self.assertEqual(result["tool_calls_made"], 2)
+
+    def test_uds_response_is_one_json_line(self):
+        """Raw newlines in a result must not become UDS frame delimiters."""
+        sender, receiver = socket.socketpair()
+        payload = '{"ok": true}\n\n[Hint: Results truncated.]'
+        try:
+            _send_uds_response(sender, payload)
+            wire = receiver.recv(4096)
+        finally:
+            sender.close()
+            receiver.close()
+
+        self.assertEqual(wire.count(b"\n"), 1)
+        self.assertTrue(wire.endswith(b"\n"))
+        self.assertEqual(json.loads(wire.decode()), payload)
+
+    def test_unexpected_trailing_tool_bytes_still_fail(self):
+        """Only the recognized UI-hint envelope may follow the JSON payload."""
+        code = """
+from hermes_tools import search_files
+search_files("needle", path=".")
+"""
+
+        def corrupted_mock(function_name, function_args, task_id=None, user_task=None):
+            if function_name == "search_files":
+                return (
+                    json.dumps({"total_count": 1})
+                    + "\n[Hint: expected]\ncorruption"
+                )
+            return _mock_handle_function_call(
+                function_name, function_args, task_id=task_id, user_task=user_task
+            )
+
+        with patch("model_tools.handle_function_call", side_effect=corrupted_mock):
+            raw = execute_code(
+                code=code,
+                task_id="test-corrupt-trailing-result",
+                enabled_tools=list(SANDBOX_ALLOWED_TOOLS),
+            )
+
+        result = json.loads(raw)
+        self.assertEqual(result["status"], "error", msg=result)
+        self.assertIn("JSONDecodeError", result.get("error", "") + result["output"])
         self.assertEqual(result["tool_calls_made"], 1)
 
 
@@ -839,7 +917,10 @@ class TestRpcTokenAuthorization(unittest.TestCase):
                     line, buf = buf.split(b"\n", 1)
                     line = line.strip()
                     if line:
-                        responses.append(json.loads(line.decode()))
+                        decoded = json.loads(line.decode())
+                        if isinstance(decoded, str):
+                            decoded = json.loads(decoded)
+                        responses.append(decoded)
         finally:
             stop_event.set()
             cli.close()
