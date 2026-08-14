@@ -20,8 +20,11 @@ export interface UpdateScriptHandoff {
   scriptPath: string
 }
 
+export type WindowsUpdateHandoff =
+  { kind: 'staged-installer'; updater: string } | { kind: 'repo-script'; handoff: UpdateScriptHandoff }
+
 /**
- * Repo-owned Windows update hand-off (frozen-binary escape hatch).
+ * Repo-owned Windows update hand-off for installs without a staged installer.
  *
  * The staged Tauri `hermes-setup.exe` has no self-update path, so every
  * updater-side fix only reaches users when a new binary is built, signed and
@@ -31,10 +34,11 @@ export interface UpdateScriptHandoff {
  * checkout instead: every `hermes update` refreshes the code that drives the
  * NEXT update, and only PowerShell itself is frozen.
  *
- * Returns the spawn recipe when the script exists in the checkout, or null
- * (caller falls back to the staged binary — old checkouts that predate the
- * script keep working unchanged). Windows-only by the same policy as
- * resolveStagedUpdaterBinary: POSIX updates in place via
+ * Returns the spawn recipe when the script exists in the checkout, or null.
+ * The caller combines this candidate with resolveStagedUpdaterBinary through
+ * selectWindowsUpdateHandoff; the visible staged installer wins whenever it
+ * exists, while this script remains the CLI-install fallback. Windows-only by
+ * the same policy as resolveStagedUpdaterBinary: POSIX updates in place via
  * applyUpdatesPosixInApp and needs no hand-off at all.
  */
 export function resolveUpdateScriptHandoff(
@@ -63,6 +67,27 @@ export function resolveUpdateScriptHandoff(
         scriptPath: candidate
       }
     }
+  }
+
+  return null
+}
+
+/**
+ * Choose the Windows update surface after both independent resolvers run.
+ *
+ * Centralizes the invariant that a staged installer takes precedence over the
+ * repo-script fallback.
+ */
+export function selectWindowsUpdateHandoff(
+  stagedUpdater: string | null,
+  scriptHandoff: UpdateScriptHandoff | null
+): WindowsUpdateHandoff | null {
+  if (stagedUpdater) {
+    return { kind: 'staged-installer', updater: stagedUpdater }
+  }
+
+  if (scriptHandoff) {
+    return { kind: 'repo-script', handoff: scriptHandoff }
   }
 
   return null
