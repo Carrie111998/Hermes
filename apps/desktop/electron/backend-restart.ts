@@ -14,7 +14,11 @@ export function isBackendExitPending(child: Pick<BackendChildProcess, 'exitCode'
 
 export async function waitForBackendExit(
   child: BackendChildProcess | null | undefined,
-  { timeoutMs = 5000, onTimeout }: { timeoutMs?: number; onTimeout?: () => void } = {}
+  {
+    timeoutMs = 5000,
+    escalationGraceMs = 2000,
+    onTimeout
+  }: { timeoutMs?: number; escalationGraceMs?: number; onTimeout?: () => void } = {}
 ): Promise<void> {
   if (!child || child.exitCode !== null || child.signalCode !== null) {
     return
@@ -23,6 +27,7 @@ export async function waitForBackendExit(
   await new Promise<void>(resolve => {
     let settled = false
     let timer: ReturnType<typeof setTimeout>
+    let graceTimer: ReturnType<typeof setTimeout> | undefined
 
     const finish = () => {
       if (settled) {
@@ -31,6 +36,7 @@ export async function waitForBackendExit(
 
       settled = true
       clearTimeout(timer)
+      clearTimeout(graceTimer)
       resolve()
     }
 
@@ -44,7 +50,13 @@ export async function waitForBackendExit(
 
       if (child.exitCode !== null || child.signalCode !== null) {
         finish()
+
+        return
       }
+
+      // The escalated kill normally produces an 'exit' event. Never block the
+      // restart flow forever when it does not arrive.
+      graceTimer = setTimeout(finish, escalationGraceMs)
     }, timeoutMs)
   })
 }

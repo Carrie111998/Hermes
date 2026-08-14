@@ -576,7 +576,12 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
         notify({ kind: 'error', title: g.restartCurrentTitle, message: g.restartCurrentOwnershipFailed })
       } else {
         setRestartStatus('failure')
-        notify({ kind: 'error', title: g.restartCurrentTitle, message: g.restartCurrentFailed })
+        notify({
+          kind: 'error',
+          title: g.restartCurrentTitle,
+          message: g.restartCurrentFailed,
+          detail: 'message' in result ? result.message : undefined
+        })
       }
     } catch (error) {
       setRestartStatus('failure')

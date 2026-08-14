@@ -14,6 +14,12 @@ vi.mock('@/store/profile', () => ({
   refreshActiveProfile: vi.fn()
 }))
 
+vi.mock('@/store/notifications', () => ({
+  notify: vi.fn(),
+  notifyError: vi.fn(),
+  readableError: (_error: unknown, fallback: string) => ({ message: fallback })
+}))
+
 const localConnection = {
   cloudOrg: '',
   envOverride: false,
@@ -140,5 +146,30 @@ describe('GatewaySettings', () => {
 
     resolveRestart({ ok: true, mode: 'local' })
     await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false))
+  })
+
+  it('surfaces the not-ready reason as notification detail on restart failure', async () => {
+    const { notify } = await import('@/store/notifications')
+    vi.mocked(notify).mockClear()
+    restartCurrentBackend.mockResolvedValue({
+      ok: false,
+      reason: 'not-ready',
+      message: 'Current SSH backend has no served session token.'
+    })
+    const { GatewaySettings } = await import('./gateway-settings')
+
+    render(<GatewaySettings />)
+    const button = await screen.findByRole('button', { name: 'Restart current backend' })
+
+    fireEvent.click(button)
+
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledWith(
+        expect.objectContaining({
+          detail: 'Current SSH backend has no served session token.',
+          kind: 'error'
+        })
+      )
+    )
   })
 })

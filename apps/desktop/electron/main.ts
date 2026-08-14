@@ -7606,9 +7606,15 @@ async function bootstrapSshConnectionInner(
 function sshRestartOptions(scope: string, fallbackToken: string) {
   const request = sshRestartRequest
 
-  return request?.scope === scope
-    ? { forceRestart: true, reuseToken: request.token }
-    : { forceRestart: false, reuseToken: fallbackToken }
+  if (request?.scope !== scope) {
+    return { forceRestart: false, reuseToken: fallbackToken }
+  }
+
+  // One-shot: consume the request so a later same-scope resolve cannot reuse
+  // the stale restart token and force-kill the freshly restarted backend.
+  sshRestartRequest = null
+
+  return { forceRestart: true, reuseToken: request.token }
 }
 
 function persistSshConnectionToken(profile, source, token) {
@@ -10079,7 +10085,10 @@ async function performCurrentBackendRestart() {
     })
   }
 
-  const scope = sshScopeKey(profile)
+  // The resolver keys the request by the scope it will actually check:
+  // per-profile overrides use sshScopeKey(profile); the global SSH path uses
+  // ''. Mismatching here silently skips the forced restart.
+  const scope = profileSsh ? sshScopeKey(profile) : ''
 
   const token =
     current?.token ||

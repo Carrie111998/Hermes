@@ -390,7 +390,9 @@ async function connectWindowsRemote(deps) {
       error.cause = cause
       throw error
     } finally {
-      await cancelForward(localPort, lock.port)
+      // Best effort: a failed forward teardown must not replace the
+      // ownership/verification error reported to the caller.
+      await cancelForward(localPort, lock.port).catch(() => undefined)
     }
 
     assertCurrent(signal)

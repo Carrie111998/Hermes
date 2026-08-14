@@ -300,3 +300,29 @@ test('Windows force restart preserves ownership artifacts when termination is no
   assert.ok(scripts.some(script => script.includes("'terminate'")))
   assert.ok(!scripts.some(script => script.includes("'remove-lock'")))
 })
+
+test('Windows force restart keeps the ownership failure when forward teardown rejects', async () => {
+  const fixture = windowsRestartConnection(true)
+
+  await assert.rejects(
+    () =>
+      connectWindowsRemote({
+        ssh: fixture.ssh,
+        ownershipId,
+        profile: '',
+        reuseToken: fixture.token,
+        pickLocalPort: async () => 50001,
+        forward: async () => {},
+        cancelForward: async () => {
+          throw new Error('forward teardown blew up')
+        },
+        waitForHermes: async () => {},
+        probeReuseProof: async () => {
+          throw new Error('probe transport failed')
+        },
+        forceRestart: true
+      }),
+    (error: any) =>
+      error.kind === 'ownership-failed' && /Could not verify the owned SSH backend/.test(error.message)
+  )
+})

@@ -52,6 +52,43 @@ test('backend exit wait escalates after timeout but resolves only after exit', a
   }
 })
 
+test('backend exit wait resolves after escalation grace when exit never arrives', async () => {
+  vi.useFakeTimers()
+
+  try {
+    let forceKillCalls = 0
+    let settled = false
+
+    const child = {
+      exitCode: null as number | null,
+      signalCode: null as string | null,
+      kill: () => undefined,
+      once: () => undefined
+    }
+
+    const wait = waitForBackendExit(child, {
+      timeoutMs: 5000,
+      onTimeout: () => {
+        forceKillCalls += 1
+      }
+    }).then(() => {
+      settled = true
+    })
+
+    await vi.advanceTimersByTimeAsync(5000)
+    assert.equal(forceKillCalls, 1)
+    // Escalation ran but the child never emits exit: still pending, no hang.
+    assert.equal(settled, false)
+
+    await vi.advanceTimersByTimeAsync(2000)
+    await wait
+
+    assert.equal(settled, true)
+  } finally {
+    vi.useRealTimers()
+  }
+})
+
 test('local restart waits for teardown before starting a new backend', async () => {
   let releaseTeardown!: () => void
 
