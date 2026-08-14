@@ -9,6 +9,7 @@ runtime contracts instead of maintaining a parallel scanner.
 from __future__ import annotations
 
 import inspect
+import logging
 import os
 import shutil
 import socket
@@ -22,6 +23,9 @@ from typing import Any, Literal
 from unittest.mock import patch
 
 from hermes_constants import get_hermes_home
+
+
+logger = logging.getLogger(__name__)
 
 
 class _DoctorLoadError(RuntimeError):
@@ -199,8 +203,8 @@ def resolve_plugin_path(target: str | os.PathLike[str] | None = None) -> Path:
                 bundled / "model-providers" / raw,
             ]
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Unable to inspect bundled plugin paths: %s", exc)
     candidates.append(Path.cwd() / ".hermes" / "plugins" / raw)
     for candidate in candidates:
         if candidate.is_dir():

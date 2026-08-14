@@ -2277,8 +2277,8 @@ def _update_node_dependencies() -> list[str]:
     try:
         from tools.browser_tool import warm_agent_browser_npx_cache
         warm_agent_browser_npx_cache()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Agent-browser npx cache warmup failed: %s", exc)
 
     if not _m()._npm_lockfile_changed(shared_hermes_root):
         logger.info("npm lockfile unchanged, skipping npm install")
