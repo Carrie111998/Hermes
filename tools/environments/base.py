@@ -915,6 +915,22 @@ class BaseEnvironment(ABC):
             parts.append(
                 f"source {_quoted_snap} >/dev/null 2>&1 || true"
             )
+            # Snapshot ``export -p`` can restore secrets / GIT_TERMINAL_PROMPT
+            # after the Popen env was sanitized. Re-apply terminal hardening
+            # immediately before the user command (local policy helper).
+            try:
+                from tools.environments.local import (
+                    _post_source_env_hardening_script,
+                )
+
+                harden = _post_source_env_hardening_script()
+                if harden:
+                    parts.append(harden)
+            except Exception:
+                parts.append(
+                    "export GIT_TERMINAL_PROMPT=0\n"
+                    "export GCM_INTERACTIVE=Never"
+                )
 
         for name, present, value in saved_names:
             parts.append(
