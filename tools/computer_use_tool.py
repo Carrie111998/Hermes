@@ -30,6 +30,7 @@ registry.register(
         "etc.). Background computer-use: does NOT steal the user's cursor "
         "or keyboard focus."
     ),
+    produces_trusted_media=True,
 )
 
 

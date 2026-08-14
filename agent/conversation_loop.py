@@ -1627,6 +1627,21 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    # Trust is session-scoped and process-local. Rebuild it from prior user
+    # messages and grounded results from explicitly designated media producers,
+    # then register the current original user input. Arbitrary assistant text
+    # and unmatched/ordinary tool history must never re-trust a reference.
+    try:
+        from agent.media_provenance import (
+            register_user_media_references,
+            rehydrate_media_references,
+        )
+
+        rehydrate_media_references(agent.session_id, conversation_history)
+        register_user_media_references(agent.session_id, original_user_message)
+    except Exception:
+        logger.warning("Media provenance registration failed", exc_info=True)
+
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()

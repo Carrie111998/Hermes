@@ -5364,6 +5364,7 @@ registry.register(
     handler=lambda args, **kw: browser_get_images(task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="🖼️",
+    produces_trusted_media=True,
 )
 registry.register(
     name="browser_vision",
@@ -5372,6 +5373,7 @@ registry.register(
     handler=lambda args, **kw: browser_vision(question=args.get("question", ""), annotate=args.get("annotate", False), task_id=kw.get("task_id")),
     check_fn=check_browser_vision_requirements,
     emoji="👁️",
+    produces_trusted_media=True,
 )
 registry.register(
     name="browser_console",

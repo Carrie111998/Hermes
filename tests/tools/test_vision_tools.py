@@ -131,6 +131,7 @@ class TestHandleVisionAnalyze:
         then None, letting the centralized call_llm router pick the default."""
 
         async def resolve(config=None, env_model=None):
+            from agent.media_provenance import register_user_media_references
             with ExitStack() as st:
                 mock_tool = st.enter_context(
                     patch("tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock)
@@ -149,8 +150,10 @@ class TestHandleVisionAnalyze:
                 else:
                     os.environ["AUXILIARY_VISION_MODEL"] = env_model
                 mock_tool.return_value = json.dumps({"result": "ok"})
+                register_user_media_references("test-session", "https://example.com/img.png")
                 await _handle_vision_analyze(
-                    {"image_url": "https://example.com/img.png", "question": "test"}
+                    {"image_url": "https://example.com/img.png", "question": "test"},
+                    session_id="test-session",
                 )
                 return mock_tool.call_args[0][2]  # third positional arg
 
@@ -976,10 +979,13 @@ class TestVisionCpuBurstCap:
             patch.object(vt, "_should_use_native_vision_fast_path", return_value=True),
             patch.object(vt, "_vision_analyze_native", side_effect=fake_native),
         ):
+            from agent.media_provenance import register_trusted_media
+            references = [f"https://example.com/frame_{i}.png" for i in range(N)]
+            register_trusted_media("test-session", references, origin="user_explicit")
             await asyncio.gather(*[
                 vt._handle_vision_analyze(
                     {"image_url": f"https://example.com/frame_{i}.png",
-                     "question": "what is this"}
+                     "question": "what is this"}, session_id="test-session"
                 )
                 for i in range(N)
             ])

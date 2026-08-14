@@ -2784,6 +2784,27 @@ def _event_media_is_image(event, index: int) -> bool:
     return getattr(event, "message_type", None) == MessageType.PHOTO
 
 
+def _register_gateway_media_paths(session_id: str, paths: List[str]) -> int:
+    """Trust inbound image attachments and their remote-backend aliases."""
+    try:
+        from agent.media_provenance import register_trusted_media
+        from tools.credential_files import to_agent_visible_cache_path
+
+        original_references = [path for path in paths if isinstance(path, str)]
+        aliases = [
+            to_agent_visible_cache_path(path)
+            for path in original_references
+            if not path.startswith(("http://", "https://", "data:"))
+        ]
+        references = original_references + aliases
+        return register_trusted_media(
+            session_id, references, origin="gateway_attachment",
+        )
+    except Exception:
+        logger.warning("Gateway media provenance registration failed", exc_info=True)
+        return 0
+
+
 def _event_media_is_audio(event, index: int) -> bool:
     """True if the attachment at *index* is audio (per-attachment MIME first)."""
     mtype = _event_media_type_at(event, index)
@@ -18996,6 +19017,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # attachments (documents, audio, etc.) are not sent to the vision
         # tool even when they appear in the same message.
         # -----------------------------------------------------------------
+        _register_gateway_media_paths(
+            session_entry.session_id,
+            [
+                path
+                for i, path in enumerate(getattr(event, "media_urls", None) or [])
+                if _event_media_is_image(event, i)
+            ],
+        )
         message_text = await self._prepare_profile_scoped_inbound_message_text(
             event=event,
             source=source,
@@ -21197,6 +21226,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         image_paths.append(path)
                 if image_paths:
                     try:
+                        _register_gateway_media_paths(task_id, image_paths)
                         enriched_prompt = await self._enrich_message_with_vision(
                             prompt, image_paths,
                         )
@@ -28131,6 +28161,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?",
                             exc_info=True,
                         )
+                    _register_gateway_media_paths(
+                        session_id,
+                        [
+                            path
+                            for i, path in enumerate(
+                                getattr(pending_event, "media_urls", None) or []
+                            )
+                            if _event_media_is_image(pending_event, i)
+                        ],
+                    )
                     next_message = await self._prepare_profile_scoped_inbound_message_text(
                         event=pending_event,
                         source=next_source,

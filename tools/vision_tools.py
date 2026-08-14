@@ -31,6 +31,7 @@ Usage:
 import base64
 import contextlib
 import asyncio
+import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 import logging
@@ -1759,6 +1760,24 @@ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
     question = args.get("question", "")
     region = args.get("region")
     task_id = kw.get("task_id")
+    session_id = kw.get("session_id")
+
+    # A reachable path does not prove that this conversation authorized it.
+    # Check before native routing, downloads, or an auxiliary model call.
+    from agent.media_provenance import is_trusted_media
+    if not is_trusted_media(session_id, image_url):
+        session_digest = hashlib.sha256(str(session_id or "").encode("utf-8")).hexdigest()[:12]
+        reference_digest = hashlib.sha256(str(image_url or "").encode("utf-8")).hexdigest()[:12]
+        logger.warning(
+            "vision_analyze provenance gate blocked unregistered media "
+            "(session_sha256=%s reference_sha256=%s)",
+            session_digest, reference_digest,
+        )
+        return tool_error(
+            "vision_analyze blocked: image_url is not registered as trusted media for this session. "
+            "Ask the user to attach it or explicitly provide the URL/path in the current conversation.",
+            error_type="untrusted_media_reference",
+        )
 
     # The fan-out cap lives inside the encode/resize step (offloaded to the
     # bounded _vision_cpu_executor), NOT around the whole analysis — so a

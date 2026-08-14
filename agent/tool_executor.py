@@ -53,6 +53,22 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def _register_trusted_media_result(
+    agent: Any, tool_name: str, result: Any, *, blocked: bool,
+) -> None:
+    """Register a designated producer result before it enters model history."""
+    if blocked:
+        return
+    try:
+        from agent.media_provenance import register_trusted_tool_result
+
+        register_trusted_tool_result(getattr(agent, "session_id", None), tool_name, result)
+    except Exception:
+        # Bookkeeping must not fail a producer call; the downstream gate still
+        # fails closed if registration did not succeed.
+        logger.warning("Trusted media provenance registration failed for %s", tool_name, exc_info=True)
+
+
 def _ensure_file_checkpoint(
     agent,
     function_name: str,
@@ -1435,6 +1451,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if blocked:
                 effect_disposition = "none"
 
+            _register_trusted_media_result(
+                agent, function_name, function_result, blocked=blocked,
+            )
             if not blocked:
                 function_result = agent._append_guardrail_observation(
                     function_name,
@@ -2194,6 +2213,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
+
+        _register_trusted_media_result(
+            agent, function_name, function_result, blocked=_execution_blocked,
+        )
 
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (

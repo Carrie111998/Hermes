@@ -92,6 +92,9 @@ def _make_runner(adapter):
 
 @pytest.mark.asyncio
 async def test_queued_followup_uses_pending_event_session_key_for_native_images(monkeypatch, tmp_path):
+    from agent.media_provenance import clear_media_provenance, is_trusted_media
+
+    clear_media_provenance()
     CaptureQueuedNativeImageAgent.calls = []
 
     fake_dotenv = types.ModuleType("dotenv")
@@ -149,3 +152,4 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
     assert queued_message[0]["type"] == "text"
     assert queued_message[0]["text"].startswith("describe this")
     assert any(part.get("type") == "image_url" for part in queued_message)
+    assert is_trusted_media("sess-native-image-followup", str(image_path))

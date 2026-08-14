@@ -169,13 +169,15 @@ class TestVisionModelOverride:
     @pytest.mark.asyncio
     async def test_env_var_overrides_default(self, monkeypatch):
         monkeypatch.setenv("AUXILIARY_VISION_MODEL", "openai/gpt-4o")
+        from agent.media_provenance import register_user_media_references
         from tools.vision_tools import _handle_vision_analyze
+        register_user_media_references("test-session", "http://test.jpg")
         with (
             patch("tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock) as mock_tool,
             patch("tools.vision_tools._should_use_native_vision_fast_path", return_value=False),
         ):
             mock_tool.return_value = '{"success": true}'
-            await _handle_vision_analyze({"image_url": "http://test.jpg", "question": "test"})
+            await _handle_vision_analyze({"image_url": "http://test.jpg", "question": "test"}, session_id="test-session")
             call_args = mock_tool.call_args
             # 3rd positional arg = model
             assert call_args[0][2] == "openai/gpt-4o"
@@ -183,13 +185,15 @@ class TestVisionModelOverride:
     @pytest.mark.asyncio
     async def test_default_model_when_no_override(self, monkeypatch):
         monkeypatch.delenv("AUXILIARY_VISION_MODEL", raising=False)
+        from agent.media_provenance import register_user_media_references
         from tools.vision_tools import _handle_vision_analyze
+        register_user_media_references("test-session", "http://test.jpg")
         with (
             patch("tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock) as mock_tool,
             patch("tools.vision_tools._should_use_native_vision_fast_path", return_value=False),
         ):
             mock_tool.return_value = '{"success": true}'
-            await _handle_vision_analyze({"image_url": "http://test.jpg", "question": "test"})
+            await _handle_vision_analyze({"image_url": "http://test.jpg", "question": "test"}, session_id="test-session")
             call_args = mock_tool.call_args
             # With no AUXILIARY_VISION_MODEL env var, model should be None
             # (the centralized call_llm router picks the provider default)
