@@ -92,6 +92,11 @@ def test_cmd_chat_still_propagates_value_error(monkeypatch) -> None:
         raise ValueError("bad config")
 
     monkeypatch.setattr("cli.main", value_error)
+    # Non-hermetic guard: in clean CI no provider is configured, so
+    # cmd_chat's first-run guard exits before cli.main is ever reached.
+    monkeypatch.setattr(
+        "hermes_cli.main._has_any_provider_configured", lambda: True
+    )
 
     from hermes_cli.main import cmd_chat
 
