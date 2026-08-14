@@ -7693,38 +7693,176 @@ def test_connect_works_when_wal_is_silently_refused(tmp_path, monkeypatch, caplo
     )
 
 
-def test_unlink_tasks_triggers_recompute_ready(kanban_home):
-    """Regression test for issue #22459.
-
-    Removing a dependency via unlink_tasks must immediately promote the child
-    to ready when all remaining parents are done — same contract as
-    complete_task and unblock_task.
-
-    Before the fix, child stayed 'todo' indefinitely after unlink; only the
-    next dispatcher tick or a manual 'hermes kanban recompute' would promote it.
-    """
+def test_unlink_tasks_promotes_only_named_child(kanban_home):
     with kb.connect() as conn:
-        # A is done.
         a = kb.create_task(conn, title="parent-done")
         kb.complete_task(conn, a)
-
-        # C is running (not done) — blocks child B.
         c = kb.create_task(conn, title="parent-running")
         kb.claim_task(conn, c, claimer="worker:1")
-
-        # B depends on both A (done) and C (running) → stays todo.
         b = kb.create_task(conn, title="child", parents=[a, c])
-        assert kb.get_task(conn, b).status == "todo"
-
-        # Remove the blocking dependency C → B.
-        removed = kb.unlink_tasks(conn, c, b)
-        assert removed is True
-
-        # B's only remaining parent is A (done) → must be ready immediately.
-        assert kb.get_task(conn, b).status == "ready", (
-            "child should promote to ready immediately after unlink_tasks "
-            "removes its last blocking dependency"
+        unrelated = kb.create_task(conn, title="unrelated eligible todo")
+        conn.execute(
+            "UPDATE tasks SET status = 'todo' WHERE id = ?",
+            (unrelated,),
         )
+        conn.commit()
+        assert kb.get_task(conn, b).status == "todo"
+        assert kb.get_task(conn, unrelated).status == "todo"
+        unrelated_before = (
+            dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (unrelated,)).fetchone()),
+            [(event.kind, event.payload) for event in kb.list_events(conn, unrelated)],
+        )
+        child = kb.get_task(conn, b)
+        assert child is not None
+
+        removed = kb.unlink_tasks(
+            conn,
+            c,
+            b,
+            expected={
+                "status": child.status,
+                "title": child.title,
+                "assignee": child.assignee,
+                "current_step_key": child.current_step_key,
+                "current_run_id": child.current_run_id,
+            },
+        )
+        assert removed is True
+        assert kb.get_task(conn, b).status == "ready"
+        assert (
+            dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (unrelated,)).fetchone()),
+            [(event.kind, event.payload) for event in kb.list_events(conn, unrelated)],
+        ) == unrelated_before
+        assert [event.kind for event in kb.list_events(conn, b)][-2:] == [
+            "unlinked",
+            "promoted",
+        ]
+
+
+def _unlink_expected(task):
+    return {
+        "status": task.status,
+        "title": task.title,
+        "assignee": task.assignee,
+        "current_step_key": task.current_step_key,
+        "current_run_id": task.current_run_id,
+    }
+
+
+def _unlink_db_state(conn, task_ids):
+    rows = {
+        task_id: dict(
+            conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        )
+        for task_id in task_ids
+    }
+    events = {
+        task_id: [
+            (event.kind, event.payload, event.run_id)
+            for event in kb.list_events(conn, task_id)
+        ]
+        for task_id in task_ids
+    }
+    edges = [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
+        ).fetchall()
+    ]
+    return rows, events, edges
+
+
+def test_unlink_tasks_keeps_todo_with_remaining_unsatisfied_parent(kanban_home):
+    with kb.connect() as conn:
+        removed_parent = kb.create_task(conn, title="removed parent")
+        remaining_parent = kb.create_task(conn, title="remaining parent")
+        child_id = kb.create_task(
+            conn,
+            title="still waiting",
+            parents=[removed_parent, remaining_parent],
+        )
+        child = kb.get_task(conn, child_id)
+        assert child is not None and child.status == "todo"
+        parents_before = _unlink_db_state(conn, [removed_parent, remaining_parent])
+
+        assert kb.unlink_tasks(
+            conn,
+            removed_parent,
+            child_id,
+        )
+
+        assert kb.get_task(conn, child_id).status == "todo"
+        assert kb.parent_ids(conn, child_id) == [remaining_parent]
+        parents_after = _unlink_db_state(conn, [removed_parent, remaining_parent])
+        assert parents_after[:2] == parents_before[:2]
+        assert parents_after[2] == [(remaining_parent, child_id)]
+        assert [event.kind for event in kb.list_events(conn, child_id)][-1] == "unlinked"
+
+
+@pytest.mark.parametrize("blocked_case", ["sticky", "failure_limit"])
+def test_unlink_tasks_preserves_ineligible_block(blocked_case, kanban_home):
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title=f"{blocked_case} parent")
+        child_id = kb.create_task(conn, title=f"{blocked_case} child")
+        if blocked_case == "sticky":
+            claimed = kb.claim_task(conn, child_id)
+            assert claimed is not None
+            assert kb.block_task(conn, child_id, reason="human decision")
+        else:
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', consecutive_failures = 1, "
+                "max_retries = 1 WHERE id = ?",
+                (child_id,),
+            )
+            conn.commit()
+        kb.link_tasks(conn, parent_id, child_id)
+        child = kb.get_task(conn, child_id)
+        assert child is not None and child.status == "blocked"
+
+        assert kb.unlink_tasks(
+            conn,
+            parent_id,
+            child_id,
+            expected=_unlink_expected(child),
+        )
+
+        assert kb.get_task(conn, child_id).status == "blocked"
+        assert [event.kind for event in kb.list_events(conn, child_id)][-1] == "unlinked"
+
+
+def test_unlink_tasks_missing_edge_and_stale_snapshot_are_atomic(kanban_home):
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="parent")
+        other_parent = kb.create_task(conn, title="other parent")
+        child_id = kb.create_task(conn, title="child", parents=[parent_id])
+        stale = kb.get_task(conn, child_id)
+        assert stale is not None
+        conn.execute(
+            "UPDATE tasks SET title = 'changed child' WHERE id = ?",
+            (child_id,),
+        )
+        conn.commit()
+        before_stale = _unlink_db_state(conn, [parent_id, other_parent, child_id])
+
+        with pytest.raises(kb.TaskSnapshotConflict):
+            kb.unlink_tasks(
+                conn,
+                parent_id,
+                child_id,
+                expected=_unlink_expected(stale),
+            )
+        assert _unlink_db_state(conn, [parent_id, other_parent, child_id]) == before_stale
+
+        current = kb.get_task(conn, child_id)
+        assert current is not None
+        before_missing = _unlink_db_state(conn, [parent_id, other_parent, child_id])
+        assert kb.unlink_tasks(
+            conn,
+            other_parent,
+            child_id,
+            expected=_unlink_expected(current),
+        ) is False
+        assert _unlink_db_state(conn, [parent_id, other_parent, child_id]) == before_missing
 
 
 
