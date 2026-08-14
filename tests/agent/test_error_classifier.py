@@ -65,6 +65,7 @@ class TestFailoverReason:
             "thinking_signature", "long_context_tier",
             "oauth_long_context_beta_forbidden",
             "llama_cpp_grammar_pattern",
+            "upstream_provider_error",
             "unknown",
         }
         actual = {r.value for r in FailoverReason}
@@ -80,6 +81,12 @@ class TestClassifiedError:
 
         e2 = ClassifiedError(reason=FailoverReason.auth_permanent)
         assert e2.is_auth is True
+
+        e3 = ClassifiedError(reason=FailoverReason.upstream_provider_error)
+        assert e3.is_auth is False
+
+        e4 = ClassifiedError(reason=FailoverReason.billing)
+        assert e4.is_auth is False
 
         e3 = ClassifiedError(reason=FailoverReason.billing)
         assert e3.is_auth is False
@@ -293,7 +300,7 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="openrouter")
 
         assert result.reason == FailoverReason.auth
-        assert result.should_rotate_credential is False
+        assert result.should_rotate_credential is True
 
     # ── Billing ──
 

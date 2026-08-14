@@ -56,6 +56,7 @@ class FailoverReason(enum.Enum):
     model_not_found = "model_not_found"  # 404 or invalid model — fallback to different model
     provider_policy_blocked = "provider_policy_blocked"  # Aggregator (e.g. OpenRouter) blocked the only endpoint due to account data/privacy policy
     content_policy_blocked = "content_policy_blocked"  # Provider safety filter rejected this prompt — deterministic per-request, don't retry unchanged
+    upstream_provider_error = "upstream_provider_error"
 
     # Request format
     format_error = "format_error"        # 400 bad request — abort or strip + retry
@@ -941,11 +942,27 @@ def _classify_by_status(
                 should_rotate_credential=True,
                 should_fallback=True,
             )
-        return result_fn(
-            FailoverReason.auth,
-            retryable=False,
-            should_fallback=True,
-        )
+        # Overloaded patterns must come BEFORE upstream_provider_error check
+        # so that "service is temporarily overloaded" takes precedence.
+        elif any(p in error_msg for p in _OVERLOADED_PATTERNS):
+            return result_fn(
+                FailoverReason.overloaded,
+                retryable=True,
+            )
+        elif _is_openrouter_upstream_error(body, provider):
+            return result_fn(
+                FailoverReason.upstream_provider_error,
+                retryable=True,
+                should_rotate_credential=False,
+                should_fallback=True,
+            )
+        else:
+            return result_fn(
+                FailoverReason.auth,
+                retryable=False,
+                should_rotate_credential=True,
+                should_fallback=True,
+            )
 
     if status_code == 402:
         return _classify_402(error_msg, result_fn)
