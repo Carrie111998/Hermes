@@ -50,6 +50,15 @@ logger = logging.getLogger(__name__)
 # Re-page interval while a backend stays in drift (seconds). Bounds volume.
 _REPAGE_SECONDS = 3600
 
+# Manifest "Laptop Monitor" harness (Diego, 2026-08-12): the canary's
+# Anthropic-shaped arm now routes through this harness instead of hitting
+# api.anthropic.com directly (which 429s under the background agent fleet).
+# The harness uses Manifest's OpenAI-compatible /v1/responses surface with
+# model "auto", so Manifest's own fallback chain picks a healthy provider.
+_MANIFEST_HARNESS_KEY_FILE = Path("C:/Users/diego/manifest/.mnfst-harness-key")
+_MANIFEST_HARNESS_BASE_URL = "http://localhost:2099/v1"
+_MANIFEST_HARNESS_MODEL = "auto"
+
 
 @dataclass
 class ProbeResult:
@@ -144,6 +153,57 @@ def check_anthropic_conformance(client: Any, model: str) -> ProbeResult:
         return ProbeResult(None, f"Anthropic probe inconclusive: {type(exc).__name__}: {str(exc)[:160]}")
 
 
+def _read_manifest_harness_key() -> Optional[str]:
+    try:
+        raw = _MANIFEST_HARNESS_KEY_FILE.read_text(encoding="utf-8").strip()
+        return raw or None
+    except Exception:
+        return None
+
+
+def build_manifest_harness_probe_client() -> "Optional[tuple[Any, str]]":
+    """Return a raw OpenAI client pointed at the Manifest "Laptop Monitor"
+    harness (base_url /v1/responses, model "auto") + model, or None if the
+    harness key file is missing/empty. Read-only; the caller issues one cheap
+    request per run.
+
+    This replaces the raw-Anthropic arm so the canary no longer hammers
+    api.anthropic.com directly (429 under the background agent fleet) — the
+    harness lets Manifest's fallback chain route to a healthy provider.
+    """
+    key = _read_manifest_harness_key()
+    if not key:
+        return None
+    from openai import OpenAI
+
+    client = OpenAI(api_key=key, base_url=_MANIFEST_HARNESS_BASE_URL)
+    return client, _MANIFEST_HARNESS_MODEL
+
+
+def check_manifest_harness_conformance(client: Any, model: str) -> ProbeResult:
+    """Assert the Manifest harness DELIVERS CONTENT via its OpenAI-compatible
+    /v1/responses endpoint (model "auto"). healthy = status 'completed' with a
+    non-empty assistant text; down = completed but empty text; unknown =
+    network/auth (R20, never contract drift)."""
+    try:
+        resp = client.responses.create(model=model, input="ping", store=False)
+        status = getattr(resp, "status", None)
+        out_text = ""
+        for item in getattr(resp, "output", None) or []:
+            if getattr(item, "type", None) == "message":
+                for c in getattr(item, "content", None) or []:
+                    if getattr(c, "type", None) == "output_text":
+                        out_text += getattr(c, "text", "") or ""
+        routed = getattr(resp, "model", model)
+        if status == "completed" and out_text.strip():
+            return ProbeResult(True, f"Manifest harness delivers content via {routed} ({len(out_text)} chars)")
+        if status == "completed":
+            return ProbeResult(False, f"Manifest harness completed with no text (model {routed})")
+        return ProbeResult(False, f"Manifest harness status not completed: {status}")
+    except Exception as exc:
+        return ProbeResult(None, f"Manifest harness probe inconclusive: {type(exc).__name__}: {str(exc)[:160]}")
+
+
 # sentinel + edge-triggered emit
 def _load_state() -> dict:
     try:
@@ -222,7 +282,7 @@ def run_canary(*, bus: Any = None) -> dict:
         except Exception:
             bus = None
 
-    from agent.auxiliary_client import build_codex_probe_client, build_anthropic_probe_client
+    from agent.auxiliary_client import build_codex_probe_client
 
     results: dict = {}
     cc = None
@@ -233,13 +293,13 @@ def run_canary(*, bus: Any = None) -> dict:
     results["codex"] = (check_codex_conformance(*cc) if cc
                         else ProbeResult(None, "no Codex token configured"))
 
-    ac = None
+    mh = None
     try:
-        ac = build_anthropic_probe_client()
+        mh = build_manifest_harness_probe_client()
     except Exception as exc:
-        logger.debug("anthropic probe client build failed: %s", exc)
-    results["anthropic"] = (check_anthropic_conformance(*ac) if ac
-                            else ProbeResult(None, "Anthropic not configured"))
+        logger.debug("manifest harness probe client build failed: %s", exc)
+    results["anthropic"] = (check_manifest_harness_conformance(*mh) if mh
+                            else ProbeResult(None, "Manifest Laptop Monitor harness not configured"))
 
     prev = _load_state()
     emit_meta = dict(prev.get("emit_meta", {}))

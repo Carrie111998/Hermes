@@ -207,3 +207,65 @@ def test_dual_backend_drift_preserves_each_emit_meta(tmp_path, monkeypatch):
     assert emit_meta["codex"]["last_drift_emit"] != old
     assert emit_meta.get("anthropic", {}).get("last_drift_emit")
     assert ("codex", "down") in bus.calls and ("anthropic", "down") in bus.calls
+
+
+# ---- Manifest "Laptop Monitor" harness arm (Diego, 2026-08-12) ----
+# The anthropic arm now routes through the self-hosted Manifest harness
+# (base_url /v1/responses, model "auto") instead of api.anthropic.com, which
+# 429s under the background agent fleet. These tests exercise the new probe
+# with a FAKE client (no openai import) so they stay fast and hermetic.
+
+
+class _FakeHarnessResponses:
+    def __init__(self, status="completed", model="gemini-3.1-flash-lite", text="pong"):
+        self._status = status
+        self._model = model
+        self._text = text
+
+    def create(self, **kw):
+        msg = SimpleNamespace(type="message",
+                              content=[SimpleNamespace(type="output_text", text=self._text)])
+        return SimpleNamespace(status=self._status, model=self._model, output=[msg])
+
+
+class _FakeHarnessClient:
+    def __init__(self, status="completed", model="gemini-3.1-flash-lite", text="pong"):
+        self.responses = _FakeHarnessResponses(status, model, text)
+
+
+def test_manifest_harness_healthy_when_completed_with_text():
+    from obs.backend_conformance_canary import check_manifest_harness_conformance
+    res = check_manifest_harness_conformance(_FakeHarnessClient(), "auto")
+    assert res.healthy is True
+    assert "gemini-3.1-flash-lite" in res.detail
+
+
+def test_manifest_harness_drift_when_completed_but_empty_text():
+    from obs.backend_conformance_canary import check_manifest_harness_conformance
+    res = check_manifest_harness_conformance(_FakeHarnessClient(text=""), "auto")
+    assert res.healthy is False
+
+
+def test_manifest_harness_drift_when_not_completed():
+    from obs.backend_conformance_canary import check_manifest_harness_conformance
+    res = check_manifest_harness_conformance(_FakeHarnessClient(status="failed"), "auto")
+    assert res.healthy is False
+
+
+def test_manifest_harness_inconclusive_on_network_error():
+    from obs.backend_conformance_canary import check_manifest_harness_conformance
+
+    class _Boom:
+        class responses:
+            @staticmethod
+            def create(**kw):
+                raise ConnectionError("dns fail")
+
+    res = check_manifest_harness_conformance(_Boom(), "auto")
+    assert res.healthy is None  # inconclusive, NOT down
+
+
+def test_manifest_harness_client_build_requires_key(monkeypatch, tmp_path):
+    import obs.backend_conformance_canary as canary
+    monkeypatch.setattr(canary, "_MANIFEST_HARNESS_KEY_FILE", tmp_path / "no-such-key")
+    assert canary.build_manifest_harness_probe_client() is None
