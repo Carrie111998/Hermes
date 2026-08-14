@@ -8843,8 +8843,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self.agent._last_flushed_db_idx = 0
             if hasattr(self.agent, "_todo_store"):
                 try:
-                    from tools.todo_tool import TodoStore
-                    self.agent._todo_store = TodoStore()
+                    # Keep the store's persistence callback attached. The new
+                    # session has no state to persist yet.
+                    self.agent._todo_store.write([], merge=False, notify=False)
                 except Exception:
                     pass
             if hasattr(self.agent, "_invalidate_system_prompt"):

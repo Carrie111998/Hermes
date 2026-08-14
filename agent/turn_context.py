@@ -629,9 +629,11 @@ def build_turn_context(
         if isinstance(pending_cli_message, dict):
             agent._pending_cli_user_message = None
 
-    # Hydrate todo store from conversation history.
-    if conversation_history and not agent._todo_store.has_items():
-        agent._hydrate_todo_store(conversation_history)
+    # Hydrate from trusted session state first, falling back to paired tool
+    # results in history. A resumed gateway turn can have durable todo state
+    # even when its caller supplies no transcript rows.
+    if not agent._todo_store.has_items():
+        agent._hydrate_todo_store(conversation_history or [])
 
     # Hydrate per-session nudge counters from persisted history (issue #22357).
     if conversation_history and agent._user_turn_count == 0:

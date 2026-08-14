@@ -15,11 +15,19 @@ Design:
 """
 
 import json
-from typing import Dict, Any, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 
 # Valid status values for todo items
-VALID_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
+VALID_STATUSES = {
+    "pending",
+    "in_progress",
+    "needs_reconfirmation",
+    "completed",
+    "cancelled",
+}
+ACTIONABLE_STATUSES = {"pending", "in_progress"}
+TODO_STATE_MODEL_CONFIG_KEY = "_todo_state"
 
 # Bounds on persisted todo state. The todo list is a planning aid the model
 # re-reads after every context-compression event (see format_for_injection),
@@ -50,13 +58,31 @@ class TodoStore:
     Items are ordered -- list position is priority. Each item has:
       - id: unique string identifier (agent-chosen)
       - content: task description
-      - status: pending | in_progress | completed | cancelled
+      - status: pending | in_progress | needs_reconfirmation | completed | cancelled
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        on_change: Optional[Callable[[List[Dict[str, str]]], None]] = None,
+    ):
         self._items: List[Dict[str, str]] = []
+        self._on_change = on_change
 
-    def write(self, todos: List[Dict[str, Any]], merge: bool = False) -> List[Dict[str, str]]:
+    def _notify_change(self) -> None:
+        if self._on_change is not None:
+            self._on_change(self.read())
+
+    def persist(self) -> None:
+        """Persist the current state through the owning agent callback."""
+        self._notify_change()
+
+    def write(
+        self,
+        todos: List[Dict[str, Any]],
+        merge: bool = False,
+        *,
+        notify: bool = True,
+    ) -> List[Dict[str, str]]:
         """
         Write todos. Returns the full current list after writing.
 
@@ -103,6 +129,8 @@ class TodoStore:
         # (list order is priority).
         if len(self._items) > MAX_TODO_ITEMS:
             self._items = self._items[:MAX_TODO_ITEMS]
+        if notify:
+            self._notify_change()
         return self.read()
 
     def read(self) -> List[Dict[str, str]]:
@@ -112,6 +140,30 @@ class TodoStore:
     def has_items(self) -> bool:
         """Check if there are any items in the list."""
         return bool(self._items)
+
+    def requires_reconfirmation(self) -> bool:
+        """Whether tool execution must pause for explicit plan revalidation."""
+        return any(
+            item["status"] == "needs_reconfirmation" for item in self._items
+        )
+
+    def mark_active_for_reconfirmation(self, *, notify: bool = True) -> int:
+        """Invalidate active work plans at a context-compression boundary.
+
+        Compression can remove the user turn, skills, and evidence that made an
+        item actionable.  Keeping the old actionable status would turn a stale
+        plan into an instruction.  The item remains visible for continuity, but
+        must be explicitly restored to ``pending`` or ``in_progress`` by a
+        subsequent todo write after the model revalidates it.
+        """
+        changed = 0
+        for item in self._items:
+            if item["status"] in ACTIONABLE_STATUSES:
+                item["status"] = "needs_reconfirmation"
+                changed += 1
+        if changed and notify:
+            self._notify_change()
+        return changed
 
     def format_for_injection(self) -> Optional[str]:
         """
@@ -129,18 +181,30 @@ class TodoStore:
             "in_progress": "[>]",
             "pending": "[ ]",
             "cancelled": "[~]",
+            "needs_reconfirmation": "[?]",
         }
 
-        # Only inject pending/in_progress items — completed/cancelled ones
-        # cause the model to re-do finished work after compression.
+        # Keep reconfirmation items visible, but distinguish them from active
+        # work so the model cannot mistake a preserved plan for authorization.
         active_items = [
             item for item in self._items
-            if item["status"] in {"pending", "in_progress"}
+            if item["status"] in ACTIONABLE_STATUSES | {"needs_reconfirmation"}
         ]
         if not active_items:
             return None
 
         lines = [TODO_INJECTION_HEADER]
+        if any(item["status"] == "needs_reconfirmation" for item in active_items):
+            # State the boundary contract once rather than once per item. At the
+            # 256-item safety cap, per-item prose adds tens of thousands of
+            # characters to every compaction and works against compression.
+            lines.append(
+                "Items marked needs_reconfirmation are not actionable. "
+                "Action-capable tools are blocked until they are resolved; "
+                "evidence-gathering tools remain available. "
+                "Revalidate each against the latest user message and evidence, "
+                "then explicitly restore pending or in_progress before acting."
+            )
         for item in active_items:
             marker = markers.get(item["status"], "[?]")
             lines.append(f"- {marker} {item['id']}. {item['content']} ({item['status']})")
@@ -181,7 +245,11 @@ class TodoStore:
         else:
             content = TodoStore._cap_content(content)
 
-        status = str(item.get("status", "pending")).strip().lower()
+        status = (
+            "needs_reconfirmation"
+            if item.get("needs_reconfirmation") is True
+            else str(item.get("status", "pending")).strip().lower()
+        )
         if status not in VALID_STATUSES:
             status = "pending"
 
@@ -241,12 +309,31 @@ def todo_tool(
     completed = sum(1 for i in items if i["status"] == "completed")
     cancelled = sum(1 for i in items if i["status"] == "cancelled")
 
+    # Keep the wire status backward-compatible with independently upgraded
+    # Desktop/TUI clients. Older clients only accept the original four-state
+    # enum and would otherwise drop the entire reconfirmation row. New clients
+    # promote the additive boolean back to the internal non-actionable state.
+    wire_items = [
+        {
+            **item,
+            **(
+                {"status": "pending", "needs_reconfirmation": True}
+                if item["status"] == "needs_reconfirmation"
+                else {}
+            ),
+        }
+        for item in items
+    ]
+
     return json.dumps({
-        "todos": items,
+        "todos": wire_items,
         "summary": {
             "total": len(items),
             "pending": pending,
             "in_progress": in_progress,
+            "needs_reconfirmation": sum(
+                1 for i in items if i["status"] == "needs_reconfirmation"
+            ),
             "completed": completed,
             "cancelled": cancelled,
         },
@@ -276,6 +363,10 @@ TODO_SCHEMA = {
         "- merge=true: update existing items by id, add any new ones\n\n"
         "Each item: {id: string, content: string, "
         "status: pending|in_progress|completed|cancelled}\n"
+        "After context compression, active items may be returned with the "
+        "server-managed flag needs_reconfirmation=true. Revalidate those items "
+        "before explicitly restoring pending or in_progress; action-capable "
+        "tools remain blocked until no item has that flag.\n"
         "List order is priority. Only ONE item in_progress at a time.\n"
         "Mark items completed immediately when done. If something fails, "
         "cancel it and add a revised item.\n\n"

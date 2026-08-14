@@ -431,8 +431,6 @@ class SessionManager:
             session_meta["base_url"] = base_url.strip()
         if isinstance(api_mode, str) and api_mode.strip():
             session_meta["api_mode"] = api_mode.strip()
-        cwd_json = json.dumps(session_meta)
-
         try:
             # Ensure the session record exists.
             existing = db.get_session(state.session_id)
@@ -444,9 +442,14 @@ class SessionManager:
                     model_config={"cwd": state.cwd},
                 )
             else:
-                # Update model_config (contains cwd) if changed.
+                # Merge ACP-owned keys rather than replacing model_config: it
+                # also carries private lineage/runtime state such as durable
+                # post-compaction todos. The patch helper merges inside its
+                # write transaction, avoiding a read/modify/write lost update.
                 try:
-                    db.update_session_meta(state.session_id, cwd_json, model_str)
+                    db.patch_session_model_config(state.session_id, session_meta)
+                    if model_str:
+                        db.update_session_model(state.session_id, model_str)
                 except Exception:
                     logger.debug("Failed to update ACP session metadata", exc_info=True)
 

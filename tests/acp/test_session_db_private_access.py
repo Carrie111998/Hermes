@@ -3,8 +3,8 @@
 Verifies that:
 1. SessionDB.update_session_meta() exists and works correctly via the
    public _execute_write path (not db._lock / db._conn directly).
-2. session.py _persist() no longer touches db._lock or db._conn.
-3. update_session_meta updates the correct columns atomically.
+2. session.py _persist() uses only public SessionDB mutators.
+3. metadata updates preserve unrelated private model_config state.
 """
 
 import ast
@@ -102,31 +102,8 @@ class TestNoPrviateDBAccess:
         assert violations == [], (
             "session.py accesses private SessionDB internals: "
             + ", ".join(violations)
-            + " — use db.update_session_meta() instead"
+            + " — use a public SessionDB mutator instead"
         )
-
-    def test_persist_calls_update_session_meta(self):
-        """AST check: _persist must call db.update_session_meta()."""
-        with open("acp_adapter/session.py", encoding="utf-8") as f:
-            tree = ast.parse(f.read())
-
-        found = False
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == "_persist":
-                for child in ast.walk(node):
-                    if isinstance(child, ast.Call):
-                        func = child.func
-                        if isinstance(func, ast.Attribute):
-                            if func.attr == "update_session_meta":
-                                found = True
-                                break
-                break
-
-        assert found, (
-            "_persist() must call db.update_session_meta() "
-            "instead of db._conn.execute() directly"
-        )
-
 
 # ---------------------------------------------------------------------------
 # Integration: _persist round-trip via SessionManager
@@ -160,6 +137,30 @@ class TestPersistRoundTrip:
 
         row = db.get_session(state.session_id)
         assert row["model"] == "new-model-xyz"
+
+    def test_save_preserves_existing_private_model_config(self, tmp_path):
+        db = _tmp_db(tmp_path)
+        manager = SessionManager(agent_factory=_mock_agent, db=db)
+        state = manager.create_session(cwd="/original")
+        durable_todos = [
+            {
+                "id": "review",
+                "content": "Revalidate plan",
+                "status": "needs_reconfirmation",
+            }
+        ]
+        db.patch_session_model_config(
+            state.session_id,
+            {"_todo_state": durable_todos},
+        )
+
+        state.cwd = "/updated"
+        manager.save_session(state.session_id)
+
+        row = db.get_session(state.session_id)
+        config = json.loads(row["model_config"])
+        assert config["cwd"] == "/updated"
+        assert config["_todo_state"] == durable_todos
 
     def test_existing_model_not_cleared_on_save(self, tmp_path):
         """If state.model is empty, the DB model column must not be overwritten."""

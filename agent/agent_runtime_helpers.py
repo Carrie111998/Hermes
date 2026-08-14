@@ -52,6 +52,21 @@ logger = logging.getLogger(__name__)
 # spins forever and never reaches ``_try_activate_fallback``. See #26080.
 _MAX_AUTH_REFRESH_ATTEMPTS = 2
 
+# Tools that can gather evidence or update the plan without carrying out the
+# preserved plan itself. Everything else stays behind the compaction barrier.
+_TODO_RECONFIRMATION_SAFE_TOOLS = frozenset({
+    "clarify",
+    "read_file",
+    "search_files",
+    "session_search",
+    "skill_view",
+    "skills_list",
+    "todo",
+    "vision_analyze",
+    "web_extract",
+    "web_search",
+})
+
 
 _REASONING_TAG_NAMES = ("think", "thinking", "reasoning", "REASONING_SCRATCHPAD", "thought")
 _TOOL_CALL_TAG_NAMES = ("tool_call", "tool_calls", "tool_result", "function_call", "function_calls")
@@ -2945,12 +2960,37 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     except Exception as _mw_err:
         logger.debug("tool_request middleware error: %s", _mw_err)
 
-    # Check plugin hooks for a block or approval directive before executing.
+    # A post-compaction plan is a hard execution barrier, not advisory prose.
+    # The todo call and read-only evidence tools remain available so the model
+    # can revalidate/cancel every preserved item before any action-capable tool
+    # runs.
     block_message: Optional[str] = None
+    block_error_type = "plugin_block"
+    if function_name not in _TODO_RECONFIRMATION_SAFE_TOOLS:
+        todo_store = getattr(agent, "_todo_store", None)
+        requires_reconfirmation = getattr(
+            todo_store,
+            "requires_reconfirmation",
+            None,
+        )
+        if (
+            callable(requires_reconfirmation)
+            and requires_reconfirmation() is True
+        ):
+            block_error_type = "todo_reconfirmation"
+            block_message = (
+                "Action-capable tool execution is blocked until the preserved "
+                "todo plan is revalidated after context compression. Use only "
+                "evidence-gathering tools, then call todo and "
+                "explicitly restore each valid item to pending/in_progress "
+                "or cancel it."
+            )
+
+    # Check plugin hooks for a block or approval directive before executing.
     if not pre_tool_block_checked:
         try:
             from hermes_cli.plugins import resolve_pre_tool_block
-            block_message = resolve_pre_tool_block(
+            plugin_block = resolve_pre_tool_block(
                 function_name,
                 function_args,
                 task_id=effective_task_id or "",
@@ -2960,8 +3000,11 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                 middleware_trace=list(_tool_middleware_trace),
             )
+            if block_message is None:
+                block_message = plugin_block
+                block_error_type = "plugin_block"
         except Exception:
-            block_message = None
+            pass
     if block_message is not None:
         result = json.dumps({"error": block_message}, ensure_ascii=False)
         try:
@@ -2976,7 +3019,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                 status="blocked",
-                error_type="plugin_block",
+                error_type=block_error_type,
                 error_message=block_message,
                 middleware_trace=list(_tool_middleware_trace),
             )

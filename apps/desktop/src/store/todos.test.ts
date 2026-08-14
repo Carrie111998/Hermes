@@ -30,6 +30,14 @@ describe('setSessionTodos finished-list auto-clear', () => {
     expect($todosBySession.get().s1).toHaveLength(2)
   })
 
+  it('keeps a list that is waiting for reconfirmation visible', () => {
+    setSessionTodos('s1', [todo('a', 'needs_reconfirmation')])
+
+    vi.advanceTimersByTime(60_000)
+
+    expect($todosBySession.get().s1).toHaveLength(1)
+  })
+
   it('drops the list shortly after every item completes', () => {
     setSessionTodos('s1', [todo('a', 'completed'), todo('b', 'cancelled')])
 
@@ -91,6 +99,7 @@ describe('todosForHydration (stale-active guard on restore)', () => {
   it('does not restore an active list (stale after a completed turn)', () => {
     expect(todosForHydration([todo('a', 'completed'), todo('b', 'in_progress')])).toBeNull()
     expect(todosForHydration([todo('a', 'pending')])).toBeNull()
+    expect(todosForHydration([todo('a', 'needs_reconfirmation')])).toBeNull()
   })
 
   it('restores a finished list so its linger shows the final checkmarks', () => {

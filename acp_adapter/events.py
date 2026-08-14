@@ -63,6 +63,10 @@ def _build_plan_update_from_todo_result(result: Any) -> AgentPlanUpdate | None:
         "pending": "pending",
         "in_progress": "in_progress",
         "completed": "completed",
+        # ACP has no paused/reconfirmation state. Keep the task non-terminal
+        # but label it explicitly so clients do not present stale work as an
+        # ordinary actionable pending item.
+        "needs_reconfirmation": "pending",
         # ACP plans only support pending/in_progress/completed. Preserve
         # cancelled tasks as terminal entries instead of dropping them and
         # making the client's full-list replacement lose visible context.
@@ -75,10 +79,16 @@ def _build_plan_update_from_todo_result(result: Any) -> AgentPlanUpdate | None:
         content = str(item.get("content") or item.get("id") or "").strip()
         if not content:
             continue
-        raw_status = str(item.get("status") or "pending").strip()
+        raw_status = (
+            "needs_reconfirmation"
+            if item.get("needs_reconfirmation") is True
+            else str(item.get("status") or "pending").strip()
+        )
         status = status_map.get(raw_status, "pending")
         if raw_status == "cancelled":
             content = f"[cancelled] {content}"
+        elif raw_status == "needs_reconfirmation":
+            content = f"[needs reconfirmation] {content}"
         entries.append(PlanEntry(content=content, priority="medium", status=status))
 
     return AgentPlanUpdate(session_update="plan", entries=entries)

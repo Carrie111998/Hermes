@@ -32,7 +32,7 @@ export interface ComposerStatusItem {
   sessionId?: string
   state: StatusItemState
   title: string
-  /** todo: the full four-state status driving the row's checkmark glyph. */
+  /** todo: the full status driving the row's checkmark/reconfirmation glyph. */
   todoStatus?: TodoStatus
   type: StatusItemType
 }

@@ -4458,7 +4458,37 @@ class AIAgent:
         seed the store without a matching canonical tool call
         (GHSA-5g4g-6jrg-mw3g).
         """
-        from tools.todo_tool import MAX_TODO_RESULT_CHARS
+        from tools.todo_tool import (
+            MAX_TODO_RESULT_CHARS,
+            TODO_STATE_MODEL_CONFIG_KEY,
+        )
+
+        # Session metadata is written by every authoritative TodoStore update
+        # and atomically at compaction. It therefore wins over older tool
+        # results that may survive in the protected compression tail.
+        session_db = getattr(self, "_session_db", None)
+        get_config = getattr(session_db, "get_session_model_config_value", None)
+        if self.session_id and callable(get_config):
+            missing = object()
+            persisted = get_config(
+                self.session_id,
+                TODO_STATE_MODEL_CONFIG_KEY,
+                missing,
+            )
+            if persisted is not missing and isinstance(persisted, list):
+                # Already durable; avoid rewriting model_config on every fresh
+                # gateway agent hydration.
+                self._todo_store.write(persisted, merge=False, notify=False)
+                self._session_init_model_config[TODO_STATE_MODEL_CONFIG_KEY] = (
+                    self._todo_store.read()
+                )
+                if not self.quiet_mode:
+                    self._vprint(
+                        f"{self.log_prefix}📋 Restored {len(persisted)} "
+                        "todo item(s) from session state"
+                    )
+                _set_interrupt(False)
+                return
 
         # Walk history backwards to find the most recent todo tool response
         last_todo_response = None
@@ -4492,8 +4522,15 @@ class AIAgent:
                 continue
 
         if last_todo_response:
-            # Replay the items into the store (replace mode)
-            self._todo_store.write(last_todo_response, merge=False)
+            # Legacy history is caller-supplied on API surfaces. It is useful
+            # for this turn, but must not be promoted into trusted durable
+            # session metadata. Fresh post-compaction sessions already carry
+            # an authoritative model_config snapshot.
+            self._todo_store.write(
+                last_todo_response,
+                merge=False,
+                notify=False,
+            )
             if not self.quiet_mode:
                 self._vprint(f"{self.log_prefix}📋 Restored {len(last_todo_response)} todo item(s) from history")
         _set_interrupt(False)

@@ -1,4 +1,4 @@
-export type TodoStatus = 'pending' | 'in_progress' | 'completed' | 'cancelled'
+export type TodoStatus = 'pending' | 'in_progress' | 'needs_reconfirmation' | 'completed' | 'cancelled'
 
 export interface TodoItem {
   content: string
@@ -6,7 +6,13 @@ export interface TodoItem {
   status: TodoStatus
 }
 
-const STATUSES: readonly TodoStatus[] = ['pending', 'in_progress', 'completed', 'cancelled']
+const STATUSES: readonly TodoStatus[] = [
+  'pending',
+  'in_progress',
+  'needs_reconfirmation',
+  'completed',
+  'cancelled'
+]
 
 const isRecord = (v: unknown): v is Record<string, unknown> => Boolean(v && typeof v === 'object' && !Array.isArray(v))
 const isStatus = (v: unknown): v is TodoStatus => (STATUSES as readonly string[]).includes(v as string)
@@ -19,8 +25,9 @@ function parseArray(value: unknown[]): TodoItem[] {
 
     const id = String(item.id ?? '').trim()
     const content = String(item.content ?? '').trim()
+    const status = item.needs_reconfirmation === true ? 'needs_reconfirmation' : item.status
 
-    return id && content ? [{ content, id, status: item.status }] : []
+    return id && content ? [{ content, id, status }] : []
   })
 }
 

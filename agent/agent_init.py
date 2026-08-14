@@ -1680,9 +1680,27 @@ def init_agent(
     except Exception:
         pass
     
-    # In-memory todo list for task planning (one per agent/session)
-    from tools.todo_tool import TodoStore
-    agent._todo_store = TodoStore()
+    # In-memory todo list for task planning (one per agent/session). Mirror
+    # every authoritative write into the session's trusted model_config so a
+    # fresh gateway agent cannot resurrect an older pre-compaction tool result.
+    from tools.todo_tool import TODO_STATE_MODEL_CONFIG_KEY, TodoStore
+
+    def _persist_todo_state(items):
+        state = [dict(item) for item in items]
+        agent._session_init_model_config[TODO_STATE_MODEL_CONFIG_KEY] = state
+        if getattr(agent, "_persist_disabled", False):
+            return
+        session_db = getattr(agent, "_session_db", None)
+        session_id = getattr(agent, "session_id", None)
+        patch_config = getattr(session_db, "patch_session_model_config", None)
+        if not session_id or not callable(patch_config):
+            return
+        try:
+            patch_config(session_id, {TODO_STATE_MODEL_CONFIG_KEY: state})
+        except Exception:
+            logger.debug("Could not persist todo state", exc_info=True)
+
+    agent._todo_store = TodoStore(on_change=_persist_todo_state)
     
     # Load config once for memory, skills, and compression sections
     try:

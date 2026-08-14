@@ -65,6 +65,53 @@ class TestFormatForInjection:
         assert "Working" in text
         assert "context compression" in text.lower()
 
+    def test_compaction_downgrades_active_items_until_revalidated(self):
+        store = TodoStore()
+        store.write([
+            {"id": "keep", "content": "Review evidence", "status": "pending"},
+            {"id": "work", "content": "Apply change", "status": "in_progress"},
+            {"id": "done", "content": "Finished", "status": "completed"},
+        ])
+
+        assert store.mark_active_for_reconfirmation() == 2
+        items = store.read()
+        assert [item["status"] for item in items] == [
+            "needs_reconfirmation",
+            "needs_reconfirmation",
+            "completed",
+        ]
+
+        text = store.format_for_injection()
+        assert text.count("(needs_reconfirmation)") == 2
+        assert "not actionable" in text
+        assert "Apply change" in text
+
+        store.write(
+            [{"id": "work", "status": "in_progress"}],
+            merge=True,
+        )
+        assert store.read()[1]["status"] == "in_progress"
+
+    def test_reconfirmation_is_idempotent(self):
+        store = TodoStore()
+        store.write([{"id": "1", "content": "Task", "status": "pending"}])
+
+        assert store.mark_active_for_reconfirmation() == 1
+        assert store.mark_active_for_reconfirmation() == 0
+
+    def test_reconfirmation_guidance_is_emitted_once_for_large_plans(self):
+        store = TodoStore()
+        store.write([
+            {"id": str(i), "content": f"Task {i}", "status": "pending"}
+            for i in range(256)
+        ])
+
+        store.mark_active_for_reconfirmation()
+        text = store.format_for_injection()
+
+        assert text.count("are not actionable") == 1
+        assert len(text) < 20_000
+
 
 class TestMergeMode:
     def test_update_existing_by_id(self):
@@ -104,6 +151,49 @@ class TestTodoToolFunction:
     def test_no_store_returns_error(self):
         result = json.loads(todo_tool())
         assert "error" in result
+
+    def test_reconfirmation_status_is_server_managed(self):
+        from tools.todo_tool import TODO_SCHEMA
+
+        writable_statuses = TODO_SCHEMA["parameters"]["properties"]["todos"][
+            "items"
+        ]["properties"]["status"]["enum"]
+
+        assert "needs_reconfirmation" not in writable_statuses
+
+    def test_reconfirmation_uses_backward_compatible_wire_status(self):
+        store = TodoStore()
+        store.write([{"id": "1", "content": "Task", "status": "pending"}])
+        store.mark_active_for_reconfirmation()
+
+        result = json.loads(todo_tool(store=store))
+
+        assert result["todos"] == [
+            {
+                "id": "1",
+                "content": "Task",
+                "status": "pending",
+                "needs_reconfirmation": True,
+            }
+        ]
+        assert result["summary"]["needs_reconfirmation"] == 1
+        assert store.read()[0]["status"] == "needs_reconfirmation"
+
+    def test_wire_flag_rehydrates_internal_reconfirmation_state(self):
+        store = TodoStore()
+
+        store.write(
+            [
+                {
+                    "id": "1",
+                    "content": "Task",
+                    "status": "pending",
+                    "needs_reconfirmation": True,
+                }
+            ]
+        )
+
+        assert store.read()[0]["status"] == "needs_reconfirmation"
 
 
 class TestTodoStoreBounds:
@@ -154,3 +244,32 @@ class TestTodoStoreBounds:
         items = store.read()
         assert [i["content"] for i in items] == ["write the report", "review PR"]
         assert "[truncated]" not in items[0]["content"]
+
+
+class TestTodoPersistenceCallback:
+    def test_write_and_state_transition_notify_with_copies(self):
+        observed = []
+        store = TodoStore(on_change=observed.append)
+
+        store.write([{"id": "a", "content": "A", "status": "pending"}])
+        store.mark_active_for_reconfirmation()
+
+        assert [states[0]["status"] for states in observed] == [
+            "pending",
+            "needs_reconfirmation",
+        ]
+        observed[0][0]["status"] = "completed"
+        assert store.read()[0]["status"] == "needs_reconfirmation"
+
+    def test_notify_can_be_deferred_until_atomic_commit(self):
+        observed = []
+        store = TodoStore(on_change=observed.append)
+        store.write(
+            [{"id": "a", "content": "A", "status": "pending"}],
+            notify=False,
+        )
+        store.mark_active_for_reconfirmation(notify=False)
+
+        assert observed == []
+        store.persist()
+        assert observed[0][0]["status"] == "needs_reconfirmation"

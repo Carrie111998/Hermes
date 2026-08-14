@@ -67,7 +67,7 @@ export const TodoPanel = memo(function TodoPanel({
           {incomplete && pending > 0 && (
             <Text color={t.color.muted} dim>
               {' '}
-              · incomplete · {pending} still {pending === 1 ? 'pending' : 'pending/in_progress'}
+              · incomplete · {pending} still unresolved
             </Text>
           )}
         </Text>

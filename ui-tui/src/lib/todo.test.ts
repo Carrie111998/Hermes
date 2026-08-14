@@ -7,6 +7,7 @@ describe('todoGlyph', () => {
     expect(todoGlyph('completed')).toBe('[x]')
     expect(todoGlyph('in_progress')).toBe('[>]')
     expect(todoGlyph('pending')).toBe('[ ]')
+    expect(todoGlyph('needs_reconfirmation')).toBe('[?]')
     expect(todoGlyph('cancelled')).toBe('[-]')
   })
 })

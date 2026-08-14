@@ -1,7 +1,10 @@
 import type { Msg, TodoItem } from '../types.js'
 
 export const countPendingTodos = (todos: readonly TodoItem[]) =>
-  todos.filter(todo => todo.status === 'in_progress' || todo.status === 'pending').length
+  todos.filter(
+    todo =>
+      todo.status === 'in_progress' || todo.status === 'pending' || todo.status === 'needs_reconfirmation'
+  ).length
 
 export const isTodoDone = (todos: readonly TodoItem[]) =>
   todos.length > 0 && todos.every(todo => todo.status === 'completed' || todo.status === 'cancelled')

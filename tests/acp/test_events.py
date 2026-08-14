@@ -180,8 +180,10 @@ class TestStepCallback:
             '{"todos":['
             '{"id":"inspect","content":"Inspect ACP","status":"completed"},'
             '{"id":"patch","content":"Patch renderer","status":"in_progress"},'
+            '{"id":"verify","content":"Recheck assumptions","status":"pending",'
+            '"needs_reconfirmation":true},'
             '{"id":"old","content":"Drop stale task","status":"cancelled"}'
-            '],"summary":{"total":3}}'
+            '],"summary":{"total":4}}'
         )
 
         with patch("acp_adapter.events._send_update") as mock_send:
@@ -197,10 +199,21 @@ class TestStepCallback:
         assert [entry.content for entry in plan.entries] == [
             "Inspect ACP",
             "Patch renderer",
+            "[needs reconfirmation] Recheck assumptions",
             "[cancelled] Drop stale task",
         ]
-        assert [entry.status for entry in plan.entries] == ["completed", "in_progress", "completed"]
-        assert [entry.priority for entry in plan.entries] == ["medium", "medium", "medium"]
+        assert [entry.status for entry in plan.entries] == [
+            "completed",
+            "in_progress",
+            "pending",
+            "completed",
+        ]
+        assert [entry.priority for entry in plan.entries] == [
+            "medium",
+            "medium",
+            "medium",
+            "medium",
+        ]
 
 
 

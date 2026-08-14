@@ -873,6 +873,88 @@ class TestHydrateTodoStore:
             agent._hydrate_todo_store(history)
         assert not agent._todo_store.has_items()
 
+    def test_session_state_wins_over_stale_pre_compaction_tool_result(self, agent):
+        persisted = [
+            {
+                "id": "dangerous",
+                "content": "Deploy the old build",
+                "status": "needs_reconfirmation",
+            }
+        ]
+        agent.session_id = "child"
+        agent._session_db = SimpleNamespace(
+            get_session_model_config_value=lambda *_args: persisted,
+        )
+        history = [
+            self._assistant_todo_call(),
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": json.dumps(
+                    {
+                        "todos": [
+                            {
+                                "id": "dangerous",
+                                "content": "Deploy the old build",
+                                "status": "in_progress",
+                            }
+                        ]
+                    }
+                ),
+            },
+        ]
+
+        with patch("run_agent._set_interrupt"):
+            agent._hydrate_todo_store(history)
+
+        assert agent._todo_store.read() == persisted
+
+    def test_authoritative_empty_session_state_does_not_resurrect_history(self, agent):
+        agent._todo_store.write(
+            [{"id": "old", "content": "Old task", "status": "pending"}],
+            notify=False,
+        )
+        agent.session_id = "child"
+        agent._session_db = SimpleNamespace(
+            get_session_model_config_value=lambda *_args: [],
+        )
+
+        with patch("run_agent._set_interrupt"):
+            agent._hydrate_todo_store([])
+
+        assert agent._todo_store.read() == []
+
+    def test_caller_history_is_not_promoted_to_durable_session_state(self, agent):
+        from tools.todo_tool import TodoStore
+
+        observed = []
+        agent._todo_store = TodoStore(on_change=observed.append)
+        history = [
+            self._assistant_todo_call(),
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": json.dumps(
+                    {
+                        "todos": [
+                            {
+                                "id": "review",
+                                "content": "Recheck evidence",
+                                "status": "pending",
+                                "needs_reconfirmation": True,
+                            }
+                        ]
+                    }
+                ),
+            },
+        ]
+
+        with patch("run_agent._set_interrupt"):
+            agent._hydrate_todo_store(history)
+
+        assert observed == []
+        assert agent._todo_store.read()[0]["status"] == "needs_reconfirmation"
+
 
 
 
@@ -1946,6 +2028,76 @@ class TestConcurrentToolExecution:
                 tool_request_middleware_trace=[],
             )
             assert result == "result"
+
+    def test_invoke_tool_blocks_actions_until_todos_are_revalidated(self, agent):
+        agent._todo_store.write(
+            [
+                {
+                    "id": "stale",
+                    "content": "Deploy old build",
+                    "status": "needs_reconfirmation",
+                }
+            ],
+            notify=False,
+        )
+
+        with patch("run_agent.handle_function_call") as mock_dispatch:
+            result = json.loads(
+                agent._invoke_tool("terminal", {"command": "deploy"}, "task-1")
+            )
+
+        assert "blocked" in result["error"].lower()
+        mock_dispatch.assert_not_called()
+
+    def test_reconfirmation_gate_allows_evidence_gathering(self, agent):
+        agent._todo_store.write(
+            [
+                {
+                    "id": "stale",
+                    "content": "Check current implementation",
+                    "status": "needs_reconfirmation",
+                }
+            ],
+            notify=False,
+        )
+
+        with patch("run_agent.handle_function_call", return_value="evidence") as dispatch:
+            result = agent._invoke_tool("read_file", {"path": "README.md"}, "task-1")
+
+        assert result == "evidence"
+        dispatch.assert_called_once()
+
+    def test_todo_revalidation_unlocks_other_tools(self, agent):
+        agent._todo_store.write(
+            [
+                {
+                    "id": "reviewed",
+                    "content": "Run verified tests",
+                    "status": "needs_reconfirmation",
+                }
+            ],
+            notify=False,
+        )
+
+        agent._invoke_tool(
+            "todo",
+            {
+                "todos": [
+                    {
+                        "id": "reviewed",
+                        "content": "Run verified tests",
+                        "status": "pending",
+                    }
+                ]
+            },
+            "task-1",
+        )
+
+        with patch("run_agent.handle_function_call", return_value="ran") as mock_dispatch:
+            result = agent._invoke_tool("terminal", {"command": "test"}, "task-1")
+
+        assert result == "ran"
+        mock_dispatch.assert_called_once()
 
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")

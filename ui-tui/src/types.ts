@@ -9,7 +9,7 @@ export interface ActiveTool {
 export interface TodoItem {
   content: string
   id: string
-  status: 'cancelled' | 'completed' | 'in_progress' | 'pending'
+  status: 'cancelled' | 'completed' | 'in_progress' | 'needs_reconfirmation' | 'pending'
 }
 
 export interface ActivityItem {

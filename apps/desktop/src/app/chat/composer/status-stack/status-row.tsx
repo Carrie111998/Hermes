@@ -19,7 +19,8 @@ const toolLabel = (name: string) => name.split('_').filter(Boolean).map(capitali
 // the in-progress item.
 const TODO_GLYPHS: Record<Exclude<TodoStatus, 'in_progress' | 'pending'>, { icon: string; tone: string }> = {
   cancelled: { icon: 'circle-slash', tone: 'text-muted-foreground/45' },
-  completed: { icon: 'pass-filled', tone: 'text-emerald-500/80' }
+  completed: { icon: 'pass-filled', tone: 'text-emerald-500/80' },
+  needs_reconfirmation: { icon: 'question', tone: 'text-amber-500/80' }
 }
 
 // Left slot: braille spinner while running, otherwise a small status dot

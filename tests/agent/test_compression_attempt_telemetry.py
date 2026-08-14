@@ -8,6 +8,18 @@ from agent.context_compressor import ContextCompressor
 
 
 class _TodoStore:
+    def read(self):
+        return []
+
+    def write(self, todos, merge=False, *, notify=True):
+        return todos
+
+    def mark_active_for_reconfirmation(self, *, notify=True):
+        return 0
+
+    def persist(self):
+        pass
+
     def format_for_injection(self):
         return ""
 

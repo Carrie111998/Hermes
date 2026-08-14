@@ -2,19 +2,37 @@ import { describe, expect, it } from 'vitest'
 
 import type { Msg } from '../types.js'
 
-import { appendToolShelfMessage, canHoldToolShelf, isTodoDone, mergeToolShelfInto } from './liveProgress.js'
+import {
+  appendToolShelfMessage,
+  canHoldToolShelf,
+  countPendingTodos,
+  isTodoDone,
+  mergeToolShelfInto
+} from './liveProgress.js'
 
 describe('isTodoDone', () => {
   it('only treats non-empty all-completed/cancelled lists as done', () => {
     expect(isTodoDone([])).toBe(false)
     expect(isTodoDone([{ content: 'x', id: 'x', status: 'completed' }])).toBe(true)
     expect(isTodoDone([{ content: 'x', id: 'x', status: 'in_progress' }])).toBe(false)
+    expect(isTodoDone([{ content: 'x', id: 'x', status: 'needs_reconfirmation' }])).toBe(false)
     expect(
       isTodoDone([
         { content: 'x', id: 'x', status: 'completed' },
         { content: 'y', id: 'y', status: 'cancelled' }
       ])
     ).toBe(true)
+  })
+})
+
+describe('countPendingTodos', () => {
+  it('counts reconfirmation items as unresolved', () => {
+    expect(
+      countPendingTodos([
+        { content: 'x', id: 'x', status: 'needs_reconfirmation' },
+        { content: 'y', id: 'y', status: 'completed' }
+      ])
+    ).toBe(1)
   })
 })
 

@@ -3168,7 +3168,25 @@ def compress_context(
                         "check auxiliary.compression.model in config.yaml."
                     )
 
-        todo_snapshot = agent._todo_store.format_for_injection()
+        # A compression boundary is also a provenance boundary: context that
+        # justified an active plan may be summarized or pruned.  Preserve the
+        # plan for continuity, but make it explicitly non-actionable until the
+        # model revalidates it in the post-compaction context.
+        from tools.todo_tool import TODO_STATE_MODEL_CONFIG_KEY, TodoStore
+
+        # Do not invoke the ordinary persistence callback before the transcript
+        # commit. The state rides the same atomic DB operation below; publishing
+        # it early could make a failed compaction invalidate an uncompressed plan.
+        _todo_state_before_compression = agent._todo_store.read()
+        _todo_snapshot_store = TodoStore()
+        _todo_snapshot_store.write(
+            _todo_state_before_compression,
+            merge=False,
+            notify=False,
+        )
+        _todo_snapshot_store.mark_active_for_reconfirmation(notify=False)
+        _todo_state_after_compression = _todo_snapshot_store.read()
+        todo_snapshot = _todo_snapshot_store.format_for_injection()
         if todo_snapshot:
             # Fold the snapshot into a trailing REAL user message so
             # compression never introduces a synthetic user/user pair. Any
@@ -3257,6 +3275,17 @@ def compress_context(
             new_system_prompt = agent._build_system_prompt(system_message)
             agent._cached_system_prompt = new_system_prompt
 
+        # All summary/prompt transforms succeeded. Publish the tentative state
+        # in memory immediately before its durable commit; the DB exception path
+        # below restores the old state if publication never happens.
+        agent._todo_store.write(
+            _todo_state_after_compression,
+            merge=False,
+            notify=False,
+        )
+        _todo_state_committed = not bool(agent._session_db)
+        if _todo_state_committed:
+            agent._todo_store.persist()
         _session_commit_succeeded = False
         split_status = "not_applicable"
         if agent._session_db:
@@ -3296,8 +3325,10 @@ def compress_context(
                         compressed,
                         model_config_patch={
                             PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
+                            TODO_STATE_MODEL_CONFIG_KEY: _todo_state_after_compression,
                         },
                     )
+                    _todo_state_committed = True
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
@@ -3360,13 +3391,17 @@ def compress_context(
                         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
                         f"{uuid.uuid4().hex[:6]}"
                     )
+                    _child_model_config = dict(agent._session_init_model_config)
+                    _child_model_config[TODO_STATE_MODEL_CONFIG_KEY] = (
+                        _todo_state_after_compression
+                    )
                     agent._session_db.publish_compression_child(
                         parent_session_id=old_session_id,
                         child_session_id=new_session_id,
                         source=agent.platform
                         or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                         model=agent.model,
-                        model_config=agent._session_init_model_config,
+                        model_config=_child_model_config,
                         system_prompt=new_system_prompt,
                         messages=compressed,
                         cwd=getattr(agent, "working_directory", None),
@@ -3374,6 +3409,7 @@ def compress_context(
                         compression_lock_holder=_lock_holder,
                         require_compression_lease=_lock_holder is not None,
                     )
+                    _todo_state_committed = True
                     agent.session_id = new_session_id
                     try:
                         from gateway.session_context import set_current_session_id
@@ -3467,7 +3503,19 @@ def compress_context(
                         if isinstance(message, dict)
                     }
                 _session_commit_succeeded = True
+                # Keep future rotation config in sync without rewriting the
+                # potentially large todo payload: the atomic DB operation above
+                # already committed this exact state.
+                agent._session_init_model_config[TODO_STATE_MODEL_CONFIG_KEY] = (
+                    _todo_state_after_compression
+                )
             except Exception as e:
+                if not _todo_state_committed:
+                    agent._todo_store.write(
+                        _todo_state_before_compression,
+                        merge=False,
+                        notify=False,
+                    )
                 if (
                     not in_place
                     and locals().get("old_session_id")

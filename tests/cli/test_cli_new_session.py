@@ -153,6 +153,7 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
     cli = _prepare_cli_with_active_session(tmp_path)
     old_session_id = cli.session_id
     old_session_start = cli.session_start
+    original_todo_store = cli.agent._todo_store
 
     cli.process_command("/new")
 
@@ -169,6 +170,7 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
 
     assert cli.agent.session_id == cli.session_id
     assert cli.agent._last_flushed_db_idx == 0
+    assert cli.agent._todo_store is original_todo_store
     assert cli.agent._todo_store.read() == []
     assert cli.session_start > old_session_start
     assert cli.agent.session_start == cli.session_start

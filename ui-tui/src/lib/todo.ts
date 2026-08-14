@@ -3,7 +3,15 @@ import type { TodoItem } from '../types.js'
 export type TodoTone = 'active' | 'body' | 'dim'
 
 export const todoGlyph = (status: TodoItem['status']) =>
-  status === 'completed' ? '[x]' : status === 'cancelled' ? '[-]' : status === 'in_progress' ? '[>]' : '[ ]'
+  status === 'completed'
+    ? '[x]'
+    : status === 'cancelled'
+      ? '[-]'
+      : status === 'in_progress'
+        ? '[>]'
+        : status === 'needs_reconfirmation'
+          ? '[?]'
+          : '[ ]'
 
 export const todoTone = (status: TodoItem['status']): TodoTone =>
-  status === 'in_progress' ? 'active' : status === 'pending' ? 'body' : 'dim'
+  status === 'in_progress' ? 'active' : status === 'pending' || status === 'needs_reconfirmation' ? 'body' : 'dim'

@@ -1086,8 +1086,9 @@ class CLICommandsMixin:
                 self.agent._last_flushed_db_idx = len(self.conversation_history)
             if hasattr(self.agent, "_todo_store"):
                 try:
-                    from tools.todo_tool import TodoStore
-                    self.agent._todo_store = TodoStore()
+                    # Preserve the persistence callback; the target session's
+                    # durable state is hydrated on its next turn.
+                    self.agent._todo_store.write([], merge=False, notify=False)
                 except Exception:
                     pass
             if hasattr(self.agent, "_invalidate_system_prompt"):
@@ -1307,8 +1308,9 @@ class CLICommandsMixin:
                 self.agent._last_flushed_db_idx = len(self.conversation_history)
             if hasattr(self.agent, "_todo_store"):
                 try:
-                    from tools.todo_tool import TodoStore
-                    self.agent._todo_store = TodoStore()
+                    # Preserve the persistence callback; the target session's
+                    # durable state is hydrated on its next turn.
+                    self.agent._todo_store.write([], merge=False, notify=False)
                 except Exception:
                     pass
             if hasattr(self.agent, "_invalidate_system_prompt"):

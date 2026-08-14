@@ -8,13 +8,23 @@ describe('parseTodos', () => {
       parseTodos([
         { content: 'Gather ingredients', id: 'prep', status: 'completed' },
         { content: 'Boil water', id: 'boil', status: 'in_progress' },
+        { content: 'Check request', id: 'check', status: 'needs_reconfirmation' },
         { content: 'Serve', id: 'serve', status: 'pending' }
       ])
     ).toEqual([
       { content: 'Gather ingredients', id: 'prep', status: 'completed' },
       { content: 'Boil water', id: 'boil', status: 'in_progress' },
+      { content: 'Check request', id: 'check', status: 'needs_reconfirmation' },
       { content: 'Serve', id: 'serve', status: 'pending' }
     ])
+  })
+
+  it('promotes the backward-compatible reconfirmation wire flag', () => {
+    expect(
+      parseTodos([
+        { content: 'Recheck evidence', id: 'a', needs_reconfirmation: true, status: 'pending' }
+      ])
+    ).toEqual([{ content: 'Recheck evidence', id: 'a', status: 'needs_reconfirmation' }])
   })
 
   it('parses nested todo payloads from wrapped objects and JSON strings', () => {

@@ -125,6 +125,9 @@ class TestOrphanRollbackOnCreateFailure:
         parent = "PARENT_ORPHAN_ROT"
         db.create_session(parent, source="cli")
         agent = _build_agent_with_db(db, parent)
+        agent._todo_store.write(
+            [{"id": "keep", "content": "Keep plan", "status": "pending"}]
+        )
 
         # Atomic publication failure must leave the live parent and caller's
         # original list untouched even when a plugin compressor mutates in place.
@@ -155,6 +158,7 @@ class TestOrphanRollbackOnCreateFailure:
         assert parent_row is not None
         assert parent_row["ended_at"] is None
         assert db.find_live_compression_child(parent) is None
+        assert agent._todo_store.read()[0]["status"] == "pending"
 
 
 class TestWorkspaceMetadataFollowsRotation:
@@ -522,12 +526,9 @@ class TestTodoSnapshotMergedNotDuplicated:
             {"role": "assistant", "content": "acknowledged"},
             {"role": "user", "content": "tail"},
         ]
-        agent._todo_store._todos = [
+        agent._todo_store.write([
             {"id": "t1", "content": "task A", "status": "pending"}
-        ]
-        agent._todo_store.format_for_injection = (
-            lambda: "## Current Tasks\n- [ ] task A"
-        )
+        ])
 
         compressed, _ = agent._compress_context(
             _msgs(), "sys", approx_tokens=120_000
@@ -565,12 +566,9 @@ class TestTodoSnapshotMergedNotDuplicated:
             {"role": "assistant", "content": "ok"},
             {"role": "user", "content": list(original_parts)},
         ]
-        agent._todo_store._todos = [
+        agent._todo_store.write([
             {"id": "t1", "content": "inspect image", "status": "in_progress"}
-        ]
-        agent._todo_store.format_for_injection = (
-            lambda: "## Current Tasks\n- [ ] inspect image"
-        )
+        ])
 
         compressed, _ = agent._compress_context(
             _msgs(), "sys", approx_tokens=120_000
@@ -648,6 +646,15 @@ class TestTodoSnapshotScaffoldingTails:
         assert tail["role"] == "user"
         assert "please fix the login bug" in tail["content"]
         assert "task A" in tail["content"]
+        assert "needs_reconfirmation" in tail["content"]
+        assert agent._todo_store.read()[0]["status"] == "needs_reconfirmation"
+        from tools.todo_tool import TODO_STATE_MODEL_CONFIG_KEY
+
+        durable_todos = db.get_session_model_config_value(
+            agent.session_id,
+            TODO_STATE_MODEL_CONFIG_KEY,
+        )
+        assert durable_todos[0]["status"] == "needs_reconfirmation"
         assert "old finished task" not in tail["content"]
         assert tail["content"].count(TODO_INJECTION_HEADER) == 1
         assert not any(

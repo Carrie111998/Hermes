@@ -18,7 +18,7 @@ import { $sessionStates } from './session-states'
 export const $todosBySession = atom<Record<string, TodoItem[]>>({})
 
 export const todoListActive = (todos: readonly TodoItem[]) =>
-  todos.some(t => t.status === 'pending' || t.status === 'in_progress')
+  todos.some(t => t.status === 'pending' || t.status === 'in_progress' || t.status === 'needs_reconfirmation')
 
 let todoProgress: Readonly<Record<string, string>> = {}
 
@@ -52,8 +52,8 @@ export const $todoProgressBySession = computed(
 )
 
 // Decide which todo list to restore when rehydrating a session from stored
-// history. Rehydration runs *after* a turn completes, so an active list (last
-// item still pending/in_progress) is stale — the turn ended without a final
+// history. Rehydration runs *after* a turn completes, so an unresolved list
+// (pending/in_progress/reconfirmation) is stale — the turn ended without a final
 // `todo` update — and must NOT be re-pinned (that would undo the turn-end
 // clear and, because it's read back from history, resurrect on restart). Only
 // a finished list is restored, so its short linger shows the last checkmark.
@@ -109,7 +109,7 @@ export function clearSessionTodos(sid: string) {
   $todosBySession.set(rest)
 }
 
-// Drop a still-active todo list (any pending/in_progress item) — used at turn
+// Drop a still-active todo list (pending/in_progress/reconfirmation) — used at turn
 // end, when an unfinished list means the turn stopped without a final `todo`
 // update, so the "Tasks N/M" panel would otherwise stay pinned above the
 // composer forever. A finished list is left untouched so its short linger

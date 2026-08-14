@@ -46,7 +46,11 @@ const diffSegmentBody = (msg: Msg): null | string => {
 const hasDetails = (msg: Msg): boolean => Boolean(msg.thinking || msg.tools?.length || msg.toolTokens)
 
 const isTodoStatus = (status: unknown): status is TodoItem['status'] =>
-  status === 'pending' || status === 'in_progress' || status === 'completed' || status === 'cancelled'
+  status === 'pending' ||
+  status === 'in_progress' ||
+  status === 'needs_reconfirmation' ||
+  status === 'completed' ||
+  status === 'cancelled'
 
 const parseTodos = (value: unknown): null | TodoItem[] => {
   if (!Array.isArray(value)) {
@@ -60,7 +64,7 @@ const parseTodos = (value: unknown): null | TodoItem[] => {
       }
 
       const row = item as Record<string, unknown>
-      const status = row.status
+      const status = row.needs_reconfirmation === true ? 'needs_reconfirmation' : row.status
 
       if (!isTodoStatus(status)) {
         return null
