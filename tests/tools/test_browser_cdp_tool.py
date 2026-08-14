@@ -187,10 +187,16 @@ def test_websockets_missing_returns_error(monkeypatch):
 
 
 def test_browser_level_redacts_secret_result(cdp_server):
-    fake_key = "sk-" + "CDPSECRETRESULT1234567890"
+    fake_secret = "sk-" + "CDPSECRETRESULT1234567890"
     cdp_server.on(
         "Runtime.evaluate",
-        lambda params, sid: {"result": {"type": "string", "value": fake_key}},
+        lambda params, sid: {
+            "result": {
+                "type": "string",
+                "value": fake_secret,
+                "nested": {fake_secret: "safe"},
+            }
+        },
     )
 
     result = json.loads(browser_cdp_tool.browser_cdp(method="Runtime.evaluate"))
@@ -199,6 +205,8 @@ def test_browser_level_redacts_secret_result(cdp_server):
     serialized = json.dumps(result)
     assert "CDPSECRETRESULT" not in serialized
     assert result["result"]["result"]["value"].startswith("sk-")
+    redacted_key = next(iter(result["result"]["result"]["nested"]))
+    assert redacted_key.startswith("sk-")
 
 
 def test_frame_id_supervisor_path_redacts_secret_result(monkeypatch):
@@ -210,7 +218,7 @@ def test_frame_id_supervisor_path_redacts_secret_result(monkeypatch):
 
     import tools.browser_supervisor as browser_supervisor
 
-    fake_key = "sk-" + "CDPSECRETFRAMERESULT1234567890"
+    fake_secret = "sk-" + "CDPSECRETFRAMERESULT1234567890"
     frame_id = "oopif-frame-1"
     child_sid = "child-session-1"
 
@@ -234,7 +242,15 @@ def test_frame_id_supervisor_path_redacts_secret_result(monkeypatch):
         coro.close()
         fut = concurrent.futures.Future()
         fut.set_result(
-            {"result": {"result": {"type": "string", "value": fake_key}}}
+            {
+                "result": {
+                    "result": {
+                        "type": "string",
+                        "value": fake_secret,
+                        "nested": {fake_secret: "safe"},
+                    }
+                }
+            }
         )
         return fut
 
@@ -258,6 +274,8 @@ def test_frame_id_supervisor_path_redacts_secret_result(monkeypatch):
     serialized = json.dumps(result)
     assert "CDPSECRETFRAMERESULT" not in serialized
     assert result["result"]["result"]["value"].startswith("sk-")
+    redacted_key = next(iter(result["result"]["result"]["nested"]))
+    assert redacted_key.startswith("sk-")
 
 
 # ---------------------------------------------------------------------------
