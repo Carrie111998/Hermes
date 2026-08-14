@@ -9426,6 +9426,51 @@ def cmd_update(args):
         )
         return
 
+    # ---- Windows self-update handoff -------------------------------------
+    # `hermes update` normally runs as a child of the venv's hermes.exe
+    # console-script launcher, which keeps that .exe mapped as a running image
+    # for the whole update. uv's final rewrite of the shims then fails with
+    # "The process cannot access the file because it is being used by another
+    # process. (os error 32)" -- every time, by construction, on both the git
+    # and ZIP fallback paths.
+    #
+    # maybe_trampoline() re-launches this update as a detached
+    # `python -m hermes_cli.main` grandchild and returns True; we return so the
+    # launcher can exit and free its shim. The grandchild re-enters here with
+    # TRAMPOLINE_PARENT_ENV set, waits for the launcher to actually go away,
+    # then updates for real. Returns False (run in-process, unchanged
+    # behavior) off Windows, when already trampolined, or when we were not
+    # launched through a shim. See hermes_cli/win_self_update.py.
+    #
+    # Placed after --check (which installs nothing and needs no handoff) and
+    # before the update lock below: a trampolining parent that had already
+    # written the lock marker would release it moments later while the
+    # grandchild ran unlocked, since the grandchild's own acquire() sees its
+    # still-live parent as an ancestor and runs under a claim about to vanish.
+    from hermes_cli import win_self_update
+
+    if win_self_update.maybe_trampoline(sys.argv[1:]):
+        return
+
+    _launcher_pid = win_self_update.trampoline_parent_pid()
+    if _launcher_pid is not None and not win_self_update.wait_for_launcher_exit(
+        _launcher_pid
+    ):
+        print(
+            f"\u2717 The hermes.exe launcher (PID {_launcher_pid}) is still running "
+            f"after {int(win_self_update.LAUNCHER_EXIT_TIMEOUT_SECONDS)}s.\n"
+            "\n"
+            "  Its shim cannot be replaced while it is alive, so the update "
+            "would fail\n"
+            "  partway through and leave the install half-migrated. Close that "
+            "window,\n"
+            "  then re-run `hermes update`."
+        )
+        from hermes_cli.update_lock import UPDATE_EXIT_CONCURRENT
+
+        sys.exit(UPDATE_EXIT_CONCURRENT)
+    # ----------------------------------------------------------------------
+
     gateway_mode = getattr(args, "gateway", False)
 
     # Protect against mid-update terminal disconnects (SIGHUP) and tolerate
