@@ -1360,6 +1360,57 @@ class TestGatewaySessionDbRecovery:
         ]
         db.close()
 
+    def test_compression_reroute_revalidates_lineage_before_append(
+        self, tmp_path, monkeypatch
+    ):
+        import threading
+        from types import SimpleNamespace
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session("parent", source="telegram")
+            db.end_session("parent", "compression")
+            db.create_session("child", source="telegram", parent_session_id="parent")
+            db.replace_messages(
+                "child", [{"role": "user", "content": "summary"}]
+            )
+            original_find = db.find_live_compression_child
+
+            def racing_find(session_id):
+                child = original_find(session_id)
+                db.create_session(
+                    "ambiguous-sibling",
+                    source="telegram",
+                    parent_session_id="parent",
+                )
+                return child
+
+            monkeypatch.setattr(db, "find_live_compression_child", racing_find)
+            store = object.__new__(SessionStore)
+            store._db = db
+            store._lock = threading.RLock()
+            store._entries = {"route": SimpleNamespace(session_id="parent")}
+            store._loaded = True
+            store._save = lambda: None
+            store._transcript_retry_lock = threading.Lock()
+            store._dirty_transcripts = {}
+            store._transcript_append_failures = {}
+            store._fts_rebuild_attempted = False
+
+            store.append_to_transcript(
+                "parent", {"role": "assistant", "content": "must fail closed"}
+            )
+
+            assert [
+                m["content"] for m in db.get_messages_as_conversation("child")
+            ] == ["summary"]
+            assert [
+                m["content"] for m in store._dirty_transcripts["parent"]
+            ] == ["must fail closed"]
+            assert store._entries["route"].session_id == "parent"
+        finally:
+            db.close()
+
     def test_transcript_reroute_migrates_remaining_backlog_to_child(self):
         import threading
         from types import SimpleNamespace
@@ -1388,10 +1439,14 @@ class TestGatewaySessionDbRecovery:
         child_attempts = []
         failed_old_2 = False
 
-        def _append(session_id, message):
+        def _append(
+            session_id, message, *, compression_lineage_root=None
+        ):
             nonlocal failed_old_2
             if session_id == "parent":
                 raise CompressionSessionClosedError("parent")
+            if message["content"] == "old-1":
+                assert compression_lineage_root == "parent"
             child_attempts.append(message["content"])
             if message["content"] == "old-2" and not failed_old_2:
                 failed_old_2 = True

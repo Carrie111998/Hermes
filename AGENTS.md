@@ -1201,12 +1201,15 @@ invalidation. See `/skills install --now` for the canonical pattern.
 ### Compression-final persistence
 
 - A long-running turn can publish a compression child before its final durable
-  flush completes. If the atomic message batch then raises
-  `CompressionSessionClosedError`, adopt only the unique live continuation via
-  `recover_rotated_compression_session()` and retry that same batch once. Do not
-  reroute other persistence errors, guess among ambiguous children, or stamp
+  flush completes, and it can remain stale across several later compression
+  generations. If the atomic message batch then raises
+  `CompressionSessionClosedError`, walk to the live tip only when **every**
+  durable compression edge has exactly one canonical continuation; then retry
+  that same batch once. Do not reroute other persistence errors, stop at an
+  already-compressed direct child, guess among ambiguous siblings, or stamp
   `_db_persisted` before the retry succeeds. Keep the real-`SessionDB`
-  regression in `tests/run_agent/test_flush_compression_child_adoption.py`.
+  regressions in `tests/run_agent/test_flush_compression_child_adoption.py` and
+  `tests/state/test_compression_lineage_guard.py`.
 
 ### Background Process Notifications (Gateway)
 

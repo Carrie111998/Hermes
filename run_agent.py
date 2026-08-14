@@ -2302,24 +2302,35 @@ class AIAgent:
                         raise
                     stale_session_id = self.session_id
                     from agent.conversation_compression import (
-                        recover_rotated_compression_session,
+                        commit_rotated_compression_session,
+                        prepare_rotated_compression_session,
                     )
 
-                    recovered = recover_rotated_compression_session(self)
-                    if recovered is None or self.session_id == stale_session_id:
+                    recovery = prepare_rotated_compression_session(self)
+                    if recovery is None:
                         raise
+                    recovery_parent, recovery_child, _ = recovery
+                    candidate_session_id = str(recovery_child.get("id") or "")
+                    if (
+                        recovery_parent != stale_session_id
+                        or not candidate_session_id
+                        or candidate_session_id == stale_session_id
+                    ):
+                        raise
+                    self._session_db.append_messages_batch(
+                        session_id=candidate_session_id,
+                        messages=_batch_rows,
+                        compression_lock_holder=getattr(
+                            self, "_active_compression_lock_holder", None
+                        ),
+                        compression_lineage_root=stale_session_id,
+                    )
+                    commit_rotated_compression_session(self, recovery)
                     logger.info(
                         "Final session flush adopted compression continuation "
                         "%s -> %s",
                         stale_session_id,
                         self.session_id,
-                    )
-                    self._session_db.append_messages_batch(
-                        session_id=self.session_id,
-                        messages=_batch_rows,
-                        compression_lock_holder=getattr(
-                            self, "_active_compression_lock_holder", None
-                        ),
                     )
                 self._flushed_db_message_session_id = self.session_id
                 for _written in _batch_msgs:

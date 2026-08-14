@@ -58,3 +58,104 @@ def test_final_flush_adopts_unique_live_compression_child(tmp_path) -> None:
         ]
     finally:
         db.close()
+
+
+def test_final_flush_adopts_unique_multi_generation_compression_tip(tmp_path) -> None:
+    """A stale long-running turn may lag behind several durable rotations."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("parent", source="telegram")
+        db.append_message("parent", "user", "before first compression")
+        db.publish_compression_child(
+            parent_session_id="parent",
+            child_session_id="child",
+            source="telegram",
+            messages=[{"role": "user", "content": "first compressed handoff"}],
+            require_compression_lease=False,
+        )
+        db.publish_compression_child(
+            parent_session_id="child",
+            child_session_id="grandchild",
+            source="telegram",
+            messages=[{"role": "user", "content": "second compressed handoff"}],
+            require_compression_lease=False,
+        )
+        agent = _bare_agent(db, "parent")
+        final = {"role": "assistant", "content": "finished after two rotations"}
+
+        result = agent._flush_messages_to_session_db_unlocked(
+            [final], conversation_history=[]
+        )
+
+        assert result is True
+        assert agent.session_id == "grandchild"
+        assert agent._flushed_db_message_session_id == "grandchild"
+        assert final.get("_db_persisted") is True
+        assert [row["content"] for row in db.get_messages("grandchild")] == [
+            "second compressed handoff",
+            "finished after two rotations",
+        ]
+    finally:
+        db.close()
+
+
+def test_final_flush_revalidates_tip_when_lineage_changes_before_retry(
+    tmp_path, monkeypatch
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("parent", source="telegram")
+        db.append_message("parent", "user", "before first compression")
+        db.publish_compression_child(
+            parent_session_id="parent",
+            child_session_id="child",
+            source="telegram",
+            messages=[{"role": "user", "content": "first handoff"}],
+            require_compression_lease=False,
+        )
+        db.publish_compression_child(
+            parent_session_id="child",
+            child_session_id="grandchild",
+            source="telegram",
+            messages=[{"role": "user", "content": "second handoff"}],
+            require_compression_lease=False,
+        )
+        original_append = db.append_messages_batch
+        injected = False
+
+        def racing_append(*args, **kwargs):
+            nonlocal injected
+            session_id = kwargs.get("session_id") or args[0]
+            if session_id == "grandchild" and not injected:
+                injected = True
+                db.create_session(
+                    "ambiguous-sibling",
+                    source="telegram",
+                    parent_session_id="parent",
+                )
+            return original_append(*args, **kwargs)
+
+        monkeypatch.setattr(db, "append_messages_batch", racing_append)
+        agent = _bare_agent(db, "parent")
+        final = {"role": "assistant", "content": "must fail closed"}
+
+        result = agent._flush_messages_to_session_db_unlocked(
+            [final], conversation_history=[]
+        )
+
+        assert result is False
+        assert agent.session_id == "parent"
+        assert final.get("_db_persisted") is not True
+
+        retry_result = agent._flush_messages_to_session_db_unlocked(
+            [final], conversation_history=[]
+        )
+
+        assert retry_result is False
+        assert agent.session_id == "parent"
+        assert final.get("_db_persisted") is not True
+        assert [row["content"] for row in db.get_messages("grandchild")] == [
+            "second handoff"
+        ]
+    finally:
+        db.close()

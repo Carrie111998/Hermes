@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
@@ -42,6 +43,128 @@ def test_find_live_compression_child_fails_closed_when_ambiguous(db: SessionDB) 
     db.create_session("child-b", source="webui", parent_session_id="parent")
 
     assert db.find_live_compression_child("parent") is None
+
+
+def test_find_live_compression_child_follows_unique_compression_chain(
+    db: SessionDB,
+) -> None:
+    _compression_parent(db)
+    db.create_session("child", source="webui", parent_session_id="parent")
+    db.end_session("child", "compression")
+    db.create_session("grandchild", source="webui", parent_session_id="child")
+
+    tip = db.find_live_compression_child("parent")
+
+    assert tip is not None
+    assert tip["id"] == "grandchild"
+    assert tip["parent_session_id"] == "child"
+    assert tip["ended_at"] is None
+
+
+def test_find_live_compression_child_fails_closed_on_ambiguous_chain(
+    db: SessionDB,
+) -> None:
+    _compression_parent(db)
+    db.create_session("child-a", source="webui", parent_session_id="parent")
+    db.end_session("child-a", "compression")
+    db.create_session("tip-a", source="webui", parent_session_id="child-a")
+    db.create_session("child-b", source="webui", parent_session_id="parent")
+    db.end_session("child-b", "compression")
+    db.create_session("tip-b", source="webui", parent_session_id="child-b")
+
+    assert db.find_live_compression_child("parent") is None
+
+
+def test_find_live_compression_child_uses_one_snapshot_during_walk(tmp_path) -> None:
+    path = tmp_path / "state.db"
+    reader = SessionDB(db_path=path)
+    writer = SessionDB(db_path=path)
+    try:
+        _compression_parent(reader)
+        reader.create_session("child", source="webui", parent_session_id="parent")
+        reader.end_session("child", "compression")
+        ready = threading.Event()
+        proceed = threading.Event()
+
+        class PausingConnection:
+            def __init__(self, inner):
+                self.inner = inner
+                self.paused = False
+
+            def execute(self, sql, params=()):
+                cursor = self.inner.execute(sql, params)
+                if (
+                    not self.paused
+                    and "WHERE s.parent_session_id = ?" in sql
+                    and params
+                    and params[0] == "parent"
+                ):
+                    self.paused = True
+                    ready.set()
+                    assert proceed.wait(5)
+                return cursor
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+        reader._conn = PausingConnection(reader._conn)
+
+        def mutate_lineage() -> None:
+            assert ready.wait(5)
+            writer.create_session(
+                "ambiguous-sibling", source="webui", parent_session_id="parent"
+            )
+            writer.create_session(
+                "grandchild", source="webui", parent_session_id="child"
+            )
+            proceed.set()
+
+        thread = threading.Thread(target=mutate_lineage)
+        thread.start()
+        observed = reader.find_live_compression_child("parent")
+        thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert observed is None
+        assert reader.find_live_compression_child("parent") is None
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_batch_append_revalidates_compression_tip_inside_write_transaction(
+    db: SessionDB,
+) -> None:
+    _compression_parent(db)
+    db.create_session("child", source="webui", parent_session_id="parent")
+    db.create_session("sibling", source="webui", parent_session_id="parent")
+
+    with pytest.raises(RuntimeError, match="closed by compression"):
+        db.append_messages_batch(
+            "child",
+            [{"role": "assistant", "content": "must not choose a sibling"}],
+            compression_lineage_root="parent",
+        )
+
+    assert db.get_messages("child") == []
+
+
+def test_single_append_revalidates_compression_tip_inside_write_transaction(
+    db: SessionDB,
+) -> None:
+    _compression_parent(db)
+    db.create_session("child", source="webui", parent_session_id="parent")
+    db.create_session("sibling", source="webui", parent_session_id="parent")
+
+    with pytest.raises(RuntimeError, match="closed by compression"):
+        db.append_message(
+            "child",
+            "assistant",
+            "must not choose a sibling",
+            compression_lineage_root="parent",
+        )
+
+    assert db.get_messages("child") == []
 
 
 def test_reopen_orphaned_compression_session_reopens_parent_without_child(
