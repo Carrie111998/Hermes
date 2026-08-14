@@ -499,8 +499,8 @@ class RealtimeVoiceSession(abc.ABC):
         return self._validated_events()
 
     async def _validated_events(self) -> AsyncIterator[RealtimeVoiceEvent]:
-        events = self._events()
         try:
+            events = self._events()
             try:
                 async for event in events:
                     if not isinstance(event, RealtimeVoiceEvent):

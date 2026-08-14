@@ -427,6 +427,11 @@ class _FinalizingEventSession(_Session):
         return stream()
 
 
+class _FailingEventFactorySession(_Session):
+    def _events(self):
+        raise RuntimeError("event factory failed")
+
+
 class _FailingContinuationSession(_Session):
     def __init__(self) -> None:
         super().__init__({RealtimeCapability.CONTINUATION})
@@ -786,6 +791,18 @@ async def test_event_stream_stops_after_first_terminal_session_event() -> None:
         SessionClosed(reason="normal")
     ]
     assert session.stream_finalized.is_set()
+
+
+@pytest.mark.asyncio
+async def test_event_factory_failure_clears_continuation_state() -> None:
+    session = _FailingEventFactorySession({RealtimeCapability.CONTINUATION})
+    await session.continue_response("batch")
+
+    with pytest.raises(RuntimeError, match="event factory failed"):
+        await anext(session.events())
+
+    assert not session._pending_continuation_batch_ids
+    assert not session._continuation_responses
 
 
 @pytest.mark.asyncio
