@@ -3739,73 +3739,73 @@ class SessionStore:
         return session_id
 
     def _drain_spooled_drops_for_target(self, target_session_id: str) -> bool:
-        """Replay older source spools before any queued row for the target."""
+        """Globally merge all older source spools before queued target rows."""
         spooled_sessions = getattr(self, "_spooled_drop_sessions", None)
-        if not spooled_sessions:
-            return True
-        reroutes = getattr(self, "_transcript_reroutes", {})
-        sources = []
-        for source_session_id in tuple(spooled_sessions):
-            if (
-                self._resolve_transcript_reroute_target(source_session_id)
-                != target_session_id
-            ):
-                continue
-            # A farther ancestor was rerouted earlier than its descendants, so
-            # its source-keyed spool must drain first. This also orders a root
-            # spool before a child spool created by a later retry-cap eviction.
-            distance = 0
-            cursor = source_session_id
-            seen = set()
-            while cursor != target_session_id and cursor not in seen:
-                seen.add(cursor)
-                next_cursor = reroutes.get(cursor)
-                if not next_cursor:
-                    break
-                cursor = next_cursor
-                distance += 1
-            sources.append((distance, source_session_id))
-        for _distance, source_session_id in sorted(
-            sources, key=lambda item: (-item[0], item[1])
-        ):
-            if not self._drain_spooled_drops(
-                source_session_id,
-                target_session_id=target_session_id,
-            ):
-                return False
-        return True
-
-    def _drain_spooled_drops(
-        self,
-        spool_session_id: str,
-        *,
-        target_session_id: Optional[str] = None,
-    ) -> bool:
-        """Replay cap-dropped spooled transcript messages after DB recovery.
-
-        ``spool_session_id`` remains the on-disk selector. A rerouted replay
-        writes to ``target_session_id`` under the original root guard; failures
-        therefore keep both the source-keyed file and process-local reroute for
-        the next successful child flush. Nothing here may raise into the caller.
-        """
-        spooled_sessions = getattr(self, "_spooled_drop_sessions", None)
-        if not spooled_sessions or spool_session_id not in spooled_sessions:
-            return True
-        target_session_id = target_session_id or spool_session_id
-        lineage_kwargs = (
-            {"compression_lineage_root": spool_session_id}
-            if target_session_id != spool_session_id
-            else {}
-        )
+        if spooled_sessions is None:
+            spooled_sessions = set()
+            self._spooled_drop_sessions = spooled_sessions
+        sources = set()
         try:
-            from gateway.shutdown_flush import drain_transcript_spool
+            from gateway.shutdown_flush import drain_transcript_spools
 
-            def replay(message: Dict[str, Any]) -> None:
+            def resolve_target(source_session_id: str) -> str:
+                getter = getattr(self._db, "get_session", None)
+                if source_session_id == target_session_id and not callable(getter):
+                    # Strict legacy fakes expose a parent-only lineage finder.
+                    # Production SessionDB has get_session and takes the
+                    # durable canonicalization branch below.
+                    return target_session_id
+                finder = getattr(self._db, "find_live_compression_child", None)
+                if callable(finder):
+                    child = finder(source_session_id)
+                    child_id = (
+                        str(child.get("id") or "")
+                        if isinstance(child, dict)
+                        else ""
+                    )
+                    if child_id:
+                        return child_id
+
+                if callable(getter):
+                    source = getter(source_session_id)
+                    if not isinstance(source, dict):
+                        raise RuntimeError(
+                            "pending spool source session is missing"
+                        )
+                    if source.get("ended_at") is None:
+                        return source_session_id
+                    if source.get("end_reason") == "compression":
+                        raise RuntimeError(
+                            "pending spool compression lineage is ambiguous"
+                        )
+                    return source_session_id
+
+                # Compatibility for strict fakes/legacy stores without durable
+                # lineage readers. Production SessionDB always uses the branch
+                # above; process-local routing is only a fallback here.
+                return self._resolve_transcript_reroute_target(source_session_id)
+
+            # The caller may still hold a stale root while every process-local
+            # spool hint has been lost (for example after restart). Canonicalize
+            # the requested target first, then let the durable scanner discover
+            # every source whose lineage resolves to that live tip.
+            durable_reader = callable(getattr(self._db, "get_session", None))
+            if durable_reader:
+                target_session_id = resolve_target(target_session_id)
+
+            def replay(
+                source_session_id: str,
+                message: Dict[str, Any],
+                replay_key: str,
+            ) -> None:
+                append_kwargs: Dict[str, Any] = {"idempotency_key": replay_key}
+                if target_session_id != source_session_id:
+                    append_kwargs["compression_lineage_root"] = source_session_id
                 try:
                     self._append_transcript_message(
                         target_session_id,
                         message,
-                        **lineage_kwargs,
+                        **append_kwargs,
                     )
                 except Exception as exc:
                     if not (
@@ -3816,20 +3816,42 @@ class SessionStore:
                     self._append_transcript_message(
                         target_session_id,
                         message,
-                        **lineage_kwargs,
+                        **append_kwargs,
                     )
 
-            _replayed, remaining = drain_transcript_spool(
-                spool_session_id,
-                replay,
+            for _rotation in range(32):
+                sources = {
+                    source_session_id
+                    for source_session_id in tuple(spooled_sessions)
+                    if resolve_target(source_session_id) == target_session_id
+                }
+                _replayed, remaining, remaining_sources = drain_transcript_spools(
+                    sources,
+                    replay,
+                    target_session_id=target_session_id,
+                    resolve_target=resolve_target,
+                )
+                spooled_sessions.update(remaining_sources)
+                for source_session_id in sources - remaining_sources:
+                    spooled_sessions.discard(source_session_id)
+                if remaining:
+                    return False
+                if not durable_reader:
+                    return True
+                revalidated_target = resolve_target(target_session_id)
+                if revalidated_target == target_session_id:
+                    return True
+                target_session_id = revalidated_target
+
+            logger.warning(
+                "Transcript spool target kept rotating during drain; preserving "
+                "the pending queue"
             )
-            if not remaining:
-                spooled_sessions.discard(spool_session_id)
-            return remaining == 0
+            return False
         except Exception as exc:
             logger.warning(
-                "Failed to drain transcript spool for %s into %s: %s",
-                spool_session_id,
+                "Failed to drain transcript spools %s into %s: %s",
+                sorted(sources),
                 target_session_id,
                 exc,
             )
@@ -3841,6 +3863,7 @@ class SessionStore:
         message: Dict[str, Any],
         *,
         compression_lineage_root: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> None:
         """Write one transcript row. Caller handles retry queuing."""
         db = self._db
@@ -3877,6 +3900,8 @@ class SessionStore:
         # guard is needed only for an actual stale-source reroute.
         if compression_lineage_root:
             append_kwargs["compression_lineage_root"] = compression_lineage_root
+        if idempotency_key:
+            append_kwargs["idempotency_key"] = idempotency_key
         db.append_message(**append_kwargs)
 
     # Maximum in-memory pending messages per session before dropping the

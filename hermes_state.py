@@ -8197,6 +8197,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         display_metadata: Optional[Dict[str, Any]] = None,
         compression_lock_holder: Optional[str] = None,
         compression_lineage_root: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -8221,6 +8222,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``compression_lineage_root`` is set only by a reroute from a stale
         compression parent. The expected ``session_id`` tip is revalidated
         inside this method's write transaction before the row is inserted.
+
+        ``idempotency_key`` identifies an external durable retry record such
+        as a pending transcript spool file. The key check, message insert,
+        counter update, and key publication share one transaction, so a crash
+        after commit but before spool cleanup cannot duplicate the row.
         """
         # Display metadata is presentation-only and never changes the model
         # context role/content replayed to providers.
@@ -8242,6 +8248,47 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # cannot bind list/dict parameters directly.
         stored_content = self._encode_content(content)
 
+        identity_values = {
+            "role": role,
+            "content": stored_content,
+            "tool_call_id": tool_call_id,
+            "tool_calls": tool_calls_json,
+            "tool_name": _scrub_surrogates(tool_name),
+            "effect_disposition": effect_disposition,
+            "token_count": token_count,
+            "finish_reason": finish_reason,
+            "reasoning": _scrub_surrogates(reasoning),
+            "reasoning_content": _scrub_surrogates(reasoning_content),
+            "reasoning_details": reasoning_details_json,
+            "codex_reasoning_items": codex_items_json,
+            "codex_message_items": codex_message_items_json,
+            "platform_message_id": platform_message_id,
+            "observed": 1 if observed else 0,
+            "api_content": (
+                _scrub_surrogates(api_content)
+                if isinstance(api_content, str)
+                else None
+            ),
+            "display_kind": (
+                _scrub_surrogates(display_kind)
+                if isinstance(display_kind, str)
+                else None
+            ),
+            "display_metadata": display_metadata_json,
+        }
+
+        def _idempotency_fingerprint(values: Dict[str, Any]) -> str:
+            canonical = json.dumps(
+                values,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                default=str,
+            )
+            return hashlib.sha256(canonical.encode("utf-8", "surrogatepass")).hexdigest()
+
+        idempotency_fingerprint = _idempotency_fingerprint(identity_values)
+
         message_timestamp = time.time()
         if timestamp is not None:
             try:
@@ -8257,6 +8304,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if tool_calls is not None:
             num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
 
+        idempotency_meta_key = None
+        if idempotency_key:
+            idempotency_meta_key = (
+                "message_append_idempotency:"
+                + _scrub_surrogates(str(idempotency_key))
+            )
+
         def _do(conn):
             self._check_transcript_write_guards(
                 conn,
@@ -8264,6 +8318,93 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 compression_lock_holder,
                 compression_lineage_root,
             )
+            if idempotency_meta_key:
+                existing = conn.execute(
+                    "SELECT value FROM state_meta WHERE key = ?",
+                    (idempotency_meta_key,),
+                ).fetchone()
+                if existing is not None:
+                    try:
+                        record = json.loads(existing[0])
+                    except (json.JSONDecodeError, TypeError) as exc:
+                        raise RuntimeError(
+                            "Invalid message append idempotency record for "
+                            f"{idempotency_key!r}"
+                        ) from exc
+                    if isinstance(record, int):
+                        message_id = record
+                        recorded_session_id = ""
+                        recorded_fingerprint = ""
+                    elif isinstance(record, dict):
+                        try:
+                            message_id = int(record["message_id"])
+                            recorded_session_id = str(record["session_id"])
+                            recorded_fingerprint = str(record["fingerprint"])
+                        except (KeyError, TypeError, ValueError) as exc:
+                            raise RuntimeError(
+                                "Invalid message append idempotency record for "
+                                f"{idempotency_key!r}"
+                            ) from exc
+                    else:
+                        raise RuntimeError(
+                            "Invalid message append idempotency record for "
+                            f"{idempotency_key!r}"
+                        )
+                    if message_id <= 0:
+                        raise RuntimeError(
+                            "Invalid message append idempotency record for "
+                            f"{idempotency_key!r}"
+                        )
+                    stored_row = conn.execute(
+                        """SELECT session_id, role, content, tool_call_id,
+                           tool_calls, tool_name, effect_disposition, token_count,
+                           finish_reason, reasoning, reasoning_content,
+                           reasoning_details, codex_reasoning_items,
+                           codex_message_items, platform_message_id, observed,
+                           api_content, display_kind, display_metadata
+                           FROM messages WHERE id = ?""",
+                        (message_id,),
+                    ).fetchone()
+                    if stored_row is None:
+                        raise RuntimeError(
+                            "Invalid message append idempotency record for "
+                            f"{idempotency_key!r}"
+                        )
+                    stored_session_id = str(stored_row["session_id"] or "")
+                    stored_values = {
+                        key: stored_row[key]
+                        for key in identity_values
+                    }
+                    stored_fingerprint = _idempotency_fingerprint(stored_values)
+                    if recorded_session_id and recorded_session_id != stored_session_id:
+                        raise RuntimeError(
+                            "Invalid message append idempotency record for "
+                            f"{idempotency_key!r}"
+                        )
+                    if recorded_fingerprint and recorded_fingerprint != stored_fingerprint:
+                        raise RuntimeError(
+                            "Invalid message append idempotency record for "
+                            f"{idempotency_key!r}"
+                        )
+                    if stored_fingerprint != idempotency_fingerprint:
+                        raise RuntimeError(
+                            "Message append idempotency conflict for "
+                            f"{idempotency_key!r}: payload differs"
+                        )
+                    if stored_session_id != session_id:
+                        live_tip = self._find_live_compression_child_on_conn(
+                            conn,
+                            stored_session_id,
+                        )
+                        live_tip_id = (
+                            str(live_tip.get("id") or "") if live_tip else ""
+                        )
+                        if live_tip_id != session_id:
+                            raise RuntimeError(
+                                "Message append idempotency conflict for "
+                                f"{idempotency_key!r}: target session differs"
+                            )
+                    return message_id
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
@@ -8307,6 +8448,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 conn.execute(
                     "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
                     (session_id,),
+                )
+            if idempotency_meta_key:
+                idempotency_record = json.dumps(
+                    {
+                        "message_id": msg_id,
+                        "session_id": session_id,
+                        "fingerprint": idempotency_fingerprint,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                conn.execute(
+                    "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                    (idempotency_meta_key, idempotency_record),
                 )
             return msg_id
 
