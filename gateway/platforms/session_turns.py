@@ -266,6 +266,14 @@ class SessionTurnLifecycleDispatcher:
         self._closed = True
         return accepted
 
+    def abort(self) -> bool:
+        """Stop delivery without inventing a non-durable terminal fact."""
+        if self._closed:
+            return False
+        accepted = self.emit("_close")
+        self._closed = True
+        return accepted
+
     def flush(self, timeout: Optional[float] = None) -> bool:
         """Wait for terminal delivery. Never call directly on the event loop."""
         return self._drained.wait(timeout)
@@ -273,6 +281,9 @@ class SessionTurnLifecycleDispatcher:
     def _run(self) -> None:
         while True:
             event, extra = self._queue.get()
+            if event == "_close":
+                self._drained.set()
+                return
             observation = _lifecycle_executor.observe_callback_started(event)
             try:
                 delivered = _emit_turn_lifecycle(
@@ -1096,6 +1107,7 @@ class SessionTurnService:
         self._tasks: Dict[str, asyncio.Task[Any]] = {}
         self._agent_refs: Dict[str, list[Any]] = {}
         self._lifecycle_dispatchers: Dict[str, SessionTurnLifecycleDispatcher] = {}
+        self._lifecycle_cleanup_owners: set[str] = set()
         # Assistant text deltas are intentionally process-local. Canonical
         # SessionDB messages are the only durable transcript authority.
         self._volatile_events: Dict[str, Dict[int, Dict[str, Any]]] = {}
@@ -1198,29 +1210,86 @@ class SessionTurnService:
 
         if created:
             # reserve() committed the runnable identity before this observation.
-            # Construct before scheduling: its bounded FIFO already contains
-            # registered, so started can never overtake it.
-            self._lifecycle_dispatchers[turn_id] = SessionTurnLifecycleDispatcher(
-                session_id, turn_id
+            self._admit_execution(
+                store, turn_id, session_id, payload, binding, slack_adapter
             )
-            task = asyncio.create_task(
-                self._execute(store, turn_id, session_id, payload, binding, slack_adapter)
-            )
-            self._tasks[turn_id] = task
-            try:
-                self.adapter._background_tasks.add(task)
-                task.add_done_callback(self.adapter._background_tasks.discard)
-            except (AttributeError, TypeError):
-                pass
-            task.add_done_callback(lambda _task, tid=turn_id: self._tasks.pop(tid, None))
         public = store.public_turn(turn_id)
         return web.json_response(
             {"object": "hermes.session.turn.accepted" if created else "hermes.session.turn.reused", "turn": public},
             status=202 if created else 200,
         )
 
+    def _track_background_task(self, task: asyncio.Task[Any]) -> None:
+        try:
+            self.adapter._background_tasks.add(task)
+            task.add_done_callback(self.adapter._background_tasks.discard)
+        except (AttributeError, TypeError):
+            pass
+
+    def _admit_execution(
+        self,
+        store: SessionTurnStore,
+        turn_id: str,
+        session_id: str,
+        payload: Dict[str, Any],
+        binding: Optional[SlackBinding],
+        slack_adapter: Any,
+    ) -> asyncio.Task[Any]:
+        """Own task admission and its never-entered cancellation seam."""
+        # Construct before scheduling: registered is already first in its FIFO.
+        dispatcher = SessionTurnLifecycleDispatcher(session_id, turn_id)
+        self._lifecycle_dispatchers[turn_id] = dispatcher
+        entered = [False]
+        task = asyncio.create_task(
+            self._execute(
+                store,
+                turn_id,
+                session_id,
+                payload,
+                binding,
+                slack_adapter,
+                entered,
+            )
+        )
+        self._tasks[turn_id] = task
+        self._track_background_task(task)
+
+        def execution_done(done: asyncio.Task[Any]) -> None:
+            if done.cancelled() and not entered[0]:
+                # A coroutine cancelled before its first instruction cannot run
+                # _execute's try/finally. Transfer all ownership to the same
+                # cleanup seam used by the normal execution epilogue.
+                cleanup = asyncio.create_task(
+                    self._finalize_execution(
+                        store,
+                        turn_id,
+                        cancelled_before_entry=True,
+                    )
+                )
+                self._tasks[turn_id] = cleanup
+                self._track_background_task(cleanup)
+                cleanup.add_done_callback(
+                    lambda finished, tid=turn_id: self._remove_task_if_current(
+                        tid, finished
+                    )
+                )
+            else:
+                self._remove_task_if_current(turn_id, done)
+
+        task.add_done_callback(execution_done)
+        return task
+
+    def _remove_task_if_current(
+        self, turn_id: str, task: asyncio.Task[Any]
+    ) -> None:
+        if self._tasks.get(turn_id) is task:
+            self._tasks.pop(turn_id, None)
+
     async def _execute(self, store: SessionTurnStore, turn_id: str, session_id: str,
-                       payload: Dict[str, Any], binding: Optional[SlackBinding], slack_adapter: Any) -> None:
+                       payload: Dict[str, Any], binding: Optional[SlackBinding], slack_adapter: Any,
+                       entered: Optional[list[bool]] = None) -> None:
+        if entered is not None:
+            entered[0] = True
         agent_ref: list[Any] = [None]
         execution_lease = None
         heartbeat_task: Optional[asyncio.Task[Any]] = None
@@ -1432,15 +1501,54 @@ class SessionTurnService:
             store.finish(turn_id, "failed", safe_error_code="run_failed")
             store.append_event(turn_id, "turn.failed", {"status": "failed", "error_code": "run_failed"})
         finally:
+            await self._finalize_execution(
+                store,
+                turn_id,
+                execution_lease=execution_lease,
+                heartbeat_task=heartbeat_task,
+            )
+
+    async def _finalize_execution(
+        self,
+        store: SessionTurnStore,
+        turn_id: str,
+        *,
+        cancelled_before_entry: bool = False,
+        execution_lease: Any = None,
+        heartbeat_task: Optional[asyncio.Task[Any]] = None,
+    ) -> None:
+        """Idempotently clean up either admission or normal execution exit."""
+        if turn_id in self._lifecycle_cleanup_owners:
+            return
+        self._lifecycle_cleanup_owners.add(turn_id)
+        dispatcher = self._lifecycle_dispatchers.get(turn_id)
+        try:
+            if cancelled_before_entry:
+                changed = store.finish(
+                    turn_id,
+                    "interrupted",
+                    safe_error_code="cancelled_before_execution",
+                )
+                if changed:
+                    store.append_event(
+                        turn_id,
+                        "turn.interrupted",
+                        {
+                            "status": "interrupted",
+                            "error_code": "cancelled_before_execution",
+                        },
+                    )
+
             if heartbeat_task is not None:
                 heartbeat_task.cancel()
                 try:
                     await heartbeat_task
                 except asyncio.CancelledError:
                     pass
-            # The durable ledger is the outcome authority. This single epilogue
-            # maps every coordinator exit without leaking safe_error_code or raw
-            # exception text, and emits nothing while execution remains live.
+
+            # The durable ledger alone authorizes public terminal truth. If it
+            # cannot supply a terminal row, stop the private dispatcher without
+            # synthesizing a lifecycle terminal.
             row = store.get(turn_id)
             status = row.get("status") if row else None
             outcome = (
@@ -1452,38 +1560,38 @@ class SessionTurnService:
                 if isinstance(status, str)
                 else None
             )
-            if outcome is not None:
-                if dispatcher is not None:
+            if dispatcher is not None:
+                if outcome is None:
+                    dispatcher.abort()
+                else:
                     dispatcher.close(outcome)
-            try:
-                if execution_lease is not None:
-                    # A caller may cancel this coordinator repeatedly during
-                    # unwind. Keep re-awaiting the lease's one shielded release
-                    # operation until durable ownership and heartbeat are gone.
-                    while True:
-                        try:
-                            await execution_lease.release()
-                            break
-                        except asyncio.CancelledError:
-                            continue
-                # Observer completion is bounded and happens only after lease
-                # release. Shield one to_thread call so repeated cancellation
-                # cannot spawn abandoned flush workers.
-                if dispatcher is not None and outcome is not None:
-                    flush_task = asyncio.create_task(
-                        asyncio.to_thread(
-                            dispatcher.flush, SESSION_TURN_LIFECYCLE_FLUSH_SECONDS
-                        )
+
+            if execution_lease is not None:
+                # Re-await the lease's single shielded release operation through
+                # repeated coordinator cancellation.
+                while True:
+                    try:
+                        await execution_lease.release()
+                        break
+                    except asyncio.CancelledError:
+                        continue
+
+            if dispatcher is not None:
+                flush_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        dispatcher.flush, SESSION_TURN_LIFECYCLE_FLUSH_SECONDS
                     )
-                    while True:
-                        try:
-                            await asyncio.shield(flush_task)
-                            break
-                        except asyncio.CancelledError:
-                            continue
-            finally:
-                self._agent_refs.pop(turn_id, None)
-                self._lifecycle_dispatchers.pop(turn_id, None)
+                )
+                while True:
+                    try:
+                        await asyncio.shield(flush_task)
+                        break
+                    except asyncio.CancelledError:
+                        continue
+        finally:
+            self._agent_refs.pop(turn_id, None)
+            self._lifecycle_dispatchers.pop(turn_id, None)
+            self._lifecycle_cleanup_owners.discard(turn_id)
 
     async def _deliver_slack(self, store: SessionTurnStore, turn_id: str, binding: SlackBinding,
                              slack_adapter: Any, content: str) -> None:

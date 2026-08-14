@@ -1228,6 +1228,97 @@ async def test_coordinator_cancellation_retains_worker_heartbeat_lease_and_termi
 
 
 @pytest.mark.asyncio
+async def test_immediate_prestart_cancellation_reclaims_all_lifecycle_capacity(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    """Never-entered coordinators still durably terminate and drain observers."""
+    import gateway.platforms.session_turns as session_turns
+
+    lifecycle = []
+
+    def capture(hook, **kwargs):
+        if hook == "session_turn_lifecycle":
+            lifecycle.append(dict(kwargs["dto"]))
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    store = SessionTurnStore(session_db)
+    admitted: dict[str, bool] = {}
+    tasks = []
+
+    # No await occurs between create_task and cancel: all 80 coordinators are
+    # deterministically cancelled before their coroutine's first instruction.
+    for index in range(80):
+        session_id = "s1" if index == 0 else f"prestart-session-{index}"
+        if index:
+            session_db.create_session(session_id, "api_server")
+        turn_id = f"prestart-turn-{index}"
+        store.reserve(session_id, turn_id, _payload(turn_id))
+        task = service._admit_execution(
+            store, turn_id, session_id, _payload(turn_id), None, None
+        )
+        admitted[turn_id] = service._lifecycle_dispatchers[turn_id]._admitted
+        task.cancel()
+        tasks.append(task)
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        stats = session_turns.session_turn_lifecycle_executor_stats()
+        if (
+            not service._tasks
+            and not service._lifecycle_dispatchers
+            and stats["active"] == 0
+            and stats["pending"] == 0
+        ):
+            break
+        await asyncio.sleep(0.01)
+
+    assert service._tasks == {}
+    assert service._lifecycle_dispatchers == {}
+    stats = session_turns.session_turn_lifecycle_executor_stats()
+    assert stats["active"] == stats["pending"] == 0
+
+    by_turn = {
+        turn_id: [item for item in lifecycle if item["turn_id"] == turn_id]
+        for turn_id in admitted
+    }
+    for turn_id, was_admitted in admitted.items():
+        row = store.get(turn_id)
+        assert row["status"] == "interrupted"
+        assert row["safe_error_code"] == "cancelled_before_execution"
+        events = by_turn[turn_id]
+        if was_admitted:
+            assert [item["event"] for item in events] == ["registered", "terminal"]
+            assert events[-1]["terminal_outcome"] == "cancelled"
+        else:
+            # Executor saturation is the contract's explicit observer fail-open.
+            assert events == []
+
+    # Recovered observer/executor capacity must support a complete later turn.
+    async def run_agent(**kwargs):
+        session_db.append_message("s1", "user", kwargs["user_message"])
+        session_db.append_message("s1", "assistant", "recovered")
+        return {"final_response": "recovered"}, {}
+
+    adapter._run_agent = run_agent
+    normal_id = "post-prestart-normal"
+    store.reserve("s1", normal_id, _payload("normal"))
+    service._admit_execution(store, normal_id, "s1", _payload("normal"), None, None)
+    await service.wait_for_turn(normal_id)
+    normal = [item for item in lifecycle if item["turn_id"] == normal_id]
+    assert store.get(normal_id)["status"] == "completed"
+    assert [item["event"] for item in normal] == ["registered", "started", "terminal"]
+    assert normal[-1]["terminal_outcome"] == "succeeded"
+    assert service._tasks == {}
+    assert service._lifecycle_dispatchers == {}
+
+
+@pytest.mark.asyncio
 async def test_slow_observer_never_blocks_post_worker_or_lease_release(
     session_db, monkeypatch: pytest.MonkeyPatch
 ):
