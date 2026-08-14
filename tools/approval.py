@@ -16,6 +16,7 @@ import hashlib
 import logging
 import os
 import re
+import secrets
 import shlex
 import sys
 import tempfile
@@ -2530,7 +2531,7 @@ def _denial_breaker_addendum(session_key: str) -> str:
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason")
+    __slots__ = ("event", "data", "result", "reason", "approval_id")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
@@ -2540,6 +2541,12 @@ class _ApprovalEntry:
         # (``/deny <reason>``) so the agent can adapt instead of only
         # hearing "denied". Ported from qwibitai/nanoclaw#2832.
         self.reason: Optional[str] = None
+        # Opaque unpredictable id, always present. Ordinary (non
+        # ``exact_operation``) entries can still be resolved via plain FIFO
+        # for backward compatibility; ``exact_operation`` entries (owner
+        # mutation confirmations) can ONLY be resolved by this id — see
+        # ``resolve_gateway_approval``.
+        self.approval_id: str = data.get("approval_id") or secrets.token_urlsafe(24)
 
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
@@ -2573,13 +2580,27 @@ def unregister_gateway_notify(session_key: str) -> None:
 
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
-                             reason: Optional[str] = None) -> int:
+                             reason: Optional[str] = None,
+                             approval_id: Optional[str] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
-    When *resolve_all* is True every pending approval in the session is
-    resolved at once (``/approve all``).  Otherwise only the oldest one
-    is resolved (FIFO).
+    When *approval_id* is supplied, ONLY the entry whose ``approval_id``
+    matches it is resolved — anywhere in the queue, not just the head — and
+    *resolve_all* is ignored. A missing, unknown, stale (already dropped by
+    timeout), or already-consumed id resolves nothing (returns 0); this
+    never falls through to FIFO. An ``exact_operation`` entry additionally
+    rejects any choice other than ``"once"``/``"deny"`` (no session/always/
+    permanent bypass) — an invalid choice against such an entry also
+    resolves nothing, leaving it queued for a correct response.
+
+    Without *approval_id*: when *resolve_all* is True every pending
+    ordinary approval in the session is resolved at once (``/approve
+    all``) — ``exact_operation`` entries are excluded from the sweep and
+    remain queued (bulk actions never satisfy an exact-operation
+    confirmation). Otherwise the oldest ordinary entry is resolved (FIFO);
+    an ``exact_operation`` entry at the head blocks plain FIFO resolution
+    (resolves nothing) since it requires its own id.
 
     *reason* is an optional free-text explanation attached to an explicit
     deny (``/deny <reason>``).  It is relayed back to the agent in the
@@ -2591,11 +2612,27 @@ def resolve_gateway_approval(session_key: str, choice: str,
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
-        if resolve_all:
-            targets = list(queue)
-            queue.clear()
+
+        if approval_id:
+            target = next((e for e in queue if e.approval_id == approval_id), None)
+            if target is None:
+                return 0
+            if target.data.get("exact_operation") and choice not in ("once", "deny"):
+                return 0
+            queue.remove(target)
+            targets = [target]
+        elif resolve_all:
+            targets = [e for e in queue if not e.data.get("exact_operation")]
+            if not targets:
+                return 0
+            remaining = [e for e in queue if e.data.get("exact_operation")]
+            queue[:] = remaining
         else:
+            head = queue[0]
+            if head.data.get("exact_operation"):
+                return 0
             targets = [queue.pop(0)]
+
         if not queue:
             _gateway_queues.pop(session_key, None)
 
@@ -3850,20 +3887,30 @@ def _transport_denied_result(
 
 
 def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
-                            *, surface: str = "gateway") -> dict:
+                            *, surface: str = "gateway",
+                            timeout_seconds: Optional[float] = None) -> dict:
     """Enqueue *approval_data*, notify the user, and block the calling agent
     thread until the request is resolved or the gateway approval timeout
     elapses — firing pre/post approval hooks and cleaning up the queue entry.
 
-    Shared by the terminal command guard (``check_all_command_guards``) and
-    the execute_code guard (``check_execute_code_guard``) so the fiddly
-    heartbeat-polling wait loop lives in one place.
+    Shared by the terminal command guard (``check_all_command_guards``),
+    the execute_code guard (``check_execute_code_guard``), and exact-operation
+    owner-mutation confirmations (``request_exact_operation_approval``) so
+    the fiddly heartbeat-polling wait loop and the queue entry's opaque
+    ``approval_id`` (generated here, unconditionally, for every entry) live
+    in one place.
+
+    ``timeout_seconds`` overrides the configured approval timeout (used by
+    expiry-bound exact-operation confirmations); ``None`` keeps the existing
+    ``_get_approval_timeout()`` behavior.
 
     Returns ``{"resolved": bool, "choice": str|None}`` on completion, or
     ``{"resolved": False, "choice": None, "notify_failed": True}`` if the
     notify callback raised.  Persistence of an approved choice and building
     the final tool-facing result dict remain the caller's responsibility.
     """
+    approval_data = dict(approval_data)
+    approval_data.setdefault("approval_id", secrets.token_urlsafe(24))
     command = approval_data.get("command", "")
     description = approval_data.get("description", "")
     primary_key = approval_data.get("pattern_key", "")
@@ -3916,7 +3963,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     # every ~10s to the agent's inactivity tracker — otherwise the gateway
     # watchdog kills the agent while the user is still responding. Mirrors
     # _wait_for_process() cadence.
-    timeout = _get_approval_timeout()
+    timeout = _get_approval_timeout() if timeout_seconds is None else max(float(timeout_seconds), 0.0)
 
     try:
         from tools.environments.base import touch_activity_if_due
@@ -3977,6 +4024,61 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         choice=_outcome,
     )
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
+
+
+def request_exact_operation_approval(
+    session_key: str,
+    *,
+    operation: str,
+    payload_digest: str,
+    actor: str,
+    profile: str,
+    description: str,
+    timeout_seconds: Optional[float] = None,
+) -> dict:
+    """Exact-operation confirmation for an owner-workspace mutation.
+
+    Deliberately bypasses the session/permanent allowlist entirely (unlike
+    ``_run_approval_gate``/``request_tool_approval``): every call requires a
+    fresh human decision bound to this exact ``operation`` + payload digest +
+    actor + profile + gateway session, with no YOLO / session / always /
+    permanent / cached shortcut. Only ``"once"`` (approve exactly this call)
+    or ``"deny"`` are meaningful outcomes — ``resolve_gateway_approval``
+    enforces that at the queue layer for ``exact_operation`` entries, and
+    also refuses to let bulk ``resolve_all`` or bare FIFO satisfy one.
+
+    Returns ``{"approved": bool, "reason": str|None}``. ``approved`` is only
+    True when a human explicitly answered "once" for THIS entry before the
+    (expiry-bound) timeout elapsed. No attached gateway notify callback (no
+    human surface on this session) fails closed.
+    """
+    with _lock:
+        notify_cb = _gateway_notify_cbs.get(session_key)
+    if notify_cb is None:
+        return {"approved": False, "reason": "no_approval_surface"}
+
+    approval_data = {
+        "exact_operation": True,
+        "operation": operation,
+        "payload_digest": payload_digest,
+        "actor": actor,
+        "profile": profile,
+        "description": description,
+        "command": description,
+    }
+    outcome = _await_gateway_decision(
+        session_key,
+        notify_cb,
+        approval_data,
+        surface="owner_workspace",
+        timeout_seconds=timeout_seconds,
+    )
+    if not outcome.get("resolved"):
+        return {"approved": False, "reason": "timeout"}
+    choice = outcome.get("choice")
+    if choice != "once":
+        return {"approved": False, "reason": choice or "deny"}
+    return {"approved": True, "reason": None}
 
 
 def check_all_command_guards(command: str, env_type: str,
