@@ -219,15 +219,18 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Idempotency: TTL cache of recently processed delivery IDs.
         # Prevents duplicate agent runs when webhook providers retry.
-        # Keyed by (profile, route, delivery_id); bound to a body hash so a
-        # conflicting replay (same key, different body) can be reported as 409.
+        # Keyed by (profile, route, provider, delivery_id); bound to a body hash
+        # so a conflicting replay can be reported as 409.
         self._seen_deliveries: Dict[tuple, float] = {}
         self._seen_delivery_bodies: Dict[tuple, str] = {}
         self._idempotency_ttl: int = 3600  # 1 hour
+        self._idempotency_max_entries: int = int(
+            config.extra.get("idempotency_max_entries", 4096)
+        )
         self._seen_deliveries_next_prune_at: float = 0.0
 
-        # Rate limiting: per-route timestamps in a fixed window.
-        self._rate_counts: Dict[str, Deque[float]] = {}
+        # Rate limiting: per-profile/per-route timestamps in a fixed window.
+        self._rate_counts: Dict[tuple[str, str], Deque[float]] = {}
         self._rate_limit: int = int(config.extra.get("rate_limit", 30))  # per minute
 
         # Body size limit (auth-before-body pattern)
@@ -427,22 +430,37 @@ class WebhookAdapter(BasePlatformAdapter):
             self._delivery_info_created.pop(key, None)
 
     def _prune_seen_deliveries(self, now: float) -> None:
-        """Occasionally prune expired delivery IDs without scanning every POST."""
-        if now < self._seen_deliveries_next_prune_at:
+        """Prune expired and oldest idempotency entries to a hard size ceiling."""
+        if now < self._seen_deliveries_next_prune_at and len(self._seen_deliveries) <= self._idempotency_max_entries:
             return
         cutoff = now - self._idempotency_ttl
-        stale = [k for k, t in self._seen_deliveries.items() if t < cutoff]
-        for k in stale:
-            self._seen_deliveries.pop(k, None)
-            self._seen_delivery_bodies.pop(k, None)
-        self._seen_deliveries_next_prune_at = now + min(60.0, max(1.0, self._idempotency_ttl / 10))
+        stale = [key for key, seen_at in self._seen_deliveries.items() if seen_at < cutoff]
+        for key in stale:
+            self._seen_deliveries.pop(key, None)
+            self._seen_delivery_bodies.pop(key, None)
+        overflow = len(self._seen_deliveries) - self._idempotency_max_entries
+        if overflow > 0:
+            oldest = sorted(self._seen_deliveries, key=self._seen_deliveries.get)[:overflow]
+            for key in oldest:
+                self._seen_deliveries.pop(key, None)
+                self._seen_delivery_bodies.pop(key, None)
+        self._seen_deliveries_next_prune_at = now + min(
+            60.0, max(1.0, self._idempotency_ttl / 10)
+        )
 
-    def _record_rate_limit_hit(self, route_name: str, now: float) -> bool:
-        """Return True if route is still within limit after recording this hit."""
-        window = self._rate_counts.get(route_name)
+    def _record_rate_limit_hit(
+        self,
+        route_name: str,
+        now: float,
+        *,
+        profile: str | None = None,
+    ) -> bool:
+        """Record one hit against the profile/route-scoped rate bucket."""
+        key = (profile or self._profile_scope_key(), route_name)
+        window = self._rate_counts.get(key)
         if not isinstance(window, deque):
             new_window: Deque[float] = deque(window or ())
-            self._rate_counts[route_name] = new_window
+            self._rate_counts[key] = new_window
             window = new_window
         cutoff = now - _RATE_WINDOW_SECONDS
         while window and window[0] < cutoff:
@@ -477,6 +495,7 @@ class WebhookAdapter(BasePlatformAdapter):
         *,
         profile: str | None = None,
         route: str | None = None,
+        provider: str | None = None,
     ) -> bool:
         """Return True when this delivery should be processed.
 
@@ -490,6 +509,7 @@ class WebhookAdapter(BasePlatformAdapter):
         key = (
             profile or self._profile_scope_key(),
             route or self._active_route_key(),
+            provider or "generic",
             delivery_id,
         )
         entry = self._seen_deliveries.get(key)
@@ -719,6 +739,13 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"error": "Payload too large"}, status=413
             )
 
+        content_encoding = request.headers.get("Content-Encoding", "").strip().lower()
+        if content_encoding not in {"", "identity"}:
+            return web.json_response(
+                {"error": "Unsupported Content-Encoding"},
+                status=415,
+            )
+
         # Read body (must be done before any validation)
         try:
             raw_body = await request.read()
@@ -763,28 +790,39 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # ── Rate limiting (after auth) ───────────────────────────
         now = time.time()
-        if not self._record_rate_limit_hit(route_name, now):
+        if not self._record_rate_limit_hit(
+            route_name, now, profile=profile or "default"
+        ):
             return web.json_response(
                 {"error": "Rate limit exceeded"},
                 status=429,
                 headers={"Retry-After": str(_RATE_WINDOW_SECONDS)},
             )
 
-        # Parse payload
-        try:
-            payload = json.loads(raw_body)
-        except json.JSONDecodeError:
-            # Try form-encoded as fallback
+        # Parse according to an explicit media type. Invalid JSON never falls
+        # through into form parsing, and unsupported/missing types fail closed.
+        media_type = request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if media_type == "application/x-www-form-urlencoded":
             try:
                 import urllib.parse
-
-                payload = dict(
-                    urllib.parse.parse_qsl(raw_body.decode("utf-8"))
-                )
+                payload = dict(urllib.parse.parse_qsl(raw_body.decode("utf-8")))
             except Exception:
-                return web.json_response(
-                    {"error": "Cannot parse body"}, status=400
-                )
+                return web.json_response({"error": "Cannot parse form body"}, status=400)
+        elif media_type == "application/json" or media_type.endswith("+json"):
+            try:
+                payload = json.loads(raw_body)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return web.json_response({"error": "Cannot parse JSON body"}, status=400)
+        else:
+            return web.json_response(
+                {"error": "Unsupported Content-Type"},
+                status=415,
+            )
+        if not isinstance(payload, dict):
+            return web.json_response(
+                {"error": "JSON body must be an object"},
+                status=400,
+            )
 
         # Check event type filter
         event_type = (
@@ -820,6 +858,47 @@ class WebhookAdapter(BasePlatformAdapter):
                     "reason": "filter",
                     "route": route_name,
                 }
+            )
+
+        # WEBHOOK_REVOLUTION_TASK10_EARLY_IDEMPOTENCY_V1
+        # Record only after authentication, media-type parsing, event matching,
+        # and pure filters; always before route scripts or agent dispatch.
+        delivery_id = request.headers.get(
+            "X-GitHub-Delivery",
+            request.headers.get(
+                "svix-id",
+                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+            ),
+        )
+        now = time.time()
+        body_hash = hashlib.sha256(raw_body).hexdigest()
+        provider = str(
+            route_config.get("provider")
+            or route_config.get("signature_mode")
+            or "generic_v2"
+        )
+        idem_result = self._record_delivery_id(
+            delivery_id,
+            now,
+            body_hash,
+            profile=profile or "default",
+            route=route_name,
+            provider=provider,
+        )
+        if idem_result == "conflict":
+            return web.json_response(
+                {
+                    "status": "conflict",
+                    "delivery_id": delivery_id,
+                    "error": "Idempotency key reused with a different body",
+                },
+                status=409,
+            )
+        if not idem_result:
+            logger.info("[webhook] Skipping duplicate delivery %s", delivery_id)
+            return web.json_response(
+                {"status": "duplicate", "delivery_id": delivery_id},
+                status=200,
             )
 
         if route_config.get("script"):
@@ -879,47 +958,6 @@ class WebhookAdapter(BasePlatformAdapter):
                         )
             except Exception as e:
                 logger.warning("[webhook] Skill loading failed: %s", e)
-
-        # Build a unique delivery ID
-        delivery_id = request.headers.get(
-            "X-GitHub-Delivery",
-            request.headers.get(
-                "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
-            ),
-        )
-
-        # ── Idempotency ─────────────────────────────────────────
-        # Skip duplicate deliveries (webhook retries). Keyed by
-        # (profile, route, delivery_id) and bound to a body hash so the same
-        # provider delivery sent to different routes executes each route once
-        # (#7448), while a conflicting replay on the same route returns 409.
-        now = time.time()
-        body_hash = hashlib.sha256(raw_body).hexdigest()
-        idem_result = self._record_delivery_id(
-            delivery_id,
-            now,
-            body_hash,
-            profile=profile or "default",
-            route=route_name,
-        )
-        if idem_result == "conflict":
-            return web.json_response(
-                {
-                    "status": "conflict",
-                    "delivery_id": delivery_id,
-                    "error": "Idempotency key reused with a different body",
-                },
-                status=409,
-            )
-        if not idem_result:
-            logger.info(
-                "[webhook] Skipping duplicate delivery %s", delivery_id
-            )
-            return web.json_response(
-                {"status": "duplicate", "delivery_id": delivery_id},
-                status=200,
-            )
 
         # ── Direct delivery mode (deliver_only) ─────────────────
         # Skip the agent entirely — the rendered prompt IS the message we
@@ -1324,10 +1362,10 @@ class WebhookAdapter(BasePlatformAdapter):
         (#55829).
         """
         if not template:
-            truncated = json.dumps(payload, indent=2)[:4000]
+            raw_envelope = self._render_raw_payload(payload)
             return (
                 f"Webhook event '{event_type}' on route "
-                f"'{route_name}':\n\n```json\n{truncated}\n```"
+                f"'{route_name}':\n\n```json\n{raw_envelope}\n```"
             )
 
         def _resolve(match: re.Match) -> str:
@@ -1352,14 +1390,14 @@ class WebhookAdapter(BasePlatformAdapter):
     def _render_raw_payload(self, payload: dict, cap: int = 4000) -> str:
         """Render ``{__raw__}`` as a structurally valid JSON envelope.
 
-        ``original_bytes`` is the serialized payload length; when the payload
-        exceeds ``cap`` the ``payload`` field holds the bounded truncated
-        value and ``truncated`` is True, so the output always parses.
+        ``original_bytes`` and ``cap`` are measured in UTF-8 bytes. Truncation
+        never emits a partial code point, and the outer envelope always parses.
         """
         serialized = json.dumps(payload, indent=2, ensure_ascii=False)
-        original_bytes = len(serialized)
+        serialized_bytes = serialized.encode("utf-8")
+        original_bytes = len(serialized_bytes)
         truncated = original_bytes > cap
-        bounded = serialized[:cap]
+        bounded = serialized_bytes[:cap].decode("utf-8", errors="ignore")
         return json.dumps(
             {
                 "payload": bounded,
