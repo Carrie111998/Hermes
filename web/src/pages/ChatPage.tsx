@@ -672,6 +672,18 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       }
 
       if (pasteModifier && ev.key.toLowerCase() === "v") {
+        // Non-secure context (dashboard opened over plain http from a
+        // remote host): the async Clipboard API is undefined, so the
+        // read()/readText() path below can never succeed. Don't
+        // preventDefault — let the DOM paste event reach xterm, whose
+        // hidden textarea pastes without the Clipboard API (the same
+        // path context-menu paste uses).
+        if (
+          typeof navigator.clipboard?.read !== "function" &&
+          typeof navigator.clipboard?.readText !== "function"
+        ) {
+          return true;
+        }
         // preventDefault suppresses the DOM paste event, so image paste must
         // be handled here via clipboard.read() — readText() alone misses
         // image-only clipboards (the Discord / #24860 failure mode).
