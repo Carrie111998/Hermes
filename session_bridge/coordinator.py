@@ -4903,6 +4903,7 @@ class SessionBridgeCoordinator:
         selected_ids = staged_ids[: self._scan_batch_size]
         indexed = 0
         locally_owned = 0
+        deferred = 0
         for native_id in selected_ids:
             try:
                 summary = summaries_by_native_id.get(native_id)
@@ -4941,6 +4942,21 @@ class SessionBridgeCoordinator:
                 # subsequent cycle re-attempts the same thread forever and the
                 # provider never leaves the degraded state.
                 locally_owned += 1
+                continue
+            except (TimeoutError, StaleExternalProjection) as exc:
+                # Same reasoning as the branch above, for the other two benign
+                # conditions. A transport timeout describes the HOST, not this
+                # thread; a stale projection is a no-op. The generic handler below
+                # returns failed=1, which abandons the rest of the batch AND leaves
+                # the id staged -- observed as one thread
+                # (task:92a4c43cd63cdbff) failing every cycle with 22 items left.
+                deferred += 1
+                self._record_codex_scan_diagnostic(
+                    stage="persistent_project",
+                    native_id=native_id,
+                    exc=exc,
+                    adapter=adapter,
+                )
                 continue
             except Exception as exc:
                 self._record_codex_scan_diagnostic(
