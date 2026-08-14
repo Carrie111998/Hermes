@@ -560,6 +560,25 @@ class TestSteerMarkerContract:
         got refused as injection — it must not come back."""
         assert "User guidance:" not in format_steer_marker("hi")
 
+    def test_note_never_assembles_a_delivery_shaped_block(self):
+        """The note must document the markers without instantiating them.
+
+        A complete OPEN…CLOSE sequence in the system prompt is byte-
+        indistinguishable from a delivered steer, and models have treated
+        the old exemplar as a newly delivered empty message (#81828). Real
+        deliveries must keep matching the delivery shape; the note must not.
+        """
+        import re
+
+        from agent.prompt_builder import STEER_CHANNEL_NOTE
+
+        delivery_shaped = re.compile(
+            r"\[OUT-OF-BAND USER MESSAGE\b.*?\[/OUT-OF-BAND USER MESSAGE\]",
+            re.DOTALL,
+        )
+        assert delivery_shaped.search(format_steer_marker("hi"))
+        assert not delivery_shaped.search(STEER_CHANNEL_NOTE)
+
 
 class TestSteerCommandRegistry:
     def test_steer_in_command_registry(self):
