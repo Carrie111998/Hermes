@@ -274,6 +274,37 @@ class TestCronDenyModeAllGuards:
             result = check_all_command_guards("rm -rf /tmp/stuff", "local")
             assert result["approved"]
 
+    def test_cron_approve_takes_precedence_over_gateway_exec_ask(self, monkeypatch):
+        """Gateway's process-wide exec-ask flag must not strand cron jobs."""
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+
+        from unittest.mock import patch as mock_patch
+        with mock_patch("tools.approval._get_cron_approval_mode", return_value="approve"):
+            result = check_all_command_guards("rm -rf /tmp/stuff", "local")
+
+        assert result["approved"]
+        assert result.get("status") != "approval_required"
+
+    def test_cron_deny_takes_precedence_over_gateway_exec_ask(self, monkeypatch):
+        """Cron deny remains fail-closed when gateway exec-ask leaks in."""
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+
+        from unittest.mock import patch as mock_patch
+        with mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"):
+            result = check_all_command_guards("rm -rf /tmp/stuff", "local")
+
+        assert not result["approved"]
+        assert "BLOCKED" in result["message"]
+        assert result.get("status") != "approval_required"
+
     def test_tirith_content_threat_blocked_in_cron_deny(self, monkeypatch):
         """Content-level threats caught only by tirith (not the regex patterns)
         are blocked in cron-deny mode. Regression for #22070: previously the

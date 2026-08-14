@@ -4075,12 +4075,16 @@ def check_all_command_guards(command: str, env_type: str,
     is_cli = _is_interactive_cli()
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
+    is_cron = _is_cron_approval_context()
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
-    if not is_cli and not is_gateway and not is_ask:
+    # Cron context takes precedence over the gateway's process-wide
+    # HERMES_EXEC_ASK flag: scheduled jobs have no listener that can resolve a
+    # queued approval, so cron_mode must remain the authoritative policy.
+    if not is_cli and not is_gateway and (is_cron or not is_ask):
         # Cron sessions: respect cron_mode config
-        if _is_cron_approval_context():
+        if is_cron:
             if _get_cron_approval_mode() == "deny":
                 # Run detection to get a description for the block message
                 is_dangerous, _pk, description = detect_dangerous_command(command)
