@@ -119,7 +119,7 @@ class TestBuildRelaunchArgvEnvShebangInterpreter:
     def test_env_shebang_script_runs_under_current_interpreter(self, monkeypatch, tmp_path):
         script = self._env_shebang_script(tmp_path)
         monkeypatch.setattr(relaunch_mod, "resolve_hermes_bin", lambda: str(script))
-        argv = relaunch_mod.build_relaunch_argv(["--resume", "abc"])
+        argv = relaunch_mod.build_relaunch_argv(["--resume", "abc"], preserve_inherited=False)
         # Must NOT be [script, ...] — that execs via the env shebang.
         assert argv[0] == sys.executable
         assert argv[1] == str(script)
@@ -130,7 +130,7 @@ class TestBuildRelaunchArgvEnvShebangInterpreter:
         script.write_text("#!/opt/venv/bin/python\n")
         script.chmod(0o755)
         monkeypatch.setattr(relaunch_mod, "resolve_hermes_bin", lambda: str(script))
-        argv = relaunch_mod.build_relaunch_argv(["--resume", "abc"])
+        argv = relaunch_mod.build_relaunch_argv(["--resume", "abc"], preserve_inherited=False)
         # A pinned interpreter is trusted — direct exec preserved.
         assert argv == [str(script), "--resume", "abc"]
 
@@ -139,7 +139,7 @@ class TestBuildRelaunchArgvEnvShebangInterpreter:
         binary.write_bytes(b"\x7fELF not really, but no shebang")
         binary.chmod(0o755)
         monkeypatch.setattr(relaunch_mod, "resolve_hermes_bin", lambda: str(binary))
-        argv = relaunch_mod.build_relaunch_argv(["--resume", "abc"])
+        argv = relaunch_mod.build_relaunch_argv(["--resume", "abc"], preserve_inherited=False)
         assert argv == [str(binary), "--resume", "abc"]
 
     @pytest.mark.linux_only
