@@ -4923,6 +4923,7 @@ def launchd_start():
 def launchd_stop():
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
+    pid = None
     try:
         from gateway.status import get_running_pid, write_planned_stop_marker
 
@@ -4930,24 +4931,51 @@ def launchd_stop():
         if pid is not None:
             write_planned_stop_marker(pid)
     except Exception:
-        pass
+        pid = None
     # bootout unloads the service definition so KeepAlive doesn't respawn
     # the process.  A plain `kill SIGTERM` only signals the process — launchd
     # immediately restarts it because KeepAlive is unconditionally true.
     # `hermes gateway start` re-bootstraps when it detects the job is unloaded.
+    launchd_owns_exit = True
     try:
         subprocess.run(["launchctl", "bootout", target], check=True, timeout=90)
     except subprocess.CalledProcessError as e:
         # Job already unloaded (3/113/125), or the domain can't be managed at
         # all (5/125, macOS 26+ detached-fallback process, issue #23387) — in
-        # both cases just fall through to the PID-based kill below.
+        # both cases launchd is not supervising this exit, so the CLI owns the
+        # stop and falls through to the PID-based path below.
         if _launchd_error_indicates_unloaded(e) or _launchctl_domain_unsupported(
             e.returncode
         ):
-            pass
+            launchd_owns_exit = False
         else:
             raise
-    _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+    if launchd_owns_exit:
+        # bootout succeeded, so launchd sent SIGTERM and will escalate to
+        # SIGKILL on its own once the plist's ExitTimeOut expires. Forcing from
+        # here would pre-empt that budget and amputate the post-drain teardown,
+        # so only wait — long enough to actually observe launchd's escalation
+        # rather than returning early and reporting a stop that has not
+        # happened. Mirrors launchd_restart(), which likewise passes
+        # force_after=None.
+        _wait_for_gateway_exit(timeout=_GATEWAY_STOP_WAIT_SECONDS, force_after=None)
+    else:
+        # Nothing is supervising this process — launchd never took the job, or
+        # the domain is unmanageable and the gateway is a detached fallback
+        # process (#23387). The CLI is the only thing that will ever signal it,
+        # and previously the only signal it sent was a SIGKILL 5s in, so the
+        # gateway never got a graceful stop at all on this path. Terminate
+        # gracefully first, then escalate no sooner than the budget launchd
+        # itself would have granted.
+        if pid is not None:
+            try:
+                terminate_pid(pid, force=False)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        _wait_for_gateway_exit(
+            timeout=_GATEWAY_STOP_WAIT_SECONDS,
+            force_after=_GATEWAY_STOP_GRACE_SECONDS,
+        )
     print("✓ Service stopped")
 
 
