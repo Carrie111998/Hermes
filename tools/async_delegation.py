@@ -612,7 +612,19 @@ def consume_deferred_completions(
                     (now, delegation_id),
                 )
                 continue
-            prepared = prepare(event) if prepare is not None else event
+            try:
+                prepared = prepare(event) if prepare is not None else event
+            except Exception as exc:
+                # A durable row may outlive the code version that produced it.
+                # Keep that row retryable, but do not let one unformattable
+                # payload suppress every later completion for the session.
+                logger.warning(
+                    "Could not prepare deferred async completion %s; leaving "
+                    "it deferred while continuing with later rows: %s",
+                    delegation_id,
+                    type(exc).__name__,
+                )
+                continue
             cur = conn.execute(
                 """UPDATE async_delegations SET delivery_state='delivered',
                           delivered_at=?, updated_at=?

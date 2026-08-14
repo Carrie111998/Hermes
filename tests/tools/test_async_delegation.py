@@ -131,14 +131,48 @@ def test_deferred_completion_stays_parked_when_preparation_fails():
     def fail_to_prepare(_event):
         raise ValueError("cannot format event")
 
-    with pytest.raises(ValueError, match="cannot format event"):
-        ad.consume_deferred_completions(
-            "raw-api-session", prepare=fail_to_prepare,
-        )
+    assert ad.consume_deferred_completions(
+        "raw-api-session", prepare=fail_to_prepare,
+    ) == []
 
     row = ad.get_durable_delegation("deleg_api_prepare_failure")
     assert row is not None
     assert row["delivery_state"] == "deferred"
+
+
+def test_deferred_preparation_failure_does_not_block_later_valid_result():
+    _persist_completed_event(
+        delegation_id="deleg_api_prepare_failure",
+        origin_session_id="raw-api-session",
+    )
+    _persist_completed_event(
+        delegation_id="deleg_api_prepare_valid",
+        origin_session_id="raw-api-session",
+    )
+    for delegation_id in (
+        "deleg_api_prepare_failure",
+        "deleg_api_prepare_valid",
+    ):
+        claim_id = f"gateway:{delegation_id}"
+        assert ad.claim_completion_delivery(delegation_id, claim_id)
+        assert ad.defer_completion_delivery(delegation_id, claim_id)
+
+    def prepare(event):
+        if event["delegation_id"] == "deleg_api_prepare_failure":
+            raise ValueError("cannot format event")
+        return event["delegation_id"]
+
+    assert ad.consume_deferred_completions(
+        "raw-api-session", prepare=prepare,
+    ) == ["deleg_api_prepare_valid"]
+    assert (
+        ad.get_durable_delegation("deleg_api_prepare_failure")["delivery_state"]
+        == "deferred"
+    )
+    assert (
+        ad.get_durable_delegation("deleg_api_prepare_valid")["delivery_state"]
+        == "delivered"
+    )
 
 
 def test_active_for_session_counts_every_live_delegation_state():
