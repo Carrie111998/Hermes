@@ -72,10 +72,13 @@ def test_load_state_missing_file_returns_empty(state_file):
 
 
 def test_save_then_load_roundtrip(state_file):
-    from events.rate_limit_signal import _load_state, _save_state
+    from events.rate_limit_signal import _load_state, _save_state, _now_iso
+    # opened_at must be NOW, not a hardcoded wall-clock literal: _load_state()
+    # reaps episodes older than _EPISODE_MAX_AGE_SECONDS, so a fixed timestamp
+    # makes this test pass or fail depending on what time of day it runs.
     episode = {
         "provider": "deepseek", "model": "deepseek-v4-pro",
-        "opened_at": "2026-08-14T10:00:00Z", "resets_at": "",
+        "opened_at": _now_iso(), "resets_at": "",
         "worst_outcome": "diverted", "alerted_level": "diverted",
         "diverted_calls": 3, "fallbacks_seen": ["openai-codex/gpt-5.6-sol"],
     }
@@ -455,3 +458,210 @@ def test_failed_persist_does_not_swallow_a_real_escalation(state_file, monkeypat
         "-- the failed _save_state call corrupted the shared in-memory "
         "episode cache before the failure was caught"
     )
+
+
+# --- I1 / I2: losing persistence must never AMPLIFY alerts. ------------------
+
+
+def _access_denied(*a, **k):
+    """The real Windows failure: utils.atomic_replace re-raises anything
+    outside {EXDEV, EBUSY}, and a concurrent reader gives errno 13."""
+    raise PermissionError(13, "Access is denied")
+
+
+def test_persistence_failure_degrades_to_one_alert_not_one_per_hit(
+        state_file, monkeypatch):
+    """I1: the anti-flood store must not become the flood.
+
+    _save_state() publishes to the cache only on success, so a store that
+    discards a rejected write re-reads {} on every subsequent hit,
+    _should_alert(None, ...) returns True, and each hit alerts again. Each of
+    those is a HIGH-priority Telegram message; at chain_exhausted each one is
+    ACT and pages WhatsApp. 200 hits produced 200 alerts.
+    """
+    from events.rate_limit_signal import record
+    monkeypatch.setattr("utils.atomic_replace", _access_denied)
+
+    bus = _FakeBus()
+    kw = dict(provider="deepseek", model="deepseek-v4-pro",
+              reason="rate_limit", detector="runtime",
+              fallback_provider="openai-codex",
+              fallback_model="gpt-5.6-sol", bus=bus)
+    for _ in range(200):
+        record(**kw)
+
+    assert not state_file.exists(), \
+        "precondition: persistence must genuinely have failed"
+    assert len(bus.emitted) == 1, (
+        f"200 hits with a failing write produced {len(bus.emitted)} alerts -- "
+        "losing persistence amplified the alert rate to one per API call"
+    )
+
+
+def test_persistence_failure_does_not_re_emit_recovered_every_call(
+        state_file, monkeypatch):
+    """I2: same root cause on the recovery side.
+
+    Hook D calls clear() after EVERY successful API call. If the removal is
+    discarded when the write fails, the closed episode keeps coming back and
+    each success re-emits RECOVERED. 10 calls produced 10 events.
+    """
+    from events.rate_limit_signal import record, clear
+
+    bus = _FakeBus()
+    assert record(provider="deepseek", model="deepseek-v4-pro",
+                  reason="rate_limit", detector="runtime",
+                  fallback_provider="openai-codex",
+                  fallback_model="gpt-5.6-sol", bus=bus) is True
+
+    monkeypatch.setattr("utils.atomic_replace", _access_denied)
+    for _ in range(10):
+        clear(provider="deepseek", model="deepseek-v4-pro", bus=bus)
+
+    recovered = [e for e in bus.emitted if e[2]["outcome"] == "recovered"]
+    assert len(recovered) == 1, (
+        f"10 successful calls emitted {len(recovered)} RECOVERED events -- "
+        "the episode was resurrected by the stale cache after each failed write"
+    )
+
+
+# --- I3: episodes must expire, or un-clearable namespaces never self-heal. ---
+
+
+def _aged_episode(opened_delta_seconds: float, resets_at: str = "") -> dict:
+    from datetime import datetime, timedelta, timezone
+    opened = datetime.now(timezone.utc) - timedelta(seconds=opened_delta_seconds)
+    return {
+        "provider": "deepseek", "model": "deepseek:pool",
+        "opened_at": opened.isoformat(timespec="seconds"),
+        "resets_at": resets_at,
+        "worst_outcome": "no_fallback", "alerted_level": "no_fallback",
+        "diverted_calls": 12, "fallbacks_seen": [],
+    }
+
+
+def test_stale_episode_expires_so_an_unclearable_namespace_self_heals(state_file):
+    """I3: hook D only ever clears real provider/model slugs, so detector B's
+    ``<provider>:pool`` key and A3's ``nous/nous-portal`` key can NEVER be
+    closed. Once such an episode reaches its top alerted_level, _should_alert
+    suppresses every future hit of that shape permanently -- across process
+    restarts, because the state file is global and nothing else reaps it.
+    """
+    from events import rate_limit_signal
+    from events.rate_limit_signal import record, _EPISODE_MAX_AGE_SECONDS
+
+    state_file.write_text(
+        json.dumps({"deepseek/deepseek:pool":
+                    _aged_episode(_EPISODE_MAX_AGE_SECONDS + 60)}),
+        encoding="utf-8",
+    )
+    rate_limit_signal.reset_state_cache()
+
+    bus = _FakeBus()
+    assert record(provider="deepseek", model="deepseek:pool",
+                  reason="pool_exhausted", detector="credential_pool",
+                  outcome="no_fallback", bus=bus) is True, (
+        "a pool exhaustion after the episode aged out was still suppressed -- "
+        "this namespace is permanently deaf"
+    )
+
+    # A still-fresh episode of the same shape must remain coalesced, or the
+    # TTL has simply disabled coalescing.
+    rate_limit_signal.reset_state_cache()
+    state_file.write_text(
+        json.dumps({"deepseek/deepseek:pool": _aged_episode(60)}),
+        encoding="utf-8",
+    )
+    bus2 = _FakeBus()
+    assert record(provider="deepseek", model="deepseek:pool",
+                  reason="pool_exhausted", detector="credential_pool",
+                  outcome="no_fallback", bus=bus2) is False
+
+
+def test_expired_episodes_are_pruned_from_the_file(state_file):
+    """I3, growth half: nothing else reads or writes this file, so an entry
+    that is never cleared is never removed and the file grows forever."""
+    from events import rate_limit_signal
+    from events.rate_limit_signal import record, _EPISODE_MAX_AGE_SECONDS
+
+    state_file.write_text(
+        json.dumps({
+            "dead/one": _aged_episode(_EPISODE_MAX_AGE_SECONDS + 1),
+            "dead/two": _aged_episode(_EPISODE_MAX_AGE_SECONDS * 5),
+        }),
+        encoding="utf-8",
+    )
+    rate_limit_signal.reset_state_cache()
+
+    record(provider="deepseek", model="deepseek-v4-pro", reason="rate_limit",
+           detector="runtime", bus=_FakeBus())
+
+    on_disk = json.loads(state_file.read_text(encoding="utf-8"))
+    assert "dead/one" not in on_disk and "dead/two" not in on_disk, \
+        f"expired episodes survived the next write: {sorted(on_disk)}"
+    assert "deepseek/deepseek-v4-pro" in on_disk
+
+
+def test_resets_at_in_the_past_expires_the_episode(state_file):
+    """resets_at was stored but never read. A provider that told us exactly
+    when its window reopens should not stay suppressed past that moment."""
+    from events import rate_limit_signal
+    from events.rate_limit_signal import record
+
+    state_file.write_text(
+        json.dumps({"nous/nous-portal":
+                    _aged_episode(60, resets_at="2026-01-01T00:00:00+00:00")}),
+        encoding="utf-8",
+    )
+    rate_limit_signal.reset_state_cache()
+
+    assert record(provider="nous", model="nous-portal", reason="rate_limit",
+                  detector="nous_guard", outcome="no_fallback",
+                  bus=_FakeBus()) is True
+
+
+# --- I4: a long-lived process must see what other processes wrote. -----------
+
+
+def test_long_lived_process_observes_episodes_written_by_other_processes(
+        state_file):
+    """I4: _load_state() cached forever and never re-read. record()/clear()
+    read-modify-write that stale snapshot and _save_state replaces the WHOLE
+    file, so a long-lived gateway deleted episodes that crons persisted -- and
+    then re-alerted them as brand new.
+    """
+    from events.rate_limit_signal import record, _now_iso
+
+    bus = _FakeBus()
+    # The long-lived gateway opens an episode, warming its cache.
+    assert record(provider="deepseek", model="deepseek-v4-pro",
+                  reason="rate_limit", detector="runtime",
+                  fallback_provider="openai-codex",
+                  fallback_model="gpt-5.6-sol", bus=bus) is True
+
+    # A one-shot cron process records an episode of its own and exits.
+    disk = json.loads(state_file.read_text(encoding="utf-8"))
+    disk["nous/nous-portal"] = {
+        "provider": "nous", "model": "nous-portal",
+        "opened_at": _now_iso(), "resets_at": "",
+        "worst_outcome": "diverted", "alerted_level": "diverted",
+        "diverted_calls": 4, "fallbacks_seen": [],
+    }
+    state_file.write_text(json.dumps(disk), encoding="utf-8")
+
+    # The gateway records its next hit -- a whole-file replace.
+    record(provider="deepseek", model="deepseek-v4-pro", reason="rate_limit",
+           detector="runtime", fallback_provider="openai-codex",
+           fallback_model="gpt-5.6-sol", bus=bus)
+
+    after = json.loads(state_file.read_text(encoding="utf-8"))
+    assert "nous/nous-portal" in after, (
+        "the gateway's write deleted the cron's episode -- every cron incident "
+        "is erased by the next gateway failover"
+    )
+
+    # ...and the foreign episode is honored, not re-alerted as brand new.
+    assert record(provider="nous", model="nous-portal", reason="rate_limit",
+                  detector="nous_guard", bus=bus) is False, \
+        "the cron's episode was re-alerted as if it had never happened"
+    assert len(bus.emitted) == 1
