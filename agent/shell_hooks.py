@@ -259,6 +259,10 @@ def register_from_config(
     up on the plugin manager.  Skipped entries (unknown events, malformed,
     not allowlisted, already registered) are logged but not returned.
     """
+    from hermes_cli.kanban_worker_scope import is_lifecycle_only_worker
+
+    if is_lifecycle_only_worker():
+        return []
     if not isinstance(cfg, dict):
         return []
 

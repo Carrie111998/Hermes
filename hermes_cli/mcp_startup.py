@@ -39,6 +39,11 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
     """
     global _mcp_discovery_started, _mcp_discovery_thread
 
+    from hermes_cli.kanban_worker_scope import is_lifecycle_only_worker
+
+    if is_lifecycle_only_worker():
+        return
+
     with _mcp_discovery_lock:
         if _mcp_discovery_started:
             thread = _mcp_discovery_thread

@@ -5358,6 +5358,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    allow_artifacts: bool = True,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
@@ -5425,9 +5426,14 @@ def complete_task(
     else:
         verified_cards = []
 
-    metadata = _merge_completion_prose_artifacts(
-        conn, task_id, metadata, summary=summary, result=result,
-    )
+    if allow_artifacts:
+        metadata = _merge_completion_prose_artifacts(
+            conn, task_id, metadata, summary=summary, result=result,
+        )
+    elif isinstance(metadata, dict) and "artifacts" in metadata:
+        raise ArtifactPreservationError(
+            "completion artifacts are disabled for this worker posture"
+        )
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -5476,7 +5482,7 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
-        if isinstance(metadata, dict):
+        if allow_artifacts and isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
                 path = Path(stored_path)
@@ -10462,6 +10468,15 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
+    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    from hermes_cli.kanban_worker_scope import (
+        LIFECYCLE_SCOPE,
+        WORKER_SCOPE_ENV,
+        pin_worker_scope,
+    )
+
+    worker_toolsets = pin_worker_scope(env, worker_toolsets)
+
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
     # quiet chat run into the Ink TUI, whose no-TTY bail-out exits 0 without
@@ -10470,16 +10485,14 @@ def _default_spawn(
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = [
-        *_resolve_hermes_argv(),
-        "-p", profile_arg,
-        "--cli",
-        # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
-        # so they see that profile's shell-hook allowlist instead of the
-        # dispatcher's root allowlist. Pass --accept-hooks explicitly so
-        # profile-local worker sessions still register configured hooks.
-        "--accept-hooks",
-    ]
+    cmd = [*_resolve_hermes_argv(), "-p", profile_arg, "--cli"]
+    if env.get(WORKER_SCOPE_ENV) == LIFECYCLE_SCOPE:
+        # A lifecycle-only child must reach its first model turn without
+        # executing profile-supplied hooks, plugins, or startup integrations.
+        env.pop("HERMES_ACCEPT_HOOKS", None)
+    else:
+        # Preserve the existing behavior for normal workers.
+        cmd.append("--accept-hooks")
     # Per-task force-loaded skills. Each name goes in its own
     # `--skills X` pair rather than a single comma-joined arg: the CLI
     # accepts both forms (action='append' + comma-split), but
@@ -10502,7 +10515,6 @@ def _default_spawn(
     # branch, not a nested one.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([

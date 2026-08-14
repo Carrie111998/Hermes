@@ -215,3 +215,51 @@ agent:
     resolved = kb._resolve_worker_cli_toolsets(str(profile))
 
     assert resolved == ["kanban_lifecycle"]
+
+
+def test_default_spawn_pins_lifecycle_process_scope_and_suppresses_hooks(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "dashboardcontrol"
+    profile.mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    profile.joinpath("config.yaml").write_text(
+        """
+platform_toolsets:
+  cli:
+    - kanban_lifecycle
+toolsets:
+  - kanban_lifecycle
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_ACCEPT_HOOKS", "1")
+    monkeypatch.setenv("HERMES_KANBAN_WORKER_SCOPE", "inherited-invalid")
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4246
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs.get("env") or {})
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    assert kb._default_spawn(
+        _make_task(kb, assignee="dashboardcontrol"), str(workspace)
+    ) == 4246
+    assert captured["env"]["HERMES_KANBAN_WORKER_SCOPE"] == "lifecycle-only"
+    assert "HERMES_ACCEPT_HOOKS" not in captured["env"]
+    assert "--accept-hooks" not in captured["cmd"]
+    pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1]
+    assert pinned == "kanban_lifecycle"

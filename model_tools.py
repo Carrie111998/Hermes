@@ -81,6 +81,27 @@ def _is_dispatcher_owned_worker() -> bool:
         return True
 
 
+def _lifecycle_worker_dispatch_error(function_name: str) -> Optional[str]:
+    """Return a fail-closed error for forged out-of-scope tool dispatch."""
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    raw_scope = str(os.environ.get("HERMES_KANBAN_WORKER_SCOPE") or "").strip()
+    if not raw_scope:
+        return None
+    try:
+        from hermes_cli.kanban_worker_scope import (
+            LIFECYCLE_TOOL_NAMES,
+            is_lifecycle_only_worker,
+        )
+
+        scoped = is_lifecycle_only_worker()
+    except Exception as exc:
+        return f"Kanban worker tool dispatch denied: invalid worker scope ({exc})"
+    if scoped and function_name not in LIFECYCLE_TOOL_NAMES:
+        return f"Tool '{function_name}' is unavailable in lifecycle-only Kanban workers"
+    return None
+
+
 # =============================================================================
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
 # =============================================================================
@@ -244,8 +265,12 @@ discover_builtin_tools()
 
 # Plugin tool discovery (user/project/pip plugins)
 try:
-    from hermes_cli.plugins import discover_plugins
-    discover_plugins()
+    from hermes_cli.kanban_worker_scope import is_lifecycle_only_worker
+
+    if not is_lifecycle_only_worker():
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
 except Exception as e:
     logger.debug("Plugin discovery failed: %s", e)
 
@@ -370,6 +395,7 @@ def get_tool_definitions(
                 registry._generation,
                 cfg_fp,
                 bool(os.environ.get("HERMES_KANBAN_TASK")),
+                os.environ.get("HERMES_KANBAN_WORKER_SCOPE", ""),
                 bool(skip_tool_search_assembly),
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
@@ -505,8 +531,45 @@ def _compute_tool_definitions(
     # needed; plugins respect enabled_toolsets / disabled_toolsets like any
     # other toolset.
 
+    from hermes_cli.kanban_worker_scope import (
+        LIFECYCLE_TOOL_NAMES,
+        is_lifecycle_only_worker,
+    )
+
+    lifecycle_only = is_lifecycle_only_worker()
+    if lifecycle_only:
+        # The process scope is authoritative. A stale CLI/profile argument may
+        # never broaden a lifecycle worker after the dispatcher pins it.
+        tools_to_include = set(LIFECYCLE_TOOL_NAMES)
+
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+
+    if lifecycle_only:
+        import copy
+
+        narrowed = []
+        for tool_def in filtered_tools:
+            cloned = copy.deepcopy(tool_def)
+            function = cloned.get("function", {})
+            name = function.get("name")
+            parameters = function.get("parameters", {})
+            properties = parameters.get("properties")
+            if isinstance(properties, dict):
+                properties.pop("task_id", None)
+                properties.pop("board", None)
+                if name == "kanban_complete":
+                    properties.pop("created_cards", None)
+                    properties.pop("artifacts", None)
+            required = parameters.get("required")
+            if isinstance(required, list):
+                parameters["required"] = [
+                    item
+                    for item in required
+                    if item not in {"task_id", "board", "created_cards", "artifacts"}
+                ]
+            narrowed.append(cloned)
+        filtered_tools = narrowed
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references
@@ -1229,6 +1292,10 @@ def handle_function_call(
     Returns:
         Function result as a JSON string.
     """
+    dispatch_error = _lifecycle_worker_dispatch_error(function_name)
+    if dispatch_error is not None:
+        return json.dumps({"error": dispatch_error}, ensure_ascii=False)
+
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):

@@ -5104,6 +5104,10 @@ def _load_mcp_config() -> Dict[str, dict]:
     ``os.environ`` (which includes ``~/.hermes/.env`` loaded at startup).
     """
     try:
+        from hermes_cli.kanban_worker_scope import is_lifecycle_only_worker
+
+        if is_lifecycle_only_worker():
+            return {}
         from hermes_cli.config import load_config
         from utils import env_var_enabled as _env_enabled
 
@@ -6750,6 +6754,10 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     Returns:
         List of all currently registered MCP tool names.
     """
+    from hermes_cli.kanban_worker_scope import is_lifecycle_only_worker
+
+    if is_lifecycle_only_worker():
+        return []
     if not _ensure_mcp_sdk():
         logger.debug("MCP SDK not available -- skipping explicit MCP registration")
         return []
@@ -6964,6 +6972,10 @@ def discover_mcp_tools() -> List[str]:
     Returns:
         List of all registered MCP tool names.
     """
+    from hermes_cli.kanban_worker_scope import is_lifecycle_only_worker
+
+    if is_lifecycle_only_worker():
+        return []
     servers = _load_mcp_config()
     if not servers:
         logger.debug("No MCP servers configured")
