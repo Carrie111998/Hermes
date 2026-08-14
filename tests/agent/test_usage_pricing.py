@@ -164,6 +164,42 @@ def test_normalize_usage_mapping_codex_fields():
     assert normalized.reasoning_tokens == 5
 
 
+def test_normalize_usage_clamps_negative_counters():
+    usage = SimpleNamespace(
+        prompt_tokens=100,
+        completion_tokens=-5,
+        prompt_tokens_details=SimpleNamespace(
+            cached_tokens=-10,
+            cache_write_tokens=-20,
+        ),
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=-3),
+    )
+
+    normalized = normalize_usage(usage, provider="openrouter", api_mode="chat_completions")
+
+    assert normalized.input_tokens == 100
+    assert normalized.output_tokens == 0
+    assert normalized.cache_read_tokens == 0
+    assert normalized.cache_write_tokens == 0
+    assert normalized.reasoning_tokens == 0
+
+
+def test_normalize_usage_clamps_inconsistent_cache_total():
+    usage = {
+        "prompt_tokens": 100,
+        "completion_tokens": 10,
+        "prompt_tokens_details": {
+            "cached_tokens": 80,
+            "cache_creation_input_tokens": 50,
+        },
+    }
+
+    normalized = normalize_usage(usage, provider="openrouter", api_mode="chat_completions")
+
+    assert normalized.input_tokens == 0
+    assert normalized.prompt_tokens == 130
+
+
 
 
 
