@@ -845,6 +845,26 @@ class TestPlannedStopMarker:
         assert not (tmp_path / ".gateway-planned-stop.json").exists()
 
 
+    def test_corrupt_marker_is_not_a_false_positive_and_is_cleaned_up(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression for #83683: a corrupt / malformed / non-UTF-8 marker must
+        never be treated as a live 'planned stop' for this process (no false
+        positive reap, no double negative), and it must be proactively dropped
+        rather than left on disk.
+
+        ``_read_json_file`` already returns None on any read/parse error, so
+        ``planned_stop_marker_targets_self`` returns False — this asserts the
+        marker is also unlinked so a clobbered file can't linger.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        marker = tmp_path / ".gateway-planned-stop.json"
+        # Truncated / binary garbage simulating a half-written or clobbered file.
+        marker.write_bytes(b"{not valid json \xff\xfe")
+
+        assert status.planned_stop_marker_targets_self() is False
+        assert not marker.exists(), "corrupt marker should be cleaned up"
+
     def test_consume_still_rejects_start_time_mismatch_when_both_known(
         self, tmp_path, monkeypatch
     ):

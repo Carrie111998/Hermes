@@ -2116,6 +2116,15 @@ def planned_stop_marker_targets_self() -> bool:
     path = _get_planned_stop_marker_path()
     record = _read_json_file(path)
     if not record:
+        # Unreadable / corrupt / empty / missing marker — it can never name
+        # this process, so drop it now rather than leaving a clobbered file
+        # behind until the next relaunch's clear_planned_stop_marker(). A
+        # corrupt marker must never be mistaken for a live "planned stop"
+        # (no false positive, no double negative) — see issue #83683.
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
         return False
 
     try:
