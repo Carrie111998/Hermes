@@ -235,11 +235,16 @@ def resolve_client_identity(headers, client_ip: str = "") -> str:
 
     Opt-in: when ``a2a.trusted_proxies`` / ``A2A_TRUSTED_PROXIES`` is set AND
     the immediate socket peer matches a trusted proxy, derive the client IP
-    from ``X-Forwarded-For``. Proxies append each hop to the *right*, so the
-    **leftmost** entry is the original client; we take the leftmost non-empty
-    hop. (This matches the comma-then-``[0]`` convention the adapter already
-    uses for ``X-Forwarded-Proto``.) If the header is absent, the socket peer
-    is used so a misconfigured proxy does not collapse to an empty identity.
+    from ``X-Forwarded-For`` by **walking validated hops right-to-left**.
+    Proxies append each hop to the *right*, so the rightmost hop is the
+    direct upstream of the (trusted) socket peer and is trusted by
+    construction; each further hop to the left is only trusted when it is
+    itself a listed trusted proxy. The first hop that is not a listed proxy
+    is the real client. This rejects caller-supplied allowed addresses
+    prepended to the header (``X-Forwarded-For: 10.0.0.1, <real client>``
+    with ``10.0.0.1`` in trusted_proxies resolves to the real client, not
+    the spoofed value). If the header is absent, the socket peer is used so
+    a misconfigured proxy does not collapse to an empty identity.
 
     ``headers`` is a mapping with a ``get`` method (e.g. ``http.client`` /
     ``BaseHTTPRequestHandler`` headers).
@@ -248,13 +253,20 @@ def resolve_client_identity(headers, client_ip: str = "") -> str:
     if proxies and _peer_in_proxies(client_ip, proxies):
         forwarded = (headers.get("X-Forwarded-For", "") or "").strip() if headers else ""
         if forwarded:
-            # Leftmost hop is the original client; later hops are appended by
-            # each proxy in the chain and are not attacker-controlled once the
-            # immediate peer is a trusted proxy.
-            for hop in forwarded.split(","):
-                hop = hop.strip()
-                if hop:
+            # Walk validated hops right-to-left: the socket peer is trusted
+            # (checked above), so the rightmost hop it appended is trusted;
+            # move left only through hops that are themselves trusted proxies.
+            # The first non-trusted hop is the real client. A caller-supplied
+            # allowed address at the left is never reached (#80534 P1). If
+            # every hop is a trusted proxy, take the leftmost (the whole
+            # chain is proxies).
+            hops = [hop.strip() for hop in forwarded.split(",") if hop.strip()]
+            if hops:
+                for hop in reversed(hops):
+                    if _peer_in_proxies(hop, proxies):
+                        continue
                     return hop
+                return hops[0]
     return client_ip
 
 

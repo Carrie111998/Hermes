@@ -5,7 +5,9 @@ Behavior contracts (not change-detectors):
     ip:<real_client>, never ip:<proxy>.
   - Without trusted_proxies: identity stays ip:<proxy> (the safe default).
   - Peer not in trusted_proxies: X-Forwarded-For is ignored (spoofing guard).
-  - Multi-hop X-Forwarded-For: the leftmost (original-client) hop is chosen.
+  - Multi-hop X-Forwarded-For: hops are walked right-to-left from the
+    socket peer; the first hop not listed in trusted_proxies is the client
+    (a caller-supplied allowed leftmost value cannot spoof identity).
   - Startup warnings fire for shared-token + non-loopback + no proxies, and
     for allow-all overriding trusted_peers; neither fires in the safe cases.
   - E2E through the real http.server: a proxied request carries the resolved
@@ -58,12 +60,41 @@ class TestResolveClientIdentity:
         assert security.resolve_client_identity({}, "10.0.0.1") == "10.0.0.1"
 
     def test_multihop_xff_picks_leftmost(self, monkeypatch):
-        """Proxies append hops to the right; the original client is leftmost.
+        """Proxies append hops to the right; walking right-to-left through
+        the listed trusted chain lands on the original client.
 
-        X-Forwarded-For: client, proxy1, proxy2 -> identity is `client`."""
-        monkeypatch.setenv("A2A_TRUSTED_PROXIES", "10.0.0.2")
+        X-Forwarded-For: client, proxy1, proxy2 -> identity is `client`,
+        with both proxies listed in trusted_proxies (the correct real-world
+        configuration for a multi-hop chain).
+        """
+        monkeypatch.setenv("A2A_TRUSTED_PROXIES", "10.0.0.1,10.0.0.2")
         xff = "203.0.113.9, 10.0.0.1, 10.0.0.2"
         assert security.resolve_client_identity(_hdr(xff), "10.0.0.2") == "203.0.113.9"
+
+    def test_caller_supplied_allowed_leftmost_hop_rejected(self, monkeypatch):
+        """P1 regression: a caller prepends an allow-listed address before the
+        proxy appends the real client (``X-Forwarded-For: 10.0.0.1, 203.0.113.9``
+        with 10.0.0.1 in trusted_proxies). The right-to-left walk must resolve
+        to the real client (203.0.113.9), never the attacker-chosen 10.0.0.1."""
+        monkeypatch.setenv("A2A_TRUSTED_PROXIES", "10.0.0.1")
+        xff = "10.0.0.1, 203.0.113.9"  # attacker-supplied leftmost, proxy-appended real client
+        assert security.resolve_client_identity(_hdr(xff), "10.0.0.1") == "203.0.113.9"
+
+    def test_all_trusted_hops_take_leftmost(self, monkeypatch):
+        """Walk right-to-left: trusted hops are skipped; when every hop is a
+        trusted proxy, the leftmost hop is the identity (whole chain is
+        proxies, so the farthest one is the origin)."""
+        monkeypatch.setenv("A2A_TRUSTED_PROXIES", "10.0.0.1,10.0.0.2")
+        xff = "10.0.0.1, 10.0.0.2"
+        assert security.resolve_client_identity(_hdr(xff), "10.0.0.2") == "10.0.0.1"
+
+    def test_unlisted_middle_hop_returns_that_hop(self, monkeypatch):
+        """Conservative semantics: a hop NOT listed in trusted_proxies stops
+        the walk (it is treated as the direct client) instead of being skipped,
+        so an attacker cannot extend the trusted chain past its configuration."""
+        monkeypatch.setenv("A2A_TRUSTED_PROXIES", "10.0.0.2")
+        xff = "203.0.113.9, 10.0.0.1, 10.0.0.2"
+        assert security.resolve_client_identity(_hdr(xff), "10.0.0.2") == "10.0.0.1"
 
     def test_cidr_trusted_proxy_matches(self, monkeypatch):
         """CIDR entries match any address in the range."""
