@@ -54,6 +54,18 @@ def test_crlf_is_normalised():
     assert _clean_copied_text("rad1\r\nrad2") == "rad1\nrad2"
 
 
+def test_del_and_c1_controls_are_removed():
+    """DEL (U+007F) and C1 controls (U+0080–U+009F) are not content."""
+    assert _clean_copied_text("a\x7fb\x9cc") == "abc"
+    assert _clean_copied_text("a\tb") == "a\tb"
+
+
+def test_decoration_followed_by_existing_space_does_not_widen_the_run():
+    """A removed glyph must not widen a following run of spaces."""
+    assert _clean_copied_text("vänster│ höger") == "vänster höger"
+    assert _clean_copied_text("vänster│   höger") == "vänster   höger"
+
+
 def test_leading_and_trailing_blank_lines_are_trimmed():
     assert _clean_copied_text("\n\n  \nhej\n\n \n") == "hej"
 

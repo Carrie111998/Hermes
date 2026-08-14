@@ -352,7 +352,7 @@ def _clean_copied_text(text: str) -> str:
         replaced_decoration = False
         for ch in line:
             code = ord(ch)
-            is_control = code < 0x20 and ch not in ("\n", "\r", "\t")
+            is_control = (code < 0x20 or 0x7F <= code <= 0x9F) and ch not in ("\n", "\r", "\t")
             is_decoration = (
                 0x2500 <= code <= 0x27BF        # box drawing, blocks, shapes, dingbats
                 or 0xE000 <= code <= 0xF8FF     # private use — nerd-font icons
@@ -362,13 +362,12 @@ def _clean_copied_text(text: str) -> str:
             if is_control or ch == "�":
                 continue
             if is_decoration:
-                # Collapse the glyph to a single space so neighbouring words
-                # don't weld together, but never open a run of spaces.
-                if out and not out[-1].isspace() and not replaced_decoration:
-                    out.append(" ")
+                # Mark that a glyph was removed; the replacement space is
+                # deferred until the next non-whitespace character, so an
+                # existing run of spaces is never widened.
                 replaced_decoration = True
                 continue
-            if replaced_decoration and out and not out[-1].isspace() and not ch.isspace():
+            if replaced_decoration and not ch.isspace() and out and not out[-1].isspace():
                 out.append(" ")
             replaced_decoration = False
             out.append(ch)
