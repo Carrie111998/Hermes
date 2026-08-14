@@ -4457,6 +4457,59 @@ CREATE TABLE IF NOT EXISTS epic_story_integrations (
     PRIMARY KEY (epic_id, story_id, source_sha)
 );
 
+CREATE TABLE IF NOT EXISTS story_integration_intents (
+    epic_id               TEXT NOT NULL,
+    story_id              TEXT NOT NULL,
+    source_sha            TEXT NOT NULL,
+    source_branch         TEXT NOT NULL,
+    review_run_id         INTEGER NOT NULL,
+    review_base_sha       TEXT NOT NULL,
+    status                TEXT NOT NULL CHECK (status IN (
+                              'pending', 'running', 'prepared', 'rework_required',
+                              'attention_required', 'integrated', 'superseded'
+                          )),
+    claim_lock            TEXT,
+    claim_expires         INTEGER,
+    attempt_count         INTEGER NOT NULL DEFAULT 0,
+    target_pre_sha        TEXT,
+    candidate_sha         TEXT,
+    candidate_ref         TEXT,
+    verification_event_id INTEGER,
+    last_failure_code     TEXT,
+    created_at            INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL,
+    PRIMARY KEY (epic_id, story_id, source_sha)
+);
+
+CREATE TABLE IF NOT EXISTS epic_release_snapshots (
+    id                              INTEGER PRIMARY KEY AUTOINCREMENT,
+    epic_id                         TEXT NOT NULL,
+    epic_tip_sha                    TEXT NOT NULL,
+    target_branch                   TEXT NOT NULL,
+    target_pre_sha                  TEXT NOT NULL,
+    release_candidate_sha           TEXT NOT NULL,
+    candidate_ref                   TEXT NOT NULL,
+    aggregate_verification_event_id INTEGER NOT NULL,
+    repository_contract_digest      TEXT NOT NULL,
+    status                          TEXT NOT NULL CHECK (status IN (
+                                        'awaiting_push', 'ci_pending', 'ci_failed',
+                                        'released', 'invalidated'
+                                    )),
+    pushed_sha                      TEXT,
+    created_at                      INTEGER NOT NULL,
+    updated_at                      INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS epic_release_members (
+    snapshot_id  INTEGER NOT NULL,
+    epic_id      TEXT NOT NULL,
+    story_id     TEXT NOT NULL,
+    source_sha   TEXT NOT NULL,
+    candidate_sha TEXT NOT NULL,
+    integrated_at INTEGER NOT NULL,
+    PRIMARY KEY (snapshot_id, story_id)
+);
+
 CREATE TABLE IF NOT EXISTS board_governance (
     id                     INTEGER PRIMARY KEY CHECK (id = 1),
     qualification_required INTEGER NOT NULL DEFAULT 0
@@ -4589,6 +4642,11 @@ CREATE INDEX IF NOT EXISTS idx_work_contracts_digest ON work_contracts(digest);
 CREATE INDEX IF NOT EXISTS idx_qualification_decisions_intake
     ON qualification_intake_decisions(intake_id, id);
 CREATE INDEX IF NOT EXISTS idx_epic_memberships_epic ON epic_memberships(epic_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_story_integration_intents_claim
+    ON story_integration_intents(status, claim_expires, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_epic_release_one_active
+    ON epic_release_snapshots(epic_id)
+    WHERE status IN ('awaiting_push', 'ci_pending', 'ci_failed');
 
 CREATE TRIGGER IF NOT EXISTS work_contracts_no_update
 BEFORE UPDATE ON work_contracts BEGIN

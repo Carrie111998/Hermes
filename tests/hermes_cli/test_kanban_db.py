@@ -119,6 +119,67 @@ def test_init_creates_expected_tables(kanban_home):
     } <= names
 
 
+def test_epic_record_schema_creates_only_the_three_additive_tables(kanban_home):
+    expected = {
+        "story_integration_intents",
+        "epic_release_snapshots",
+        "epic_release_members",
+    }
+
+    with kb.connect() as conn:
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+
+    assert expected <= tables
+    assert "repository_verification_runs" not in tables
+
+
+def test_epic_record_migration_adds_only_three_tables_and_is_idempotent(tmp_path):
+    db_path = tmp_path / "pre-feature.db"
+    expected = {
+        "story_integration_intents",
+        "epic_release_snapshots",
+        "epic_release_members",
+    }
+
+    with kb.connect(db_path) as conn:
+        modern_tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        conn.execute("DROP TABLE epic_release_members")
+        conn.execute("DROP TABLE epic_release_snapshots")
+        conn.execute("DROP TABLE story_integration_intents")
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path) as conn:
+        migrated_tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+
+    assert migrated_tables - (modern_tables - expected) == expected
+    assert migrated_tables == modern_tables
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path) as conn:
+        rerun_tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert rerun_tables == migrated_tables
+
+
 def test_board_metadata_repository_policy_is_validated(kanban_home, tmp_path):
     repo = tmp_path / "repository-policy"
     _init_git_repo(repo)
@@ -11313,7 +11374,7 @@ def _run_reusable_verification(conn, fixture):
     )
 
 
-def test_exact_repository_verification_receipt_skips_command(
+def test_parser_addition_preserves_exact_repository_verification_receipt_reuse(
     kanban_home, tmp_path, monkeypatch
 ):
     fixture = _verification_run_fixture(kanban_home, tmp_path, monkeypatch)
