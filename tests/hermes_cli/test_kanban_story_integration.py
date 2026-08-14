@@ -1202,7 +1202,7 @@ def test_recover_prepared_intent_handles_each_target_boundary(
     tmp_path, monkeypatch, boundary, current_sha, expected
 ):
     with kb.connect(tmp_path / f"recover-{boundary}.db") as conn:
-        key, _prepared = _prepared_intent(tmp_path, monkeypatch, conn)
+        key, prepared = _prepared_intent(tmp_path, monkeypatch, conn)
         monkeypatch.setattr(
             integration_module,
             "inspect_prepared_candidate_ref",
@@ -1245,7 +1245,14 @@ def test_recover_prepared_intent_handles_each_target_boundary(
     assert result == expected
     assert advance_calls == ([True] if boundary == "preimage" else [])
     if boundary == "diverged":
-        assert tuple(row) == ("pending", None, None, None, None, "target_moved")
+        assert tuple(row) == (
+            "attention_required",
+            TARGET_SHA,
+            CANDIDATE_SHA,
+            prepared.candidate_ref,
+            prepared.verification_event_id,
+            "target_moved",
+        )
         assert fact is None
         assert tuple(story) == ("review", "integration_pending")
     else:
@@ -1300,3 +1307,122 @@ def test_integrated_fact_recovery_and_epic_readiness_survive_verification_event_
     assert cleanup_observed_fact == [CANDIDATE_SHA]
     assert tuple(row) == ("integrated", None)
     assert ready is True
+
+
+@pytest.mark.parametrize("failure_code", ["merge_conflict", "verification_failed"])
+def test_product_owned_integration_failure_uses_existing_development_rework_path(
+    tmp_path, monkeypatch, failure_code
+):
+    metadata = _claim_board_metadata(tmp_path)
+    metadata["product_workflow"]["max_rework_cycles"] = 3
+    monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: metadata)
+
+    with kb.connect(tmp_path / f"product-{failure_code}.db") as conn:
+        key = _insert_claimable_intent(conn)
+        claimed = claim_next_intent(
+            conn,
+            "owner",
+            60,
+            repository_check=lambda *_args: CandidateEligibility(SOURCE_SHA, True),
+        )
+        assert claimed is not None
+
+        routed = integration_module.route_intent_failure(
+            conn,
+            claimed,
+            kb.IntegrationCandidateError(
+                "safe product failure",
+                code=failure_code,
+            ),
+        )
+        task = kb.get_task(conn, key.story_id)
+        directive = kb.active_rework_directive(conn, key.story_id)
+        intent = conn.execute(
+            "SELECT status, claim_lock, claim_expires, last_failure_code "
+            "FROM story_integration_intents WHERE story_id=?",
+            (key.story_id,),
+        ).fetchone()
+        approval_runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=? AND step_key='review'",
+            (key.story_id,),
+        ).fetchone()[0]
+
+    assert routed.status == "rework_required"
+    assert tuple(intent) == ("rework_required", None, None, failure_code)
+    assert task is not None
+    assert task.current_step_key == "development"
+    assert task.rework_count == 1
+    assert task.current_step_key != "release_measure"
+    assert directive is not None
+    assert directive.origin_kind == "integration"
+    assert directive.origin_intent_key == (
+        f"{key.epic_id}:{key.story_id}:{key.source_sha}"
+    )
+    assert directive.target_phase == "development"
+    assert directive.rejected_branch == "story/one"
+    assert directive.rejected_sha == SOURCE_SHA
+    assert directive.findings == (f"story integration {failure_code}",)
+    assert approval_runs == 1
+
+
+@pytest.mark.parametrize(
+    "failure_code",
+    [
+        "command_missing",
+        "ref_missing",
+        "profile_missing",
+        "timeout",
+        "provisioning_failed",
+        "io_error",
+        "ownership_changed",
+        "checked_out",
+        "source_moved",
+        "target_moved",
+    ],
+)
+def test_infrastructure_integration_failure_keeps_same_lineage_without_rework(
+    tmp_path, monkeypatch, failure_code
+):
+    metadata = _claim_board_metadata(tmp_path)
+    monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: metadata)
+
+    with kb.connect(tmp_path / f"attention-{failure_code}.db") as conn:
+        key = _insert_claimable_intent(conn)
+        claimed = claim_next_intent(
+            conn,
+            "owner-one",
+            60,
+            repository_check=lambda *_args: CandidateEligibility(SOURCE_SHA, True),
+        )
+        assert claimed is not None
+        routed = integration_module.route_intent_failure(
+            conn,
+            claimed,
+            kb.IntegrationCandidateError(
+                "safe infrastructure failure",
+                code=failure_code,
+            ),
+        )
+        retried = claim_next_intent(
+            conn,
+            "owner-two",
+            60,
+            repository_check=lambda *_args: CandidateEligibility(SOURCE_SHA, True),
+        )
+        task = kb.get_task(conn, key.story_id)
+        directive = kb.active_rework_directive(conn, key.story_id)
+        intent = conn.execute(
+            "SELECT status, attempt_count, last_failure_code "
+            "FROM story_integration_intents WHERE story_id=?",
+            (key.story_id,),
+        ).fetchone()
+
+    assert routed.status == "attention_required"
+    assert retried is not None and retried.key == key
+    assert retried.attempt_count == 2
+    assert tuple(intent) == ("running", 2, failure_code)
+    assert task is not None
+    assert task.current_step_key == "integration_pending"
+    assert task.rework_count == 0
+    assert task.current_step_key != "release_measure"
+    assert directive is None

@@ -13,6 +13,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_story_integration as integration_module
+from hermes_cli.kanban_product_outcomes import CandidateEligibility
 from hermes_cli import projects_db as pdb
 from hermes_cli.plugins import PluginManager
 
@@ -546,3 +548,200 @@ def test_governed_product_story_recovers_through_release_and_done(
     ]
     assert worktree_paths
     assert all(_git(worktree, "status", "--porcelain") == "" for worktree in worktree_paths)
+
+
+@pytest.mark.parametrize(
+    ("failure_code", "expected_status", "expected_rework"),
+    [
+        ("merge_conflict", "rework_required", 1),
+        ("timeout", "attention_required", 0),
+    ],
+)
+def test_public_reconcile_routes_integration_failure_without_approval_or_graph_growth(
+    governed_profile: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_code: str,
+    expected_status: str,
+    expected_rework: int,
+) -> None:
+    repo = tmp_path / f"integration-{failure_code}"
+    repo.mkdir()
+    board = f"integration-{failure_code}"
+    kb.ensure_product_board_defaults(
+        board,
+        name="Integration ownership fixture",
+        default_workdir=str(repo),
+    )
+    metadata_path = kb.board_metadata_path(board)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["product_workflow"]["handoff_v2"] = True
+    metadata["repository"] = {
+        "base_ref": "refs/heads/main",
+        "target_branch": "main",
+        "verification_profiles": {
+            "story_integration": [
+                {
+                    "argv": ["bash", "scripts/run_tests.sh"],
+                    "workdir": ".",
+                    "timeout_seconds": 30,
+                }
+            ],
+            "epic_release": [
+                {
+                    "argv": ["bash", "scripts/run_tests.sh"],
+                    "workdir": ".",
+                    "timeout_seconds": 30,
+                }
+            ],
+        },
+        "ci_observation": {
+            "provider": "github_actions",
+            "required_workflows": ["CI"],
+        },
+        "boundary_evidence": {
+            "test_globs": ["tests/**"],
+            "fixture_globs": ["tests/fixtures/**"],
+            "generated_paths": [],
+        },
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+    now = 1_700_000_000
+    source_sha = "1" * 40
+    base_sha = "2" * 40
+    branch = "story/owned-failure"
+    with kb.connect(board=board) as conn:
+        epic_id = kb.create_task(conn, title="Epic", work_item_kind="epic")
+        story_id = kb.create_task(
+            conn,
+            title="Story",
+            workflow_template_id="product",
+            current_step_key="review",
+        )
+        kb.add_epic_membership(conn, epic_id=epic_id, task_id=story_id)
+        test_metadata = {
+            "workflow_outcome": {"verdict": "passed"},
+            "ai_provenance": {
+                "writer": {"agent": "developer"},
+                "tester": {"agent": "tester", "result": "passed"},
+            },
+            "test_branch": branch,
+            "test_head_sha": source_sha,
+        }
+        review_metadata = {
+            "workflow_outcome": {"verdict": "approved"},
+            "ai_provenance": {
+                "writer": {"agent": "developer"},
+                "reviewer": {"agent": "reviewer"},
+            },
+            "review_branch": branch,
+            "review_base_sha": base_sha,
+            "review_head_sha": source_sha,
+        }
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, step_key, status, outcome, metadata, started_at, ended_at) "
+            "VALUES (?, 'test', 'completed', 'advanced', ?, ?, ?)",
+            (story_id, json.dumps(test_metadata), now - 4, now - 3),
+        )
+        review_run_id = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, step_key, status, outcome, metadata, started_at, ended_at) "
+            "VALUES (?, 'review', 'completed', 'advanced', ?, ?, ?)",
+            (story_id, json.dumps(review_metadata), now - 2, now - 1),
+        ).lastrowid
+        with kb.authorized_governance_write(), kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workflow_template_id='product_epic', "
+                "current_step_key='collecting_members', status='todo', assignee=NULL, "
+                "running=0, blocked=0, current_run_id=NULL WHERE id=?",
+                (epic_id,),
+            )
+            conn.execute(
+                "UPDATE tasks SET current_step_key='integration_pending', "
+                "status='review', assignee=NULL, running=0, blocked=0, "
+                "current_run_id=NULL, branch_name=? WHERE id=?",
+                (branch, story_id),
+            )
+            conn.execute(
+                "INSERT INTO story_integration_intents "
+                "(epic_id, story_id, source_sha, source_branch, review_run_id, "
+                "review_base_sha, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (
+                    epic_id,
+                    story_id,
+                    source_sha,
+                    branch,
+                    review_run_id,
+                    base_sha,
+                    now,
+                    now,
+                ),
+            )
+        before_tasks = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        before_links = conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0]
+        before_runs = conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0]
+
+        monkeypatch.setattr(
+            integration_module,
+            "candidate_eligibility",
+            lambda *_args: CandidateEligibility(source_sha, True),
+        )
+
+        observed_lineages = []
+
+        def fail_preparation(_conn, intent, **_kwargs):
+            observed_lineages.append(intent.key)
+            if failure_code == "merge_conflict":
+                raise RuntimeError("merge conflict")
+            raise kb.IntegrationCandidateError("safe forced failure", code=failure_code)
+
+        monkeypatch.setattr(
+            integration_module,
+            "prepare_claimed_intent",
+            fail_preparation,
+        )
+        result = kb.reconcile(conn, board=board, spawn_ready=False)
+        if not expected_rework:
+            retry_result = kb.reconcile(conn, board=board, spawn_ready=False)
+            assert retry_result.integrated == []
+
+        intent = conn.execute(
+            "SELECT status, last_failure_code, attempt_count "
+            "FROM story_integration_intents WHERE story_id=?",
+            (story_id,),
+        ).fetchone()
+        task = kb.get_task(conn, story_id)
+        directive = kb.active_rework_directive(conn, story_id)
+        after_tasks = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        after_links = conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0]
+        after_runs = conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0]
+        event_kinds = {
+            row["kind"]
+            for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=?",
+                (story_id,),
+            ).fetchall()
+        }
+
+    assert result.integrated == []
+    expected_attempts = 1 if expected_rework else 2
+    assert tuple(intent) == (expected_status, failure_code, expected_attempts)
+    assert len(observed_lineages) == expected_attempts
+    assert len(set(observed_lineages)) == 1
+    assert task is not None and task.rework_count == expected_rework
+    assert task.current_step_key == (
+        "development" if expected_rework else "integration_pending"
+    )
+    assert task.current_step_key != "release_measure"
+    assert (directive is not None) is bool(expected_rework)
+    assert (after_tasks, after_links, after_runs) == (
+        before_tasks,
+        before_links,
+        before_runs,
+    )
+    assert not event_kinds.intersection(
+        {"approval_requested", "release_requested", "release_approved"}
+    )

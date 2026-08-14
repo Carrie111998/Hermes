@@ -14274,10 +14274,12 @@ class IntegrationCandidateError(RuntimeError):
         self,
         message: str,
         *,
+        code: str = "integration_error",
         scratch_worktree: Optional[Path] = None,
         verification_result: Optional[VerificationResult] = None,
     ):
         super().__init__(message)
+        self.code = str(code or "integration_error")
         self.scratch_worktree = scratch_worktree
         self.verification_result = verification_result
 
@@ -14372,14 +14374,26 @@ def _integration_git(
             timeout=timeout,
             check=False,
         )
-    except Exception as exc:
-        raise IntegrationCandidateError(f"git command failed: {args[0]}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise IntegrationCandidateError(
+            f"git command timed out: {args[0]}", code="timeout"
+        ) from exc
+    except OSError as exc:
+        raise IntegrationCandidateError(
+            f"git command failed: {args[0]}", code="io_error"
+        ) from exc
+    except subprocess.SubprocessError as exc:
+        raise IntegrationCandidateError(
+            f"git command failed: {args[0]}", code="command_failed"
+        ) from exc
 
 
 def _checked_out_branch_worktree(repo_root: Path, branch: str) -> Optional[Path]:
     listed = _integration_git(repo_root, ["worktree", "list", "--porcelain"])
     if listed.returncode != 0:
-        raise IntegrationCandidateError("could not list repository worktrees")
+        raise IntegrationCandidateError(
+            "could not list repository worktrees", code="command_failed"
+        )
     wanted = f"refs/heads/{branch}"
     for block in (listed.stdout or "").strip().split("\n\n"):
         fields: dict[str, str] = {}
@@ -14400,12 +14414,14 @@ def _remove_clean_integration_worktree(repo_root: Path, scratch: Path) -> None:
     if not _worktree_is_clean(scratch):
         raise IntegrationCandidateError(
             f"scratch worktree is dirty; preserved at {scratch}",
+            code="ownership_changed",
             scratch_worktree=scratch,
         )
     removed = _integration_git(repo_root, ["worktree", "remove", str(scratch)])
     if removed.returncode != 0:
         raise IntegrationCandidateError(
             f"could not remove scratch worktree; preserved at {scratch}",
+            code="command_failed",
             scratch_worktree=scratch,
         )
 
@@ -14430,24 +14446,32 @@ def _build_verified_merge_candidate(
     repo_root = repo_root.resolve()
     target_worktree = _checked_out_branch_worktree(repo_root, target_branch)
     if target_worktree is not None and not _worktree_is_clean(target_worktree):
-        raise IntegrationCandidateError(f"target worktree is dirty: {target_worktree}")
+        raise IntegrationCandidateError(
+            f"target worktree is dirty: {target_worktree}",
+            code="ownership_changed",
+        )
 
     source_result = _integration_git(
         repo_root, ["rev-parse", f"refs/heads/{source_branch}"]
     )
     source_sha = (source_result.stdout or "").strip()
     if source_result.returncode != 0 or not source_sha:
-        raise IntegrationCandidateError(f"could not resolve {source_branch}")
+        raise IntegrationCandidateError(
+            f"could not resolve {source_branch}", code="ref_missing"
+        )
     if expected_source_sha is not None and source_sha != expected_source_sha:
         raise IntegrationCandidateError(
-            f"source branch moved: {source_branch} no longer matches reviewed SHA"
+            f"source branch moved: {source_branch} no longer matches reviewed SHA",
+            code="source_moved",
         )
     approved_source_sha = expected_source_sha or source_sha
 
     pre_result = _integration_git(repo_root, ["rev-parse", f"refs/heads/{target_branch}"])
     pre_sha = (pre_result.stdout or "").strip()
     if pre_result.returncode != 0 or not pre_sha:
-        raise IntegrationCandidateError(f"could not resolve {target_branch}")
+        raise IntegrationCandidateError(
+            f"could not resolve {target_branch}", code="ref_missing"
+        )
 
     source_ancestor = _integration_git(
         repo_root,
@@ -14455,9 +14479,11 @@ def _build_verified_merge_candidate(
     )
     empty_contribution = source_ancestor.returncode == 0
     if empty_contribution and not allow_empty_contribution:
-        raise IntegrationCandidateError("empty contribution")
+        raise IntegrationCandidateError("empty contribution", code="source_moved")
     if source_ancestor.returncode not in {0, 1}:
-        raise IntegrationCandidateError("could not verify candidate contribution")
+        raise IntegrationCandidateError(
+            "could not verify candidate contribution", code="command_failed"
+        )
 
     nonce = secrets.token_hex(6)
     scratch = repo_root / ".worktrees" / f"integration-{nonce}"
@@ -14466,7 +14492,9 @@ def _build_verified_merge_candidate(
         repo_root, ["worktree", "add", "--detach", str(scratch), pre_sha]
     )
     if added.returncode != 0:
-        raise IntegrationCandidateError("could not create integration worktree")
+        raise IntegrationCandidateError(
+            "could not create integration worktree", code="provisioning_failed"
+        )
 
     if not empty_contribution:
         merged = _integration_git(
@@ -14477,7 +14505,7 @@ def _build_verified_merge_candidate(
         if merged.returncode != 0:
             _integration_git(scratch, ["merge", "--abort"])
             _remove_clean_integration_worktree(repo_root, scratch)
-            raise IntegrationCandidateError("merge conflict")
+            raise IntegrationCandidateError("merge conflict", code="merge_conflict")
 
     try:
         _provision_node_dependencies(_primary_checkout_root(repo_root), scratch)
@@ -14485,7 +14513,8 @@ def _build_verified_merge_candidate(
         _cleanup_provisioned_node_dependencies(scratch)
         _remove_clean_integration_worktree(repo_root, scratch)
         raise IntegrationCandidateError(
-            f"candidate dependency provisioning failed: {exc}"
+            f"candidate dependency provisioning failed: {exc}",
+            code="provisioning_failed",
         ) from exc
 
     candidate_result = _integration_git(scratch, ["rev-parse", "HEAD"])
@@ -14493,7 +14522,9 @@ def _build_verified_merge_candidate(
     if candidate_result.returncode != 0 or not candidate_sha:
         _cleanup_provisioned_node_dependencies(scratch)
         raise IntegrationCandidateError(
-            "could not resolve integration candidate", scratch_worktree=scratch
+            "could not resolve integration candidate",
+            code="ref_missing",
+            scratch_worktree=scratch,
         )
 
     verification_result: Optional[VerificationResult] = None
@@ -14540,10 +14571,30 @@ def _build_verified_merge_candidate(
     if not verified:
         _cleanup_provisioned_node_dependencies(scratch)
         _remove_clean_integration_worktree(repo_root, scratch)
+        failure_code = "verification_failed"
+        if verification_result is not None:
+            if verification_result.status == "configuration_error":
+                if verification_result.error in {"missing_profile", "empty_profile"}:
+                    failure_code = "profile_missing"
+                elif verification_result.error in {
+                    "invalid_command",
+                } or str(verification_result.error or "").startswith(
+                    "missing_executable:"
+                ):
+                    failure_code = "command_missing"
+                else:
+                    failure_code = "profile_invalid"
+            elif verification_result.status == "infrastructure_error":
+                failure_code = (
+                    "timeout"
+                    if verification_result.error == "timeout"
+                    else "io_error"
+                )
         raise IntegrationCandidateError(
             "candidate verification failed"
             if verification_result is None
             else f"candidate verification {verification_result.status}",
+            code=failure_code,
             verification_result=verification_result,
         )
 
@@ -14559,12 +14610,14 @@ def _build_verified_merge_candidate(
         ):
             _remove_clean_integration_worktree(repo_root, scratch)
             raise IntegrationCandidateError(
-                f"source branch moved: {source_branch} no longer matches reviewed SHA"
+                f"source branch moved: {source_branch} no longer matches reviewed SHA",
+                code="source_moved",
             )
 
     if not _worktree_is_clean(scratch):
         raise IntegrationCandidateError(
             f"scratch worktree is dirty; preserved at {scratch}",
+            code="ownership_changed",
             scratch_worktree=scratch,
         )
 
@@ -14572,7 +14625,9 @@ def _build_verified_merge_candidate(
     retained = _integration_git(repo_root, ["update-ref", candidate_ref, candidate_sha])
     if retained.returncode != 0:
         raise IntegrationCandidateError(
-            "could not retain integration candidate", scratch_worktree=scratch
+            "could not retain integration candidate",
+            code="command_failed",
+            scratch_worktree=scratch,
         )
     _remove_clean_integration_worktree(repo_root, scratch)
     return IntegrationCandidate(
@@ -17772,6 +17827,7 @@ def reconcile(
         finish_intent,
         prepare_claimed_intent,
         recover_expired_intents,
+        route_intent_failure,
     )
 
     facts_before = {
@@ -17798,10 +17854,12 @@ def reconcile(
             board=board,
         )
         if claimed_intent is not None:
+            active_intent = claimed_intent
             try:
                 prepared_intent = prepare_claimed_intent(
                     conn, claimed_intent, board=board
                 )
+                active_intent = prepared_intent
                 cas_result = advance_prepared_intent(
                     conn, prepared_intent, board=board
                 )
@@ -17813,11 +17871,17 @@ def reconcile(
                         conn, prepared_intent, cas_result, board=board
                     )
                     result.integrated.append(fact.story_id)
-            except Exception:
-                # The durable intent remains running/prepared for the next
-                # recovery pass; failure taxonomy/attention routing is owned
-                # by the follow-up coordinator task.
-                pass
+                else:
+                    route_intent_failure(
+                        conn, prepared_intent, cas_result, board=board
+                    )
+            except Exception as exc:
+                try:
+                    route_intent_failure(conn, active_intent, exc, board=board)
+                except Exception:
+                    # Lost ownership or an interrupted routing transaction keeps
+                    # the durable intent available to same-lineage recovery.
+                    pass
 
     # Step 5 (merge-back): carry finished work to LOCAL main. OFF unless the
     # board opts into product_workflow.merge_after_green.

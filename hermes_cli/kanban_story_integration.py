@@ -20,6 +20,7 @@ from hermes_cli.kanban_product_outcomes import (
 from hermes_cli.kanban_repository import (
     PreparedRefCASResult,
     RepositoryContract,
+    RepositoryConfigurationError,
     VerificationResult,
     advance_prepared_candidate_ref,
     delete_prepared_candidate_ref,
@@ -98,6 +99,223 @@ class RecoveryCounts:
     reset: int = 0
     deferred: int = 0
     cleaned: int = 0
+
+
+FailureOwnership: TypeAlias = Literal["product", "infrastructure"]
+
+
+@dataclass(frozen=True)
+class IntegrationFailure:
+    ownership: FailureOwnership
+    code: str
+
+
+_PRODUCT_FAILURE_CODES = frozenset({"merge_conflict", "verification_failed"})
+
+
+def _repository_failure_code(code: str) -> str:
+    if "ref" in code or "sha" in code:
+        return "ref_invalid"
+    if "profile" in code:
+        return "profile_invalid"
+    if "command" in code or "executable" in code:
+        return "command_missing"
+    return "repository_configuration"
+
+
+def classify_intent_failure(
+    failure: BaseException | PreparedRefCASResult,
+) -> IntegrationFailure:
+    """Return one safe ownership/code pair without persisting exception prose."""
+
+    from hermes_cli import kanban_db as kb
+
+    if isinstance(failure, PreparedRefCASResult):
+        code = (
+            failure.kind
+            if failure.kind in {"checked_out", "target_moved"}
+            else "ownership_changed"
+        )
+    elif isinstance(failure, kb.IntegrationCandidateError):
+        code = failure.code
+    elif type(failure) is RuntimeError and str(failure) in {
+        "merge conflict",
+        "candidate verification failed",
+    }:
+        # Exact compatibility for the pre-typed coordinator boundary and its
+        # frozen public probe; new candidate errors carry ``code`` above.
+        code = (
+            "merge_conflict"
+            if str(failure) == "merge conflict"
+            else "verification_failed"
+        )
+    elif isinstance(failure, RepositoryConfigurationError):
+        code = _repository_failure_code(failure.code)
+    elif isinstance(failure, TimeoutError):
+        code = "timeout"
+    elif isinstance(failure, OSError):
+        code = "io_error"
+    elif isinstance(failure, ValueError):
+        code = "ownership_changed"
+    else:
+        code = "unexpected_error"
+    return IntegrationFailure(
+        "product" if code in _PRODUCT_FAILURE_CODES else "infrastructure",
+        code,
+    )
+
+
+def _intent_key_text(key: IntegrationKey) -> str:
+    return f"{key.epic_id}:{key.story_id}:{key.source_sha}"
+
+
+def route_intent_failure(
+    conn: sqlite3.Connection,
+    intent: IntegrationIntent,
+    failure: BaseException | PreparedRefCASResult,
+    *,
+    board: str | None = None,
+) -> IntegrationIntent:
+    """Route one claimed/prepared failure by owner on the same story lineage."""
+
+    from hermes_cli import kanban_db as kb
+
+    route = classify_intent_failure(failure)
+    slug = board if board is not None else kb._known_board_slug_for_connection(conn)
+    metadata = kb.product_board_metadata(slug) or {}
+    workflow = metadata.get("product_workflow")
+    policy = workflow if isinstance(workflow, dict) else {}
+    try:
+        max_cycles = max(1, int(policy.get("max_rework_cycles", 3)))
+    except (TypeError, ValueError):
+        max_cycles = 3
+    now = int(time.time())
+
+    with kb.authorized_governance_write(), kb.write_txn(conn):
+        current = _current_intent(conn, intent.key)
+        if (
+            current.status in {"rework_required", "attention_required"}
+            and current.last_failure_code == route.code
+        ):
+            return current
+        if current != intent or current.status not in {"running", "prepared"}:
+            raise ValueError("integration intent ownership changed before failure routing")
+        task = conn.execute(
+            "SELECT status, current_step_key, current_run_id, rework_count "
+            "FROM tasks WHERE id=?",
+            (current.key.story_id,),
+        ).fetchone()
+        if (
+            task is None
+            or task["status"] != "review"
+            or task["current_step_key"] != "integration_pending"
+            or task["current_run_id"] is not None
+        ):
+            raise ValueError("story ownership changed before failure routing")
+
+        if route.ownership == "product":
+            observed_count = int(task["rework_count"] or 0)
+            next_count = observed_count + 1
+            limit_reached = next_count > max_cycles
+            next_status = (
+                "blocked"
+                if limit_reached
+                else kb._column_status_for_step(metadata, "development")
+            )
+            next_assignee = (
+                "default"
+                if limit_reached
+                else kb._product_role_assignee(metadata, "developer")
+            )
+            intent_updated = conn.execute(
+                "UPDATE story_integration_intents SET status='rework_required', "
+                "claim_lock=NULL, claim_expires=NULL, target_pre_sha=NULL, "
+                "candidate_sha=NULL, candidate_ref=NULL, verification_event_id=NULL, "
+                "last_failure_code=?, updated_at=? WHERE epic_id=? AND story_id=? "
+                "AND source_sha=? AND status=? AND claim_lock IS ?",
+                (
+                    route.code,
+                    now,
+                    current.key.epic_id,
+                    current.key.story_id,
+                    current.key.source_sha,
+                    current.status,
+                    current.claim_lock,
+                ),
+            )
+            task_updated = conn.execute(
+                "UPDATE tasks SET rework_count=?, current_step_key='development', "
+                "status=?, assignee=?, running=0, blocked=?, claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL, block_kind=? "
+                "WHERE id=? AND status='review' "
+                "AND current_step_key='integration_pending' AND current_run_id IS NULL "
+                "AND rework_count=?",
+                (
+                    next_count,
+                    next_status,
+                    next_assignee,
+                    1 if limit_reached else 0,
+                    "rework_limit" if limit_reached else None,
+                    current.key.story_id,
+                    observed_count,
+                ),
+            )
+            if intent_updated.rowcount != 1 or task_updated.rowcount != 1:
+                raise ValueError("integration failure routing ownership changed")
+            directive = kb.create_rework_directive(
+                conn,
+                current.key.story_id,
+                origin_kind="integration",
+                origin_intent_key=_intent_key_text(current.key),
+                origin_phase="integration_pending",
+                target_phase="development",
+                rejected_branch=current.source_branch,
+                rejected_sha=current.key.source_sha,
+                epic_tip_sha=current.target_pre_sha,
+                findings=(f"story integration {route.code}",),
+            )
+            kb._append_event(
+                conn,
+                current.key.story_id,
+                "rework_limit_reached" if limit_reached else "rework_requested",
+                {
+                    "from_step": "integration_pending",
+                    "target_step": "development",
+                    "failure_code": route.code,
+                    "rework_count": next_count,
+                    "max_rework_cycles": max_cycles,
+                    "directive_id": directive.id,
+                },
+            )
+        else:
+            updated = conn.execute(
+                "UPDATE story_integration_intents SET status='attention_required', "
+                "claim_lock=NULL, claim_expires=NULL, last_failure_code=?, updated_at=? "
+                "WHERE epic_id=? AND story_id=? AND source_sha=? AND status=? "
+                "AND claim_lock IS ?",
+                (
+                    route.code,
+                    now,
+                    current.key.epic_id,
+                    current.key.story_id,
+                    current.key.source_sha,
+                    current.status,
+                    current.claim_lock,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("integration attention ownership changed")
+            kb._append_event(
+                conn,
+                current.key.story_id,
+                "story_integration_attention_required",
+                {
+                    "intent_key": _intent_key_text(current.key),
+                    "failure_code": route.code,
+                    "attempt_count": current.attempt_count,
+                },
+            )
+        return _current_intent(conn, current.key)
 
 
 def _value(row: Row, field: str) -> object:
@@ -221,9 +439,10 @@ def claim_next_intent(
             return None
         row = conn.execute(
             "SELECT * FROM story_integration_intents "
-            "WHERE status='pending' "
+            "WHERE status IN ('pending', 'attention_required') "
             "OR (status='running' AND claim_expires IS NOT NULL AND claim_expires<=?) "
-            "ORDER BY CASE WHEN status='running' THEN 0 ELSE 1 END, created_at, "
+            "ORDER BY CASE status WHEN 'running' THEN 0 "
+            "WHEN 'attention_required' THEN 1 ELSE 2 END, created_at, "
             "epic_id, story_id, source_sha LIMIT 1",
             (now,),
         ).fetchone()
@@ -233,8 +452,8 @@ def claim_next_intent(
             "UPDATE story_integration_intents SET status='running', claim_lock=?, "
             "claim_expires=?, attempt_count=attempt_count+1, updated_at=? "
             "WHERE epic_id=? AND story_id=? AND source_sha=? "
-            "AND (status='pending' OR (status='running' AND claim_expires IS NOT NULL "
-            "AND claim_expires<=?))",
+            "AND (status IN ('pending', 'attention_required') OR "
+            "(status='running' AND claim_expires IS NOT NULL AND claim_expires<=?))",
             (
                 claim_lock,
                 now + int(lease_seconds),
@@ -448,6 +667,40 @@ def prepare_claimed_intent(
         if not _prepared_receipt_is_exact(conn, current, contract):
             raise ValueError("prepared integration receipt does not match")
         return current
+    retained_fields = (
+        current.target_pre_sha,
+        current.candidate_sha,
+        current.candidate_ref,
+        current.verification_event_id,
+    )
+    if any(value is not None for value in retained_fields):
+        if (
+            current != intent
+            or current.status != "running"
+            or not current.claim_lock
+            or not all(value is not None for value in retained_fields)
+        ):
+            raise ValueError("retained integration preparation is incomplete")
+        with kb.authorized_governance_write(), kb.write_txn(conn):
+            updated = conn.execute(
+                "UPDATE story_integration_intents SET status='prepared', "
+                "claim_lock=NULL, claim_expires=NULL, last_failure_code=NULL, updated_at=? "
+                "WHERE epic_id=? AND story_id=? AND source_sha=? "
+                "AND status='running' AND claim_lock=?",
+                (
+                    int(time.time()),
+                    current.key.epic_id,
+                    current.key.story_id,
+                    current.key.source_sha,
+                    current.claim_lock,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("integration attention claim changed during retry")
+            prepared = _current_intent(conn, current.key)
+            if not _prepared_receipt_is_exact(conn, prepared, contract):
+                raise ValueError("retained integration receipt does not match")
+            return prepared
     if (
         current != intent
         or current.status != "running"
@@ -857,6 +1110,7 @@ def recover_expired_intents(
                             _cleanup_integrated_candidate(conn, intent, contract)
                         )
                     else:
+                        route_intent_failure(conn, intent, cas_result, board=slug)
                         deferred = 1
                 elif boundary.kind in {"candidate", "descendant"}:
                     assert boundary.current_sha is not None
@@ -866,24 +1120,19 @@ def recover_expired_intents(
                     finalized = 1
                     cleaned = int(_cleanup_integrated_candidate(conn, intent, contract))
                 else:
-                    with kb.authorized_governance_write(), kb.write_txn(conn):
-                        changed = conn.execute(
-                            "UPDATE story_integration_intents SET status='pending', "
-                            "claim_lock=NULL, claim_expires=NULL, target_pre_sha=NULL, "
-                            "candidate_sha=NULL, candidate_ref=NULL, "
-                            "verification_event_id=NULL, last_failure_code='target_moved', "
-                            "updated_at=? WHERE epic_id=? AND story_id=? AND source_sha=? "
-                            "AND status='prepared' AND candidate_sha=?",
-                            (
-                                int(time.time()),
-                                intent.key.epic_id,
-                                intent.key.story_id,
-                                intent.key.source_sha,
-                                intent.candidate_sha,
-                            ),
-                        )
-                        reset = int(changed.rowcount == 1)
-        except Exception:
+                    route_intent_failure(
+                        conn,
+                        intent,
+                        PreparedRefCASResult("target_moved", boundary.current_sha),
+                        board=slug,
+                    )
+                    reset = 1
+        except Exception as exc:
+            if intent.status == "prepared":
+                try:
+                    route_intent_failure(conn, intent, exc, board=slug)
+                except Exception:
+                    pass
             deferred = 1
         counts = RecoveryCounts(
             counts.advanced + advanced,
