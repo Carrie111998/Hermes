@@ -3352,3 +3352,77 @@ class TestPreLlmFeasibilityCheck:
             feasibility_skip=compressor._last_feasibility_skip,
         )
         assert compressor._fallback_compression_streak == 1
+
+
+class TestExternalProtectedTail:
+    def _compressor(self):
+        return ContextCompressor(
+            model="test/model",
+            threshold_percent=0.75,
+            protect_first_n=2,
+            protect_last_n=20,
+            summary_target_ratio=0.20,
+            quiet_mode=True,
+            config_context_length=272_000,
+        )
+
+    @staticmethod
+    def _older_head():
+        messages = []
+        for index in range(30):
+            messages.extend([
+                {"role": "user", "content": f"old request {index}"},
+                {
+                    "role": "assistant",
+                    "content": f"old reply {index} " + ("x" * 4_000),
+                },
+            ])
+        return messages
+
+    def test_external_tail_disables_nested_inner_tail(self):
+        """A caller-owned recent tail must be the only recency boundary.
+
+        Without ``external_protected_tail``, this transcript fits inside the
+        ordinary token-budget tail and cannot shrink. A boundary-aware manual
+        compression already holds the selected exchanges outside this list, so
+        the complete older head must be summarized instead of protecting either
+        a second large suffix or the ordinary configured head rows.
+        """
+        messages = self._older_head()
+
+        ordinary = self._compressor()
+        with patch.object(
+            ordinary,
+            "_generate_summary",
+            return_value="ordinary summary",
+        ) as ordinary_summary:
+            ordinary_result = ordinary.compress(
+                list(messages),
+                current_tokens=250_000,
+                force=True,
+            )
+
+        external = self._compressor()
+        with patch.object(
+            external,
+            "_generate_summary",
+            return_value="external protected-tail summary",
+        ) as external_summary:
+            external_result = external.compress(
+                list(messages),
+                current_tokens=250_000,
+                force=True,
+                external_protected_tail=True,
+            )
+
+        ordinary_summary.assert_called_once()
+        assert len(ordinary_result) > len(external_result)
+        assert "old request 29" in str(ordinary_result)
+        assert "old reply 29" in str(ordinary_result)
+        external_summary.assert_called_once()
+        assert len(external_result) == 1
+        assert "external protected-tail summary" in external_result[0]["content"]
+        assert "old request 0" not in str(external_result)
+        assert "old reply 0" not in str(external_result)
+        assert "old request 29" not in str(external_result)
+        assert "old reply 29" not in str(external_result)

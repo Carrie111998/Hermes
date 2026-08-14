@@ -67,6 +67,7 @@ const cssEscape = (value: string): string => {
 }
 
 interface SubmitDetail {
+  preserveDraft?: boolean
   target: ComposerTarget
   text: string
 }
@@ -261,12 +262,21 @@ export const onComposerInsertRefsRequest = (handler: (detail: InsertRefsDetail) 
  * the agent a task without the user round-tripping through the input. */
 export const requestComposerSubmit = (
   text: string,
-  { target = 'active' }: { target?: ComposerTarget | 'active' } = {}
+  {
+    preserveDraft = false,
+    target = 'active'
+  }: { preserveDraft?: boolean; target?: ComposerTarget | 'active' } = {}
 ) => {
   const trimmed = text.trim()
 
   if (trimmed) {
-    dispatch<SubmitDetail>(SUBMIT_EVENT, { target: resolve(target), text: trimmed })
+    const detail: SubmitDetail = { target: resolve(target), text: trimmed }
+
+    if (preserveDraft) {
+      detail.preserveDraft = true
+    }
+
+    dispatch<SubmitDetail>(SUBMIT_EVENT, detail)
   }
 }
 

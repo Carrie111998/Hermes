@@ -7575,6 +7575,7 @@ class AIAgent:
         force: bool = False,
         defer_context_engine_notification: bool = False,
         commit_fence=None,
+        protected_tail: list = None,
     ) -> tuple:
         """Forwarder — see ``agent.conversation_compression.compress_context``.
 
@@ -7617,6 +7618,12 @@ class AIAgent:
         # manual paths. hard_interrupt() uses this exact instance to serialize
         # cancel admission against begin_commit().
         active_fence = commit_fence or CompressionCommitFence()
+        # Partial compression can run on the pooled worker after the caller has
+        # returned from its dispatch frame. Never let that worker retain the
+        # caller's live protected-tail objects; snapshot them just like the head.
+        protected_tail_snapshot = (
+            copy.deepcopy(protected_tail) if protected_tail else None
+        )
         # A single agent can receive overlapping automatic/manual entrypoints.
         # Serialize fence publication so a waiter cannot replace the fence of
         # the attempt currently generating/committing a summary.
@@ -7631,17 +7638,26 @@ class AIAgent:
             self._active_compression_commit_fence = active_fence
         try:
             def _run(fence=None, target_messages=None):
+                kwargs = {
+                    "approx_tokens": approx_tokens,
+                    "task_id": task_id,
+                    "focus_topic": focus_topic,
+                    "force": force,
+                    "defer_context_engine_notification": (
+                        defer_context_engine_notification
+                    ),
+                    "commit_fence": fence,
+                }
+                # Keep the historical call shape for every ordinary/full
+                # compression. Strict plugin wrappers and test doubles may not
+                # accept new optional keywords they never use.
+                if protected_tail_snapshot:
+                    kwargs["protected_tail"] = protected_tail_snapshot
                 return compress_context(
                     self,
                     target_messages if target_messages is not None else messages,
                     system_message,
-                    approx_tokens=approx_tokens, task_id=task_id,
-                    focus_topic=focus_topic,
-                    force=force,
-                    defer_context_engine_notification=(
-                        defer_context_engine_notification
-                    ),
-                    commit_fence=fence,
+                    **kwargs,
                 )
 
             # Callers that already own a progress-aware wait (gateway session

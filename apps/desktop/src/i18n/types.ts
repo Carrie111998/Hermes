@@ -2177,6 +2177,9 @@ export interface Translations {
       openStarmap: string
       turnRunning: string
       contextUsage: string
+      contextNearCompression: string
+      contextCompressionDue: string
+      contextCompressionTooltip: (percent: number) => string
       contextUsagePanel: {
         categories: {
           conversation: string
@@ -2190,8 +2193,18 @@ export interface Translations {
         }
         empty: string
         loading: string
+        automaticCompression: (percent: number, tokens: string) => string
+        compressionDue: string
+        compressNow: string
+        compressNowTitle: string
+        compressUnavailable: string
+        keepRecent: string
+        keepRecentAll: string
+        keepRecentTitle: string
+        keepRecentTurns: (turns: number) => string
         percentFull: (percent: number) => string
         title: string
+        tokensRemaining: (tokens: string) => string
         tokenSummary: (used: string, max: string) => string
       }
       session: string
@@ -2555,6 +2568,13 @@ export interface Translations {
     resumeStrandedTitle: string
     resumeStrandedBody: string
     resumeRetry: string
+    compactionGuardTitle: (sessionLabel: string) => string
+    compactionGuardSessionId: (sessionId: string) => string
+    compactionGuardDescription: string
+    compactionGuardStatus: string
+    compactionCompleteTitle: string
+    compactionCompleteMessage: string
+    compactionFailedTitle: string
     nothingToBranch: string
     branchNeedsChat: string
     sessionBusy: string

@@ -1395,6 +1395,8 @@ def _(rid, params: dict) -> dict:
                 "context_max": usage.get("context_max", 0) or 0,
                 "context_percent": usage.get("context_percent", 0) or 0,
                 "context_used": usage.get("context_used", 0) or 0,
+                "compression_threshold_percent": usage.get("compression_threshold_percent", 0) or 0,
+                "compression_threshold_tokens": usage.get("compression_threshold_tokens", 0) or 0,
                 "estimated_total": usage.get("context_used", 0) or usage.get("total", 0) or 0,
                 "model": _metadata_mirror(session).get("model", ""),
             },

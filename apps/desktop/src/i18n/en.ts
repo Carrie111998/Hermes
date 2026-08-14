@@ -2585,6 +2585,9 @@ export const en: Translations = {
       openStarmap: 'Open memory graph',
       turnRunning: 'Running',
       contextUsage: 'Context usage',
+      contextNearCompression: 'Context near compression',
+      contextCompressionDue: 'Context compression due',
+      contextCompressionTooltip: percent => `Automatic compression near ${percent}% context`,
       contextUsagePanel: {
         categories: {
           conversation: 'Conversation',
@@ -2598,8 +2601,18 @@ export const en: Translations = {
         },
         empty: 'No context data yet',
         loading: 'Loading breakdown…',
+        automaticCompression: (percent, tokens) => `Automatic compression near ${percent}% (${tokens} tokens)`,
+        compressionDue: 'Compression will start before the next model call.',
+        compressNow: 'Compress now',
+        compressNowTitle: 'Compress this session before the next turn',
+        compressUnavailable: 'Wait for the current session activity to finish.',
+        keepRecent: 'Keep recent turns',
+        keepRecentAll: 'Summarize all',
+        keepRecentTitle: 'Keep the selected number of recent user/Hermes exchanges verbatim',
+        keepRecentTurns: turns => `${turns} turn${turns === 1 ? '' : 's'}`,
         percentFull: percent => `${percent}% Full`,
         title: 'Context Usage',
+        tokensRemaining: tokens => `${tokens} tokens remaining`,
         tokenSummary: (used, max) => `${used} / ${max} Tokens`
       },
       session: 'Session',
@@ -3009,6 +3022,15 @@ export const en: Translations = {
     resumeStrandedBody:
       'The connection to this session failed and automatic retries gave up. Check that the gateway is running, then try again.',
     resumeRetry: 'Retry',
+    compactionGuardTitle: sessionLabel => `Compressing “${sessionLabel}”`,
+    compactionGuardSessionId: sessionId => `Session ${sessionId}`,
+    compactionGuardDescription:
+      'Hermes is summarizing earlier context in this chat. Only this chat is temporarily locked; you can switch to other sessions.',
+    compactionGuardStatus:
+      'Sending, steering, and queueing are disabled here until Hermes reports that compression completed or failed. Your draft is preserved.',
+    compactionCompleteTitle: 'Context compressed',
+    compactionCompleteMessage: 'Earlier history was summarized successfully. This session is ready to continue.',
+    compactionFailedTitle: 'Context compression failed',
     nothingToBranch: 'Nothing to branch',
     branchNeedsChat: 'Start or resume a chat before branching.',
     sessionBusy: 'Session busy',

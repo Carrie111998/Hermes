@@ -6431,6 +6431,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         focus_topic: Optional[str] = None,
         force: bool = False,
         memory_context: str = "",
+        external_protected_tail: bool = False,
     ) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
@@ -6467,6 +6468,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                 summary path.  Auto-compress callers pass False.
             memory_context: Optional provider-supplied context to preserve in
                 the summary prompt. Whitespace-only values are ignored.
+            external_protected_tail: True when the caller already split off a
+                boundary-aware recent tail (for example ``/compress here N``).
+                In that mode the selected tail is the sole recency boundary:
+                summarize the entire older head instead of protecting a second
+                token-budget tail inside it.
         """
         # Reset per-call summary failure state — callers inspect these fields
         # after compress() returns to decide whether to surface a warning.
@@ -6525,8 +6531,13 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Phase 1: Prune old tool results (cheap, no LLM call)
         messages, pruned_count = self._prune_old_tool_results(
-            messages, protect_tail_count=self.protect_last_n,
-            protect_tail_tokens=self.tail_token_budget,
+            messages,
+            protect_tail_count=(
+                0 if external_protected_tail else self.protect_last_n
+            ),
+            protect_tail_tokens=(
+                0 if external_protected_tail else self.tail_token_budget
+            ),
         )
         if pruned_count and not self.quiet_mode:
             logger.info("Pre-compression: pruned %d old tool result(s)", pruned_count)
@@ -6544,17 +6555,31 @@ This compaction should PRIORITISE preserving all information related to the focu
             n_messages = len(messages)
         latest_actionable_idx = self._find_last_user_message_idx(messages, 0)
 
-        # Phase 2: Determine boundaries
-        compress_start = self._protect_head_size(messages)
-        compress_start = self._align_boundary_forward(messages, compress_start)
+        # Phase 2: Determine boundaries. A user-selected external tail is the
+        # *only* verbatim boundary: even the ordinary protected head belongs to
+        # the older material the user asked us to summarize. Keeping those first
+        # rows can leak an old user message into the tail seam.
+        if external_protected_tail:
+            compress_start = 0
+        else:
+            compress_start = self._protect_head_size(messages)
+            compress_start = self._align_boundary_forward(messages, compress_start)
 
-        # Use token-budget tail protection instead of fixed message count
-        compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
+        # A boundary-aware caller already owns the exact recent tail. Applying
+        # the ordinary token-budget tail here creates a nested protected tail,
+        # which can leave only a handful of old rows compressible and keep the
+        # request above threshold forever. Summarize through the end of this
+        # older head; the caller rejoins its selected tail after the summary.
+        if external_protected_tail:
+            compress_end = len(messages)
+        else:
+            # Use token-budget tail protection instead of fixed message count.
+            compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
 
         # A double role collision can merge the summary into the first tail
         # row. Keep an actionable user event out of that position by retaining
         # the genuinely older assistant/tool bridge when one exists.
-        if compress_end == latest_actionable_idx:
+        if not external_protected_tail and compress_end == latest_actionable_idx:
             bridge_idx = latest_actionable_idx - 1
             if bridge_idx >= 0 and messages[bridge_idx].get("role") == "tool":
                 bridge_idx = self._align_boundary_backward(

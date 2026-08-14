@@ -4876,16 +4876,16 @@ def _compress_session_history(
         return 0, usage
     partial, keep_last, focus_topic = parse_partial_compress_args(focus_topic or "")
     # Boundary-aware split: only the head is summarized; the most recent
-    # `keep_last` exchanges ride along verbatim. A degenerate split (empty
-    # tail — everything would be kept, or no head left to compress) falls
-    # back to full compression so the user still gets an action.
+    # `keep_last` exchanges ride along verbatim. If no head remains to
+    # summarize, honor the protected-tail request with a no-op instead of
+    # silently falling back to full compression.
     tail: list = []
     head = history
     if partial:
         head, tail = split_history_for_partial_compress(history, keep_last)
         if not tail:
-            partial = False
-            head = history
+            usage = _get_usage(agent)
+            return 0, usage
     if approx_tokens is None:
         # Include system prompt + tool schemas so the figure reflects real
         # request pressure, not a transcript-only underestimate (#6217).
@@ -4915,6 +4915,7 @@ def _compress_session_history(
             focus_topic=focus_topic or None,
             force=True,
             defer_context_engine_notification=True,
+            **({"protected_tail": tail} if partial and tail else {}),
         )
     except Exception:
         finalize_context_engine_compression_notification(
@@ -5082,10 +5083,17 @@ def _get_usage(agent) -> dict:
         if last_prompt < 0:
             last_prompt = 0
         ctx_max = getattr(comp, "context_length", 0) or 0
+        threshold_tokens = getattr(comp, "threshold_tokens", 0) or 0
         if ctx_max and last_prompt:
             usage["context_used"] = last_prompt
             usage["context_max"] = ctx_max
             usage["context_percent"] = max(0, min(100, round(last_prompt / ctx_max * 100)))
+        if ctx_max and threshold_tokens:
+            usage["compression_threshold_tokens"] = threshold_tokens
+            usage["compression_threshold_percent"] = max(
+                0,
+                min(100, round(threshold_tokens / ctx_max * 100)),
+            )
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
     # Live count of background/async subagents still running (delegate_task
     # batches + background single delegations). Mirrors the classic CLI status

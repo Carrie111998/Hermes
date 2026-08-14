@@ -11104,6 +11104,7 @@ def _partial_compress_agent(compress_context_calls):
 
     def _fake_compress_context(history, sys, approx_tokens=0, focus_topic=None, **kw):
         compress_context_calls.append((list(history), focus_topic))
+        agent._last_test_protected_tail = kw.get("protected_tail")
         return list(_PARTIAL_COMPRESSED_HEAD), {}
 
     agent._compress_context = _fake_compress_context
@@ -11134,6 +11135,7 @@ def test_compress_session_history_here_triggers_partial_compress():
     head_passed, focus_passed = compress_context_calls[0]
     assert head_passed == _PARTIAL_FAKE_HISTORY[:-2]
     assert focus_passed is None  # partial compress has no focus topic
+    assert agent._last_test_protected_tail == _PARTIAL_FAKE_HISTORY[-2:]
     # Session history must now contain the rejoined transcript: compressed
     # head + the last exchange verbatim.
     assert session["history"] == _PARTIAL_COMPRESSED_HEAD + _PARTIAL_FAKE_HISTORY[-2:]
@@ -11141,9 +11143,9 @@ def test_compress_session_history_here_triggers_partial_compress():
     assert removed == len(_PARTIAL_FAKE_HISTORY) - len(session["history"])
 
 
-def test_compress_session_history_here_falls_back_on_degenerate_split():
-    """/compress here with keep_last >= exchanges produces an empty tail —
-    must fall back to full compression (whole history, no rejoined tail)."""
+def test_compress_session_history_here_noops_on_degenerate_split():
+    """If keep_last covers every exchange, there is no unprotected head to
+    summarize; preserve the requested tail and report no change."""
     compress_context_calls = []
     agent = _partial_compress_agent(compress_context_calls)
 
@@ -11151,15 +11153,14 @@ def test_compress_session_history_here_falls_back_on_degenerate_split():
     short_history = _PARTIAL_FAKE_HISTORY[:4]
     session = _session(agent=agent)
     session["history"] = list(short_history)
+    original_version = session.get("history_version", 0)
 
-    server._compress_session_history(session, "here 5")
+    removed, _usage = server._compress_session_history(session, "here 5")
 
-    # Degenerate split → full compress of the whole history, focus_topic=None
-    assert len(compress_context_calls) == 1
-    head_passed, focus_passed = compress_context_calls[0]
-    assert head_passed == short_history
-    assert focus_passed is None
-    assert session["history"] == _PARTIAL_COMPRESSED_HEAD
+    assert compress_context_calls == []
+    assert session["history"] == short_history
+    assert session.get("history_version", 0) == original_version
+    assert removed == 0
 
 
 def test_compress_session_history_plain_focus_topic_not_parsed_as_partial():
@@ -11208,6 +11209,40 @@ def test_session_compress_rpc_honors_here_argument(monkeypatch):
     assert head_passed == _PARTIAL_FAKE_HISTORY[:-2]
     assert focus_passed is None
     assert session["history"] == _PARTIAL_COMPRESSED_HEAD + _PARTIAL_FAKE_HISTORY[-2:]
+
+
+def test_session_compress_rpc_reports_noop_when_keep_covers_history(monkeypatch):
+    """A protected tail must never be silently replaced by full compression."""
+    compress_context_calls = []
+    agent = _partial_compress_agent(compress_context_calls)
+    short_history = _PARTIAL_FAKE_HISTORY[:4]
+    session = _session(agent=agent)
+    session["history"] = list(short_history)
+    server._sessions["sid"] = session
+
+    monkeypatch.setattr(server, "_session_info", lambda *_a, **_kw: {"model": "x"})
+    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "_emit", lambda *args: None)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.compress",
+                "params": {"session_id": "sid", "focus_topic": "here 5"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert resp["result"]["status"] == "compressed"
+    assert resp["result"]["summary"]["noop"] is True
+    assert resp["result"]["removed"] == 0
+    assert [message["text"] for message in resp["result"]["messages"]] == [
+        message["content"] for message in short_history
+    ]
+    assert compress_context_calls == []
+    assert session["history"] == short_history
 
 
 def test_command_dispatch_compress_honors_here_argument(monkeypatch):
@@ -16203,12 +16238,15 @@ def test_get_usage_reports_real_current_occupancy():
             last_prompt_tokens=60_000,
             context_length=120_000,
             compression_count=2,
+            threshold_tokens=90_000,
         ),
     )
     usage = server._get_usage(agent)
     assert usage["context_used"] == 60_000
     assert usage["context_max"] == 120_000
     assert usage["context_percent"] == 50
+    assert usage["compression_threshold_tokens"] == 90_000
+    assert usage["compression_threshold_percent"] == 75
 
 
 def test_get_usage_clamps_post_compression_sentinel():

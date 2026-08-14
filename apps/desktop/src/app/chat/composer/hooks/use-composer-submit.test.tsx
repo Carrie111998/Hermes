@@ -2,7 +2,7 @@ import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { $clarifyRequests } from '@/store/clarify'
-import type { ComposerAttachment } from '@/store/composer'
+import { type ComposerAttachment, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { $gateway } from '@/store/gateway'
 import {
   clearAllPrompts,
@@ -76,6 +76,7 @@ function renderSubmitHook({
 describe('useComposerSubmit busy-turn routing', () => {
   afterEach(() => {
     cleanup()
+    takeSessionDraft('stored-session')
     vi.restoreAllMocks()
   })
 
@@ -95,7 +96,7 @@ describe('useComposerSubmit busy-turn routing', () => {
     expect(onSubmit).not.toHaveBeenCalled()
   })
 
-  it('queues a plain-text follow-up while the active turn is compacting', () => {
+  it('blocks every submit route while the active turn is compacting', () => {
     const { hook, onCancel, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({
       busy: true,
       compacting: true,
@@ -103,13 +104,43 @@ describe('useComposerSubmit busy-turn routing', () => {
     })
 
     act(() => {
+      hook.result.current.dispatchSubmit('blocked direct submit')
       hook.result.current.submitDraft()
+      hook.result.current.queueDraft()
+      hook.result.current.steerDraft()
     })
 
-    expect(queueCurrentDraft).toHaveBeenCalledTimes(1)
+    expect(queueCurrentDraft).not.toHaveBeenCalled()
     expect(onSteer).not.toHaveBeenCalled()
     expect(onSubmit).not.toHaveBeenCalled()
     expect(onCancel).not.toHaveBeenCalled()
+  })
+
+  it('preserves the existing draft when an external control submits a side-effect command', async () => {
+    stashSessionDraft('stored-session', 'unfinished user draft', [])
+    const { hook, onSubmit } = renderSubmitHook({ text: 'unfinished user draft' })
+
+    act(() => {
+      hook.result.current.dispatchSubmit('/compress here 4', undefined, { preserveDraft: true })
+    })
+
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledWith('/compress here 4', { composerScope: 'stored-session' })
+    )
+    expect(takeSessionDraft('stored-session').text).toBe('unfinished user draft')
+  })
+
+  it('does not overwrite the existing draft when a preserved side-effect command is rejected', async () => {
+    stashSessionDraft('stored-session', 'unfinished user draft', [])
+    const { hook, onSubmit } = renderSubmitHook({ text: 'unfinished user draft' })
+    onSubmit.mockResolvedValueOnce(false)
+
+    act(() => {
+      hook.result.current.dispatchSubmit('/compress here 2', undefined, { preserveDraft: true })
+    })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalled())
+    expect(takeSessionDraft('stored-session').text).toBe('unfinished user draft')
   })
 
   it('runs slash commands immediately while busy', async () => {

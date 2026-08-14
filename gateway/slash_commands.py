@@ -4210,6 +4210,7 @@ class GatewaySlashCommandsMixin:
                         focus_topic=focus_topic,
                         force=True,
                         defer_context_engine_notification=True,
+                        **({"protected_tail": tail} if partial and tail else {}),
                     )
                 )
 

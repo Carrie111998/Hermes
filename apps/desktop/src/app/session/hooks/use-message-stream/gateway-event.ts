@@ -21,7 +21,7 @@ import { type AgentNoticePayload, clearAgentNotice, nativeNoticeInput, showAgent
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { billingCtaLabel, clearBillingBlock, runBillingRecovery, setBillingBlock } from '@/store/billing-block'
 import { clearClarifyRequest, normalizeChoices, setClarifyRequest, warnDroppedChoices } from '@/store/clarify'
-import { setSessionCompacting } from '@/store/compaction'
+import { isSessionCompacting, setSessionCompacting } from '@/store/compaction'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
 import { $gateway } from '@/store/gateway'
 import { applyGoalStatusText } from '@/store/goals'
@@ -202,6 +202,24 @@ const COMPACTION_RESUME_EVENT_TYPES = new Set([
   'tool.complete'
 ])
 
+function completeSessionCompaction(sessionId: string): void {
+  const wasCompacting = isSessionCompacting(sessionId)
+
+  setSessionCompacting(sessionId, false)
+
+  if (!wasCompacting) {
+    return
+  }
+
+  notify({
+    durationMs: 4_000,
+    id: `compaction-complete:${sessionId}`,
+    kind: 'success',
+    message: translateNow('desktop.compactionCompleteMessage'),
+    title: translateNow('desktop.compactionCompleteTitle')
+  })
+}
+
 interface GatewayEventDeps {
   activeGatewayProfile: string
   activeSessionIdRef: MutableRefObject<string | null>
@@ -259,6 +277,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
   } = deps
 
   const unscopedStreamSessionIdRef = useRef<string | null>(null)
+  const manualCompactingSessionsRef = useRef(new Set<string>())
 
   // session.info arrives in bursts (agent build ready + turn end + title /
   // MCP / compress edges within the same second). Each used to fire its own
@@ -321,7 +340,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       // turn has resumed, so retire the phase label without waiting for the
       // whole turn to complete.
       if (sessionId && COMPACTION_RESUME_EVENT_TYPES.has(event.type) && compactedTurnRef.current.has(sessionId)) {
-        setSessionCompacting(sessionId, false)
+        completeSessionCompaction(sessionId)
       }
 
       if (sessionId && DRAFT_SUPERSEDING_EVENT_TYPES.has(event.type)) {
@@ -403,6 +422,16 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         const modelChanged = typeof payload?.model === 'string'
         const providerChanged = typeof payload?.provider === 'string'
         const runningChanged = typeof payload?.running === 'boolean'
+
+        // Manual `/compress` is an idle control operation rather than a turn:
+        // it emits `status.update(kind="compressing")`, then an authoritative
+        // idle session.info after committing the replacement history. Unlock
+        // without the automatic-compaction success toast — the slash action
+        // owns the richer success/aborted/no-op result from session.compress.
+        if (sessionId && payload?.running === false && manualCompactingSessionsRef.current.delete(sessionId)) {
+          setSessionCompacting(sessionId, false)
+        }
+
         // The backend stamps model/provider (as strings) on EVERY session.info,
         // so the presence flags above are true on every heartbeat/turn edge —
         // fine for the cheap atom writes below (nanostores skips identical
@@ -597,6 +626,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         flushQueuedDeltas(sessionId)
         pruneFinishedSessionSubagents(sessionId)
         setSessionCompacting(sessionId, false)
+        manualCompactingSessionsRef.current.delete(sessionId)
         compactedTurnRef.current.delete(sessionId)
         nativeSubagentSessionsRef.current.delete(sessionId)
         // A fresh turn on this session optimistically clears its billing wall;
@@ -767,6 +797,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // last item stuck pending/in_progress. Finished lists keep their linger.
         clearActiveSessionTodos(sessionId)
         setSessionCompacting(sessionId, false)
+        manualCompactingSessionsRef.current.delete(sessionId)
 
         flushQueuedDeltas(sessionId)
 
@@ -1213,9 +1244,22 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         if (sessionId && payload?.kind === 'compacting') {
           setSessionCompacting(sessionId, true)
           compactedTurnRef.current.add(sessionId)
+        } else if (sessionId && payload?.kind === 'compressing') {
+          setSessionCompacting(sessionId, true)
+          manualCompactingSessionsRef.current.add(sessionId)
         } else if (sessionId && payload?.kind === 'compacted') {
-          setSessionCompacting(sessionId, false)
+          completeSessionCompaction(sessionId)
           compactedTurnRef.current.delete(sessionId)
+        } else if (
+          sessionId &&
+          payload?.kind === 'ready' &&
+          manualCompactingSessionsRef.current.delete(sessionId)
+        ) {
+          // `ready` is the manual compressor's finally edge. It also fires on
+          // abort/error paths that do not emit session.info, so it must always
+          // release the lock but must not claim success; `/compress` renders the
+          // authoritative RPC result (or error) immediately afterward.
+          setSessionCompacting(sessionId, false)
         } else if (sessionId && payload?.kind === 'process') {
           // The gateway's notification poller announces background process
           // completions / watch matches here — re-sync the status stack.
@@ -1290,6 +1334,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       } else if (event.type === 'error') {
         const errorMessage = payload?.message || 'Hermes reported an error'
         const looksLikeProviderSetup = isProviderSetupErrorMessage(errorMessage)
+        const compactionFailed = isSessionCompacting(sessionId)
 
         // A turn that errors out has also ended — drop any open blocking prompt
         // for this session so an approval/sudo/secret overlay can't linger past
@@ -1299,6 +1344,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           clearClarifyRequest(undefined, sessionId)
           clearActiveSessionTodos(sessionId)
           setSessionCompacting(sessionId, false)
+          manualCompactingSessionsRef.current.delete(sessionId)
           compactedTurnRef.current.delete(sessionId)
         }
 
@@ -1316,6 +1362,17 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         if (looksLikeProviderSetup) {
           requestDesktopOnboarding(errorMessage)
+        }
+
+        if (compactionFailed) {
+          notify({
+            id: `compaction-failed:${sessionId}`,
+            kind: 'error',
+            message: errorMessage,
+            title: translateNow('desktop.compactionFailedTitle')
+          })
+        } else if (looksLikeProviderSetup) {
+          // Onboarding above is the actionable surface for setup failures.
         } else if (isDiskFullErrorMessage(errorMessage)) {
           notifyError(new Error(errorMessage), translateNow('notifications.errors.diskFull'))
         } else {

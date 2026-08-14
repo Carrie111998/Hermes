@@ -58,6 +58,36 @@ export function contextBarLabel(usage: UsageStats): string {
   return `[${contextBar(usage.context_percent)}] ${pct}%`
 }
 
+export type ContextCompressionPressure = 'normal' | 'near' | 'due'
+
+const CONTEXT_COMPRESSION_WARNING_RATIO = 0.85
+
+export function contextTokensUntilCompression(usage: UsageStats): number | null {
+  const threshold = usage.compression_threshold_tokens
+  const used = usage.context_used
+
+  if (!threshold || threshold <= 0 || used == null || used < 0) {
+    return null
+  }
+
+  return Math.max(0, threshold - used)
+}
+
+export function contextCompressionPressure(usage: UsageStats): ContextCompressionPressure {
+  const threshold = usage.compression_threshold_tokens
+  const used = usage.context_used
+
+  if (!threshold || threshold <= 0 || used == null || used <= 0) {
+    return 'normal'
+  }
+
+  if (used >= threshold) {
+    return 'due'
+  }
+
+  return used >= threshold * CONTEXT_COMPRESSION_WARNING_RATIO ? 'near' : 'normal'
+}
+
 export function LiveDuration({ since }: { since: number | null | undefined }) {
   const [now, setNow] = useState(() => Date.now())
 

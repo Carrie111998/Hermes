@@ -42,6 +42,10 @@ interface UseComposerSubmitArgs {
   stashAt: (scope: string | null, text?: string, attachments?: ComposerAttachment[]) => void
 }
 
+interface DispatchSubmitOptions {
+  preserveDraft?: boolean
+}
+
 /**
  * The composer's submit engine — the orchestration seam where the draft and
  * queue meet. `submitDraft` is the one decision tree (queue-edit save · slash-
@@ -80,11 +84,23 @@ export function useComposerSubmit({
 
   // Shared send primitive: fire onSubmit, and if the gateway rejects (accepted
   // === false) or throws, re-load + re-stash the draft so the words survive.
-  const dispatchSubmit = (text: string, attachments?: ComposerAttachment[]) => {
+  const dispatchSubmit = (
+    text: string,
+    attachments?: ComposerAttachment[],
+    { preserveDraft = false }: DispatchSubmitOptions = {}
+  ) => {
+    if (disabled || compacting) {
+      return
+    }
+
     const submittedScope = activeQueueSessionKeyRef.current
     const submittedAttachments = attachments ?? []
 
     const restore = () => {
+      if (preserveDraft) {
+        return
+      }
+
       loadIntoComposer(text, submittedAttachments)
       // Use the scope captured at dispatch, not whatever session is focused
       // now — the gateway can reject well after the user has switched away,
@@ -98,7 +114,13 @@ export function useComposerSubmit({
         ? onSubmit(text, { attachments, composerScope: submittedScope })
         : onSubmit(text, { composerScope: submittedScope })
     )
-      .then(accepted => void (accepted === false ? restore() : clearSessionDraft(submittedScope)))
+      .then(accepted => {
+        if (accepted === false) {
+          restore()
+        } else if (!preserveDraft) {
+          clearSessionDraft(submittedScope)
+        }
+      })
       .catch(restore)
   }
 
@@ -110,16 +132,16 @@ export function useComposerSubmit({
 
   useEffect(
     () =>
-      onComposerSubmitRequest(({ target, text }) => {
+      onComposerSubmitRequest(({ preserveDraft, target, text }) => {
         if (target === 'main' && !inputDisabled) {
-          dispatchSubmitRef.current(text)
+          dispatchSubmitRef.current(text, undefined, { preserveDraft })
         }
       }),
     [inputDisabled]
   )
 
   const submitDraft = () => {
-    if (disabled) {
+    if (disabled || compacting) {
       return
     }
 
@@ -227,6 +249,10 @@ export function useComposerSubmit({
   // active model request with its displayed context or waits for the current
   // tool boundary. If the turn already ended, queue the words instead.
   const steerDraft = () => {
+    if (compacting) {
+      return
+    }
+
     const text = draftRef.current.trim()
 
     // Guard on live editor state, not the render-lagged `canSteer`: a redirect
@@ -246,7 +272,7 @@ export function useComposerSubmit({
   }
 
   const queueDraft = () => {
-    if (disabled || !busy) {
+    if (disabled || compacting || !busy) {
       return
     }
 

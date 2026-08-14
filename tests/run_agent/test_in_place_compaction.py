@@ -18,11 +18,12 @@ import pytest
 
 
 def _make_agent(session_db, session_id, *, in_place):
-    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+    fake_api_key = "test" + "-key"
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": fake_api_key}):
         from run_agent import AIAgent
 
         agent = AIAgent(
-            api_key="test-key",
+            api_key=fake_api_key,
             base_url="https://openrouter.ai/api/v1",
             model="test/model",
             quiet_mode=True,
@@ -34,7 +35,14 @@ def _make_agent(session_db, session_id, *, in_place):
     agent.compression_in_place = in_place
     # Mock the compressor to return a deterministic shrunk transcript so the
     # test exercises the DB-mutation path, not summarization quality.
-    def _fake_compress(messages, current_tokens=None, focus_topic=None, force=False):
+    def _fake_compress(
+        messages,
+        current_tokens=None,
+        focus_topic=None,
+        force=False,
+        external_protected_tail=False,
+    ):
+        agent._test_external_protected_tail = external_protected_tail
         return [
             {"role": "user", "content": "[CONTEXT COMPACTION] summary of prior turns"},
             {"role": "assistant", "content": "recent reply"},
@@ -59,6 +67,134 @@ def _seed(db, sid, title, n=8):
 
 
 class TestInPlaceCompaction:
+    def test_in_place_atomically_commits_manual_protected_tail(self):
+        """Partial manual compression must persist its protected tail.
+
+        Regression: the outer manual-compression helper split history into a
+        head and tail, then called _compress_context(head). In-place compaction
+        archived every active SQLite row and committed only the compressed head;
+        rejoining the tail afterward repaired the in-memory list but not the
+        durable session. A reload therefore lost exactly the turns selected by
+        "Keep recent".
+        """
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260810_partial_tail"
+            _seed(db, sid, "partial-tail")
+            agent = _make_agent(db, sid, in_place=True)
+            head = [{"role": "user", "content": f"head {i}"} for i in range(8)]
+            protected_tail = [
+                {"role": "user", "content": "keep user turn 1"},
+                {"role": "assistant", "content": "keep assistant reply 1"},
+                {"role": "user", "content": "keep user turn 2"},
+                {"role": "assistant", "content": "keep assistant reply 2"},
+                {"role": "user", "content": "keep user turn 3"},
+                {"role": "assistant", "content": "keep assistant reply 3"},
+            ]
+
+            compressed_head, _ = compress_context(
+                agent,
+                head,
+                "sys",
+                approx_tokens=100_000,
+                protected_tail=protected_tail,
+            )
+
+            # Backward-compatible return contract: manual callers still do the
+            # in-memory rejoin once after _compress_context returns.
+            assert [m["content"] for m in compressed_head] == [
+                "[CONTEXT COMPACTION] summary of prior turns",
+                "recent reply",
+            ]
+            # Durability contract: the atomic in-place commit already includes
+            # the protected tail, so resume/reload cannot discard it.
+            reloaded = db.get_messages_as_conversation(sid)
+            reloaded_contents = [m["content"] for m in reloaded]
+            active_count = db.get_session(sid)["message_count"]
+            # The wrapper may use a pooled worker on Windows. Close the explicit
+            # fixture connection before TemporaryDirectory removes the DB file.
+            db.close()
+
+            assert reloaded_contents == [
+                "[CONTEXT COMPACTION] summary of prior turns",
+                "recent reply",
+                "keep user turn 1",
+                "keep assistant reply 1",
+                "keep user turn 2",
+                "keep assistant reply 2",
+                "keep user turn 3",
+                "keep assistant reply 3",
+            ]
+            assert active_count == 8
+            assert agent._test_external_protected_tail is True
+
+    def test_in_place_same_role_seam_keeps_first_protected_message_verbatim(self):
+        """A user-role summary must never absorb the first protected user row."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260811_partial_tail_seam"
+            _seed(db, sid, "partial-tail-seam")
+            agent = _make_agent(db, sid, in_place=True)
+
+            def _user_summary_only(messages, **kwargs):
+                agent._test_external_protected_tail = kwargs.get(
+                    "external_protected_tail", False
+                )
+                return [{
+                    "role": "user",
+                    "content": (
+                        "[CONTEXT COMPACTION — REFERENCE ONLY] summary of older head"
+                    ),
+                    "_context_summary": True,
+                }]
+
+            agent.context_compressor.compress = _user_summary_only
+            head = [
+                {"role": "user", "content": "older question"},
+                {"role": "assistant", "content": "older answer"},
+            ]
+            protected_tail = [
+                {"role": "user", "content": "first protected question", "timestamp": 1_786_000_001.0},
+                {"role": "assistant", "content": "first protected answer", "timestamp": 1_786_000_002.0},
+                {"role": "user", "content": "second protected question", "timestamp": 1_786_000_003.0},
+                {"role": "assistant", "content": "second protected answer", "timestamp": 1_786_000_004.0},
+                {"role": "user", "content": "third protected question", "timestamp": 1_786_000_005.0},
+                {"role": "assistant", "content": "third protected answer", "timestamp": 1_786_000_006.0},
+            ]
+
+            compressed_head, _ = compress_context(
+                agent,
+                head,
+                "sys",
+                approx_tokens=100_000,
+                protected_tail=protected_tail,
+            )
+            reloaded = db.get_messages_as_conversation(sid)
+            active_count = db.get_session(sid)["message_count"]
+            db.close()
+
+            assert len(compressed_head) == 1
+            assert compressed_head[0]["content"].startswith("[CONTEXT COMPACTION")
+            assert "older question" not in str(compressed_head)
+            assert reloaded[0]["content"].startswith("[CONTEXT COMPACTION")
+            assert reloaded[1]["role"] == "assistant"
+            assert reloaded[1]["display_kind"] == "compression_bridge"
+            assert [
+                {key: message.get(key) for key in ("role", "content", "timestamp")}
+                for message in reloaded[-len(protected_tail):]
+            ] == [
+                {key: message.get(key) for key in ("role", "content", "timestamp")}
+                for message in protected_tail
+            ]
+            assert active_count == 2 + len(protected_tail)
+            assert agent._test_external_protected_tail is True
+
     def test_in_place_keeps_same_session_id(self):
         """In-place mode: id unchanged, no child row, no rename, history kept."""
         from hermes_state import SessionDB

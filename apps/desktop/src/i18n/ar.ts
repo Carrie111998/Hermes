@@ -2112,6 +2112,21 @@ export const ar = defineLocale({
       openCron: 'فتح المهام المجدولة',
       turnRunning: 'الدور يعمل',
       contextUsage: 'استخدام السياق',
+      contextNearCompression: 'اقترب ضغط السياق',
+      contextCompressionDue: 'ضغط السياق مطلوب',
+      contextCompressionTooltip: percent => `ضغط تلقائي عند نحو ${percent}% من السياق`,
+      contextUsagePanel: {
+        automaticCompression: (percent, tokens) => `ضغط تلقائي عند نحو ${percent}% (${tokens} رمزًا)`,
+        compressionDue: 'سيبدأ الضغط قبل استدعاء النموذج التالي.',
+        compressNow: 'ضغط السياق الآن',
+        compressNowTitle: 'اضغط سياق هذه الجلسة قبل الرسالة التالية',
+        compressUnavailable: 'انتظر حتى ينتهي نشاط الجلسة الحالي.',
+        keepRecent: 'الاحتفاظ بآخر الجولات',
+        keepRecentAll: 'تلخيص الكل',
+        keepRecentTitle: 'الاحتفاظ بآخر تبادلات المستخدم وHermes المحددة دون تغيير',
+        keepRecentTurns: turns => `آخر ${turns} جولة`,
+        tokensRemaining: tokens => `متبقٍ ${tokens} رمزًا حتى الضغط التلقائي`
+      },
       session: 'الجلسة',
       yoloOn: 'YOLO مفعل',
       yoloOff: 'YOLO معطل',
@@ -2554,6 +2569,15 @@ export const ar = defineLocale({
     resumeStrandedBody:
       'فشل الاتصال بهذه الجلسة وتوقفت إعادة المحاولة التلقائية. تأكد من تشغيل البوابة، ثم حاول مجددا.',
     resumeRetry: 'إعادة المحاولة',
+    compactionGuardTitle: sessionLabel => `جارٍ ضغط «${sessionLabel}»`,
+    compactionGuardSessionId: sessionId => `الجلسة ${sessionId}`,
+    compactionGuardDescription:
+      'يلخّص Hermes السياق السابق في هذه المحادثة. هذه المحادثة وحدها مقفلة مؤقتًا؛ يمكنك الانتقال إلى جلسات أخرى.',
+    compactionGuardStatus:
+      'تم تعطيل الإرسال والتوجيه ووضع الرسائل في قائمة الانتظار هنا حتى يبلغ Hermes عن اكتمال الضغط أو فشله. ستبقى مسودتك محفوظة.',
+    compactionCompleteTitle: 'تم ضغط السياق',
+    compactionCompleteMessage: 'تم تلخيص السجل السابق بنجاح. هذه الجلسة جاهزة للمتابعة.',
+    compactionFailedTitle: 'فشل ضغط السياق',
     nothingToBranch: 'لا يوجد ما يمكن تفريعه',
     branchNeedsChat: 'يحتاج التفريع إلى محادثة',
     sessionBusy: 'الجلسة مشغولة',

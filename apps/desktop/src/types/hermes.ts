@@ -652,6 +652,8 @@ export interface SessionRuntimeInfo {
 
 export interface UsageStats {
   calls: number
+  compression_threshold_percent?: number
+  compression_threshold_tokens?: number
   context_max?: number
   context_percent?: number
   context_used?: number
@@ -711,6 +713,8 @@ export interface ContextUsageCategory {
 
 export interface ContextBreakdown {
   categories: ContextUsageCategory[]
+  compression_threshold_percent: number
+  compression_threshold_tokens: number
   context_max: number
   context_percent: number
   context_used: number
