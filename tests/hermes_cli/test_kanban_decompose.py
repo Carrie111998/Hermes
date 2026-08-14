@@ -214,6 +214,86 @@ def test_fresh_triage_remains_auto_decomposable(kanban_home):
         assert tid in decomp.list_triage_ids()
 
 
+def test_unclassified_legacy_triage_fails_closed(kanban_home):
+    """A pre-marker triage row must never enter the automatic feed."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="legacy triage", triage=True)
+        with kb.write_txn(conn):
+            conn.execute(
+                "DELETE FROM task_events "
+                "WHERE task_id = ? AND kind = 'triage_fresh_intake'",
+                (tid,),
+            )
+        assert kb.is_auto_decomposable_triage(conn, tid) is False
+        assert tid not in decomp.list_triage_ids()
+
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        outcome = decomp.decompose_task(
+            tid, author=decomp.AUTO_DECOMPOSER_AUTHOR,
+        )
+    assert outcome.ok is False
+    assert "provenance is unclassified" in outcome.reason
+    call_llm.assert_not_called()
+
+
+@pytest.mark.parametrize("fanout", [False, True])
+def test_decompose_race_rejects_new_open_child_graph(kanban_home, fanout):
+    """A child linked while the LLM runs must block both spec and fanout."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="governed root", triage=True)
+
+    payload = {
+        "fanout": fanout,
+        "rationale": "attempt replacement",
+        "title": "replacement root",
+        "body": "must not land",
+    }
+    if fanout:
+        payload["tasks"] = [
+            {
+                "title": "duplicate work",
+                "body": "must not exist",
+                "assignee": "engineer",
+                "parents": [],
+            },
+        ]
+
+    def link_child_then_reply(**_kwargs):
+        with kb.connect_closing() as conn:
+            kb.create_task(
+                conn,
+                title="existing review lane",
+                assignee="reviewer",
+                parents=(tid,),
+            )
+        return _fake_aux_response(jsonlib.dumps(payload))
+
+    patches = _patch_list_profiles(["orchestrator", "engineer", "reviewer"])
+    for p in patches:
+        p.start()
+    try:
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            side_effect=link_child_then_reply,
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "open governed child graph" in outcome.reason
+    with kb.connect_closing() as conn:
+        root = kb.get_task(conn, tid)
+        rows = kb.list_tasks(conn, limit=100)
+        assert root.status == "triage"
+        assert root.title == "governed root"
+        assert sorted(task.title for task in rows) == [
+            "existing review lane",
+            "governed root",
+        ]
+
+
 def test_manual_decompose_of_escalated_triage_recovers_and_proceeds(kanban_home):
     """Explicit `hermes kanban decompose <id>` on an escalated card IS the
     human-in-the-loop decision: acknowledge (audited) and decompose (#79728)."""
@@ -295,6 +375,85 @@ def test_manual_decompose_failure_keeps_escalation(kanban_home):
         call_llm.assert_not_called()
 
 
+def test_recovery_receipt_rolls_back_with_failed_spec_transaction(kanban_home):
+    """Recovery, spec mutation, and status transition are one DB commit."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="atomic recovery")
+        _escalate_via_block_loop(conn, tid, kind="capability")
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "must roll back",
+        "body": "must roll back",
+    })
+    real_append_event = kb._append_event
+
+    def fail_after_recovery(conn, task_id, kind, payload=None, **kwargs):
+        if kind == "specified":
+            raise RuntimeError("synthetic write failure")
+        return real_append_event(
+            conn, task_id, kind, payload, **kwargs,
+        )
+
+    patches = _patch_list_profiles(["orchestrator", "fallback"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), patch.object(
+            kb, "_append_event", side_effect=fail_after_recovery,
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage"
+        assert task.title == "atomic recovery"
+        assert task.block_kind == "capability"
+        assert kb.is_block_loop_escalated(conn, tid) is True
+        events = kb.list_events(conn, tid)
+        assert not any(
+            event.kind == "triage_escalation_recovered" for event in events
+        )
+
+
+def test_single_task_decompose_respects_auto_promote_false(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="manual gate", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "approved later",
+        "body": "stay todo",
+    })
+    patches = _patch_list_profiles(["orchestrator", "fallback"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={
+                "kanban": {
+                    "default_assignee": "fallback",
+                    "auto_promote_children": False,
+                },
+            },
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "todo"
+
+
 def test_manual_decompose_fanout_recovers_on_success(kanban_home):
     """The fanout=true success path also acknowledges the escalation
     (audited) after the children are created."""
@@ -348,5 +507,3 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
             p.stop()
     assert outcome.ok is False
     assert "not in triage" in outcome.reason
-
-

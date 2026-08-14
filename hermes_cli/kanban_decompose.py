@@ -296,8 +296,11 @@ def decompose_task(
             return DecomposeOutcome(
                 task_id, False, f"task is not in triage (status={task.status!r})"
             )
-        if kb.is_block_loop_escalated(conn, task_id):
-            if author == AUTO_DECOMPOSER_AUTHOR:
+        escalated = kb.is_block_loop_escalated(conn, task_id)
+        if author == AUTO_DECOMPOSER_AUTHOR and not kb.is_auto_decomposable_triage(
+            conn, task_id,
+        ):
+            if escalated:
                 # Block-loop escalations are waiting on a human decision; the
                 # breaker exists precisely to stop automated unblock↔re-block
                 # loops, so re-specifying one from the dispatcher would undo
@@ -307,6 +310,12 @@ def decompose_task(
                     "task escalated to triage after repeated blocks; "
                     "waiting on human input — refusing to re-specify",
                 )
+            return DecomposeOutcome(
+                task_id, False,
+                "triage provenance is unclassified; explicit operator "
+                "decomposition is required",
+            )
+        if escalated:
             # Explicit manual decomposition IS the operator's human-in-the-loop
             # decision, but the escalation is acknowledged (audited) only when
             # the decomposition actually succeeds. A failed attempt must leave
@@ -385,22 +394,30 @@ def decompose_task(
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
             )
-        with kb.connect_closing() as conn:
-            ok = kb.specify_triage_task(
-                conn,
-                task_id,
-                title=title_val,
-                body=body_val,
-                assignee=assignee_val,
-                author=audit_author,
+        try:
+            with kb.connect_closing() as conn:
+                ok = kb.specify_triage_task(
+                    conn,
+                    task_id,
+                    title=title_val,
+                    body=body_val,
+                    assignee=assignee_val,
+                    author=audit_author,
+                    auto_promote=auto_promote,
+                    recover_escalation=recover_after,
+                    reject_open_descendants=True,
+                )
+        except ValueError as exc:
+            return DecomposeOutcome(task_id, False, f"DB rejected spec: {exc}")
+        except Exception as exc:
+            logger.exception("decompose: DB error specifying task %s", task_id)
+            return DecomposeOutcome(
+                task_id, False, f"DB error: {type(exc).__name__}",
             )
         if not ok:
             return DecomposeOutcome(
                 task_id, False, "task moved out of triage before promotion",
             )
-        if recover_after:
-            with kb.connect_closing() as conn:
-                kb.recover_escalated_triage_task(conn, task_id)
         return DecomposeOutcome(
             task_id, True, "single task (no fanout)",
             fanout=False, new_title=title_val,
@@ -465,6 +482,8 @@ def decompose_task(
                 children=children,
                 author=audit_author,
                 auto_promote=auto_promote,
+                recover_escalation=recover_after,
+                reject_open_descendants=True,
             )
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
@@ -476,10 +495,6 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, "task moved out of triage before decomposition",
         )
-    if recover_after:
-        with kb.connect_closing() as conn:
-            kb.recover_escalated_triage_task(conn, task_id)
-
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children",
         fanout=True, child_ids=child_ids,
@@ -489,14 +504,14 @@ def decompose_task(
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Return auto-decomposable task ids currently in the triage column.
 
-    Excludes block-loop-escalated cards (reached triage via the unblock-loop
-    breaker — ``block_loop_detected`` event without a newer operator
-    recovery). Those are waiting on a human decision and must not be
-    re-specified by the auto-decomposer (#79738, #79728).
+    A durable ``triage_fresh_intake`` or ``triage_escalation_recovered``
+    marker must be newer than any block-loop/decomposition/specification that
+    consumed it. Legacy or otherwise unclassified rows fail closed and require
+    explicit operator decomposition.
     """
     query = (
         "SELECT id FROM tasks "
-        "WHERE status = 'triage' AND NOT " + kb._BLOCK_LOOP_ESCALATED_SQL
+        "WHERE status = 'triage' AND " + kb._AUTO_DECOMPOSABLE_TRIAGE_SQL
     )
     params: list[str] = []
     if tenant is not None:
