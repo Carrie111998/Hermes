@@ -70,6 +70,52 @@ def test_normalize_usage_openai_reads_top_level_anthropic_cache_fields():
     assert normalized.output_tokens == 200
 
 
+def test_normalize_usage_openai_reads_nested_cache_creation_tokens():
+    usage = SimpleNamespace(
+        prompt_tokens=1000,
+        completion_tokens=200,
+        prompt_tokens_details=SimpleNamespace(
+            cached_tokens=100,
+            cache_creation_input_tokens=300,
+        ),
+    )
+
+    normalized = normalize_usage(usage, provider="openrouter", api_mode="chat_completions")
+
+    assert normalized.cache_read_tokens == 100
+    assert normalized.cache_write_tokens == 300
+    assert normalized.input_tokens == 600
+
+
+def test_normalize_usage_openai_reads_mapping_cache_creation_tokens():
+    usage = {
+        "prompt_tokens": 1000,
+        "completion_tokens": 200,
+        "prompt_tokens_details": {"cache_creation_input_tokens": 300},
+    }
+
+    normalized = normalize_usage(usage, provider="openrouter", api_mode="chat_completions")
+
+    assert normalized.cache_write_tokens == 300
+    assert normalized.input_tokens == 700
+
+
+def test_normalize_usage_openai_prefers_nested_cache_write_tokens():
+    usage = SimpleNamespace(
+        prompt_tokens=1000,
+        prompt_tokens_details=SimpleNamespace(
+            cache_write_tokens=200,
+            cache_creation_input_tokens=300,
+        ),
+        cache_creation_input_tokens=400,
+        cache_write_tokens=500,
+    )
+
+    normalized = normalize_usage(usage, provider="openrouter", api_mode="chat_completions")
+
+    assert normalized.cache_write_tokens == 200
+
+
 
 
 
