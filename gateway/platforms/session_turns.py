@@ -22,6 +22,7 @@ import time
 import uuid
 import warnings
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable, Dict, Optional, TypeVar
 
 from aiohttp import web
@@ -38,6 +39,144 @@ SESSION_TURN_LIFECYCLE_WORKERS = 4
 SESSION_TURN_LIFECYCLE_PENDING_DISPATCHERS = 32
 SESSION_TURN_LIFECYCLE_SLOW_SECONDS = 0.1
 SESSION_TURN_LIFECYCLE_FLUSH_SECONDS = 0.05
+SESSION_TURN_CALLBACK_QUEUE_SIZE = 32
+
+
+class _CallbackEventClass(Enum):
+    """Persistence guarantees for events emitted by synchronous agent callbacks."""
+
+    STRUCTURAL = "structural"
+    VOLATILE = "volatile"
+
+
+@dataclass(frozen=True)
+class _CallbackPersistenceEvent:
+    event_class: _CallbackEventClass
+    event_type: str
+    data: Dict[str, Any]
+
+
+class _CallbackPersistenceOverloaded(RuntimeError):
+    """Stop an on-loop producer rather than lose a structural event."""
+
+
+class _CallbackPersistenceIngress:
+    """Bounded sync-callback ingress to one loop-owned persistence pump.
+
+    Structural callbacks from the agent worker apply backpressure to that worker.
+    A callback unexpectedly invoked on the aiohttp loop cannot wait without
+    deadlocking, so saturation raises and safely stops its producer. Volatile
+    deltas use one coalescing loop notification and explicitly request canonical
+    resync when one cannot be retained.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, maxsize: int):
+        self.loop = loop
+        self.queue: asyncio.Queue[_CallbackPersistenceEvent] = asyncio.Queue(
+            maxsize=max(1, maxsize)
+        )
+        self.done = asyncio.Event()
+        self.pump_task: Optional[asyncio.Task[Any]] = None
+        self.max_observed = 0
+        self.resync_required = False
+        self._loop_thread_id = threading.get_ident()
+        self._volatile_lock = threading.Lock()
+        self._pending_volatile: Optional[_CallbackPersistenceEvent] = None
+        self._volatile_notification_pending = False
+        self._accepting = True
+
+    def bind_pump(self, pump_task: asyncio.Task[Any]) -> None:
+        self.pump_task = pump_task
+
+    def append_structural(self, event_type: str, data: Dict[str, Any]) -> None:
+        event = _CallbackPersistenceEvent(
+            _CallbackEventClass.STRUCTURAL, event_type, dict(data)
+        )
+        if threading.get_ident() == self._loop_thread_id:
+            if not self._accepting:
+                raise _CallbackPersistenceOverloaded("callback persistence closed")
+            try:
+                self.queue.put_nowait(event)
+            except asyncio.QueueFull as exc:
+                raise _CallbackPersistenceOverloaded(
+                    "structural callback persistence saturated"
+                ) from exc
+            self._observe_size()
+            return
+        future = asyncio.run_coroutine_threadsafe(self._put_structural(event), self.loop)
+        # Backpressure only the agent callback thread, never the aiohttp loop.
+        future.result()
+
+    async def _put_structural(self, event: _CallbackPersistenceEvent) -> None:
+        while self._accepting:
+            if self.pump_task is not None and self.pump_task.done():
+                raise _CallbackPersistenceOverloaded("callback persistence unavailable")
+            try:
+                await asyncio.wait_for(self.queue.put(event), timeout=0.05)
+                self._observe_size()
+                return
+            except asyncio.TimeoutError:
+                continue
+        raise _CallbackPersistenceOverloaded("callback persistence closed")
+
+    def append_volatile(self, event_type: str, data: Dict[str, Any]) -> None:
+        event = _CallbackPersistenceEvent(
+            _CallbackEventClass.VOLATILE, event_type, dict(data)
+        )
+        if threading.get_ident() == self._loop_thread_id:
+            if not self._accepting:
+                return
+            try:
+                self.queue.put_nowait(event)
+                self._observe_size()
+            except asyncio.QueueFull:
+                self.resync_required = True
+            return
+        with self._volatile_lock:
+            if not self._accepting:
+                return
+            if self._pending_volatile is not None:
+                # Do not concatenate bodies: retained callback memory stays fixed.
+                self.resync_required = True
+                return
+            self._pending_volatile = event
+            if self._volatile_notification_pending:
+                return
+            self._volatile_notification_pending = True
+        self.loop.call_soon_threadsafe(self._flush_volatile)
+
+    def _flush_volatile(self) -> None:
+        with self._volatile_lock:
+            event = self._pending_volatile
+            self._pending_volatile = None
+            self._volatile_notification_pending = False
+        if event is None:
+            return
+        if not self._accepting:
+            self.resync_required = True
+            return
+        try:
+            self.queue.put_nowait(event)
+            self._observe_size()
+        except asyncio.QueueFull:
+            self.resync_required = True
+
+    def close(self) -> None:
+        """Run on the loop after the agent exits; retain or mark the last delta."""
+        with self._volatile_lock:
+            self._accepting = False
+            pending = self._pending_volatile
+            self._pending_volatile = None
+        if pending is not None:
+            try:
+                self.queue.put_nowait(pending)
+                self._observe_size()
+            except asyncio.QueueFull:
+                self.resync_required = True
+        self.done.set()
+
+    def _observe_size(self) -> None:
+        self.max_observed = max(self.max_observed, self.queue.qsize())
 
 
 @dataclass
@@ -1211,6 +1350,17 @@ class SessionTurnService:
             finish_and_append, propagate_cancellation=False
         )
 
+    async def _finish_after_callback_store_failure(
+        self, store: SessionTurnStore, turn_id: str
+    ) -> None:
+        """Terminate without appending behind structural events the pump lost."""
+        await self._store_operation(
+            lambda: store.finish(
+                turn_id, "failed", safe_error_code="event_store_failed"
+            ),
+            propagate_cancellation=False,
+        )
+
     @staticmethod
     def _turn_id(request: web.Request, body: Dict[str, Any]) -> str:
         header_id = request.headers.get("Idempotency-Key", "").strip()
@@ -1401,7 +1551,9 @@ class SessionTurnService:
         heartbeat_task: Optional[asyncio.Task[Any]] = None
         agent_task: Optional[asyncio.Task[Any]] = None
         callback_event_task: Optional[asyncio.Task[Any]] = None
-        callback_events_done = threading.Event()
+        callback_ingress: Optional[_CallbackPersistenceIngress] = None
+        callback_events_drained = False
+        drain_callback_events: Optional[Callable[[], Any]] = None
         dispatcher = self._lifecycle_dispatchers.get(turn_id)
         self._agent_refs[turn_id] = agent_ref
         try:
@@ -1463,39 +1615,67 @@ class SessionTurnService:
                 return
             message_high_water = await self._store_operation(store.message_high_water)
 
-            callback_events: queue.Queue[tuple[str, Dict[str, Any]]] = queue.Queue()
+            callback_ingress = _CallbackPersistenceIngress(
+                asyncio.get_running_loop(), SESSION_TURN_CALLBACK_QUEUE_SIZE
+            )
 
             async def persist_callback_events() -> None:
+                assert callback_ingress is not None
                 while True:
+                    if callback_ingress.done.is_set() and callback_ingress.queue.empty():
+                        break
                     try:
-                        event_type, data = callback_events.get_nowait()
-                    except queue.Empty:
-                        if callback_events_done.is_set():
-                            return
-                        await asyncio.sleep(0.01)
+                        event = await asyncio.wait_for(
+                            callback_ingress.queue.get(), timeout=0.05
+                        )
+                    except asyncio.TimeoutError:
                         continue
                     durable = await self._store_operation(
-                        lambda event_type=event_type, data=data: store.append_event(
-                            turn_id, event_type, data
+                        lambda event=event: store.append_event(
+                            turn_id, event.event_type, event.data
                         )
                     )
                     if (
-                        event_type == "assistant.delta"
+                        event.event_class is _CallbackEventClass.VOLATILE
                         and payload["delivery_mode"] != "slack_only"
                     ):
                         self._volatile_events.setdefault(turn_id, {})[
                             durable["seq"]
-                        ] = {**durable, "data": dict(data)}
+                        ] = {**durable, "data": dict(event.data)}
+                if callback_ingress.resync_required:
+                    # A durable body-free delta marker drives all replay paths
+                    # through the canonical-transcript resync contract.
+                    await self._store_operation(
+                        lambda: store.append_event(
+                            turn_id, "assistant.delta", {"volatile": True}
+                        )
+                    )
 
             callback_event_task = asyncio.create_task(persist_callback_events())
+            callback_ingress.bind_pump(callback_event_task)
 
-            async def drain_callback_events() -> bool:
-                callback_events_done.set()
+            async def _drain_callback_events() -> bool:
+                nonlocal callback_events_drained
+                if not callback_events_drained:
+                    assert callback_ingress is not None
+                    callback_ingress.close()
+                    callback_events_drained = True
                 assert callback_event_task is not None
-                results = await asyncio.gather(
-                    callback_event_task, return_exceptions=True
-                )
-                if isinstance(results[0], BaseException):
+                # Shield the single owned pump and re-await through repeated
+                # cancellation. No retained structural event may be overtaken by
+                # terminal persistence, and the pump exception is consumed here.
+                while not callback_event_task.done():
+                    try:
+                        await asyncio.shield(callback_event_task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if callback_event_task.cancelled():
+                    error: Optional[BaseException] = asyncio.CancelledError()
+                else:
+                    error = callback_event_task.exception()
+                if error is not None:
                     logger.error(
                         "session_turn_background_task_failed "
                         "reason=callback_event_store_error"
@@ -1503,12 +1683,7 @@ class SessionTurnService:
                     return False
                 return True
 
-            def append(event_type: str, data: Dict[str, Any]) -> None:
-                # Agent callbacks may originate on the aiohttp loop or on an
-                # executor thread. Queue only safe projections here; the one
-                # loop-owned pump routes every SQLite call through the ordered
-                # off-loop helper without blocking either caller.
-                callback_events.put_nowait((event_type, dict(data)))
+            drain_callback_events = _drain_callback_events
 
             def on_delta(delta: Any) -> None:
                 if (
@@ -1516,13 +1691,19 @@ class SessionTurnService:
                     and isinstance(delta, str)
                     and delta
                 ):
-                    append("assistant.delta", {"delta": delta})
+                    assert callback_ingress is not None
+                    callback_ingress.append_volatile(
+                        "assistant.delta", {"delta": delta}
+                    )
 
             def on_tool_start(tool_call_id: Any, function_name: Any, function_args: Any) -> None:
                 projected = project_safe_tool_event(
                     "tool.started", tool_call_id=tool_call_id, tool_name=function_name, args=function_args
                 )
-                append(projected["event"], projected["data"])
+                assert callback_ingress is not None
+                callback_ingress.append_structural(
+                    projected["event"], projected["data"]
+                )
 
             def on_tool_complete(tool_call_id: Any, function_name: Any, function_args: Any, function_result: Any) -> None:
                 try:
@@ -1538,7 +1719,10 @@ class SessionTurnService:
                     event_type, tool_call_id=tool_call_id, tool_name=function_name,
                     args=function_args, output=function_result,
                 )
-                append(projected["event"], projected["data"])
+                assert callback_ingress is not None
+                callback_ingress.append_structural(
+                    projected["event"], projected["data"]
+                )
 
             agent_task = asyncio.create_task(
                 self.adapter._run_agent(
@@ -1581,10 +1765,9 @@ class SessionTurnService:
                     # Continue heartbeat and lease ownership until the executor
                     # future itself resolves. Repeated cancellation is handled
                     # by the same bounded, non-abandoning loop.
+            assert drain_callback_events is not None
             if not await drain_callback_events():
-                await self._finish_turn(
-                    store, turn_id, "failed", "turn.failed", "event_store_failed"
-                )
+                await self._finish_after_callback_store_failure(store, turn_id)
                 return
             effective_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
             if execution_lease is None or not await execution_lease.still_owned():
@@ -1646,17 +1829,21 @@ class SessionTurnService:
             # so cancellation can never contradict a persisted turn.started.
             if agent_task is not None and agent_task.done():
                 phase.execution_done = True
-            if callback_event_task is not None and not callback_events_done.is_set():
-                callback_events_done.set()
-                await asyncio.gather(callback_event_task, return_exceptions=True)
+            if callback_event_task is not None:
+                assert drain_callback_events is not None
+                if not await drain_callback_events():
+                    await self._finish_after_callback_store_failure(store, turn_id)
+                    return
             await self._finish_turn(
                 store, turn_id, "interrupted", "turn.interrupted",
                 phase.cancellation_code,
             )
         except Exception:
-            if callback_event_task is not None and not callback_events_done.is_set():
-                callback_events_done.set()
-                await asyncio.gather(callback_event_task, return_exceptions=True)
+            if callback_event_task is not None:
+                assert drain_callback_events is not None
+                if not await drain_callback_events():
+                    await self._finish_after_callback_store_failure(store, turn_id)
+                    return
             await self._finish_turn(
                 store, turn_id, "failed", "turn.failed", "run_failed"
             )
@@ -1760,16 +1947,13 @@ class SessionTurnService:
                 return None
             return store.get_delivery(turn_id, "slack") or {}
 
-        delivery = await self._store_operation(begin_and_read_delivery)
-        if delivery is None:
-            return
-
         async def record_outcome(
             state: str,
             event_type: str,
             error_code: Optional[str] = None,
             *,
             provider_message_id: Optional[str] = None,
+            cancellation_resistant: bool = False,
         ) -> None:
             def finish_and_append() -> None:
                 store.finish_delivery(
@@ -1784,7 +1968,48 @@ class SessionTurnService:
                     data["error_code"] = error_code
                 store.append_event(turn_id, event_type, data)
 
-            await self._store_operation(finish_and_append)
+            await self._store_operation(
+                finish_and_append,
+                propagate_cancellation=not cancellation_resistant,
+            )
+
+        async def record_cancelled_sending() -> None:
+            # Own exactly one ordered transition task and retrieve every error.
+            transition = asyncio.create_task(
+                record_outcome(
+                    "needs_manual_retry",
+                    "delivery.failed",
+                    "delivery_outcome_unknown",
+                    cancellation_resistant=True,
+                )
+            )
+            while not transition.done():
+                try:
+                    await asyncio.shield(transition)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not transition.cancelled() and transition.exception() is not None:
+                logger.error(
+                    "session_turn_delivery_transition_failed "
+                    "destination=slack reason=store_error"
+                )
+
+        try:
+            delivery = await self._store_operation(begin_and_read_delivery)
+        except asyncio.CancelledError:
+            # _store_operation finishes its worker before propagating, so inspect
+            # the resulting durable state rather than guessing whether begin ran.
+            current = await self._store_operation(
+                lambda: store.get_delivery(turn_id, "slack"),
+                propagate_cancellation=False,
+            )
+            if current is not None and current.get("state") == "sending":
+                await record_cancelled_sending()
+            raise
+        if delivery is None:
+            return
 
         if len(content) > MAX_SLACK_ROUTED_CHARS:
             await record_outcome(
@@ -1799,6 +2024,12 @@ class SessionTurnService:
             result = await slack_adapter.send(
                 binding.chat_id, content, reply_to=binding.thread_id, metadata=metadata
             )
+        except asyncio.CancelledError:
+            # chat.postMessage may already have reached Slack. Own one shielded,
+            # ordered write through repeated cancellation before propagating;
+            # neither provider text nor message content enters the ledger/log.
+            await record_cancelled_sending()
+            raise
         except Exception:
             await record_outcome(
                 "needs_manual_retry",

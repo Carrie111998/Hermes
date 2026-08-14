@@ -56,6 +56,239 @@ def _png(width: int = 1, height: int = 1) -> str:
 
 
 @pytest.mark.asyncio
+async def test_callback_drain_survives_cancellation_without_terminal_overtake(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    store = SessionTurnStore(session_db)
+    turn_id = "cancel-during-callback-drain"
+    store.reserve("s1", turn_id, _payload())
+    persistence_entered = threading.Event()
+    persistence_release = threading.Event()
+    original_append = store.append_event
+
+    def blocked_append(tid, event_type, data):
+        if event_type == "tool.started":
+            persistence_entered.set()
+            persistence_release.wait(timeout=2)
+        return original_append(tid, event_type, data)
+
+    monkeypatch.setattr(store, "append_event", blocked_append)
+
+    async def run_agent(**kwargs):
+        kwargs["tool_start_callback"]("call-1", "terminal", {})
+        session_db.append_message("s1", "user", kwargs["user_message"])
+        session_db.append_message("s1", "assistant", "done")
+        return {"final_response": "done"}, {}
+
+    adapter._run_agent = run_agent
+    execution = service._admit_execution(
+        store, turn_id, "s1", _payload(), None, None
+    )
+    assert await asyncio.to_thread(persistence_entered.wait, 1)
+    execution.cancel()
+    await asyncio.sleep(0)
+    assert not execution.done()
+    persistence_release.set()
+    await service.wait_for_turn(turn_id)
+
+    events = store.events_after(turn_id, 0)
+    names = [event["event"] for event in events]
+    assert store.get(turn_id)["status"] == "completed"
+    assert names.index("tool.started") < names.index("assistant.completed")
+    assert names.index("tool.started") < names.index("turn.completed")
+
+
+@pytest.mark.asyncio
+async def test_slack_send_cancellation_durably_marks_manual_retry_privacy_safe(
+    session_db,
+):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    service = adapter._session_turn_service
+    store = SessionTurnStore(session_db)
+    turn_id = "cancel-slack-send"
+    store.reserve("s1", turn_id, _payload(mode="both"))
+    send_entered = asyncio.Event()
+
+    async def cancelled_send(*_args, **_kwargs):
+        send_entered.set()
+        await asyncio.Future()
+
+    slack = MagicMock()
+    slack.send = cancelled_send
+    task = asyncio.create_task(
+        service._deliver_slack(
+            store,
+            turn_id,
+            SlackBinding(chat_id="safe", thread_id=None, metadata={}),
+            slack,
+            "private assistant body",
+        )
+    )
+    await asyncio.wait_for(send_entered.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    delivery = store.get_delivery(turn_id, "slack")
+    events = store.events_after(turn_id, 0)
+    assert delivery is not None
+    assert delivery["state"] == "needs_manual_retry"
+    assert delivery["safe_error_code"] == "delivery_outcome_unknown"
+    assert [event["event"] for event in events] == ["delivery.failed"]
+    assert "private assistant body" not in repr(events)
+
+
+@pytest.mark.asyncio
+async def test_slow_callback_store_applies_bounded_worker_backpressure_and_recovers(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    import gateway.platforms.session_turns as session_turns
+
+    monkeypatch.setattr(session_turns, "SESSION_TURN_CALLBACK_QUEUE_SIZE", 2)
+    created_ingress = []
+    ingress_type = session_turns._CallbackPersistenceIngress
+
+    def capture_ingress(loop, maxsize):
+        ingress = ingress_type(loop, maxsize)
+        created_ingress.append(ingress)
+        return ingress
+
+    monkeypatch.setattr(session_turns, "_CallbackPersistenceIngress", capture_ingress)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    store = SessionTurnStore(session_db)
+    turn_id = "bounded-callback-backpressure"
+    store.reserve("s1", turn_id, _payload())
+    first_write_entered = threading.Event()
+    release_store = threading.Event()
+    producer_done = threading.Event()
+    original_append = store.append_event
+
+    def slow_append(tid, event_type, data):
+        if event_type == "tool.started" and not first_write_entered.is_set():
+            first_write_entered.set()
+            release_store.wait(timeout=2)
+        return original_append(tid, event_type, data)
+
+    monkeypatch.setattr(store, "append_event", slow_append)
+
+    async def run_agent(**kwargs):
+        def worker():
+            for index in range(8):
+                call_id = f"call-{index}"
+                kwargs["tool_start_callback"](call_id, "terminal", {})
+                kwargs["tool_complete_callback"](
+                    call_id, "terminal", {}, "success"
+                )
+            producer_done.set()
+
+        await asyncio.to_thread(worker)
+        session_db.append_message("s1", "user", kwargs["user_message"])
+        session_db.append_message("s1", "assistant", "done")
+        return {"final_response": "done"}, {}
+
+    adapter._run_agent = run_agent
+    execution = service._admit_execution(
+        store, turn_id, "s1", _payload(), None, None
+    )
+    assert await asyncio.to_thread(first_write_entered.wait, 1)
+    await asyncio.sleep(0.03)
+    assert not producer_done.is_set()
+    ticked = asyncio.Event()
+    asyncio.get_running_loop().call_soon(ticked.set)
+    await asyncio.wait_for(ticked.wait(), 0.1)
+    assert created_ingress[0].queue.qsize() <= 2
+    assert created_ingress[0].max_observed <= 2
+
+    release_store.set()
+    await service.wait_for_turn(turn_id)
+    assert execution.done()
+    structural = [
+        event["event"]
+        for event in store.events_after(turn_id, 0)
+        if event["event"].startswith("tool.")
+    ]
+    assert structural == ["tool.started", "tool.completed"] * 8
+    assert store.get(turn_id)["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_failing_callback_store_never_overtakes_retained_structure_and_recovers(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    store = SessionTurnStore(session_db)
+    producer_queued_following_event = threading.Event()
+    original_append = store.append_event
+    fail_callbacks = True
+
+    def failing_append(tid, event_type, data):
+        if fail_callbacks and event_type == "tool.started":
+            # Ensure tool.completed is retained behind the failing current event.
+            producer_queued_following_event.wait(timeout=1)
+            raise sqlite3.OperationalError("private callback store failure")
+        return original_append(tid, event_type, data)
+
+    monkeypatch.setattr(store, "append_event", failing_append)
+
+    async def run_agent(**kwargs):
+        def worker():
+            kwargs["tool_start_callback"]("call-1", "terminal", {})
+            kwargs["tool_complete_callback"](
+                "call-1", "terminal", {}, "success"
+            )
+            producer_queued_following_event.set()
+
+        await asyncio.to_thread(worker)
+        session_db.append_message("s1", "user", kwargs["user_message"])
+        session_db.append_message(
+            "s1", "assistant", kwargs["authoritative_turn_id"]
+        )
+        return {"final_response": kwargs["authoritative_turn_id"]}, {}
+
+    adapter._run_agent = run_agent
+    failed_turn = "callback-store-failure"
+    store.reserve("s1", failed_turn, _payload())
+    service._admit_execution(
+        store, failed_turn, "s1", _payload(), None, None
+    )
+    await service.wait_for_turn(failed_turn)
+
+    assert store.get(failed_turn)["status"] == "failed"
+    assert store.get(failed_turn)["safe_error_code"] == "event_store_failed"
+    # A terminal event must not jump ahead of the retained tool.completed event.
+    assert [event["event"] for event in store.events_after(failed_turn, 0)] == [
+        "turn.started"
+    ]
+
+    fail_callbacks = False
+    recovered_turn = "callback-store-recovered"
+    store.reserve("s1", recovered_turn, _payload())
+    service._admit_execution(
+        store, recovered_turn, "s1", _payload(), None, None
+    )
+    await service.wait_for_turn(recovered_turn)
+
+    recovered_events = [
+        event["event"] for event in store.events_after(recovered_turn, 0)
+    ]
+    assert store.get(recovered_turn)["status"] == "completed"
+    assert recovered_events == [
+        "turn.started",
+        "tool.started",
+        "tool.completed",
+        "assistant.completed",
+        "turn.completed",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_execution_lease_release_survives_repeated_cancellation(
     session_db, monkeypatch: pytest.MonkeyPatch
 ):
