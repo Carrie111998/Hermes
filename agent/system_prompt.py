@@ -431,10 +431,24 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             )
         except Exception:
             _compact_cats = frozenset()
+        _skill_index_mode = "full"
+        _pinned_skills = frozenset()
+        try:
+            from hermes_cli.config import load_config
+
+            _skills_config = (load_config() or {}).get("skills") or {}
+            _skill_index_mode = str(_skills_config.get("index_mode") or "full")
+            _raw_pins = _skills_config.get("pinned") or []
+            if isinstance(_raw_pins, (list, tuple, set, frozenset)):
+                _pinned_skills = frozenset(str(name) for name in _raw_pins)
+        except Exception:
+            pass
         skills_prompt = _r.build_skills_system_prompt(
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
+            index_mode=_skill_index_mode,
+            pinned_skills=_pinned_skills or None,
         )
     else:
         skills_prompt = ""

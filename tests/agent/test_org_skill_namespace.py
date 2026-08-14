@@ -130,6 +130,29 @@ class TestListingCollisionsAndLabels:
         assert "[org-shared: by bens-macbook]" in out
         assert "personal-a" in out
 
+    def test_category_mode_preserves_org_category_and_pinned_provenance(
+        self, tmp_path, monkeypatch
+    ):
+        skills, pb = self._render(tmp_path, monkeypatch)
+        _mk_skill(skills, "personal-a")
+        _mk_skill(
+            skills,
+            f"{sku.ORG_MIRROR_DIR_NAME}/org-1/shared-x",
+            name="shared-x",
+        )
+        (skills / sku.ORG_MIRROR_DIR_NAME / "org-1" / sku.ORG_PROVENANCE_FILE).write_text(
+            json.dumps({"author_device": "bens-macbook"}), encoding="utf-8"
+        )
+        _mark_active(skills, "org-1")
+
+        out = pb.build_skills_system_prompt(
+            index_mode="categories",
+            pinned_skills=frozenset({"shared-x"}),
+        )
+
+        assert "org:org-1 (1 skill)" in out
+        assert "shared-x: [org-shared: by bens-macbook]" in out
+
     def test_collision_flags_both_sides(self, tmp_path, monkeypatch):
         skills, pb = self._render(tmp_path, monkeypatch)
         _mk_skill(skills, "k8s-debug", body="personal version\n")

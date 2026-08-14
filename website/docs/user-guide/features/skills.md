@@ -151,10 +151,31 @@ applies if you have it on.
 Skills use a token-efficient loading pattern:
 
 ```
-Level 0: skills_list()           → [{name, description, category}, ...]   (~3k tokens)
-Level 1: skill_view(name)        → Full content + metadata       (varies)
-Level 2: skill_view(name, path)  → Specific reference file       (varies)
+Level 0: system prompt category map + pinned skills (with skills.index_mode: categories)
+Level 1: skills_list(category)  → matching names + descriptions
+Level 2: skill_view(name)       → Full content + metadata
+Level 3: skill_view(name, path) → Specific reference file
 ```
+
+By default, `skills.index_mode` is `full`, which keeps every installed skill
+name and description in the system prompt for maximum discoverability. Large
+skill collections can opt into category-first discovery:
+
+```yaml
+skills:
+  index_mode: categories
+  pinned:
+    - hermes-agent
+    - github-development-workflows
+```
+
+In category mode, the system prompt contains top-level category names/counts and
+the full entries for pinned high-use skills. Nested paths such as `mlops/models`
+are queried as `mlops`, while root-level skills use the synthetic `general`
+category. All other skills remain available through `skills_list(category)` and
+`skill_view(name)`; their content is not deleted or disabled. Pin critical
+routing/meta skills and keep durable `skill:X` pointers in compact memory when a
+procedure must be loaded before acting.
 
 The agent only loads the full skill content when it actually needs it.
 

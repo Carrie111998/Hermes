@@ -1480,9 +1480,9 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-# v2: entries gained org provenance fields (org_id/org_author/rel_dir) for M2
-# org-shared skills; older snapshots are discarded and rebuilt.
-_SKILLS_SNAPSHOT_VERSION = 2
+# v3: entries include org provenance plus progressive-disclosure metadata.
+# Older snapshots are discarded and rebuilt.
+_SKILLS_SNAPSHOT_VERSION = 3
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1603,8 +1603,10 @@ def _build_snapshot_entry(
     if len(parts) >= 2:
         skill_name = parts[-2]
         category = "/".join(parts[:-2]) if len(parts) > 2 else parts[0]
+        discovery_category = parts[0] if len(parts) > 2 else "general"
     else:
         category = "general"
+        discovery_category = "general"
         skill_name = skill_file.parent.name
 
     platforms = frontmatter.get("platforms") or []
@@ -1614,6 +1616,7 @@ def _build_snapshot_entry(
     entry = {
         "skill_name": skill_name,
         "category": category,
+        "discovery_category": discovery_category,
         "frontmatter_name": str(frontmatter.get("name", skill_name)),
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
@@ -1718,6 +1721,8 @@ def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
+    index_mode: str | None = None,
+    pinned_skills: "frozenset[str] | None" = None,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -1738,9 +1743,21 @@ def build_skills_system_prompt(
     the rendered index. Nothing is ever hidden: every skill name stays
     visible and loadable via ``skill_view`` / ``skills_list``; only the
     descriptions are dropped, and a footer note explains the demotion.
+
+    ``index_mode='categories'`` is an explicit progressive-disclosure mode:
+    only category names/counts and configured pinned skills are rendered. The
+    remaining catalog stays discoverable through ``skills_list(category=...)``
+    and ``skill_view(name=...)``.
     """
     skills_dir = get_skills_dir()
     external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
+
+    normalized_index_mode = str(index_mode or "full").strip().lower()
+    if normalized_index_mode not in {"full", "categories"}:
+        normalized_index_mode = "full"
+    normalized_pins = frozenset(
+        str(name).strip() for name in (pinned_skills or ()) if str(name).strip()
+    )
 
     if not skills_dir.exists() and not external_dirs:
         return ""
@@ -1758,6 +1775,8 @@ def build_skills_system_prompt(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        normalized_index_mode,
+        tuple(sorted(normalized_pins)),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1769,11 +1788,40 @@ def build_skills_system_prompt(
     snapshot = _load_skills_snapshot(skills_dir)
 
     skills_by_category: dict[str, list[tuple[str, str]]] = {}
+    skills_by_discovery_category: dict[str, list[tuple[str, str]]] = {}
     category_descriptions: dict[str, str] = {}
     # Unified visible-entry list (both paths) so the org labeling +
     # fail-loud collision pass below runs identically for snapshot and scan.
     visible_entries: list[dict] = []
     skill_entries: list[dict] = []
+
+    def _add_indexed_entry(
+        entry: dict,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        category: str | None = None,
+        discovery_category: str | None = None,
+    ) -> None:
+        """Index one resolved entry for full and category-only render modes."""
+        resolved_name = str(
+            name or entry.get("frontmatter_name") or entry.get("skill_name") or ""
+        )
+        resolved_description = str(
+            description if description is not None else entry.get("description") or ""
+        )
+        resolved_category = str(category or entry.get("category") or "general")
+        resolved_discovery_category = str(
+            discovery_category
+            or entry.get("discovery_category")
+            or resolved_category.split("/", 1)[0]
+            or "general"
+        )
+        item = (resolved_name, resolved_description)
+        skills_by_category.setdefault(resolved_category, []).append(item)
+        skills_by_discovery_category.setdefault(
+            resolved_discovery_category, []
+        ).append(item)
 
     if snapshot is not None:
         # Fast path: use pre-parsed metadata from disk
@@ -1818,12 +1866,8 @@ def build_skills_system_prompt(
             visible_entries.append(entry)
 
     # ── M2 org labeling + FAIL-LOUD collisions ─────────────────────────
-    # An org skill lists with an explicit provenance tag. When a personal and
-    # an org skill share a name, NEITHER silently wins: both list qualified
-    # (personal keeps the bare name is the wrong default — silent divergence
-    # from the org set; org winning silently shadows the user's own work) —
-    # so both entries carry a [name collision] flag and skill_view refuses
-    # the ambiguous bare name (its existing multi-candidate guard).
+    # Preserve the upstream org/personal provenance contract before rendering
+    # either the full index or the local category-only progressive index.
     name_owners: dict[str, set[str]] = {}
     for entry in visible_entries:
         fm = entry.get("frontmatter_name") or entry.get("skill_name") or ""
@@ -1839,11 +1883,27 @@ def build_skills_system_prompt(
             tag = f"[org-shared{': by ' + author if author else ''}]"
             desc = f"{tag} {desc}".strip()
             category = f"org:{org_id}"
+            discovery_category = category
         else:
             category = entry.get("category") or "general"
+            discovery_category = (
+                entry.get("discovery_category")
+                or str(category).split("/", 1)[0]
+                or "general"
+            )
         if collided:
-            desc = f"[name collision — also exists {'personally' if org_id else 'in your org'}; load via category path] {desc}".strip()
-        skills_by_category.setdefault(category, []).append((fm, desc))
+            desc = (
+                f"[name collision — also exists "
+                f"{'personally' if org_id else 'in your org'}; "
+                f"load via category path] {desc}"
+            ).strip()
+        _add_indexed_entry(
+            entry,
+            name=fm,
+            description=desc,
+            category=str(category),
+            discovery_category=str(discovery_category),
+        )
 
     if snapshot is None:
         # (continuation of the cold path below: category descriptions + write)
@@ -1899,9 +1959,7 @@ def build_skills_system_prompt(
                 ):
                     continue
                 seen_skill_names.add(frontmatter_name)
-                skills_by_category.setdefault(entry["category"], []).append(
-                    (frontmatter_name, entry["description"])
-                )
+                _add_indexed_entry(entry, name=frontmatter_name)
             except Exception as e:
                 logger.debug("Error reading external skill %s: %s", skill_file, e)
 
@@ -1943,6 +2001,47 @@ def build_skills_system_prompt(
 
     if not skills_by_category:
         result = ""
+    elif normalized_index_mode == "categories":
+        category_lines = []
+        all_skills: dict[str, str] = {}
+        for category in sorted(skills_by_discovery_category):
+            unique_names = {
+                name for name, _desc in skills_by_discovery_category[category]
+            }
+            count = len(unique_names)
+            noun = "skill" if count == 1 else "skills"
+            category_lines.append(f"  {category} ({count} {noun})")
+            for name, desc in skills_by_discovery_category[category]:
+                all_skills.setdefault(name, desc)
+
+        pinned_lines = []
+        for name in sorted(normalized_pins):
+            if name not in all_skills:
+                continue
+            desc = all_skills[name]
+            pinned_lines.append(f"  - {name}: {desc}" if desc else f"  - {name}")
+
+        pinned_block = "\n".join(pinned_lines) if pinned_lines else "  (none)"
+        result = (
+            "## Skills (mandatory; progressive disclosure)\n"
+            "Only categories and pinned high-use skills are shown to keep the "
+            "system context small. Before acting, scan the categories below. "
+            "If one is relevant, call `skills_list(category='...')`, then load "
+            "the matching procedure with `skill_view(name='...')`. Load a pinned "
+            "skill directly when it matches. If persistent memory contains a "
+            "`skill:X` pointer for the task, load X before acting. For Hermes "
+            "Agent configuration or troubleshooting, load `hermes-agent`. Only "
+            "proceed without a skill after checking the relevant category and "
+            "finding no match.\n\n"
+            "<available_skills>\n"
+            "<skill_categories>\n"
+            + "\n".join(category_lines)
+            + "\n</skill_categories>\n\n"
+            "<pinned_skills>\n"
+            + pinned_block
+            + "\n</pinned_skills>\n"
+            "</available_skills>"
+        )
     else:
         index_lines = []
         for category in sorted(skills_by_category.keys()):
