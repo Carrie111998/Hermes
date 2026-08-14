@@ -1,5 +1,7 @@
 """Tests for the central command registry and autocomplete."""
 
+import pytest
+
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
 
@@ -667,20 +669,20 @@ class TestTelegramMenuCommands:
             "/local-one": {
                 "name": "local-one",
                 "description": "Local",
-                "skill_md_path": f"{local_dir}/local-one/SKILL.md",
-                "skill_dir": f"{local_dir}/local-one",
+                "skill_md_path": str(local_dir / "local-one" / "SKILL.md"),
+                "skill_dir": str(local_dir / "local-one"),
             },
             "/morning-briefing": {
                 "name": "morning-briefing",
                 "description": "External skill",
-                "skill_md_path": f"{external_dir}/morning-briefing/SKILL.md",
-                "skill_dir": f"{external_dir}/morning-briefing",
+                "skill_md_path": str(external_dir / "morning-briefing" / "SKILL.md"),
+                "skill_dir": str(external_dir / "morning-briefing"),
             },
             "/lookalike-skill": {
                 "name": "lookalike-skill",
                 "description": "Lives in a sibling dir that shares a prefix",
-                "skill_md_path": f"{lookalike_dir}/lookalike-skill/SKILL.md",
-                "skill_dir": f"{lookalike_dir}/lookalike-skill",
+                "skill_md_path": str(lookalike_dir / "lookalike-skill" / "SKILL.md"),
+                "skill_dir": str(lookalike_dir / "lookalike-skill"),
             },
         }
 
@@ -702,6 +704,104 @@ class TestTelegramMenuCommands:
         assert "lookalike_skill" not in menu_names, (
             "prefix-match sibling directories must not be admitted"
         )
+
+    def test_hub_exclusion_is_path_component_aware(self, tmp_path, monkeypatch):
+        """Exclude real .hub descendants without hiding prefix-sharing dirs."""
+        from unittest.mock import patch
+
+        local_dir = tmp_path / "skills"
+        local_dir.mkdir()
+        fake_cmds = {
+            "/hub-skill": {
+                "name": "hub-skill",
+                "description": "Installed by the hub",
+                "skill_md_path": str(local_dir / ".hub" / "hub-skill" / "SKILL.md"),
+            },
+            "/hub-backup-skill": {
+                "name": "hub-backup-skill",
+                "description": "A normal local skill",
+                "skill_md_path": str(local_dir / ".hub-backup" / "hub-backup-skill" / "SKILL.md"),
+            },
+            "/hub-other-skill": {
+                "name": "hub-other-skill",
+                "description": "Another normal local skill",
+                "skill_md_path": str(local_dir / ".hub-other" / "hub-other-skill" / "SKILL.md"),
+            },
+        }
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with (
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+        ):
+            menu, _ = telegram_menu_commands(max_commands=100)
+
+        menu_names = {name for name, _description in menu}
+        assert "hub_skill" not in menu_names
+        assert "hub_backup_skill" in menu_names
+        assert "hub_other_skill" in menu_names
+
+    @pytest.mark.require_symlinks
+    def test_symlinked_local_skill_outside_root_stays_in_gateway_menus(
+        self, tmp_path, monkeypatch
+    ):
+        """A trusted lexical skill path may target a checkout outside the root."""
+        from unittest.mock import patch
+
+        from agent.skill_utils import iter_skill_index_files
+        from hermes_cli.commands import discord_skill_commands_by_category
+
+        local_dir = tmp_path / "skills"
+        local_dir.mkdir()
+        checkout_dir = tmp_path / "checked-out-skills" / "symlinked-skill"
+        checkout_dir.mkdir(parents=True)
+        (checkout_dir / "SKILL.md").write_text(
+            "---\nname: symlinked-skill\ndescription: Linked checkout\n---\n",
+            encoding="utf-8",
+        )
+        linked_dir = local_dir / "symlinked-skill"
+        linked_dir.symlink_to(checkout_dir, target_is_directory=True)
+
+        discovered = list(iter_skill_index_files(local_dir, "SKILL.md"))
+        assert discovered == [linked_dir / "SKILL.md"]
+        assert discovered[0].resolve() == checkout_dir / "SKILL.md"
+        assert not checkout_dir.is_relative_to(local_dir)
+
+        fake_cmds = {
+            "/symlinked-skill": {
+                "name": "symlinked-skill",
+                "description": "Linked checkout",
+                "skill_md_path": str(discovered[0]),
+                "skill_dir": str(linked_dir),
+            },
+        }
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with (
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+        ):
+            telegram_menu, _ = telegram_menu_commands(max_commands=100)
+            discord_entries, hidden = discord_skill_commands(
+                max_slots=50, reserved_names=set()
+            )
+            categories, uncategorized, category_hidden = (
+                discord_skill_commands_by_category(reserved_names=set())
+            )
+
+        assert "symlinked_skill" in {
+            name for name, _description in telegram_menu
+        }
+        assert "symlinked-skill" in {
+            name for name, _description, _key in discord_entries
+        }
+        assert categories == {}
+        assert [name for name, _description, _key in uncategorized] == [
+            "symlinked-skill"
+        ]
+        assert hidden == 0
+        assert category_hidden == 0
 
     def test_special_chars_in_skill_names_sanitized(self, tmp_path, monkeypatch):
         """Skills with +, /, or other special chars produce valid Telegram names."""
@@ -793,6 +893,82 @@ class TestBackwardCompatAliases:
 class TestDiscordSkillCommands:
     """Tests for discord_skill_commands() — centralized skill registration."""
 
+
+    @pytest.mark.windows_only
+    def test_native_windows_paths_include_local_and_external_skills(
+        self, tmp_path, monkeypatch,
+    ):
+        """Backslash-native skill paths remain visible in the flat collector."""
+        from unittest.mock import patch
+
+        local_dir = tmp_path / "skills"
+        external_dir = tmp_path / "external-skills"
+        lookalike_dir = tmp_path / "external-skills-backup"
+        local_dir.mkdir()
+        external_dir.mkdir()
+        lookalike_dir.mkdir()
+        fake_cmds = {
+            "/local-skill": {
+                "name": "local-skill",
+                "description": "Local",
+                "skill_md_path": str(local_dir / "local-skill" / "SKILL.md"),
+            },
+            "/external-skill": {
+                "name": "external-skill",
+                "description": "External",
+                "skill_md_path": str(external_dir / "external-skill" / "SKILL.md"),
+            },
+            "/lookalike-skill": {
+                "name": "lookalike-skill",
+                "description": "Outside the configured external root",
+                "skill_md_path": str(
+                    lookalike_dir / "lookalike-skill" / "SKILL.md"
+                ),
+            },
+            "/hub-skill": {
+                "name": "hub-skill",
+                "description": "Installed by the hub",
+                "skill_md_path": str(
+                    local_dir / ".hub" / "hub-skill" / "SKILL.md"
+                ),
+            },
+            "/hub-backup-skill": {
+                "name": "hub-backup-skill",
+                "description": "A normal local skill",
+                "skill_md_path": str(
+                    local_dir / ".hub-backup" / "hub-backup-skill" / "SKILL.md"
+                ),
+            },
+            "/hub-other-skill": {
+                "name": "hub-other-skill",
+                "description": "Another normal local skill",
+                "skill_md_path": str(
+                    local_dir / ".hub-other" / "hub-other-skill" / "SKILL.md"
+                ),
+            },
+        }
+
+        assert "\\" in str(local_dir.resolve())
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with (
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                return_value=[external_dir],
+            ),
+        ):
+            entries, hidden = discord_skill_commands(
+                max_slots=50, reserved_names=set(),
+            )
+
+        assert {name for name, _desc, _key in entries} == {
+            "external-skill",
+            "hub-backup-skill",
+            "hub-other-skill",
+            "local-skill",
+        }
+        assert hidden == 0
 
     def test_names_allow_hyphens(self, tmp_path, monkeypatch):
         """Discord names should keep hyphens (unlike Telegram's _ sanitization)."""
@@ -974,6 +1150,45 @@ class TestDiscordSkillCommandsByCategory:
             "prefix check was broken for by_category (completes #18741)"
         )
         assert any(n == "external-skill" for n, _d, _k in categories["mlops"])
+        assert uncategorized == []
+        assert hidden == 0
+
+    def test_hub_exclusion_is_path_component_aware(self, tmp_path, monkeypatch):
+        """Discord categories exclude .hub, not similarly named siblings."""
+        from unittest.mock import patch
+
+        local_dir = tmp_path / "skills"
+        fake_cmds = {
+            "/hub-skill": {
+                "name": "hub-skill",
+                "description": "Installed by the hub",
+                "skill_md_path": str(local_dir / ".hub" / "hub-skill" / "SKILL.md"),
+            },
+            "/hub-backup-skill": {
+                "name": "hub-backup-skill",
+                "description": "A normal local skill",
+                "skill_md_path": str(local_dir / ".hub-backup" / "hub-backup-skill" / "SKILL.md"),
+            },
+            "/hub-other-skill": {
+                "name": "hub-other-skill",
+                "description": "Another normal local skill",
+                "skill_md_path": str(local_dir / ".hub-other" / "hub-other-skill" / "SKILL.md"),
+            },
+        }
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with (
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+        ):
+            categories, uncategorized, hidden = discord_skill_commands_by_category(
+                reserved_names=set(),
+            )
+
+        assert ".hub" not in categories
+        assert any(name == "hub-backup-skill" for name, _desc, _key in categories[".hub-backup"])
+        assert any(name == "hub-other-skill" for name, _desc, _key in categories[".hub-other"])
         assert uncategorized == []
         assert hidden == 0
 
