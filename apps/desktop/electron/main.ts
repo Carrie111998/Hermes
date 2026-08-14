@@ -262,9 +262,9 @@ import {
   observeUpdaterHandoff,
   resolvePosixScriptHandoff,
   resolveStagedUpdaterBinary,
-  selectWindowsUpdateHandoff,
   resolveUpdateScriptHandoff,
   sandboxFallbackFromEnv,
+  selectWindowsUpdateHandoff,
   spawnUpdaterProcess,
   stagedUpdaterSupportsPrewrittenMarker,
   wrapHandoffForDetachedConsole
