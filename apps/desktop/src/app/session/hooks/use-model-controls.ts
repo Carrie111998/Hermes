@@ -207,10 +207,20 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
       }
 
       try {
+        // The PRIMARY profile's main agent is the profile's default — its
+        // model/provider choice IS the default, so persist it to config.yaml
+        // (model.default + model.provider) via --global. This is what makes
+        // the selection "stick": a set model.provider outranks a leftover
+        // OPENAI_API_KEY env var in resolve_provider(), so the main agent
+        // keeps the chosen (e.g. subscription) provider across restarts
+        // instead of silently falling back to an env key. A SECONDARY chat
+        // tile stays --session so picking a model there can't rewrite the
+        // profile default (the cross-session-contamination guard).
+        const scope = touchesPrimary ? '--global' : '--session'
         const result = await requestGateway<{ deferred?: boolean }>('config.set', {
           session_id: liveSessionId,
           key: 'model',
-          value: `${selection.model} --provider ${selection.provider} --session`
+          value: `${selection.model} --provider ${selection.provider} ${scope}`
         })
 
         // A pick made DURING a turn is queued by the gateway and applied at the
