@@ -5239,6 +5239,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._status_usage_snapshot = None
         self._status_usage_checked_at = 0.0
         self._status_usage_refreshing = False
+        self._status_usage_completed_before_app = False
         self._status_usage_lock = threading.Lock()
         # When True, the input separator rules and the dynamic status bar are
         # hidden until the next user input. Set by _recover_after_resize() so a
@@ -5965,8 +5966,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if used is None:
                         continue
                     remaining = max(0, min(100, round(100 - float(used))))
-                    if getattr(window, "label", "") == "Weekly":
-                        labels.append(f"weekly {round(float(used))}% used · {remaining}% left")
+                    short = {"Session": "S", "Weekly": "W"}.get(
+                        getattr(window, "label", "")
+                    )
+                    if short is None:
+                        continue
+                    labels.append(f"{short} {remaining}%")
                 snapshot["plan_usage_label"] = "plan " + " · ".join(labels) if labels else ""
         except Exception:
             pass
@@ -6097,16 +6102,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if not provider:
                     return
                 from agent.account_usage import fetch_account_usage
-                usage = fetch_account_usage(
-                    provider,
-                    base_url=getattr(agent, "base_url", None) or getattr(self, "base_url", None),
-                    api_key=getattr(agent, "api_key", None) or getattr(self, "api_key", None),
-                )
+                if str(provider).lower() == "openai-codex":
+                    # The active inference key may be a short-lived/runtime
+                    # credential that the ChatGPT quota endpoint rejects. Let
+                    # account_usage resolve the native Codex OAuth credential
+                    # (and account identity) instead of blindly reusing it.
+                    usage = fetch_account_usage(provider)
+                else:
+                    usage = fetch_account_usage(
+                        provider,
+                        base_url=getattr(agent, "base_url", None) or getattr(self, "base_url", None),
+                        api_key=getattr(agent, "api_key", None) or getattr(self, "api_key", None),
+                    )
                 with lock:
                     self._status_usage_snapshot = usage
                 app = getattr(self, "_app", None)
                 if app is not None:
                     app.invalidate()
+                else:
+                    self._status_usage_completed_before_app = True
             except Exception:
                 pass
             finally:
@@ -6114,6 +6128,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self._status_usage_refreshing = False
 
         threading.Thread(target=refresh, name="hermes-status-usage", daemon=True).start()
+
+    def _replay_status_usage_invalidation(self) -> None:
+        """Repaint once if usage arrived before prompt_toolkit had an app."""
+        if getattr(self, "_status_usage_completed_before_app", False):
+            self._status_usage_completed_before_app = False
+            app = getattr(self, "_app", None)
+            if app is not None:
+                app.invalidate()
 
     def _get_status_bar_session_title(self) -> str:
         """Return the current title without polling state.db on every repaint."""
@@ -18880,6 +18902,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         )
         _disable_prompt_toolkit_cpr_warning(app)
         self._app = app  # Store reference for clarify_callback
+        self._replay_status_usage_invalidation()
 
         # ── Fix ghost status-bar lines on terminal resize ──────────────
         # Resize handling: monkey-patch prompt_toolkit's _output_screen_diff

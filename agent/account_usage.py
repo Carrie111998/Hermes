@@ -525,10 +525,23 @@ def _fetch_codex_account_usage(
     payload = response.json() or {}
     rate_limit = payload.get("rate_limit") or {}
     windows: list[AccountUsageWindow] = []
-    for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
+    # The API's primary/secondary slots are not semantic: when a plan only
+    # exposes one window, the weekly window may be returned as primary. Classify
+    # known windows by duration so the status bar cannot call a 7-day quota a
+    # session quota. Unknown durations are intentionally omitted rather than
+    # assigned a misleading label.
+    window_labels = {18_000: "Session", 604_800: "Weekly"}
+    for key in ("primary_window", "secondary_window"):
         window = rate_limit.get(key) or {}
         used = window.get("used_percent")
         if used is None:
+            continue
+        duration = window.get("limit_window_seconds")
+        if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+            label = window_labels.get(int(duration))
+        else:
+            label = None
+        if label is None:
             continue
         windows.append(
             AccountUsageWindow(
