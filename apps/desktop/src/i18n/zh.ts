@@ -3046,6 +3046,8 @@ export const zh: Translations = {
       toolCount: count => `${count} 个工具`,
       notInCatalog: server => `“${server}”不在 MCP 目录中`,
       catalogSource: '来自 Nous 认证目录',
+      launchCommand: target => `将运行：${target}`,
+      launchRemote: target => `将连接：${target}`,
       envRequired: '请先填写所需凭据',
       sendFailed: '无法发送 MCP 设置响应',
       reloadFailed: '服务器已保存，但重新加载 MCP 工具失败 — 将在下个会话加载',

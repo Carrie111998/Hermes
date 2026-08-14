@@ -2457,6 +2457,8 @@ export interface Translations {
       toolCount: (count: number) => string
       notInCatalog: (server: string) => string
       catalogSource: string
+      launchCommand: (target: string) => string
+      launchRemote: (target: string) => string
       envRequired: string
       sendFailed: string
       reloadFailed: string

@@ -2874,6 +2874,8 @@ export const en: Translations = {
       toolCount: count => (count === 1 ? '1 tool' : `${count} tools`),
       notInCatalog: server => `“${server}” is not in the MCP catalog`,
       catalogSource: 'From the Nous-approved catalog',
+      launchCommand: target => `Runs: ${target}`,
+      launchRemote: target => `Connects to: ${target}`,
       envRequired: 'Fill in the required credentials first',
       sendFailed: 'Could not send MCP setup response',
       reloadFailed: 'Server saved, but reloading MCP tools failed — they load next session',

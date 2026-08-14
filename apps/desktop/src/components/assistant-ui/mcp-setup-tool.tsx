@@ -18,6 +18,7 @@ import {
   getMcpCatalog,
   getMcpOAuthFlow,
   installMcpCatalogEntry,
+  listMcpServers,
   type McpCatalogEntry,
   removeMcpServer,
   setMcpServerEnabled
@@ -28,6 +29,7 @@ import { AlertCircle, CheckCircle2, Loader2 } from '@/lib/icons'
 import { brandFor, brandGlyphStyle } from '@/lib/mcp-brands'
 import { completeMcpDesktopOAuth, McpOAuthCancelled } from '@/lib/mcp-dashboard-oauth'
 import { directoryEntry } from '@/lib/mcp-directory'
+import { formatMcpLaunchTarget, type McpLaunchTarget } from '@/lib/mcp-launch-target'
 import { prettyName } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { $gateway } from '@/store/gateway'
@@ -182,6 +184,10 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
   const [envDraft, setEnvDraft] = useState<Record<string, string>>({})
   const [entry, setEntry] = useState<McpCatalogEntry | null | undefined>(undefined)
   const [envOpen, setEnvOpen] = useState(false)
+  // What would actually execute (stdio command line) or be contacted (remote
+  // URL) — resolved BEFORE the user approves, so consent is informed
+  // (ported from MoonshotAI/kimi-code#2843).
+  const [launchTarget, setLaunchTarget] = useState<McpLaunchTarget | null>(null)
   // Set when the user cancels mid-flight (a stuck OAuth tab, a hung install).
   // The in-flight flow checks it at every poll boundary and aborts via the
   // CANCELLED sentinel; the declined respond has already been sent by then.
@@ -190,6 +196,55 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
   // Race: tool.start fires a tick before mcp.setup.request — hold the buttons
   // until the gateway request is wired (same spinner rule as clarify).
   const ready = Boolean(request?.requestId)
+
+  // Resolve the launch target for the pre-consent line. For installs this
+  // doubles as the catalog-entry prefetch approve() reuses; for enable /
+  // authorize the configured mcp_servers entry names the target. Best-effort:
+  // the card still works without the line when a lookup fails.
+  useEffect(() => {
+    if (!server) {
+      return
+    }
+
+    let stale = false
+
+    void (async () => {
+      try {
+        if (action === 'install') {
+          const catalog = await getMcpCatalog()
+          const resolved = catalog.entries.find(candidate => candidate.name === server) ?? null
+
+          if (stale) {
+            return
+          }
+
+          setEntry(resolved)
+
+          if (resolved) {
+            setLaunchTarget(formatMcpLaunchTarget(resolved))
+          } else {
+            const known = directoryEntry(server)
+            setLaunchTarget(known ? formatMcpLaunchTarget({ url: known.url }) : null)
+          }
+
+          return
+        }
+
+        const { servers } = await listMcpServers()
+        const configured = servers.find(candidate => candidate.name === server)
+
+        if (!stale) {
+          setLaunchTarget(configured ? formatMcpLaunchTarget(configured) : null)
+        }
+      } catch {
+        // Leave the target line off; approve() has its own error reporting.
+      }
+    })()
+
+    return () => {
+      stale = true
+    }
+  }, [action, server])
 
   const respond = useCallback(
     async (outcome: McpSetupOutcome) => {
@@ -399,12 +454,19 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
   const actionLabel =
     action === 'enable' ? copy.enableAction : action === 'authorize' ? copy.authorizeAction : copy.installAction
 
-  // What connecting actually means — the endpoint that will be contacted.
-  // VS Code's trust dialog links the config it's about to trust; same idea.
-  // Directory servers know their URL statically; catalog entries state their
-  // provenance (the reviewed manifest carries the transport).
+  // What connecting actually means — the endpoint that will be contacted or
+  // the command that will run. VS Code's trust dialog links the config it's
+  // about to trust; kimi-code's workspace-trust prompt lists launch targets
+  // (MoonshotAI/kimi-code#2843). The resolved target wins; installs without
+  // one fall back to the directory URL / catalog provenance line.
   const known = directoryEntry(server)
-  const sourceLine = action === 'install' ? (known?.url ?? copy.catalogSource) : null
+  const sourceLine = launchTarget
+    ? launchTarget.kind === 'stdio'
+      ? copy.launchCommand(launchTarget.target)
+      : copy.launchRemote(launchTarget.target)
+    : action === 'install'
+      ? (known?.url ?? copy.catalogSource)
+      : null
   const brand = brandFor(server)
 
   const trailingIcon = brand ? (
