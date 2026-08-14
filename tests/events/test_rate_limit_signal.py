@@ -264,3 +264,28 @@ def test_severity_never_downgrades():
         "fallbacks_seen": [],
     }
     assert _should_alert(ep, "diverted", "") is False
+
+
+def test_alert_decision_uses_alerted_level_not_worst_outcome():
+    """Discriminating case: worst_outcome and alerted_level deliberately
+    diverge, so this only passes if condition 2 reads alerted_level.
+
+    Every other fixture in this file sets worst_outcome == alerted_level,
+    so swapping the field read at rate_limit_signal.py:122 produces
+    identical results on those tests -- zero regression protection against
+    the exact bug this function exists to guard against. Do not "tidy"
+    these two fields back into agreement; the divergence is the point.
+
+    Here worst_outcome is already chain_exhausted (e.g. from a prior
+    episode state) but the user was only ever ALERTED at diverted. A new
+    chain_exhausted hit must alert because it's worse than what was
+    alerted, even though it is not worse than what was already recorded
+    as worst_outcome. fallback_key is "" so condition 3 (new fallback
+    target) cannot supply a false pass.
+    """
+    from events.rate_limit_signal import _should_alert
+    ep = {
+        "worst_outcome": "chain_exhausted", "alerted_level": "diverted",
+        "fallbacks_seen": ["openai-codex/gpt-5.6-sol"],
+    }
+    assert _should_alert(ep, "chain_exhausted", "") is True
