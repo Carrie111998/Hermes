@@ -3411,20 +3411,6 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
-        # Optional pre-turn context: prepend a deterministically-maintained state
-        # file (e.g. campaign save-state) to this turn's system prompt, so the model
-        # always sees current truth without relying on it to look things up. Set
-        # HERMES_PRETURN_CONTEXT_FILE to the file path.
-        _ctxf = os.environ.get("HERMES_PRETURN_CONTEXT_FILE", "").strip()
-        if _ctxf:
-            try:
-                with open(os.path.expanduser(_ctxf), encoding="utf-8") as _cf:
-                    _ctx = _cf.read().strip()
-                if _ctx:
-                    _pre = f"[CURRENT CAMPAIGN STATE — authoritative, maintained externally]\n{_ctx}\n"
-                    system_prompt = (_pre + "\n" + system_prompt) if system_prompt else _pre
-            except OSError:
-                pass
         # Runtime selection — mirrors _handle_session_chat (lock wins,
         # otherwise session-persisted model then per-request values).
         runtime_request = self._effective_session_runtime_request(
@@ -3523,8 +3509,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 }))
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
                 history = await self._conversation_history_for_session(session_id)
+                # Optional resume seed: a deterministically-maintained state file
+                # (e.g. campaign save-state), set via HERMES_PRETURN_CONTEXT_FILE.
+                # It is for RESUMING, not for play — seeded ONLY on the very first
+                # turn of a brand-new conversation (empty history), so a new chat
+                # opens knowing exactly where the last one left off. It is NOT
+                # re-seeded mid-session, including after a compression: the recent
+                # turns are still in context there, so re-injecting the last scene
+                # would be redundant, bloat the transcript, and bust the KV cache.
+                agent_user_message = user_message
+                _ctxf = os.environ.get("HERMES_PRETURN_CONTEXT_FILE", "").strip()
+                if _ctxf and isinstance(agent_user_message, str) and agent_user_message:
+                    _marker = "[CURRENT CAMPAIGN STATE"
+                    if not history:
+                        try:
+                            with open(os.path.expanduser(_ctxf), encoding="utf-8") as _cf:
+                                _ctx = _cf.read().strip()
+                            if _ctx:
+                                agent_user_message = (
+                                    f"{agent_user_message}\n\n"
+                                    f"{_marker} — authoritative, maintained externally]\n{_ctx}"
+                                )
+                        except OSError:
+                            pass
                 result, usage = await self._run_agent(
-                    user_message=user_message,
+                    user_message=agent_user_message,
                     conversation_history=history,
                     ephemeral_system_prompt=system_prompt,
                     session_id=session_id,
@@ -3540,7 +3549,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
-                turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
+                turn_messages = self._turn_transcript_messages(history, agent_user_message, result) if isinstance(result, dict) else []
                 effective_runtime = {}
                 if isinstance(result, dict):
                     effective_runtime = result.get("runtime") or {}
