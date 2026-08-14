@@ -2101,6 +2101,11 @@ DEFAULT_CONFIG = {
     #   smart  — use auxiliary LLM to auto-approve low-risk commands (default)
     #   off    — skip all approval prompts (equivalent to --yolo)
     #
+    # gateway_mode — what to do when a messaging/API gateway hits an action
+    # that would otherwise require user approval:
+    #   prompt — notify the user and wait for a decision (default, interactive)
+    #   deny   — block immediately without notifying (safe for unattended agents)
+    #
     # cron_mode — what to do when a cron job hits a dangerous command:
     #   deny    — block the command and let the agent find another way (default, safe)
     #   approve — auto-approve all dangerous commands in cron jobs
@@ -2113,6 +2118,7 @@ DEFAULT_CONFIG = {
     "approvals": {
         "mode": "smart",
         "timeout": 300,
+        "gateway_mode": "prompt",
         "cron_mode": "deny",
         # Operator-customizable policy text for smart approvals. When
         # non-empty, this is appended to the smart-approval guardian's

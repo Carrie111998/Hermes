@@ -84,6 +84,15 @@ class TestSmartApproval:
 
 
 class TestDetectDangerousRm:
+    @pytest.mark.parametrize("runtime", ["docker", "podman"])
+    def test_container_auto_remove_flag_is_not_recursive_filesystem_delete(self, runtime):
+        command = (
+            f"{runtime} run --rm --network none --read-only "
+            "review-worker:2 node /workspace/audit.cjs"
+        )
+
+        assert detect_dangerous_command(command) == (False, None, None)
+
     def test_rm_flags_after_operands_detected(self):
         # GNU rm permutes options: `rm build/ -rf` == `rm -rf build/`.
         # Port of openai/codex#33464.
@@ -118,6 +127,56 @@ class TestDetectDangerousRm:
         with mock_patch("tempfile.gettempdir", return_value=str(linked_temp)):
             assert detect_dangerous_command(f"rm -f {linked_temp / basename}")[0] is True
             assert detect_dangerous_command(f"rm -f {real_temp / basename}") == (
+                False,
+                None,
+                None,
+            )
+
+    def test_tmp_alias_is_only_exempt_when_it_is_macos_private_tmp(self):
+        basename = "hermes-verify-example.py"
+
+        def unrelated_tmp_target(path):
+            value = os.fspath(path)
+            if value == "/tmp":
+                return "/attacker-controlled-temp"
+            if value.startswith("/tmp/"):
+                return value.replace("/tmp", "/attacker-controlled-temp", 1)
+            return value
+
+        with (
+            mock_patch("tempfile.gettempdir", return_value="/tmp"),
+            mock_patch.object(
+                approval_module.os,
+                "path",
+                wraps=os.path,
+            ) as mocked_path,
+            mock_patch.object(approval_module.sys, "platform", "darwin"),
+        ):
+            mocked_path.realpath.side_effect = unrelated_tmp_target
+            assert detect_dangerous_command(f"rm -f /tmp/{basename}")[0] is True
+
+    def test_tmp_alias_is_exempt_for_macos_private_tmp(self):
+        basename = "hermes-verify-example.py"
+
+        def macos_tmp_target(path):
+            value = os.fspath(path)
+            if value == "/tmp":
+                return "/private/tmp"
+            if value.startswith("/tmp/"):
+                return value.replace("/tmp", "/private/tmp", 1)
+            return value
+
+        with (
+            mock_patch("tempfile.gettempdir", return_value="/tmp"),
+            mock_patch.object(
+                approval_module.os,
+                "path",
+                wraps=os.path,
+            ) as mocked_path,
+            mock_patch.object(approval_module.sys, "platform", "darwin"),
+        ):
+            mocked_path.realpath.side_effect = macos_tmp_target
+            assert detect_dangerous_command(f"rm -f /tmp/{basename}") == (
                 False,
                 None,
                 None,

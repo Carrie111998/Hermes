@@ -690,10 +690,17 @@ def _sudo_stdin_block_result(description: str) -> dict:
 # Dangerous command patterns
 # =========================================================================
 
+# ``\brm`` also matches the ``rm`` suffix inside container-runtime ``--rm``
+# options.  Require that the command word is not immediately preceded by a
+# dash so ``docker run --rm --network …`` cannot be mistaken for
+# ``rm --network …``.  Real command spellings (rm, /bin/rm, sudo rm) remain
+# matched, including after quote-aware command separators.
+_RM_COMMAND_WORD = r'(?<!-)\brm'
+
 DANGEROUS_PATTERNS = [
-    (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
-    (r'\brm\s+-[^\s]*r', "recursive delete"),
-    (r'\brm\s+--recursive\b', "recursive delete (long flag)"),
+    (_RM_COMMAND_WORD + r'\s+(-[^\s]*\s+)*/', "delete in root path"),
+    (_RM_COMMAND_WORD + r'\s+-[^\s]*r', "recursive delete"),
+    (_RM_COMMAND_WORD + r'\s+--recursive\b', "recursive delete (long flag)"),
     # GNU rm permutes options, so a recursive flag group may legally FOLLOW
     # the operands: `rm build/ -rf`, `rm build/ -r -f`, and `rm build/
     # --recursive --force` are all equivalent to the flags-first spellings the
@@ -709,7 +716,7 @@ DANGEROUS_PATTERNS = [
     # like `--registry` (preceded by `-`, not whitespace) does not count.
     # Port of openai/codex#33464 ("recognize force options when they follow
     # operands").
-    (r'\brm\s+(?!--(?:\s|$))(?:(?!\s--(?:\s|$))[^\n"\';|&])*\s'
+    (_RM_COMMAND_WORD + r'\s+(?!--(?:\s|$))(?:(?!\s--(?:\s|$))[^\n"\';|&])*\s'
      r'(?:-[a-z]*r[a-z]*\b|--recursive\b)',
      "recursive delete (flags after operands)"),
     # Windows shell front-ends have destructive built-ins that do not look like
@@ -2161,9 +2168,22 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
         return False
 
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
+    configured_temp_dir = os.path.abspath(tempfile.gettempdir())
+    temp_dir = os.path.realpath(configured_temp_dir)
     basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+    allowed_operand_dirs = {temp_dir}
+    # macOS exposes the system temp directory as /tmp while its canonical path
+    # is /private/tmp. Accept that one OS-defined alias, but do not generalize
+    # to arbitrary symlinked temp directories (see the symlink regression test).
+    if (
+        sys.platform == "darwin"
+        and configured_temp_dir == "/tmp"
+        and temp_dir == "/private/tmp"
+    ):
+        allowed_operand_dirs.add(configured_temp_dir)
+    if operand not in {
+        os.path.join(directory, basename) for directory in allowed_operand_dirs
+    }:
         return False
 
     target = os.path.realpath(operand)
@@ -2977,6 +2997,38 @@ def _get_approval_timeout() -> int:
         return 300
 
 
+def _get_gateway_approval_mode() -> str:
+    """Read gateway approval behavior: interactive ``prompt`` or fail-closed ``deny``.
+
+    ``deny`` is intended for unattended messaging profiles. It blocks flagged
+    actions before smart assessment or user notification while leaving CLI and
+    other gateway profiles on the backwards-compatible interactive default.
+    """
+    try:
+        mode = str(_get_approval_config().get("gateway_mode", "prompt")).lower().strip()
+    except Exception:
+        return "prompt"
+    return "deny" if mode in {"deny", "block"} else "prompt"
+
+
+def _gateway_deny_result(pattern_key: str, description: str) -> dict:
+    """Return the common unattended-gateway block without notifying a user."""
+    return {
+        "approved": False,
+        "message": (
+            f"BLOCKED: approval required ({description}), but this unattended "
+            "gateway is configured with approvals.gateway_mode: deny. No "
+            "approval request was sent. Do not ask the user, retry, rephrase, "
+            "allowlist, or bypass this action; classify the affected activity "
+            "as unavailable and continue independent safe work."
+        ),
+        "pattern_key": pattern_key,
+        "description": description,
+        "outcome": "gateway_denied",
+        "user_consent": False,
+    }
+
+
 def _get_cron_approval_mode() -> str:
     """Read the cron approval mode from config. Returns 'deny' or 'approve'."""
     try:
@@ -3195,10 +3247,14 @@ def _run_approval_gate(
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
         ``check_dangerous_command`` so all callers handle it uniformly.
     """
-    # --yolo bypasses all approval prompts (session- or process-scoped).
-    # Hardline blocks are handled by the caller BEFORE this gate, so yolo
-    # here only skips the recoverable approval layer.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    # --yolo or approvals.mode=off bypasses all approval prompts (session- or
+    # process-scoped). Hardline blocks are handled by command callers BEFORE
+    # this gate, so this only skips the recoverable approval layer.
+    if (
+        _YOLO_MODE_FROZEN
+        or is_current_session_yolo_enabled()
+        or _get_approval_mode() == "off"
+    ):
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
@@ -3214,6 +3270,9 @@ def _run_approval_gate(
 
     is_cli = _is_interactive_cli()
     is_gateway = _is_gateway_approval_context()
+
+    if is_gateway and _get_gateway_approval_mode() == "deny":
+        return _gateway_deny_result(pattern_key, description)
 
     if not is_cli and not is_gateway:
         # Cron sessions: respect cron_mode config
@@ -3934,6 +3993,12 @@ def check_all_command_guards(command: str, env_type: str,
     if not warnings:
         return {"approved": True, "message": None}
 
+    # Unattended gateway profiles fail closed before smart assessment or any
+    # notification callback. This is the gateway equivalent of cron_mode=deny.
+    if is_gateway and _get_gateway_approval_mode() == "deny":
+        combined_desc = "; ".join(desc for _, desc, _ in warnings)
+        return _gateway_deny_result(warnings[0][0], combined_desc)
+
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
@@ -4304,6 +4369,13 @@ def check_execute_code_guard(code: str, env_type: str,
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
+    # Unattended gateway profiles must block arbitrary local Python before the
+    # smart guardian or notification flow. execute_code can bypass terminal
+    # string guards through os/subprocess APIs, so parity with terminal/plugin
+    # gateway deny is security-critical.
+    if is_gateway and _get_gateway_approval_mode() == "deny":
+        return _gateway_deny_result(pattern_key, description)
+
     # Smart mode: ask the aux LLM about the whole script. An APPROVE here only
     # suppresses the redundant whole-script prompt; the per-call terminal()
     # guards (restored by context propagation) still run independently.
@@ -4490,6 +4562,14 @@ def request_elicitation_consent(
         return "decline"
 
     if _is_gateway_approval_context():
+        if _get_gateway_approval_mode() == "deny":
+            logger.info(
+                "Elicitation requested in unattended gateway session %s; "
+                "declining without notification",
+                session_key,
+            )
+            return "decline"
+
         with _lock:
             notify_cb = _gateway_notify_cbs.get(session_key)
         if notify_cb is None:
