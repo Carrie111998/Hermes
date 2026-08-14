@@ -70,6 +70,111 @@ def _spawn_python_sleep(seconds: float) -> subprocess.Popen:
     )
 
 
+_SYSTEMD_SCOPE_TTY_CHILD = r"""
+import json
+import os
+import shlex
+import subprocess
+import time
+import termios
+from pathlib import Path
+
+import tools.process_registry as process_registry_module
+
+report_fd = int(os.environ["HERMES_TEST_REPORT_FD"])
+ready_path = Path(os.environ["HERMES_TEST_READY_PATH"])
+workdir = os.environ["HERMES_TEST_WORKDIR"]
+
+
+def report(payload):
+    os.write(
+        report_fd,
+        (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"),
+    )
+
+
+process_registry_module._is_supervised_gateway_process = lambda: True
+process_registry_module._systemd_run_user_scope_available = lambda: True
+process_registry_module._find_shell = lambda: "/bin/bash"
+registry = process_registry_module.ProcessRegistry()
+registry._write_checkpoint = lambda: None
+
+session = None
+exit_code = 2
+try:
+    tty_fd = 0
+    interactive_pid = os.getpid()
+    interactive_sid = os.getsid(0)
+    interactive_pgid = os.getpgrp()
+    before_tpgid = os.tcgetpgrp(tty_fd)
+    tty_attrs = termios.tcgetattr(tty_fd)
+
+    command = (
+        f"printf ready > {shlex.quote(str(ready_path))}; "
+        "exec sleep 5"
+    )
+    session = registry.spawn_local(
+        command=command,
+        cwd=workdir,
+        use_pty=False,
+    )
+    report({
+        "type": "spawned",
+        "worker_pid": session.pid,
+        "worker_start_time": session.host_start_time,
+    })
+
+    foreground_preserved = True
+    deadline = time.monotonic() + 5.0
+    while not ready_path.exists():
+        if os.tcgetpgrp(tty_fd) != interactive_pgid:
+            foreground_preserved = False
+        if session.process.poll() is not None:
+            raise RuntimeError(
+                f"worker exited before readiness (rc={session.process.returncode})"
+            )
+        if time.monotonic() >= deadline:
+            raise TimeoutError("worker did not signal readiness after shell startup")
+        time.sleep(0.01)
+
+    after_tpgid = os.tcgetpgrp(tty_fd)
+    if after_tpgid != interactive_pgid:
+        foreground_preserved = False
+
+    # Model prompt_toolkit's terminal-mode update after the worker shell has
+    # completed interactive startup. If the worker stole the foreground group,
+    # the kernel stops this process with SIGTTOU before it can report success.
+    termios.tcsetattr(tty_fd, termios.TCSANOW, tty_attrs)
+    worker_sid = os.getsid(session.pid)
+    report({
+        "type": "result",
+        "interactive_pid": interactive_pid,
+        "interactive_sid": interactive_sid,
+        "interactive_pgid": interactive_pgid,
+        "before_tpgid": before_tpgid,
+        "after_tpgid": after_tpgid,
+        "foreground_preserved": foreground_preserved,
+        "worker_sid": worker_sid,
+    })
+    exit_code = 0
+except BaseException as exc:
+    report({
+        "type": "error",
+        "error": f"{type(exc).__name__}: {exc}",
+    })
+finally:
+    if session is not None and session.process is not None:
+        if session.process.poll() is None:
+            session.process.terminate()
+        try:
+            session.process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            session.process.kill()
+            session.process.wait(timeout=2)
+    os._exit(exit_code)
+"""
+
+
 def test_kill_started_since_preserves_preexisting_and_foreign_processes(registry):
     old = _make_session(sid="proc_old", task_id="session-a")
     finished = _make_session(
@@ -1806,6 +1911,188 @@ class TestSystemdCgroupIsolation:
         assert captured["start_new_session"] is True
         # The session must record the unit name so kill_process can stop it.
         assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
+
+    @pytest.mark.skipif(
+        not sys.platform.startswith("linux"),
+        reason="Linux controlling-terminal job-control regression",
+    )
+    def test_systemd_scope_worker_preserves_interactive_terminal_foreground_pgrp(
+        self, registry, tmp_path
+    ):
+        """A scope-wrapped worker must not take ownership of the CLI's tty.
+
+        ``systemd-run --scope`` changes cgroup membership, not Unix session or
+        controlling-terminal ownership.  This test replaces it with a small
+        exec-only shim, then exercises the real ``subprocess.Popen`` boundary
+        from a child that owns a real kernel PTY.  With the historical
+        ``start_new_session=False`` bug, interactive bash moves itself into a
+        new process group and installs that group as the PTY foreground group;
+        the subsequent tcsetattr then stops the simulated CLI with SIGTTOU.
+        """
+        import pty
+        import select
+
+        shim = tmp_path / "systemd-run"
+        shim.write_text(
+            """#!/bin/sh
+while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+    shift
+done
+[ "$#" -gt 0 ] || exit 64
+shift
+exec "$@"
+""",
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+
+        report_read, report_write = os.pipe()
+        os.set_inheritable(report_write, True)
+        ready_path = tmp_path / "worker-ready"
+        child_env = {
+            **os.environ,
+            "INVOCATION_ID": "inherited-systemd-marker",
+            "PATH": f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}",
+            "HERMES_TEST_REPORT_FD": str(report_write),
+            "HERMES_TEST_READY_PATH": str(ready_path),
+            "HERMES_TEST_WORKDIR": str(tmp_path),
+        }
+        child_pid = worker_pid = None
+        worker_start_time = None
+        child_status = None
+        report_data = b""
+
+        try:
+            try:
+                child_pid, master_fd = pty.fork()
+            except OSError as exc:
+                pytest.skip(f"no PTY devices available: {exc}")
+
+            if child_pid == 0:
+                os.close(report_read)
+                os.execvpe(
+                    sys.executable,
+                    [sys.executable, "-c", _SYSTEMD_SCOPE_TTY_CHILD],
+                    child_env,
+                )
+
+            os.close(report_write)
+            report_write = -1
+            os.set_blocking(report_read, False)
+            deadline = time.monotonic() + 10.0
+
+            while time.monotonic() < deadline:
+                waited_pid, status = os.waitpid(
+                    child_pid,
+                    os.WNOHANG | os.WUNTRACED,
+                )
+                if waited_pid == child_pid:
+                    child_status = status
+                    if os.WIFSTOPPED(status) or os.WIFEXITED(status) or os.WIFSIGNALED(status):
+                        break
+
+                ready, _, _ = select.select([report_read], [], [], 0.05)
+                if ready:
+                    try:
+                        chunk = os.read(report_read, 4096)
+                    except BlockingIOError:
+                        chunk = b""
+                    if chunk:
+                        report_data += chunk
+
+            # Drain reports emitted immediately before the child changed state.
+            while True:
+                try:
+                    chunk = os.read(report_read, 4096)
+                except BlockingIOError:
+                    break
+                if not chunk:
+                    break
+                report_data += chunk
+
+            reports = [
+                json.loads(line)
+                for line in report_data.decode("utf-8", "replace").splitlines()
+                if line.strip()
+            ]
+            spawned = next(
+                (item for item in reports if item.get("type") == "spawned"),
+                None,
+            )
+            if spawned is not None:
+                worker_pid = int(spawned["worker_pid"])
+                worker_start_time = spawned.get("worker_start_time")
+
+            assert child_status is not None, (
+                f"interactive PTY child did not finish within timeout; reports={reports!r}"
+            )
+            assert not os.WIFSTOPPED(child_status), (
+                "interactive PTY child was stopped by "
+                f"signal {os.WSTOPSIG(child_status)}; reports={reports!r}"
+            )
+            assert os.WIFEXITED(child_status), (
+                f"interactive PTY child exited abnormally; reports={reports!r}"
+            )
+            assert os.WEXITSTATUS(child_status) == 0, reports
+
+            error = next(
+                (item for item in reports if item.get("type") == "error"),
+                None,
+            )
+            assert error is None, error
+            result = next(
+                (item for item in reports if item.get("type") == "result"),
+                None,
+            )
+            assert result is not None, reports
+            assert (
+                result["interactive_pid"]
+                == result["interactive_sid"]
+                == result["interactive_pgid"]
+            )
+            assert result["before_tpgid"] == result["interactive_pgid"]
+            assert result["after_tpgid"] == result["interactive_pgid"]
+            assert result["foreground_preserved"] is True
+            assert result["worker_sid"] != result["interactive_sid"]
+        finally:
+            if child_pid not in (None, 0):
+                try:
+                    waited_pid, _ = os.waitpid(child_pid, os.WNOHANG)
+                except ChildProcessError:
+                    waited_pid = child_pid
+                if waited_pid == 0:
+                    # The helper is still alive (normally because the kernel
+                    # stopped it on the regression path). Reap its explicitly
+                    # reported worker first, while it is still our descendant,
+                    # then terminate the helper itself.
+                    worker_is_ours = (
+                        worker_pid is not None
+                        and worker_start_time is not None
+                        and registry._safe_host_start_time(worker_pid)
+                        == worker_start_time
+                    )
+                    if worker_is_ours:
+                        try:
+                            os.kill(worker_pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        os.waitpid(child_pid, 0)
+                    except ChildProcessError:
+                        pass
+            if report_read >= 0:
+                os.close(report_read)
+            if report_write >= 0:
+                os.close(report_write)
+            if child_pid not in (None, 0):
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
 
     def test_falls_back_when_systemd_run_unavailable(self, registry, monkeypatch, _gateway_identity):
         """Under a supervisor but without systemd-run, fall back to the
