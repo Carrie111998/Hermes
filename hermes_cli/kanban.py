@@ -2085,7 +2085,39 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        policy = kb.workspace_conflict_policy()
+        if policy == "allow":
+            task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        else:
+            # The dispatcher performs this same check under the board's
+            # dispatch flock. Claiming by hand needs that fence too: without
+            # it, two shell users could both observe no conflict and claim
+            # different tasks pointing at the same workspace.
+            with kb._dispatch_tick_lock(kb.kanban_db_path()) as held:
+                if not held:
+                    print(
+                        "cannot claim while another kanban dispatcher or claim "
+                        "operation is checking this board; retry shortly",
+                        file=sys.stderr,
+                    )
+                    return 1
+                candidate = kb.get_task(conn, args.task_id)
+                if candidate is not None:
+                    workspace_path, running_task_ids = kb.workspace_conflicts_with_running(
+                        conn, candidate,
+                    )
+                    if workspace_path is not None and running_task_ids:
+                        message = kb.workspace_conflict_message(
+                            candidate.id, workspace_path, running_task_ids,
+                        )
+                        if policy == "warn":
+                            kb._log.warning(
+                                "kanban workspace conflict: claiming despite %s", message,
+                            )
+                        else:
+                            print(f"cannot claim {args.task_id}: {message}", file=sys.stderr)
+                            return 1
+                task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
         if task is None:
             # Report why
             existing = kb.get_task(conn, args.task_id)

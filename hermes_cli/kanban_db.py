@@ -7859,9 +7859,9 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
 
 
 def _resolve_worktree_workspace(
-    task: Task, *, board: Optional[str] = None
+    task: Task, *, board: Optional[str] = None, materialize: bool = True,
 ) -> tuple[Path, str]:
-    """Resolve + materialize a linked git worktree for ``task``.
+    """Resolve a linked git worktree for ``task``, materializing it by default.
 
     When ``task.workspace_path`` is unset, the anchor is the board's
     ``default_workdir`` (a persistent project checkout). This keeps every
@@ -7898,8 +7898,10 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
-        return target, branch_name
+        if materialize:
+            _ensure_git_worktree(repo_root, target, branch_name)
+            return target, branch_name
+        return target.resolve(strict=False), branch_name
 
     requested = Path(task.workspace_path).expanduser()
     if not requested.is_absolute():
@@ -7924,7 +7926,8 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                if materialize:
+                    _ensure_git_worktree(fallback_root, fallback, branch_name)
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this
         # task's own canonical worktree): keep the legacy reuse rather
@@ -7934,8 +7937,10 @@ def _resolve_worktree_workspace(
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
-        return target, branch_name
+        if materialize:
+            _ensure_git_worktree(repo_root, target, branch_name)
+            return target, branch_name
+        return target.resolve(strict=False), branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
     if repo_root is None:
@@ -7943,8 +7948,10 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
-    return requested, branch_name
+    if materialize:
+        _ensure_git_worktree(repo_root, requested, branch_name)
+        return requested, branch_name
+    return requested_resolved, branch_name
 
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
@@ -8027,6 +8034,100 @@ def set_branch_name(
             "UPDATE tasks SET branch_name = ? WHERE id = ?",
             (str(branch_name), task_id),
         )
+
+
+_WORKSPACE_CONFLICT_POLICIES = frozenset({"allow", "warn", "serialize"})
+
+
+def workspace_conflict_policy() -> str:
+    """Return the configured workspace-conflict policy, defaulting to allow.
+
+    A bad or unreadable configuration must preserve historical dispatch
+    behavior rather than silently suppress work.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        value = (load_config() or {}).get("kanban", {}).get(
+            "workspace_conflict", "allow",
+        )
+    except Exception:
+        return "allow"
+    policy = str(value).strip().lower()
+    if policy in _WORKSPACE_CONFLICT_POLICIES:
+        return policy
+    _log.warning(
+        "kanban: invalid workspace_conflict=%r; preserving historical allow policy",
+        value,
+    )
+    return "allow"
+
+
+def _workspace_conflict_path(task: Task, *, board: Optional[str] = None) -> Optional[Path]:
+    """Return a task's conflict path without creating a workspace.
+
+    Scratch workspaces intentionally never serialize. Directory tasks compare
+    their stored path, while worktrees use the same deterministic target
+    selection as materialization with ``materialize=False``.
+    """
+    kind = task.workspace_kind or "scratch"
+    if kind == "scratch":
+        return None
+    try:
+        if kind == "dir":
+            if not task.workspace_path:
+                return None
+            path = Path(task.workspace_path).expanduser()
+            return path.resolve(strict=False) if path.is_absolute() else None
+        if kind == "worktree":
+            path, _branch = _resolve_worktree_workspace(
+                task, board=board, materialize=False,
+            )
+            return path.resolve(strict=False)
+    except Exception:
+        # Keep validation and spawn-failure behavior where it already lives:
+        # conflict checks must not turn an invalid candidate into a new gate.
+        _log.debug(
+            "kanban: could not pre-resolve workspace conflict path for task %s",
+            task.id,
+            exc_info=True,
+        )
+    return None
+
+
+def workspace_conflicts_with_running(
+    conn: sqlite3.Connection, task: Task, *, board: Optional[str] = None,
+) -> tuple[Optional[Path], list[str]]:
+    """Return ``(path, running_task_ids)`` sharing ``task``'s workspace.
+
+    ``conn`` is board-scoped, so every returned task is necessarily on the
+    same board. This function is read-only and safe to call inside the
+    dispatch tick flock before a claim CAS.
+    """
+    path = _workspace_conflict_path(task, board=board)
+    if path is None:
+        return None, []
+    conflicts: list[str] = []
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE status = 'running' AND id != ?",
+        (task.id,),
+    ).fetchall()
+    for row in rows:
+        running_path = _workspace_conflict_path(Task.from_row(row), board=board)
+        if running_path == path:
+            conflicts.append(row["id"])
+    return path, conflicts
+
+
+def workspace_conflict_message(
+    task_id: str, path: Path, running_task_ids: Iterable[str],
+) -> str:
+    """Describe one candidate's shared workspace for logs and CLI errors."""
+    blockers = ", ".join(running_task_ids)
+    return (
+        f"task {task_id} workspace {path} is already used by running task(s): "
+        f"{blockers}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -8167,6 +8268,10 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_workspace_conflict: list[tuple[str, list[str], str]] = field(default_factory=list)
+    """Tasks deferred by ``workspace_conflict=serialize`` as
+    ``(task_id, running_task_ids, workspace_path)`` triples. The task remains
+    ready/review and is considered again after the running owner finishes."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -9875,6 +9980,7 @@ def _dispatch_once_locked(
         advertise_dispatcher_capabilities(conn)
 
     result = DispatchResult()
+    workspace_policy = workspace_conflict_policy()
     result.reclaimed = release_stale_claims(conn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
@@ -10073,6 +10179,24 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        if workspace_policy != "allow":
+            candidate = get_task(conn, row["id"])
+            if candidate is not None:
+                workspace_path, running_task_ids = workspace_conflicts_with_running(
+                    conn, candidate, board=board,
+                )
+                if workspace_path is not None and running_task_ids:
+                    message = workspace_conflict_message(
+                        candidate.id, workspace_path, running_task_ids,
+                    )
+                    if workspace_policy == "warn":
+                        _log.warning("kanban workspace conflict: dispatching %s", message)
+                    else:
+                        result.skipped_workspace_conflict.append(
+                            (candidate.id, running_task_ids, str(workspace_path))
+                        )
+                        _log.info("kanban workspace conflict: serializing %s", message)
+                        continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1
@@ -10207,6 +10331,24 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        if workspace_policy != "allow":
+            candidate = get_task(conn, row["id"])
+            if candidate is not None:
+                workspace_path, running_task_ids = workspace_conflicts_with_running(
+                    conn, candidate, board=board,
+                )
+                if workspace_path is not None and running_task_ids:
+                    message = workspace_conflict_message(
+                        candidate.id, workspace_path, running_task_ids,
+                    )
+                    if workspace_policy == "warn":
+                        _log.warning("kanban workspace conflict: dispatching %s", message)
+                    else:
+                        result.skipped_workspace_conflict.append(
+                            (candidate.id, running_task_ids, str(workspace_path))
+                        )
+                        _log.info("kanban workspace conflict: serializing %s", message)
+                        continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             spawned += 1
