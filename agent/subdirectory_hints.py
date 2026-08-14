@@ -20,7 +20,7 @@ import shlex
 from pathlib import Path
 from typing import Dict, Any, Optional, Set
 
-from agent.prompt_builder import _scan_context_content
+from agent.prompt_builder import _is_blocked_implicit_context_read, _scan_context_content
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +144,8 @@ class SubdirectoryHintTracker:
         for filename in _HINT_FILENAMES:
             candidate = self.working_dir / filename
             if _is_denied_context_path(candidate, base_path=self.working_dir):
+                continue
+            if _is_blocked_implicit_context_read(candidate):
                 continue
             try:
                 if not candidate.is_file():
@@ -356,6 +358,8 @@ class SubdirectoryHintTracker:
         for filename in _HINT_FILENAMES:
             hint_path = directory / filename
             if _is_denied_context_path(hint_path, base_path=self.working_dir):
+                continue
+            if _is_blocked_implicit_context_read(hint_path):
                 continue
             try:
                 if not hint_path.is_file():

@@ -142,6 +142,25 @@ class TestSubdirectoryHintTracker:
         assert "Allowed relative hint sibling" in result
         assert "RELATIVE DENIED HINT" not in result
 
+    def test_progressive_context_rejects_symlink_to_sensitive_file(self, tmp_path):
+        secret = tmp_path / "secrets" / ".env"
+        secret.parent.mkdir()
+        secret.write_text("PROGRESSIVE_CONTEXT_SECRET=must-not-load", encoding="utf-8")
+        subdir = tmp_path / "pkg"
+        subdir.mkdir()
+        try:
+            (subdir / "AGENTS.md").symlink_to(secret)
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable: {exc}")
+
+        tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
+        result = tracker.check_tool_call(
+            "read_file",
+            {"path": str(subdir / "module.py")},
+        )
+
+        assert result is None
+
     def test_denied_working_dir_context_is_not_read_during_digest_seed(self, project):
         """Tracker initialization must not read a denied startup context file."""
         agents = project / "AGENTS.md"

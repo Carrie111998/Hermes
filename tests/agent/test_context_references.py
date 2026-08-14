@@ -212,6 +212,39 @@ async def test_permissions_deny_blocks_reference_before_path_resolution(
 
 
 @pytest.mark.asyncio
+async def test_permissions_deny_preflights_cwd_ancestors_before_resolve(
+    tmp_path: Path,
+):
+    from agent.context_references import preprocess_context_references_async
+
+    denied_ancestor = tmp_path / "private1"
+    cwd = denied_ancestor / "src"
+    cwd.mkdir(parents=True)
+    original_resolve = Path.resolve
+
+    def guarded_resolve(path_obj, *args, **kwargs):
+        if path_obj == denied_ancestor or denied_ancestor in path_obj.parents:
+            raise AssertionError("denied cwd ancestry resolved before lexical preflight")
+        return original_resolve(path_obj, *args, **kwargs)
+
+    with (
+        patch(
+            "agent.deny_policy.permissions_deny_paths",
+            return_value=[str(tmp_path / "private?")],
+        ),
+        patch.object(Path, "resolve", autospec=True, side_effect=guarded_resolve),
+    ):
+        result = await preprocess_context_references_async(
+            "inspect @file:notes.txt",
+            cwd=cwd,
+            context_length=100_000,
+        )
+
+    assert result.blocked
+    assert any("permissions.deny.paths" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
 async def test_file_reference_rechecks_resolved_sensitive_home_alias(tmp_path: Path):
     import os
 

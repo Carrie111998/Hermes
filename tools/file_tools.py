@@ -232,6 +232,16 @@ def _uses_container_paths(task_id: str = "default") -> bool:
     return _terminal_env_type_for_task(task_id) in container_backends
 
 
+def _uses_remote_lexical_paths(task_id: str = "default") -> bool:
+    """Return whether paths belong to a remote POSIX-like namespace.
+
+    SSH paths are remote even though SSH is not a container backend. They must
+    therefore avoid host MSYS conversion, ``Path.resolve()``, and host symlink
+    dereferencing just like container paths.
+    """
+    return _terminal_env_type_for_task(task_id) == "ssh" or _uses_container_paths(task_id)
+
+
 def _normalize_without_host_deref(path: str | Path | PurePosixPath) -> PurePosixPath:
     """Normalize path syntax without following host symlinks.
 
@@ -352,7 +362,7 @@ def _resolve_base_dir(
     """
     root = _authoritative_workspace_root(task_id)
     if container_paths is None:
-        container_paths = _uses_container_paths(task_id)
+        container_paths = _uses_remote_lexical_paths(task_id)
     if root:
         base_text = _expand_tilde(root)
     else:
@@ -391,7 +401,7 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     translated to ``C:\\Users\\...`` before resolution so file tools don't
     treat them as relative ``\\c\\Users\\...`` under the process cwd.
     """
-    container_paths = _uses_container_paths(task_id)
+    container_paths = _uses_remote_lexical_paths(task_id)
     if container_paths:
         expanded = _expand_tilde(filepath)
         if posixpath.isabs(expanded):
@@ -439,7 +449,7 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
         workspace_root = _authoritative_workspace_root(task_id)
         if not workspace_root:
             return None  # No authoritative workspace root to compare against.
-        if _uses_container_paths(task_id):
+        if _uses_remote_lexical_paths(task_id):
             root = _normalize_without_host_deref(Path(_expand_tilde(workspace_root)))
         else:
             root = Path(_expand_tilde(workspace_root)).resolve()

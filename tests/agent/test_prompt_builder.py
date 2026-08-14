@@ -15,6 +15,7 @@ from agent.prompt_builder import (
     _skill_should_show,
     _find_hermes_md,
     _find_git_root,
+    _DENIED_CONTEXT_DISCOVERY,
     _strip_yaml_frontmatter,
     build_skills_system_prompt,
     build_nous_subscription_prompt,
@@ -515,6 +516,20 @@ class TestBuildContextFilesPrompt:
         assert "Allowed relative-rule sibling" in result
         assert "RELATIVE DENIED CONTEXT" not in result
 
+    def test_startup_context_rejects_symlink_to_sensitive_file(self, tmp_path):
+        secret = tmp_path / "secrets" / ".env"
+        secret.parent.mkdir()
+        secret.write_text("STARTUP_CONTEXT_SECRET=must-not-load", encoding="utf-8")
+        try:
+            (tmp_path / "AGENTS.md").symlink_to(secret)
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable: {exc}")
+
+        result = build_context_files_prompt(cwd=str(tmp_path), skip_soul=True)
+
+        assert "STARTUP_CONTEXT_SECRET" not in result
+        assert result == ""
+
     def test_denied_cursor_rules_descendant_blocks_directory_enumeration(self, tmp_path):
         from pathlib import Path
         from unittest.mock import patch
@@ -587,7 +602,10 @@ class TestBuildContextFilesPrompt:
         original_exists = Path.exists
         original_is_file = Path.is_file
         from agent import deny_policy
-        from agent.prompt_builder import _is_denied_project_context_root
+        from agent.prompt_builder import (
+            _is_denied_project_context_path,
+            _is_denied_project_context_root,
+        )
 
         def in_denied_subtree(path_obj):
             return path_obj == denied_ancestor or denied_ancestor in path_obj.parents
@@ -622,7 +640,7 @@ class TestBuildContextFilesPrompt:
             assert _find_git_root(
                 cwd,
                 is_lexically_root_denied=lexical_root_denied,
-            ) is None
+            ) is _DENIED_CONTEXT_DISCOVERY
             git_realpath_calls = [
                 str(call.args[0])
                 for call in mock_realpath.call_args_list
@@ -632,8 +650,13 @@ class TestBuildContextFilesPrompt:
             mock_realpath.reset_mock()
             assert _find_hermes_md(
                 cwd,
+                is_lexically_denied=lambda path: _is_denied_project_context_path(
+                    path,
+                    base_path=cwd,
+                    canonicalize=False,
+                ),
                 is_lexically_root_denied=lexical_root_denied,
-            ) is None
+            ) is _DENIED_CONTEXT_DISCOVERY
             hermes_realpath_calls = [
                 str(call.args[0])
                 for call in mock_realpath.call_args_list
@@ -934,7 +957,7 @@ class TestFindGitRoot:
                 nested,
                 is_denied=lambda _path: False,
                 is_root_denied=lambda path: path == root,
-            ) is None
+            ) is _DENIED_CONTEXT_DISCOVERY
 
 
 class TestStripYamlFrontmatter:

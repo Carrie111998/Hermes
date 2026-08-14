@@ -112,6 +112,56 @@ class TestIsCodingContext:
                 config=cfg,
             ) is False
 
+    def test_public_entry_preflights_denied_cwd_ancestor_before_realpath(self, tmp_path):
+        denied_ancestor = tmp_path / "private1"
+        cwd = denied_ancestor / "src"
+        cwd.mkdir(parents=True)
+        cfg = {"agent": {"coding_context": "auto"}}
+        from agent import deny_policy
+
+        with (
+            patch(
+                "agent.deny_policy.permissions_deny_paths",
+                return_value=[str(tmp_path / "private?")],
+            ),
+            patch(
+                "agent.deny_policy.os.path.realpath",
+                wraps=deny_policy.os.path.realpath,
+            ) as mock_realpath,
+        ):
+            assert cc.is_coding_context(
+                platform="cli",
+                cwd=cwd,
+                config=cfg,
+            ) is False
+
+        assert not any(
+            Path(call.args[0]) == denied_ancestor
+            or denied_ancestor in Path(call.args[0]).parents
+            for call in mock_realpath.call_args_list
+        )
+
+    def test_denied_marker_discovery_stops_before_git_fallback(self, tmp_path):
+        denied_ancestor = tmp_path / "private1"
+        cwd = denied_ancestor / "src"
+        cwd.mkdir(parents=True)
+
+        with patch(
+            "agent.deny_policy.permissions_deny_paths",
+            return_value=[str(tmp_path / "private?")],
+        ):
+            result = cc._marker_root(cwd, policy_base_path=cwd)
+
+        assert result is cc._DENIED_DISCOVERY
+        with (
+            patch("agent.coding_context._marker_root", return_value=result),
+            patch(
+                "agent.coding_context._git_root",
+                side_effect=AssertionError("git fallback ran after denied marker discovery"),
+            ),
+        ):
+            assert cc._detect_profile_name("auto", "cli", str(cwd)) == "general"
+
 
 
     def test_auto_bare_git_repo_without_code_stays_general(self, tmp_path):
@@ -488,7 +538,7 @@ class TestDetection:
             ),
             patch.object(Path, "exists", guarded_exists),
         ):
-            assert cc._marker_root(nested, policy_base_path=nested) is None
+            assert cc._marker_root(nested, policy_base_path=nested) is cc._DENIED_DISCOVERY
 
     @pytest.mark.parametrize("resolver", [cc._git_root, cc._marker_root])
     def test_workspace_discovery_preflights_fixed_width_denied_ancestor(
@@ -515,7 +565,7 @@ class TestDetection:
                 wraps=deny_policy.os.path.realpath,
             ) as mock_realpath,
         ):
-            assert resolver(cwd, policy_base_path=cwd) is None
+            assert resolver(cwd, policy_base_path=cwd) is cc._DENIED_DISCOVERY
 
         assert not any(
             in_denied_subtree(call.args[0])

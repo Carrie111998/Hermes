@@ -297,6 +297,33 @@ class TestPermissionsDenyFileTools:
         assert file_tools._terminal_env_type_for_task("task") == "modal"
         assert file_tools._uses_container_paths("task") is True
 
+    def test_ssh_relative_rule_anchors_in_remote_path_dialect(self, monkeypatch):
+        _install_permissions_config(monkeypatch, paths=["secret/**"])
+        monkeypatch.setattr(
+            file_tools,
+            "_terminal_env_type_for_task",
+            lambda task_id="default": "ssh",
+        )
+        monkeypatch.setattr(
+            file_tools,
+            "_authoritative_workspace_root",
+            lambda task_id="default": "/c/workspace",
+        )
+
+        direct_error = file_tools._check_permissions_deny_path(
+            "/c/workspace/secret/file.txt",
+            task_id="task",
+        )
+        search_error = file_tools._check_permissions_deny_search_root(
+            "/c/workspace",
+            task_id="task",
+        )
+
+        assert direct_error is not None
+        assert "secret/**" in direct_error
+        assert search_error is not None
+        assert "secret/**" in search_error
+
     def test_unrecognized_configured_environment_identity_is_unknown(
         self,
         monkeypatch,

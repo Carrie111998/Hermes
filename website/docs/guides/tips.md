@@ -101,7 +101,7 @@ Already have a `.cursorrules` or `.cursor/rules/*.mdc` file? Hermes reads those 
 
 ### Discovery
 
-Hermes loads the top-level `AGENTS.md` from the current working directory at session start. Subdirectory `AGENTS.md` files are discovered lazily during tool calls (via `subdirectory_hints.py`) and injected into tool results — they are not loaded upfront into the system prompt.
+At session start, Hermes discovers the git/project root and merges each `AGENTS.md` on the directory chain from that root through the current working directory. `AGENTS.md` files below the working directory are discovered lazily during tool calls (via `subdirectory_hints.py`) and injected into tool results — they are not loaded upfront into the system prompt.
 
 :::tip
 Keep context files focused and concise. Every character counts against your token budget since they're injected into every single message.

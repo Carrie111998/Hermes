@@ -79,18 +79,21 @@ def _scan_context_content(content: str, filename: str) -> str:
     return content
 
 
+class _DeniedContextDiscovery:
+    """Distinct result for a policy-blocked startup-context root walk."""
+
+
+_DENIED_CONTEXT_DISCOVERY = _DeniedContextDiscovery()
+
+
 def _find_git_root(
     start: Path,
     *,
     is_denied: Optional[Callable[[Path], bool]] = None,
     is_root_denied: Optional[Callable[[Path], bool]] = None,
     is_lexically_root_denied: Optional[Callable[[Path], bool]] = None,
-) -> Optional[Path]:
-    """Walk *start* and its parents looking for a ``.git`` directory.
-
-    Returns the directory containing ``.git``, or ``None`` if we hit the
-    filesystem root without finding one.
-    """
+) -> Optional[Path] | _DeniedContextDiscovery:
+    """Walk *start* and parents for ``.git``, preserving policy denial."""
     policy_aware = (
         is_denied is not None
         or is_root_denied is not None
@@ -101,13 +104,13 @@ def _find_git_root(
     if is_lexically_root_denied is not None and any(
         is_lexically_root_denied(parent) for parent in parents
     ):
-        return None
+        return _DENIED_CONTEXT_DISCOVERY
     for parent in parents:
         if is_root_denied is not None and is_root_denied(parent):
-            return None
+            return _DENIED_CONTEXT_DISCOVERY
         git_marker = parent / ".git"
         if is_denied is not None and is_denied(git_marker):
-            return None
+            return _DENIED_CONTEXT_DISCOVERY
         if git_marker.exists():
             return parent
     return None
@@ -121,8 +124,10 @@ def _find_hermes_md(
     *,
     is_denied: Optional[Callable[[Path], bool]] = None,
     is_root_denied: Optional[Callable[[Path], bool]] = None,
+    is_lexically_denied: Optional[Callable[[Path], bool]] = None,
     is_lexically_root_denied: Optional[Callable[[Path], bool]] = None,
-) -> Optional[Path]:
+    is_read_blocked: Optional[Callable[[Path], bool]] = None,
+) -> Optional[Path] | _DeniedContextDiscovery:
     """Discover the nearest ``.hermes.md`` or ``HERMES.md``.
 
     Search order: *cwd* first, then each parent directory up to (and
@@ -132,21 +137,38 @@ def _find_hermes_md(
     policy_aware = (
         is_denied is not None
         or is_root_denied is not None
+        or is_lexically_denied is not None
         or is_lexically_root_denied is not None
     )
     current = cwd.absolute() if policy_aware else cwd.resolve()
-    if is_lexically_root_denied is not None and any(
-        is_lexically_root_denied(parent)
-        for parent in [current, *current.parents]
+    if is_lexically_denied is not None and any(
+        is_lexically_denied(parent) for parent in [current, *current.parents]
     ):
-        return None
-
-    stop_at = _find_git_root(
-        cwd,
-        is_denied=is_denied,
-        is_root_denied=is_root_denied,
-        is_lexically_root_denied=is_lexically_root_denied,
+        return _DENIED_CONTEXT_DISCOVERY
+    lexical_root_denied = (
+        is_lexically_root_denied is not None
+        and any(
+            is_lexically_root_denied(parent)
+            for parent in [current, *current.parents]
+        )
     )
+
+    if lexical_root_denied:
+        # Broad ancestor discovery is denied, but cwd-local candidates remain
+        # independently checkable through their exact path and sensitive-read
+        # guards below.
+        stop_at = None
+    else:
+        stop_at = _find_git_root(
+            cwd,
+            is_denied=is_denied,
+            is_root_denied=is_root_denied,
+            is_lexically_root_denied=is_lexically_root_denied,
+        )
+        if stop_at is _DENIED_CONTEXT_DISCOVERY:
+            # A denied descendant prevents the ancestor walk, but cwd-local
+            # context candidates remain independently guarded.
+            stop_at = None
 
     # When there is no git root, only check cwd itself – walking parents
     # could pick up a .hermes.md planted in /tmp, /home, etc.
@@ -156,6 +178,8 @@ def _find_hermes_md(
         for name in _HERMES_MD_NAMES:
             candidate = directory / name
             if is_denied is not None and is_denied(candidate):
+                continue
+            if is_read_blocked is not None and is_read_blocked(candidate):
                 continue
             if candidate.is_file():
                 return candidate
@@ -2178,6 +2202,26 @@ def _is_denied_project_context_root(
         return True
 
 
+def _is_blocked_implicit_context_read(path: Path) -> bool:
+    """Apply the canonical sensitive-read guard after resolving aliases.
+
+    Implicit context files have prompt authority, so an allowed-looking symlink
+    must not bypass the same credential guard used by explicit file references.
+    Guard failures block the read rather than silently weakening the boundary.
+    """
+    try:
+        from agent.file_safety import get_read_block_error
+
+        return get_read_block_error(str(path)) is not None
+    except Exception:
+        logger.warning(
+            "sensitive implicit-context read check failed closed for %s",
+            path,
+            exc_info=True,
+        )
+        return True
+
+
 def _has_denied_project_context_ancestor(path: Path, *, base_path: Path) -> bool:
     """Lexically preflight the full discovery chain before filesystem probes."""
     current = path.absolute()
@@ -2246,6 +2290,8 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
             soul_path,
         )
         return None
+    if _is_blocked_implicit_context_read(soul_path):
+        return None
 
     try:
         from hermes_cli.config import ensure_hermes_home
@@ -2270,7 +2316,10 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
         return None
 
 
-def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
+def _load_hermes_md(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+) -> str | _DeniedContextDiscovery:
     """.hermes.md / HERMES.md — walk to git root."""
     hermes_md_path = _find_hermes_md(
         cwd_path,
@@ -2280,10 +2329,16 @@ def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str
         is_root_denied=lambda path: _is_denied_project_context_root(
             path, base_path=cwd_path
         ),
+        is_lexically_denied=lambda path: _is_denied_project_context_path(
+            path, base_path=cwd_path, canonicalize=False
+        ),
         is_lexically_root_denied=lambda path: _is_denied_project_context_root(
             path, base_path=cwd_path, canonicalize=False
         ),
+        is_read_blocked=_is_blocked_implicit_context_read,
     )
+    if hermes_md_path is _DENIED_CONTEXT_DISCOVERY:
+        return _DENIED_CONTEXT_DISCOVERY
     if not hermes_md_path:
         return ""
     if _is_denied_project_context_path(hermes_md_path, base_path=cwd_path):
@@ -2309,7 +2364,9 @@ def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str
         return ""
 
 
-def _agents_md_directory_chain(cwd_path: Path) -> List[Path]:
+def _agents_md_directory_chain(
+    cwd_path: Path,
+) -> List[Path] | _DeniedContextDiscovery:
     """Directories to check for AGENTS.md: git root first, cwd last.
 
     Ported from superagent-ai/grok-cli ``src/utils/instructions.ts``
@@ -2333,6 +2390,10 @@ def _agents_md_directory_chain(cwd_path: Path) -> List[Path]:
             path, base_path=current, canonicalize=False
         ),
     )
+    if root is _DENIED_CONTEXT_DISCOVERY:
+        # Do not walk ancestors across the denied boundary. The current
+        # directory remains safe to inspect under per-file guards.
+        return [current]
     if root is None or root == current:
         return [current]
     try:
@@ -2347,7 +2408,10 @@ def _agents_md_directory_chain(cwd_path: Path) -> List[Path]:
     return chain
 
 
-def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
+def _load_agents_md(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+) -> str | _DeniedContextDiscovery:
     """AGENTS.md — merged directory chain from git root down to cwd.
 
     Each directory on the chain (see ``_agents_md_directory_chain``)
@@ -2361,10 +2425,15 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     cwd_resolved = cwd_path.absolute()
     sections: List[str] = []
     seen_content: set = set()
-    for directory in _agents_md_directory_chain(cwd_resolved):
+    directory_chain = _agents_md_directory_chain(cwd_resolved)
+    if directory_chain is _DENIED_CONTEXT_DISCOVERY:
+        return _DENIED_CONTEXT_DISCOVERY
+    for directory in directory_chain:
         for name in ["AGENTS.md", "agents.md"]:
             candidate = directory / name
             if _is_denied_project_context_path(candidate, base_path=cwd_resolved):
+                continue
+            if _is_blocked_implicit_context_read(candidate):
                 continue
             if not candidate.exists():
                 continue
@@ -2410,6 +2479,8 @@ def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str
         candidate = cwd_path / name
         if _is_denied_project_context_path(candidate, base_path=cwd_path):
             continue
+        if _is_blocked_implicit_context_read(candidate):
+            continue
         if candidate.exists():
             try:
                 content = candidate.read_text(encoding="utf-8").strip()
@@ -2431,6 +2502,7 @@ def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> s
     cursorrules_file = cwd_path / ".cursorrules"
     if (
         not _is_denied_project_context_path(cursorrules_file, base_path=cwd_path)
+        and not _is_blocked_implicit_context_read(cursorrules_file)
         and cursorrules_file.exists()
     ):
         try:
@@ -2444,12 +2516,15 @@ def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> s
     cursor_rules_dir = cwd_path / ".cursor" / "rules"
     if (
         not _is_denied_project_context_root(cursor_rules_dir, base_path=cwd_path)
+        and not _is_blocked_implicit_context_read(cursor_rules_dir)
         and cursor_rules_dir.exists()
         and cursor_rules_dir.is_dir()
     ):
         mdc_files = sorted(cursor_rules_dir.glob("*.mdc"))
         for mdc_file in mdc_files:
             if _is_denied_project_context_path(mdc_file, base_path=cwd_path):
+                continue
+            if _is_blocked_implicit_context_read(mdc_file):
                 continue
             try:
                 content = mdc_file.read_text(encoding="utf-8").strip()
@@ -2536,13 +2611,27 @@ def build_context_files_prompt(
         )
         project_context = ""
     else:
-        # Priority-based project context: first match wins
-        project_context = (
-            _load_hermes_md(cwd_path, context_length)
-            or _load_agents_md(cwd_path, context_length)
-            or _load_claude_md(cwd_path, context_length)
-            or _load_cursorrules(cwd_path, context_length)
-        )
+        # Priority-based project context: first match wins. A denied root walk
+        # stops the chain entirely rather than masquerading as "not found" and
+        # falling through to a lower-priority implicit reader.
+        project_context = ""
+        for loader in (
+            _load_hermes_md,
+            _load_agents_md,
+            _load_claude_md,
+            _load_cursorrules,
+        ):
+            candidate_context = loader(cwd_path, context_length)
+            if candidate_context is _DENIED_CONTEXT_DISCOVERY:
+                logger.warning(
+                    "skipping project-context discovery after a denied root walk (%s)",
+                    cwd_path,
+                )
+                project_context = ""
+                break
+            if candidate_context:
+                project_context = candidate_context
+                break
     if project_context:
         sections.append(project_context)
 
