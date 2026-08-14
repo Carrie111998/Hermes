@@ -289,3 +289,169 @@ def test_alert_decision_uses_alerted_level_not_worst_outcome():
         "fallbacks_seen": ["openai-codex/gpt-5.6-sol"],
     }
     assert _should_alert(ep, "chain_exhausted", "") is True
+
+
+class _FakeBus:
+    def __init__(self):
+        self.emitted = []
+
+    def emit(self, *, event_type, source, payload, priority=None, **kw):
+        self.emitted.append((event_type, source, payload, priority))
+        return "evt-id"
+
+
+def test_record_emits_on_first_hit(state_file):
+    from events.rate_limit_signal import record
+    bus = _FakeBus()
+    assert record(provider="deepseek", model="deepseek-v4-pro",
+                  reason="rate_limit", detector="runtime",
+                  fallback_provider="openai-codex",
+                  fallback_model="gpt-5.6-sol",
+                  source_hint="matcher", bus=bus) is True
+    assert len(bus.emitted) == 1
+    et, source, payload, _ = bus.emitted[0]
+    assert et is EventType.MODEL_RATE_LIMITED
+    assert payload["provider"] == "deepseek"
+    assert payload["fallback_model"] == "gpt-5.6-sol"
+    assert payload["outcome"] == "diverted"
+    assert payload["diverted_calls"] == 1
+
+
+def test_record_coalesces_repeat_hits(state_file):
+    from events.rate_limit_signal import record
+    bus = _FakeBus()
+    kw = dict(provider="deepseek", model="deepseek-v4-pro",
+              reason="rate_limit", detector="runtime",
+              fallback_provider="openai-codex",
+              fallback_model="gpt-5.6-sol", bus=bus)
+    for _ in range(200):
+        record(**kw)
+    assert len(bus.emitted) == 1, "200 hits must produce exactly one alert"
+
+
+def test_record_realerts_on_chain_exhausted(state_file):
+    from events.rate_limit_signal import record
+    bus = _FakeBus()
+    record(provider="deepseek", model="deepseek-v4-pro", reason="rate_limit",
+           detector="runtime", fallback_provider="openai-codex",
+           fallback_model="gpt-5.6-sol", bus=bus)
+    record(provider="deepseek", model="deepseek-v4-pro", reason="rate_limit",
+           detector="runtime", outcome="chain_exhausted", bus=bus)
+    assert len(bus.emitted) == 2
+    assert bus.emitted[1][2]["outcome"] == "chain_exhausted"
+
+
+def test_record_counts_diverted_calls(state_file):
+    from events.rate_limit_signal import record
+    bus = _FakeBus()
+    kw = dict(provider="deepseek", model="deepseek-v4-pro",
+              reason="rate_limit", detector="runtime",
+              fallback_provider="openai-codex",
+              fallback_model="gpt-5.6-sol", bus=bus)
+    for _ in range(5):
+        record(**kw)
+    record(**{**kw, "outcome": "chain_exhausted",
+              "fallback_provider": "", "fallback_model": ""})
+    assert bus.emitted[-1][2]["diverted_calls"] == 6
+
+
+def test_clear_emits_recovered_and_closes_episode(state_file):
+    from events.rate_limit_signal import record, clear, _load_state
+    bus = _FakeBus()
+    record(provider="deepseek", model="deepseek-v4-pro", reason="rate_limit",
+           detector="runtime", fallback_provider="openai-codex",
+           fallback_model="gpt-5.6-sol", bus=bus)
+    assert clear(provider="deepseek", model="deepseek-v4-pro", bus=bus) is True
+    assert bus.emitted[-1][2]["outcome"] == "recovered"
+    assert _load_state() == {}
+
+
+def test_clear_on_healthy_provider_is_a_noop(state_file):
+    from events.rate_limit_signal import clear
+    bus = _FakeBus()
+    assert clear(provider="deepseek", model="deepseek-v4-pro", bus=bus) is False
+    assert bus.emitted == []
+
+
+def test_kill_switch_suppresses_all_emission(state_file, monkeypatch):
+    from events.rate_limit_signal import record
+    monkeypatch.setenv("HERMES_RATE_LIMIT_ALERTS", "0")
+    bus = _FakeBus()
+    assert record(provider="deepseek", model="deepseek-v4-pro",
+                  reason="rate_limit", detector="runtime", bus=bus) is False
+    assert bus.emitted == []
+
+
+def test_record_never_raises_when_bus_explodes(state_file):
+    from events.rate_limit_signal import record
+
+    class _ExplodingBus:
+        def emit(self, **kw):
+            raise RuntimeError("bus is down")
+
+    assert record(provider="deepseek", model="deepseek-v4-pro",
+                  reason="rate_limit", detector="runtime",
+                  bus=_ExplodingBus()) is False
+
+
+def test_record_never_raises_when_state_write_fails(state_file, monkeypatch):
+    from events import rate_limit_signal
+    monkeypatch.setattr(rate_limit_signal, "_save_state",
+                        lambda s: (_ for _ in ()).throw(OSError("nope")))
+    bus = _FakeBus()
+    assert rate_limit_signal.record(
+        provider="deepseek", model="deepseek-v4-pro",
+        reason="rate_limit", detector="runtime", bus=bus) in (True, False)
+
+
+def test_failed_persist_does_not_swallow_a_real_escalation(state_file, monkeypatch):
+    """Named risk (carried forward from Task 2 review): _load_state() caches
+    the SAME dict object across calls, and record() does
+    ``state = dict(_load_state())`` -- a SHALLOW copy. The nested episode
+    dict is therefore still the cached object, so mutating it (e.g.
+    ``episode["alerted_level"] = ...``) happens in place BEFORE
+    ``_save_state`` is ever called.
+
+    If ``_save_state`` then fails, the in-memory cache has already been
+    advanced to reflect the escalation that was never actually persisted
+    NOR emitted (the exception aborts record() before it reaches _emit).
+    A later, otherwise-identical escalation must still get through once
+    persistence recovers -- it must not be silently treated as
+    "already alerted" because of a mutation that never made it to disk.
+    """
+    from events import rate_limit_signal
+    from events.rate_limit_signal import record
+
+    bus = _FakeBus()
+
+    # Establish an open episode at "diverted", persisted successfully.
+    assert record(provider="deepseek", model="deepseek-v4-pro",
+                  reason="rate_limit", detector="runtime",
+                  outcome="diverted", bus=bus) is True
+    assert len(bus.emitted) == 1
+
+    # A genuine escalation arrives while persistence is broken.
+    real_save_state = rate_limit_signal._save_state
+    monkeypatch.setattr(
+        rate_limit_signal, "_save_state",
+        lambda s: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    record(provider="deepseek", model="deepseek-v4-pro", reason="rate_limit",
+           detector="runtime", outcome="chain_exhausted", bus=bus)
+
+    # Persistence recovers.
+    monkeypatch.setattr(rate_limit_signal, "_save_state", real_save_state)
+
+    # The same escalation hits again. If the in-memory cache was corrupted
+    # by the failed attempt above, this will be silently coalesced away too
+    # -- the escalation is then swallowed forever within this process.
+    record(provider="deepseek", model="deepseek-v4-pro", reason="rate_limit",
+           detector="runtime", outcome="chain_exhausted", bus=bus)
+
+    escalation_outcomes = [e[2]["outcome"] for e in bus.emitted[1:]]
+    assert "chain_exhausted" in escalation_outcomes, (
+        "the chain_exhausted escalation was never delivered to the bus, "
+        "even after persistence recovered on a subsequent identical call "
+        "-- the failed _save_state call corrupted the shared in-memory "
+        "episode cache before the failure was caught"
+    )
