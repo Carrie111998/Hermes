@@ -9,7 +9,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 // the shared primary activates the primary socket instead of dialing.
 
 const gatewayMocks = vi.hoisted(() => ({
-  connect: vi.fn(async (_wsUrl: string) => undefined)
+  connect: vi.fn(async (_wsUrl: string): Promise<void> => {
+    throw new Error('dialed a socket for a shared-primary profile')
+  })
 }))
 
 vi.mock('@/hermes', () => ({
@@ -59,6 +61,7 @@ describe('ensureGatewayForProfile under a shared global remote', () => {
 
     await ensureGatewayForProfile('venture')
 
+    expect(gatewayMocks.connect).not.toHaveBeenCalled()
     expect($gateway.get()).toBe(primary)
   })
 
@@ -77,6 +80,7 @@ describe('ensureGatewayForProfile under a shared global remote', () => {
         wsUrl: remoteWsUrl
       }))
     })
+    gatewayMocks.connect.mockResolvedValueOnce(undefined)
 
     await ensureGatewayForProfile('worker')
 
