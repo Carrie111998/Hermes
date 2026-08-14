@@ -23906,11 +23906,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Mirrors the CLI's idle ``process_loop`` drain. Stays silent when the
         queue has nothing for us; ignores non-async event types (those are
         handled by ``_run_process_watcher`` / the post-turn drain).
+
+        The in-memory queue is only the low-latency wake; the durable
+        async-delegation store is authoritative. Each tick first sweeps the
+        durable store for due pending completions whose wake was missed or
+        lost (``sweep_undelivered_completions``) so a persisted completion is
+        delivered within single-digit seconds even without its queue wake —
+        not on the next gateway restart (production evidence: two pending
+        rows sat undelivered for ~21h until a restart). The sweep re-enqueues
+        onto this same queue; the atomic per-row delivery claim keeps a
+        raced immediate wake + sweep copy down to one user turn.
         """
         await asyncio.sleep(3)  # let platforms finish connecting
+        from tools.async_delegation import sweep_undelivered_completions
         from tools.process_registry import process_registry as _pr
         while self._running:
             try:
+                try:
+                    sweep_undelivered_completions(_pr.completion_queue)
+                except Exception as e:
+                    logger.debug("Async delegation durable sweep error: %s", e)
                 # Peek the queue for async-delegation events. We must NOT
                 # consume watch/completion events here (other drains own them),
                 # so requeue anything that isn't ours.

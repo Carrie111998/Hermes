@@ -2660,6 +2660,68 @@ def _format_age(seconds: float) -> str:
     return f"{h}h" if m == 0 else f"{h}h{m}m"
 
 
+# A completion delivered more than this long after it was produced gets an
+# explicit staleness notice. Age lines are always computed against NOW (the
+# delivery moment), never against completed_at - dispatched_at: that
+# difference is the producer's runtime, and rendering it as "(Xs ago)" made a
+# 21-hour-old restart-recovered event claim "0s ago" (2026-08-13 incident).
+_DELIVERY_LAG_NOTICE_S = 120.0
+
+
+def _delivery_staleness_line(completed_at, now: float) -> "str | None":
+    """Honest delivery-age notice for a late-delivered completion, or None."""
+    if not isinstance(completed_at, (int, float)):
+        return None
+    lag = now - completed_at
+    if lag <= _DELIVERY_LAG_NOTICE_S:
+        return None
+    import time as _time
+    ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(completed_at))
+    return (
+        f"Completed: {ts} ({_format_age(lag)} ago — delivery was delayed; "
+        "treat time-sensitive details as stale)"
+    )
+
+
+def _format_background_notification(evt: dict) -> str:
+    """Format a publish_background_notification event (kind='notification').
+
+    Unlike a delegation completion there is no subagent, goal re-dispatch
+    block, or producer runtime — just the producer's update, its occurrence
+    time, and an honest delivery age.
+    """
+    import time as _time
+
+    now = _time.time()
+    notif_id = evt.get("delegation_id", "unknown")
+    title = evt.get("goal") or ""
+    context = evt.get("context")
+    status = evt.get("status") or "completed"
+    summary = evt.get("summary") or ""
+    occurred_at = evt.get("completed_at") or evt.get("dispatched_at")
+
+    lines = [
+        f"[BACKGROUND NOTIFICATION — {notif_id}]",
+        "A background task you set up earlier posted an update. Act on it, "
+        "or disregard it if events have already moved past it.",
+        "",
+    ]
+    if isinstance(occurred_at, (int, float)):
+        ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(occurred_at))
+        lines.append(f"Occurred: {ts} ({_format_age(now - occurred_at)} ago)")
+    stale = _delivery_staleness_line(occurred_at, now)
+    if stale:
+        lines.append(stale)
+    if title:
+        lines.append(f"Title: {title}")
+    if context:
+        lines.append(f"Context: {context}")
+    lines.append(f"Status: {status}")
+    lines.append("--- NOTIFICATION ---")
+    lines.append(summary)
+    return "\n".join(lines)
+
+
 def _format_async_delegation(evt: dict) -> str:
     """Format an async-delegation completion into a self-contained re-injection.
 
@@ -2669,9 +2731,18 @@ def _format_async_delegation(evt: dict) -> str:
     may be deep in unrelated context and won't remember why the subagent
     existed, so the block is written to stand entirely on its own — enough to
     use the result OR re-dispatch if the world has moved on.
+
+    Age semantics: "(X ago)" is always measured against NOW — the moment the
+    notification is actually delivered — while ``Duration`` is the producer's
+    runtime. A recovered event delivered 21h after completion must visibly be
+    21h old (see ``_delivery_staleness_line``), never "0s ago".
     """
     import time as _time
 
+    if evt.get("kind") == "notification":
+        return _format_background_notification(evt)
+
+    now = _time.time()
     deleg_id = evt.get("delegation_id", "unknown")
     goal = evt.get("goal", "") or ""
     context = evt.get("context")
@@ -2706,8 +2777,11 @@ def _format_async_delegation(evt: dict) -> str:
         ]
         if isinstance(dispatched_at, (int, float)):
             ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(dispatched_at))
-            age = f" ({_format_age(completed_at - dispatched_at)} ago)"
+            age = f" ({_format_age(now - dispatched_at)} ago)"
             lines.append(f"Dispatched: {ts}{age}")
+        stale = _delivery_staleness_line(evt.get("completed_at"), now)
+        if stale:
+            lines.append(stale)
         if context:
             lines.append(f"Context you provided: {context}")
         if toolsets:
@@ -2757,7 +2831,7 @@ def _format_async_delegation(evt: dict) -> str:
 
     age = ""
     if isinstance(dispatched_at, (int, float)):
-        age = f" ({_format_age(completed_at - dispatched_at)} ago)"
+        age = f" ({_format_age(now - dispatched_at)} ago)"
 
     lines = [
         f"[ASYNC DELEGATION COMPLETE — {deleg_id}]",
@@ -2769,6 +2843,9 @@ def _format_async_delegation(evt: dict) -> str:
     if isinstance(dispatched_at, (int, float)):
         ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(dispatched_at))
         lines.append(f"Dispatched: {ts}{age}")
+    stale = _delivery_staleness_line(evt.get("completed_at"), now)
+    if stale:
+        lines.append(stale)
     lines.append(f"Original goal: {goal}")
     if context:
         lines.append(f"Context you provided: {context}")

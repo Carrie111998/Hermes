@@ -32,6 +32,27 @@ This module owns ONLY the async lifecycle. The actual child build + run is
 delegated back to ``delegate_tool._run_single_child`` via an injected
 runner, so all the credential leasing, heartbeat, timeout, and result-shaping
 logic stays in one place.
+
+Governing delivery invariant
+----------------------------
+The durable SQLite rows are the AUTHORITATIVE delivery state; the in-memory
+``completion_queue`` is only a low-latency wake. Every persisted completion
+whose ``delivery_state`` is ``pending`` must converge — during live operation
+(``sweep_undelivered_completions``, driven by the gateway watcher), not just
+after a process restart (``restore_undelivered_completions``) — to exactly one
+of: ``delivered`` (one accepted user turn), ``dropped`` (attempt cap,
+staleness cap, or permanently-gone target), or ``superseded`` (an explicitly
+declared newer stream event was delivered first). A lost or dropped queue wake
+therefore delays delivery by at most a few seconds; it can never lose the
+completion. Duplicate queue copies of one completion are legal — the atomic
+per-row delivery claim guarantees at most one user turn per completion per
+consumer lifecycle, and a refused duplicate claim does not burn the retry
+budget.
+
+Producers other than ``delegate_task`` (plugins, service integrations) must
+use :func:`publish_background_notification` — the supported persist+wake API —
+instead of reaching into the private ``_persist_*`` helpers. It reuses this
+same durable table and delivery rail; there is no second ledger.
 """
 
 from __future__ import annotations
@@ -88,7 +109,76 @@ _MAX_DELIVERY_ATTEMPTS = 8
 # restore_undelivered_completions). 48h keeps overnight/weekend results
 # deliverable while stopping weeks-old sessions from replaying after upgrades.
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
+# A delivery claim older than this is considered abandoned and may be
+# re-claimed by another consumer (see claim_completion_delivery).
+_DELIVERY_CLAIM_TTL_S = 300.0
 _DB_LOCK = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Live durable-truth sweep (lost-wake recovery without a restart)
+# ---------------------------------------------------------------------------
+# The in-memory completion_queue wake can be lost (queue.put raced a consumer
+# crash, a producer in this process persisted the row but its wake never
+# happened, a swept copy was dropped mid-flight). Production evidence: two
+# durable rows sat delivery_state='pending' with delivery_attempts=0 for ~21h
+# until a gateway restart, because restore_undelivered_completions only runs
+# in the ProcessRegistry constructor. The live sweep makes the durable store
+# authoritative WHILE the process is running.
+#
+# Timing contract: these are operational notifications (a 1-minute ETA cannot
+# spend a quarter of its lifetime waiting on recovery). A lost wake must be
+# rediscovered within single-digit seconds: grace + the ~2s gateway watcher
+# tick bounds first recovery at ~5s, and a swept wake that is itself lost is
+# re-armed after _SWEEP_REWAKE_INTERVAL_S, bounding repeat recovery the same
+# way. Tests may patch these lower; production values must keep the
+# single-digit-seconds bound.
+_SWEEP_MIN_PENDING_AGE_S = 3.0  # grace before a pending row counts as "wake lost"
+_SWEEP_REWAKE_INTERVAL_S = 5.0  # min spacing between re-wakes of the SAME row
+# recover_abandoned_delegations() probes owner PIDs; throttle it inside the
+# high-frequency sweep so liveness probing stays cheap.
+_SWEEP_ABANDONED_RECOVERY_INTERVAL_S = 30.0
+_last_abandoned_recovery_at = 0.0
+
+# delegation_id -> last wake/claim activity timestamp (monotonic wall clock).
+# Precise queued-ID tracking: an entry means "a queue copy for this row was
+# enqueued, or a consumer claimed it, within the last re-arm window", so the
+# sweep does not flood the queue with copies of a row that is already in
+# flight. Entries are cleared on terminal transitions and expire after the
+# re-arm window — a swept wake that is itself lost is re-woken on the next
+# sweep past that window, never suppressed for a blind minute.
+_wake_tracker_lock = threading.Lock()
+_recent_wake_activity: Dict[str, float] = {}
+_WAKE_TRACKER_PRUNE_AGE_S = 600.0
+
+
+def _note_wake_activity(delegation_id: str, ts: Optional[float] = None) -> None:
+    if not delegation_id:
+        return
+    with _wake_tracker_lock:
+        _recent_wake_activity[delegation_id] = ts if ts is not None else time.time()
+
+
+def _clear_wake_activity(delegation_id: str) -> None:
+    if not delegation_id:
+        return
+    with _wake_tracker_lock:
+        _recent_wake_activity.pop(delegation_id, None)
+
+
+def _wake_recently_active(delegation_id: str, now: float) -> bool:
+    with _wake_tracker_lock:
+        last = _recent_wake_activity.get(delegation_id)
+    return last is not None and (now - last) < _SWEEP_REWAKE_INTERVAL_S
+
+
+def _prune_wake_tracker(now: float) -> None:
+    with _wake_tracker_lock:
+        stale = [
+            key for key, ts in _recent_wake_activity.items()
+            if now - ts > _WAKE_TRACKER_PRUNE_AGE_S
+        ]
+        for key in stale:
+            _recent_wake_activity.pop(key, None)
 
 # ---------------------------------------------------------------------------
 # Stale-delegation detection (progress-based, on by default)
@@ -178,6 +268,15 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         # completions recovered after a process restart are unroutable on
         # api_server (the in-memory record that carried it is gone).
         ("origin_session_id", "TEXT"),
+        # Optional producer stream contract (publish_background_notification):
+        # rows sharing a stream_id with a monotonic stream_seq are delivered
+        # low→high; supersedes_before declares that THIS event, once
+        # delivered, makes every pending event in the stream with
+        # stream_seq < supersedes_before obsolete ('superseded'). Ordering
+        # and supersession are distinct: sequence alone never drops events.
+        ("stream_id", "TEXT"),
+        ("stream_seq", "INTEGER"),
+        ("supersedes_before", "INTEGER"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
@@ -440,40 +539,288 @@ def restore_undelivered_completions(target_queue) -> int:
             if isinstance(evt, dict):
                 evt["restored"] = True
             target_queue.put(evt)
+            _note_wake_activity(delegation_id, now)
             restored += 1
     return restored
+
+
+def sweep_undelivered_completions(target_queue, *, now: Optional[float] = None) -> int:
+    """Re-wake due pending durable completions during LIVE operation.
+
+    Called periodically by the live consumer (the gateway async-delegation
+    watcher, every ~2s). Makes the durable store authoritative while the
+    process runs: a completion whose in-memory queue wake was missed or lost
+    is rediscovered here within single-digit seconds and re-enters the exact
+    same delivery rail (enqueue → claim → inject → ack/release) instead of
+    waiting for a process restart.
+
+    Due = ``delivery_state='pending'`` with a persisted event, no active
+    delivery claim (an in-flight consumer owns claimed rows), quiet for at
+    least ``_SWEEP_MIN_PENDING_AGE_S`` (grace so the normal immediate wake
+    wins the common case), and no wake/claim activity recorded within
+    ``_SWEEP_REWAKE_INTERVAL_S`` (precise queued-ID tracking — duplicates are
+    claim-safe, but the sweep still must not flood the queue while a copy is
+    already in flight). Rows are enqueued deterministically in occurrence
+    order (``completed_at, delegation_id``); opt-in stream ordering and
+    supersession are enforced downstream at the claim chokepoint.
+
+    Ownership: only rows owned by THIS process, by a dead process, or with no
+    recorded owner are swept. A pending row owned by a live sibling process
+    (e.g. a TUI sharing the same state.db) belongs to that process's own
+    drain — adopting it here would steal routing (#64484-class). Every swept
+    event is stamped ``restored=True`` for the same reason boot-restored
+    events are: it is a durable replay, and an unfiltered legacy drain must
+    not adopt another session's addressed event; consumers with positive
+    ownership proof (gateway routing, TUI/CLI ownership callbacks) still
+    consume it normally.
+
+    Shares the restore path's terminal hygiene: rows past the 48h staleness
+    cap are terminally dropped here too, and abandoned 'running' rows of dead
+    owners are classified (throttled) so live operation gets the same crash
+    recovery a restart would perform.
+    """
+    global _last_abandoned_recovery_at
+    now = time.time() if now is None else now
+    if now - _last_abandoned_recovery_at >= _SWEEP_ABANDONED_RECOVERY_INTERVAL_S:
+        _last_abandoned_recovery_at = now
+        try:
+            recover_abandoned_delegations()
+        except Exception:  # noqa: BLE001 — recovery is additive, never fatal
+            logger.debug("Sweep abandoned-delegation recovery failed", exc_info=True)
+    _prune_wake_tracker(now)
+    my_pid = __import__("os").getpid()
+    try:
+        from gateway.status import _pid_exists, get_process_start_time
+    except Exception:
+        _pid_exists = None
+        get_process_start_time = None
+    enqueued = 0
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, event_json, completed_at, dispatched_at,
+                      owner_pid, owner_started_at
+               FROM async_delegations
+               WHERE state != 'running' AND delivery_state='pending'
+                 AND event_json IS NOT NULL AND updated_at <= ?
+                 AND (delivery_claim IS NULL OR delivery_claimed_at < ?)
+               ORDER BY completed_at, delegation_id""",
+            (now - _SWEEP_MIN_PENDING_AGE_S, now - _DELIVERY_CLAIM_TTL_S),
+        ).fetchall()
+        for (delegation_id, payload, completed_at, dispatched_at,
+             owner_pid, owner_started_at) in rows:
+            if owner_pid and int(owner_pid) != my_pid:
+                if _pid_exists is None:
+                    continue  # cannot prove the owner is dead — leave it alone
+                owner_live = _pid_exists(int(owner_pid))
+                if owner_live and owner_started_at is not None:
+                    owner_live = (
+                        get_process_start_time(int(owner_pid)) == int(owner_started_at)
+                    )
+                if owner_live:
+                    continue  # a live sibling process owns this row
+            age_basis = completed_at or dispatched_at
+            if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
+                conn.execute(
+                    """UPDATE async_delegations SET delivery_state='dropped',
+                              delivery_claim=NULL, delivery_claimed_at=NULL,
+                              updated_at=?
+                       WHERE delegation_id=? AND delivery_state='pending'""",
+                    (now, delegation_id),
+                )
+                _clear_wake_activity(delegation_id)
+                logger.warning(
+                    "Async delegation %s: pending completion is %.1fh old "
+                    "(cap %.1fh); terminally dropping the live re-wake "
+                    "(result remains queryable).",
+                    delegation_id, (now - age_basis) / 3600.0,
+                    _MAX_COMPLETION_REPLAY_AGE_S / 3600.0,
+                )
+                continue
+            if _wake_recently_active(delegation_id, now):
+                continue  # a copy is already queued/claimed — no flood
+            evt = json.loads(payload)
+            if isinstance(evt, dict):
+                # Durable replay: same fail-closed ownership stamp as boot
+                # restore, so unfiltered legacy drains leave it for its owner.
+                evt["restored"] = True
+            target_queue.put(evt)
+            _note_wake_activity(delegation_id, now)
+            enqueued += 1
+            logger.info(
+                "Async delegation %s: durable pending completion had no live "
+                "queue wake; re-woken by the durable sweep (%.1fs after last "
+                "activity).",
+                delegation_id,
+                max(0.0, now - (age_basis or now)),
+            )
+    return enqueued
 
 
 def mark_completion_delivered(delegation_id: str) -> bool:
     """Atomically acknowledge successful injection of a durable completion."""
     now = time.time()
+    superseded: List[str] = []
     with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
                WHERE delegation_id=? AND delivery_state!='delivered'""",
             (now, now, delegation_id),
         )
-        return cur.rowcount == 1
+        delivered = cur.rowcount == 1
+        if delivered:
+            superseded = _apply_supersession_watermark_locked(conn, delegation_id, now)
+    if delivered:
+        _clear_wake_activity(delegation_id)
+        for sid in superseded:
+            _clear_wake_activity(sid)
+    return delivered
+
+
+def _stream_superseded_locked(
+    conn: sqlite3.Connection, delegation_id: str, stream_id: str, stream_seq: int
+) -> bool:
+    """Whether a DELIVERED stream event's watermark covers this sequence."""
+    return conn.execute(
+        """SELECT 1 FROM async_delegations
+           WHERE stream_id=? AND delegation_id!=? AND delivery_state='delivered'
+             AND supersedes_before IS NOT NULL AND supersedes_before > ?
+           LIMIT 1""",
+        (stream_id, delegation_id, stream_seq),
+    ).fetchone() is not None
+
+
+def _stream_order_blocked_locked(
+    conn: sqlite3.Connection,
+    delegation_id: str,
+    stream_id: str,
+    stream_seq: int,
+    supersedes_before: Optional[int],
+) -> bool:
+    """Whether an undelivered lower-sequence stream sibling blocks this row.
+
+    Opt-in strict stream order, enforced at the claim chokepoint (queue wakes
+    can race and present a higher sequence first — deterministic sweep
+    ordering alone cannot guarantee order). A sequenced row may not deliver
+    while any nonterminal (still-pending, including claimed/running) row with
+    a lower sequence remains in the stream — UNLESS this event's own
+    ``supersedes_before`` watermark covers that lower row, in which case the
+    lower row is scheduled for supersession rather than delivery and must not
+    gate the superseding event.
+    """
+    return conn.execute(
+        """SELECT 1 FROM async_delegations
+           WHERE stream_id=? AND delegation_id!=? AND stream_seq IS NOT NULL
+             AND stream_seq < ? AND delivery_state='pending'
+             AND (? IS NULL OR stream_seq >= ?)
+           LIMIT 1""",
+        (stream_id, delegation_id, stream_seq, supersedes_before, supersedes_before),
+    ).fetchone() is not None
+
+
+def _apply_supersession_watermark_locked(
+    conn: sqlite3.Connection,
+    delegation_id: str,
+    now: float,
+) -> List[str]:
+    """After delivering ``delegation_id``, retire the stream rows it supersedes.
+
+    Returns the superseded delegation ids (for wake-tracker cleanup). Only
+    rows the producer explicitly declared obsolete (stream_seq strictly below
+    the delivered event's ``supersedes_before`` watermark) are touched;
+    plain sequenced rows without a watermark never retire siblings.
+    """
+    meta = conn.execute(
+        """SELECT stream_id, supersedes_before FROM async_delegations
+           WHERE delegation_id=?""",
+        (delegation_id,),
+    ).fetchone()
+    if not meta or not meta[0] or meta[1] is None:
+        return []
+    stream_id, watermark = meta
+    superseded = [
+        r[0] for r in conn.execute(
+            """SELECT delegation_id FROM async_delegations
+               WHERE stream_id=? AND delegation_id!=? AND stream_seq IS NOT NULL
+                 AND stream_seq < ? AND delivery_state='pending'""",
+            (stream_id, delegation_id, watermark),
+        ).fetchall()
+    ]
+    if superseded:
+        conn.execute(
+            f"""UPDATE async_delegations SET delivery_state='superseded',
+                       delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+                WHERE delegation_id IN ({','.join('?' * len(superseded))})""",
+            (now, *superseded),
+        )
+        logger.info(
+            "Stream %s: %d pending event(s) superseded by delivered watermark "
+            "of %s: %s",
+            stream_id, len(superseded), delegation_id, ", ".join(superseded),
+        )
+    return superseded
 
 
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    """Claim one pending completion across competing consumers/processes."""
+    """Claim one pending completion across competing consumers/processes.
+
+    This is the single delivery chokepoint — immediate wakes, the live
+    durable sweep, and restart restore all pass through it, so duplicate
+    queue copies of one completion collapse to at most one granted claim.
+    A refused claim never increments the delivery-attempt budget.
+
+    Sequenced rows (optional producer stream contract) are additionally
+    gated here: a row superseded by an already-delivered watermark is
+    terminally retired instead of claimed, and an in-order row is refused
+    while an undelivered lower sequence in its stream remains (see
+    ``_stream_order_blocked_locked``).
+    """
     now = time.time()
+    granted = False
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
-            "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
+            """SELECT delivery_state, stream_id, stream_seq, supersedes_before
+               FROM async_delegations WHERE delegation_id=?""",
             (delegation_id,),
         ).fetchone()
         if row is None:
             return True  # legacy event created before durable dispatch
+        delivery_state, stream_id, stream_seq, supersedes_before = row
+        if delivery_state == "pending" and stream_id and stream_seq is not None:
+            if _stream_superseded_locked(conn, delegation_id, stream_id, stream_seq):
+                conn.execute(
+                    """UPDATE async_delegations SET delivery_state='superseded',
+                              delivery_claim=NULL, delivery_claimed_at=NULL,
+                              updated_at=?
+                       WHERE delegation_id=? AND delivery_state='pending'""",
+                    (now, delegation_id),
+                )
+                logger.info(
+                    "Stream %s: refusing delivery of %s (seq %s) — a delivered "
+                    "event's supersession watermark already covers it.",
+                    stream_id, delegation_id, stream_seq,
+                )
+                _clear_wake_activity(delegation_id)
+                return False
+            if _stream_order_blocked_locked(
+                conn, delegation_id, stream_id, stream_seq, supersedes_before
+            ):
+                # Refused, not failed: no attempt burned, row stays pending.
+                # The sweep re-wakes it once the lower sibling resolves.
+                _note_wake_activity(delegation_id, now)
+                return False
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_claim=?, delivery_claimed_at=?,
                       delivery_attempts=delivery_attempts+1, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
-            (claim_id, now, now, delegation_id, now - 300),
+            (claim_id, now, now, delegation_id, now - _DELIVERY_CLAIM_TTL_S),
         )
-        return cur.rowcount == 1
+        granted = cur.rowcount == 1
+    # A claim attempt (granted or raced) proves a queue copy is in flight in
+    # some consumer right now — the sweep need not add another for a re-arm
+    # window.
+    _note_wake_activity(delegation_id, now)
+    return granted
 
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
@@ -512,6 +859,7 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                 "marking terminally dropped (result remains queryable).",
                 delegation_id, _MAX_DELIVERY_ATTEMPTS,
             )
+            _clear_wake_activity(delegation_id)
             return True
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_claim=NULL,
@@ -542,12 +890,23 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                  AND delivery_claim=?""",
             (now, delegation_id, claim_id),
         )
-        return cur.rowcount == 1
+        dropped = cur.rowcount == 1
+    if dropped:
+        _clear_wake_activity(delegation_id)
+    return dropped
 
 
 def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    """Acknowledge acceptance for the consumer holding this claim."""
+    """Acknowledge acceptance for the consumer holding this claim.
+
+    If the delivered event declared a supersession watermark
+    (``supersedes_before``), every pending event in its stream below that
+    watermark is atomically retired as ``superseded`` in the same
+    transaction — a delivered terminal/superseding event guarantees the
+    older events it obsoletes can never surface afterwards.
+    """
     now = time.time()
+    superseded: List[str] = []
     with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered',
@@ -557,7 +916,14 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                  AND delivery_claim=?""",
             (now, now, delegation_id, claim_id),
         )
-        return cur.rowcount == 1
+        delivered = cur.rowcount == 1
+        if delivered:
+            superseded = _apply_supersession_watermark_locked(conn, delegation_id, now)
+    if delivered:
+        _clear_wake_activity(delegation_id)
+        for sid in superseded:
+            _clear_wake_activity(sid)
+    return delivered
 
 
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
@@ -587,6 +953,177 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         "delivery_state": row[5], "delivery_attempts": row[6],
         "origin_session_id": row[7] or "",
     }
+
+
+def publish_background_notification(
+    *,
+    summary: str,
+    session_key: str = "",
+    title: str = "",
+    notification_id: Optional[str] = None,
+    status: str = "completed",
+    parent_session_id: Optional[str] = None,
+    origin_ui_session_id: str = "",
+    origin_session_id: str = "",
+    context: Optional[str] = None,
+    occurred_at: Optional[float] = None,
+    stream_id: str = "",
+    sequence: Optional[int] = None,
+    supersedes_before_sequence: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Persist + wake one background notification (supported producer API).
+
+    This is the public rail for plugins and service integrations that need a
+    durable, restart-surviving notification to re-enter a conversation as a
+    fresh agent turn — instead of importing the private ``_persist_dispatch``
+    / ``_persist_completion`` helpers or inventing a second ledger. The
+    notification reuses the async-delegation durable table and the exact
+    delivery pipeline (queue wake → live durable sweep → atomic claim →
+    inject → ack/release), so it inherits crash recovery, routing ownership,
+    retry caps, the 48h staleness cap, and message-role-alternation-safe
+    injection for free.
+
+    Parameters
+    ----------
+    summary
+        The notification body the agent receives. Required, non-empty.
+    session_key / parent_session_id / origin_ui_session_id / origin_session_id
+        Routing, identical semantics to delegation completions: the gateway
+        parses ``session_key``; ``parent_session_id`` pins the spawning
+        durable session (enables the compression-continuation resolver and
+        the user-boundary terminal drop); ``origin_session_id`` is the raw
+        api_server wake target; ``origin_ui_session_id`` binds TUI/desktop
+        ownership.
+    title / context / status
+        Rendered in the re-injection block. ``status`` is free-form producer
+        state (e.g. ``"completed"``, ``"driver_assigned"``).
+    notification_id
+        Stable producer identity (e.g. ``"chauffeur/<ride>/13"``). Publishing
+        is idempotent per id: re-publishing a still-pending id only refreshes
+        its wake; re-publishing an id that already reached a terminal
+        delivery state is a no-op returning ``{"status": "duplicate"}``.
+        Auto-generated when omitted.
+    occurred_at
+        Event occurrence time (defaults to now). Drives deterministic
+        recovery ordering, the staleness cap, and honest delivery-age
+        rendering.
+    stream_id / sequence / supersedes_before_sequence
+        OPTIONAL producer stream contract. Ordering and supersession are
+        distinct and both opt-in:
+
+        - ``stream_id`` + monotonic ``sequence`` declare an ORDERED stream:
+          events deliver strictly low→high (enforced at the claim
+          chokepoint, so racing immediate wakes cannot deliver a higher
+          sequence past an undelivered lower one). Nothing is ever dropped
+          by sequencing alone.
+        - ``supersedes_before_sequence`` additionally declares that THIS
+          event makes every pending stream event with
+          ``sequence < supersedes_before_sequence`` obsolete. Once this
+          event is delivered, those older events are retired as
+          ``superseded`` and can never surface afterwards. A terminal event
+          may pass its own sequence (supersede everything before it); a
+          latest-wins stream may do so on every event.
+
+    Returns ``{"status": "published"|"republished"|"duplicate",
+    "notification_id": ...}``.
+    """
+    if not isinstance(summary, str) or not summary.strip():
+        raise ValueError("summary must be a non-empty string")
+    if (stream_id and sequence is None) or (sequence is not None and not stream_id):
+        raise ValueError("stream_id and sequence must be provided together")
+    if supersedes_before_sequence is not None and sequence is None:
+        raise ValueError(
+            "supersedes_before_sequence requires stream_id and sequence"
+        )
+    if sequence is not None:
+        sequence = int(sequence)
+    if supersedes_before_sequence is not None:
+        supersedes_before_sequence = int(supersedes_before_sequence)
+    notification_id = notification_id or f"notif_{uuid.uuid4().hex[:12]}"
+    now = time.time()
+    occurred_at = float(occurred_at) if occurred_at is not None else now
+
+    evt: Dict[str, Any] = {
+        "type": "async_delegation",
+        "kind": "notification",
+        "delegation_id": notification_id,
+        "session_key": session_key or "",
+        "origin_ui_session_id": origin_ui_session_id or "",
+        "origin_session_id": origin_session_id or "",
+        "parent_session_id": parent_session_id,
+        "goal": title or "",
+        "context": context,
+        "status": status,
+        "summary": summary,
+        "error": None,
+        "dispatched_at": occurred_at,
+        "completed_at": occurred_at,
+        **_capture_routing_origin(),
+    }
+    if stream_id:
+        evt["stream_id"] = stream_id
+        evt["sequence"] = sequence
+        if supersedes_before_sequence is not None:
+            evt["supersedes_before_sequence"] = supersedes_before_sequence
+    result = {"status": status, "summary": summary}
+
+    try:
+        from gateway.status import get_process_start_time
+        owner_started_at = get_process_start_time(__import__("os").getpid())
+    except Exception:
+        owner_started_at = None
+    task_payload = {
+        key: evt[key]
+        for key in ("goal", "context", "scope_id", "user_id", "user_name")
+        if evt.get(key)
+    }
+
+    outcome = "published"
+    with _DB_LOCK, _transaction() as conn:
+        existing = conn.execute(
+            "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
+            (notification_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing[0] != "pending":
+                # Terminal (delivered/dropped/superseded): idempotent no-op —
+                # a producer retry must never resurrect a finished delivery.
+                return {"status": "duplicate", "notification_id": notification_id}
+            outcome = "republished"
+        else:
+            conn.execute(
+                """INSERT INTO async_delegations
+                   (delegation_id, origin_session, origin_ui_session_id,
+                    parent_session_id, state, dispatched_at, completed_at,
+                    updated_at, event_json, result_json, delivery_state,
+                    delivery_attempts, owner_pid, owner_started_at, task_json,
+                    origin_session_id, stream_id, stream_seq, supersedes_before)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?)""",
+                (notification_id, session_key or "", origin_ui_session_id or "",
+                 parent_session_id, status, occurred_at, occurred_at, now,
+                 json.dumps(evt), json.dumps(result),
+                 __import__("os").getpid(), owner_started_at,
+                 json.dumps(task_payload), origin_session_id or "",
+                 stream_id or None, sequence, supersedes_before_sequence),
+            )
+    _prune_durable_records()
+
+    try:
+        from tools.process_registry import process_registry
+        process_registry.completion_queue.put(dict(evt))
+        _note_wake_activity(notification_id, now)
+    except Exception as exc:  # noqa: BLE001 — durable row survives a lost wake
+        logger.warning(
+            "Background notification %s persisted but its immediate wake "
+            "failed (%s); the durable sweep will deliver it.",
+            notification_id, exc,
+        )
+    logger.info(
+        "Published background notification %s (session_key=%s, stream=%s seq=%s)",
+        notification_id, session_key or "<cli>", stream_id or "-",
+        sequence if sequence is not None else "-",
+    )
+    return {"status": outcome, "notification_id": notification_id}
 
 
 def _get_executor(max_workers: int) -> ThreadPoolExecutor:
@@ -1004,10 +1541,11 @@ def _push_completion_event(
     _persist_completion(evt, result)
     try:
         process_registry.completion_queue.put(evt)
+        _note_wake_activity(str(record.get("delegation_id") or ""))
     except Exception as exc:  # pragma: no cover
         logger.error(
             "Async delegation %s: failed to enqueue completion event; "
-            "result lost: %s",
+            "the durable sweep will re-wake it: %s",
             record.get("delegation_id"), exc,
         )
 
@@ -1218,10 +1756,11 @@ def _push_batch_completion_event(
     _persist_completion(evt, combined)
     try:
         process_registry.completion_queue.put(evt)
+        _note_wake_activity(str(event_record.get("delegation_id") or ""))
     except Exception as exc:  # pragma: no cover
         logger.error(
             "Async delegation batch %s: failed to enqueue completion event; "
-            "result lost: %s",
+            "the durable sweep will re-wake it: %s",
             event_record.get("delegation_id"), exc,
         )
 
@@ -1588,6 +2127,7 @@ def interrupt_for_session(
 def _reset_for_tests() -> None:
     """Test-only: clear all state and tear down the executor + monitor."""
     global _executor, _executor_max_workers, _monitor_thread
+    global _last_abandoned_recovery_at
     with _executor_lock:
         if _executor is not None:
             _executor.shutdown(wait=False)
@@ -1601,3 +2141,6 @@ def _reset_for_tests() -> None:
         thread.join(timeout=2)
     with _records_lock:
         _records.clear()
+    with _wake_tracker_lock:
+        _recent_wake_activity.clear()
+    _last_abandoned_recovery_at = 0.0
