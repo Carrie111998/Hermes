@@ -254,6 +254,138 @@ class TestCmdStatus:
         assert "API key:" not in out
 
 
+class TestEnsureAiPeerObservation:
+    """The v3 peer hardening must use the real client-config shape."""
+
+    @staticmethod
+    def _capture_urlopen(monkeypatch, honcho_cli):
+        calls = []
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def _urlopen(request, timeout):
+            calls.append((request, timeout))
+            return _Response()
+
+        monkeypatch.setattr(honcho_cli.urllib.request, "urlopen", _urlopen)
+        return calls
+
+    def test_real_config_uses_workspace_id_and_cloud_bearer(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        calls = self._capture_urlopen(monkeypatch, honcho_cli)
+        config = HonchoClientConfig(
+            workspace_id="team/space",
+            api_key="cloud-secret",
+            base_url="https://api.honcho.dev",
+            ai_peer="hermes/qa",
+            enabled=True,
+        )
+
+        honcho_cli._ensure_ai_peer_observe_me_disabled(config)
+
+        assert len(calls) == 1
+        request, timeout = calls[0]
+        assert request.full_url == (
+            "https://api.honcho.dev/v3/workspaces/team%2Fspace/peers/hermes%2Fqa"
+        )
+        assert json.loads(request.data) == {
+            "configuration": {"observe_me": False}
+        }
+        assert request.get_header("Authorization") == "Bearer cloud-secret"
+        assert timeout == 10
+
+    def test_local_placeholder_does_not_send_authorization(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        calls = self._capture_urlopen(monkeypatch, honcho_cli)
+        config = HonchoClientConfig(
+            workspace_id="fleet",
+            api_key="local",
+            base_url="http://127.0.0.1:8000",
+            ai_peer="hermes-qa",
+            enabled=True,
+        )
+
+        honcho_cli._ensure_ai_peer_observe_me_disabled(config)
+
+        request, _ = calls[0]
+        assert request.get_header("Authorization") is None
+
+    def test_local_server_ignores_unscoped_cloud_key(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        calls = self._capture_urlopen(monkeypatch, honcho_cli)
+        config = HonchoClientConfig(
+            workspace_id="fleet",
+            api_key="cloud-secret",
+            base_url="http://127.0.0.1:8000",
+            ai_peer="hermes-qa",
+            enabled=True,
+            raw={"apiKey": "cloud-secret"},
+        )
+
+        honcho_cli._ensure_ai_peer_observe_me_disabled(config)
+
+        request, _ = calls[0]
+        assert request.get_header("Authorization") is None
+
+    def test_local_server_sends_explicit_host_jwt(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        calls = self._capture_urlopen(monkeypatch, honcho_cli)
+        config = HonchoClientConfig(
+            workspace_id="fleet",
+            api_key="local-jwt",
+            base_url="http://127.0.0.1:8000",
+            ai_peer="hermes-qa",
+            enabled=True,
+            raw={"hosts": {"hermes": {"apiKey": "local-jwt"}}},
+        )
+
+        honcho_cli._ensure_ai_peer_observe_me_disabled(config)
+
+        request, _ = calls[0]
+        assert request.get_header("Authorization") == "Bearer local-jwt"
+
+    def test_peer_provisioning_remains_nonfatal_on_hardening_failure(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        config = HonchoClientConfig(
+            workspace_id="fleet",
+            api_key="local",
+            base_url="http://127.0.0.1:8000",
+            ai_peer="hermes-qa",
+            enabled=True,
+        )
+        client = SimpleNamespace(peer=lambda _peer: object())
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: config,
+        )
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.get_honcho_client",
+            lambda _config: client,
+        )
+        monkeypatch.setattr(
+            honcho_cli,
+            "_ensure_ai_peer_observe_me_disabled",
+            lambda _config: (_ for _ in ()).throw(OSError("offline")),
+        )
+
+        assert honcho_cli._ensure_peer_exists("hermes_qa") is False
+
+
 class TestCloneHonchoForProfile:
     """Identity-key carryover during profile cloning.
 
@@ -779,4 +911,3 @@ class TestCmdSetupDeviceFlow:
         )
         assert len(calls) == 1
         assert "apiKey" not in cfg.get("hosts", {}).get("hermes", {})
-

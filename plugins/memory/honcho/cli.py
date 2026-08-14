@@ -13,7 +13,14 @@ import urllib.request
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
-from plugins.memory.honcho.client import _host_block, profile_host_key, resolve_active_host, resolve_config_path, HOST
+from plugins.memory.honcho.client import (
+    HOST,
+    _host_block,
+    _is_local_base_url,
+    profile_host_key,
+    resolve_active_host,
+    resolve_config_path,
+)
 from hermes_cli.config import cfg_get
 
 
@@ -31,18 +38,26 @@ def _canonical_ai_peer(profile_name: str) -> str:
 
 def _ensure_ai_peer_observe_me_disabled(hcfg) -> None:
     """Best-effort default for stable AI/system peers: disable self-observation."""
-    if not getattr(hcfg, "base_url", None) or not getattr(hcfg, "workspace", None) or not getattr(hcfg, "ai_peer", None):
+    base_url = getattr(hcfg, "base_url", None)
+    workspace_id = getattr(hcfg, "workspace_id", None)
+    ai_peer = getattr(hcfg, "ai_peer", None)
+    if not base_url or not workspace_id or not ai_peer:
         return
 
     url = (
-        f"{hcfg.base_url.rstrip('/')}/v3/workspaces/"
-        f"{urllib.parse.quote(hcfg.workspace, safe='')}/peers/"
-        f"{urllib.parse.quote(hcfg.ai_peer, safe='')}"
+        f"{base_url.rstrip('/')}/v3/workspaces/"
+        f"{urllib.parse.quote(workspace_id, safe='')}/peers/"
+        f"{urllib.parse.quote(ai_peer, safe='')}"
     )
     payload = json.dumps({"configuration": {"observe_me": False}}).encode("utf-8")
     req = urllib.request.Request(url, data=payload, method="PUT")
     req.add_header("Content-Type", "application/json")
     api_key = getattr(hcfg, "api_key", None)
+    if _is_local_base_url(base_url):
+        raw = getattr(hcfg, "raw", None) or {}
+        host_block = (raw.get("hosts") or {}).get(getattr(hcfg, "host", HOST), {})
+        if not host_block.get("apiKey"):
+            api_key = None
     if api_key and api_key != "local":
         req.add_header("Authorization", f"Bearer {api_key}")
 
