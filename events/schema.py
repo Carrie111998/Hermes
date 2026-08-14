@@ -158,6 +158,17 @@ class EventType(Enum):
     DIGEST_GENERATED = ("digest_generated", Priority.LOW, "📝")
     GATEWAY_HEALTH = ("gateway_health", Priority.HIGH, "🛰️")
     AGENT_ERROR = ("agent_error", Priority.HIGH, "⚠️")
+    # Model rate limiting — added 2026-08-14. Emitted by
+    # events/rate_limit_signal.py when any Hermes activity hits a provider
+    # rate limit, credit exhaustion, or usage cap. Coalesced into "episodes"
+    # keyed (provider, model) so a sustained outage produces one alert, not
+    # hundreds. Attention is payload-driven via the `outcome` field (see the
+    # conditional hook in routing_policy.classify): diverted -> WARN on
+    # alerts, chain_exhausted/no_fallback -> ACT + page, recovered -> INFO.
+    # Icon: stop sign = this model is not taking traffic. Verified disjoint
+    # from all 80 pre-existing icons; 🚦 was the first pick and collides with
+    # DEVFLOW_MERGE_PENDING.
+    MODEL_RATE_LIMITED = ("model_rate_limited", Priority.HIGH, "🛑")
     MEMORY_CONSOLIDATED = ("memory_consolidated", Priority.LOW, "🧠")
     SKILL_EVOLVED = ("skill_evolved", Priority.LOW, "🚀")
     MAILBOX_MESSAGE = ("mailbox_message", Priority.LOW, "📨")
