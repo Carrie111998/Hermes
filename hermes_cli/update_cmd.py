@@ -4294,26 +4294,51 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 text=True, encoding="utf-8", errors="replace",
             )
             if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                    cwd=_m().PROJECT_ROOT,
-                    capture_output=True,
-                    text=True, encoding="utf-8", errors="replace",
-                )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
+                # Fleet overlay (kanban/cron survival patches): never reset
+                # --hard to origin. That drops unique commits. Merge instead.
+                _overlay = get_hermes_home() / "FLEET-OVERLAY"
+                if _overlay.is_file():
                     print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        "  ⚠ Fast-forward not possible (fleet overlay). "
+                        "Merging origin instead of reset --hard..."
                     )
-                    sys.exit(1)
+                    merge_result = subprocess.run(
+                        git_cmd + ["merge", "--no-edit", "--no-ff", f"origin/{branch}"],
+                        cwd=_m().PROJECT_ROOT,
+                        capture_output=True,
+                        text=True, encoding="utf-8", errors="replace",
+                    )
+                    if merge_result.returncode != 0:
+                        print("✗ Merge of origin onto the fleet overlay failed.")
+                        if merge_result.stderr.strip():
+                            print(f"  {merge_result.stderr.strip()}")
+                        print(
+                            "  Resolve conflicts, or run: "
+                            "/home/frank/.hermes/scripts/hermes-fleet-update.sh"
+                        )
+                        sys.exit(1)
+                    pull_result = merge_result
+                else:
+                    # ff-only failed — local and remote have diverged (e.g. upstream
+                    # force-pushed or rebase).  Since local changes are already
+                    # stashed, reset to match the remote exactly.
+                    print(
+                        "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                    )
+                    reset_result = subprocess.run(
+                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                        cwd=_m().PROJECT_ROOT,
+                        capture_output=True,
+                        text=True, encoding="utf-8", errors="replace",
+                    )
+                    if reset_result.returncode != 0:
+                        print(f"✗ Failed to reset to origin/{branch}.")
+                        if reset_result.stderr.strip():
+                            print(f"  {reset_result.stderr.strip()}")
+                        print(
+                            f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        )
+                        sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
