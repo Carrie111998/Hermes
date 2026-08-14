@@ -56,6 +56,21 @@ VALID_ASPECT_RATIOS: Tuple[str, ...] = ("landscape", "square", "portrait")
 DEFAULT_ASPECT_RATIO = "landscape"
 
 
+def resolve_output_size_enforcement(config: Any, provider_name: str) -> bool:
+    """Resolve the opt-in output-size normalization flag for a provider."""
+    if not isinstance(config, dict):
+        return False
+    provider_config = config.get(provider_name)
+    value = None
+    if isinstance(provider_config, dict):
+        value = provider_config.get("enforce_output_size")
+    if value is None:
+        value = config.get("enforce_output_size", False)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 # ---------------------------------------------------------------------------
 # ABC
 # ---------------------------------------------------------------------------
@@ -260,6 +275,69 @@ def save_b64_image(
     path = _images_cache_dir() / f"{prefix}_{ts}_{short}.{extension}"
     path.write_bytes(raw)
     return path
+
+
+def normalize_image_file_size(path: Path, expected_size: str) -> Dict[str, Any]:
+    """Normalize a cached raster image to an exact ``WIDTHxHEIGHT`` target.
+
+    The provider response may differ slightly from the requested dimensions
+    (notably through hosted-tool image generation paths).  This helper uses a
+    centered cover fit so the final file honors the requested canvas without
+    letterboxing or stretching.  Exact-size inputs are left byte-for-byte
+    untouched.
+    """
+    try:
+        parts = expected_size.lower().split("x")
+        if len(parts) != 2:
+            raise ValueError
+        width, height = (int(part) for part in parts)
+        if width <= 0 or height <= 0:
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Expected image size in positive WIDTHxHEIGHT form, got {expected_size!r}."
+        ) from exc
+
+    from PIL import Image, ImageOps
+
+    with Image.open(path) as source:
+        source_width, source_height = source.size
+        source_size = f"{source_width}x{source_height}"
+        if source.size == (width, height):
+            return {
+                "source_size": source_size,
+                "size": expected_size,
+                "output_size_normalized": False,
+            }
+
+        image_format = source.format or "PNG"
+        fitted = ImageOps.fit(
+            source,
+            (width, height),
+            method=Image.Resampling.LANCZOS,
+            centering=(0.5, 0.5),
+        )
+        save_kwargs: Dict[str, Any] = {}
+        icc_profile = source.info.get("icc_profile")
+        if icc_profile:
+            save_kwargs["icc_profile"] = icc_profile
+
+        temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            fitted.save(temp_path, format=image_format, **save_kwargs)
+            temp_path.replace(path)
+        finally:
+            fitted.close()
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    return {
+        "source_size": source_size,
+        "size": expected_size,
+        "output_size_normalized": True,
+    }
 
 
 # Extension inference for save_url_image — keep small and explicit.  We don't

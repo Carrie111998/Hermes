@@ -31,8 +31,10 @@ from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
     ImageGenProvider,
     error_response,
+    normalize_image_file_size,
     normalize_reference_images,
     resolve_aspect_ratio,
+    resolve_output_size_enforcement,
     save_b64_image,
     success_response,
 )
@@ -550,6 +552,10 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
 
         tier_id, meta = _resolve_model()
         size = _SIZES.get(aspect, _SIZES["square"])
+        enforce_output_size = resolve_output_size_enforcement(
+            _load_image_gen_config(),
+            "openai-codex",
+        )
 
         token = _read_codex_access_token()
         if not token:
@@ -608,6 +614,9 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
 
         try:
             saved_path = save_b64_image(b64, prefix=f"openai_codex_{tier_id}")
+            normalization_meta: Dict[str, Any] = {}
+            if enforce_output_size:
+                normalization_meta = normalize_image_file_size(saved_path, size)
         except Exception as exc:
             return error_response(
                 error=f"Could not save image to cache: {exc}",
@@ -625,7 +634,12 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             aspect_ratio=aspect,
             provider="openai-codex",
             modality="image" if input_images else "text",
-            extra={"size": size, "quality": meta["quality"], "input_image_count": len(input_images)},
+            extra={
+                "size": size,
+                "quality": meta["quality"],
+                "input_image_count": len(input_images),
+                **normalization_meta,
+            },
         )
 
 

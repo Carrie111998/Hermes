@@ -171,6 +171,36 @@ class TestGenerate:
         # gpt-image-2 rejects response_format — we must NOT send it.
         assert "response_format" not in call_kwargs
 
+    def test_enforce_output_size_normalizes_cached_image(self, provider, monkeypatch):
+        fake_client = MagicMock()
+        fake_client.images.generate.return_value = _fake_response(b64=_b64_png())
+        monkeypatch.setattr(
+            openai_plugin,
+            "_load_openai_config",
+            lambda: {"enforce_output_size": True},
+        )
+        normalize = MagicMock(
+            return_value={
+                "source_size": "1450x1280",
+                "size": "1536x1024",
+                "output_size_normalized": True,
+            }
+        )
+        monkeypatch.setattr(
+            openai_plugin,
+            "normalize_image_file_size",
+            normalize,
+            raising=False,
+        )
+
+        with _patched_openai(fake_client):
+            result = provider.generate("a cat", aspect_ratio="landscape")
+
+        normalize.assert_called_once_with(Path(result["image"]), "1536x1024")
+        assert result["source_size"] == "1450x1280"
+        assert result["size"] == "1536x1024"
+        assert result["output_size_normalized"] is True
+
     @pytest.mark.parametrize("tier,expected_quality", [
         ("gpt-image-2-low", "low"),
         ("gpt-image-2-medium", "medium"),

@@ -4941,6 +4941,9 @@ _OPEN_DICT_TOP_LEVEL_KEYS = frozenset({
     "server_actions",
     "secrets",
     "goals",
+    # Backend plugins own their provider-specific config surface.
+    "image_gen",
+    "video_gen",
 })
 
 # Top-level keys whose sub-keys are partially schema-defined (e.g. on a

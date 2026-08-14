@@ -120,6 +120,38 @@ class TestGenerate:
         # tell the two backends apart.
         assert saved.name.startswith("openai_codex_")
 
+    def test_enforce_output_size_normalizes_cached_image(self, provider, monkeypatch):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+        monkeypatch.setattr(codex_plugin, "_collect_image_b64", lambda *a, **kw: _b64_png())
+        monkeypatch.setattr(
+            codex_plugin,
+            "_load_image_gen_config",
+            lambda: {"enforce_output_size": True},
+        )
+        calls = []
+
+        def _normalize(path, size):
+            calls.append((path, size))
+            return {
+                "source_size": "1672x941",
+                "size": size,
+                "output_size_normalized": True,
+            }
+
+        monkeypatch.setattr(
+            codex_plugin,
+            "normalize_image_file_size",
+            _normalize,
+            raising=False,
+        )
+
+        result = provider.generate("a cat", aspect_ratio="landscape")
+
+        assert calls == [(Path(result["image"]), "1536x1024")]
+        assert result["source_size"] == "1672x941"
+        assert result["size"] == "1536x1024"
+        assert result["output_size_normalized"] is True
+
     def test_codex_stream_request_shape(self, provider, monkeypatch):
         monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
 
