@@ -831,6 +831,8 @@ def _discover(
             offset=0,
             sort=sort,
             fields=_DISCOVER_SEARCH_FIELDS,
+            after_ts=after_ts,
+            before_ts=before_ts,
         )
     except Exception as e:
         logging.error("FTS5 search failed: %s", e, exc_info=True)
