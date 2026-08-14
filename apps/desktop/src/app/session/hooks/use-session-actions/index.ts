@@ -30,6 +30,7 @@ import {
   $currentReasoningEffort,
   $messages,
   $newChatWorkspaceTarget,
+  $replayedPendingPrompt,
   $sessions,
   $yoloActive,
   type NewChatWorkspaceTarget,
@@ -194,6 +195,23 @@ interface FreshSessionDraftOptions {
 
 function normalizeNewChatWorkspaceTarget(target: NewChatWorkspaceTarget): NewChatWorkspaceTarget {
   return typeof target === 'string' ? target.trim() || null : target
+}
+
+/** Park a replayed blocking prompt for the wiring layer to dispatch.
+ *
+ *  The backend emits clarify/sudo/secret/terminal.read exactly once, so a
+ *  client that disconnected before answering only learns about the still-open
+ *  request from this resume/activate payload. Draining happens in an effect,
+ *  which is what keeps the dispatch ordered after the transcript commit.
+ */
+function parkReplayedPendingPrompt(payload: SessionResumeResponse, runtimeSessionId: string): void {
+  const pending = payload.pending
+
+  if (!pending?.request_id || !pending.event || !runtimeSessionId) {
+    return
+  }
+
+  $replayedPendingPrompt.set({ pending, sessionId: runtimeSessionId })
 }
 
 export function useSessionActions({
@@ -769,17 +787,10 @@ export function useSessionActions({
             } else {
               const runtimeInfo = applyRuntimeInfo(activated.info)
 
-              // `omit_messages` means the response carries NO transcript, not
-              // an empty one — the cache is the base and the live projection is
-              // a tail to graft onto it. Reconciling against the empty list
-              // instead rebuilds the thread out of the projection alone, so
-              // activating a session that is mid-turn somewhere else (leaving
-              // HUD mode is exactly that) collapsed the whole conversation down
-              // to the in-flight prompt until the turn finished and the
-              // post-turn hydrate restored it.
-              let activatedMessages = activated.messages_omitted
-                ? appendLiveSessionProjection(cachedViewState.messages, activated)
-                : activated.messages.length || activated.inflight || activated.queued
+              parkReplayedPendingPrompt(activated, activated.session_id || cachedRuntimeId)
+
+              let activatedMessages =
+                activated.messages.length || activated.inflight || activated.queued
                   ? reconcileAuthoritativeMessages(activated.messages, cachedViewState.messages, activated)
                   : cachedViewState.messages
 
@@ -971,6 +982,8 @@ export function useSessionActions({
           !prefetchedStoredSessionId || !resumedStoredSessionId || prefetchedStoredSessionId === resumedStoredSessionId
 
         const hasLiveProjection = Boolean(resumed.inflight || resumed.queued)
+
+        parkReplayedPendingPrompt(resumed, resumed.session_id)
 
         const preferredMessages =
           prefetchApplied && prefetchMatchesResumedSession && !hasLiveProjection
