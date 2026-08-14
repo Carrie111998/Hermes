@@ -52,7 +52,7 @@ describe('ensureGatewayForProfile under a shared global remote', () => {
     setPrimaryGateway(primary as never, 'default')
     installDesktop({
       // Shared descriptor: primary connection tagged with the profile.
-      getConnection: vi.fn(async () => ({ port: 4242, profile: 'venture', token: 't' }))
+      getConnection: vi.fn(async () => ({ port: 4242, profile: 'venture', sharedPrimary: true, token: 't' }))
     })
 
     await ensureGatewayForProfile('venture')
@@ -65,7 +65,7 @@ describe('ensureGatewayForProfile under a shared global remote', () => {
     setPrimaryGateway(primary as never, 'default')
     installDesktop({
       // Own descriptor: no profile tag → normal pooled path (dial attempted).
-      getConnection: vi.fn(async () => ({ port: 5151, token: 't2' }))
+      getConnection: vi.fn(async () => ({ port: 5151, profile: 'worker', token: 't2' }))
     })
 
     await ensureGatewayForProfile('worker')
