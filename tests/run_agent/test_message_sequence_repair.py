@@ -395,6 +395,95 @@ def test_sanitize_drops_empty_tool_calls_created_by_dedup():
     assert all(m.get("tool_calls") != [] for m in out)
 
 
+def test_sanitize_reorders_scattered_tool_results_adjacent():
+    """Tool results scattered far from their assistant are moved adjacent.
+
+    A context rollup (compression window / session rebuild) can replay an
+    assistant message carrying tool_calls while its tool results stay at
+    their original positions much later in the transcript. Strict
+    OpenAI-compatible providers (DeepSeek, opencode.ai) 400 with "An
+    assistant message with 'tool_calls' must be followed by tool messages
+    responding to each 'tool_call_id'. (insufficient tool messages
+    following tool_calls message)". sanitize_api_messages must place each
+    assistant's results immediately after it (in call order) and drop
+    results whose call no longer exists.
+    """
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "first turn, two calls",
+         "tool_calls": [
+             {"id": "call_A", "type": "function",
+              "function": {"name": "foo", "arguments": "{}"}},
+             {"id": "call_B", "type": "function",
+              "function": {"name": "foo", "arguments": "{}"}},
+         ]},
+        {"role": "user", "content": "interjection"},
+        {"role": "assistant", "content": "second turn, one call",
+         "tool_calls": [
+             {"id": "call_C", "type": "function",
+              "function": {"name": "foo", "arguments": "{}"}},
+         ]},
+        # results for the FIRST assistant, sitting far below after other turns
+        {"role": "tool", "tool_call_id": "call_B", "content": "result B"},
+        {"role": "tool", "tool_call_id": "call_A", "content": "result A"},
+        {"role": "tool", "tool_call_id": "call_C", "content": "result C"},
+    ]
+    out = sanitize_api_messages(list(messages))
+    idx_a = next(i for i, m in enumerate(out)
+                 if m.get("role") == "assistant" and m.get("tool_calls")
+                 and m["tool_calls"][0]["id"] == "call_A")
+    # both results immediately follow their assistant, in call order
+    assert out[idx_a + 1]["tool_call_id"] == "call_A"
+    assert out[idx_a + 2]["tool_call_id"] == "call_B"
+    idx_c = next(i for i, m in enumerate(out)
+                 if m.get("role") == "assistant" and m.get("tool_calls")
+                 and m["tool_calls"][0]["id"] == "call_C")
+    assert out[idx_c + 1]["tool_call_id"] == "call_C"
+    # every tool result exactly once, no orphans, no duplicates
+    tool_ids = [m["tool_call_id"] for m in out if m.get("role") == "tool"]
+    assert tool_ids == ["call_A", "call_B", "call_C"]
+
+
+def test_sanitize_normalizes_replayed_tool_calls_and_answers():
+    """A compressed rollup replaying an answered call id gets normalized.
+
+    Same tool_call id appears twice: once answered in the original turn,
+    once replayed in a rollup block with the results sitting elsewhere.
+    The survivor keeps its call and the result moves adjacent; the replay
+    loses the duplicate call key entirely (empty == absent, #58755/#59110).
+    """
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "user", "content": "rollup context"},
+        # rollup replay of the answered turn — calls only, no results
+        {"role": "assistant", "content": "replayed call",
+         "tool_calls": [
+             {"id": "call_X", "type": "function",
+              "function": {"name": "foo", "arguments": "{}"}}]},
+        {"role": "user", "content": "later"},
+        # the original answered turn, further down the transcript
+        {"role": "assistant", "content": "original call",
+         "tool_calls": [
+             {"id": "call_X", "type": "function",
+              "function": {"name": "foo", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_X", "content": "result X"},
+    ]
+    out = sanitize_api_messages(list(messages))
+    assistants = [m for m in out if m.get("role") == "assistant"]
+    # first assistant keeps the call; the replay drops it
+    assert assistants[0]["tool_calls"][0]["id"] == "call_X"
+    assert "tool_calls" not in assistants[1]
+    # exactly one tool result, placed adjacent to the surviving call
+    tool_ids = [m["tool_call_id"] for m in out if m.get("role") == "tool"]
+    assert tool_ids == ["call_X"]
+    idx = next(i for i, m in enumerate(out)
+               if m.get("role") == "assistant" and m.get("tool_calls"))
+    assert out[idx + 1]["tool_call_id"] == "call_X"
+
+
 
 
 

@@ -3489,6 +3489,66 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             removed_dupes,
         )
 
+    # 4. Normalize tool adjacency. Strict OpenAI-compatible providers require
+    # every assistant message with ``tool_calls`` to be IMMEDIATELY followed
+    # by the tool messages responding to each ``tool_call_id``. A context
+    # rollup (compression window, session rebuild) can replay an assistant
+    # turn with its calls while leaving the tool results at their original
+    # positions later in the transcript; the provider then 400s with
+    # "An assistant message with 'tool_calls' must be followed by tool
+    # messages responding to each 'tool_call_id'. (insufficient tool
+    # messages following tool_calls message)". The stub-injection pass above
+    # only covers results missing ENTIRELY; this pass fixes results that
+    # exist but sit far from their assistant. Rebuild the sequence so each
+    # assistant is followed directly by its responses (in call order), and
+    # drop any result whose id no longer matches a surviving assistant call.
+    # For healthy transcripts (results already adjacent) the rebuild is a
+    # no-op — same objects, same order.
+    resp_by_id: Dict[str, Dict[str, Any]] = {}
+    for msg in messages:
+        if msg.get("role") == "tool":
+            cid = (msg.get("tool_call_id") or "").strip()
+            if cid and cid not in resp_by_id:
+                resp_by_id[cid] = msg
+    live_call_ids: set = set()
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                cid = _ra().AIAgent._get_tool_call_id_static(tc)
+                if cid:
+                    live_call_ids.add(cid)
+    adjacency_msgs: List[Dict[str, Any]] = []
+    consumed_result_ids: set = set()
+    placed_results = 0
+    dropped_orphan_results = 0
+    for msg in messages:
+        role = msg.get("role")
+        if role == "tool":
+            cid = (msg.get("tool_call_id") or "").strip()
+            if cid in consumed_result_ids:
+                continue  # already emitted next to its assistant
+            if cid not in live_call_ids:
+                dropped_orphan_results += 1  # call vanished (e.g. via dedup)
+                continue
+            adjacency_msgs.append(msg)
+            continue
+        adjacency_msgs.append(msg)
+        if role == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                cid = _ra().AIAgent._get_tool_call_id_static(tc)
+                if cid and cid in resp_by_id and cid not in consumed_result_ids:
+                    adjacency_msgs.append(resp_by_id[cid])
+                    consumed_result_ids.add(cid)
+                    placed_results += 1
+    if adjacency_msgs != messages:
+        messages = adjacency_msgs
+        _ra().logger.debug(
+            "Pre-call sanitizer: normalized tool adjacency (%d tool result(s) "
+            "placed next to their assistant, %d orphaned result(s) dropped)",
+            placed_results,
+            dropped_orphan_results,
+        )
+
     # Final sweep: no assistant message may carry an empty ``tool_calls``
     # array onto the wire. The dedicated empty-drop pass above runs before
     # the dedup pass, so any empty list created by dedup (or by any other
