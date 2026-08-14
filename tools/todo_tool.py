@@ -58,12 +58,22 @@ LEGACY_TODO_INJECTION_HEADERS = (
 )
 TODO_INJECTION_HEADERS = (TODO_INJECTION_HEADER, *LEGACY_TODO_INJECTION_HEADERS)
 TODO_INJECTION_RECONCILIATION_GUIDANCE = (
-    "Reconcile these candidates with the preserved ## Key Decisions and ## "
-    "Completed Actions before continuing. A completed investigation item "
-    "(trace/check/verify) can invalidate a pending action item below it — if "
-    "a preserved finding or the latest user message contradicts an item's "
-    "premise, cancel or rewrite it rather than acting on the stale wording."
+    "Items below are prefixed 'needs reconfirmation after compaction' because "
+    "the reasoning that justified them was compacted away. Reconcile each "
+    "against the preserved ## Key Decisions and ## Completed Actions (a "
+    "completed investigation item — trace/check/verify — can invalidate a "
+    "pending action item) and the latest user message. If still valid, "
+    "rewrite it via the todo tool without the prefix; if invalidated, cancel "
+    "or rewrite it rather than acting on the stale wording."
 )
+# Written into the item's persisted content (not only the synthetic
+# injection block) so the expiry survives beyond one compaction — a later
+# `todo` read/write still sees it, not only this post-compaction message.
+# Kept in `content` rather than a new status value: a new status enum member
+# would need matching changes to the desktop UI's TodoStatus type
+# (apps/desktop/src/lib/todos.ts), which silently drops items whose status
+# it doesn't recognize instead of rendering them.
+NEEDS_RECONFIRMATION_MARKER = "[needs reconfirmation after compaction] "
 
 
 class TodoStore:
@@ -141,6 +151,14 @@ class TodoStore:
         """
         Render the todo list for post-compression injection.
 
+        Side effect: active items crossing the boundary are marked
+        needs-reconfirmation in persisted content (see
+        NEEDS_RECONFIRMATION_MARKER) — the expiry is not just cosmetic to
+        this rendering, it survives in the store past this call (#84718
+        proposal 2). Safe because the sole caller
+        (conversation_compression.py) invokes this exactly once per
+        committed compaction, never speculatively.
+
         Returns a human-readable string to append to the compressed
         message history, or None if the list is empty.
         """
@@ -163,6 +181,12 @@ class TodoStore:
         ]
         if not active_items:
             return None
+
+        for item in active_items:
+            if not item["content"].startswith(NEEDS_RECONFIRMATION_MARKER):
+                item["content"] = self._cap_content(
+                    NEEDS_RECONFIRMATION_MARKER + item["content"]
+                )
 
         lines = [TODO_INJECTION_HEADER, TODO_INJECTION_RECONCILIATION_GUIDANCE]
         for index, item in enumerate(active_items):

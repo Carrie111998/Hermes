@@ -187,6 +187,62 @@ class TestTodoStoreBounds:
         assert "priority-255" not in injection
         assert "higher-priority items were preserved" in injection
 
+
+class TestNeedsReconfirmationExpiry:
+    """#84718 proposal 2: expire active items at the compaction boundary."""
+
+    def test_active_items_are_marked_in_persisted_state_not_just_the_injection(self):
+        from tools.todo_tool import NEEDS_RECONFIRMATION_MARKER
+
+        store = TodoStore()
+        store.write([
+            {"id": "trace", "content": "Trace the origin", "status": "completed"},
+            {"id": "remove", "content": "Remove the checkout route", "status": "pending"},
+        ])
+        store.format_for_injection()
+
+        persisted = {item["id"]: item for item in store.read()}
+        # The persisted item content carries the marker, not only the
+        # rendered injection string — a later plain `todo` read/write
+        # (outside the synthetic post-compaction message) still sees it.
+        assert persisted["remove"]["content"].startswith(NEEDS_RECONFIRMATION_MARKER)
+        # completed/cancelled items never crossed the boundary as "active",
+        # so they are left untouched.
+        assert persisted["trace"]["content"] == "Trace the origin"
+
+    def test_repeated_compactions_do_not_stack_the_marker(self):
+        from tools.todo_tool import NEEDS_RECONFIRMATION_MARKER
+
+        store = TodoStore()
+        store.write([{"id": "1", "content": "Ship the fix", "status": "pending"}])
+        store.format_for_injection()
+        store.format_for_injection()
+
+        content = store.read()[0]["content"]
+        assert content.count(NEEDS_RECONFIRMATION_MARKER) == 1
+
+    def test_marker_plus_content_respects_the_existing_content_cap(self):
+        from tools.todo_tool import MAX_TODO_CONTENT_CHARS
+
+        store = TodoStore()
+        store.write([{"id": "1", "content": "A" * (MAX_TODO_CONTENT_CHARS - 5), "status": "pending"}])
+        store.format_for_injection()
+
+        assert len(store.read()[0]["content"]) <= MAX_TODO_CONTENT_CHARS
+
+    def test_rewriting_content_clears_the_marker(self):
+        from tools.todo_tool import NEEDS_RECONFIRMATION_MARKER
+
+        store = TodoStore()
+        store.write([{"id": "1", "content": "Old plan", "status": "pending"}])
+        store.format_for_injection()
+        assert store.read()[0]["content"].startswith(NEEDS_RECONFIRMATION_MARKER)
+
+        # Model reconfirms by writing fresh content for the same id.
+        store.write([{"id": "1", "content": "Reconfirmed plan", "status": "pending"}], merge=True)
+
+        assert store.read()[0]["content"] == "Reconfirmed plan"
+
     def test_maximal_store_serializes_within_hydration_limit(self):
         from tools.todo_tool import MAX_TODO_RESULT_CHARS
 
