@@ -14,7 +14,7 @@ metadata:
 
 # Pay Skill
 
-Wraps the `pay` CLI (https://github.com/solana-foundation/pay) so Hermes can discover priced APIs and pay for per-request access against servers that respond with `HTTP 402 Payment Required` (x402 and MPP). Shown only when the `pay` MCP server isn't connected — if it is, use its native tools directly instead of this skill.
+Wraps the `pay` CLI (https://github.com/solana-foundation/pay) so Hermes can discover priced APIs and pay for per-request access against servers that respond with `HTTP 402 Payment Required`. Covers the full x402 (exact, upto, batch-settlement) and MPP (charge, session, subscription) scheme surface, settling on Solana for low fees and fast finality. Shown only when the `pay` MCP server isn't connected — if it is, use its native tools directly instead of this skill.
 
 ## When to Use
 
