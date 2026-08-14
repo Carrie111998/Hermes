@@ -205,6 +205,53 @@ def test_strict_board_create_returns_inert_intake_receipt(kanban_home):
     assert '"parents":["t_missing"]' in record["raw_request"]
 
 
+def test_run_slash_intake_show_reports_safe_failure_and_budget(kanban_home):
+    kb.ensure_product_board_defaults("strict", switch=True)
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    with kb.connect(board="strict") as conn:
+        intake_id = kb.create_qualification_intake(
+            conn, raw_request="request", source="cli"
+        )
+        kb.append_qualification_intake_event(
+            conn,
+            intake_id=intake_id,
+            kind="work_contract_verification_failed",
+            payload={"failure_path": "io_error", "raw": "secret"},
+        )
+        conn.execute(
+            "UPDATE qualification_intake SET status = 'attention_required' WHERE id = ?",
+            (intake_id,),
+        )
+
+    output = kc.run_slash(f"intake show {intake_id}")
+    assert "io_error" in output
+    assert "Attempts: 0/3" in output
+    assert "secret" not in output
+
+
+def test_run_slash_intake_retry_reports_refusal_and_success(kanban_home):
+    kb.ensure_product_board_defaults("strict", switch=True)
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    with kb.connect(board="strict") as conn:
+        intake_id = kb.create_qualification_intake(
+            conn, raw_request="request", source="cli"
+        )
+        conn.execute(
+            "UPDATE qualification_intake SET status = 'attention_required' WHERE id = ?",
+            (intake_id,),
+        )
+
+    assert f"{intake_id}: pending" in kc.run_slash(f"intake retry {intake_id}")
+    refusal = kc.run_slash(f"intake retry {intake_id}")
+    assert "attention_required" in refusal
+
+
 def test_run_slash_dispatch_dry_run_counts(kanban_home):
     kc.run_slash("create 'a' --assignee alice")
     kc.run_slash("create 'b' --assignee bob")

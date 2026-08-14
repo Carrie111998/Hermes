@@ -279,6 +279,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--json", action="store_true", help="Emit the full machine-readable result"
     )
 
+    # --- intake inspect/retry ---
+    p_intake = sub.add_parser(
+        "intake",
+        help="Inspect or retry a durable qualification intake",
+    )
+    intake_sub = p_intake.add_subparsers(dest="intake_action")
+    p_intake_show = intake_sub.add_parser(
+        "show", help="Show safe status, failure path, and retry budget"
+    )
+    p_intake_show.add_argument("intake_id")
+    p_intake_show.add_argument("--json", action="store_true")
+    p_intake_retry = intake_sub.add_parser(
+        "retry", help="Retry an attention-required intake within its budget"
+    )
+    p_intake_retry.add_argument("intake_id")
+
     # --- legacy-reconcile ---
     p_legacy_reconcile = sub.add_parser(
         "legacy-reconcile",
@@ -1140,6 +1156,9 @@ def kanban_command(args: argparse.Namespace) -> int:
     if action == "boards":
         return _dispatch_boards(args)
 
+    if action == "intake":
+        return _dispatch_intake(args)
+
     # `--board <slug>` applies to every subcommand below by way of an
     # env-var pin for the duration of this call. Using HERMES_KANBAN_BOARD
     # (rather than threading `board=` through 50+ kb.connect() sites)
@@ -1266,6 +1285,78 @@ def _profile_author() -> str:
         return get_active_profile_name() or "user"
     except Exception:
         return "user"
+
+
+def _dispatch_intake(args: argparse.Namespace) -> int:
+    action = getattr(args, "intake_action", None)
+    if action == "show":
+        return _cmd_intake_show(args)
+    if action == "retry":
+        return _cmd_intake_retry(args)
+    print("kanban intake: choose show or retry", file=sys.stderr)
+    return 2
+
+
+def _intake_retry_view(conn, intake_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
+    record = kb.get_qualification_intake(conn, intake_id)
+    if record is None:
+        raise ValueError(f"unknown qualification intake: {intake_id}")
+    events = kb.list_qualification_intake_events(conn, intake_id)
+    failure_path = next(
+        (
+            event.get("payload", {}).get("failure_path")
+            for event in reversed(events)
+            if event.get("kind") == "work_contract_verification_failed"
+            and event.get("payload", {}).get("failure_path") in {
+                "shape", "canonical_mismatch", "digest_mismatch",
+                "signature_mismatch", "key_unreadable", "io_error",
+            }
+        ),
+        None,
+    )
+    state = kb.qualification_retry_state(
+        conn, intake_id, kanban_intake.qualification_max_total_attempts(metadata)
+    )
+    return {
+        "intake_id": intake_id,
+        "status": record["status"],
+        "failure_path": failure_path,
+        "attempts_used": state.attempts_used,
+        "attempts_limit": state.attempts_limit,
+        "retry_allowed": state.allowed and record["status"] == "attention_required",
+    }
+
+
+def _cmd_intake_show(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        metadata = kb.read_board_metadata(kb.get_current_board())
+        view = _intake_retry_view(conn, args.intake_id, metadata)
+    if getattr(args, "json", False):
+        print(json.dumps(view, indent=2, ensure_ascii=False))
+    else:
+        print(f"Intake {view['intake_id']}: {view['status']}")
+        if view["failure_path"]:
+            print(f"Failure path: {view['failure_path']}")
+        print(
+            f"Attempts: {view['attempts_used']}/{view['attempts_limit']} "
+            f"(retry {'allowed' if view['retry_allowed'] else 'not allowed'})"
+        )
+    return 0
+
+
+def _cmd_intake_retry(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        try:
+            ok = kb.retry_qualification_intake(conn, args.intake_id)
+        except ValueError as exc:
+            print(f"kanban intake retry: {exc}", file=sys.stderr)
+            return 1
+    if not ok:
+        print(f"kanban intake retry: {args.intake_id} was not scheduled", file=sys.stderr)
+        return 1
+    kanban_intake._wake_intake_qualifier()
+    print(f"{args.intake_id}: pending")
+    return 0
 
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({

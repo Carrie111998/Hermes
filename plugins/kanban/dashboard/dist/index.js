@@ -3801,6 +3801,10 @@
         onSpecify: props.onSpecify,
         onDecompose: props.onDecompose,
       }),
+      t.intake_id ? h(IntakeRecoverySection, {
+        intakeId: t.intake_id,
+        boardSlug: props.boardSlug,
+      }) : null,
       h(DiagnosticsSection, {
         task: t,
         boardSlug: props.boardSlug,
@@ -3955,6 +3959,42 @@
       ),
       h(WorkerLogSection, { taskId: t.id, boardSlug: props.boardSlug }),
       h(RunHistorySection, { runs: props.data.runs || [] }),
+    );
+  }
+
+  function IntakeRecoverySection(props) {
+    const { t } = useI18n();
+    const [state, setState] = useState({ loading: true, data: null, err: null });
+    const [busy, setBusy] = useState(false);
+    const load = useCallback(function () {
+      setState({ loading: true, data: null, err: null });
+      SDK.fetchJSON(withBoard(`${API}/work-inbox/status?intake_id=${encodeURIComponent(props.intakeId)}`, props.boardSlug))
+        .then(function (data) { setState({ loading: false, data: data, err: null }); })
+        .catch(function (err) { setState({ loading: false, data: null, err: String(err.message || err) }); });
+    }, [props.intakeId, props.boardSlug]);
+    useEffect(function () { load(); }, [load]);
+    if (state.loading) return null;
+    if (state.err || !state.data) return null;
+    const data = state.data;
+    const action = (data.actions || []).find(function (item) { return item.id === "retry"; });
+    return h("div", { className: "hermes-kanban-section hermes-kanban-intake-recovery" },
+      h("div", { className: "hermes-kanban-section-head" }, tx(t, "intakeRecovery", "Intake recovery")),
+      h("div", { className: "text-xs text-muted-foreground" },
+        `Attempts: ${data.attempts_used}/${data.attempts_limit}`),
+      action ? h(Button, {
+        size: "sm",
+        disabled: busy,
+        onClick: function () {
+          setBusy(true);
+          SDK.fetchJSON(withBoard(`${API}/work-inbox`, props.boardSlug), {
+            method: action.method,
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ version: 2, kind: "retry", intake_id: props.intakeId }),
+          }).then(load).catch(function (err) {
+            setState({ loading: false, data: data, err: String(err.message || err) });
+          }).finally(function () { setBusy(false); });
+        },
+      }, busy ? tx(t, "retrying", "Retrying…") : tx(t, "retry", "Retry")) : null,
     );
   }
 
