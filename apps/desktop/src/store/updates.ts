@@ -11,7 +11,8 @@ import type {
   DesktopUpdateProgress,
   DesktopUpdateStage,
   DesktopUpdateStatus,
-  DesktopVersionInfo
+  DesktopVersionInfo,
+  HermesConnection
 } from '@/global'
 import { checkHermesUpdate, getActionStatus, updateHermes } from '@/hermes'
 import { translateNow } from '@/i18n'
@@ -251,6 +252,11 @@ export function openUpdatesWindow(): void {
  */
 export function startActiveUpdate(): void {
   const target: UpdateTarget = isRemoteMode() ? 'backend' : 'client'
+
+  startUpdateFor(target)
+}
+
+export function startUpdateFor(target: UpdateTarget): void {
   $updateOverlayTarget.set(target)
   $updateOverlayOpen.set(true)
   void (target === 'backend' ? applyBackendUpdate() : applyUpdates())
@@ -267,7 +273,7 @@ export function requestActiveUpdate(): void {
   const status = target === 'backend' ? $backendUpdateStatus.get() : $updateStatus.get()
 
   if ((status?.behind ?? 0) > 0 || status?.updateAvailable) {
-    startActiveUpdate()
+    startUpdateFor(target)
 
     return
   }
@@ -303,18 +309,33 @@ export async function refreshDesktopVersion(): Promise<DesktopVersionInfo | null
   }
 }
 
+function backendConnectionIdentity(connection: HermesConnection | null = $connection.get()): string | null {
+  if (connection?.mode !== 'remote') {
+    return null
+  }
+
+  return JSON.stringify([connection.baseUrl.trim(), connection.profile?.trim() || 'default'])
+}
+
 function isRemoteMode(): boolean {
-  return $connection.get()?.mode === 'remote'
+  return backendConnectionIdentity() !== null
 }
 
 function mapBackendCheck(res: BackendUpdateCheckResponse): DesktopUpdateStatus {
-  const behind = res.behind ?? 0
+  // The backend uses `behind: null` when a git update check could not reach its
+  // source. Do not coerce that failure to zero: zero means authoritatively
+  // current and would make About claim "latest". Externally managed installs
+  // also report null, but `can_apply: false` is their explicit unsupported
+  // state rather than a failed reachable-source check.
+  const checkFailed = res.behind === null && !res.update_available && res.can_apply
+  const behind = res.behind ?? undefined
 
   return {
     supported: res.can_apply,
+    error: checkFailed ? 'check-failed' : undefined,
     message: res.message ?? undefined,
     updateAvailable: res.update_available,
-    behind: behind > 0 ? behind : 0,
+    behind: behind === undefined ? undefined : Math.max(behind, 0),
     currentVersion: res.current_version,
     targetSha: res.update_available ? `backend:${res.current_version}` : undefined,
     commits: res.commits,
@@ -322,33 +343,87 @@ function mapBackendCheck(res: BackendUpdateCheckResponse): DesktopUpdateStatus {
   }
 }
 
-export async function checkBackendUpdates(): Promise<DesktopUpdateStatus | null> {
-  if (!isRemoteMode() || $backendUpdateChecking.get()) {
-    return $backendUpdateStatus.get()
+interface BackendUpdateCheckRequest {
+  generation: number
+  promise: Promise<DesktopUpdateStatus | null>
+}
+
+const backendUpdateChecks = new Map<string, BackendUpdateCheckRequest>()
+let backendConnectionGeneration = 0
+let observedBackendConnectionIdentity: null | string | undefined
+
+function reconcileBackendConnection(identity: null | string): boolean {
+  if (identity === observedBackendConnectionIdentity) {
+    return false
+  }
+
+  observedBackendConnectionIdentity = identity
+  backendConnectionGeneration += 1
+  $backendUpdateStatus.set(null)
+  $backendUpdateChecking.set(false)
+
+  return true
+}
+
+export function checkBackendUpdates(): Promise<DesktopUpdateStatus | null> {
+  const connectionIdentity = backendConnectionIdentity()
+  reconcileBackendConnection(connectionIdentity)
+
+  if (!connectionIdentity) {
+    return Promise.resolve(null)
+  }
+
+  const generation = backendConnectionGeneration
+  const existing = backendUpdateChecks.get(connectionIdentity)
+
+  if (existing?.generation === generation) {
+    return existing.promise
   }
 
   $backendUpdateChecking.set(true)
 
-  try {
-    const status = mapBackendCheck(await checkHermesUpdate(true))
-    $backendUpdateStatus.set(status)
-    maybeNotifyUpdateAvailable(status)
+  const request = (async () => {
+    try {
+      const status = mapBackendCheck(await checkHermesUpdate(true))
 
-    return status
-  } catch (error) {
-    const fallback: DesktopUpdateStatus = {
-      supported: $backendUpdateStatus.get()?.supported ?? true,
-      error: 'check-failed',
-      message: error instanceof Error ? error.message : String(error),
-      fetchedAt: Date.now()
+      if (backendConnectionIdentity() !== connectionIdentity || backendConnectionGeneration !== generation) {
+        return null
+      }
+
+      $backendUpdateStatus.set(status)
+      maybeNotifyUpdateAvailable(status)
+
+      return status
+    } catch (error) {
+      if (backendConnectionIdentity() !== connectionIdentity || backendConnectionGeneration !== generation) {
+        return null
+      }
+
+      const fallback: DesktopUpdateStatus = {
+        supported: $backendUpdateStatus.get()?.supported ?? true,
+        error: 'check-failed',
+        message: error instanceof Error ? error.message : String(error),
+        fetchedAt: Date.now()
+      }
+
+      $backendUpdateStatus.set(fallback)
+
+      return fallback
+    }
+  })()
+
+  backendUpdateChecks.set(connectionIdentity, { generation, promise: request })
+  void request.then(() => {
+    if (backendUpdateChecks.get(connectionIdentity)?.promise === request) {
+      backendUpdateChecks.delete(connectionIdentity)
     }
 
-    $backendUpdateStatus.set(fallback)
+    if (backendConnectionIdentity() === connectionIdentity && backendConnectionGeneration === generation) {
+      $backendUpdateChecking.set(false)
+    }
+  })
 
-    return fallback
-  } finally {
-    $backendUpdateChecking.set(false)
-  }
+  return request
 }
 
 export async function checkUpdates(): Promise<DesktopUpdateStatus | null> {
@@ -720,7 +795,6 @@ let pollerStarted = false
 let backgroundTimer: ReturnType<typeof setInterval> | null = null
 let lastFocusAt = 0
 let connectionUnsub: (() => void) | null = null
-let lastConnectionMode: string | undefined
 
 /** Wire up background polling + progress streaming. Idempotent. */
 export function startUpdatePoller(): void {
@@ -736,21 +810,21 @@ export function startUpdatePoller(): void {
 
   pollerStarted = true
   void checkUpdates()
-  void checkBackendUpdates()
   void refreshDesktopVersion()
   bridge.onProgress(ingestProgress)
 
   // The poller starts at mount, before the gateway connects — so the first
-  // backend check above sees mode≠remote and no-ops. Re-check once the
-  // connection resolves to remote.
+  // subscription normally sees no remote. Scope backend state and requests to
+  // the actual connection store identity, then check whenever baseUrl/profile
+  // resolves or changes.
   connectionUnsub = $connection.subscribe(conn => {
-    if (conn?.mode === lastConnectionMode) {
+    const identity = backendConnectionIdentity(conn)
+
+    if (!reconcileBackendConnection(identity)) {
       return
     }
 
-    lastConnectionMode = conn?.mode
-
-    if (conn?.mode === 'remote') {
+    if (identity) {
       void checkBackendUpdates()
     }
   })
@@ -773,7 +847,9 @@ export function stopUpdatePoller(): void {
 
   connectionUnsub?.()
   connectionUnsub = null
-  lastConnectionMode = undefined
+  observedBackendConnectionIdentity = undefined
+  backendConnectionGeneration += 1
+  $backendUpdateChecking.set(false)
   window.removeEventListener('focus', onFocus)
   pollerStarted = false
 }

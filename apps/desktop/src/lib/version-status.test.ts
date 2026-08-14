@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { en } from '@/i18n/en'
 
-import { resolveVersionStatus } from './version-status'
+import { resolveBackendVersion, resolveVersionStatus } from './version-status'
 
 const copy = en.shell.statusbar
 
@@ -81,5 +81,12 @@ describe('resolveVersionStatus', () => {
 
   it('hides a backend row that has no version at all', () => {
     expect(backend().unknown).toBe(true)
+  })
+})
+
+describe('resolveBackendVersion', () => {
+  it('falls back from the live backend snapshot to the update check version before hiding the chip', () => {
+    expect(resolveBackendVersion(undefined, '0.16.0')).toBe('0.16.0')
+    expect(resolveBackendVersion('0.17.0', '0.16.0')).toBe('0.17.0')
   })
 })

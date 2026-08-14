@@ -15,7 +15,7 @@ import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
-import { resolveVersionStatus } from '@/lib/version-status'
+import { resolveBackendVersion, resolveVersionStatus } from '@/lib/version-status'
 import { copyFilePath, revealFile } from '@/store/file-actions'
 import { revealFileInTree } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
@@ -328,7 +328,7 @@ export function useStatusbarItems({
       restarting: backendUpdateApply.stage === 'restart',
       target: 'backend',
       updateAvailable: backendUpdateStatus?.updateAvailable,
-      version: statusSnapshot?.version
+      version: resolveBackendVersion(statusSnapshot?.version, backendUpdateStatus?.currentVersion)
     })
 
     return {
@@ -346,6 +346,7 @@ export function useStatusbarItems({
   }, [
     connection?.mode,
     statusSnapshot?.version,
+    backendUpdateStatus?.currentVersion,
     backendUpdateStatus?.behind,
     backendUpdateStatus?.updateAvailable,
     backendUpdateApply.applying,
