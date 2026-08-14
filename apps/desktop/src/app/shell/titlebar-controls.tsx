@@ -4,7 +4,7 @@ import { useLocation, useNavigate } from 'react-router'
 
 import { hudTargetSessionId } from '@/app/hud/handoff'
 import { toggleLayoutEditMode } from '@/components/pane-shell/edit-mode'
-import { resetLayoutTree } from '@/components/pane-shell/tree/store'
+import { equalizeVisibleSessionPanes, resetLayoutTree } from '@/components/pane-shell/tree/store'
 import { Button } from '@/components/ui/button'
 import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
@@ -186,6 +186,15 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
         toggleLayoutEditMode()
       },
       title: t.titlebar.layoutEditorTitle
+    },
+    {
+      icon: <TitlebarIcon name="layout-centered" />,
+      id: 'equalize-conversation-panes',
+      label: t.titlebar.equalizeConversationPanes,
+      onSelect: () => {
+        triggerHaptic('tap')
+        equalizeVisibleSessionPanes()
+      }
     },
     {
       // No `title`: TitlebarToolButton passes `title` to TipKeybindLabel as a

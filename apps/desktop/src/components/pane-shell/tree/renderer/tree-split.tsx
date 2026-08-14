@@ -22,7 +22,9 @@ import { allPaneIds } from '../model'
 import {
   $collapsedTreeSides,
   $hiddenTreePanes,
+  $layoutEqualizeMotion,
   $narrowViewport,
+  cancelLayoutEqualizeMotion,
   isCollapsePane,
   persistTree,
   presetSplitWeights,
@@ -96,6 +98,7 @@ export function TreeSplit({ node, root, rootRow }: { node: SplitNode; root?: boo
   const overrides = useSubtreeOverrides(useMemo(() => allPaneIds(node), [node]))
   const editMode = useStore($layoutEditMode)
   const collapsedSides = useStore($collapsedTreeSides)
+  const equalizeMotion = useStore($layoutEqualizeMotion)
   const horizontal = node.orientation === 'row'
   const axis = node.orientation
 
@@ -187,6 +190,7 @@ export function TreeSplit({ node, root, rootRow }: { node: SplitNode; root?: boo
         return
       }
 
+      cancelLayoutEqualizeMotion()
       e.preventDefault()
 
       const handle = e.currentTarget
@@ -583,7 +587,11 @@ export function TreeSplit({ node, root, rootRow }: { node: SplitNode; root?: boo
 
         return (
           <div
-            className="relative flex min-h-0 min-w-0"
+            className={cn(
+              'relative flex min-h-0 min-w-0',
+              equalizeMotion &&
+                'transition-[flex-grow,flex-shrink,flex-basis] duration-200 ease-out motion-reduce:transition-none'
+            )}
             key={child.id}
             style={
               collapsed

@@ -249,6 +249,7 @@ export interface Translations {
     exitHud: string
     layoutEditor: string
     layoutEditorTitle: string
+    equalizeConversationPanes: string
   }
 
   keybinds: {
