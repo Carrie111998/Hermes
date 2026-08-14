@@ -1242,3 +1242,189 @@ registry.register(
     emoji="📄",
     max_result_size_chars=100_000,
 )
+
+WEB_SEARCH_ADVANCED_SCHEMA = {
+    "name": "web_search_advanced",
+    "description": "Advanced web search (Exa backend) with full control over filters, domains, dates, categories, highlights, summaries, and subpage crawling. Best for research needing specific filters (date ranges, domain restrictions, category filters). For simple searches use web_search instead. Returns search results with optional highlights, summaries, and subpage content.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search query — can be a question, statement, or keywords",
+            },
+            "num_results": {
+                "type": "integer",
+                "description": "Number of results (1-100, default: 10)",
+                "minimum": 1,
+                "maximum": 100,
+                "default": 10,
+            },
+            "type": {
+                "type": "string",
+                "enum": ["auto", "fast", "instant"],
+                "description": "Search type — 'auto': high quality and works with all filters (recommended), 'fast': quick results, 'instant': fastest results",
+            },
+            "category": {
+                "type": "string",
+                "enum": [
+                    "company",
+                    "publication",
+                    "news",
+                    "pdf",
+                    "github",
+                    "personal site",
+                    "people",
+                    "financial report",
+                ],
+                "description": "Filter results to a specific category",
+            },
+            "include_domains": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Only include results from these domains (e.g. ['arxiv.org', 'github.com'])",
+            },
+            "exclude_domains": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Exclude results from these domains",
+            },
+            "start_published_date": {
+                "type": "string",
+                "description": "Only include results published after this date (ISO 8601: YYYY-MM-DD)",
+            },
+            "end_published_date": {
+                "type": "string",
+                "description": "Only include results published before this date (ISO 8601: YYYY-MM-DD)",
+            },
+            "start_crawl_date": {
+                "type": "string",
+                "description": "Only include results crawled after this date (ISO 8601: YYYY-MM-DD)",
+            },
+            "end_crawl_date": {
+                "type": "string",
+                "description": "Only include results crawled before this date (ISO 8601: YYYY-MM-DD)",
+            },
+            "include_text": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Only include results containing ALL of these text strings",
+            },
+            "exclude_text": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Exclude results containing ANY of these text strings",
+            },
+            "user_location": {
+                "type": "string",
+                "description": "ISO country code for geo-targeted results (e.g. 'US', 'GB', 'DE')",
+            },
+            "enable_highlights": {
+                "type": "boolean",
+                "description": "Enable highlights extraction",
+            },
+            "enable_summary": {
+                "type": "boolean",
+                "description": "Enable summary generation for results",
+            },
+            "subpages": {
+                "type": "integer",
+                "description": "Number of subpages to crawl from each result (1-10)",
+                "minimum": 1,
+                "maximum": 10,
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+
+def web_search_advanced_tool(query: str, **kwargs: Any) -> str:
+    """Dispatch advanced search to the configured provider (Exa)."""
+    try:
+        _ensure_web_plugins_loaded()
+        from agent.web_search_registry import get_provider as _wsp_get_provider
+
+        backend = _get_search_backend()
+        provider = _wsp_get_provider(backend) if backend else None
+        if provider is None or not hasattr(provider, "advanced_search"):
+            return tool_error(
+                "Advanced search requires the Exa backend. Set web.backend=exa "
+                "and ensure EXA_API_KEY is configured."
+            )
+        response_data = provider.advanced_search(query, **kwargs)
+        return json.dumps(response_data, indent=2, ensure_ascii=False)
+    except Exception as e:  # noqa: BLE001
+        return tool_error(f"Error in advanced web search: {e}")
+
+
+def exa_agent_run_tool(
+    instructions: str,
+    output_schema: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Run an Exa Agent (multi-step research) natively."""
+    try:
+        _ensure_web_plugins_loaded()
+        from agent.web_search_registry import get_provider as _wsp_get_provider
+
+        backend = _get_search_backend()
+        provider = _wsp_get_provider(backend) if backend else None
+        if provider is None or not hasattr(provider, "agent_run"):
+            return tool_error(
+                "Exa Agent requires the Exa backend. Set web.backend=exa "
+                "and ensure EXA_API_KEY is configured."
+            )
+        response_data = provider.agent_run(
+            instructions,
+            output_schema=output_schema,
+        )
+        return json.dumps(response_data, indent=2, ensure_ascii=False)
+    except Exception as e:  # noqa: BLE001
+        return tool_error(f"Error in Exa agent run: {e}")
+
+
+WEB_AGENT_RUN_SCHEMA = {
+    "name": "exa_agent_run",
+    "description": "Run an Exa Agent for multi-step research, list-building, enrichment, and structured output. Takes a natural-language research objective and returns structured results with citations. Runs may take several minutes. Use for deep research tasks that need multiple search passes. Requires the Exa backend.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "instructions": {
+                "type": "string",
+                "description": "Natural-language research or enrichment objective",
+            },
+            "output_schema": {
+                "type": "object",
+                "description": "Optional JSON Schema for structured output. Prefer a top-level object with bounded arrays and source/evidence fields.",
+            },
+        },
+        "required": ["instructions"],
+    },
+}
+
+registry.register(
+    name="web_search_advanced",
+    toolset="web",
+    schema=WEB_SEARCH_ADVANCED_SCHEMA,
+    handler=lambda args, **kw: web_search_advanced_tool(
+        args.get("query", ""),
+        **{k: v for k, v in args.items() if k != "query"},
+    ),
+    check_fn=check_web_api_key,
+    requires_env=_web_requires_env(),
+    emoji="🔎",
+    max_result_size_chars=100_000,
+)
+registry.register(
+    name="exa_agent_run",
+    toolset="web",
+    schema=WEB_AGENT_RUN_SCHEMA,
+    handler=lambda args, **kw: exa_agent_run_tool(
+        args.get("instructions", ""),
+        output_schema=args.get("output_schema"),
+    ),
+    check_fn=check_web_api_key,
+    requires_env=_web_requires_env(),
+    emoji="🧭",
+    max_result_size_chars=100_000,
+)

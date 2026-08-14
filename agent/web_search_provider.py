@@ -209,3 +209,29 @@ class WebSearchProvider(abc.ABC):
             "tag": "",
             "env_vars": [],
         }
+
+    def advanced_search(self, query: str, **kwargs: Any) -> Dict[str, Any]:
+        """Execute an advanced web search with filters (Exa backend).
+
+        Optional capability — providers that implement it (currently Exa)
+        expose the ``web_search_advanced`` tool. The default raises
+        NotImplementedError; callers gate on ``hasattr`` before calling.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support advanced search"
+        )
+
+    def agent_run(
+        self,
+        instructions: str,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Run a multi-step research agent (Exa backend).
+
+        Optional capability — providers that implement it (currently Exa)
+        expose the ``exa_agent_run`` tool. The default raises
+        NotImplementedError; callers gate on ``hasattr`` before calling.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support agent runs"
+        )

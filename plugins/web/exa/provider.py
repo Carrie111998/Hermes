@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from agent.web_search_provider import WebSearchProvider
 
@@ -200,6 +200,164 @@ class ExaWebSearchProvider(WebSearchProvider):
                 {"url": u, "title": "", "content": "", "error": f"Exa extract failed: {exc}"}
                 for u in urls
             ]
+
+    def advanced_search(self, query: str, **kwargs: Any) -> Dict[str, Any]:
+        """Execute an Exa search with the full advanced filter set.
+
+        Mirrors the ``web_search_advanced_exa`` MCP tool natively so the
+        capability works without an MCP server. Accepts the same filters the
+        Exa SDK ``search()`` exposes: ``include_domains``, ``exclude_domains``,
+        ``start_published_date``/``end_published_date``,
+        ``start_crawl_date``/``end_crawl_date``, ``category``, ``type``
+        (auto/fast/instant), ``include_text``/``exclude_text``,
+        ``user_location``, ``num_results``, ``enable_highlights``,
+        ``enable_summary``, and ``subpages``.
+
+        Returns ``{"success": True, "data": {"web": [...], "searchTime": ...}}``
+        on success, ``{"success": False, "error": str}`` on failure.
+        """
+        try:
+            from tools.interrupt import is_interrupted
+
+            if is_interrupted():
+                return {"success": False, "error": "Interrupted"}
+
+            logger.info("Exa advanced search: '%s'", query)
+
+            contents: Dict[str, Any] = {"text": True}
+            if kwargs.get("enable_highlights"):
+                contents["highlights"] = True
+            if kwargs.get("enable_summary"):
+                contents["summary"] = True
+            if kwargs.get("subpages"):
+                contents["subpages"] = int(kwargs["subpages"])
+
+            search_kwargs: Dict[str, Any] = {
+                "num_results": int(kwargs.get("num_results", 10)),
+                "contents": contents,
+            }
+            for key in (
+                "include_domains",
+                "exclude_domains",
+                "start_published_date",
+                "end_published_date",
+                "start_crawl_date",
+                "end_crawl_date",
+                "category",
+                "type",
+                "include_text",
+                "exclude_text",
+                "user_location",
+            ):
+                if kwargs.get(key) is not None:
+                    search_kwargs[key] = kwargs[key]
+
+            response = _get_exa_client().search(query, **search_kwargs)
+
+            web_results = []
+            for i, result in enumerate(response.results or []):
+                highlights = result.highlights or []
+                item: Dict[str, Any] = {
+                    "url": result.url or "",
+                    "title": result.title or "",
+                    "description": " ".join(highlights) if highlights else "",
+                    "position": i + 1,
+                }
+                if kwargs.get("enable_summary"):
+                    item["summary"] = result.summary or ""
+                if kwargs.get("subpages"):
+                    item["subpages"] = result.subpages or []
+                web_results.append(item)
+
+            return {
+                "success": True,
+                "data": {
+                    "web": web_results,
+                    "searchTime": getattr(response, "search_time", None),
+                },
+            }
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+        except ImportError as exc:
+            return {"success": False, "error": f"Exa SDK not installed: {exc}"}
+        except Exception as exc:  # noqa: BLE001 — surface as failure
+            logger.warning("Exa advanced search error: %s", exc)
+            return {"success": False, "error": f"Exa advanced search failed: {exc}"}
+
+    def agent_run(
+        self,
+        instructions: str,
+        *,
+        output_schema: Optional[Dict[str, Any]] = None,
+        model: str = "exa-research-fast",
+        poll_interval: int = 2000,
+        timeout_ms: int = 600000,
+    ) -> Dict[str, Any]:
+        """Run an Exa Agent (multi-step research) natively.
+
+        Mirrors the ``agent_run`` MCP tool. Creates an Agent run on
+        ``/agent/runs`` and polls until it reaches a terminal state, returning
+        the output plus status/cost. ``model`` is accepted for API
+        compatibility; the Agent API derives effort from the run payload.
+        """
+        try:
+            from tools.interrupt import is_interrupted
+
+            if is_interrupted():
+                return {"success": False, "error": "Interrupted"}
+
+            logger.info("Exa agent run: '%s'", instructions)
+            client = _get_exa_client()
+
+            payload: Dict[str, Any] = {"query": instructions}
+            if output_schema is not None:
+                payload["outputSchema"] = output_schema
+
+            created = client.request("/agent/runs", data=payload, method="POST")
+            run_id = created.get("id") or created.get("runId")
+            if not run_id:
+                return {"success": False, "error": f"Agent run creation failed: {created}"}
+
+            import time
+
+            deadline = time.monotonic() + timeout_ms / 1000.0
+            while True:
+                if is_interrupted():
+                    return {"success": False, "error": "Interrupted", "run_id": run_id}
+                status_resp = client.request(
+                    f"/agent/runs/{run_id}", method="GET"
+                )
+                status = status_resp.get("status", "running")
+                if status in ("completed", "succeeded", "failed", "cancelled", "canceled"):
+                    break
+                if time.monotonic() > deadline:
+                    return {
+                        "success": False,
+                        "error": f"Agent run timed out after {timeout_ms}ms",
+                        "run_id": run_id,
+                        "status": status,
+                    }
+                time.sleep(poll_interval / 1000.0)
+
+            result = {
+                "success": status in ("completed", "succeeded"),
+                "run_id": run_id,
+                "status": status,
+                "output": status_resp.get("output"),
+            }
+            if status in ("failed", "cancelled", "canceled"):
+                result["error"] = status_resp.get("error") or f"agent run {status}"
+            cost = status_resp.get("costDollars") or status_resp.get("cost_dollars")
+            if cost is not None:
+                result["cost_dollars"] = cost
+            return result
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+        except ImportError as exc:
+            return {"success": False, "error": f"Exa SDK not installed: {exc}"}
+        except Exception as exc:  # noqa: BLE001 — surface as failure
+            logger.warning("Exa agent run error: %s", exc)
+            return {"success": False, "error": f"Exa agent run failed: {exc}"}
 
     def get_setup_schema(self) -> Dict[str, Any]:
         return {
