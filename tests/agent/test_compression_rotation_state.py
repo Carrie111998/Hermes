@@ -607,6 +607,14 @@ class TestTodoSnapshotMergedNotDuplicated:
 class TestTodoSnapshotScaffoldingTails:
     """Scaffolding tails must never absorb the todo snapshot (#69292)."""
 
+    def test_quoted_todo_header_is_not_stripped_from_user_content(self):
+        from agent.conversation_compression import _strip_stale_todo_snapshot
+        from tools.todo_tool import TODO_INJECTION_HEADER
+
+        content = f"Search the docs for {TODO_INJECTION_HEADER} exactly."
+
+        assert _strip_stale_todo_snapshot(content) == content
+
     def test_legacy_snapshot_is_stripped_before_reinjection(self):
         """A renamed header must not stack stale snapshots from persisted sessions."""
         from agent.conversation_compression import _strip_stale_todo_snapshot

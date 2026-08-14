@@ -1972,7 +1972,10 @@ def _strip_stale_todo_snapshot(content: Any) -> Any:
     from tools.todo_tool import TODO_INJECTION_HEADERS
 
     if isinstance(content, str):
-        indices = [content.find(header) for header in TODO_INJECTION_HEADERS]
+        # Snapshots merged into a real user turn are appended on their own
+        # blank-line-delimited block. Do not treat a user quoting a public
+        # marker in ordinary prose as transport metadata.
+        indices = [content.find(f"\n\n{header}") for header in TODO_INJECTION_HEADERS]
         indices = [idx for idx in indices if idx >= 0]
         if not indices:
             return content
