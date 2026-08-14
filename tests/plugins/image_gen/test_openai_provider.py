@@ -193,7 +193,7 @@ class TestGenerate:
     @pytest.mark.parametrize("aspect,expected_size", [
         ("landscape", "1792x1008"),
         ("square", "1024x1024"),
-        ("portrait", "1024x1536"),
+        ("portrait", "1008x1792"),
     ])
     def test_aspect_ratio_mapping(self, provider, aspect, expected_size):
         fake_client = MagicMock()
