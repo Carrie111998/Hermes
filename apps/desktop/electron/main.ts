@@ -5737,19 +5737,47 @@ async function writeComposerImage(buffer, ext = '.png') {
   return filePath
 }
 
+function clipboardTextExtension(text) {
+  const trimmed = String(text || '').trim()
+
+  if (trimmed[0] !== '{' && trimmed[0] !== '[') {
+    return '.md'
+  }
+
+  try {
+    const value = JSON.parse(trimmed)
+
+    return Array.isArray(value) || (value !== null && typeof value === 'object') ? '.json' : '.md'
+  } catch {
+    return '.md'
+  }
+}
+
+function isFilenameControlCharacter(char) {
+  const code = char.codePointAt(0)
+
+  return code !== undefined && (code < 32 || (code >= 127 && code <= 159))
+}
+
 async function writeComposerText(text) {
   const preview = String(text || '')
     .trim()
     .replace(/\s+/g, ' ')
     .slice(0, 30)
-    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '')
-    .trim()
-  const safePreview = preview.replace(/[. ]+$/, '') || 'clipboard'
+    .replace(/[<>:"/\\|?*]/g, '')
+
+  const safePreview =
+    Array.from(preview)
+      .filter(char => !isFilenameControlCharacter(char))
+      .join('')
+      .trim()
+      .replace(/[. ]+$/, '') || 'clipboard'
+
   const dir = path.join(app.getPath('userData'), 'composer-files')
   await fs.promises.mkdir(dir, { recursive: true })
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').replace('Z', '')
   const random = crypto.randomBytes(3).toString('hex')
-  const filePath = path.join(dir, `${safePreview}_${stamp}_${random}.txt`)
+  const filePath = path.join(dir, `${safePreview}_${stamp}_${random}${clipboardTextExtension(text)}`)
   await fs.promises.writeFile(filePath, text, 'utf8')
 
   return filePath

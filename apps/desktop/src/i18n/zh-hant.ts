@@ -2032,7 +2032,7 @@ export const zhHant = defineLocale({
     folder: '資料夾…',
     images: '圖片…',
     pasteImage: '貼上圖片',
-    pasteAsFile: 'Paste clipboard as file',
+    pasteAsFile: '將剪貼簿內容貼上為檔案',
     url: 'URL…',
     promptSnippets: '提示詞片段…',
     tipPre: '提示：輸入 ',
@@ -2929,7 +2929,7 @@ export const zhHant = defineLocale({
     attachImages: '附加圖片',
     clipboard: '剪貼簿',
     noClipboardImage: '剪貼簿中沒有圖片',
-    noClipboardText: 'No text in clipboard',
+    noClipboardText: '剪貼簿中沒有文字',
     clipboardPasteFailed: '剪貼簿貼上失敗',
     dropFiles: '拖曳檔案',
     handoff: {
