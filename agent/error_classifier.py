@@ -205,6 +205,32 @@ _USAGE_LIMIT_PATTERNS = [
     "key limit exceeded",
 ]
 
+# Patterns that indicate a 429 is actually billing/quota exhaustion, not a
+# transient rate limit.  Some providers return HTTP 429 for hard quota caps
+# — e.g. "you have reached your weekly usage limit, upgrade for higher
+# limits" — which is semantically billing exhaustion: the account cannot
+# serve requests until the quota window resets (days, not seconds).  Without
+# this check the 429 falls through to ``rate_limit``, which retries the same
+# dead credential once before rotating (wasting an API call) and sizes the
+# cooldown as a transient 1-hour TTL instead of the full billing bench.
+#
+# Mirrors the keywords already recognised by
+# ``auxiliary_client._is_payment_error`` so the classifier and the auxiliary
+# client agree on the verdict.
+_429_BILLING_SIGNALS = [
+    "weekly usage limit",
+    "weekly limit",
+    "upgrade for higher limits",
+    "reached your session usage limit",
+    "quota exceeded",
+    "quota_exceeded",
+    "resource exhausted",
+    "too many tokens per day",
+    "daily limit",
+    "tokens per day",
+    "daily quota",
+]
+
 # Patterns confirming usage limit is transient (not billing)
 _USAGE_LIMIT_TRANSIENT_SIGNALS = [
     "try again",
@@ -1213,6 +1239,20 @@ def _classify_by_status(
                 should_rotate_credential=False,
                 should_fallback=True,
                 error_context=ctx,
+            )
+        # Some providers return HTTP 429 for hard quota / billing exhaustion
+        # (e.g. "weekly usage limit", "too many tokens per day",
+        # "resource exhausted").  These are not transient rate limits — the
+        # account cannot serve requests until the quota window resets (hours
+        # or days).  Classify as ``billing`` so the recovery path rotates
+        # immediately instead of retrying the same dead credential, and the
+        # cooldown gets the full billing bench.
+        if any(p in error_msg for p in _429_BILLING_SIGNALS):
+            return result_fn(
+                FailoverReason.billing,
+                retryable=False,
+                should_rotate_credential=True,
+                should_fallback=True,
             )
         return result_fn(
             FailoverReason.rate_limit,

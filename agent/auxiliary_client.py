@@ -3977,10 +3977,30 @@ def _mark_provider_unhealthy(provider: str, ttl: Optional[float] = None) -> None
     """Mark ``provider`` as recently-402'd, hidden from chain iteration
     until the TTL expires. Called from the payment-fallback branches in
     ``call_llm`` and ``acall_llm`` after a confirmed payment error.
+
+    If the provider has a credential pool with other available entries
+    (e.g. a multi-account pool where one account hit a weekly quota but
+    another is healthy), do NOT mark the provider unhealthy.  The pool
+    rotation will handle the per-credential failure; marking the whole
+    provider unhealthy would block the healthy accounts too.
     """
     label = _normalize_chain_label(provider)
     if not label:
         return
+    # Skip marking if the provider's credential pool still has available
+    # entries — the failure is per-account, not provider-wide.
+    try:
+        pool = load_pool(label)
+        if pool and pool.has_available():
+            logger.info(
+                "Auxiliary: NOT marking %s unhealthy — credential pool "
+                "still has available entries (per-account failure, not "
+                "provider-wide). Pool rotation will handle it.",
+                label,
+            )
+            return
+    except Exception:
+        pass  # No pool or pool check failed — fall through to marking
     expires_at = time.time() + (ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS)
     _aux_unhealthy_until[label] = expires_at
     logger.warning(
