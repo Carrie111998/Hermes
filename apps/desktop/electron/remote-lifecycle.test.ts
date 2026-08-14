@@ -16,6 +16,7 @@ import {
   openForward,
   ownershipDirectory,
   pidIsOurDashboard,
+  probeRemoteHermesHome,
   probeRemotePlatform,
   PROTOCOL_VERSION,
   readLockfile,
@@ -58,13 +59,19 @@ function fakeSsh(rules: any[] = []) {
   return {
     calls,
     async exec(cmd) {
-      calls.push(cmd)
+      // Lifecycle commands are wrapped in a portable POSIX-shell transport.
+      // Expose the decoded payload too so existing behavioral matchers keep
+      // asserting the command they are meant to cover.
+      const encoded = /printf %s ([A-Za-z0-9+/=]+)/.exec(cmd)?.[1]
+      const visibleCommand = encoded ? `${cmd}\n${Buffer.from(encoded, 'base64').toString('utf8')}` : cmd
+
+      calls.push(visibleCommand)
 
       for (const [matcher, resp] of rules) {
-        const hit = typeof matcher === 'function' ? matcher(cmd) : matcher.test(cmd)
+        const hit = typeof matcher === 'function' ? matcher(visibleCommand) : matcher.test(visibleCommand)
 
         if (hit) {
-          const out = typeof resp === 'function' ? resp(cmd) : resp
+          const out = typeof resp === 'function' ? resp(visibleCommand) : resp
 
           if (out instanceof Error) {
             throw out
@@ -207,6 +214,14 @@ test('probeRemotePlatform rejects unsupported remote platforms', async () => {
       return true
     }
   )
+})
+
+test('remote-home discovery runs through POSIX sh for Fish login shells', async () => {
+  const ssh = fakeSsh([[/base64/, '/Users/rook/.hermes\n']])
+
+  assert.equal(await probeRemoteHermesHome(ssh), '/Users/rook/.hermes')
+  assert.match(ssh.calls[0], /^\/bin\/sh -lc /)
+  assert.match(ssh.calls[0], /base64/)
 })
 
 test('ownership paths are isolated by ownership ID and spawn nonce', () => {
@@ -861,21 +876,23 @@ test('spawnRemoteDashboard streams the token over stdin, not argv/env', async ()
   const ssh = {
     calls,
     async exec(cmd, opts?) {
-      calls.push(cmd)
+      const encoded = /printf %s ([A-Za-z0-9+/=]+)/.exec(cmd)?.[1]
+      const visibleCommand = encoded ? `${cmd}\n${Buffer.from(encoded, 'base64').toString('utf8')}` : cmd
+      calls.push(visibleCommand)
 
       if (opts?.stdinData) {
         stdinCalls.push(opts.stdinData)
       }
 
-      if (/grep -q ssh-session-token-file/.test(cmd)) {
+      if (/grep -q ssh-session-token-file/.test(visibleCommand)) {
         return 'YES\n'
       }
 
-      if (/python3 -c/.test(cmd)) {
+      if (/python3 -c/.test(visibleCommand)) {
         return ''
       }
 
-      if (/setsid|nohup/.test(cmd)) {
+      if (/setsid|nohup/.test(visibleCommand)) {
         return '4242\n'
       }
 
@@ -912,17 +929,19 @@ test('spawnRemoteDashboard upload uses exclusive-create and O_NOFOLLOW', async (
   const ssh = {
     calls,
     async exec(cmd, opts?) {
-      calls.push(cmd)
+      const encoded = /printf %s ([A-Za-z0-9+/=]+)/.exec(cmd)?.[1]
+      const visibleCommand = encoded ? `${cmd}\n${Buffer.from(encoded, 'base64').toString('utf8')}` : cmd
+      calls.push(visibleCommand)
 
-      if (/grep -q ssh-session-token-file/.test(cmd)) {
+      if (/grep -q ssh-session-token-file/.test(visibleCommand)) {
         return 'YES\n'
       }
 
-      if (/python3 -c/.test(cmd)) {
+      if (/python3 -c/.test(visibleCommand)) {
         return ''
       }
 
-      if (/setsid|nohup/.test(cmd)) {
+      if (/setsid|nohup/.test(visibleCommand)) {
         return '4242\n'
       }
 
