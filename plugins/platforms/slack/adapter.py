@@ -7917,6 +7917,7 @@ class SlackAdapter(BasePlatformAdapter):
         provenance_thread_ts: str = "",
         provenance_trigger_ts: str = "",
         provenance_uploader_id: str = "",
+        provenance_uploader_kind: str = "",
         provenance_uploader_trust: str = "",
     ) -> _SlackAttachmentResolution:
         """Resolve, download, cache, and describe Slack file objects.
@@ -8143,6 +8144,7 @@ class SlackAdapter(BasePlatformAdapter):
                         "thread_ts": provenance_thread_ts,
                         "trigger_ts": provenance_trigger_ts or None,
                         "uploader_id": provenance_uploader_id or None,
+                        "uploader_kind": provenance_uploader_kind or "unknown",
                         "uploader_trust": provenance_uploader_trust or "unknown",
                     }
                     result.provenance.append(
@@ -8199,21 +8201,40 @@ class SlackAdapter(BasePlatformAdapter):
 
         root_user_id = _safe_slack_actor_id(root.get("user"))
         is_bot_root = bool(root.get("bot_id")) or root.get("subtype") == "bot_message"
-        if is_bot_root:
-            uploader_trust = "bot"
+        uploader_kind = "bot" if is_bot_root else "user"
+        self_bot_uid = (
+            self._team_bot_user_ids.get(team_id) if team_id else None
+        ) or self._bot_user_id
+        is_self_bot_root = bool(
+            is_bot_root and root_user_id and self_bot_uid and root_user_id == self_bot_uid
+        )
+        root_authorized: Optional[bool] = None
+        if is_self_bot_root:
+            uploader_trust = "self_bot"
         else:
             root_authorized = self._is_sender_authorized(
                 root_user_id or None,
                 chat_type="thread",
                 chat_id=channel_id,
             )
-            if root_authorized is False:
+            # Third-party bot payloads do not inherit the text-context bot
+            # bypass: unlike a labelled text line, downloaded media enters the
+            # current turn as ordinary multimodal input. Require explicit
+            # allowlist authorization for those bot users. Human roots retain
+            # legacy behavior only when no authorization check is configured.
+            should_block = (
+                is_bot_root and root_authorized is not True
+            ) or (
+                not is_bot_root and root_authorized is False
+            )
+            if should_block:
+                sender_label = "unverified bot sender" if is_bot_root else "unverified sender"
                 result = _SlackAttachmentResolution(
                     file_ids=seen_file_ids if seen_file_ids is not None else set(),
                     sha256s=seen_sha256s if seen_sha256s is not None else set(),
                 )
                 result.notices.append(
-                    "Thread-root attachments from an unverified sender were not downloaded and are not available to this turn. Treat their [unverified] file markers as background only."
+                    f"Thread-root attachments from an {sender_label} were not downloaded and are not available to this turn. Treat their file markers as background only."
                 )
                 result.provenance.append(
                     "- "
@@ -8224,6 +8245,7 @@ class SlackAdapter(BasePlatformAdapter):
                             "thread_ts": thread_ts,
                             "trigger_ts": trigger_ts or None,
                             "uploader_id": root_user_id or None,
+                            "uploader_kind": uploader_kind,
                             "uploader_trust": "unverified",
                         },
                         ensure_ascii=True,
@@ -8246,6 +8268,7 @@ class SlackAdapter(BasePlatformAdapter):
             provenance_thread_ts=thread_ts,
             provenance_trigger_ts=trigger_ts,
             provenance_uploader_id=root_user_id,
+            provenance_uploader_kind=uploader_kind,
             provenance_uploader_trust=uploader_trust,
         )
 

@@ -4294,12 +4294,22 @@ class TestThreadAttachmentContext:
             "team": "T_TEAM",
         }
 
-    def _replies(self, root_files=None, mid_files=None, root_text="Latest revenue chart"):
+    def _replies(
+        self,
+        root_files=None,
+        mid_files=None,
+        root_text="Latest revenue chart",
+        root_user="U_ALICE",
+        root_bot_id=None,
+    ):
         root = {
             "ts": "123.000",
-            "user": "U_ALICE",
+            "user": root_user,
             "text": root_text,
         }
+        if root_bot_id is not None:
+            root["bot_id"] = root_bot_id
+            root["subtype"] = "bot_message"
         if root_files is not None:
             root["files"] = root_files
         mid = {"ts": "123.100", "user": "U_ALICE", "text": "context reply"}
@@ -4517,6 +4527,75 @@ class TestThreadAttachmentContext:
         msg_event = a.handle_message.await_args.args[0]
         assert "[Slack attachment notice]" not in msg_event.text
         assert "[Slack thread-root attachment provenance]" not in msg_event.channel_context
+
+    @pytest.mark.asyncio
+    async def test_unverified_third_party_bot_root_attachment_is_not_hydrated(
+        self, adapter_with_session_store
+    ):
+        a = self._prep(adapter_with_session_store)
+        a.set_authorization_check(
+            lambda user_id, chat_type=None, chat_id=None: user_id == "U_USER"
+        )
+        a._download_slack_file_bytes = AsyncMock(return_value=b"%PDF-1.7\n")
+        a._app.client.conversations_replies = self._replies(
+            root_user="U_EXTERNAL_BOT",
+            root_bot_id="B_EXTERNAL",
+            root_files=[
+                {
+                    "id": "F_BOT_UNVERIFIED",
+                    "name": "bot-instructions.pdf",
+                    "mimetype": "application/pdf",
+                    "size": 1024,
+                    "url_private_download": "https://files.slack.com/T1-FBOT/file.pdf",
+                }
+            ],
+        )
+
+        await a._handle_slack_message(self._thread_event())
+
+        msg_event = a.handle_message.await_args.args[0]
+        assert msg_event.media_urls == []
+        assert "unverified bot sender" in msg_event.text
+        assert '"status": "blocked_unverified_sender"' in msg_event.channel_context
+        assert '"uploader_id": "U_EXTERNAL_BOT"' in msg_event.channel_context
+        assert '"uploader_kind": "bot"' in msg_event.channel_context
+        assert '"uploader_trust": "unverified"' in msg_event.channel_context
+        a._download_slack_file_bytes.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_self_bot_root_attachment_remains_trusted(
+        self, adapter_with_session_store
+    ):
+        a = self._prep(adapter_with_session_store)
+        a.set_authorization_check(
+            lambda user_id, chat_type=None, chat_id=None: user_id == "U_USER"
+        )
+        a._download_slack_file_bytes = AsyncMock(return_value=b"%PDF-1.7\n")
+        a._app.client.conversations_replies = self._replies(
+            root_user="U_BOT",
+            root_bot_id="B_SELF",
+            root_files=[
+                {
+                    "id": "F_SELF_BOT",
+                    "name": "generated.pdf",
+                    "mimetype": "application/pdf",
+                    "size": 1024,
+                    "url_private_download": "https://files.slack.com/T1-FSELF/file.pdf",
+                }
+            ],
+        )
+
+        with patch(
+            "plugins.platforms.slack.adapter.cache_document_from_bytes",
+            return_value="/tmp/generated.pdf",
+        ):
+            await a._handle_slack_message(self._thread_event())
+
+        msg_event = a.handle_message.await_args.args[0]
+        assert msg_event.media_urls == ["/tmp/generated.pdf"]
+        assert '"uploader_id": "U_BOT"' in msg_event.channel_context
+        assert '"uploader_kind": "bot"' in msg_event.channel_context
+        assert '"uploader_trust": "self_bot"' in msg_event.channel_context
 
     @pytest.mark.asyncio
     async def test_slack_connect_root_stub_resolves_before_download(
@@ -4858,6 +4937,7 @@ class TestThreadAttachmentContext:
         assert '\"declared_size\": 1024' in context
         assert '\"downloaded_size\": 9' in context
         assert '\"uploader_id\": \"U_ALICE\"' in context
+        assert '\"uploader_kind\": \"user\"' in context
         assert '\"uploader_trust\": \"authorized\"' in context
         assert "url_private" not in context
         assert "https://" not in context
