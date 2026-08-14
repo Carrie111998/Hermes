@@ -386,6 +386,10 @@ while not os.path.exists(os.environ['P_STOP_FILE']):
         """#!/usr/bin/env python3
 import os, sys
 args = sys.argv[1:]
+unit = next((arg.split('=', 1)[1] for arg in args if arg.startswith('--unit=')), '')
+if unit.startswith('hermes-kanban-isolation-probe-'):
+ print(f'0::/user.slice/user@1000.service/app.slice/{unit}.scope')
+ raise SystemExit(0)
 for arg in args:
  if arg.startswith('--setenv='):
   key, value = arg[len('--setenv='):].split('=', 1)
