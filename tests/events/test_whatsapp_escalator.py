@@ -858,6 +858,66 @@ class TestCredentialLoss:
         assert "creds.json 0 bytes" in msg
 
 
+class TestModelRateLimitedMessage:
+    """2026-08-14: MODEL_RATE_LIMITED landed with routing + an icon but NO arm
+    in format_message, so a real live-fire page rendered as the generic
+    key:value dump ("model_rate_limited: provider: deepseek · model: ... ·
+    outcome: chain_exhausted"). Same sibling-table drift class events/coverage.py
+    documents. These pin the plain-English wording — and specifically that the
+    two ACT outcomes stay worded APART, because their remedy differs."""
+
+    @staticmethod
+    def _ev(outcome, **over):
+        payload = {"provider": "deepseek", "model": "deepseek-v4-pro",
+                   "reason": "rate_limit", "detector": "runtime",
+                   "outcome": outcome, "fallback_provider": "openai-codex",
+                   "fallback_model": "gpt-5.6-sol", "resets_at": "",
+                   "diverted_calls": 52, "episode_opened_at": "x"}
+        payload.update(over)
+        return Event.create(event_type=EventType.MODEL_RATE_LIMITED,
+                            source="agent-loop", payload=payload)
+
+    def _msg(self, bus, quiet_config, queue_path, outcome, **over):
+        escalator = WhatsAppEscalator(bus, quiet_config_path=quiet_config,
+                                      queue_path=queue_path)
+        return escalator.format_message(self._ev(outcome, **over))
+
+    def test_diverted_names_the_model_that_absorbed_the_traffic(self, bus, quiet_config, queue_path):
+        msg = self._msg(bus, quiet_config, queue_path, "diverted")
+        assert "deepseek-v4-pro" in msg
+        assert "gpt-5.6-sol" in msg
+        assert "52" in msg
+
+    def test_chain_exhausted_says_runs_are_failing(self, bus, quiet_config, queue_path):
+        msg = self._msg(bus, quiet_config, queue_path, "chain_exhausted")
+        assert "runs are failing" in msg
+        assert "every fallback is exhausted" in msg
+
+    def test_no_fallback_names_the_different_remedy(self, bus, quiet_config, queue_path):
+        """chain_exhausted = wait it out; no_fallback = go configure one.
+        Collapsing these into one string loses the only actionable difference."""
+        msg = self._msg(bus, quiet_config, queue_path, "no_fallback")
+        assert "NO fallback configured" in msg
+        assert "Add a fallback provider" in msg
+        assert "every fallback is exhausted" not in msg
+
+    def test_recovered_reads_as_closure(self, bus, quiet_config, queue_path):
+        msg = self._msg(bus, quiet_config, queue_path, "recovered")
+        assert "is back" in msg
+
+    def test_reset_time_is_surfaced_when_known(self, bus, quiet_config, queue_path):
+        msg = self._msg(bus, quiet_config, queue_path, "chain_exhausted",
+                        resets_at="2026-08-15T00:30:00+00:00")
+        assert "Resets 2026-08-15T00:30:00+00:00" in msg
+
+    def test_never_falls_back_to_the_raw_payload_dump(self, bus, quiet_config, queue_path):
+        """The regression this class exists for."""
+        for outcome in ("diverted", "chain_exhausted", "no_fallback", "recovered"):
+            msg = self._msg(bus, quiet_config, queue_path, outcome)
+            assert "detector: runtime" not in msg, f"{outcome} fell through to the generic dump"
+            assert "model_rate_limited:" not in msg
+
+
 class TestDeliveryFailureRequeue:
     """2026-07-11 hardening: failed sends are requeued into the bounded
     quiet queue instead of being dropped (observed loss 2026-07-11 11:29,
