@@ -13,12 +13,11 @@
 - **Working checkout:** `D:/PROJECT/Hermes`.
 - **Canonical remote:** `origin` -> `git@github.com:cwliao/hermes-agent.git`.
 - **Canonical mainline:** `origin/main` at
-  `6a225b43502463e0e21e305a96b456444b82017c`.
+  `7018f93aaee7aa0319ee342ea860ad90da206c9b`.
 - **Current checkout branch:** `ticket/hermes-reliability-002`.
-- **Current checkout HEAD:**
-  `7e78039c97173d59413826f0cc09fe88b461ce99` (`feat: add safe Claude remote
-  recovery`). The branch name is historical and must not be treated as proof
-  that HERMES-RELIABILITY-002 is complete.
+- **Current checkout HEAD:** `9f3755c42` (`fix: register Claude recovery
+  builtin`) on the historical ticket branch. The canonical integrated state is
+  `origin/main=7018f93aa`; do not infer mainline status from the ticket branch.
 - **DGX runtime:** host `140.96.58.171`, checkout
   `/home/cwliao/.hermes/hermes-agent`, service `hermes-gateway.service`.
 - **In scope:** Hermes CLI, gateway, runtime state, platform adapters, CI,
@@ -29,36 +28,34 @@
 
 ## 2. Goal and roadmap
 
-- **Current goal:** Advance `HERMES-CLAUDE-RECOVERY-001` through its CI/PR gate
-  after resolving the external review blocker, without repurposing the existing
-  KLIB Claude session; then reconcile older pending tickets before `ARCH-002`.
+- **Current goal:** Preserve the verified merged/deployed state of
+  `HERMES-CLAUDE-RECOVERY-001` and move to the next independently reviewed
+  ticket, without repurposing the existing KLIB Claude session.
 - **Completed and verified:** CI baseline and earlier ARCH-001 work are on the
   recorded mainline history; Telegram controlled execution reached PR #10 and
   passed CI run `31571694814`; HERMES-AUTH-001's bounded DGX SSH probe reached
   the host without mutating runtime data.
-- **Active, pending CI:** HERMES-CLAUDE-RECOVERY-001 has the scoped commit
-  `7e78039c` plus an uncommitted polling-status correction. Independent Claude
-  and AGY re-review both returned `PASS` on the same bounded packet, so the
-  external-review blocker is resolved. It has no PR and is not merged,
-  deployed, or enabled as a scheduled task.
+- **Completed and deployed:** HERMES-CLAUDE-RECOVERY-001 merged as PR #12 at
+  `7018f93aa` after CI run `31768361031` passed. DGX now runs the immutable
+  release snapshot `v2026.8.14-hermes-claude-recovery-7018f93aa`; no
+  Hermes-scoped scheduled task was enabled.
 - **Deferred or pending:** HERMES-MONITORING-001 remains `BLOCKED`;
   HERMES-AUTH-001 and HERMES-RELIABILITY-002 remain
   `IMPLEMENTED_PENDING_REVIEW`. Live skill synchronization, SkillClaw work,
   and unrelated DGX service changes remain separate work.
-- **Next candidates after this ticket's remaining CI/merge gates:** complete the
-  required independent reviews and reconciliation for the pending tickets,
-  then advance `ARCH-002`. Do not promote a candidate to active work without
-  its ticket and acceptance gates.
+- **Next candidates:** complete the required independent reviews and
+  reconciliation for pending tickets, then advance `ARCH-002`. Do not promote
+  a candidate to active work without its ticket and acceptance gates.
 
 ## 3. Verified runtime and deployment state
 
-- **Mainline versus deployed code:** mainline is `6a225b4`; the recorded DGX
-  release is the older Telegram-controlled snapshot
-  `/home/cwliao/.hermes/releases/v2026.8.12-telegram-controlled-af99f0f1ad`,
-  selected through `24-telegram-controlled-execution.conf`. A running DGX
-  service is not evidence that the current ticket is deployed.
-- **DGX service evidence:** `hermes-gateway.service` was recorded active with
-  MainPID `4109761`, exit status `0`, and `NRestarts=0`.
+- **Mainline versus deployed code:** mainline is `7018f93aa`; DGX uses
+  `/home/cwliao/.hermes/releases/v2026.8.14-hermes-claude-recovery-7018f93aaee`
+  selected through `25-hermes-claude-recovery-7018f93aa.conf`. The live
+  checkout remains untouched.
+- **DGX service evidence:** `hermes-gateway.service` is active/running with
+  MainPID `1969858`, exit status `0`, and `NRestarts=0`; cwd and `PYTHONPATH`
+  match the release snapshot and the new PID has no Traceback/ERROR logs.
 - **Telegram evidence:** the gateway was active or attempting connection, but
   end-to-end Telegram readiness/polling was not confirmed in the observed
   window.
@@ -73,22 +70,21 @@
 ### Current ticket: HERMES-CLAUDE-RECOVERY-001
 
 - **Plan:** `docs/plans/2026-08-14-hermes-claude-recovery-001-auto.md`
-- **Status:** `IMPLEMENTED_PENDING_CI`; the external-review blocker is resolved.
+- **Status:** `MERGED_DEPLOYED`.
 - **Scope:** opt-in native-Windows `hermes claude-recovery status|repair`;
   disabled and empty by default; no task creation, OAuth, kill/restart,
   DGX mutation, Telegram watchdog, or LLM watchdog.
-- **Evidence:** 44 original focused/regression tests plus 1 correction test
-  passed in the managed environment. Ruff, `py_compile`, diff checks, isolated
-  CLI smoke, local security review, and local operations review passed.
-  Independent Claude and AGY re-review both returned `PASS` on the same bounded
-  read-only packet after the correction; consensus was reached. Live readiness
-  remains unverified because no Hermes-scoped task is configured or enabled.
-- **Required next action:** run the CI/PR gate for the corrected implementation.
-  Do not create a new headless session, repurpose the KLIB-scoped session,
-  inject a guessed TTY, or bypass approval and permission boundaries.
-- **Repository state:** commit `7e78039c` is pushed, while the polling
-  correction and its test are currently uncommitted. The worktree also contains
-  unrelated dirty changes that must be preserved.
+- **Evidence:** 45 local tests passed; GitHub CI run `31768361031` passed all
+  required checks; Claude and AGY independent review consensus is `PASS/PASS`.
+  DGX snapshot, systemd drop-in, compile, service state, cwd/PYTHONPATH, and
+  new-PID log evidence are verified. Live Telegram readiness remains
+  unverified and no Hermes-scoped task is configured or enabled.
+- **Required next action:** select the next ticket; do not create a new
+  headless session, repurpose the KLIB-scoped session, inject a guessed TTY, or
+  bypass approval and permission boundaries.
+- **Repository state:** PR #12 is merged; the current checkout contains only
+  the follow-up documentation changes plus unrelated pre-existing dirty work
+  that must be preserved.
 
 ### Other ticket state
 
@@ -104,7 +100,8 @@
 Ticket implementation, local tests, independent cross-review, reconciliation,
 CI, merge, DGX deployment, runtime health, and Telegram delivery are separate
 gates. A pass at one gate cannot be reported as a pass at another. The current
-ticket cannot be called complete while its external review is blocked.
+ticket is complete for this implementation/deployment scope; Telegram
+readiness and future ticket gates remain separate.
 
 ## 5. Safe continuation instructions
 
@@ -119,8 +116,7 @@ ticket cannot be called complete while its external review is blocked.
    session: DGX Spark first, then local WSL, then native Windows. A headless
    fallback is allowed only after those candidates are unavailable and a
    bounded preflight proves it is authenticated and usable.
-6. Do not merge or deploy HERMES-CLAUDE-RECOVERY-001 until its CI, PR review,
-   merge, and deployment gates are separately passed. Do not change DGX runtime
-   state without a reviewed deployment gate and rollback evidence.
+6. Do not change DGX runtime state without a reviewed deployment gate and
+   rollback evidence; the current release already has both.
 7. Before ending the next session, refresh this handover with verified facts
    only, including the exact next action and any remaining gate.
