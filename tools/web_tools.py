@@ -353,13 +353,15 @@ def _is_backend_available(backend: str) -> bool:
 
 
 def _ddgs_package_importable() -> bool:
-    """Return True when the ``ddgs`` Python package can be imported.
+    """Return True when the platform's bundled DDG transport is available.
 
-    ddgs is the only backend whose availability is driven by a package
-    presence rather than an env var / config entry.  Wrapped in a helper
-    so auto-detect and ``_is_backend_available`` share the same check
-    (and tests can monkeypatch a single symbol).
+    Termux uses the provider's core-httpx fallback because ``ddgs`` aborts in
+    native ``primp`` code there. Other platforms require the optional package.
     """
+    from hermes_constants import is_termux
+
+    if is_termux():
+        return True
     try:
         import ddgs  # noqa: F401
         return True

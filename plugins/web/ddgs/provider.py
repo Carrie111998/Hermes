@@ -25,9 +25,12 @@ import os
 import subprocess
 import sys
 import time
+from html.parser import HTMLParser
 from typing import Any, Dict, Optional
+from urllib.parse import parse_qs, urljoin, urlparse
 
 from agent.web_search_provider import WebSearchProvider
+from hermes_constants import is_termux
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +52,81 @@ class _SearchInterrupted(Exception):
     """Raised when tools.interrupt.is_interrupted() trips during a search wait."""
 
 
+_DDG_HTML_ENDPOINT = "https://html.duckduckgo.com/html/"
+
+
+def _decode_ddg_url(href: str) -> str:
+    """Return the destination hidden inside DDG's redirect wrapper."""
+    absolute = urljoin(_DDG_HTML_ENDPOINT, href)
+    parsed = urlparse(absolute)
+    if parsed.hostname in {"duckduckgo.com", "www.duckduckgo.com"}:
+        destination = parse_qs(parsed.query).get("uddg")
+        if destination:
+            return destination[0]
+    return absolute
+
+
+class _DDGHTMLParser(HTMLParser):
+    """Extract the result fields emitted by DuckDuckGo's HTML endpoint."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(convert_charrefs=True)
+        self.limit = limit
+        self.results: list[dict[str, Any]] = []
+        self._field: Optional[str] = None
+        self._depth = 0
+        self._current: Optional[dict[str, Any]] = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        attributes = dict(attrs)
+        classes = set((attributes.get("class") or "").split())
+        if tag == "a" and "result__a" in classes and len(self.results) < self.limit:
+            href = attributes.get("href") or ""
+            self._current = {
+                "title": "",
+                "url": _decode_ddg_url(href),
+                "description": "",
+                "position": len(self.results) + 1,
+            }
+            self.results.append(self._current)
+            self._field = "title"
+            self._depth = 1
+        elif "result__snippet" in classes and self._current is not None:
+            self._field = "description"
+            self._depth = 1
+        elif self._field:
+            self._depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self._field:
+            return
+        self._depth -= 1
+        if self._depth == 0:
+            self._field = None
+
+    def handle_data(self, data: str) -> None:
+        if self._field and self._current is not None:
+            current = str(self._current[self._field])
+            self._current[self._field] = f"{current} {data}".strip()
+
+
+def _run_ddg_html_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
+    """Search DDG without the Android-incompatible ``primp`` transport."""
+    import httpx
+
+    response = httpx.post(
+        _DDG_HTML_ENDPOINT,
+        data={"q": query},
+        headers={"User-Agent": "Mozilla/5.0 (compatible; Hermes-Agent/1.0)"},
+        follow_redirects=True,
+        timeout=10,
+    )
+    response.raise_for_status()
+    parser = _DDGHTMLParser(safe_limit)
+    parser.feed(response.text)
+    return parser.results
+
+
 def _run_ddgs_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
     """Run the blocking ddgs query and return normalized hits.
 
@@ -57,6 +135,9 @@ def _run_ddgs_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
     each individual HTTP request; the overall wall-clock cap is enforced by
     the parent via process timeout (#68096).
     """
+    if is_termux():
+        return _run_ddg_html_search(query, safe_limit)
+
     from ddgs import DDGS  # type: ignore
 
     results: list[dict[str, Any]] = []
@@ -281,12 +362,14 @@ class DDGSWebSearchProvider(WebSearchProvider):
         return "DuckDuckGo (ddgs)"
 
     def is_available(self) -> bool:
-        """Return True when the ``ddgs`` package is importable.
+        """Return True when the active platform's transport is available.
 
-        Probes the import once; cheap because Python caches the import. Must
-        NOT perform network I/O — runs at tool-registration time and on every
-        ``hermes tools`` paint.
+        Termux uses core ``httpx``; other platforms probe ``ddgs`` once. Must
+        not perform network I/O because this runs during tool registration and
+        on every ``hermes tools`` paint.
         """
+        if is_termux():
+            return True
         try:
             import ddgs  # noqa: F401
 
@@ -307,13 +390,14 @@ class DDGSWebSearchProvider(WebSearchProvider):
         a hard wall-clock timeout (``_SEARCH_TIMEOUT_SECS``) so a hung native
         ``primp`` call cannot freeze the Hermes process (#36776, #68096).
         """
-        try:
-            import ddgs  # type: ignore  # noqa: F401 — availability probe
-        except ImportError:
-            return {
-                "success": False,
-                "error": "ddgs package is not installed — run `pip install ddgs`",
-            }
+        if not is_termux():
+            try:
+                import ddgs  # type: ignore  # noqa: F401 — availability probe
+            except ImportError:
+                return {
+                    "success": False,
+                    "error": "ddgs package is not installed — run `pip install ddgs`",
+                }
 
         # DDGS().text yields at most `max_results` items; we cap defensively
         # in case the package ignores the hint.
@@ -351,12 +435,13 @@ class DDGSWebSearchProvider(WebSearchProvider):
         return {"success": True, "data": {"web": web_results}}
 
     def get_setup_schema(self) -> Dict[str, Any]:
-        return {
+        schema = {
             "name": "DuckDuckGo (ddgs)",
             "badge": "free · no key · search only",
-            "tag": "Search via the ddgs Python package — no API key (pair with any extract provider)",
+            "tag": "Search DuckDuckGo without an API key (pair with any extract provider)",
             "env_vars": [],
-            # Trigger `_run_post_setup("ddgs")` after the user picks this row
-            # so the ddgs Python package gets pip-installed on first selection.
-            "post_setup": "ddgs",
         }
+        if not is_termux():
+            # The Android fallback uses core httpx; primp aborts under Termux.
+            schema["post_setup"] = "ddgs"
+        return schema

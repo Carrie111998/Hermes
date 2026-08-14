@@ -88,8 +88,65 @@ class TestDDGSProviderIsConfigured:
         from plugins.web.ddgs.provider import DDGSWebSearchProvider
         assert issubclass(DDGSWebSearchProvider, WebSearchProvider)
 
+    def test_termux_is_available_without_ddgs_and_skips_installer(self, monkeypatch):
+        import plugins.web.ddgs.provider as prov
+
+        monkeypatch.setattr(prov, "is_termux", lambda: True)
+
+        provider = prov.DDGSWebSearchProvider()
+        assert provider.is_available() is True
+        assert "post_setup" not in provider.get_setup_schema()
+
 
 class TestDDGSProviderSearch:
+    def test_termux_uses_html_transport_without_importing_ddgs(self, monkeypatch):
+        import plugins.web.ddgs.provider as prov
+
+        monkeypatch.setattr(prov, "is_termux", lambda: True)
+        monkeypatch.setitem(sys.modules, "ddgs", None)
+        monkeypatch.setattr(
+            prov,
+            "_run_ddgs_search_bounded",
+            lambda query, safe_limit: [{"title": query, "position": safe_limit}],
+        )
+
+        result = prov.DDGSWebSearchProvider().search("termux query", limit=3)
+
+        assert result == {
+            "success": True,
+            "data": {"web": [{"title": "termux query", "position": 3}]},
+        }
+
+    def test_html_parser_decodes_redirects_and_normalizes_text(self):
+        from plugins.web.ddgs.provider import _DDGHTMLParser
+
+        parser = _DDGHTMLParser(limit=1)
+        parser.feed(
+            '<div class="result"><a class="result__a" '
+            'href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa%3Fx%3D1">'
+            '<b>Example</b> &amp; result</a>'
+            '<a class="result__snippet">A <b>useful</b> description.</a></div>'
+            '<a class="result__a" href="https://ignored.example">Ignored</a>'
+        )
+
+        assert parser.results == [{
+            "title": "Example & result",
+            "url": "https://example.com/a?x=1",
+            "description": "A useful description.",
+            "position": 1,
+        }]
+
+    def test_termux_worker_dispatches_to_html_transport(self, monkeypatch):
+        import plugins.web.ddgs.provider as prov
+
+        expected = [{"title": "hit"}]
+        monkeypatch.setattr(prov, "is_termux", lambda: True)
+        monkeypatch.setattr(
+            prov, "_run_ddg_html_search", lambda query, limit: expected
+        )
+
+        assert prov._run_ddgs_search("q", 2) is expected
+
     def test_happy_path_normalizes_results(self, monkeypatch):
         _install_fake_ddgs(monkeypatch, text_results=[
             {"title": "A", "href": "https://a.example.com", "body": "desc A"},
@@ -233,6 +290,15 @@ class TestDDGSProcessIsolation:
 
 
 class TestDDGSBackendWiring:
+    def test_termux_backend_available_without_ddgs(self, monkeypatch):
+        from tools import web_tools
+
+        monkeypatch.setitem(sys.modules, "ddgs", None)
+        monkeypatch.setattr("hermes_constants.is_termux", lambda: True)
+
+        assert web_tools._ddgs_package_importable() is True
+        assert web_tools._is_backend_available("ddgs") is True
+
     def test_is_backend_available_true_when_package_importable(self, monkeypatch):
         from tools import web_tools
         monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: True)
