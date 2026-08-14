@@ -12,21 +12,54 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
 EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
+_IMPORT_EXECUTIONS_FILE = EXECUTIONS_FILE
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
 
+def _current_executions_file() -> Path:
+    """Resolve the ledger path at call time from the ACTIVE cron store.
+
+    The jobs store already resolves its paths dynamically
+    (``cron.jobs._current_cron_store``): an explicit ``use_cron_store()``
+    override wins, then deliberately re-pointed module constants, then the
+    ACTIVE profile home resolved fresh. The ledger must follow the same
+    store or it silently writes to the import-time home after a
+    profile/store context switch (#82651).
+
+    Precedence, most explicit first:
+
+    1. an active ``use_cron_store()`` override (ContextVar) — its cron dir
+       owns the ledger;
+    2. a deliberately re-pointed ``EXECUTIONS_FILE`` module constant — the
+       documented compatibility surface tests/embedders use to redirect the
+       ledger without touching the jobs store;
+    3. the ACTIVE profile home, resolved fresh via ``get_hermes_home()``, so
+       a HERMES_HOME switch after import reads/writes the new home's ledger;
+    4. the import-time constant (home unchanged since import).
+    """
+    from cron.jobs import _cron_store_override, _current_cron_store
+
+    if _cron_store_override.get() is not None:
+        return _current_cron_store().cron_dir / "executions.db"
+    if EXECUTIONS_FILE != _IMPORT_EXECUTIONS_FILE:
+        return EXECUTIONS_FILE
+    return _current_cron_store().cron_dir / "executions.db"
+
+
 def _connect() -> sqlite3.Connection:
-    EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(EXECUTIONS_FILE, timeout=5)
+    path = _current_executions_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(path, timeout=5)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
