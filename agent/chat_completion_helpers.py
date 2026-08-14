@@ -1439,7 +1439,11 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             messages=_msgs_for_codex,
             tools=tools_for_api,
             reasoning_config=agent.reasoning_config,
-            session_id=getattr(agent, "session_id", None),
+            session_id=(
+                None
+                if getattr(agent, "_isolated_runtime", False)
+                else getattr(agent, "session_id", None)
+            ),
             base_url=agent.base_url,
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
@@ -1548,7 +1552,11 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             max_tokens_param_fn=agent._max_tokens_param,
             reasoning_config=agent.reasoning_config,
             request_overrides=agent.request_overrides,
-            session_id=getattr(agent, "session_id", None),
+            session_id=(
+                None
+                if getattr(agent, "_isolated_runtime", False)
+                else getattr(agent, "session_id", None)
+            ),
             provider_profile=_profile,
             ollama_num_ctx=agent._ollama_num_ctx,
             # Context forwarded to profile hooks:
@@ -1580,7 +1588,11 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         max_tokens_param_fn=agent._max_tokens_param,
         reasoning_config=agent.reasoning_config,
         request_overrides=agent.request_overrides,
-        session_id=getattr(agent, "session_id", None),
+        session_id=(
+            None
+            if getattr(agent, "_isolated_runtime", False)
+            else getattr(agent, "session_id", None)
+        ),
         model_lower=(agent.model or "").lower(),
         is_openrouter=_is_or,
         is_nous=_is_nous,
@@ -4080,7 +4092,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     def _call():
         import httpx as _httpx
 
-        _max_stream_retries = env_int("HERMES_STREAM_RETRIES", 2)
+        _max_stream_retries = (
+            0
+            if getattr(agent, "_isolated_runtime", False)
+            else env_int("HERMES_STREAM_RETRIES", 2)
+        )
 
         try:
             for _stream_attempt in range(_max_stream_retries + 1):

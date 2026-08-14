@@ -567,6 +567,15 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    persist_session: bool = True,
+    minimal_system_prompt: bool = False,
+    api_max_attempts: int = None,
+    isolated_runtime: bool = False,
+    persona_id: str = None,
+    persona_growth_read: bool = False,
+    persona_growth_write: bool = False,
+    persona_growth_query: str = "",
+    persona_knowledge_read: bool = False,
 ):
     """
     Initialize the AI Agent.
@@ -654,6 +663,42 @@ def init_agent(
     # skip_memory=True already disables the memory-review trigger; this
     # flag is the explicit single-switch off for both review paths.
     agent.skip_background_review = bool(skip_background_review)
+    agent._minimal_system_prompt = bool(minimal_system_prompt)
+    agent._isolated_runtime = bool(isolated_runtime)
+    agent._fallback_disabled = bool(isolated_runtime)
+    agent._persona_kernel = None
+    agent._persona_growth_store = None
+    agent._persona_growth_context = ""
+    agent._persona_knowledge_store = None
+    agent._persona_knowledge_context = ""
+    if isolated_runtime and (persona_growth_read or persona_growth_write or persona_knowledge_read):
+        raise ValueError("Persona growth and knowledge are disabled in isolated runtime")
+    if (persona_growth_read or persona_growth_write or persona_knowledge_read) and not persona_id:
+        raise ValueError("Persona memory requires an explicitly selected Persona")
+    if persona_id:
+        if isolated_runtime:
+            raise ValueError("Persona kernels are disabled in isolated runtime")
+        from agent.persona.loader import load_persona_kernel
+        agent._persona_kernel = load_persona_kernel(persona_id)
+        if persona_growth_read or persona_growth_write:
+            from agent.persona.growth import PoliceGrowthStore, render_reflective_context
+            agent._persona_growth_store = PoliceGrowthStore(
+                get_hermes_home(), agent._persona_kernel,
+                read_enabled=persona_growth_read,
+                write_enabled=persona_growth_write,
+            )
+            if persona_growth_read and persona_growth_query:
+                agent._persona_growth_context = render_reflective_context(
+                    agent._persona_growth_store.select(persona_growth_query)
+                )
+        if persona_knowledge_read:
+            from agent.persona.knowledge import KnowledgeStore, render_controlled_knowledge
+            agent._persona_knowledge_store = KnowledgeStore(
+                get_hermes_home(), agent._persona_kernel, read_enabled=True,
+            )
+            agent._persona_knowledge_context = render_controlled_knowledge(
+                agent._persona_knowledge_store.read_controlled()
+            )
     agent.pass_session_id = pass_session_id
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -785,7 +830,9 @@ def init_agent(
     # AIAgent is created for every gateway request, so without the guard
     # each message leaks one OS thread and the process eventually exhausts
     # the system thread limit (RuntimeError: can't start new thread).
-    if (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
+    if isolated_runtime:
+        pass
+    elif (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
             not _ra()._openrouter_prewarm_done.is_set():
         _ra()._openrouter_prewarm_done.set()
         threading.Thread(
@@ -1396,9 +1443,10 @@ def init_agent(
                 apply_custom_provider_tls_to_client_kwargs,
                 get_compatible_custom_providers,
                 load_config,
+                load_config_readonly,
             )
 
-            _cp_config = load_config()
+            _cp_config = load_config_readonly() if isolated_runtime else load_config()
             _cp_entries = get_compatible_custom_providers(_cp_config)
             _cp_base_url = str(client_kwargs.get("base_url") or agent.base_url or "")
             apply_custom_provider_tls_to_client_kwargs(
@@ -1588,7 +1636,8 @@ def init_agent(
     # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
     hermes_home = get_hermes_home()
     agent.logs_dir = hermes_home / "sessions"
-    agent.logs_dir.mkdir(parents=True, exist_ok=True)
+    if not isolated_runtime:
+        agent.logs_dir.mkdir(parents=True, exist_ok=True)
     # Per-session JSON snapshot writer (~/.hermes/sessions/session_{sid}.json)
     # is opt-in via sessions.write_json_snapshots (default False).  state.db
     # is canonical — the snapshot is only useful for external tooling that
@@ -1662,7 +1711,7 @@ def init_agent(
     # (state.db) or the JSON snapshot, regardless of session_id. Set on the
     # background skill/memory review fork so its harness turn can't leak into
     # the user's real session and hijack the next live turn. Default False.
-    agent._persist_disabled = False
+    agent._persist_disabled = not persist_session
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,
@@ -1931,6 +1980,11 @@ def init_agent(
         _api_retries = max(_api_retries, 1)  # 1 = no retry (single attempt)
     except (TypeError, ValueError):
         _api_retries = 3
+    if api_max_attempts is not None:
+        try:
+            _api_retries = max(int(api_max_attempts), 1)
+        except (TypeError, ValueError):
+            pass
     agent._api_max_retries = _api_retries
 
     # Initialize context compressor for automatic context management
@@ -2491,6 +2545,9 @@ def init_agent(
         _config_context_length,
         _lmstudio_runtime_context_length,
     )
+    if isolated_runtime and not _effective_context_length:
+        from agent.model_metadata import CONTEXT_PROBE_TIERS
+        _effective_context_length = CONTEXT_PROBE_TIERS[0]
 
 
 
