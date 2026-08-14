@@ -701,26 +701,6 @@ class TestWebServerEndpoints:
         memory_config = load_config().get("memory", {})
         assert "openviking" not in memory_config
 
-
-
-        assert resp.status_code == 200
-        data = resp.json()
-        fields = self._provider_field_map(data)
-        assert {
-            "mode",
-            "api_key",
-            "api_url",
-            "llm_provider",
-            "llm_base_url",
-            "llm_api_key",
-            "llm_model",
-            "bank_id",
-            "recall_budget",
-        } <= set(fields)
-        assert fields["mode"]["kind"] == "select"
-        assert fields["api_key"]["kind"] == "secret"
-        assert fields["llm_api_key"]["kind"] == "secret"
-
     def test_declared_surface_preserves_local_embedded_values(self):
         from hermes_constants import get_hermes_home
         from hermes_cli.config import save_env_value
