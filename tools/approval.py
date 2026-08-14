@@ -1794,6 +1794,45 @@ def _scan_dollar_paren_end(command: str, start: int) -> int | None:
     return None
 
 
+def _scan_parameter_expansion_end(
+    command: str, start: int, end: int | None = None
+) -> int | None:
+    """Return the offset after a balanced ``${...}`` parameter expansion."""
+    depth = 1
+    quote: str | None = None
+    limit = len(command) if end is None else min(end, len(command))
+    i = start + 2
+    while i < limit:
+        ch = command[i]
+        if quote:
+            if ch == "\\" and quote == '"' and i + 1 < limit:
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < limit:
+            i += 2
+            continue
+        if command.startswith("${", i):
+            depth += 1
+            i += 2
+            continue
+        if ch == "}":
+            depth -= 1
+            i += 1
+            if depth == 0:
+                return i
+            continue
+        i += 1
+    return None
+
+
 def _scan_backtick_end(command: str, start: int) -> int | None:
     i = start + 1
     while i < len(command):
@@ -2026,6 +2065,12 @@ def _iter_shell_command_starts(command: str):
                 nested_end = _scan_backtick_end(command, i)
                 starts.append(i + 1)
                 scan(i + 1, nested_end - 1 if nested_end is not None else end)
+                i = nested_end if nested_end is not None else end
+                continue
+            # Parameter-expansion braces are shell word syntax, not command
+            # group openers. The quoted branch never treats `{` as an opener.
+            if command.startswith("${", i):
+                nested_end = _scan_parameter_expansion_end(command, i, end)
                 i = nested_end if nested_end is not None else end
                 continue
             if ch in ("(", "{"):

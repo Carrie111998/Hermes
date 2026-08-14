@@ -305,6 +305,57 @@ def test_plain_hardline_commands_remain_blocked(command, description):
     assert detect_hardline_command(command) == (True, description)
 
 
+@pytest.mark.parametrize(
+    ("command", "description"),
+    [
+        (
+            r'echo "a\"b"; rm${IFS}-rf${IFS}--no-preserve-root${IFS}/',
+            "recursive delete of root filesystem",
+        ),
+        (
+            r'echo "a\"b"; echo${IFS}x; rm${IFS}-rf${IFS}/',
+            "recursive delete of root filesystem",
+        ),
+        (
+            r'rm${IFS}-rf${IFS}--no-preserve-root${IFS}/',
+            "recursive delete of root filesystem",
+        ),
+        (r'echo "a\"b"; ${IFS}reboot', "system shutdown/reboot"),
+        (
+            r'echo "a\"b"; rm ${IFS:0:1}-rf --no-preserve-root /',
+            "recursive delete of root filesystem",
+        ),
+        (r'echo "a\"b"; reboot', "system shutdown/reboot"),
+        (
+            r'echo "a\"b" && rm -rf --no-preserve-root /',
+            "recursive delete of root filesystem",
+        ),
+        (r'cat "file\"name.txt"; rm -rf ~/', "recursive delete of home directory"),
+        ('echo "ab"; reboot', "system shutdown/reboot"),
+        ("reboot", "system shutdown/reboot"),
+        ("rm -rf --no-preserve-root /", "recursive delete of root filesystem"),
+    ],
+)
+def test_parameter_expansions_preserve_hardline_command_starts(command, description):
+    assert detect_hardline_command(command) == (True, description)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r'cd ~/.hermes/hermes-agent && grep -n "^from\|^__all__\|^    \"" tools/environments/__init__.py | head -15',
+        r'egrep -n "alpha\"beta|gamma" input.txt',
+        "grep -P '(?:safe|rm -rf --no-preserve-root /)' audit.log",
+        'grep -n "; reboot" f.txt',
+        'echo "; reboot"',
+        'echo "${IFS}"',
+        'echo "value is ${HOME}/x"',
+    ],
+)
+def test_parameter_expansion_marking_avoids_false_positives(command):
+    assert detect_hardline_command(command) == (False, None)
+
+
 def test_interpreter_heredoc_keeps_legacy_approval_key_compatibility():
     from tools.approval import _approval_key_aliases
 
