@@ -6908,6 +6908,54 @@ function readActiveDesktopProfile() {
   return null
 }
 
+/**
+ * Scan for named profiles on disk under HERMES_HOME/profiles/.
+ * Returns an array of profile names (empty if none found).
+ */
+function scanNamedProfiles(): string[] {
+  try {
+    const profilesDir = path.join(HERMES_HOME, 'profiles')
+    const entries = fs.readdirSync(profilesDir, { withFileTypes: true })
+    return entries
+      .filter(entry => entry.isDirectory() && PROFILE_NAME_RE.test(entry.name))
+      .map(entry => entry.name)
+      .sort()
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Ensure active-profile.json exists. If missing, auto-create it from
+ * on-disk profile state so CLI-spawned profiles don't leave the desktop
+ * silently pinned to "default".
+ *
+ * Logic:
+ *   - If named profiles exist on disk, pin to the first one (sorted).
+ *   - Otherwise, pin to "default".
+ *
+ * This only runs when the file is MISSING — an existing file is always
+ * respected (user's explicit choice wins).
+ */
+function ensureActiveDesktopProfile(): string | null {
+  const existing = readActiveDesktopProfile()
+  if (existing !== null) {
+    return existing
+  }
+
+  const profiles = scanNamedProfiles()
+  const chosen = profiles.length > 0 ? profiles[0] : 'default'
+
+  try {
+    writeActiveDesktopProfile(chosen)
+    rememberLog(`[profile] active-profile.json missing; auto-created with profile "${chosen}" (${profiles.length} named profile(s) on disk)`)
+    return chosen
+  } catch (error) {
+    rememberLog(`[profile] failed to auto-create active-profile.json: ${error}`)
+    return null
+  }
+}
+
 function writeActiveDesktopProfile(name) {
   const value = typeof name === 'string' ? name.trim() : ''
 
@@ -12451,6 +12499,12 @@ app.whenReady().then(() => {
   } else if (systemCa.error) {
     rememberLog(`[tls] could not load Windows system CA certificates: ${systemCa.error}`)
   }
+
+  // Ensure the desktop's active-profile.json exists. CLI-spawned profiles
+  // (e.g. `hermes -p <name>`) skip the UI and never create this file,
+  // leaving the desktop silently pinned to "default". Auto-create it
+  // from on-disk profile state so named profiles are picked up.
+  ensureActiveDesktopProfile()
 
   // Keyring-less Linux `--password-store=basic` support. This must run before
   // createWindow() and anything that could touch safeStorage; the narrow
