@@ -994,6 +994,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_repair.add_argument("--json", action="store_true",
                           help="Emit the repair report as JSON")
 
+    p_openspec_activate = sub.add_parser(
+        "openspec-activate",
+        help="Activate OpenSpec enforcement registry and restrict mutations to authorized operators"
+    )
+    p_openspec_activate.add_argument("operator", help="Authorized operator profile string (e.g. 'commander')")
+
+    p_openspec_rollback = sub.add_parser(
+        "openspec-rollback",
+        help="Roll back OpenSpec enforcement registry and revert the board to free-form mode"
+    )
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -1131,6 +1142,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
             "gc":       _cmd_gc,
+            "openspec-activate": _cmd_openspec_activate,
+            "openspec-rollback": _cmd_openspec_rollback,
         }
         handler = handlers.get(action)
         if not handler:
@@ -3219,6 +3232,34 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     )
     print(f"GC complete: {removed_ws} workspace(s), "
           f"{removed_events} event row(s), {removed_logs} log file(s) removed")
+    return 0
+
+
+def _cmd_openspec_activate(args: argparse.Namespace) -> int:
+    try:
+        from hermes_state_common import activate_openspec_enforcement
+    except ImportError:
+        print("kanban: openspec enforcement unavailable", file=sys.stderr)
+        return 1
+    with kb.connect() as conn:
+        activate_openspec_enforcement(conn, args.operator)
+        print(f"OpenSpec enforcement activated. Operator {args.operator!r} authorized.", file=sys.stderr)
+    return 0
+
+def _cmd_openspec_rollback(args: argparse.Namespace) -> int:
+    try:
+        from hermes_state_common import rollback_openspec_enforcement
+    except ImportError:
+        print("kanban: openspec enforcement unavailable", file=sys.stderr)
+        return 1
+    with kb.connect() as conn:
+        try:
+            # Revert to unrestricted mode using the commander operator token to bypass checks
+            rollback_openspec_enforcement(conn, operator="commander")
+            print("OpenSpec enforcement rolled back.", file=sys.stderr)
+        except Exception as e:
+            print(f"kanban: {e}", file=sys.stderr)
+            return 1
     return 0
 
 
