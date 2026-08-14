@@ -564,6 +564,45 @@ def test_queue_or_replace_pending_event_merges_contiguous_media_at_fifo_tail():
     assert turns[1].media_urls == ["/tmp/b-1.jpg", "/tmp/b-2.jpg"]
 
 
+def test_queue_or_replace_pending_event_keeps_fifo_security_contexts_separate():
+    """Same-sender FIFO neighbors cannot merge across plugin trust boundaries."""
+    runner, adapter = _runner_with_adapter()
+    session_key = "telegram:group:security-context-tail"
+    source = _alice_source()
+    events = [
+        _text_event("human head", source, message_id="a1"),
+        MessageEvent(
+            text="plugin wake",
+            message_type=MessageType.TEXT,
+            source=_alice_source(),
+            message_id="p1",
+            internal=True,
+            allow_gateway_control=False,
+            metadata={
+                "hermes_plugin_id": "notify-plugin",
+                "hermes_plugin_injection": True,
+                "gateway_session_key": session_key,
+                "gateway_session_id": "session-1",
+                "gateway_session_strict": True,
+            },
+        ),
+        _text_event("human tail", _alice_source(), message_id="a2"),
+    ]
+
+    for event in events:
+        runner._queue_or_replace_pending_event(
+            session_key, event, adapter, merge_text=True
+        )
+
+    turns = _queued_turns(runner, adapter, session_key)
+    assert [turn.message_id for turn in turns] == ["a1", "p1", "a2"]
+    assert [turn.text for turn in turns] == [
+        "human head",
+        "plugin wake",
+        "human tail",
+    ]
+
+
 def test_queue_or_replace_pending_event_preserves_empty_media_photo_after_head():
     """A failed photo download must not replace the occupied head slot."""
     runner, adapter = _runner_with_adapter()
