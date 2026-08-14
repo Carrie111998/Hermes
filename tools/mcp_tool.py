@@ -116,6 +116,7 @@ from datetime import datetime
 from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
+from agent.redact import redact_credential_url
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -1238,23 +1239,23 @@ def _validate_remote_mcp_url(server_name: str, url: Any) -> str:
         parsed = urlparse(stripped)
     except Exception as exc:  # urlparse is very permissive — belt and braces
         raise InvalidMcpUrlError(
-            f"Invalid MCP URL for '{server_name}': {stripped!r} ({exc})"
+            f"Invalid MCP URL for '{server_name}': {redact_credential_url(stripped)!r} ({redact_credential_url(exc)})"
         ) from exc
     if parsed.scheme.lower() not in {"http", "https"}:
         raise InvalidMcpUrlError(
             f"Invalid MCP URL for '{server_name}': scheme must be http or "
-            f"https, got {parsed.scheme!r} ({stripped!r})"
+            f"https, got {parsed.scheme!r} ({redact_credential_url(stripped)!r})"
         )
     if not parsed.netloc:
         raise InvalidMcpUrlError(
-            f"Invalid MCP URL for '{server_name}': missing host ({stripped!r})"
+            f"Invalid MCP URL for '{server_name}': missing host ({redact_credential_url(stripped)!r})"
         )
     # ``urlparse`` accepts ``http://:8080`` (empty host, explicit port).
     # Reject that — we need a real host.
     if not parsed.hostname:
         raise InvalidMcpUrlError(
             f"Invalid MCP URL for '{server_name}': missing hostname "
-            f"({stripped!r})"
+            f"({redact_credential_url(stripped)!r})"
         )
     return stripped
 
@@ -2963,7 +2964,7 @@ class MCPServerTask:
             return  # Looks like a real MCP endpoint.
 
         raise NonMcpEndpointError(
-            f"MCP server '{self.name}' at {url} returned Content-Type "
+            f"MCP server '{self.name}' at {redact_credential_url(url)} returned Content-Type "
             f"'{ct_base}', not an MCP response (expected one of: "
             f"{', '.join(self._MCP_CONTENT_TYPES)}). The URL most likely "
             "points at a web page rather than an MCP endpoint — check it "
@@ -3061,7 +3062,7 @@ class MCPServerTask:
                     self.name, url, config.get("oauth"),
                 )
             except Exception as exc:
-                logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
+                logger.warning("MCP OAuth setup failed for '%s': %s", self.name, redact_credential_url(exc))
                 raise
 
         sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
