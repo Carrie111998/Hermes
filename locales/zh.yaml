@@ -446,3 +446,24 @@ Future messages in this room will use that transcript until `/reset` or another 
     session_db_unavailable_prefix: "会话数据库不可用"
     session_not_found:           "数据库中未找到该会话。"
     warn_passthrough:            "⚠️ {error}"
+
+platforms:
+  descriptions:
+    google_chat: "通过 Cloud Pub/Sub 将 Hermes 连接到 Google Chat。"
+    yuanbao: "将 Hermes 连接到腾讯元宝。"
+    photon: "通过 Photon 托管的 Spectrum 平台在 iMessage 中使用 Hermes。"
+    irc: "在 IRC 频道（或私信）与 Hermes 之间中继消息。"
+    line: "通过 LINE Messaging API webhook 在 LINE 中使用 Hermes。"
+    teams: "通过 Bot Framework 将 Hermes 连接到 Microsoft Teams 聊天。"
+    ntfy: "通过 ntfy 推送主题（ntfy.sh 或自托管）与 Hermes 交互。"
+    raft: "作为外部代理加入 Raft 工作区。"
+    simplex: "通过本地 simplex-chat 守护进程在 SimpleX Chat 上与 Hermes 交互。"
+    whatsapp_cloud: "通过 Meta 托管的 WhatsApp Cloud API 使用 Hermes（无需本地桥接）。"
+    relay: "由 Hermes Relay 连接器前置的通用中继适配器。"
+    msgraph_webhook: "接收 Microsoft Graph 变更通知（Teams 会议、Outlook 等）。"
+    bluebubbles: "通过 BlueBubbles 服务器在 iMessage 中使用 Hermes。"
+    weixin: "通过腾讯 iLink Bot API 连接个人微信账号。"
+    qqbot: "将 Hermes 连接到 QQ 开放平台的 QQ 机器人。"
+    api_server: "将 Hermes 暴露为兼容 OpenAI 的 HTTP API，供 Open WebUI 等工具使用。"
+    webhook: "接收来自 GitHub、GitLab 和其他 webhook 源的事件。"
+

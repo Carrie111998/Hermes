@@ -1694,7 +1694,7 @@ export const zh: Translations = {
     bulkNoChange: '没有需要更改的内容。',
     usageCount: count => `已使用 ${count} 次`,
     provenance: {
-      agent: '习得',
+      agent: '自定义',
       bundled: '内置',
       hub: '技能中心'
     },
@@ -2682,21 +2682,21 @@ export const zh: Translations = {
     createAction: '创建定时任务',
     tabs: {
       jobs: '任务',
-      blueprints: '蓝图'
+      blueprints: '模板'
     },
     blueprints: {
-      tab: '蓝图',
+      tab: '模板',
       startFrom: '从此开始',
       custom: '自定义',
       subtitle: '现成的自动化',
       dialogDesc: '填写详细信息并进行排程。',
       scheduleIt: '安排任务',
       scheduling: '安排中...',
-      scheduled: '蓝图已安排',
-      loading: '正在加载蓝图...',
-      failedLoad: '加载蓝图失败',
-      emptyTitle: '没有可用的蓝图',
-      emptyDesc: '此后端上没有可用的自动化蓝图。'
+      scheduled: '模板已安排',
+      loading: '正在加载模板...',
+      failedLoad: '加载模板失败',
+      emptyTitle: '没有可用的模板',
+      emptyDesc: '此后端上没有可用的自动化模板。'
     }
   },
 

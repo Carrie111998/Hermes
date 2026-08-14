@@ -1677,8 +1677,24 @@ export const ar = defineLocale({
     placeholderStarting: 'جار بدء Hermes...',
     placeholderReconnecting: 'جار إعادة الاتصال...',
     placeholderFollowUp: 'اكتب متابعة...',
-    newSessionPlaceholders: ['اسأل Hermes عن شيء...', 'اطلب من Hermes تنفيذ مهمة...', 'ابدأ محادثة جديدة...'],
-    followUpPlaceholders: ['اكتب متابعة...', 'أضف توجيها...', 'اسأل سؤالا آخر...'],
+    newSessionPlaceholders: [
+      'ماذا نبني؟',
+      'أعط Hermes مهمة',
+      'ما الذي تفكر فيه؟',
+      'صف ما تحتاجه',
+      'ما الذي يجب أن نتعامل معه؟',
+      'اسأل أي شيء',
+      'ابدأ بهدف'
+    ],
+    followUpPlaceholders: [
+      'أرسل متابعة',
+      'أضف المزيد من السياق',
+      'حسّن الطلب',
+      'ما التالي؟',
+      'استمر في التقدم',
+      'ادفعها أبعد',
+      'اضبط أو استمر'
+    ],
     startVoice: 'بدء الصوت',
     openDirective: 'فتح',
     queueMessage: 'إضافة الرسالة للطابور',

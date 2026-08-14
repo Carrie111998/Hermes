@@ -8419,9 +8419,21 @@ def _build_catalog_entry(
     else:
         name = platform_id.replace("_", " ").title()
 
+    # Try i18n description first, fall back to override or plugin
     description = override.get("description")
     if not description and plugin_entry is not None:
         description = plugin_entry.install_hint or ""
+
+    # Use i18n system to get localized description if available
+    try:
+        from agent.i18n import t
+        i18n_key = f"platforms.descriptions.{platform_id}"
+        localized_desc = t(i18n_key)
+        # Only use the i18n description if it's not just the key (which means translation exists)
+        if localized_desc != i18n_key:
+            description = localized_desc
+    except Exception:
+        pass  # Fall back to override/plugin description
 
     return {
         "id": platform_id,
