@@ -37,13 +37,22 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+_CANONICAL_MORTAL3D_BOARD_DB = Path(
+    "/Users/sopitz/.hermes/kanban/boards/mortal3d/kanban.db"
+).resolve()
+
+
 @pytest.fixture
 def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolated HERMES_HOME with an empty kanban DB."""
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    resolved_db = kb.kanban_db_path().resolve()
+    assert resolved_db.is_relative_to(tmp_path.resolve())
+    assert resolved_db != _CANONICAL_MORTAL3D_BOARD_DB
     kb.init_db()
     return home
 
