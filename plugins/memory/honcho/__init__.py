@@ -268,6 +268,8 @@ class HonchoMemoryProvider(MemoryProvider):
 
         # Recall cadence and liveness state.
         self._turn_count = 0
+        # Author of the turn in flight, refreshed by on_turn_start.
+        self._turn_author: dict[str, Any] = {}
         self._query_rewrite_enabled = False
         self._injection_frequency = "every-turn"  # or "first-turn"
         self._context_cadence = 1   # minimum turns between context API calls
@@ -1280,8 +1282,18 @@ class HonchoMemoryProvider(MemoryProvider):
         return is_trivial_prompt(text)
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        """Track turn count for cadence and injection_frequency logic."""
+        """Track turn count for cadence, and record who wrote this turn.
+
+        The author is read per turn because a shared session carries turns
+        from several participants; the peer resolved at session init only
+        describes whoever created the session.
+        """
         self._turn_count = turn_number
+        self._turn_author = {
+            "id": kwargs.get("author_id") or None,
+            "name": kwargs.get("author_name") or None,
+            "is_bot": bool(kwargs.get("author_is_bot")),
+        }
 
     @staticmethod
     def _chunk_message(content: str, limit: int) -> list[str]:
@@ -1403,11 +1415,19 @@ class HonchoMemoryProvider(MemoryProvider):
         clean_user_content = sanitize_context(user_content or "").strip()
         clean_assistant_content = sanitize_context(assistant_content or "").strip()
 
+        # Resolved before the thread starts so a following turn cannot
+        # overwrite the author while this write is still queued.
+        author_peer_id = self._manager.resolve_author_peer_id(
+            self._session_key,
+            self._turn_author.get("id"),
+            self._turn_author.get("name"),
+        )
+
         def _sync():
             try:
                 session = self._manager.get_or_create(self._session_key)
                 for chunk in self._chunk_message(clean_user_content, msg_limit):
-                    session.add_message("user", chunk)
+                    session.add_message("user", chunk, author_peer_id=author_peer_id)
                 for chunk in self._chunk_message(clean_assistant_content, msg_limit):
                     session.add_message("assistant", chunk)
                 self._manager._flush_session(session)
