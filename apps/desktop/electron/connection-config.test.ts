@@ -413,6 +413,29 @@ test('buildGatewayWsUrl url-encodes the token', () => {
   assert.equal(buildGatewayWsUrl('https://host', 'a/b c+d'), 'wss://host/api/ws?token=a%2Fb%20c%2Bd')
 })
 
+test('buildGatewayWsUrl appends profile param when provided', () => {
+  assert.equal(buildGatewayWsUrl('https://gw.example.com', 'tok123', 'sheepyr'), 'wss://gw.example.com/api/ws?token=tok123&profile=sheepyr')
+})
+
+test('buildGatewayWsUrl omits profile param when null', () => {
+  assert.equal(buildGatewayWsUrl('https://gw.example.com', 'tok123', null), 'wss://gw.example.com/api/ws?token=tok123')
+})
+
+test('buildGatewayWsUrl url-encodes the profile', () => {
+  assert.equal(buildGatewayWsUrl('https://gw.example.com', 'tok123', 'my profile'), 'wss://gw.example.com/api/ws?token=tok123&profile=my%20profile')
+})
+
+test('buildGatewayWsUrlWithTicket appends profile param when provided', () => {
+  const url = buildGatewayWsUrlWithTicket('https://gw.example.com/hermes', 'tkt-9', 'sheepyr')
+  assert.equal(url, 'wss://gw.example.com/hermes/api/ws?ticket=tkt-9&profile=sheepyr')
+  assert.ok(!url.includes('token='))
+})
+
+test('buildGatewayWsUrlWithTicket omits profile param when null', () => {
+  const url = buildGatewayWsUrlWithTicket('https://gw.example.com/hermes', 'tkt-9', null)
+  assert.equal(url, 'wss://gw.example.com/hermes/api/ws?ticket=tkt-9')
+})
+
 // --- buildGatewayWsUrlWithTicket (oauth) ---
 
 test('buildGatewayWsUrlWithTicket uses ?ticket= not ?token=', () => {

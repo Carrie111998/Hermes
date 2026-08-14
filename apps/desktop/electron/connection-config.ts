@@ -99,20 +99,20 @@ function normalizeRemoteBaseUrl(rawUrl) {
   return parsed.toString().replace(/\/+$/, '')
 }
 
-function buildGatewayWsUrl(baseUrl, token) {
+function buildGatewayWsUrl(baseUrl, token, profile?: string | null) {
   const parsed = new URL(baseUrl)
   const wsScheme = parsed.protocol === 'https:' ? 'wss' : 'ws'
   const prefix = parsed.pathname.replace(/\/+$/, '')
 
-  return `${wsScheme}://${parsed.host}${prefix}/api/ws?token=${encodeURIComponent(token)}`
+  return `${wsScheme}://${parsed.host}${prefix}/api/ws?token=${encodeURIComponent(token)}${profile ? `&profile=${encodeURIComponent(profile)}` : ""}`
 }
 
-function buildGatewayWsUrlWithTicket(baseUrl, ticket) {
+function buildGatewayWsUrlWithTicket(baseUrl, ticket, profile?: string | null) {
   const parsed = new URL(baseUrl)
   const wsScheme = parsed.protocol === 'https:' ? 'wss' : 'ws'
   const prefix = parsed.pathname.replace(/\/+$/, '')
 
-  return `${wsScheme}://${parsed.host}${prefix}/api/ws?ticket=${encodeURIComponent(ticket)}`
+  return `${wsScheme}://${parsed.host}${prefix}/api/ws?ticket=${encodeURIComponent(ticket)}${profile ? `&profile=${encodeURIComponent(profile)}` : ""}`
 }
 
 /** True only when a gateway explicitly rejected the current OAuth session. */
