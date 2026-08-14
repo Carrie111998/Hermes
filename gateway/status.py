@@ -356,6 +356,28 @@ def get_process_start_time(pid: int) -> Optional[int]:
     return _get_process_start_time(pid)
 
 
+def get_process_age_seconds(pid: int) -> Optional[float]:
+    """Seconds since ``pid`` started, or ``None`` when unknowable.
+
+    Deliberately NOT derived from :func:`get_process_start_time`.  That value
+    is ``/proc`` clock-ticks-since-boot on Linux and psutil
+    centiseconds-since-epoch everywhere else — two different origins in two
+    different units, meaningful only for same-source *equality* (its docstring
+    says so).  Subtracting it from a wall clock is a unit error on every
+    platform.  psutil's ``create_time()`` is epoch seconds uniformly, which is
+    the only reading age arithmetic can use.
+
+    ``None`` means "don't know" — a dead PID, a denied handle, or psutil
+    unavailable.  Callers must fail open rather than treat it as young.
+    """
+    try:
+        import psutil  # type: ignore
+
+        return max(0.0, time.time() - psutil.Process(pid).create_time())
+    except Exception:
+        return None
+
+
 def _read_process_cmdline(pid: int) -> Optional[str]:
     """Return the process command line as a space-separated string.
 

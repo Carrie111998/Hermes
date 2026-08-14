@@ -23170,6 +23170,48 @@ def start_early_boot_heartbeat(
     return thread
 
 
+# ── Replace boot-grace ────────────────────────────────────────────────────
+# ``--replace`` terminates the incumbent named by the PID file without asking
+# how old it is, so two takeovers minutes apart each truncate the other's boot
+# and the port stays dead through both.  Observed 2026-08-14: PID 43052 was
+# SIGTERMed 66s into a boot that needs ~60-100s to bind :8642, by a sibling
+# agent session deploying the same commit.  Mirrors the watchdog's existing
+# ``BOOT_INPROGRESS_GRACE_SECONDS``, which is why that supervisor cannot cause
+# this.  Set the env var to ``0`` to replace a still-booting gateway anyway.
+DEFAULT_REPLACE_MIN_INCUMBENT_AGE_S = 120.0
+_REPLACE_MIN_AGE_ENV = "HERMES_GATEWAY_REPLACE_MIN_AGE_SECONDS"
+
+
+def _replace_min_incumbent_age_s() -> float:
+    """The boot-grace window, from env, falling back to the default."""
+    raw = os.getenv(_REPLACE_MIN_AGE_ENV)
+    if raw is None:
+        return DEFAULT_REPLACE_MIN_INCUMBENT_AGE_S
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return DEFAULT_REPLACE_MIN_INCUMBENT_AGE_S
+
+
+def _booting_incumbent_blocks_replace(existing_pid: int) -> Optional[float]:
+    """The incumbent's age when it is too young to replace, else ``None``.
+
+    Fails OPEN: an unknown age never blocks.  A ``--replace`` is a deliberate
+    act, and stranding the gateway because psutil declined to answer would be
+    a worse failure than the race this guards.
+    """
+    grace = _replace_min_incumbent_age_s()
+    if grace <= 0:
+        return None
+
+    from gateway.status import get_process_age_seconds
+
+    age = get_process_age_seconds(existing_pid)
+    if age is None or age >= grace:
+        return None
+    return age
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -23207,6 +23249,28 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     existing_pid = get_running_pid()
     if existing_pid is not None and existing_pid != os.getpid():
         if replace:
+            # Refuse to SIGTERM a gateway that is still coming up — it has not
+            # bound :8642 yet, so killing it leaves the port dead for the whole
+            # of our own boot too, and the operator sees one outage spanning
+            # two launches. Checked BEFORE the takeover marker so a refusal
+            # leaves no state behind for the incumbent to misread.
+            _incumbent_age = _booting_incumbent_blocks_replace(existing_pid)
+            if _incumbent_age is not None:
+                _grace = _replace_min_incumbent_age_s()
+                logger.error(
+                    "Refusing --replace: gateway PID %d is only %.0fs old and is "
+                    "still booting (grace %.0fs). Something else is already "
+                    "starting a gateway; wait for it, or set %s=0 to override.",
+                    existing_pid, _incumbent_age, _grace, _REPLACE_MIN_AGE_ENV,
+                )
+                print(
+                    f"\n❌ Refusing to replace gateway PID {existing_pid} — it is "
+                    f"only {_incumbent_age:.0f}s old and still booting.\n"
+                    f"   Another launch is already in flight. Wait for it to bind "
+                    f":8642,\n"
+                    f"   or set {_REPLACE_MIN_AGE_ENV}=0 to replace it anyway.\n"
+                )
+                return False
             existing_start_time = get_process_start_time(existing_pid)
             logger.info(
                 "Replacing existing gateway instance (PID %d) with --replace.",
