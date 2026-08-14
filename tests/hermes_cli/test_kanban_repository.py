@@ -11,10 +11,12 @@ import hermes_cli.kanban_repository as repository_module
 from hermes_cli.kanban_repository import (
     EvidenceWorkspaceError,
     EvidenceWorkspaceResult,
+    PreparedRefCASResult,
     RepositoryConfigurationError,
     RefreshRequest,
     VerificationCommand,
     VerificationProfile,
+    advance_prepared_candidate_ref,
     build_verification_receipt,
     build_verification_receipt_key,
     inspect_evidence_workspace,
@@ -351,6 +353,251 @@ def _commit(repo: Path, name: str, content: str, message: str) -> str:
     _git(repo, "add", name)
     _git(repo, "commit", "-m", message)
     return _git(repo, "rev-parse", "HEAD")
+
+
+def _prepared_ref_fixture(
+    repository: Path, *, checked_out: bool = False
+) -> tuple[str, str, str, str]:
+    target_ref = "refs/heads/main"
+    candidate_ref = "refs/hermes/integration-candidates/exact"
+    pre_sha = _git(repository, "rev-parse", target_ref)
+    _git(repository, "switch", "-c", "candidate-source")
+    candidate_sha = _commit(
+        repository, "candidate.txt", "candidate\n", "candidate"
+    )
+    _git(repository, "update-ref", candidate_ref, candidate_sha)
+    if checked_out:
+        _git(repository, "switch", "main")
+    return target_ref, candidate_ref, pre_sha, candidate_sha
+
+
+def test_prepared_ref_cas_uses_one_exact_update_ref_path(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+):
+    target_ref, candidate_ref, pre_sha, candidate_sha = _prepared_ref_fixture(repository)
+    real_git = repository_module._prepared_ref_git
+    calls: list[tuple[str, ...]] = []
+
+    def capture(path: Path, *args: str):
+        calls.append(args)
+        return real_git(path, *args)
+
+    monkeypatch.setattr(repository_module, "_prepared_ref_git", capture)
+
+    result = advance_prepared_candidate_ref(
+        repository,
+        target_ref=target_ref,
+        candidate_ref=candidate_ref,
+        pre_sha=pre_sha,
+        candidate_sha=candidate_sha,
+    )
+
+    assert result == PreparedRefCASResult("advanced", candidate_sha)
+    assert _git(repository, "rev-parse", target_ref) == candidate_sha
+    assert [call for call in calls if call[:1] == ("update-ref",)] == [
+        ("update-ref", target_ref, candidate_sha, pre_sha)
+    ]
+    assert not any(
+        command in call
+        for call in calls
+        for command in ("merge", "read-tree", "reset", "clean", "stash")
+    )
+
+
+def test_prepared_ref_cas_refuses_target_checked_out_in_any_worktree(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+):
+    target_ref, candidate_ref, pre_sha, candidate_sha = _prepared_ref_fixture(
+        repository, checked_out=True
+    )
+    real_git = repository_module._prepared_ref_git
+    calls: list[tuple[str, ...]] = []
+
+    def capture(path: Path, *args: str):
+        calls.append(args)
+        return real_git(path, *args)
+
+    monkeypatch.setattr(repository_module, "_prepared_ref_git", capture)
+
+    result = advance_prepared_candidate_ref(
+        repository,
+        target_ref=target_ref,
+        candidate_ref=candidate_ref,
+        pre_sha=pre_sha,
+        candidate_sha=candidate_sha,
+    )
+
+    assert result == PreparedRefCASResult("checked_out", pre_sha)
+    assert _git(repository, "rev-parse", target_ref) == pre_sha
+    assert not any(call[:1] == ("update-ref",) for call in calls)
+
+
+def test_prepared_ref_cas_reports_target_moved_without_ref_movement(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+):
+    target_ref, candidate_ref, pre_sha, candidate_sha = _prepared_ref_fixture(repository)
+    moved_sha = _commit(repository, "operator.txt", "moved\n", "operator move")
+    _git(repository, "update-ref", target_ref, moved_sha, pre_sha)
+    real_git = repository_module._prepared_ref_git
+    calls: list[tuple[str, ...]] = []
+
+    def capture(path: Path, *args: str):
+        calls.append(args)
+        return real_git(path, *args)
+
+    monkeypatch.setattr(repository_module, "_prepared_ref_git", capture)
+
+    result = advance_prepared_candidate_ref(
+        repository,
+        target_ref=target_ref,
+        candidate_ref=candidate_ref,
+        pre_sha=pre_sha,
+        candidate_sha=candidate_sha,
+    )
+
+    assert result == PreparedRefCASResult("target_moved", moved_sha)
+    assert _git(repository, "rev-parse", target_ref) == moved_sha
+    assert not any(call[:1] == ("update-ref",) for call in calls)
+
+
+def test_prepared_ref_cas_loss_reports_target_moved_and_preserves_winner(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+):
+    target_ref, candidate_ref, pre_sha, candidate_sha = _prepared_ref_fixture(repository)
+    winner_sha = _commit(repository, "winner.txt", "winner\n", "CAS winner")
+    real_git = repository_module._prepared_ref_git
+    intercepted = False
+
+    def lose_cas(path: Path, *args: str):
+        nonlocal intercepted
+        if args == ("update-ref", target_ref, candidate_sha, pre_sha):
+            intercepted = True
+            won = real_git(path, "update-ref", target_ref, winner_sha, pre_sha)
+            assert won.returncode == 0
+            return subprocess.CompletedProcess(
+                ["git", "update-ref", target_ref], 1, "", "CAS lost"
+            )
+        return real_git(path, *args)
+
+    monkeypatch.setattr(repository_module, "_prepared_ref_git", lose_cas)
+
+    result = advance_prepared_candidate_ref(
+        repository,
+        target_ref=target_ref,
+        candidate_ref=candidate_ref,
+        pre_sha=pre_sha,
+        candidate_sha=candidate_sha,
+    )
+
+    assert intercepted is True
+    assert result == PreparedRefCASResult("target_moved", winner_sha)
+    assert _git(repository, "rev-parse", target_ref) == winner_sha
+
+
+def test_prepared_ref_cas_recognizes_reflected_cas_without_second_update(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+):
+    target_ref, candidate_ref, pre_sha, candidate_sha = _prepared_ref_fixture(repository)
+    first = advance_prepared_candidate_ref(
+        repository,
+        target_ref=target_ref,
+        candidate_ref=candidate_ref,
+        pre_sha=pre_sha,
+        candidate_sha=candidate_sha,
+    )
+    real_git = repository_module._prepared_ref_git
+    calls: list[tuple[str, ...]] = []
+
+    def capture(path: Path, *args: str):
+        calls.append(args)
+        return real_git(path, *args)
+
+    monkeypatch.setattr(repository_module, "_prepared_ref_git", capture)
+    reflected = advance_prepared_candidate_ref(
+        repository,
+        target_ref=target_ref,
+        candidate_ref=candidate_ref,
+        pre_sha=pre_sha,
+        candidate_sha=candidate_sha,
+    )
+
+    assert first == PreparedRefCASResult("advanced", candidate_sha)
+    assert reflected == PreparedRefCASResult("reflected", candidate_sha)
+    assert not any(call[:1] == ("update-ref",) for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_kind", "expected_current", "expected_updates"),
+    [
+        ("advance", "advanced", "b" * 40, 1),
+        ("reflected", "reflected", "b" * 40, 0),
+        ("checked_out", "checked_out", "a" * 40, 0),
+        ("target_moved", "target_moved", "c" * 40, 0),
+        ("cas_lost", "target_moved", "c" * 40, 1),
+    ],
+)
+def test_prepared_ref_cas_fake_git_proves_single_update_and_refusal_immutability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    expected_kind: str,
+    expected_current: str,
+    expected_updates: int,
+):
+    target_ref = "refs/heads/epic"
+    candidate_ref = "refs/hermes/integration-candidates/exact"
+    pre_sha = "a" * 40
+    candidate_sha = "b" * 40
+    winner_sha = "c" * 40
+    state = {
+        "target": (
+            candidate_sha
+            if scenario == "reflected"
+            else winner_sha if scenario == "target_moved" else pre_sha
+        )
+    }
+    calls: list[tuple[str, ...]] = []
+
+    def fake_git(_path: Path, *args: str):
+        calls.append(args)
+        if args[:2] == ("rev-parse", "--verify"):
+            ref = args[2].removesuffix("^{commit}")
+            value = candidate_sha if ref == candidate_ref else state["target"]
+            return subprocess.CompletedProcess(["git", *args], 0, f"{value}\n", "")
+        if args == ("worktree", "list", "--porcelain"):
+            branch = (
+                f"worktree /tmp/epic\nHEAD {pre_sha}\nbranch {target_ref}\n"
+                if scenario == "checked_out"
+                else f"worktree /tmp/operator\nHEAD {pre_sha}\nbranch refs/heads/operator\n"
+            )
+            return subprocess.CompletedProcess(["git", *args], 0, branch, "")
+        if args == ("update-ref", target_ref, candidate_sha, pre_sha):
+            if scenario == "cas_lost":
+                state["target"] = winner_sha
+                return subprocess.CompletedProcess(["git", *args], 1, "", "CAS lost")
+            state["target"] = candidate_sha
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
+        raise AssertionError(f"unexpected Git call: {args}")
+
+    monkeypatch.setattr(repository_module, "_prepared_ref_git", fake_git)
+
+    result = advance_prepared_candidate_ref(
+        tmp_path,
+        target_ref=target_ref,
+        candidate_ref=candidate_ref,
+        pre_sha=pre_sha,
+        candidate_sha=candidate_sha,
+    )
+
+    updates = [call for call in calls if call[:1] == ("update-ref",)]
+    assert result == PreparedRefCASResult(expected_kind, expected_current)
+    assert updates == (
+        [("update-ref", target_ref, candidate_sha, pre_sha)]
+        if expected_updates
+        else []
+    )
+    if scenario in {"checked_out", "target_moved"}:
+        assert state["target"] == expected_current
 
 
 def _refresh_fixture(repository: Path) -> tuple[Path, Path]:

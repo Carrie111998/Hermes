@@ -18,8 +18,10 @@ from hermes_cli.kanban_product_outcomes import (
     candidate_eligibility,
 )
 from hermes_cli.kanban_repository import (
+    PreparedRefCASResult,
     RepositoryContract,
     VerificationResult,
+    advance_prepared_candidate_ref,
     verification_receipt_matches,
     verification_result_payload,
 )
@@ -521,6 +523,54 @@ def prepare_claimed_intent(
         if not _prepared_receipt_is_exact(conn, prepared, contract):
             raise ValueError("prepared integration receipt was not durable")
         return prepared
+
+
+def advance_prepared_intent(
+    conn: sqlite3.Connection,
+    intent: IntegrationIntent,
+    *,
+    board: str | None = None,
+) -> PreparedRefCASResult:
+    """Apply the sole exact CAS for one durable prepared story candidate.
+
+    This boundary only validates the prepared record and invokes the repository
+    CAS.  It deliberately writes no integration fact, event, or intent state;
+    the lifecycle finalizer owns those durable transitions.
+    """
+
+    from hermes_cli import kanban_db as kb
+
+    if not isinstance(intent, IntegrationIntent):
+        raise ValueError("prepared integration intent is required")
+    if conn.in_transaction:
+        raise ValueError("candidate advance requires no active DB transaction")
+    slug = board if board is not None else kb._known_board_slug_for_connection(conn)
+    metadata = kb.product_board_metadata(slug)
+    contract = (
+        kb.repository_contract_for_metadata(metadata)
+        if metadata is not None
+        else None
+    )
+    if contract is None or "story_integration" not in contract.verification:
+        raise ValueError("story integration repository contract is required")
+
+    current = _current_intent(conn, intent.key)
+    if current != intent or current.status != "prepared":
+        raise ValueError("prepared integration intent changed before CAS")
+    if not _prepared_receipt_is_exact(conn, current, contract):
+        raise ValueError("prepared integration receipt does not match")
+    assert (
+        current.target_pre_sha is not None
+        and current.candidate_sha is not None
+        and current.candidate_ref is not None
+    )
+    return advance_prepared_candidate_ref(
+        contract.repo_root,
+        target_ref=f"refs/heads/{kb.epic_branch_for(current.key.epic_id)}",
+        candidate_ref=current.candidate_ref,
+        pre_sha=current.target_pre_sha,
+        candidate_sha=current.candidate_sha,
+    )
 
 
 def enqueue_approved_story(

@@ -12,9 +12,11 @@ import time
 import pytest
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_story_integration as integration_module
 from hermes_cli.kanban_story_integration import (
     IntegrationIntent,
     IntegrationKey,
+    advance_prepared_intent,
     claim_next_intent,
     enqueue_approved_story,
     integration_intent_from_row,
@@ -26,6 +28,7 @@ from hermes_cli.kanban_product_outcomes import (
     PassedTest,
 )
 from hermes_cli.kanban_repository import (
+    PreparedRefCASResult,
     VerificationResult,
     build_verification_receipt_key,
 )
@@ -806,6 +809,84 @@ def test_prepare_claimed_candidate_persists_exact_receipt_atomically_without_app
     assert len(events) == 1
     assert prepared.verification_event_id == events[0].id
     assert events[0].payload["receipt"]["key"]["candidate_sha"] == CANDIDATE_SHA
+
+
+@pytest.mark.parametrize("kind", ["advanced", "reflected", "target_moved"])
+def test_advance_prepared_intent_forwards_exact_cas_without_db_fact_completion(
+    tmp_path, monkeypatch, kind
+):
+    db_path = tmp_path / f"advance-{kind}.db"
+    board_metadata = _claim_board_metadata(tmp_path)
+    monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: board_metadata)
+    with kb.connect(db_path) as conn:
+        key = _insert_claimable_intent(conn)
+        claimed = claim_next_intent(
+            conn,
+            "owner",
+            60,
+            repository_check=lambda _contract, approved, _passed: CandidateEligibility(
+                source_sha=approved.source_sha, non_empty=True
+            ),
+        )
+        assert claimed is not None
+        contract = kb.repository_contract_for_metadata(board_metadata)
+        assert contract is not None
+        prepared = prepare_claimed_intent(
+            conn,
+            claimed,
+            candidate_builder=lambda *_args, **_kwargs: _passed_candidate(
+                tmp_path, contract, key
+            ),
+        )
+        calls = []
+
+        def exact_cas(repo_root, **kwargs):
+            calls.append((repo_root, kwargs))
+            current = CANDIDATE_SHA if kind in {"advanced", "reflected"} else TARGET_SHA
+            return PreparedRefCASResult(kind, current)
+
+        monkeypatch.setattr(
+            integration_module, "advance_prepared_candidate_ref", exact_cas
+        )
+        before_changes = conn.total_changes
+        before_intent = conn.execute(
+            "SELECT * FROM story_integration_intents WHERE epic_id=? AND story_id=? "
+            "AND source_sha=?",
+            (key.epic_id, key.story_id, key.source_sha),
+        ).fetchone()
+        before_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=?", (key.story_id,)
+        ).fetchone()[0]
+
+        result = advance_prepared_intent(conn, prepared)
+
+        after_intent = conn.execute(
+            "SELECT * FROM story_integration_intents WHERE epic_id=? AND story_id=? "
+            "AND source_sha=?",
+            (key.epic_id, key.story_id, key.source_sha),
+        ).fetchone()
+        after_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=?", (key.story_id,)
+        ).fetchone()[0]
+        after_changes = conn.total_changes
+
+    assert result == PreparedRefCASResult(
+        kind, CANDIDATE_SHA if kind in {"advanced", "reflected"} else TARGET_SHA
+    )
+    assert calls == [
+        (
+            tmp_path.resolve(),
+            {
+                "target_ref": f"refs/heads/{kb.epic_branch_for(key.epic_id)}",
+                "candidate_ref": "refs/hermes/integration-candidates/exact",
+                "pre_sha": TARGET_SHA,
+                "candidate_sha": CANDIDATE_SHA,
+            },
+        )
+    ]
+    assert dict(after_intent) == dict(before_intent)
+    assert after_events == before_events
+    assert after_changes == before_changes
 
 
 def test_prepare_claimed_candidate_crash_replay_leaves_one_durable_prepared_record(

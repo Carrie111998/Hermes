@@ -131,6 +131,14 @@ class VerificationResult:
     reused: bool = False
 
 
+@dataclass(frozen=True)
+class PreparedRefCASResult:
+    """Typed outcome of the sole prepared-candidate target-ref CAS path."""
+
+    kind: Literal["advanced", "reflected", "checked_out", "target_moved"]
+    current_sha: str | None
+
+
 _VERIFICATION_OUTPUT_TAIL_CHARS = 4096
 _VERIFICATION_ENV_KEYS = (
     "HOME",
@@ -1420,6 +1428,104 @@ def resolve_commit(repo_root: Path, ref: str) -> str:
     ):
         raise _error("missing_ref", ref)
     return sha
+
+
+def _prepared_ref_git(
+    repo_root: Path, *args: str
+) -> subprocess.CompletedProcess[str]:
+    """Run one bounded, shell-free Git command for prepared-ref CAS."""
+
+    return subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+        check=False,
+    )
+
+
+def _prepared_ref_sha(repo_root: Path, ref: str) -> str | None:
+    completed = _prepared_ref_git(
+        repo_root, "rev-parse", "--verify", f"{ref}^{{commit}}"
+    )
+    value = (completed.stdout or "").strip()
+    return value if completed.returncode == 0 and FULL_SHA.fullmatch(value) else None
+
+
+def _prepared_target_is_checked_out(repo_root: Path, target_ref: str) -> bool:
+    listed = _prepared_ref_git(repo_root, "worktree", "list", "--porcelain")
+    if listed.returncode != 0:
+        raise RepositoryConfigurationError("worktree_list_failed")
+    for block in (listed.stdout or "").strip().split("\n\n"):
+        fields: dict[str, str] = {}
+        for line in block.splitlines():
+            key, _, value = line.partition(" ")
+            fields[key] = value
+        if fields.get("branch") == target_ref and fields.get("worktree"):
+            return True
+    return False
+
+
+def advance_prepared_candidate_ref(
+    repo_root: Path,
+    *,
+    target_ref: str,
+    candidate_ref: str,
+    pre_sha: str,
+    candidate_sha: str,
+) -> PreparedRefCASResult:
+    """Advance one exact unchecked target ref by one preimage-protected CAS.
+
+    The retained candidate ref is validated before any target operation.  A
+    target already at the exact candidate is a reflected successful CAS; every
+    other preimage mismatch is typed as target movement.  Checked-out targets
+    are always refused, even when their worktree is clean.  This function has
+    no merge/read-tree/reset/clean/stash path and never deletes the retained
+    candidate ref.
+    """
+
+    root = Path(repo_root).expanduser().resolve(strict=False)
+    if (
+        not isinstance(target_ref, str)
+        or not target_ref.startswith("refs/heads/")
+        or target_ref != target_ref.strip()
+        or "\x00" in target_ref
+    ):
+        raise RepositoryConfigurationError("malformed_target_ref")
+    if (
+        not isinstance(candidate_ref, str)
+        or not candidate_ref.startswith("refs/hermes/integration-candidates/")
+        or candidate_ref != candidate_ref.strip()
+        or "\x00" in candidate_ref
+    ):
+        raise RepositoryConfigurationError("malformed_candidate_ref")
+    if not isinstance(pre_sha, str) or FULL_SHA.fullmatch(pre_sha) is None:
+        raise RepositoryConfigurationError("malformed_pre_sha")
+    if not isinstance(candidate_sha, str) or FULL_SHA.fullmatch(candidate_sha) is None:
+        raise RepositoryConfigurationError("malformed_candidate_sha")
+
+    retained_sha = _prepared_ref_sha(root, candidate_ref)
+    if retained_sha != candidate_sha:
+        raise RepositoryConfigurationError("candidate_ref_mismatch")
+    current_sha = _prepared_ref_sha(root, target_ref)
+    if current_sha == candidate_sha:
+        return PreparedRefCASResult("reflected", current_sha)
+    if current_sha != pre_sha:
+        return PreparedRefCASResult("target_moved", current_sha)
+    if _prepared_target_is_checked_out(root, target_ref):
+        return PreparedRefCASResult("checked_out", current_sha)
+
+    applied = _prepared_ref_git(
+        root, "update-ref", target_ref, candidate_sha, pre_sha
+    )
+    reflected_sha = _prepared_ref_sha(root, target_ref)
+    if applied.returncode == 0 and reflected_sha == candidate_sha:
+        return PreparedRefCASResult("advanced", reflected_sha)
+    if reflected_sha == candidate_sha:
+        return PreparedRefCASResult("reflected", reflected_sha)
+    return PreparedRefCASResult("target_moved", reflected_sha)
 
 
 def _refresh_git(
