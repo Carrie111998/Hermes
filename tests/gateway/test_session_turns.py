@@ -1228,6 +1228,140 @@ async def test_coordinator_cancellation_retains_worker_heartbeat_lease_and_termi
 
 
 @pytest.mark.asyncio
+async def test_post_agent_cancellation_preserves_started_ledger_truth(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    """Cancellation after agent exit must not claim execution never started."""
+    still_owned_entered = asyncio.Event()
+    fake_lease = MagicMock()
+
+    async def blocked_still_owned():
+        still_owned_entered.set()
+        await asyncio.Event().wait()
+
+    fake_lease.still_owned = AsyncMock(side_effect=blocked_still_owned)
+    fake_lease.release = AsyncMock(return_value=True)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    adapter._acquire_session_execution_lease = AsyncMock(return_value=fake_lease)
+
+    async def run_agent(**_kwargs):
+        session_db.append_message("s1", "user", "hello")
+        session_db.append_message("s1", "assistant", "finished agent result")
+        return {"final_response": "finished agent result"}, {}
+
+    adapter._run_agent = run_agent
+    store = SessionTurnStore(session_db)
+    turn_id = "cancel-after-agent"
+    store.reserve("s1", turn_id, _payload())
+    coordinator = adapter._session_turn_service._admit_execution(
+        store, turn_id, "s1", _payload(), None, None
+    )
+    await asyncio.wait_for(still_owned_entered.wait(), 1)
+    coordinator.cancel()
+    await adapter._session_turn_service.wait_for_turn(turn_id)
+
+    row = store.get(turn_id)
+    events = store.events_after(turn_id, 0)
+    assert row["status"] == "interrupted"
+    assert row["started_at"] is not None
+    assert row["safe_error_code"] == "cancelled_after_execution"
+    assert [event["event"] for event in events] == [
+        "turn.started", "turn.interrupted"
+    ]
+    assert events[-1]["data"]["error_code"] == "cancelled_after_execution"
+    fake_lease.release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_forced_cleanup_failure_is_retrieved_and_privacy_safe(
+    session_db, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """Cleanup ownership reports failure without asyncio's unretrieved warning."""
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    store = SessionTurnStore(session_db)
+    turn_id = "forced-cleanup-failure"
+    store.reserve("s1", turn_id, _payload())
+    monkeypatch.setattr(
+        service,
+        "_finalize_execution",
+        AsyncMock(side_effect=RuntimeError("private cleanup secret")),
+    )
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
+    loop_contexts = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_contexts.append(context))
+    try:
+        execution = service._admit_execution(
+            store, turn_id, "s1", _payload(), None, None
+        )
+        execution.cancel()
+        await asyncio.gather(execution, return_exceptions=True)
+        deadline = time.monotonic() + 1
+        while turn_id in service._tasks and time.monotonic() < deadline:
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert turn_id not in service._tasks
+    assert not [
+        context for context in loop_contexts
+        if context.get("message") == "Task exception was never retrieved"
+    ]
+    assert "session_turn_background_task_failed" in caplog.text
+    assert "private cleanup secret" not in caplog.text
+    # The forced replacement intentionally prevented the real cleanup body;
+    # explicitly drain its test-only observer after proving task ownership.
+    dispatcher = service._lifecycle_dispatchers.pop(turn_id)
+    dispatcher.abort()
+    assert await asyncio.to_thread(dispatcher.flush, 1)
+
+
+@pytest.mark.asyncio
+async def test_blocking_finalize_store_does_not_block_event_loop(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    """Synchronous SQLite finalization remains ordered but runs off-loop."""
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    store = SessionTurnStore(session_db)
+    turn_id = "blocking-finalize-store"
+    store.reserve("s1", turn_id, _payload())
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
+    finish_entered = threading.Event()
+    finish_release = threading.Event()
+    original_finish = store.finish
+
+    def blocking_finish(*args, **kwargs):
+        finish_entered.set()
+        finish_release.wait(timeout=2)
+        return original_finish(*args, **kwargs)
+
+    monkeypatch.setattr(store, "finish", blocking_finish)
+    execution = service._admit_execution(
+        store, turn_id, "s1", _payload(), None, None
+    )
+    execution.cancel()
+    await asyncio.gather(execution, return_exceptions=True)
+    assert await asyncio.to_thread(finish_entered.wait, 1)
+
+    # This timer must fire while finish() is blocked in the store worker.
+    ticked = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.02, ticked.set)
+    await asyncio.wait_for(ticked.wait(), 0.1)
+    finish_release.set()
+    await service.wait_for_turn(turn_id)
+
+    assert store.get(turn_id)["status"] == "interrupted"
+
+
+@pytest.mark.asyncio
 async def test_immediate_prestart_cancellation_reclaims_all_lifecycle_capacity(
     session_db, monkeypatch: pytest.MonkeyPatch
 ):

@@ -22,7 +22,7 @@ import time
 import uuid
 import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, TypeVar
 
 from aiohttp import web
 
@@ -30,6 +30,7 @@ from gateway.session_execution_lease import SessionExecutionConflict
 
 
 logger = logging.getLogger(__name__)
+_StoreResult = TypeVar("_StoreResult")
 
 SESSION_TURN_HEARTBEAT_INTERVAL_SECONDS = 15.0
 SESSION_TURN_LIFECYCLE_QUEUE_SIZE = 32
@@ -37,6 +38,23 @@ SESSION_TURN_LIFECYCLE_WORKERS = 4
 SESSION_TURN_LIFECYCLE_PENDING_DISPATCHERS = 32
 SESSION_TURN_LIFECYCLE_SLOW_SECONDS = 0.1
 SESSION_TURN_LIFECYCLE_FLUSH_SECONDS = 0.05
+
+
+@dataclass
+class _TurnExecutionState:
+    """Authoritative phase reached only after the corresponding durable write."""
+
+    entered: bool = False
+    started: bool = False
+    execution_done: bool = False
+
+    @property
+    def cancellation_code(self) -> str:
+        if not self.started:
+            return "cancelled_before_execution"
+        if self.execution_done:
+            return "cancelled_after_execution"
+        return "cancelled_during_execution"
 
 
 def _emit_turn_lifecycle(event: str, session_id: str, turn_id: str, **extra: Any) -> bool:
@@ -1104,6 +1122,10 @@ class SessionTurnService:
         self.adapter = adapter
         self._stores: Dict[int, SessionTurnStore] = {}
         self._store_lock = asyncio.Lock()
+        # SessionDB serializes SQLite with its own lock. This lock additionally
+        # preserves submission order for all loop-originated store operations;
+        # the operation itself always runs off the aiohttp loop.
+        self._store_operation_lock = asyncio.Lock()
         self._tasks: Dict[str, asyncio.Task[Any]] = {}
         self._agent_refs: Dict[str, list[Any]] = {}
         self._lifecycle_dispatchers: Dict[str, SessionTurnLifecycleDispatcher] = {}
@@ -1129,6 +1151,61 @@ class SessionTurnService:
     async def reconcile_startup(self) -> None:
         """Initialize the ledger and interrupt crash-uncertain prior work."""
         await self._store()
+
+    async def _store_operation(
+        self,
+        operation: Callable[[], _StoreResult],
+        *,
+        propagate_cancellation: bool = True,
+    ) -> _StoreResult:
+        """Run one ordered store operation off-loop and never abandon its thread."""
+
+        async def run_ordered() -> _StoreResult:
+            async with self._store_operation_lock:
+                return await asyncio.to_thread(operation)
+
+        operation_task = asyncio.create_task(run_ordered())
+        cancelled = False
+        while True:
+            try:
+                result = await asyncio.shield(operation_task)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                continue
+        if cancelled and propagate_cancellation:
+            raise asyncio.CancelledError
+        return result
+
+    async def _finish_turn(
+        self,
+        store: SessionTurnStore,
+        turn_id: str,
+        status: str,
+        event_type: str,
+        error_code: Optional[str] = None,
+        effective_session_id: Optional[str] = None,
+    ) -> bool:
+        """Persist terminal row and matching ledger event as one ordered unit."""
+
+        def finish_and_append() -> bool:
+            changed = store.finish(
+                turn_id,
+                status,
+                safe_error_code=error_code,
+                effective_session_id=effective_session_id,
+            )
+            if changed:
+                data = {"status": status}
+                if error_code is not None:
+                    data["error_code"] = error_code
+                store.append_event(turn_id, event_type, data)
+            return changed
+
+        # Terminal ownership must survive cancellation through both writes.
+        return await self._store_operation(
+            finish_and_append, propagate_cancellation=False
+        )
 
     @staticmethod
     def _turn_id(request: web.Request, body: Dict[str, Any]) -> str:
@@ -1181,7 +1258,9 @@ class SessionTurnService:
             return web.json_response(
                 {
                     "object": "hermes.session.turn.reused",
-                    "turn": store.public_turn(turn_id),
+                    "turn": await self._store_operation(
+                        lambda: store.public_turn(turn_id)
+                    ),
                 },
                 status=200,
             )
@@ -1213,13 +1292,30 @@ class SessionTurnService:
             self._admit_execution(
                 store, turn_id, session_id, payload, binding, slack_adapter
             )
-        public = store.public_turn(turn_id)
+        public = await self._store_operation(lambda: store.public_turn(turn_id))
         return web.json_response(
             {"object": "hermes.session.turn.accepted" if created else "hermes.session.turn.reused", "turn": public},
             status=202 if created else 200,
         )
 
+    @staticmethod
+    def _consume_background_task_exception(task: asyncio.Task[Any]) -> None:
+        """Retrieve failures and log only a stable, privacy-safe classification."""
+        if task.cancelled():
+            return
+        try:
+            failure = task.exception()
+        except asyncio.CancelledError:
+            return
+        if failure is not None:
+            logger.error(
+                "session_turn_background_task_failed reason=internal_task_error"
+            )
+
     def _track_background_task(self, task: asyncio.Task[Any]) -> None:
+        # Exception retrieval is unconditional even when an adapter does not
+        # expose the optional ownership set.
+        task.add_done_callback(self._consume_background_task_exception)
         try:
             self.adapter._background_tasks.add(task)
             task.add_done_callback(self.adapter._background_tasks.discard)
@@ -1239,7 +1335,7 @@ class SessionTurnService:
         # Construct before scheduling: registered is already first in its FIFO.
         dispatcher = SessionTurnLifecycleDispatcher(session_id, turn_id)
         self._lifecycle_dispatchers[turn_id] = dispatcher
-        entered = [False]
+        phase = _TurnExecutionState()
         task = asyncio.create_task(
             self._execute(
                 store,
@@ -1248,14 +1344,17 @@ class SessionTurnService:
                 payload,
                 binding,
                 slack_adapter,
-                entered,
+                phase,
             )
         )
         self._tasks[turn_id] = task
         self._track_background_task(task)
 
         def execution_done(done: asyncio.Task[Any]) -> None:
-            if done.cancelled() and not entered[0]:
+            # Explicitly consume the execution exception here as well as in the
+            # generic tracker. Reading it does not alter cleanup ownership.
+            self._consume_background_task_exception(done)
+            if done.cancelled() and not phase.entered:
                 # A coroutine cancelled before its first instruction cannot run
                 # _execute's try/finally. Transfer all ownership to the same
                 # cleanup seam used by the normal execution epilogue.
@@ -1269,8 +1368,9 @@ class SessionTurnService:
                 self._tasks[turn_id] = cleanup
                 self._track_background_task(cleanup)
                 cleanup.add_done_callback(
-                    lambda finished, tid=turn_id: self._remove_task_if_current(
-                        tid, finished
+                    lambda finished, tid=turn_id: (
+                        self._consume_background_task_exception(finished),
+                        self._remove_task_if_current(tid, finished),
                     )
                 )
             else:
@@ -1287,9 +1387,9 @@ class SessionTurnService:
 
     async def _execute(self, store: SessionTurnStore, turn_id: str, session_id: str,
                        payload: Dict[str, Any], binding: Optional[SlackBinding], slack_adapter: Any,
-                       entered: Optional[list[bool]] = None) -> None:
-        if entered is not None:
-            entered[0] = True
+                       phase: Optional[_TurnExecutionState] = None) -> None:
+        phase = phase or _TurnExecutionState()
+        phase.entered = True
         agent_ref: list[Any] = [None]
         execution_lease = None
         heartbeat_task: Optional[asyncio.Task[Any]] = None
@@ -1309,16 +1409,27 @@ class SessionTurnService:
                     on_lost=interrupt_on_lease_loss,
                 )
             except SessionExecutionConflict:
-                store.finish(turn_id, "failed", safe_error_code="active_session_execution")
-                store.append_event(turn_id, "turn.failed", {"status": "failed", "error_code": "active_session_execution"})
+                await self._finish_turn(
+                    store, turn_id, "failed", "turn.failed", "active_session_execution"
+                )
                 return
-            if store.stop_requested(turn_id):
-                store.finish(turn_id, "interrupted", safe_error_code="stopped_before_start")
-                store.append_event(turn_id, "turn.interrupted", {"status": "interrupted", "error_code": "stopped_before_start"})
+            if await self._store_operation(lambda: store.stop_requested(turn_id)):
+                await self._finish_turn(
+                    store, turn_id, "interrupted", "turn.interrupted", "stopped_before_start"
+                )
                 return
-            if not store.set_running(turn_id):
+            def start_turn() -> bool:
+                if not store.set_running(turn_id):
+                    return False
+                store.append_event(turn_id, "turn.started", {"status": "running"})
+                # Set in the same off-loop ownership unit as the durable write.
+                # If the coordinator is cancelled while awaiting this worker,
+                # _store_operation waits for it and the catch below sees truth.
+                phase.started = True
+                return True
+
+            if not await self._store_operation(start_turn):
                 return
-            store.append_event(turn_id, "turn.started", {"status": "running"})
             if dispatcher is not None:
                 dispatcher.emit("started")
 
@@ -1332,18 +1443,17 @@ class SessionTurnService:
             try:
                 history = await self.adapter._conversation_history_for_session(session_id)
             except Exception:
-                store.finish(turn_id, "failed", safe_error_code="history_read_failed")
-                store.append_event(turn_id, "turn.failed", {"status": "failed", "error_code": "history_read_failed"})
-                return
-            if store.stop_requested(turn_id):
-                store.finish(turn_id, "interrupted", safe_error_code="stopped_before_execution")
-                store.append_event(
-                    turn_id,
-                    "turn.interrupted",
-                    {"status": "interrupted", "error_code": "stopped_before_execution"},
+                await self._finish_turn(
+                    store, turn_id, "failed", "turn.failed", "history_read_failed"
                 )
                 return
-            message_high_water = await asyncio.to_thread(store.message_high_water)
+            if await self._store_operation(lambda: store.stop_requested(turn_id)):
+                await self._finish_turn(
+                    store, turn_id, "interrupted", "turn.interrupted",
+                    "stopped_before_execution",
+                )
+                return
+            message_high_water = await self._store_operation(store.message_high_water)
 
             def append(event_type: str, data: Dict[str, Any]) -> None:
                 durable = store.append_event(turn_id, event_type, data)
@@ -1401,6 +1511,7 @@ class SessionTurnService:
                     # abandons the still-live thread. Shield the child and keep
                     # this coordinator as monitoring owner until real exit.
                     result, _usage = await asyncio.shield(agent_task)
+                    phase.execution_done = True
                     break
                 except asyncio.CancelledError:
                     if agent_task.done():
@@ -1416,45 +1527,36 @@ class SessionTurnService:
                             pass
                     else:
                         watcher = asyncio.create_task(self._interrupt_when_available(turn_id))
-                        try:
-                            self.adapter._background_tasks.add(watcher)
-                            watcher.add_done_callback(self.adapter._background_tasks.discard)
-                        except (AttributeError, TypeError):
-                            pass
+                        self._track_background_task(watcher)
                     # Continue heartbeat and lease ownership until the executor
                     # future itself resolves. Repeated cancellation is handled
                     # by the same bounded, non-abandoning loop.
             effective_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
             if execution_lease is None or not await execution_lease.still_owned():
-                store.finish(
-                    turn_id,
-                    "interrupted",
-                    safe_error_code="execution_lease_lost",
-                    effective_session_id=effective_id,
-                )
-                store.append_event(
-                    turn_id,
-                    "turn.interrupted",
-                    {"status": "interrupted", "error_code": "execution_lease_lost"},
+                await self._finish_turn(
+                    store, turn_id, "interrupted", "turn.interrupted",
+                    "execution_lease_lost", effective_id,
                 )
                 return
-            if store.stop_requested(turn_id):
-                store.finish(turn_id, "interrupted", safe_error_code="stop_requested", effective_session_id=effective_id)
-                store.append_event(turn_id, "turn.interrupted", {"status": "interrupted", "error_code": "stop_requested"})
+            if await self._store_operation(lambda: store.stop_requested(turn_id)):
+                await self._finish_turn(
+                    store, turn_id, "interrupted", "turn.interrupted",
+                    "stop_requested", effective_id,
+                )
                 return
             if not isinstance(result, dict) or result.get("failed"):
-                store.finish(turn_id, "failed", safe_error_code="run_failed", effective_session_id=effective_id)
-                store.append_event(turn_id, "turn.failed", {"status": "failed", "error_code": "run_failed"})
+                await self._finish_turn(
+                    store, turn_id, "failed", "turn.failed", "run_failed", effective_id
+                )
                 return
 
-            assistant_message_id = await asyncio.to_thread(
-                store.anchor_completed_assistant,
-                turn_id,
-                effective_id,
-                after_message_id=message_high_water,
+            assistant_message_id = await self._store_operation(
+                lambda: store.anchor_completed_assistant(
+                    turn_id, effective_id, after_message_id=message_high_water
+                )
             )
-            anchored_content = await asyncio.to_thread(
-                store.anchored_assistant_content, turn_id
+            anchored_content = await self._store_operation(
+                lambda: store.anchored_assistant_content(turn_id)
             )
             final_response = result.get("final_response")
             if (
@@ -1463,43 +1565,40 @@ class SessionTurnService:
                 or not isinstance(final_response, str)
                 or anchored_content != final_response
             ):
-                store.finish(
-                    turn_id,
-                    "failed",
-                    safe_error_code="assistant_anchor_mismatch",
-                    effective_session_id=effective_id,
-                )
-                store.append_event(
-                    turn_id,
-                    "turn.failed",
-                    {"status": "failed", "error_code": "assistant_anchor_mismatch"},
+                await self._finish_turn(
+                    store, turn_id, "failed", "turn.failed",
+                    "assistant_anchor_mismatch", effective_id,
                 )
                 return
-            store.append_event(
-                turn_id,
-                "assistant.completed",
-                {"completed": True, "assistant_message_id": assistant_message_id},
+            await self._store_operation(
+                lambda: store.append_event(
+                    turn_id,
+                    "assistant.completed",
+                    {"completed": True, "assistant_message_id": assistant_message_id},
+                )
             )
             if payload["delivery_mode"] in {"slack_only", "both"}:
                 assert binding is not None and slack_adapter is not None
                 await self._deliver_slack(
                     store, turn_id, binding, slack_adapter, anchored_content
                 )
-            store.finish(turn_id, "completed", effective_session_id=effective_id)
-            store.append_event(turn_id, "turn.completed", {"status": "completed"})
+            await self._finish_turn(
+                store, turn_id, "completed", "turn.completed",
+                effective_session_id=effective_id,
+            )
         except asyncio.CancelledError:
-            # Cancellation before an executor exists is mechanically terminal.
-            # Once agent_task exists, the shielded loop above retains ownership
-            # and this branch is unreachable until that worker has really quit.
-            store.finish(turn_id, "interrupted", safe_error_code="cancelled_before_execution")
-            store.append_event(
-                turn_id,
-                "turn.interrupted",
-                {"status": "interrupted", "error_code": "cancelled_before_execution"},
+            # Phase changes only after its corresponding durable truth exists,
+            # so cancellation can never contradict a persisted turn.started.
+            if agent_task is not None and agent_task.done():
+                phase.execution_done = True
+            await self._finish_turn(
+                store, turn_id, "interrupted", "turn.interrupted",
+                phase.cancellation_code,
             )
         except Exception:
-            store.finish(turn_id, "failed", safe_error_code="run_failed")
-            store.append_event(turn_id, "turn.failed", {"status": "failed", "error_code": "run_failed"})
+            await self._finish_turn(
+                store, turn_id, "failed", "turn.failed", "run_failed"
+            )
         finally:
             await self._finalize_execution(
                 store,
@@ -1524,20 +1623,13 @@ class SessionTurnService:
         dispatcher = self._lifecycle_dispatchers.get(turn_id)
         try:
             if cancelled_before_entry:
-                changed = store.finish(
+                await self._finish_turn(
+                    store,
                     turn_id,
                     "interrupted",
-                    safe_error_code="cancelled_before_execution",
+                    "turn.interrupted",
+                    "cancelled_before_execution",
                 )
-                if changed:
-                    store.append_event(
-                        turn_id,
-                        "turn.interrupted",
-                        {
-                            "status": "interrupted",
-                            "error_code": "cancelled_before_execution",
-                        },
-                    )
 
             if heartbeat_task is not None:
                 heartbeat_task.cancel()
@@ -1545,11 +1637,18 @@ class SessionTurnService:
                     await heartbeat_task
                 except asyncio.CancelledError:
                     pass
+                except Exception:
+                    # Awaiting retrieves the exception; never expose its text.
+                    logger.error(
+                        "session_turn_background_task_failed reason=heartbeat_error"
+                    )
 
             # The durable ledger alone authorizes public terminal truth. If it
             # cannot supply a terminal row, stop the private dispatcher without
             # synthesizing a lifecycle terminal.
-            row = store.get(turn_id)
+            row = await self._store_operation(
+                lambda: store.get(turn_id), propagate_cancellation=False
+            )
             status = row.get("status") if row else None
             outcome = (
                 {
