@@ -329,7 +329,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- create ---
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
-    p_create.add_argument("--body", default=None, help="Optional opening post")
+    _body_group = p_create.add_mutually_exclusive_group()
+    _body_group.add_argument("--body", default=None, help="Optional opening post")
+    _body_group.add_argument(
+        "--body-file", default=None,
+        help="Read body from PATH (or '-' for stdin). Max 1 MiB, UTF-8.",
+    )
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
@@ -1539,6 +1544,51 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+_BODY_FILE_MAX_BYTES = 1_048_576  # 1 MiB
+_BODY_FILE_PATH_DISPLAY_MAX = 200
+
+
+def _body_file_source_label(path: str) -> str:
+    escaped = ascii(path)
+    if len(escaped) <= _BODY_FILE_PATH_DISPLAY_MAX:
+        return escaped
+    return escaped[:_BODY_FILE_PATH_DISPLAY_MAX - 3] + "..."
+
+
+def _resolve_body_file(path: str) -> str | None:
+    """Read and validate a ``--body-file`` argument.
+
+    Returns the decoded UTF-8 string on success, or *None* on failure
+    (after printing a bounded error to stderr).
+    """
+    source = _body_file_source_label(path)
+    try:
+        if path == "-":
+            raw = sys.stdin.buffer.read(_BODY_FILE_MAX_BYTES + 1)
+        else:
+            with open(path, "rb") as fh:
+                raw = fh.read(_BODY_FILE_MAX_BYTES + 1)
+    except FileNotFoundError:
+        print(f"kanban: --body-file: not found: {source}", file=sys.stderr)
+        return None
+    except (OSError, ValueError, AttributeError):
+        print(f"kanban: --body-file: cannot read: {source}", file=sys.stderr)
+        return None
+
+    if len(raw) > _BODY_FILE_MAX_BYTES:
+        print(
+            f"kanban: --body-file: exceeds 1 MiB ({_BODY_FILE_MAX_BYTES} bytes)",
+            file=sys.stderr,
+        )
+        return None
+
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        print("kanban: --body-file: not valid utf-8", file=sys.stderr)
+        return None
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
@@ -1562,11 +1612,19 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # Resolve --body-file after cheap flag validation but before DB access.
+    body_file = getattr(args, "body_file", None)
+    if body_file is not None:
+        body = _resolve_body_file(body_file)
+        if body is None:
+            return 2
+    else:
+        body = args.body
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
             title=args.title,
-            body=args.body,
+            body=body,
             assignee=args.assignee,
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind,
