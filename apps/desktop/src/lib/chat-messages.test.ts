@@ -380,11 +380,31 @@ describe('renderMediaTags', () => {
     expect(renderMediaTags('MEDIA:/tmp/demo.mp4')).toBe('[Video: demo.mp4](#media:%2Ftmp%2Fdemo.mp4)')
   })
 
+  it('keeps an unquoted standalone MEDIA path with spaces intact', () => {
+    const path = '/Users/zora/Documents/ZORA/hermes/operations/B17-B Value Extraction and Retirement Receipt.md'
+
+    expect(renderMediaTags(`ready\nMEDIA:${path}`)).toBe(
+      `ready\n[File: B17-B Value Extraction and Retirement Receipt.md](#media:${encodeURIComponent(path)})`
+    )
+  })
+
   it('renders streamed assistant media once the tag is complete', () => {
     const parts = appendAssistantTextPart(appendAssistantTextPart([], 'ok\nMEDIA:'), '/tmp/voice.mp3')
     const text = chatMessageText({ id: 'a', role: 'assistant', parts })
 
     expect(text).toBe('ok\n[Audio: voice.mp3](#media:%2Ftmp%2Fvoice.mp3)')
+  })
+
+  it('does not freeze a streamed standalone MEDIA path before later space-separated chunks arrive', () => {
+    const path = '/Users/zora/Documents/ZORA/hermes/operations/B17-B Value Extraction and Retirement Receipt.md'
+    let parts = appendAssistantTextPart([], 'ready\nMEDIA:/Users/zora/Documents/ZORA/hermes/operations/B17-B')
+
+    parts = appendAssistantTextPart(parts, ' Value Ex')
+    parts = appendAssistantTextPart(parts, 'traction and Retirement Receipt.md\n')
+
+    expect(chatMessageText({ id: 'a', role: 'assistant', parts })).toBe(
+      `ready\n[File: B17-B Value Extraction and Retirement Receipt.md](#media:${encodeURIComponent(path)})\n`
+    )
   })
 })
 
