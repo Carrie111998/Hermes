@@ -125,3 +125,112 @@ def test_survives_accounting_failure():
     # Must swallow the failure, never raise into the review thread.
     background_review._record_review_usage_to_parent(_FakeParent(_BoomDB()), _review_agent())
     assert True
+
+
+# ---------------------------------------------------------------------------
+# Wiring tests: the recording call must run even when the fork's
+# run_conversation raises after consuming tokens. Regression for the PR #85714
+# triage finding — the call originally sat AFTER the try/finally wrapping
+# run_conversation, so the exception path (outer except in _run_review_in_thread)
+# skipped attribution entirely.
+# ---------------------------------------------------------------------------
+
+
+def _make_review_parent(db):
+    """Minimal parent stand-in carrying the attributes _run_review_in_thread reads."""
+    parent = _FakeParent(db)
+    for _name, _val in {
+        "model": "test-model",
+        "provider": "test-provider",
+        "platform": "test",
+        "_memory_store": None,
+        "_memory_enabled": False,
+        "_user_profile_enabled": False,
+        "_cached_system_prompt": None,
+        "session_start": "2026-08-14T00:00:00",
+        "background_review_callback": None,
+        "memory_notifications": "off",
+        "_background_review_agent": None,
+        "_background_review_lock": None,
+        "_active_children": [],
+        "_active_children_lock": None,
+        "_safe_print": lambda *a, **k: None,
+        "_emit_auxiliary_failure": lambda *a, **k: None,
+    }.items():
+        setattr(parent, _name, _val)
+    return parent
+
+
+class _FakeFork(_FakeReview):
+    """Fork stand-in whose run_conversation can raise after consuming tokens."""
+
+    def __init__(self, calls=3, cache=50000, raise_on_call=True):
+        # Same counters conversation_loop populates on a real fork; the
+        # session_* names matter (_FakeReview only stores whatever keys it
+        # is handed).
+        super().__init__(**vars(_review_agent(calls=calls, cache=cache)))
+        self._session_messages = []
+        self.raise_on_call = raise_on_call
+        self.close_called = False
+        self.shutdown_called = False
+
+    def run_conversation(self, **kwargs):
+        if self.raise_on_call:
+            # Simulates a fork that landed API calls (counters populated by
+            # conversation_loop) and then failed mid-review.
+            raise RuntimeError("simulated mid-review failure after API calls")
+
+    def shutdown_memory_provider(self):
+        self.shutdown_called = True
+
+    def close(self):
+        self.close_called = True
+
+
+def _run_review_with_fake_fork(db, monkeypatch, fork):
+    db.create_session("sess-parent", source="cli")
+    parent = _make_review_parent(db)
+    monkeypatch.setattr("run_agent.AIAgent", lambda **kwargs: fork)
+    monkeypatch.setattr(
+        background_review,
+        "_resolve_review_runtime",
+        lambda agent: {"routed": False},
+    )
+
+    background_review._run_review_in_thread(parent, [], "review prompt")
+    return parent
+
+
+def test_records_usage_when_fork_raises_after_calls(db, monkeypatch):
+    """A fork that consumed tokens and THEN raised is still attributed.
+
+    Before the fix the recording call sat after the try/finally wrapping
+    run_conversation, so the exception jumped to the outer except and the
+    fork's billed calls were never written to session_model_usage.
+    """
+    fork = _FakeFork(calls=3, cache=50000, raise_on_call=True)
+    _run_review_with_fake_fork(db, monkeypatch, fork)
+
+    assert fork.close_called  # exception path still tears the fork down
+    rows = _usage_rows(db, "sess-parent")
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["task"] == "background_review"
+    assert r["model"] == "test-model"
+    assert r["input_tokens"] == 12000
+    assert r["output_tokens"] == 2400
+    assert r["cache_read_tokens"] == 50000
+    assert r.get("estimated_cost_usd") == 0.05
+
+
+def test_records_usage_once_when_fork_completes(db, monkeypatch):
+    """Normal completion still records exactly once (finally placement must
+    not double-record on the success path)."""
+    fork = _FakeFork(calls=3, cache=50000, raise_on_call=False)
+    _run_review_with_fake_fork(db, monkeypatch, fork)
+
+    assert fork.close_called  # success path tears the fork down at close()
+    rows = _usage_rows(db, "sess-parent")
+    assert len(rows) == 1
+    assert rows[0]["input_tokens"] == 12000
+    assert rows[0]["cache_read_tokens"] == 50000

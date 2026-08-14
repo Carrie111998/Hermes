@@ -1049,18 +1049,23 @@ def _run_review_in_thread(
                 # next live turn. Runs on both the success and exception
                 # path (this whole block is inside the try/finally above).
                 _unregister_review_agent(review_agent)
-
-            # Attribute the review fork's usage to the PARENT session. The
-            # fork runs with ``_session_db=None`` (persistence isolation — see
-            # the PERSISTENCE ISOLATION comment above), so its API calls are
-            # billed by the provider but never written to
-            # ``session_model_usage``. The fork still accumulates the same
-            # in-memory counters the main loop does (session_*_tokens), so
-            # snapshot them BEFORE close() and record them against the parent
-            # session via the aux-accounting chokepoint, which writes only
-            # session_model_usage (never the transcript, never the sessions
-            # summary row).
-            _record_review_usage_to_parent(agent, review_agent)
+                # Attribute the review fork's usage to the PARENT session. The
+                # fork runs with ``_session_db=None`` (persistence isolation — see
+                # the PERSISTENCE ISOLATION comment above), so its API calls are
+                # billed by the provider but never written to
+                # ``session_model_usage``. The fork still accumulates the same
+                # in-memory counters the main loop does (session_*_tokens), so
+                # snapshot them BEFORE close() and record them against the parent
+                # session via the aux-accounting chokepoint, which writes only
+                # session_model_usage (never the transcript, never the sessions
+                # summary row). Placed in this finally (not after the
+                # try/finally) so a fork that consumed tokens and THEN raised
+                # is still attributed — otherwise its billed calls would miss
+                # session_model_usage, the same gap this accounting exists to
+                # close. Best-effort: the recording never raises into the
+                # review thread (its own try/except), and a fork that made no
+                # successful calls no-ops on all-zero counters.
+                _record_review_usage_to_parent(agent, review_agent)
 
             # Snapshot review actions before teardown. close() is allowed to
             # clean per-session state, but the user-visible self-improvement
