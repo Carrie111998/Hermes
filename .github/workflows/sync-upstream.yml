@@ -114,8 +114,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if gh pr view sync/upstream --json number >/dev/null 2>&1; then
-            echo "existing sync PR updated by the branch push"
+          # --state open is load-bearing: `gh pr view <branch>` also finds a
+          # MERGED or CLOSED PR, so without it this reports "already open" once
+          # the first sync PR is merged and never opens another.
+          OPEN_PR=$(gh pr list --state open --head sync/upstream --json number --jq '.[0].number // empty')
+          if [ -n "$OPEN_PR" ]; then
+            echo "existing sync PR #$OPEN_PR updated by the branch push"
           else
             gh pr create --base main --head sync/upstream \
               --title "sync: merge upstream NousResearch/hermes-agent" \
