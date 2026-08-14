@@ -14590,14 +14590,47 @@ def _build_verified_merge_candidate(
 
 
 def _fast_forward_target(candidate: IntegrationCandidate) -> bool:
-    result = advance_prepared_candidate_ref(
-        candidate.repo_root,
-        target_ref=f"refs/heads/{candidate.target_branch}",
-        candidate_ref=candidate.candidate_ref,
-        pre_sha=candidate.pre_sha,
-        candidate_sha=candidate.candidate_sha,
+    target_ref = f"refs/heads/{candidate.target_branch}"
+    current = _integration_git(candidate.repo_root, ["rev-parse", target_ref])
+    if current.returncode != 0 or (current.stdout or "").strip() != candidate.pre_sha:
+        return False
+
+    current_target_worktree = _checked_out_branch_worktree(
+        candidate.repo_root, candidate.target_branch
     )
-    return result.kind in {"advanced", "reflected"}
+    if current_target_worktree != candidate.target_worktree:
+        return False
+
+    if current_target_worktree is not None:
+        if not _worktree_is_clean(current_target_worktree):
+            return False
+        branch = _integration_git(current_target_worktree, ["branch", "--show-current"])
+        if branch.returncode != 0 or (branch.stdout or "").strip() != candidate.target_branch:
+            return False
+        current = _integration_git(candidate.repo_root, ["rev-parse", target_ref])
+        if current.returncode != 0 or (current.stdout or "").strip() != candidate.pre_sha:
+            return False
+        applied = _integration_git(
+            current_target_worktree, ["merge", "--ff-only", candidate.candidate_sha]
+        )
+    else:
+        applied = _integration_git(
+            candidate.repo_root,
+            ["update-ref", target_ref, candidate.candidate_sha, candidate.pre_sha],
+        )
+    if applied.returncode != 0:
+        return False
+    applied_ref = _integration_git(candidate.repo_root, ["rev-parse", target_ref])
+    if (
+        applied_ref.returncode != 0
+        or (applied_ref.stdout or "").strip() != candidate.candidate_sha
+    ):
+        return False
+    _integration_git(
+        candidate.repo_root,
+        ["update-ref", "-d", candidate.candidate_ref, candidate.candidate_sha],
+    )
+    return True
 
 
 def _default_epic_verify(
