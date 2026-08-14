@@ -294,6 +294,7 @@ describe('useComposerActions native image drops', () => {
         scope: {
           add,
           remove: vi.fn(() => null),
+          update: vi.fn(() => false),
           target: 'test-composer'
         }
       })
