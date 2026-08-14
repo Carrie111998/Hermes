@@ -1751,6 +1751,102 @@ class TestListSessionsRich:
         db.touch_session_activity("s1", 1_700_000_500.0, description="api")  # older than message
         assert db.list_sessions_rich()[0]["last_active"] == 1_700_000_800.0
 
+    def test_recent_order_groups_message_activity_once(self, db):
+        """Recency SQL must not probe MAX(messages.timestamp) per session row."""
+        for index in range(3):
+            session_id = f"s{index}"
+            db.create_session(session_id, "cli")
+            db.append_message(session_id, "user", f"message {index}")
+
+        statements = []
+
+        def trace(statement):
+            if "message_activity(session_id, last_message_at)" in statement:
+                statements.append(statement)
+
+        db._conn.set_trace_callback(trace)
+        try:
+            db.list_sessions_rich(order_by_last_active=True)
+        finally:
+            db._conn.set_trace_callback(None)
+
+        assert len(statements) == 1
+        query = " ".join(statements[0].split())
+        assert "message_activity(session_id, last_message_at) AS" in query
+        assert "SELECT MAX(_act_m.timestamp)" not in query
+
+    def test_grouped_activity_preserves_compression_chain_recency(self, db):
+        """A recent continuation still orders its projected root ahead of peers."""
+        db.create_session("root", "cli")
+        db.append_message("root", "user", "root message")
+        db.end_session("root", "compression")
+        db.create_session("tip", "cli", parent_session_id="root")
+        db.append_message("tip", "user", "tip message")
+        db.create_session("peer", "cli")
+        db.append_message("peer", "user", "peer message")
+
+        with db._lock:
+            db._conn.execute(
+                "UPDATE messages SET timestamp = ? WHERE session_id = ?",
+                (1_700_000_900.0, "tip"),
+            )
+            db._conn.execute(
+                "UPDATE messages SET timestamp = ? WHERE session_id = ?",
+                (1_700_000_800.0, "peer"),
+            )
+            db._conn.commit()
+
+        rows = db.list_sessions_rich(order_by_last_active=True)
+        assert [row["id"] for row in rows] == ["tip", "peer"]
+        assert rows[0]["_lineage_root_id"] == "root"
+        assert rows[0]["last_active"] == 1_700_000_900.0
+
+    def test_grouped_activity_preserves_newer_heartbeat_recency(self, db):
+        """The fast path keeps heartbeat activity when it is newer than messages."""
+        db.create_session("heartbeat", "cli")
+        db.append_message("heartbeat", "user", "older message")
+        with db._lock:
+            db._conn.execute(
+                "UPDATE messages SET timestamp = ? WHERE session_id = ?",
+                (1_700_000_500.0, "heartbeat"),
+            )
+            db._conn.commit()
+        db.touch_session_activity("heartbeat", 1_700_000_900.0, description="api")
+
+        rows = db.list_sessions_rich(order_by_last_active=True)
+
+        assert rows[0]["id"] == "heartbeat"
+        assert rows[0]["last_active"] == 1_700_000_900.0
+
+    def test_grouped_activity_scopes_recovery_chain_to_filtered_rows(self, db):
+        """Filtered sidebar lanes seed compression recovery only from eligible rows."""
+        db.create_session("cli-row", "cli")
+        db.append_message("cli-row", "user", "cli")
+        db.create_session("foreign-root", "telegram")
+        db.end_session("foreign-root", "compression")
+        db.create_session(
+            "foreign-tip", "telegram", parent_session_id="foreign-root"
+        )
+        db.append_message("foreign-tip", "user", "foreign")
+        statements = []
+
+        def trace(statement):
+            if "message_activity(session_id, last_message_at)" in statement:
+                statements.append(statement)
+
+        db._conn.set_trace_callback(trace)
+        try:
+            rows = db.list_sessions_rich(
+                source="cli", order_by_last_active=True
+            )
+        finally:
+            db._conn.set_trace_callback(None)
+
+        assert [row["id"] for row in rows] == ["cli-row"]
+        query = " ".join(statements[0].split())
+        assert "FROM eligible e WHERE e.end_reason = 'compression'" in query
+        assert "SELECT s.id, s.id FROM sessions s" not in query
+
     def test_list_gateway_sessions_last_active_uses_activity_heartbeat(self, db):
         db.create_session(
             "gw-1",

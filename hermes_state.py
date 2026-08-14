@@ -7662,7 +7662,86 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # pass id_query=None.
         id_needle = (id_query or "").strip().lower()
         search_needle = (search_query or "").strip().lower()
-        if order_by_last_active:
+        if order_by_last_active and not id_needle and not search_needle:
+            # The Desktop sidebar is an unsearched recency page. Build its
+            # filtered set once, aggregate message activity once, and recurse
+            # only from surfaced compression roots. Most profiles have no
+            # compression roots, so their recursive chain is empty while the
+            # query remains a single SQLite snapshot (no check-then-query
+            # race). Search keeps the general chain-aware query below because
+            # it must match every title/id in a continuation chain.
+            _sel = self._compact_session_cols() if compact_rows else "s.*"
+            query = f"""
+                WITH RECURSIVE
+                eligible(id, end_reason) AS (
+                    SELECT s.id, s.end_reason FROM sessions s {where_sql}
+                ),
+                message_activity(session_id, last_message_at) AS (
+                    SELECT session_id, MAX(timestamp)
+                    FROM messages
+                    GROUP BY session_id
+                ),
+                chain(root_id, cur_id) AS (
+                    SELECT e.id, e.id
+                    FROM eligible e
+                    WHERE e.end_reason = 'compression'
+                    UNION ALL
+                    SELECT c.root_id, child.id
+                    FROM chain c
+                    JOIN sessions parent ON parent.id = c.cur_id
+                    JOIN sessions child ON child.parent_session_id = c.cur_id
+                    WHERE parent.end_reason = 'compression'
+                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
+                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                      AND COALESCE(child.source, '') != 'tool'
+                ),
+                chain_max AS (
+                    SELECT
+                        c.root_id,
+                        MAX(
+                            COALESCE(
+                                MAX(cs.last_activity_at, ma.last_message_at),
+                                cs.last_activity_at,
+                                ma.last_message_at,
+                                cs.started_at
+                            )
+                        ) AS effective_last_active
+                    FROM chain c
+                    JOIN sessions cs ON cs.id = c.cur_id
+                    LEFT JOIN message_activity ma ON ma.session_id = c.cur_id
+                    GROUP BY c.root_id
+                )
+                SELECT {_sel}{prompt_select},
+                    COALESCE(
+                        (SELECT {_PREVIEW_RAW_SELECT}
+                         FROM messages m
+                         WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                         ORDER BY m.timestamp, m.id LIMIT 1),
+                        ''
+                    ) AS _preview_raw,
+                    COALESCE(
+                        MAX(s.last_activity_at, sma.last_message_at),
+                        s.last_activity_at,
+                        sma.last_message_at,
+                        s.started_at
+                    ) AS last_active,
+                    COALESCE(
+                        cm.effective_last_active,
+                        MAX(s.last_activity_at, sma.last_message_at),
+                        s.last_activity_at,
+                        sma.last_message_at,
+                        s.started_at
+                    ) AS _effective_last_active
+                FROM eligible e
+                JOIN sessions s ON s.id = e.id
+                LEFT JOIN message_activity sma ON sma.session_id = s.id
+                LEFT JOIN chain_max cm ON cm.root_id = s.id
+                {prompt_join}
+                ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
+                LIMIT ? OFFSET ?
+            """
+            params = base_where_params + [limit, offset]
+        elif order_by_last_active:
             # Compute effective_last_active by walking each surfaced session's
             # compression-continuation chain forward in SQL and taking the MAX
             # timestamp across the chain. This lets us ORDER BY + LIMIT at SQL
