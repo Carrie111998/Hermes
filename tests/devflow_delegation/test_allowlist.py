@@ -189,3 +189,40 @@ def test_path_allowed_enforces_allow_and_deny(allowlist_file):
     assert path_allowed(t, "secrets/token.json") is False
     # outside every allowed glob
     assert path_allowed(t, "bridges/hermes_to_devflow.py") is False
+
+
+def test_agent_fields_have_conservative_defaults(tmp_path):
+    target = resolve_target(load_allowlist(_canary_file(tmp_path)), "sandbox")
+    assert target.agent_model == "deepseek/deepseek-v4-pro"
+    assert target.agent_max_iterations == 25
+    assert target.agent_max_tokens == 200_000
+    assert target.agent_max_files == 10
+    assert target.agent_timeout_seconds == 900
+
+
+def test_agent_fields_are_overridable(tmp_path):
+    target = resolve_target(load_allowlist(_canary_file(
+        tmp_path, agent_model="anthropic/claude-opus-5", agent_max_iterations=5,
+        agent_max_tokens=1000, agent_max_files=2, agent_timeout_seconds=60,
+    )), "sandbox")
+    assert target.agent_model == "anthropic/claude-opus-5"
+    assert target.agent_max_iterations == 5
+    assert target.agent_max_tokens == 1000
+    assert target.agent_max_files == 2
+    assert target.agent_timeout_seconds == 60
+
+
+@pytest.mark.parametrize("mutation", [
+    {"agent_max_iterations": 0},
+    {"agent_max_tokens": 0},
+    {"agent_max_files": 0},
+    {"agent_timeout_seconds": 0},
+    {"agent_max_iterations": -1},
+    {"agent_model": ""},
+    {"agent_max_tokens": "lots"},
+])
+def test_invalid_agent_config_fails_closed(tmp_path, mutation):
+    # Every agent bound is load-bearing: a zero/negative ceiling would remove the
+    # bound entirely, and a blank model would silently fall back to provider defaults.
+    with pytest.raises(AllowlistError):
+        load_allowlist(_canary_file(tmp_path, **mutation))

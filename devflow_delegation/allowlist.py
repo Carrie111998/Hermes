@@ -45,6 +45,11 @@ class TargetConfig:
     canary_real: bool = False
     pr_budget: int = 1
     pr_budget_window_hours: int = 24
+    agent_model: str = "deepseek/deepseek-v4-pro"
+    agent_max_iterations: int = 25
+    agent_max_tokens: int = 200_000
+    agent_max_files: int = 10
+    agent_timeout_seconds: int = 900
     implementation_command: Optional[Tuple[str, ...]] = None
     github_repo: str = ""
     deploy_command: Optional[str] = None
@@ -139,6 +144,27 @@ def load_allowlist(path: Path) -> Allowlist:
             raise AllowlistError(
                 f"allowlist target '{name}' malformed: pr_budget/pr_budget_window_hours must be int ({exc})"
             ) from exc
+        agent_model = str(raw.get("agent_model", "deepseek/deepseek-v4-pro")).strip()
+        if not agent_model:
+            raise AllowlistError(f"allowlist target '{name}' malformed: agent_model must be a non-empty string")
+        agent_ints = {}
+        for field_name, default in (
+            ("agent_max_iterations", 25),
+            ("agent_max_tokens", 200_000),
+            ("agent_max_files", 10),
+            ("agent_timeout_seconds", 900),
+        ):
+            try:
+                value = int(raw.get(field_name, default))
+            except (TypeError, ValueError) as exc:
+                raise AllowlistError(
+                    f"allowlist target '{name}' malformed: {field_name} must be int ({exc})"
+                ) from exc
+            if value < 1:
+                raise AllowlistError(
+                    f"allowlist target '{name}' malformed: {field_name} must be >= 1"
+                )
+            agent_ints[field_name] = value
         if executor_enabled:
             if not (command and github_repo and max_action == "create_pr"):
                 raise AllowlistError(
@@ -189,6 +215,11 @@ def load_allowlist(path: Path) -> Allowlist:
             canary_real=canary_real,
             pr_budget=pr_budget,
             pr_budget_window_hours=pr_budget_window_hours,
+            agent_model=agent_model,
+            agent_max_iterations=agent_ints["agent_max_iterations"],
+            agent_max_tokens=agent_ints["agent_max_tokens"],
+            agent_max_files=agent_ints["agent_max_files"],
+            agent_timeout_seconds=agent_ints["agent_timeout_seconds"],
             implementation_command=command,
             github_repo=github_repo,
             deploy_command=raw.get("deploy_command"),
