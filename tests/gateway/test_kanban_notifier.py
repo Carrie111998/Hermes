@@ -622,3 +622,130 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     finally:
         conn.close()
     assert remaining == []
+
+
+def test_discord_origin_same_card_review_cycle_notifies_changes(
+    tmp_path, monkeypatch
+):
+    """One Discord-origin card survives review, rework, and completion.
+
+    The test crosses the real Kanban tool creation surface, durable subscription
+    row, review state machine, notifier cursor, and Discord thread routing.
+    """
+    import json
+
+    from gateway.config import Platform
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import kanban_tools
+
+    db_path = tmp_path / "discord-same-card.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    tokens = set_session_vars(
+        platform="discord",
+        chat_id="thread-42",
+        thread_id="thread-42",
+        chat_type="thread",
+        user_id="owner-7",
+        scope_id="guild-9",
+        session_id="origin-session",
+        profile="default",
+    )
+    try:
+        created = json.loads(
+            kanban_tools._handle_create(
+                {"title": "same-card canary", "assignee": "implementer"}
+            )
+        )
+    finally:
+        clear_session_vars(tokens)
+    assert created["ok"] is True
+    task_id = created["task_id"]
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id)
+        assert len(subs) == 1
+        assert subs[0]["platform"] == "discord"
+        assert subs[0]["chat_id"] == "thread-42"
+        assert subs[0]["thread_id"] == "thread-42"
+        assert subs[0]["notifier_profile"] == "default"
+
+        build = kb.claim_task(conn, task_id, claimer="impl-1")
+        assert build is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="implementation ready",
+            reviewer="reviewer",
+            expected_run_id=build.current_run_id,
+        )
+
+        first_review = kb.claim_review_task(conn, task_id, claimer="review-1")
+        assert first_review is not None
+        changed, implementer = kb.request_changes(
+            conn,
+            task_id,
+            reason="tighten the contract",
+            expected_run_id=first_review.current_run_id,
+        )
+        assert changed is True
+        assert implementer == "implementer"
+
+        rework = kb.claim_task(conn, task_id, claimer="impl-2")
+        assert rework is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="changes addressed",
+            expected_run_id=rework.current_run_id,
+        )
+
+        second_review = kb.claim_review_task(conn, task_id, claimer="review-2")
+        assert second_review is not None
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="review approved",
+            expected_run_id=second_review.current_run_id,
+        )
+        finished = kb.get_task(conn, task_id)
+        assert finished is not None
+        assert finished.status == "done"
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner.adapters = {Platform.DISCORD: adapter}  # type: ignore[dict-item]
+    runner._active_profile_name = lambda: "default"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    messages = [item["text"] for item in adapter.sent]
+    assert len(messages) == 4
+    assert sum("ready for review" in message for message in messages) == 2
+    assert sum("changes requested" in message for message in messages) == 1
+    assert sum(" done" in message for message in messages) == 1
+    assert all(task_id in message for message in messages)
+    assert all(item["chat_id"] == "thread-42" for item in adapter.sent)
+    assert all(
+        item["metadata"]["thread_id"] == "thread-42" for item in adapter.sent
+    )
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id)
+        assert len(subs) == 1, "done remains reopenable; retain origin routing"
+        event_kinds = [
+            row["kind"]
+            for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            ).fetchall()
+        ]
+        assert event_kinds.count("review_requested") == 2
+        assert event_kinds.count("changes_requested") == 1
+        assert event_kinds.count("completed") == 1
+    finally:
+        conn.close()
