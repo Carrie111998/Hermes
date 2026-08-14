@@ -1571,6 +1571,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 _existing_cooldown,
                 time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S,
             )
+        # A2 — nothing absorbed the traffic. This is the ACT case: runs stop
+        # working rather than silently degrading, and it is invisible in every
+        # other surface today.
+        if reason in {FailoverReason.rate_limit, FailoverReason.billing,
+                      FailoverReason.upstream_rate_limit}:
+            try:
+                from events.rate_limit_signal import record
+                record(
+                    provider=getattr(agent, "provider", "") or "",
+                    model=getattr(agent, "model", "") or "",
+                    reason=reason.value,
+                    detector="runtime",
+                    outcome=("chain_exhausted" if agent._fallback_chain
+                             else "no_fallback"),
+                )
+            except Exception:
+                pass
         return False
     fb = agent._fallback_chain[agent._fallback_index]
     agent._fallback_index += 1
@@ -1717,6 +1734,25 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
+
+        # A1 — the swap succeeded: old_provider/old_model got limited and
+        # fb_provider/fb_model is absorbing the traffic. Fire-and-forget;
+        # a telemetry defect must never break a model call.
+        if reason in {FailoverReason.rate_limit, FailoverReason.billing,
+                      FailoverReason.upstream_rate_limit}:
+            try:
+                from events.rate_limit_signal import record
+                record(
+                    provider=old_provider or "",
+                    model=old_model or "",
+                    reason=reason.value,
+                    detector="runtime",
+                    outcome="diverted",
+                    fallback_provider=fb_provider,
+                    fallback_model=fb_model,
+                )
+            except Exception:
+                pass
 
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream
