@@ -947,6 +947,9 @@ DEFAULT_CONFIG = {
             "timeout": 360,        # seconds (6min) — per-attempt LLM summarization timeout; increase for slow local models
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
+            "max_tokens": 1000,      # judge output budget; reasoning models
+                                     # need ≥~800 or they burn everything on
+                                     # thinking and return empty content
         },
         "compression": {
             "provider": "auto",

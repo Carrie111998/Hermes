@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Union
@@ -46,6 +47,16 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Union
 logger = logging.getLogger(__name__)
 
 _AUX_TASK = "outcome"
+
+# The judge must return ``{"task_succeeded", "confidence", "failure_points",
+# "reason"}`` as JSON. Models routinely wrap answers in ```json fences, lead
+# with a sentence of prose, or truncate mid-JSON at max_tokens — a bare
+# ``json.loads(content)`` would return None for all of these and silently
+# record nothing (the eval's verdict is the whole feature). This regex grabs
+# the first JSON object (``{...}``) in the response so prose/fences around it
+# don't kill the parse. A truncated object (unbalanced braces) is rejected,
+# but a valid object embedded anywhere in the text survives.
+_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 # A pass is only recorded (and only eligible to clear `needs_review`) when the
 # eval declares success at or above this confidence. A weak pass — no verifier,
@@ -139,32 +150,94 @@ def _build_prompt(
     return "\n".join(lines)
 
 
-def _default_aux_eval(prompt: str) -> Optional[Dict[str, Any]]:
-    """Real aux-client path. Best-effort: no client / any error → None."""
-    try:
-        from agent.auxiliary_client import get_text_auxiliary_client
+def _parse_judge_json(content: str) -> Optional[Dict[str, Any]]:
+    """Tolerantly parse the judge's JSON verdict from raw model output.
 
-        client, model = get_text_auxiliary_client(task=_AUX_TASK)
-        if client is None or not model:
-            return None
-        resp = client.chat.completions.create(
-            model=model,
+    Tries strict parsing first, then falls back to grabbing the first
+    ``{...}`` object in the text. Handles the three real-world shapes that
+    break a bare ``json.loads``:
+
+      - fenced: `````json\n{"task_succeeded": ...}\n`````
+      - prose-wrapped: ``"The task failed. {"task_succeeded": false, ...}"``
+      - exact: ``{"task_succeeded": ...}``
+
+    Returns None when nothing parseable survives (truncated/unbalanced object,
+    prose with no JSON). Never raises.
+    """
+    if not content or not isinstance(content, str):
+        return None
+    text = content.strip()
+    if not text:
+        return None
+    # Fast path: the whole response is the JSON object.
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    # Tolerant path: strip fences/prose and parse the first {…} object.
+    match = _JSON_OBJECT_RE.search(text)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+        return parsed if isinstance(parsed, dict) else None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _default_aux_eval(prompt: str) -> Optional[Dict[str, Any]]:
+    """Real aux-client path. Best-effort: no client / any error → None.
+
+    Routed through ``call_llm`` (not a raw ``client.chat.completions.create``)
+    so the task's configured ``auxiliary.outcome.timeout``, ``extra_body``,
+    and ``reasoning_effort`` actually reach the wire, and so ``max_tokens`` is
+    translated to ``max_completion_tokens`` where the provider requires it.
+    The token budget is config-driven (``auxiliary.outcome.max_tokens``,
+    default 1000): a fixed 200 was far too small for reasoning models, which
+    burn their whole budget on ``reasoning`` and return empty ``content`` —
+    silently recording nothing (the eval's verdict is the whole feature).
+    """
+    try:
+        from agent.auxiliary_client import call_llm
+
+        config = _default_outcome_config()
+        max_tokens = int(config.get("max_tokens") or 1000)
+        resp = call_llm(
+            task=_AUX_TASK,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=200,
+            max_tokens=max_tokens,
         )
         content = getattr(getattr(resp, "choices", [{}])[0].message, "content", "") or ""
-        parsed = json.loads(content)
-        return parsed if isinstance(parsed, dict) else None
+        return _parse_judge_json(content)
     except Exception as e:
         logger.debug("outcome aux eval failed: %s", e, exc_info=True)
         return None
 
 
-def _record(skill_name: str, success: bool, reason: str = "") -> None:
-    """Best-effort write to the usage sidecar. Never raises into the turn."""
-    try:
-        from tools.skill_usage import bump_outcome
+def _record(
+    skill_name: str, success: bool, reason: str = "", skill_dir: Optional[Path] = None
+) -> None:
+    """Best-effort write to the usage sidecar. Never raises into the turn.
 
+    Gated on curation eligibility, mirroring the mechanical verifier path
+    (``tools.skill_verify.run_verification`` refuses non-eligible skills before
+    it can produce a FAIL). Without this gate, an eval-attributed failure point
+    — the judge may name ANY skill, including a bundled/hub-installed one that
+    also ran — would flip ``needs_review`` on a skill the curator never
+    surfaces, and its reason would sit in the sidecar permanently. Eligible
+    skills are the only ones whose outcomes feed curator review.
+    """
+    try:
+        from tools.skill_usage import bump_outcome, is_curation_eligible
+
+        if not is_curation_eligible(skill_name, skill_dir):
+            logger.debug(
+                "turn_outcome: skipping outcome record for %s — not "
+                "curation-eligible",
+                skill_name,
+            )
+            return
         bump_outcome(skill_name, success, reason=reason or None)
     except Exception as e:
         logger.debug("turn_outcome: failed to record %s: %s", skill_name, e, exc_info=True)
@@ -312,14 +385,29 @@ def evaluate_turn_outcome(
         # ── Attribution (dumb recorder) + persistence ───────────────────────
         mechanical_points = [n for n, _ in fail_verdicts]
         fail_reasons = {n: r for n, r in fail_verdicts}
-        failure_points = list(dict.fromkeys(mechanical_points + eval_points))
+        # Eval-attributed points are intersected with the skills actually used
+        # this turn. The judge has only the prompt's summary of the turn and can
+        # hallucinate a skill name ("summarization", ...) that never ran — the
+        # recorder must not pin blame (or flip needs_review) on a skill the turn
+        # never touched. Mechanical points are already used-skills-only.
+        used_names = {name for name, _d in skill_dirs}
+        failure_points = list(
+            dict.fromkeys(mechanical_points + [p for p in eval_points if p in used_names])
+        )
+        dir_by_name = dict(skill_dirs)
         for s in failure_points:
             # Mechanical fails carry their verifier's reason; eval-attributed
-            # points carry the eval's merged reason text.
-            _record(s, False, fail_reasons.get(s) or eval_reason)
+            # points carry the eval's merged reason text. Pass the skill dir so
+            # the eligibility gate resolves external/bundled skills correctly.
+            _record(
+                s,
+                False,
+                fail_reasons.get(s) or eval_reason,
+                skill_dir=dir_by_name.get(s),
+            )
         if task_succeeded and confidence >= _PASS_CONFIDENCE_THRESHOLD:
-            for name, _d in skill_dirs:
-                _record(name, True)
+            for name, d in skill_dirs:
+                _record(name, True, skill_dir=d)
 
         # ── Reason corpus ───────────────────────────────────────────────────
         parts = []

@@ -427,3 +427,260 @@ def test_verifier_runs_in_agent_cwd_not_process_cwd(turn_env):
         clear_session_cwd()
     assert (session_cwd / "ran-here").exists()
     assert not (Path.cwd() / "ran-here").exists()
+
+
+def test_eval_attribution_respects_curation_eligibility(turn_env):
+    """Eval-attributed failure points must not flip needs_review on skills the
+    curator can't manage.
+
+    The mechanical path already refuses non-eligible skills (a bundled/hub/
+    external skill's verifier never runs, so it can never FAIL). But the judge
+    may name ANY skill — including a hub-installed one that also ran this turn.
+    Recording that verdict would flip ``needs_review`` on a skill the curator
+    never surfaces, leaving a permanent orphan reason in the sidecar. The
+    attribution recorder must apply the same eligibility gate.
+    """
+    import json as _json
+
+    from agent.turn_outcome import evaluate_turn_outcome
+    from tools.skill_usage import get_record, load_usage, _read_hub_installed_names
+
+    # The skill used this turn lives under skills/ but is hub-installed:
+    # a local record exists (findable), yet it is NOT curator-managed.
+    d = _write_plain_skill(turn_env / "skills", "hubskill")
+    hub_dir = turn_env / "skills" / ".hub"
+    hub_dir.mkdir()
+    (hub_dir / "lock.json").write_text(
+        _json.dumps({"installed": {"hubskill": {"install_path": "hubskill"}}}),
+        encoding="utf-8",
+    )
+    assert "hubskill" in _read_hub_installed_names()
+
+    outcome = evaluate_turn_outcome(
+        skills_used_this_turn={"hubskill": d},
+        outcome_config={"enabled": True, "run": "always"},
+        _aux_eval=_eval(
+            task_succeeded=False, confidence=0.9, failure_points=["hubskill"], reason="x"
+        ),
+    )
+    assert outcome is not None
+    # The verdict itself still names the skill — but nothing reaches the sidecar.
+    assert outcome.failure_points == ["hubskill"]
+    assert get_record("hubskill").get("recent_outcomes") == []
+    assert "hubskill" not in load_usage()
+
+
+def test_eval_cannot_blame_a_skill_not_used_this_turn(turn_env):
+    """The judge must not pin blame on a skill the turn never touched.
+
+    The judge only sees a summarized prompt and can hallucinate a skill name
+    ("summarization", ...) that never ran. Attribution is intersected with the
+    actually-used skills, so a phantom name never reaches the sidecar, never
+    flips needs_review, and never even surfaces in failure_points. The outcome
+    still records the turn failed — with no skill to blame, like an infra
+    failure.
+    """
+    from agent.turn_outcome import evaluate_turn_outcome
+    from tools.skill_usage import get_record, load_usage
+
+    d = _write_plain_skill(turn_env / "skills", "real")
+
+    outcome = evaluate_turn_outcome(
+        skills_used_this_turn={"real": d},
+        outcome_config={"enabled": True, "run": "always"},
+        _aux_eval=_eval(
+            task_succeeded=False,
+            confidence=0.9,
+            failure_points=["summarization"],  # hallucinated, never used
+            reason="claimed summary but provided no content",
+        ),
+    )
+    assert outcome is not None
+    assert outcome.task_succeeded is False
+    # The phantom name is not attributed.
+    assert outcome.failure_points == []
+    assert "summarization" not in load_usage()
+    # The used skill is not blamed either — the judge gave no reason to.
+    assert get_record("real").get("recent_outcomes") == []
+
+
+class TestParseJudgeJson:
+    """The judge's verdict parser must survive real-world model output shapes.
+
+    The aux LLM's raw response is what lands on ``json.loads`` in
+    ``_default_aux_eval``; models wrap answers in ```json fences, lead with a
+    sentence of prose, or truncate mid-JSON at ``max_tokens``. A bare strict
+    parse returns None for all three and silently records nothing — the eval's
+    verdict is the whole feature. These pin the tolerant path.
+    """
+
+    def test_exact_json_object(self):
+        from agent.turn_outcome import _parse_judge_json
+
+        verdict = _parse_judge_json(
+            '{"task_succeeded": false, "confidence": 0.8, '
+            '"failure_points": ["web_extract"], "reason": "timeout"}'
+        )
+        assert verdict is not None
+        assert verdict["task_succeeded"] is False
+        assert verdict["confidence"] == 0.8
+        assert verdict["failure_points"] == ["web_extract"]
+
+    def test_fenced_json_block(self):
+        from agent.turn_outcome import _parse_judge_json
+
+        verdict = _parse_judge_json(
+            '```json\n{"task_succeeded": true, "confidence": 0.9, '
+            '"failure_points": [], "reason": "looked good"}\n```'
+        )
+        assert verdict is not None
+        assert verdict["task_succeeded"] is True
+        assert verdict["confidence"] == 0.9
+
+    def test_prose_before_json(self):
+        from agent.turn_outcome import _parse_judge_json
+
+        verdict = _parse_judge_json(
+            'The turn did not meet the goal. '
+            '{"task_succeeded": false, "confidence": 0.6, "failure_points": ["x"], "reason": "n"}'
+        )
+        assert verdict is not None
+        assert verdict["task_succeeded"] is False
+        assert verdict["failure_points"] == ["x"]
+
+    def test_json_then_trailing_prose(self):
+        from agent.turn_outcome import _parse_judge_json
+
+        verdict = _parse_judge_json(
+            '{"task_succeeded": true, "confidence": 0.7, "failure_points": [], "reason": "ok"} '
+            "Everything completed as expected."
+        )
+        assert verdict is not None
+        assert verdict["task_succeeded"] is True
+
+    def test_truncated_object_returns_none(self):
+        from agent.turn_outcome import _parse_judge_json
+
+        # Unbalanced braces at max_tokens cut-off — must not half-parse.
+        assert _parse_judge_json('{"task_succeeded": false, "confid') is None
+
+    def test_non_json_prose_returns_none(self):
+        from agent.turn_outcome import _parse_judge_json
+
+        assert _parse_judge_json("The task failed because of a network issue.") is None
+
+    def test_empty_and_none_inputs_return_none(self):
+        from agent.turn_outcome import _parse_judge_json
+
+        assert _parse_judge_json("") is None
+        assert _parse_judge_json("   ") is None
+        assert _parse_judge_json(None) is None
+
+    def test_non_dict_json_returns_none(self):
+        from agent.turn_outcome import _parse_judge_json
+
+        assert _parse_judge_json("[1, 2, 3]") is None
+        assert _parse_judge_json('"just a string"') is None
+
+
+class TestDefaultAuxEvalRealResolution:
+    """``_default_aux_eval`` must survive the real resolution chain + transport.
+
+    Unlike the injected ``_aux_eval`` seam (used by every decision-logic
+    test), these exercise the production default: the eval routes through the
+    real ``call_llm`` auxiliary wrapper (which resolves task provider/model,
+    honors ``auxiliary.outcome.timeout``/``extra_body``/``reasoning_effort``,
+    and translates ``max_tokens`` where the provider requires it), then parses
+    the raw-output JSON. Covers the two seams the rest of the suite stubs:
+    client construction and the raw-output parse.
+    """
+
+    def _fake_response(self, content):
+        class _FakeMessage:
+            pass
+
+        class _FakeChoices:
+            pass
+
+        class _FakeResp:
+            pass
+
+        msg = _FakeMessage()
+        msg.content = content
+        ch = _FakeChoices()
+        ch.message = msg
+        resp = _FakeResp()
+        resp.choices = [ch]
+        return resp
+
+    def test_fenced_verdict_through_real_call_llm(self, monkeypatch):
+        from agent.turn_outcome import _default_aux_eval
+
+        captured = {}
+
+        def _fake_call_llm(task=None, **kw):
+            captured["task"] = task
+            captured["max_tokens"] = kw.get("max_tokens")
+            captured["messages"] = kw.get("messages")
+            return self._fake_response(
+                '```json\n{"task_succeeded": false, "confidence": 0.8, '
+                '"failure_points": ["web_extract"], "reason": "curl timed out"}\n```'
+            )
+
+        monkeypatch.setattr("agent.auxiliary_client.call_llm", _fake_call_llm)
+        # Outcome enabled so the default config reader resolves max_tokens.
+        monkeypatch.setattr(
+            "agent.turn_outcome._default_outcome_config",
+            lambda: {"enabled": True, "max_tokens": 1000},
+        )
+
+        verdict = _default_aux_eval("judge this turn")
+        assert verdict is not None
+        assert verdict["task_succeeded"] is False
+        assert verdict["failure_points"] == ["web_extract"]
+        assert "curl timed out" in verdict["reason"]
+        # Must route the outcome task through call_llm and apply the
+        # config-driven budget — the fixed 200-token hardcode silently
+        # no-ops on reasoning models.
+        assert captured["task"] == "outcome"
+        assert captured["max_tokens"] == 1000
+        assert captured["messages"][0]["role"] == "user"
+
+    def test_custom_max_tokens_from_config(self, monkeypatch):
+        from agent.turn_outcome import _default_aux_eval
+
+        captured = {}
+
+        def _fake_call_llm(task=None, **kw):
+            captured["max_tokens"] = kw.get("max_tokens")
+            return self._fake_response(
+                '{"task_succeeded": true, "confidence": 0.9, '
+                '"failure_points": [], "reason": "ok"}'
+            )
+
+        monkeypatch.setattr("agent.auxiliary_client.call_llm", _fake_call_llm)
+        monkeypatch.setattr(
+            "agent.turn_outcome._default_outcome_config",
+            lambda: {"enabled": True, "max_tokens": 2048},
+        )
+
+        verdict = _default_aux_eval("judge this turn")
+        assert verdict is not None
+        assert verdict["task_succeeded"] is True
+        assert captured["max_tokens"] == 2048
+
+    def test_empty_content_from_reasoning_model_returns_none(self, monkeypatch):
+        """A reasoning model that burns its budget on thinking returns empty
+        content — must not half-parse, must not raise."""
+        from agent.turn_outcome import _default_aux_eval
+
+        def _fake_call_llm(task=None, **kw):
+            return self._fake_response("")
+
+        monkeypatch.setattr("agent.auxiliary_client.call_llm", _fake_call_llm)
+        monkeypatch.setattr(
+            "agent.turn_outcome._default_outcome_config",
+            lambda: {"enabled": True, "max_tokens": 200},
+        )
+
+        assert _default_aux_eval("judge this turn") is None
