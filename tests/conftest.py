@@ -597,13 +597,18 @@ def _reset_module_state():
     except Exception:
         pass
 
-    # --- agent.model_metadata — nine module-level caches behind TTLs of
+    # --- agent.model_metadata — eleven module-level caches behind TTLs of
     #     3600s / 300s / 30s. Nothing cleared these between tests, so a
     #     metadata or capability lookup in one file decided the answer for
     #     every later file in the same process. Measured 2026-08-13: this is
     #     the mechanism behind the ~128 order/timing-dependent failures in
     #     tests/agent, which pass individually and fail in the hour-long run.
-    #     The suite's own helper reset only two of the nine.
+    #     The suite's own helper reset only two of them.
+    #
+    #     Enumerate from the module, do not trust this list: the first version
+    #     of this block said "nine" and missed _LOCAL_CTX_PROBE_CACHE and
+    #     _TOOLS_TOKENS_CACHE. Re-derive with:
+    #       grep -nE "^_[A-Za-z_]+.*= *(\{\}|dict\(\))" agent/model_metadata.py
     try:
         _mm_mod = sys.modules["agent.model_metadata"]
         for _name in (
@@ -613,6 +618,8 @@ def _reset_module_state():
             "_endpoint_model_metadata_cache_time",
             "_endpoint_probe_path_cache",
             "_codex_oauth_context_cache",
+            "_LOCAL_CTX_PROBE_CACHE",
+            "_TOOLS_TOKENS_CACHE",
         ):
             _cache = getattr(_mm_mod, _name, None)
             if _cache is not None:
@@ -624,6 +631,43 @@ def _reset_module_state():
                 setattr(_mm_mod, _name, 0)
         if hasattr(_mm_mod, "_codex_oauth_context_cache_time"):
             _mm_mod._codex_oauth_context_cache_time = 0.0
+    except Exception:
+        pass
+
+    # --- agent.bedrock_adapter — three module-level caches, none of which
+    #     anything reset between tests.
+    #
+    #     _bedrock_runtime_client_cache demonstrably leaks: several tests in
+    #     tests/agent/test_bedrock_adapter.py write entries directly and one
+    #     asserts an entry SURVIVES (`_bedrock_runtime_client_cache
+    #     ["us-west-2"] == "live-client"`), so the junk is still there for
+    #     every later test in the process — and that file sorts before
+    #     test_model_metadata.py.
+    #
+    #     Symptom this is aimed at:
+    #     test_bedrock_provider_returns_static_table_before_probe expects the
+    #     static 200000 and gets 1300000 in a full run, which is
+    #     _BEDROCK_PROBE_TIERS[0] — a *padding target*, so the probe really ran
+    #     and "succeeded" instead of failing to the static table as it does in
+    #     isolation. A leaked client object is the plausible route.
+    #
+    #     Stated carefully on purpose: clearing agent.model_metadata's caches
+    #     did NOT fix it, so that mechanism is ruled out, but which of these
+    #     three caches is responsible has not been isolated. Resetting all
+    #     three is correct hygiene either way — no test should inherit another
+    #     file's cached AWS client.
+    #     Re-derive with:
+    #       grep -nE "^_[A-Za-z_]+.*= *(\{\}|dict\(\))" agent/bedrock_adapter.py
+    try:
+        _br_mod = sys.modules["agent.bedrock_adapter"]
+        _br_mod.reset_discovery_cache()
+        for _name in (
+            "_bedrock_runtime_client_cache",
+            "_bedrock_control_client_cache",
+        ):
+            _cache = getattr(_br_mod, _name, None)
+            if _cache is not None:
+                _cache.clear()
     except Exception:
         pass
 
