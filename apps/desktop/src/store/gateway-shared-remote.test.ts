@@ -52,7 +52,9 @@ describe('ensureGatewayForProfile under a shared global remote', () => {
     setPrimaryGateway(primary as never, 'default')
     installDesktop({
       // Shared descriptor: primary connection tagged with the profile.
-      getConnection: vi.fn(async () => ({ port: 4242, profile: 'venture', token: 't' }))
+      getConnection: vi.fn(async profile =>
+        profile ? { baseUrl: 'https://shared.example', profile: 'venture', token: 't' } : { baseUrl: 'https://shared.example' }
+      )
     })
 
     await ensureGatewayForProfile('venture')
@@ -64,8 +66,11 @@ describe('ensureGatewayForProfile under a shared global remote', () => {
     const primary = makePrimary()
     setPrimaryGateway(primary as never, 'default')
     installDesktop({
-      // Own descriptor: no profile tag → normal pooled path (dial attempted).
-      getConnection: vi.fn(async () => ({ port: 5151, token: 't2' }))
+      // Pooled descriptors also carry a profile for WS token minting, but their
+      // endpoint differs from the primary so they must open their own socket.
+      getConnection: vi.fn(async profile =>
+        profile ? { baseUrl: 'https://worker.example', profile: 'worker', token: 't2' } : { baseUrl: 'https://primary.example' }
+      )
     })
 
     await ensureGatewayForProfile('worker')
