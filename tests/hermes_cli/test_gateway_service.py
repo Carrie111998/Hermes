@@ -2,6 +2,7 @@
 
 import os
 import plistlib
+import re
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -2060,3 +2061,180 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
         )
         assert ok is False
         assert list_calls["n"] >= 1
+
+
+class TestGatewayStopGraceBudget:
+    """The CLI must not force-kill the gateway inside the service manager's
+    own graceful-stop budget.
+
+    The installed launchd plist sets ``ExitTimeOut`` to 25s and the systemd
+    unit sets ``TimeoutStopSec`` to ``max(60, drain + 30)``, both so the
+    gateway can finish draining and run gateway/run.py's post-drain teardown
+    (closing the SQLite session DBs to release the WAL write lock, removing
+    the PID file, releasing the runtime lock, writing ``.clean_shutdown``).
+    Every CLI stop path used to SIGKILL 5s in, skipping all of it.
+    """
+
+    LABEL = "ai.hermes.gateway"
+    DOMAIN = "gui/501"
+    PID = 4242
+    # The smallest graceful-stop budget any service manager we install grants
+    # (the launchd plist's ExitTimeOut; the systemd unit's TimeoutStopSec is
+    # never below 60s). The CLI's escalation must not land before this.
+    MIN_PLATFORM_STOP_BUDGET = 25.0
+
+    def _stub_launchd_stop(self, monkeypatch, *, bootout_error=None):
+        """Drive launchd_stop() with launchctl and the exit wait instrumented."""
+        waits = []
+        terminations = []
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: self.LABEL)
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: self.DOMAIN)
+        monkeypatch.setattr(
+            "gateway.status.get_running_pid", lambda *_a, **_k: self.PID
+        )
+        monkeypatch.setattr(
+            "gateway.status.write_planned_stop_marker", lambda *_a, **_k: None
+        )
+
+        def fake_run(cmd, **_kwargs):
+            assert cmd == ["launchctl", "bootout", f"{self.DOMAIN}/{self.LABEL}"]
+            if bootout_error is not None:
+                raise bootout_error
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_gateway_exit",
+            lambda timeout=None, force_after=None: (
+                waits.append((timeout, force_after)) or True
+            ),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "terminate_pid",
+            lambda pid, force=False: terminations.append((pid, force)),
+        )
+        return waits, terminations
+
+    def test_stop_leaves_escalation_to_launchd_after_successful_bootout(
+        self, monkeypatch
+    ):
+        """bootout succeeded, so launchd owns the SIGTERM -> SIGKILL escalation.
+
+        The CLI must not send a kill of its own inside ExitTimeOut, and must
+        wait long enough to actually observe launchd's escalation instead of
+        returning at 10s and reporting a stop that has not happened.
+        """
+        waits, terminations = self._stub_launchd_stop(monkeypatch)
+
+        gateway_cli.launchd_stop()
+
+        assert len(waits) == 1
+        timeout, force_after = waits[0]
+        assert force_after is None, "CLI must not pre-empt launchd's ExitTimeOut"
+        assert timeout >= self.MIN_PLATFORM_STOP_BUDGET
+        assert terminations == [], "no signal is owed; bootout already sent SIGTERM"
+
+    @pytest.mark.parametrize(
+        "returncode, why",
+        [
+            (3, "job already unloaded"),
+            (5, "domain unmanageable, detached fallback process (#23387)"),
+        ],
+    )
+    def test_stop_signals_gracefully_when_launchd_is_not_supervising(
+        self, monkeypatch, returncode, why
+    ):
+        """When bootout falls through, nothing else will ever signal the process.
+
+        The CLI owns the whole stop here. It previously sent no SIGTERM at all
+        on this path -- the only signal was a SIGKILL 5s in -- so a detached
+        fallback gateway never got a graceful stop. It must now terminate
+        gracefully first and escalate no sooner than the budget launchd itself
+        would have granted.
+        """
+        waits, terminations = self._stub_launchd_stop(
+            monkeypatch,
+            bootout_error=subprocess.CalledProcessError(
+                returncode, ["launchctl", "bootout"]
+            ),
+        )
+
+        gateway_cli.launchd_stop()
+
+        assert terminations == [(self.PID, False)], f"expected a SIGTERM ({why})"
+        assert len(waits) == 1
+        timeout, force_after = waits[0]
+        assert force_after >= self.MIN_PLATFORM_STOP_BUDGET
+        assert timeout > force_after, "the wait must outlast its own escalation"
+
+    def test_stop_still_reraises_unexpected_launchctl_failures(self, monkeypatch):
+        """Only the unloaded/unmanageable codes fall through to the PID path."""
+        self._stub_launchd_stop(
+            monkeypatch,
+            bootout_error=subprocess.CalledProcessError(
+                1, ["launchctl", "bootout"]
+            ),
+        )
+
+        with pytest.raises(subprocess.CalledProcessError):
+            gateway_cli.launchd_stop()
+
+    def test_start_all_waits_out_the_budget_before_force_killing(self, monkeypatch):
+        """`gateway start --all` SIGTERMs every stale gateway, then escalates.
+
+        kill_gateway_processes() terminates with force=False, so this wait is
+        purely the escalation backstop and must sit at the platform budget.
+        """
+        waits = []
+
+        monkeypatch.setattr(
+            gateway_cli, "kill_gateway_processes", lambda **_kwargs: 2
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_gateway_exit",
+            lambda timeout=None, force_after=None: (
+                waits.append((timeout, force_after)) or True
+            ),
+        )
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
+        monkeypatch.setattr(gateway_cli, "systemd_start", lambda system=False: None)
+
+        gateway_cli.gateway_command(
+            SimpleNamespace(gateway_command="start", all=True)
+        )
+
+        assert len(waits) == 1
+        timeout, force_after = waits[0]
+        assert force_after >= self.MIN_PLATFORM_STOP_BUDGET, (
+            "force-kill must not land inside the service manager's own budget"
+        )
+        assert timeout > force_after
+
+    def test_cli_grace_never_pre_empts_the_installed_plist_exit_timeout(
+        self, tmp_path, monkeypatch
+    ):
+        """Drift guard tying the CLI's grace to the plist the CLI installs.
+
+        This is the invariant the whole change rests on: whatever ExitTimeOut
+        the generated plist carries, the CLI must not escalate before it. The
+        assertion is one-sided on purpose -- raising ExitTimeOut is always safe,
+        while lowering it below the CLI's grace silently reintroduces the
+        force-kill-inside-the-budget defect this class exists to prevent.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        plist = gateway_cli.generate_launchd_plist()
+        match = re.search(
+            r"<key>ExitTimeOut</key>\s*<integer>(\d+)</integer>", plist
+        )
+        assert match is not None, "plist no longer declares ExitTimeOut"
+        exit_timeout = float(match.group(1))
+        assert exit_timeout >= gateway_cli._GATEWAY_STOP_GRACE_SECONDS, (
+            "the CLI would force-kill before launchd's own escalation"
+        )
+        assert exit_timeout >= self.MIN_PLATFORM_STOP_BUDGET
