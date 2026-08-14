@@ -2580,6 +2580,17 @@ def run_conversation(
                         tools_for_api=tools_for_api,
                     )
                 )
+                # Re-run the unconditional pre-API sanitizer on the re-derived
+                # list. _redecorate_prompt_cache_for_provider returns fresh
+                # shallow copies every retry attempt (fallback provider swap,
+                # MoA rebase, cache re-render), so the payload for THIS attempt
+                # must be re-verified before the wire: strict OpenAI-compatible
+                # providers (DeepSeek v4) reject ``tool_calls: []`` with HTTP
+                # 400 at any position, including mid-tool-loop retries (#6545,
+                # upstream of WebUI fix #5737). Idempotent and non-destructive
+                # on the already-clean list; populated tool_calls pass through
+                # unchanged.
+                api_messages = agent._sanitize_api_messages(api_messages)
                 if tools_for_api == agent.tools:
                     api_kwargs = agent._build_api_kwargs(api_messages)
                 else:
