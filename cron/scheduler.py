@@ -2279,9 +2279,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         # Relay-fronted logical platforms (credential in the connector) are
         # deliberately not natively enabled. Detect that from the same env
-        # stamp the live adapter uses so out-of-process cron (adapters=None)
-        # can still skip the native gate and deliver via gateway loopback
-        # (#86249) instead of dying with "not configured/enabled".
+        # stamp the live adapter uses so out-of-process cron (no live relay
+        # adapter in *this* process) can still skip the native gate and
+        # deliver via gateway loopback instead of dying with
+        # "not configured/enabled".
         relay_fronted = False
         try:
             from gateway.relay import relay_fronted_platforms
@@ -2292,7 +2293,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 "relay_fronted_platforms lookup failed for %r",
                 platform_name, exc_info=True,
             )
-        no_live_adapters = not adapters
+        # Gate on the resolved runtime adapter, not `not adapters`. A non-empty
+        # adapters map that lacks Platform.RELAY (or any handle for this
+        # logical platform) must still take the loopback path — `not adapters`
+        # is too coarse and would re-hit the native credential gate.
+        no_live_relay_adapter = runtime_adapter is None
 
         if transport is not None and transport.is_relay:
             # A relay transport carries the RELAY adapter's config, and
@@ -2305,11 +2310,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             if pconfig is None:
                 from gateway.config import PlatformConfig
                 pconfig = PlatformConfig(enabled=True)
-        elif relay_fronted and no_live_adapters:
-            # Out-of-process: no live relay handle in *this* process, but the
-            # deploy stamp says the connector fronts this platform. Synthesize
-            # an enabled config so we reach the loopback send below rather
-            # than the native credential gate.
+        elif relay_fronted and no_live_relay_adapter:
+            # No live relay handle for this logical platform in *this*
+            # process, but the deploy stamp says the connector fronts it.
+            # Synthesize an enabled config so we reach the loopback send
+            # below rather than the native credential gate.
             if pconfig is None or not pconfig.enabled:
                 from gateway.config import PlatformConfig
                 pconfig = PlatformConfig(enabled=True)
@@ -2724,10 +2729,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     )
 
         if not delivered:
-            if relay_fronted and no_live_adapters:
-                # Out-of-process + relay-fronted: the only working transport is
-                # the live gateway's relay socket. POST to api_server on
-                # loopback (option 2 in #86249) — never open a second connector
+            if relay_fronted and no_live_relay_adapter:
+                # Relay-fronted with no live relay handle here: the only
+                # working transport is the live gateway's relay socket. POST
+                # to api_server on loopback — never open a second connector
                 # handshake, and never fall through to the native Discord/
                 # Slack standalone HTTP path (no bot token on this host).
                 from gateway.loopback_delivery import deliver_via_gateway_loopback

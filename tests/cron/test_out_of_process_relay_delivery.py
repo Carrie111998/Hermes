@@ -91,6 +91,33 @@ class TestOutOfProcessRelayFrontedDelivery:
         assert "not configured/enabled" in err
         loopback.assert_not_called()
 
+    def test_nonempty_adapters_without_relay_still_loopbacks(self, monkeypatch):
+        """Non-empty adapters map without a Discord/relay handle → loopback.
+
+        ``not adapters`` is too coarse: a process can hold other platform
+        adapters and still lack a live transport for the relay-fronted
+        logical platform.
+        """
+        _clear_home_env(monkeypatch)
+        monkeypatch.setenv("GATEWAY_RELAY_PLATFORMS", "discord")
+        # Other platform present, but no RELAY / Discord runtime adapter.
+        adapters = {Platform.TELEGRAM: MagicMock()}
+
+        with patch("gateway.config.load_gateway_config",
+                   return_value=_relay_only_config()), \
+             patch("cron.scheduler.load_config",
+                   return_value={"cron": {"wrap_response": False}}), \
+             patch(
+                 "gateway.loopback_delivery.deliver_via_gateway_loopback",
+                 return_value=None,
+             ) as loopback:
+            err = _deliver_result(
+                _job(), "Nightly report.", adapters=adapters, loop=None,
+            )
+
+        assert err is None
+        loopback.assert_called_once()
+
     def test_loopback_unreachable_fails_closed(self, monkeypatch):
         """Gateway down → clear error; never fall through to Discord HTTP."""
         _clear_home_env(monkeypatch)
