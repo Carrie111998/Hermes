@@ -244,16 +244,48 @@ _MD_LINK_RE = re.compile(r"\[([^\]]*)\]\((?:[^()\s]|\([^()]*\))*\)")
 _MD_NOISE_RE = re.compile(r"[*_`~]|\\(?=[^\w\s])")
 
 
+def _normalize_unicode(text: str) -> str:
+    """Fold typographic/Unicode variants so honest quotes of curly-quote or
+    ASCII-typed sources match.
+
+    Covers the class that failed the x-monitor digest-1 gate (2026-08-12):
+    raw pages typed with U+2011 non-breaking hyphens, curly quotes, ≥/−, and
+    ellipses were ASCII-folded by the worker and so failed naive verbatim
+    matching even though every figure was exact. Apply NFKC (which already
+    folds many of these) then a small explicit fold table for the residual
+    separators/ellipsis forms NFKC does not unify.
+    """
+    import unicodedata
+
+    s = unicodedata.normalize("NFKC", text or "")
+    # Explicit folds for the NFKC residuals most common in prose: hyphen family,
+    # apostrophe/quote family, ellipsis family, and the min/greater-equal signs.
+    table = {
+        "\u2010\u2011\u2012\u2013\u2014": "-",  # hyphen, non-breaking, en, em
+        "\u2018\u2019\u02bb\u201b": "'",  # left/right single quote, ʻ, reversed
+        "\u201c\u201d\u2033": '"',  # left/right double quote, double prime
+        "\u2026": "...",  # ellipsis (multi-char fold via single-char replace)
+        "\u2265": ">=",  # greater-than-or-equal
+        "\u2264": "<=",  # less-than-or-equal
+        "\u2212": "-",  # minus sign
+    }
+    for chars, repl in table.items():
+        for ch in chars:
+            s = s.replace(ch, repl)
+    return s
+
+
 def _match_key(text: str) -> str:
     """Canonicalize text for verbatim comparison.
 
-    Whitespace-, case-, and markdown-insensitive: inline links collapse to
-    their label, emphasis/code markers and backslash escapes are dropped.  The
-    stored quote keeps whatever the caller passed, so the rendered evidence
-    block shows clean prose rather than extractor artifacts.
+    Whitespace-, case-, markdown-, and Unicode-insensitive: inline links
+    collapse to their label, emphasis/code markers and backslash escapes are
+    dropped, and typographic variants fold to ASCII. The stored quote keeps
+    whatever the caller passed, so the rendered evidence block shows clean
+    prose rather than extractor artifacts.
     """
     collapsed = _MD_LINK_RE.sub(r"\1", text or "")
-    return _normalize_ws(_MD_NOISE_RE.sub("", collapsed)).casefold()
+    return _normalize_ws(_normalize_unicode(_MD_NOISE_RE.sub("", collapsed))).casefold()
 
 
 def quote_in_evidence(quote: str, evidence: str) -> bool:

@@ -522,6 +522,59 @@ def test_markup_tolerance_does_not_admit_paraphrase(sources_mod, ledger: Path) -
 
 
 # ---------------------------------------------------------------------------
+# Unicode / typographic tolerance in the verbatim check
+#
+# x-monitor digest-1 DEFECT (2026-08-12): raw pages typed with U+2011 non-breaking
+# hyphens, curly quotes, ≥/−, and ellipses were ASCII-folded by the worker and so
+# failed naive verbatim matching even though every figure was exact.  This test
+# pins the fix so it cannot silently regress (or be lost on an upstream update).
+# Genuine truncations/paraphrases must still fail — the fabrication line stays.
+# ---------------------------------------------------------------------------
+
+# Same sentence twice: once with the raw typographic characters a real page
+# carries, once as the ASCII-typed honest quote a worker would produce.
+_PAGE_TYPOGRAPHIC = (
+    "Tetra’s 5–year run saw ≥12% of revenue from its flagship product,\n"
+    "and margins held at −4.2% “all-in” through the close…\n"
+    "A second, cleanly-typed line for the paraphrase guard.\n"
+)
+
+
+def test_quote_matches_through_typographic_unicode(sources_mod, ledger: Path) -> None:
+    """Honest ASCII quote of a typographically-typed page must still match.
+
+    Reproduces x-monitor digest-1: the worker ASCII-folds its rendering while the
+    source page carries U+2011 NB-hyphen, curly quotes, ≥/−, and ellipsis.  Every
+    figure is exact, so the match must survive.
+    """
+    sources_mod.add_sources(ledger, ["https://x.example"])
+    entry = sources_mod.attach_quote(
+        ledger,
+        1,
+        "Tetra's 5-year run saw >=12% of revenue from its flagship product, "
+        "and margins held at -4.2% \"all-in\" through the close...",
+        _PAGE_TYPOGRAPHIC,
+    )
+    assert len(entry["quotes"]) == 1
+    # The stored quote keeps the caller's clean ASCII prose.
+    assert entry["quotes"][0]["text"] == (
+        'Tetra\'s 5-year run saw >=12% of revenue from its flagship product, '
+        'and margins held at -4.2% "all-in" through the close...'
+    )
+
+
+def test_typographic_tolerance_does_not_admit_paraphrase(sources_mod, ledger: Path) -> None:
+    """Unicode folding must not admit a genuinely different sentence."""
+    sources_mod.add_sources(ledger, ["https://x.example"])
+    with pytest.raises(SystemExit) as exc:
+        sources_mod.attach_quote(
+            ledger, 1, "A quarter of sales came from the firm's top offering in five years.",
+            _PAGE_TYPOGRAPHIC,
+        )
+    assert "not found verbatim" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
 # render --replace-in
 # ---------------------------------------------------------------------------
 
