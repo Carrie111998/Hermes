@@ -3539,10 +3539,78 @@ class SessionStore:
                         "(on-disk spool unavailable)",
                         session_id, self._MAX_PENDING_PER_SESSION,
                     )
-            # Snapshot the first pending message, then release the lock
-            # before the DB write so other sessions are not blocked.
-            msg = pending[0]
         queue_session_id = session_id
+        spooled_sessions = getattr(self, "_spooled_drop_sessions", None)
+        has_target_spool = bool(
+            spooled_sessions
+            and any(
+                self._resolve_transcript_reroute_target(source_session_id)
+                == session_id
+                for source_session_id in tuple(spooled_sessions)
+            )
+        )
+        if has_target_spool:
+            # A cap-evicted source row is older than every surviving row in
+            # ``pending``. Resolve a compression-ended source before replay so
+            # the source-keyed spool can be inserted into the live tip first.
+            finder = getattr(self._db, "find_live_compression_child", None)
+            if callable(finder):
+                try:
+                    child = finder(session_id)
+                except Exception as exc:
+                    logger.warning(
+                        "Cannot resolve transcript spool lineage for %s; "
+                        "keeping spool and pending queue: %s",
+                        session_id,
+                        exc,
+                    )
+                    return
+                child_id = (
+                    str(child.get("id") or "")
+                    if isinstance(child, dict)
+                    else ""
+                )
+                if child_id and child_id != session_id:
+                    source_session_id = session_id
+                    with self._transcript_retry_lock:
+                        existing_child_pending = self._dirty_transcripts.get(
+                            child_id, []
+                        )
+                        pending.extend(existing_child_pending)
+                        self._dirty_transcripts[child_id] = pending
+                        self._dirty_transcripts.pop(queue_session_id, None)
+                        previous_failures = self._transcript_append_failures.pop(
+                            queue_session_id, 0
+                        )
+                        if previous_failures:
+                            self._transcript_append_failures[child_id] = max(
+                                previous_failures,
+                                self._transcript_append_failures.get(child_id, 0),
+                            )
+                        self._transcript_reroutes[source_session_id] = child_id
+                        queue_session_id = child_id
+                        session_id = child_id
+                    # Publish routing only after the retry queue has moved, so
+                    # direct child writes cannot bypass the older source spool.
+                    with self._lock:
+                        for entry in self._entries.values():
+                            if entry.session_id == source_session_id:
+                                entry.session_id = child_id
+                        self._save()
+
+        # Cap-dropped rows predate every surviving in-memory row. If replay of
+        # the oldest spool fails, retain the whole queue and stop: writing a
+        # younger row would make the chronology corruption durable.
+        if not self._drain_spooled_drops_for_target(session_id):
+            return
+
+        # Snapshot the first pending message after older spools are durable,
+        # then release the retry lock before normal DB writes.
+        with self._transcript_retry_lock:
+            if not pending:
+                self._dirty_transcripts.pop(queue_session_id, None)
+                return
+            msg = pending[0]
         # DB write outside the retry lock — other sessions can append
         # concurrently. We re-acquire the lock only to update the queue.
         while True:
@@ -3651,9 +3719,9 @@ class SessionStore:
                         queue_empty = False
                         msg = pending[0]
                 if queue_empty:
-                    # DB write just succeeded and the in-memory backlog is
-                    # clear: replay any cap-dropped messages spooled to disk
-                    # for this session (#78182).
+                    # The pre-drain normally consumed every older spool. Check
+                    # again defensively in case retry bookkeeping changed while
+                    # the queue was being persisted (#78182).
                     self._drain_spooled_drops_for_target(session_id)
                     return
                 continue
@@ -3670,27 +3738,49 @@ class SessionStore:
             session_id = reroutes[session_id]
         return session_id
 
-    def _drain_spooled_drops_for_target(self, target_session_id: str) -> None:
-        """Replay every tracked source spool now routed to ``target_session_id``."""
+    def _drain_spooled_drops_for_target(self, target_session_id: str) -> bool:
+        """Replay older source spools before any queued row for the target."""
         spooled_sessions = getattr(self, "_spooled_drop_sessions", None)
         if not spooled_sessions:
-            return
-        for source_session_id in sorted(tuple(spooled_sessions)):
+            return True
+        reroutes = getattr(self, "_transcript_reroutes", {})
+        sources = []
+        for source_session_id in tuple(spooled_sessions):
             if (
                 self._resolve_transcript_reroute_target(source_session_id)
-                == target_session_id
+                != target_session_id
             ):
-                self._drain_spooled_drops(
-                    source_session_id,
-                    target_session_id=target_session_id,
-                )
+                continue
+            # A farther ancestor was rerouted earlier than its descendants, so
+            # its source-keyed spool must drain first. This also orders a root
+            # spool before a child spool created by a later retry-cap eviction.
+            distance = 0
+            cursor = source_session_id
+            seen = set()
+            while cursor != target_session_id and cursor not in seen:
+                seen.add(cursor)
+                next_cursor = reroutes.get(cursor)
+                if not next_cursor:
+                    break
+                cursor = next_cursor
+                distance += 1
+            sources.append((distance, source_session_id))
+        for _distance, source_session_id in sorted(
+            sources, key=lambda item: (-item[0], item[1])
+        ):
+            if not self._drain_spooled_drops(
+                source_session_id,
+                target_session_id=target_session_id,
+            ):
+                return False
+        return True
 
     def _drain_spooled_drops(
         self,
         spool_session_id: str,
         *,
         target_session_id: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         """Replay cap-dropped spooled transcript messages after DB recovery.
 
         ``spool_session_id`` remains the on-disk selector. A rerouted replay
@@ -3700,7 +3790,7 @@ class SessionStore:
         """
         spooled_sessions = getattr(self, "_spooled_drop_sessions", None)
         if not spooled_sessions or spool_session_id not in spooled_sessions:
-            return
+            return True
         target_session_id = target_session_id or spool_session_id
         lineage_kwargs = (
             {"compression_lineage_root": spool_session_id}
@@ -3710,16 +3800,32 @@ class SessionStore:
         try:
             from gateway.shutdown_flush import drain_transcript_spool
 
+            def replay(message: Dict[str, Any]) -> None:
+                try:
+                    self._append_transcript_message(
+                        target_session_id,
+                        message,
+                        **lineage_kwargs,
+                    )
+                except Exception as exc:
+                    if not (
+                        self._is_fts_corruption_error(exc)
+                        and self._rebuild_fts_once()
+                    ):
+                        raise
+                    self._append_transcript_message(
+                        target_session_id,
+                        message,
+                        **lineage_kwargs,
+                    )
+
             _replayed, remaining = drain_transcript_spool(
                 spool_session_id,
-                lambda message: self._append_transcript_message(
-                    target_session_id,
-                    message,
-                    **lineage_kwargs,
-                ),
+                replay,
             )
             if not remaining:
                 spooled_sessions.discard(spool_session_id)
+            return remaining == 0
         except Exception as exc:
             logger.warning(
                 "Failed to drain transcript spool for %s into %s: %s",
@@ -3727,6 +3833,7 @@ class SessionStore:
                 target_session_id,
                 exc,
             )
+            return False
 
     def _append_transcript_message(
         self,
@@ -3736,7 +3843,10 @@ class SessionStore:
         compression_lineage_root: Optional[str] = None,
     ) -> None:
         """Write one transcript row. Caller handles retry queuing."""
-        self._db.append_message(
+        db = self._db
+        if db is None:
+            raise RuntimeError("Session DB unavailable during transcript append")
+        append_kwargs: Dict[str, Any] = dict(
             session_id=session_id,
             role=message.get("role", "unknown"),
             content=message.get("content"),
@@ -3761,8 +3871,13 @@ class SessionStore:
             # #82888). DB-only; stripped from provider-bound payloads.
             display_kind=message.get("display_kind"),
             display_metadata=message.get("display_metadata"),
-            compression_lineage_root=compression_lineage_root,
         )
+        # Preserve compatibility with strict SessionDB substitutes/overrides
+        # that implement the pre-lineage append_message signature. The new
+        # guard is needed only for an actual stale-source reroute.
+        if compression_lineage_root:
+            append_kwargs["compression_lineage_root"] = compression_lineage_root
+        db.append_message(**append_kwargs)
 
     # Maximum in-memory pending messages per session before dropping the
     # oldest. Prevents unbounded growth when the DB is persistently broken.

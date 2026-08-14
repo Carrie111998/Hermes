@@ -65,8 +65,43 @@ class CompressionRerouteDb:
         self.rows.append(kwargs)
 
     def find_live_compression_child(self, session_id):
-        assert session_id == "root"
-        return {"id": "child", "parent_session_id": "root"}
+        if session_id == "root":
+            return {"id": "child", "parent_session_id": "root"}
+        assert session_id == "child"
+        return None
+
+
+class StrictLegacyAppendDb:
+    """Pre-lineage ``append_message`` override with no extra keyword slot."""
+
+    def __init__(self):
+        self.rows = []
+
+    def append_message(
+        self,
+        session_id,
+        role,
+        content=None,
+        tool_name=None,
+        tool_calls=None,
+        tool_call_id=None,
+        token_count=None,
+        finish_reason=None,
+        reasoning=None,
+        reasoning_content=None,
+        reasoning_details=None,
+        codex_reasoning_items=None,
+        codex_message_items=None,
+        platform_message_id=None,
+        observed=False,
+        effect_disposition=None,
+        timestamp=None,
+        api_content=None,
+        display_kind=None,
+        display_metadata=None,
+        compression_lock_holder=None,
+    ):
+        self.rows.append({"session_id": session_id, "role": role, "content": content})
 
 
 @pytest.fixture()
@@ -86,6 +121,18 @@ def _spool_files(home):
 
 
 class TestSpoolOnDrop:
+    def test_non_rerouted_append_preserves_legacy_override_signature(self):
+        db = StrictLegacyAppendDb()
+        store = _make_store(db)
+
+        store.append_to_transcript(
+            "live", {"role": "assistant", "content": "ordinary"}
+        )
+
+        assert db.rows == [
+            {"session_id": "live", "role": "assistant", "content": "ordinary"}
+        ]
+
     def test_drop_spool_drain_roundtrip(self, spool_home, caplog, monkeypatch):
         # Small cap so the test stays fast.
         monkeypatch.setattr(SessionStore, "_MAX_PENDING_PER_SESSION", 5)
@@ -163,6 +210,34 @@ class TestSpoolOnDrop:
         a_rows = [r["content"] for r in db.rows if r["session_id"] == "sess-a"]
         assert "a0" in a_rows
 
+    def test_spool_replays_before_surviving_in_memory_queue(
+        self, spool_home, monkeypatch
+    ):
+        monkeypatch.setattr(SessionStore, "_MAX_PENDING_PER_SESSION", 3)
+        db = BrokenThenHealedDb()
+        store = _make_store(db)
+
+        for i in range(5):
+            store.append_to_transcript(
+                "ordered", {"role": "user", "content": f"m{i}"}
+            )
+        assert len(_spool_files(spool_home)) == 2
+
+        db.broken = False
+        store.append_to_transcript(
+            "ordered", {"role": "assistant", "content": "m5"}
+        )
+
+        assert [row["content"] for row in db.rows] == [
+            "m0",
+            "m1",
+            "m2",
+            "m3",
+            "m4",
+            "m5",
+        ]
+        assert _spool_files(spool_home) == []
+
     def test_spool_failure_degrades_to_plain_drop(
         self, spool_home, caplog, monkeypatch
     ):
@@ -225,6 +300,7 @@ class TestSpoolOnDrop:
         # Spool files survive the failed replay for the next attempt.
         assert len(_spool_files(spool_home)) == 3
         assert "sess-r" in getattr(store, "_spooled_drop_sessions", set())
+        assert flaky.rows == []
 
 
 class TestCompressionRerouteSpool:
@@ -271,7 +347,7 @@ class TestCompressionRerouteSpool:
 
             assert [
                 row["content"] for row in db.get_messages_as_conversation("tip")
-            ] == ["second summary", "newer", "older"]
+            ] == ["second summary", "older", "newer"]
             assert _spool_files(spool_home) == []
             assert store._entries["route"].session_id == "tip"
         finally:
@@ -292,7 +368,7 @@ class TestCompressionRerouteSpool:
         )
 
         assert [row["session_id"] for row in db.rows] == ["child", "child"]
-        assert [row["content"] for row in db.rows] == ["newer", "older"]
+        assert [row["content"] for row in db.rows] == ["older", "newer"]
         assert _spool_files(spool_home) == []
         assert "root" not in getattr(store, "_spooled_drop_sessions", set())
 
@@ -316,11 +392,64 @@ class TestCompressionRerouteSpool:
         )
 
         assert [row["content"] for row in db.rows] == [
+            "older",
             "newer",
             "future",
-            "older",
         ]
         assert _spool_files(spool_home) == []
+
+    def test_failed_spool_replay_follows_tip_rotation_before_younger_rows(
+        self, spool_home, monkeypatch
+    ):
+        monkeypatch.setattr(SessionStore, "_MAX_PENDING_PER_SESSION", 1)
+        db = SessionDB(db_path=spool_home / "state.db")
+        try:
+            db.create_session("root", source="telegram")
+            store = _make_store(db)
+            real_append = store._append_transcript_message
+            older_failures = 2
+
+            def _fail_initial_and_first_replay(session_id, message, **kwargs):
+                nonlocal older_failures
+                if message.get("content") == "older" and older_failures:
+                    older_failures -= 1
+                    raise RuntimeError("older row not durable yet")
+                return real_append(session_id, message, **kwargs)
+
+            store._append_transcript_message = _fail_initial_and_first_replay
+            store.append_to_transcript(
+                "root", {"role": "user", "content": "older"}
+            )
+            db.publish_compression_child(
+                parent_session_id="root",
+                child_session_id="child",
+                source="telegram",
+                messages=[{"role": "user", "content": "first summary"}],
+                require_compression_lease=False,
+            )
+            store.append_to_transcript(
+                "root", {"role": "assistant", "content": "newer"}
+            )
+            assert len(_spool_files(spool_home)) == 1
+
+            db.publish_compression_child(
+                parent_session_id="child",
+                child_session_id="tip",
+                source="telegram",
+                messages=[{"role": "user", "content": "second summary"}],
+                require_compression_lease=False,
+            )
+            store.append_to_transcript(
+                "root", {"role": "assistant", "content": "future"}
+            )
+
+            assert [
+                row["content"] for row in db.get_messages_as_conversation("tip")
+            ] == ["second summary", "older", "newer", "future"]
+            assert _spool_files(spool_home) == []
+            assert store._entries["route"].session_id == "tip"
+        finally:
+            db.close()
 
     def test_startup_recovery_follows_unique_compression_lineage(
         self, spool_home
@@ -353,6 +482,63 @@ class TestCompressionRerouteSpool:
             assert _spool_files(spool_home) == []
         finally:
             db.close()
+
+    def test_startup_recovery_preserves_transcript_spool_sequence(
+        self, spool_home, monkeypatch
+    ):
+        db = SessionDB(db_path=spool_home / "state.db")
+        try:
+            db.create_session("root", source="telegram")
+            db.publish_compression_child(
+                parent_session_id="root",
+                child_session_id="tip",
+                source="telegram",
+                messages=[{"role": "user", "content": "summary"}],
+                require_compression_lease=False,
+            )
+            # Filename order is intentionally different from creation/seq order.
+            file_ids = iter(["f" * 32, "0" * 32, "8" * 32])
+            monkeypatch.setattr(
+                shutdown_flush.uuid,
+                "uuid4",
+                lambda: SimpleNamespace(hex=next(file_ids)),
+            )
+            for i in range(3):
+                shutdown_flush.spool_dropped_transcript_message(
+                    "root", {"role": "assistant", "content": f"older-{i}"}
+                )
+
+            assert shutdown_flush.recover_pending_to_db(db) == 3
+            assert [
+                row["content"] for row in db.get_messages_as_conversation("tip")
+            ] == ["summary", "older-0", "older-1", "older-2"]
+            assert _spool_files(spool_home) == []
+        finally:
+            db.close()
+
+    def test_startup_recovery_stops_after_oldest_transcript_failure(
+        self, spool_home
+    ):
+        class FailsOldestDb:
+            def __init__(self):
+                self.rows = []
+
+            def append_message(self, **kwargs):
+                if kwargs.get("content") == "older":
+                    raise RuntimeError("oldest row still unavailable")
+                self.rows.append(kwargs)
+
+        db = FailsOldestDb()
+        shutdown_flush.spool_dropped_transcript_message(
+            "live", {"role": "assistant", "content": "older"}
+        )
+        shutdown_flush.spool_dropped_transcript_message(
+            "live", {"role": "assistant", "content": "newer"}
+        )
+
+        assert shutdown_flush.recover_pending_to_db(db) == 0
+        assert db.rows == []
+        assert len(_spool_files(spool_home)) == 2
 
     def test_startup_recovery_keeps_spool_when_lineage_is_ambiguous(
         self, spool_home

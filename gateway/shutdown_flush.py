@@ -283,6 +283,24 @@ def _serialise_value(value: Any) -> Optional[dict]:
     return {"text": str(value)}
 
 
+def _pending_recovery_sort_key(path: Path) -> tuple[int, int, int, str]:
+    """Order recovery payloads by creation metadata, never random UUID name."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return (0, 2, 0, path.name)
+    try:
+        timestamp = int(payload.get("ts", 0))
+    except (TypeError, ValueError):
+        timestamp = 0
+    is_transcript = payload.get("reason") == TRANSCRIPT_CAP_DROP_REASON
+    try:
+        sequence = int(payload.get("seq", 0)) if is_transcript else 0
+    except (TypeError, ValueError):
+        sequence = 0
+    return (timestamp, 0 if is_transcript else 1, sequence, path.name)
+
+
 def recover_pending_to_db(
     session_db=None,
 ) -> int:
@@ -305,7 +323,10 @@ def recover_pending_to_db(
         Number of messages recovered.
     """
     flush_dir = _get_flush_dir()
-    flush_files = sorted(flush_dir.glob("*.json"))
+    flush_files = sorted(
+        flush_dir.glob("*.json"),
+        key=_pending_recovery_sort_key,
+    )
     if not flush_files:
         return 0
 
@@ -317,7 +338,9 @@ def recover_pending_to_db(
         own_db = True
 
     recovered = 0
+    transcript_replay_blocked = False
     for path in flush_files:
+        is_transcript_payload = False
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             # Agent-history snapshots use a different schema (reason +
@@ -331,6 +354,9 @@ def recover_pending_to_db(
             # root guard as the live gateway path (#78182). This handles spool
             # files that were never drained before a restart.
             if payload.get("reason") == TRANSCRIPT_CAP_DROP_REASON:
+                is_transcript_payload = True
+                if transcript_replay_blocked:
+                    continue
                 data = payload.get("data", {}) or {}
                 spooled_sid = data.get("session_id", "")
                 message = data.get("message")
@@ -340,6 +366,7 @@ def recover_pending_to_db(
                         "file %s; preserved for manual inspection",
                         path,
                     )
+                    transcript_replay_blocked = True
                     continue
                 append_kwargs = {
                     "role": message.get("role", "unknown"),
@@ -414,6 +441,11 @@ def recover_pending_to_db(
             recovered += 1
             path.unlink(missing_ok=True)
         except Exception as exc:
+            if is_transcript_payload:
+                # Transcript spool files are creation-ordered. Once an older
+                # row fails, replaying any younger row would make the ordering
+                # corruption durable; preserve the rest for the next startup.
+                transcript_replay_blocked = True
             logger.warning(
                 "Failed to recover pending message from %s: %s",
                 path, exc,
